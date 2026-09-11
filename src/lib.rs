@@ -172,6 +172,7 @@ pub mod d3d11;
 pub mod d3d12;
 pub mod denuvo;
 pub mod diagnostics;
+pub mod dplay;
 pub mod dwrite;
 pub mod error;
 pub mod gdiplus_render;
@@ -247,6 +248,8 @@ pub mod wmi;
 pub mod workloads {
     pub mod steam;
 }
+pub mod casak;
+pub mod driver_image;
 pub mod wsl;
 pub mod x3daudio;
 pub mod xact;

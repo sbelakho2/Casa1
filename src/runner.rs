@@ -89,6 +89,17 @@ impl JitMode {
     }
 }
 
+/// The first thread's start routine/parameter for a child process created
+/// by `NtCreateProcess` + `NtCreateThreadEx`: the runner begins guest
+/// execution at `address` (a preferred-base guest VA inside the child image)
+/// with `parameter` (x86 thread entry: `[esp+4]`; x64: `rcx`) instead of the
+/// image entry point.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunnerThreadStart {
+    pub address: u64,
+    pub parameter: u64,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunnerJob {
     pub ge_name: String,
@@ -109,6 +120,10 @@ pub struct RunnerJob {
     pub window_width: Option<u32>,
     #[serde(default)]
     pub window_height: Option<u32>,
+    /// `NtCreateThreadEx` first-thread start routine/parameter for a native
+    /// `NtCreateProcess` child (`None` for every ordinary run).
+    #[serde(default)]
+    pub thread_start: Option<RunnerThreadStart>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -449,6 +464,9 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
                 live_session: None,
                 jit_mode: Some(job.jit_mode),
                 steam_ipc: job.steam_ipc,
+                thread_start: job
+                    .thread_start
+                    .map(|start| (start.address, start.parameter)),
                 ..pe_runtime::PeExecutionOptions::default()
             };
             // Steam workload wiring: Steam.exe and steamwebhelper child runs
@@ -756,6 +774,7 @@ pub fn replay_trace(trace_path: &Path, ge: &GameEnvironment) -> AppResult<Canoni
         steam_ipc: false,
         window_width: None,
         window_height: None,
+        thread_start: None,
     };
     let actual = execute_job(&job)?.canonical_output;
     compare_outputs(
@@ -909,6 +928,9 @@ fn execute_live_pe_job(
     let test_id = job.test_id.clone();
     let jit_mode = job.jit_mode;
     let steam_ipc = job.steam_ipc;
+    let thread_start = job
+        .thread_start
+        .map(|start| (start.address, start.parameter));
     let is_steam_workload = is_steam_executable(&job.program) || is_webhelper_program(&job.program);
     let worker = std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
@@ -926,6 +948,7 @@ fn execute_live_pe_job(
                 live_session: Some(live_session),
                 jit_mode: Some(jit_mode),
                 steam_ipc,
+                thread_start,
                 ..pe_runtime::PeExecutionOptions::default()
             };
             // Steam workload wiring (see the non-live path): the observer

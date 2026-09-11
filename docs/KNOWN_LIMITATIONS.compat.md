@@ -6,7 +6,7 @@
 
 Every tracked export whose dispatch is not exact or whose backing subsystem is not fully available, per the semantic axes of the API database (level = dispatch quality; fidelity = how close the guest-visible behavior is to the documented operation; capability = whether the Windows subsystem the operation belongs to exists in the modeled environment).
 
-**Counts**: 37 entries deviate from exact/full — fidelity Exact 3, Restricted 14, SyntheticEnvironment 20, capability Full 1, Partial 20, Absent 16.
+**Counts**: 37 entries deviate from exact/full — fidelity Exact 3, Restricted 16, SyntheticEnvironment 18, capability Full 1, Partial 22, Absent 14.
 
 
 ### actxprxy.dll
@@ -42,12 +42,12 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### dplay.dll
 
-- `DirectPlayCreate` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — Models a machine with no DirectPlay runtime: class creation answers REGDB_E_CLASSNOTREG.  No DirectPlay sessions can exist.
-- `DirectPlayEnumerateW` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No DirectPlay sessions exist in the modeled environment; enumeration completes with zero sessions.
+- `DirectPlayCreate` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Creates a real legacy IDirectPlay4 object over the software DirectPlay8 peer engine: real UDP host/connect, session and player state, enumeration, send/receive with real datagrams and the documented DirectPlay error codes.  Group replication, lobby registration and async handler callbacks are not wired yet.
+- `DirectPlayEnumerateW` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Enumerates the real TCP/IP service provider plus every session actually hosted by the runtime by invoking the guest's DPENUMSESSIONS callback with real provider and session records.
 
 ### dpnet.dll
 
-- `DP8SPCreate` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No DirectPlay8 service provider: class creation answers REGDB_E_CLASSNOTREG.
+- `DP8SPCreate` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — DirectPlay8 peers run directly on the UDP transport, so separate service-provider objects are not created: the call answers CLASS_E_CLASSNOTAVAILABLE.
 
 ### gdiplus.dll
 
@@ -64,7 +64,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### mfplat.dll
 
-- `MFGetService` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real service-provider table on the session object graph: MFGetService resolves the owner (session, topology object, topology node) and returns real service objects — the session itself (MF_MEDIASESSION_SERVICE) and genuine IMFRateControl/IMFRateSupport (MF_RATE_CONTROL_SERVICE) backed by real session rate state; genuinely unowned service GUIDs answer MF_E_UNSUPPORTED_SERVICE.
+- `MFGetService` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real service-provider table on the runtime object graph: MFGetService resolves the owner (session, topology object/node, real media source, real byte stream) and returns real service objects — the session itself, genuine IMFRateControl/IMFRateSupport, MF_MEDIASOURCE_SERVICE on real sources and byte-stream attribute services; genuinely unowned GUIDs answer MF_E_UNSUPPORTED_SERVICE.
 
 ### mmdevapi.dll
 
@@ -93,7 +93,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### ntdll.dll
 
-- `NtCreateProcess` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Creates a real child guest process through the same machinery CreateProcessW uses (real pid, image, environment/cwd, kernel handle, exit sync) with real NTSTATUS failure paths, and the first NtCreateThreadEx on the child launches the real casa1-runner host execution of the image with the child's exit code bridged to the process handle.  Remaining native blast radius: the host child starts at the image entry point (the recorded start routine/parameter are not injected), CREATE_SUSPENDED is recorded but the host child starts immediately, additional threads get real thread objects without injection into the running child, terminating the child records the exit code without killing an already-spawned runner, and non-NULL image-backed sections are not modeled (STATUS_INVALID_IMAGE_FORMAT).
+- `NtCreateProcess` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Creates a real child guest process through the same machinery CreateProcessW uses (real pid, image, environment/cwd, kernel handle, exit sync) with real NTSTATUS failure paths; image-backed SEC_IMAGE sections are resolved through the real section registry, the first NtCreateThreadEx launches the real casa1-runner host execution with the caller's start routine actually injected (verified end to end), CREATE_SUSPENDED defers the host launch until NtResumeThread and a suspended child terminated before resume never runs, NtTerminateProcess kills the tracked host child and records the exit code, and NtQueryInformationThread reports the child's real process id, TEB and start address.
 - `NtCreateThreadEx` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real native thread creation on a process object: real handle/client id, suspend count and full NtSuspend/NtResume/NtTerminate semantics; real guest thread records (TEB, stack from StackReserve, CPU state, start routine and parameter) scheduled through the guest thread scheduler for bare entries and the first thread on an image-backed native child launches the real host child execution.  Start routines are not injected into a running host child and host-launched child threads report parent-process query fields.
 
 ### riched32.dll

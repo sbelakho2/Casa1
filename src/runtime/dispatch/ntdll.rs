@@ -13,8 +13,18 @@
 //!   ([`GuestWait`] + the `parked_wait` epilogue) — never host blocking.
 
 use super::super::*;
+use super::final_scraps::{
+    native_child_host_pid, native_child_launch_cancel_suspended, native_child_launch_resume_claim,
+    native_child_launch_unclaim, native_child_terminate_host,
+    native_child_thread_handles_for_process, native_child_thread_info, native_child_thread_retain,
+    native_child_thread_take, section_image_register,
+};
 use crate::ntdll as nt;
 use crate::pe::ImportSymbol;
+
+/// `SEC_IMAGE` — the `NtCreateSection` allocation attribute that creates an
+/// image section (the section carries the PE image of its backing file).
+const SEC_IMAGE: u32 = 0x0100_0000;
 
 impl PeHostRuntime {
     /// The SHARED device/IOCTL dispatch: the Win32 `DeviceIoControl` thunk
@@ -866,7 +876,14 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(status.code()));
             self.last_error = 0;
         } else if timeout_100ns == 0 {
+            // Zero timeout is a poll: it never enters the alertable state.
             state.set(Register::Rax, u64::from(nt::STATUS_TIMEOUT.raw()));
+            self.last_error = 0;
+        } else if alertable && self.deliver_current_thread_apcs(state, memory)? {
+            // The wait would block; deliver the thread's pending APCs in
+            // FIFO order through the guest callback machinery and report
+            // STATUS_USER_APC instead of parking.
+            state.set(Register::Rax, u64::from(nt::STATUS_USER_APC.raw()));
             self.last_error = 0;
         } else {
             let now = self.win32.get_tick_count64();
@@ -1009,6 +1026,12 @@ impl PeHostRuntime {
 
     /// `NtCreateSection` — create a section object (pagefile- or
     /// file-backed) in the live object namespace.
+    ///
+    /// A file-backed section created with `SEC_IMAGE` whose file is a real
+    /// PE image is recorded as an image section (keyed by the section's
+    /// object id), so `NtCreateProcess` can resolve the returned handle —
+    /// through any duplicate/alias of it — to the child image.  Every other
+    /// section stays a plain data section.
     pub(crate) fn dispatch_nt_create_section(
         &mut self,
         state: &mut CpuState,
@@ -1019,7 +1042,7 @@ impl PeHostRuntime {
         let object_attributes = guest_call_arg(state, memory, 2)?;
         let maximum_size_ptr = guest_call_arg(state, memory, 3)?;
         let section_page_protection = guest_call_arg_u32(state, memory, 4)?;
-        let _allocation_attributes = guest_call_arg_u32(state, memory, 5)?;
+        let allocation_attributes = guest_call_arg_u32(state, memory, 5)?;
         let file_handle_raw = guest_call_arg_u32(state, memory, 6)?;
 
         let name = object_attributes_name(memory, object_attributes, self.guest_arch)?;
@@ -1041,6 +1064,26 @@ impl PeHostRuntime {
             file_handle,
         ) {
             Ok(handle) => {
+                // Image section: the backing file is a real PE image, so
+                // record the section's object identity → image guest path
+                // for NtCreateProcess.  A SEC_IMAGE request over a non-PE
+                // file is not an image section; it stays unrecorded and
+                // NtCreateProcess answers STATUS_INVALID_IMAGE_FORMAT.
+                if allocation_attributes & SEC_IMAGE != 0
+                    && let Some(file_handle) = file_handle
+                    && let Ok(file_state) = self.win32.file_state(file_handle)
+                    && let Ok(object_id) = self.win32.handle_object_identity(handle)
+                    && let Ok(host_path) = self
+                        .win32
+                        .guest_path_to_host_path(&file_state.normalized_path)
+                    && is_pe_image(&host_path).unwrap_or(false)
+                {
+                    section_image_register(
+                        self.guest_pid,
+                        object_id.0,
+                        &file_state.normalized_path,
+                    );
+                }
                 if handle_ptr != 0 {
                     write_u32(memory, handle_ptr, handle);
                 }
@@ -1892,12 +1935,24 @@ impl PeHostRuntime {
                         return Ok(());
                     }
                 };
-                let teb_base = self
-                    .pending_guest_threads
-                    .iter()
-                    .find(|thread| thread.handle == thread_handle)
-                    .map(|thread| thread.teb_base)
+                // A host-launched native child thread reports the CHILD
+                // process id and the child thread's real TEB; a thread of
+                // this runtime reports this runtime's pid/TEB.
+                let child_thread = native_child_thread_info(self.guest_pid, thread_handle);
+                let teb_base = child_thread
+                    .as_ref()
+                    .map(|info| info.teb_base)
+                    .or_else(|| {
+                        self.pending_guest_threads
+                            .iter()
+                            .find(|thread| thread.handle == thread_handle)
+                            .map(|thread| thread.teb_base)
+                    })
                     .unwrap_or(self.teb_base);
+                let unique_process_id = child_thread
+                    .as_ref()
+                    .map(|info| info.process_id)
+                    .unwrap_or(self.guest_pid);
                 let exit_status = self
                     .win32
                     .get_exit_code_thread(thread_handle)
@@ -1908,7 +1963,7 @@ impl PeHostRuntime {
                 let info = nt::thread::NtThreadBasicInformation {
                     exit_status,
                     teb_base_address: teb_base,
-                    unique_process_id: u64::from(self.guest_pid),
+                    unique_process_id: u64::from(unique_process_id),
                     unique_thread_id: u64::from(thread_id),
                     affinity_mask: 0xFF,
                     priority,
@@ -2033,13 +2088,19 @@ impl PeHostRuntime {
                     );
                     return Ok(());
                 }
-                // The queued guest thread's start routine; 0 for threads
-                // with no scheduler record (e.g. the main thread).
+                // The start routine the thread was created with: the queued
+                // guest thread's start routine, or a host-launched native
+                // child thread's real Win32StartAddress; 0 for threads with
+                // no start record (e.g. the main thread).
                 let start_address = self
                     .pending_guest_threads
                     .iter()
                     .find(|thread| thread.handle == thread_handle)
                     .map(|thread| thread.start_address)
+                    .or_else(|| {
+                        native_child_thread_info(self.guest_pid, thread_handle)
+                            .map(|info| info.start_address)
+                    })
                     .unwrap_or(0);
                 write_guest_pointer(memory, info_ptr, start_address, self.guest_arch)?;
                 if return_length_ptr != 0 {
@@ -2268,6 +2329,12 @@ impl PeHostRuntime {
         match self.win32.resume_thread(thread_handle) {
             Ok(previous) => {
                 self.sync_pending_thread_suspend_count(thread_handle);
+                if previous == 1 {
+                    // The suspension is fully released: a CREATE_SUSPENDED
+                    // first thread of a deferred native child starts the
+                    // deferred host run now.
+                    self.launch_deferred_native_child_on_resume(thread_handle)?;
+                }
                 if previous_count_ptr != 0 {
                     write_u32(memory, previous_count_ptr, previous);
                 }
@@ -2295,6 +2362,54 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    /// Start the deferred host run of a `CREATE_SUSPENDED` native child when
+    /// its first thread's suspension count reaches zero.  A host run that
+    /// cannot start is reported in the trace and the start routine falls
+    /// back to the runtime's guest thread scheduler (bare-entry scheduling),
+    /// exactly like an immediate `NtCreateThreadEx` whose spawn failed.
+    fn launch_deferred_native_child_on_resume(&mut self, thread_handle: u32) -> AppResult<()> {
+        let Some(info) = native_child_thread_info(self.guest_pid, thread_handle) else {
+            return Ok(());
+        };
+        let Some(claim) =
+            native_child_launch_resume_claim(self.guest_pid, info.process_id, thread_handle)
+        else {
+            return Ok(());
+        };
+        let pending =
+            native_child_thread_take(self.guest_pid, thread_handle).map(|(_, thread)| thread);
+        match self.spawn_native_child_image(&claim) {
+            Ok(()) => {
+                if let Some(pending) = pending {
+                    native_child_thread_retain(
+                        self.guest_pid,
+                        thread_handle,
+                        info.process_id,
+                        pending,
+                    );
+                }
+            }
+            Err(error) => {
+                native_child_launch_unclaim(self.guest_pid, info.process_id);
+                self.push_trace(
+                    "process",
+                    "NtResumeThread",
+                    BTreeMap::from([
+                        ("thread_handle".to_string(), json!(thread_handle)),
+                        ("process_id".to_string(), json!(info.process_id)),
+                        ("failure".to_string(), json!(error.message)),
+                    ]),
+                    json!("STATUS_SUCCESS"),
+                );
+                if let Some(mut pending) = pending {
+                    pending.suspended = 0;
+                    self.pending_guest_threads.push_back(pending);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `NtTerminateProcess` — the process exit path (current process ends
     /// the run; other process objects record their exit code).
     pub(crate) fn dispatch_nt_terminate_process(
@@ -2315,6 +2430,39 @@ impl PeHostRuntime {
         }
         match self.win32.terminate_process(process_handle, exit_status) {
             Ok(()) => {
+                // A native `NtCreateProcess` child: cancel any deferred host
+                // launch, kill an already-spawned host child, and end the
+                // child's recorded guest threads so thread handles observe
+                // the termination.  Every one of these is a no-op for a
+                // process this runtime did not create through NtCreateProcess.
+                if let Ok(child) = self.win32.process_state(process_handle) {
+                    let child_pid = child.process_id;
+                    let host_pid = native_child_host_pid(self.guest_pid, child_pid);
+                    let host_killed = native_child_terminate_host(self.guest_pid, child_pid);
+                    for thread_handle in
+                        native_child_thread_handles_for_process(self.guest_pid, child_pid)
+                    {
+                        let _ = native_child_thread_take(self.guest_pid, thread_handle);
+                        let _ = self.win32.terminate_thread(thread_handle, exit_status);
+                    }
+                    if host_pid.is_some() || host_killed {
+                        self.push_trace(
+                            "process",
+                            "NtTerminateProcess",
+                            BTreeMap::from([
+                                ("process_id".to_string(), json!(child_pid)),
+                                ("host_pid".to_string(), json!(host_pid)),
+                                ("host_killed".to_string(), json!(host_killed)),
+                            ]),
+                            json!(format!("{exit_status:#x}")),
+                        );
+                    }
+                }
+                // Wake every waiter on the process object with the exit code
+                // this termination recorded.
+                let _ = self
+                    .win32
+                    .set_process_exit_code_and_notify(process_handle, exit_status);
                 state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
             }
             Err(_) => {
@@ -2352,6 +2500,23 @@ impl PeHostRuntime {
         // A queued (not-yet-run) guest thread is terminated outright.
         self.pending_guest_threads
             .retain(|thread| thread.thread_id != target_tid);
+        // Terminating the CREATE_SUSPENDED first thread of a deferred native
+        // child means the child can never launch: cancel the deferred host
+        // run before dropping the thread record.
+        if let Some((process_id, _)) = native_child_thread_take(self.guest_pid, thread_handle)
+            && native_child_launch_cancel_suspended(self.guest_pid, process_id, thread_handle)
+        {
+            self.push_trace(
+                "process",
+                "NtTerminateThread",
+                BTreeMap::from([
+                    ("thread_handle".to_string(), json!(thread_handle)),
+                    ("process_id".to_string(), json!(process_id)),
+                    ("deferred_launch".to_string(), json!("cancelled")),
+                ]),
+                json!(format!("{exit_status:#x}")),
+            );
+        }
         match self.win32.terminate_thread(thread_handle, exit_status) {
             Ok(_) => {
                 state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));

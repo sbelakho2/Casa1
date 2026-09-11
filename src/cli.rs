@@ -303,6 +303,7 @@ where
                 steam_ipc: false,
                 window_width: None,
                 window_height: None,
+                thread_start: None,
             };
             let outcome = dispatch_runner(&ge, &job)?;
             outcome.canonical_output.stable_json()
@@ -340,6 +341,7 @@ where
                 steam_ipc: false,
                 window_width: None,
                 window_height: None,
+                thread_start: None,
             };
             let outcome = dispatch_runner(&ge, &job)?;
             outcome.canonical_output.stable_json()
@@ -399,6 +401,7 @@ where
                 steam_ipc: false,
                 window_width: None,
                 window_height: None,
+                thread_start: None,
             };
             let outcome = dispatch_runner(&ge, &job)?;
             outcome.canonical_output.stable_json()

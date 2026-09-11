@@ -52,6 +52,7 @@ fn steam_first_divergence_diagnostic() {
         steam_ipc: false,
         window_width: None,
         window_height: None,
+        thread_start: None,
     };
 
     let outcome = runner::execute_job(&job).expect("runner execute_job");

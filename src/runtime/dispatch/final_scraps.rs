@@ -62,6 +62,13 @@ use crate::x3daudio::{
 };
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
+
+/// Write guest bytes (the dispatch layer's checked writer, surfaced through
+/// the DirectPlay helpers that report their own failure codes).
+fn write_guest_bytes(memory: &mut MemoryImage, address: u64, bytes: &[u8]) -> AppResult<()> {
+    write_guest_bytes_checked(memory, address, bytes)
+}
 
 /// S_OK / TRUE / ERROR_SUCCESS / STATUS_SUCCESS.
 const S_OK: u32 = 0;
@@ -196,33 +203,11 @@ impl PeHostRuntime {
             HostThunk::Xact3CreateEngine | HostThunk::Xact3CreateEngineWithFlags => {
                 self.dispatch_xact_create_engine(state, memory)
             }
-            // ── DirectPlay ──
-            HostThunk::DirectPlayCreate => {
-                let _clsid = guest_call_arg(state, memory, 0)?;
-                let out = guest_call_arg(state, memory, 1)?;
-                let _outer = guest_call_arg(state, memory, 2)?;
-                if out != 0 {
-                    write_guest_pointer(memory, out, 0, self.guest_arch).ok();
-                }
-                state.set(Register::Rax, 0x8004_0153); // REGDB_E_CLASSNOTREG
-                Ok(())
-            }
-            HostThunk::DirectPlayEnumerateW => {
-                let _callback = guest_call_arg(state, memory, 0)?;
-                let _context = guest_call_arg(state, memory, 1)?;
-                // No DirectPlay sessions exist.
-                state.set(Register::Rax, u64::from(S_OK));
-                Ok(())
-            }
-            HostThunk::Dp8spCreate => {
-                let _clsid = guest_call_arg(state, memory, 0)?;
-                let out = guest_call_arg(state, memory, 1)?;
-                if out != 0 {
-                    write_guest_pointer(memory, out, 0, self.guest_arch).ok();
-                }
-                state.set(Register::Rax, 0x8004_0153);
-                Ok(())
-            }
+            // ── DirectPlay: the real software DirectPlay8 peer engine and the
+            //    legacy DirectPlayCreate object.  The factory/enumeration
+            //    entries and every guest-object vtable slot have dedicated
+            //    arms in `runtime::dispatch_import` that route to
+            //    `dispatch_dplay_entry` / `dispatch_dplay8_method` below ──
             // ── the directory-service answers ──
             HostThunk::NetGetDcName | HostThunk::NetGetAnyDcName => {
                 let _server = guest_call_arg(state, memory, 0)?;
@@ -1944,9 +1929,16 @@ impl PeHostRuntime {
     /// guest pid, a real kernel handle, an image, and full process-control
     /// semantics (query/terminate/duplicate).  A NULL section handle (or
     /// `NtCurrentProcess`) creates the child from the parent's own image.
-    /// `InheritObjectTable` is honored by recording the parent's inheritable
-    /// handles on the child exactly as `CreateProcessW(bInheritHandles)`
-    /// does.
+    /// A non-NULL section must be an IMAGE-backed section: a section whose
+    /// backing file is a real PE image (recorded by `NtCreateSection` when
+    /// the caller requests `SEC_IMAGE`) maps the child to that image, the
+    /// exact semantics of an image-section `NtCreateProcess`.  Every other
+    /// section kind — anonymous/data sections and file sections created
+    /// without image semantics — keeps `STATUS_INVALID_IMAGE_FORMAT`, the
+    /// status real Windows reports for a section that is not an executable
+    /// image.  `InheritObjectTable` is honored by recording the parent's
+    /// inheritable handles on the child exactly as
+    /// `CreateProcessW(bInheritHandles)` does.
     ///
     /// `NtCreateProcess` itself creates no primary thread (the native
     /// contract leaves that to `NtCreateThread`); the child is not launched
@@ -1955,12 +1947,6 @@ impl PeHostRuntime {
     /// execution through the host-runner machinery
     /// (`spawn_native_child_image`), with the real exit code delivered to
     /// the exit-sync pair installed here.
-    ///
-    /// Documented model bound: the runtime's section objects are anonymous
-    /// data sections (no image-backed `NtCreateSection` exists in this
-    /// runtime), so a non-NULL section cannot be resolved to an image and
-    /// fails with `STATUS_INVALID_IMAGE_FORMAT` — the exact status real
-    /// Windows reports for a section that is not an image section.
     pub(crate) fn dispatch_nt_create_process(
         &mut self,
         state: &mut CpuState,
@@ -1997,10 +1983,11 @@ impl PeHostRuntime {
 
         // Resolve the child image:
         //  - a NULL section creates the child from the parent's own image;
-        //  - a section handle must be a live Section object, and the
-        //    runtime's sections are data sections — never image sections —
-        //    so they answer STATUS_INVALID_IMAGE_FORMAT like real Windows.
-        if section_handle != 0 {
+        //  - a section handle must be a live Section object backed by a real
+        //    PE image (an image section), which supplies the child image;
+        //  - every other section kind answers STATUS_INVALID_IMAGE_FORMAT,
+        //    like real Windows for a section that is not an executable image.
+        let section_image = if section_handle != 0 {
             let section_is_live = matches!(
                 self.win32.handle_object_type(section_handle),
                 Ok(crate::win32::ObjectType::Section)
@@ -2009,30 +1996,33 @@ impl PeHostRuntime {
                 self.nt_create_process_fail(state, STATUS_INVALID_HANDLE, "invalid section handle");
                 return Ok(());
             }
-            self.nt_create_process_fail(
-                state,
-                STATUS_INVALID_IMAGE_FORMAT,
-                "section is not an executable image",
-            );
-            return Ok(());
-        }
-        let image = match parent_process {
-            0 | u32::MAX => {
-                // NtCurrentProcess (NULL or (HANDLE)-1): the child is born
-                // from the parent's own image.
-                if self.main_module_path.is_empty() {
+            let resolved = self
+                .win32
+                .handle_object_identity(section_handle)
+                .ok()
+                .and_then(|object_id| section_image_lookup(self.guest_pid, object_id.0));
+            match resolved {
+                Some(image) => Some(image),
+                None => {
                     self.nt_create_process_fail(
                         state,
                         STATUS_INVALID_IMAGE_FORMAT,
-                        "parent image is not known",
+                        "section is not an executable image",
                     );
                     return Ok(());
                 }
-                self.main_module_path.clone()
             }
-            parent => match self.win32.process_state(parent) {
-                Ok(parent_state) => parent_state.executable,
-                Err(_) => {
+        } else {
+            None
+        };
+        let image = match section_image {
+            Some(image) => {
+                // The section carries the image.  A supplied parent handle is
+                // still validated (an unusable parent is an invalid client
+                // id) but never overrides the image, matching Windows.
+                if !matches!(parent_process, 0 | u32::MAX)
+                    && self.win32.process_state(parent_process).is_err()
+                {
                     self.nt_create_process_fail(
                         state,
                         STATUS_INVALID_CID,
@@ -2040,6 +2030,33 @@ impl PeHostRuntime {
                     );
                     return Ok(());
                 }
+                image
+            }
+            None => match parent_process {
+                0 | u32::MAX => {
+                    // NtCurrentProcess (NULL or (HANDLE)-1): the child is born
+                    // from the parent's own image.
+                    if self.main_module_path.is_empty() {
+                        self.nt_create_process_fail(
+                            state,
+                            STATUS_INVALID_IMAGE_FORMAT,
+                            "parent image is not known",
+                        );
+                        return Ok(());
+                    }
+                    self.main_module_path.clone()
+                }
+                parent => match self.win32.process_state(parent) {
+                    Ok(parent_state) => parent_state.executable,
+                    Err(_) => {
+                        self.nt_create_process_fail(
+                            state,
+                            STATUS_INVALID_CID,
+                            "invalid parent process",
+                        );
+                        return Ok(());
+                    }
+                },
             },
         };
 
@@ -2091,6 +2108,10 @@ impl PeHostRuntime {
                 process_id: result.process_id,
                 sync,
                 launched: false,
+                thread_start: None,
+                suspended_thread: None,
+                host_pid: Arc::new(std::sync::Mutex::new(None)),
+                terminated: false,
             },
         );
         write_guest_pointer(
@@ -2116,7 +2137,14 @@ impl PeHostRuntime {
                     "desired_access".to_string(),
                     json!(format!("{desired_access:#x}")),
                 ),
-                ("section".to_string(), json!("NULL (parent image)")),
+                (
+                    "section".to_string(),
+                    json!(if section_handle == 0 {
+                        "NULL (parent image)".to_string()
+                    } else {
+                        format!("image section {section_handle:#x}")
+                    }),
+                ),
                 ("process_handle".to_string(), json!(result.process_handle)),
                 ("process_id".to_string(), json!(result.process_id)),
                 (
@@ -2244,18 +2272,37 @@ impl PeHostRuntime {
         // FIRST thread on an unlaunched `NtCreateProcess` child spawns the
         // host run; later threads get real thread records (a host-runner
         // child cannot be injected with a new guest thread).
+        //
+        // The first thread's start routine/parameter is handed to the host
+        // run (the `casa1-runner` job's `thread_start`), so the child's
+        // first thread genuinely begins at the caller's routine exactly like
+        // Windows — not at the image entry point.  With CREATE_SUSPENDED the
+        // host run is DEFERRED until the first `NtResumeThread` releases the
+        // suspension; a child terminated before that resume never launches.
         let registered = native_child_launch_registered(self.guest_pid, process.process_id);
         let mut host_launched = false;
+        let mut deferred = false;
         let mut launch_note: Option<String> = None;
         if registered {
-            if let Some(claim) = native_child_launch_claim(self.guest_pid, process.process_id) {
-                match self.spawn_native_child_image(
-                    claim.process_id,
-                    &claim.image,
-                    &claim.environment,
-                    &claim.cwd,
-                    claim.sync.clone(),
+            native_child_launch_set_thread_start(
+                self.guest_pid,
+                process.process_id,
+                start_address,
+                parameter,
+            );
+            if create_suspended {
+                match native_child_launch_mark_suspended(
+                    self.guest_pid,
+                    process.process_id,
+                    thread_handle,
                 ) {
+                    Ok(()) => deferred = true,
+                    Err(note) => launch_note = Some(note),
+                }
+            } else if let Some(claim) =
+                native_child_launch_claim(self.guest_pid, process.process_id)
+            {
+                match self.spawn_native_child_image(&claim) {
                     Ok(()) => host_launched = true,
                     Err(error) => {
                         native_child_launch_unclaim(self.guest_pid, process.process_id);
@@ -2269,11 +2316,12 @@ impl PeHostRuntime {
 
         // The runtime-side thread record: a real TEB/stack/CPU state for the
         // start routine.  When the real execution runs outside this runtime
-        // (a host-runner / already-running child), the record is kept in the
+        // (a host-runner / already-running child, or a CREATE_SUSPENDED
+        // child whose host run is deferred), the record is kept in the
         // runtime's external-child thread table; only a native child whose
         // host run could not start falls back to the runtime's existing guest
         // thread scheduler (bare-entry scheduling).
-        let external_execution = !registered || host_launched;
+        let external_execution = !registered || host_launched || deferred;
         let mut scheduled = false;
         if self.guest_arch == GuestArch::X86 {
             match self.prepare_guest_thread_entry(
@@ -2289,7 +2337,12 @@ impl PeHostRuntime {
                         let _ = self.win32.set_thread_suspend_count(thread_id, 1);
                     }
                     if external_execution {
-                        native_child_thread_retain(self.guest_pid, thread_handle, pending);
+                        native_child_thread_retain(
+                            self.guest_pid,
+                            thread_handle,
+                            process.process_id,
+                            pending,
+                        );
                     } else {
                         self.pending_guest_threads.push_back(pending);
                         scheduled = true;
@@ -2322,6 +2375,7 @@ impl PeHostRuntime {
             ("parameter".to_string(), json!(format!("{parameter:#x}"))),
             ("create_suspended".to_string(), json!(create_suspended)),
             ("host_launched".to_string(), json!(host_launched)),
+            ("deferred".to_string(), json!(deferred)),
             ("external_execution".to_string(), json!(external_execution)),
             ("scheduled".to_string(), json!(scheduled)),
         ]);
@@ -2344,14 +2398,20 @@ impl PeHostRuntime {
     /// the image (argv[0]) with no extra arguments, matching Windows for a
     /// process created from an image section with no parameters.  The runner
     /// protocol's `args` vector is empty for that reason.
-    fn spawn_native_child_image(
-        &mut self,
-        process_id: u32,
-        image: &str,
-        environment: &BTreeMap<String, String>,
-        cwd: &str,
-        sync: Arc<(std::sync::Mutex<Option<u32>>, std::sync::Condvar)>,
-    ) -> AppResult<()> {
+    ///
+    /// The first thread's start routine/parameter (from `NtCreateThreadEx`)
+    /// travels in the job's `thread_start`, so a PE child's first thread
+    /// genuinely begins at the caller's routine.  The spawned host process
+    /// id is recorded in the launch entry's host-pid slot so
+    /// `NtTerminateProcess` can kill a running child.
+    pub(crate) fn spawn_native_child_image(&mut self, claim: &NativeChildClaim) -> AppResult<()> {
+        let process_id = claim.process_id;
+        let image = claim.image.as_str();
+        let environment = &claim.environment;
+        let cwd = claim.cwd.as_str();
+        let sync = claim.sync.clone();
+        let thread_start = claim.thread_start;
+        let host_pid = claim.host_pid.clone();
         let host_program = self.win32.guest_path_to_host_path(image)?;
         if !host_program.exists() {
             return Err(AppError::new(
@@ -2403,6 +2463,12 @@ impl PeHostRuntime {
                 steam_ipc: false,
                 window_width: None,
                 window_height: None,
+                // The NT first thread's start routine: the runner begins
+                // guest execution there with the thread parameter instead of
+                // the image entry point (Windows NtCreateThreadEx).
+                thread_start: thread_start.map(|(address, parameter)| {
+                    crate::runner::RunnerThreadStart { address, parameter }
+                }),
             };
             let job_json = serde_json::to_string(&job).map_err(|error| {
                 AppError::new(
@@ -2418,7 +2484,10 @@ impl PeHostRuntime {
                     &error,
                 )
             })?;
-            let job_path = job_dir.join(format!("native-child-{process_id}.json"));
+            let job_path = job_dir.join(format!(
+                "native-child-{process_id}-{}.json",
+                NATIVE_CHILD_JOB_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             std::fs::write(&job_path, &job_json).map_err(|error| {
                 AppError::from_io(
                     ReasonCode::RcIo,
@@ -2426,12 +2495,30 @@ impl PeHostRuntime {
                     &error,
                 )
             })?;
+            // Spawn synchronously so a missing runner or a refused spawn
+            // falls back to the guest scheduler instead of silently never
+            // running; the pid is tracked for NtTerminateProcess.
+            let child = match Self::spawn_runner_process(&runner_path, &job_path) {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&job_path);
+                    return Err(error);
+                }
+            };
+            if let Ok(mut slot) = host_pid.lock() {
+                *slot = Some(child.id());
+            }
             std::thread::spawn(move || {
-                let exit_code = Self::spawn_runner_and_wait(&runner_path, &job_path);
+                let exit_code = Self::finish_runner_child(child);
                 let _ = std::fs::remove_file(&job_path);
                 let (lock, cvar) = &*sync;
                 let mut guard = lock.lock().unwrap();
-                *guard = Some(exit_code);
+                // First writer wins: a terminate that already recorded the
+                // requested exit code must not be overwritten by the killed
+                // host child's synthetic wait result.
+                if guard.is_none() {
+                    *guard = Some(exit_code);
+                }
                 cvar.notify_all();
             });
         } else {
@@ -2445,27 +2532,34 @@ impl PeHostRuntime {
             for (key, value) in environment {
                 command.env(key, value);
             }
+            let mut child = command.spawn().map_err(|error| {
+                AppError::from_io(
+                    ReasonCode::RcRunnerSpawnFailed,
+                    format!(
+                        "failed to spawn native child {}: {error}",
+                        host_program.display()
+                    ),
+                    &error,
+                )
+            })?;
+            if let Ok(mut slot) = host_pid.lock() {
+                *slot = Some(child.id());
+            }
             std::thread::spawn(move || {
-                let exit_code = match command.spawn() {
-                    Ok(mut child) => match child.wait() {
-                        Ok(status) => status.code().map(|code| code as u32).unwrap_or(u32::MAX),
-                        Err(error) => {
-                            eprintln!(
-                                "[pe_runtime] failed to wait for native child {host_program:?}: {error:?}"
-                            );
-                            u32::MAX
-                        }
-                    },
+                let exit_code = match child.wait() {
+                    Ok(status) => status.code().map(|code| code as u32).unwrap_or(u32::MAX),
                     Err(error) => {
                         eprintln!(
-                            "[pe_runtime] failed to spawn native child {host_program:?}: {error:?}"
+                            "[pe_runtime] failed to wait for native child {host_program:?}: {error:?}"
                         );
                         u32::MAX
                     }
                 };
                 let (lock, cvar) = &*sync;
                 let mut guard = lock.lock().unwrap();
-                *guard = Some(exit_code);
+                if guard.is_none() {
+                    *guard = Some(exit_code);
+                }
                 cvar.notify_all();
             });
         }
@@ -3276,6 +3370,11 @@ pub(crate) struct WkstaSetInfoState {
     pub lan_root: Option<String>,
     pub logged_on_users: Option<u32>,
 }
+
+/// Per-process sequence making native-child runner job files unique even when
+/// concurrent runtimes reuse guest pids (parallel tests, multiple children).
+static NATIVE_CHILD_JOB_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 static WKSTA_SET_INFO_STATE: LazyLock<Mutex<BTreeMap<u32, WkstaSetInfoState>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
@@ -4131,8 +4230,8 @@ fn cng_audit_records_for(runtime_pid: u32) -> Vec<CngAuditRecord> {
 
 /// Launch state for a native child process created by `NtCreateProcess`
 /// before a thread makes it runnable: the image/cwd/environment its host run
-/// must use, the exit-sync pair installed on its process object, and whether
-/// the real host execution has been spawned.
+/// must use, the exit-sync pair installed on its process object, the first
+/// thread's start routine, and the state of the deferred/immediate host run.
 struct NativeChildLaunch {
     image: String,
     cwd: String,
@@ -4145,6 +4244,20 @@ struct NativeChildLaunch {
     /// on the same process only get thread records (a running host child
     /// cannot be injected with new guest threads).
     launched: bool,
+    /// The FIRST thread's start routine/parameter (`NtCreateThreadEx`): the
+    /// host run begins at this routine with this parameter instead of the
+    /// image entry point, exactly like Windows.
+    thread_start: Option<(u64, u64)>,
+    /// The guest thread handle whose `NtResumeThread` must start the host
+    /// run when the first thread was created CREATE_SUSPENDED.  `None` for
+    /// an immediately-launched first thread and cleared on resume.
+    suspended_thread: Option<u32>,
+    /// Host process id of the running child once spawned.  Shared with the
+    /// monitor thread; taken by `NtTerminateProcess` to kill the child.
+    host_pid: Arc<std::sync::Mutex<Option<u32>>>,
+    /// Set when the child process was terminated: no later thread creation
+    /// or resume may launch the host run.
+    terminated: bool,
 }
 
 /// The per-runtime native-child launch table, keyed by
@@ -4174,41 +4287,141 @@ fn native_child_launch_register(runtime_pid: u32, process_id: u32, launch: Nativ
     }
 }
 
-/// The fields needed to spawn a claimed launch (owned, so the store lock is
-/// never held across the host spawn).
-struct NativeChildClaim {
-    image: String,
-    cwd: String,
-    environment: BTreeMap<String, String>,
+/// Record the first thread's start routine/parameter for the host run.  A
+/// later thread never overrides the routine the first thread already
+/// recorded (or the host run already started with).
+fn native_child_launch_set_thread_start(
+    runtime_pid: u32,
     process_id: u32,
-    sync: Arc<(std::sync::Mutex<Option<u32>>, std::sync::Condvar)>,
+    start_address: u64,
+    parameter: u64,
+) {
+    if let Ok(mut store) = native_child_launch_store().lock()
+        && let Some(entry) = store.get_mut(&(runtime_pid, process_id))
+        && !entry.launched
+        && !entry.terminated
+        && entry.thread_start.is_none()
+    {
+        entry.thread_start = Some((start_address, parameter));
+    }
 }
 
-/// Claim the first launch of an unlaunched native child.  Returns `None` for
-/// process ids that are not registered `NtCreateProcess` children or were
-/// already claimed; the claim is reverted with
-/// [`native_child_launch_unclaim`] when the host spawn fails, so a later
-/// thread creation can retry.
-fn native_child_launch_claim(runtime_pid: u32, process_id: u32) -> Option<NativeChildClaim> {
-    let mut store = native_child_launch_store().lock().ok()?;
-    let entry = store.get_mut(&(runtime_pid, process_id))?;
-    if entry.launched {
-        return None;
+/// Mark the first thread CREATE_SUSPENDED: the host run is deferred until
+/// that thread's `NtResumeThread` releases the suspension.  Returns the
+/// reason the suspension could not be recorded (the child already launched
+/// or was terminated) so the caller can trace it honestly.
+fn native_child_launch_mark_suspended(
+    runtime_pid: u32,
+    process_id: u32,
+    thread_handle: u32,
+) -> Result<(), String> {
+    if let Ok(mut store) = native_child_launch_store().lock()
+        && let Some(entry) = store.get_mut(&(runtime_pid, process_id))
+    {
+        if entry.terminated {
+            return Err("native child is terminated".to_string());
+        }
+        if entry.launched {
+            return Err("native child already launched".to_string());
+        }
+        if entry.suspended_thread.is_none() {
+            entry.suspended_thread = Some(thread_handle);
+        }
+        return Ok(());
     }
-    entry.launched = true;
-    Some(NativeChildClaim {
+    Err("native child is not registered".to_string())
+}
+
+/// The fields needed to spawn a claimed launch (owned, so the store lock is
+/// never held across the host spawn).
+pub(crate) struct NativeChildClaim {
+    pub(crate) image: String,
+    pub(crate) cwd: String,
+    pub(crate) environment: BTreeMap<String, String>,
+    pub(crate) process_id: u32,
+    pub(crate) sync: Arc<(std::sync::Mutex<Option<u32>>, std::sync::Condvar)>,
+    /// First-thread start routine/parameter handed to the host run.
+    pub(crate) thread_start: Option<(u64, u64)>,
+    /// Host-pid slot the spawn records the running child pid in.
+    pub(crate) host_pid: Arc<std::sync::Mutex<Option<u32>>>,
+}
+
+fn native_child_claim_from(entry: &NativeChildLaunch) -> NativeChildClaim {
+    NativeChildClaim {
         image: entry.image.clone(),
         cwd: entry.cwd.clone(),
         environment: entry.environment.clone(),
         process_id: entry.process_id,
         sync: entry.sync.clone(),
-    })
+        thread_start: entry.thread_start,
+        host_pid: entry.host_pid.clone(),
+    }
+}
+
+/// Claim the first launch of an unlaunched native child.  Returns `None` for
+/// process ids that are not registered `NtCreateProcess` children, were
+/// already claimed, or were terminated; the claim is reverted with
+/// [`native_child_launch_unclaim`] when the host spawn fails, so a later
+/// thread creation can retry.
+fn native_child_launch_claim(runtime_pid: u32, process_id: u32) -> Option<NativeChildClaim> {
+    let mut store = native_child_launch_store().lock().ok()?;
+    let entry = store.get_mut(&(runtime_pid, process_id))?;
+    if entry.launched || entry.terminated {
+        return None;
+    }
+    entry.launched = true;
+    entry.suspended_thread = None;
+    Some(native_child_claim_from(entry))
+}
+
+/// Claim the DEFERRED launch when the CREATE_SUSPENDED first thread is
+/// resumed (its suspend count reaches zero).  `None` for a thread that is
+/// not the deferred first thread, or for a launch that already ran or was
+/// terminated — those must never start a host run.
+pub(crate) fn native_child_launch_resume_claim(
+    runtime_pid: u32,
+    process_id: u32,
+    thread_handle: u32,
+) -> Option<NativeChildClaim> {
+    let mut store = native_child_launch_store().lock().ok()?;
+    let entry = store.get_mut(&(runtime_pid, process_id))?;
+    if entry.launched || entry.terminated || entry.suspended_thread != Some(thread_handle) {
+        return None;
+    }
+    entry.launched = true;
+    entry.suspended_thread = None;
+    Some(native_child_claim_from(entry))
+}
+
+/// Cancel a deferred launch because its CREATE_SUSPENDED first thread was
+/// terminated before ever being resumed: the child must never launch.
+/// Returns `true` when a deferred launch was actually cancelled.
+pub(crate) fn native_child_launch_cancel_suspended(
+    runtime_pid: u32,
+    process_id: u32,
+    thread_handle: u32,
+) -> bool {
+    let Ok(mut store) = native_child_launch_store().lock() else {
+        return false;
+    };
+    let Some(entry) = store.get_mut(&(runtime_pid, process_id)) else {
+        return false;
+    };
+    if entry.launched || entry.terminated || entry.suspended_thread != Some(thread_handle) {
+        return false;
+    }
+    entry.terminated = true;
+    entry.launched = true;
+    entry.suspended_thread = None;
+    entry.thread_start = None;
+    true
 }
 
 /// Revert an optimistic claim after a failed host spawn.
-fn native_child_launch_unclaim(runtime_pid: u32, process_id: u32) {
+pub(crate) fn native_child_launch_unclaim(runtime_pid: u32, process_id: u32) {
     if let Ok(mut store) = native_child_launch_store().lock()
         && let Some(entry) = store.get_mut(&(runtime_pid, process_id))
+        && !entry.terminated
     {
         entry.launched = false;
     }
@@ -4223,23 +4436,170 @@ fn native_child_launch_registered(runtime_pid: u32, process_id: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Terminate a native child: mark it terminated so no later thread creation
+/// or resume can launch the host run, and kill an already-running host child
+/// (SIGKILL on Unix — `NtTerminateProcess` is a forceful termination).
+/// Returns `true` when a live host child was signalled.
+pub(crate) fn native_child_terminate_host(runtime_pid: u32, process_id: u32) -> bool {
+    let host_pid = {
+        let Ok(mut store) = native_child_launch_store().lock() else {
+            return false;
+        };
+        let Some(entry) = store.get_mut(&(runtime_pid, process_id)) else {
+            return false;
+        };
+        entry.terminated = true;
+        entry.launched = true; // every later claim is refused
+        entry.suspended_thread = None;
+        entry.thread_start = None;
+        entry.host_pid.clone()
+    };
+    let Some(pid) = host_pid.lock().ok().and_then(|mut slot| slot.take()) else {
+        return false;
+    };
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    true
+}
+
+/// The running host child's pid for a registered `NtCreateProcess` child
+/// (`None` before the host run starts, after it exits, or after a kill).
+pub(crate) fn native_child_host_pid(runtime_pid: u32, process_id: u32) -> Option<u32> {
+    let store = native_child_launch_store().lock().ok()?;
+    store
+        .get(&(runtime_pid, process_id))
+        .and_then(|entry| entry.host_pid.lock().ok().and_then(|slot| *slot))
+}
+
 /// The runtime-side thread records for child threads whose real execution
 /// runs outside this runtime (spawned host-runner children, already-running
-/// children, or a native child whose host run could not start): real
-/// TEB/stack/CPU state owned by the runtime, keyed by
-/// `(runtime guest pid, thread handle)`.
-fn native_child_thread_store() -> &'static std::sync::Mutex<BTreeMap<(u32, u32), PendingGuestThread>>
-{
+/// children, CREATE_SUSPENDED children whose host run is deferred, or a
+/// native child whose host run could not start): real TEB/stack/CPU state
+/// owned by the runtime, keyed by `(runtime guest pid, thread handle)` and
+/// carrying the child process id the thread belongs to.
+struct NativeChildThreadRecord {
+    process_id: u32,
+    thread: PendingGuestThread,
+}
+
+/// The query view of a runtime-side child thread record: the values
+/// `NtQueryInformationThread` must report for a host-launched child thread.
+pub(crate) struct NativeChildThreadInfo {
+    pub(crate) process_id: u32,
+    pub(crate) start_address: u64,
+    pub(crate) teb_base: u64,
+}
+
+fn native_child_thread_store()
+-> &'static std::sync::Mutex<BTreeMap<(u32, u32), NativeChildThreadRecord>> {
     use std::sync::LazyLock;
-    static STORE: LazyLock<std::sync::Mutex<BTreeMap<(u32, u32), PendingGuestThread>>> =
+    static STORE: LazyLock<std::sync::Mutex<BTreeMap<(u32, u32), NativeChildThreadRecord>>> =
         LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
     &STORE
 }
 
-fn native_child_thread_retain(runtime_pid: u32, thread_handle: u32, thread: PendingGuestThread) {
+/// The query view of a child thread record (`None` for runtime-scheduled
+/// threads and unknown handles).
+pub(crate) fn native_child_thread_info(
+    runtime_pid: u32,
+    thread_handle: u32,
+) -> Option<NativeChildThreadInfo> {
+    let store = native_child_thread_store().lock().ok()?;
+    store
+        .get(&(runtime_pid, thread_handle))
+        .map(|record| NativeChildThreadInfo {
+            process_id: record.process_id,
+            start_address: record.thread.start_address,
+            teb_base: record.thread.teb_base,
+        })
+}
+
+/// Remove and return a child thread record (the deferred-launch resume and
+/// the terminate cleanup need to take ownership of the pending record).
+pub(crate) fn native_child_thread_take(
+    runtime_pid: u32,
+    thread_handle: u32,
+) -> Option<(u32, PendingGuestThread)> {
+    let mut store = native_child_thread_store().lock().ok()?;
+    store
+        .remove(&(runtime_pid, thread_handle))
+        .map(|record| (record.process_id, record.thread))
+}
+
+/// Every child thread handle recorded for a child process (the terminate
+/// cleanup enumerates them to end the process's threads).
+pub(crate) fn native_child_thread_handles_for_process(
+    runtime_pid: u32,
+    process_id: u32,
+) -> Vec<u32> {
+    native_child_thread_store()
+        .lock()
+        .map(|store| {
+            store
+                .iter()
+                .filter(|((pid, _), record)| *pid == runtime_pid && record.process_id == process_id)
+                .map(|((_, handle), _)| *handle)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn native_child_thread_retain(
+    runtime_pid: u32,
+    thread_handle: u32,
+    process_id: u32,
+    thread: PendingGuestThread,
+) {
     if let Ok(mut store) = native_child_thread_store().lock() {
-        store.insert((runtime_pid, thread_handle), thread);
+        store.insert(
+            (runtime_pid, thread_handle),
+            NativeChildThreadRecord { process_id, thread },
+        );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Image-backed section registry
+// ---------------------------------------------------------------------------
+//
+// `NtCreateSection` records a section whose backing file is a real PE image
+// (SEC_IMAGE) under `(runtime guest pid, section object id)`.  The object id
+// — not the handle — is the key, so duplicate/aliased handles to the same
+// section resolve the same image.  `NtCreateProcess` resolves its section
+// handle through the same registry; every section without an entry is not an
+// executable image and keeps STATUS_INVALID_IMAGE_FORMAT.
+
+fn section_image_store() -> &'static std::sync::Mutex<BTreeMap<(u32, u64), String>> {
+    use std::sync::LazyLock;
+    static STORE: LazyLock<std::sync::Mutex<BTreeMap<(u32, u64), String>>> =
+        LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+    &STORE
+}
+
+/// Record a section as image-backed by `image` (the guest path of its PE
+/// file).  Bounded per runtime so a long-lived host process cannot grow the
+/// registry without bound.
+pub(crate) fn section_image_register(runtime_pid: u32, object_id: u64, image: &str) {
+    const MAX_IMAGES_PER_RUNTIME: usize = 1024;
+    if let Ok(mut store) = section_image_store().lock() {
+        let same_runtime = store.keys().filter(|(pid, _)| *pid == runtime_pid).count();
+        if same_runtime >= MAX_IMAGES_PER_RUNTIME {
+            store.retain(|(pid, _), _| *pid != runtime_pid);
+        }
+        store.insert((runtime_pid, object_id), image.to_string());
+    }
+}
+
+fn section_image_lookup(runtime_pid: u32, object_id: u64) -> Option<String> {
+    section_image_store()
+        .lock()
+        .ok()?
+        .get(&(runtime_pid, object_id))
+        .cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -6983,6 +7343,2277 @@ fn xact_mix_tracks(tracks: &[(Vec<i16>, f32)], channels: usize) -> Vec<i16> {
         .into_iter()
         .map(|sample| sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// DirectPlay — the real software DirectPlay8 peer engine
+// ---------------------------------------------------------------------------
+//
+// The dispatch layer below implements the `dplay8.h`/`dpaddr.h` interfaces
+// (`IDirectPlay8Address`, `IDirectPlay8Peer`) and the legacy `IDirectPlay4`
+// subset from `dplay.h` against the real engine in `crate::dplay`:
+//
+// - `DirectPlay8Create` / `DirectPlay8AddressCreate` / `DirectPlayCreate`
+//   hand out real guest objects whose vtables are the exact interface tables
+//   from the DirectX headers; every slot is a `HostThunk::Dplay8Method`
+//   carrying its interface/method identity.
+// - `DirectPlayEnumerateW` runs the guest callback for the built-in TCP/IP
+//   service provider and for every real session this runtime currently hosts
+//   (see `crate::dplay::hosted_sessions`).
+// - `Host`/`Connect`/`SendTo`/`EnumHosts`/`Close` map onto the real UDP
+//   transport; `GetCaps`/`GetSPCaps`/`GetConnectionInfo` report the live
+//   engine facts; the remaining methods return the genuine `DPNERR_*` for
+//   the condition (including `DPNERR_UNSUPPORTED` for the surfaces the
+//   engine genuinely does not model, such as lobby registration).
+//
+// The engine never fabricates success: see `crate::dplay` for the wire
+// messages and the per-operation failure codes.
+
+/// `CLASS_E_CLASSNOTAVAILABLE` — the honest answer of the internal
+/// `DP8SPCreate` service-provider factory, which has no COM class object in
+/// this runtime (applications use `DirectPlay8Create` instead).
+const DPLAY_CLASS_E_CLASSNOTAVAILABLE: u32 = 0x8004_0153;
+
+/// Align a byte offset to the guest pointer size (Windows x64 aligns
+/// pointers to 8; x86 to 4).
+fn dplay_align(value: u64, pointer_size: u64) -> u64 {
+    (value + pointer_size - 1) & !(pointer_size - 1)
+}
+
+fn dplay_riid(memory: &MemoryImage, address: u64) -> [u8; 16] {
+    let mut riid = [0u8; 16];
+    if address != 0 {
+        if let Ok(bytes) = read_guest_bytes(memory, address, 16) {
+            riid.copy_from_slice(&bytes);
+        }
+    }
+    riid
+}
+
+fn dplay_utf16_z(memory: &MemoryImage, address: u64) -> String {
+    if address == 0 {
+        return String::new();
+    }
+    read_utf16z(memory, address, 4096).unwrap_or_default()
+}
+
+fn dplay_ansi_z(memory: &MemoryImage, address: u64) -> String {
+    if address == 0 {
+        return String::new();
+    }
+    read_c_string(memory, address).unwrap_or_default()
+}
+
+/// Write a byte buffer with the DirectPlay buffer contract: the size pointer
+/// is always updated to the required size; a null/too-small buffer returns
+/// `DPNERR_BUFFERTOOSMALL`.
+fn dplay_write_raw_buffer(
+    memory: &mut MemoryImage,
+    buffer: u64,
+    size_ptr: u64,
+    data: &[u8],
+) -> u32 {
+    let available = if size_ptr != 0 {
+        read_u32(memory, size_ptr).unwrap_or(0)
+    } else {
+        u32::MAX
+    };
+    if size_ptr != 0 {
+        write_u32(memory, size_ptr, data.len() as u32);
+    }
+    if buffer == 0 || (size_ptr != 0 && available < data.len() as u32) {
+        return crate::dplay::DPNERR_BUFFERTOOSMALL;
+    }
+    if write_guest_bytes_checked(memory, buffer, data).is_err() {
+        return crate::dplay::DPNERR_INVALIDPOINTER;
+    }
+    S_OK
+}
+
+/// The same contract for a NUL-terminated UTF-16 string: the count is in
+/// characters including the terminator.
+fn dplay_write_utf16_buffer(
+    memory: &mut MemoryImage,
+    buffer: u64,
+    size_ptr: u64,
+    text: &str,
+) -> u32 {
+    let mut data = crate::dplay::encode_utf16_bytes(text);
+    data.extend_from_slice(&[0, 0]);
+    let required_chars = (data.len() / 2) as u32;
+    let available = if size_ptr != 0 {
+        read_u32(memory, size_ptr).unwrap_or(0)
+    } else {
+        u32::MAX
+    };
+    if size_ptr != 0 {
+        write_u32(memory, size_ptr, required_chars);
+    }
+    if buffer == 0 || (size_ptr != 0 && available < required_chars) {
+        return crate::dplay::DPNERR_BUFFERTOOSMALL;
+    }
+    if write_guest_bytes_checked(memory, buffer, &data).is_err() {
+        return crate::dplay::DPNERR_INVALIDPOINTER;
+    }
+    S_OK
+}
+
+/// The ANSI variant (count in bytes including the terminator).
+fn dplay_write_ansi_buffer(
+    memory: &mut MemoryImage,
+    buffer: u64,
+    size_ptr: u64,
+    text: &str,
+) -> u32 {
+    let mut data = text.as_bytes().to_vec();
+    data.push(0);
+    let available = if size_ptr != 0 {
+        read_u32(memory, size_ptr).unwrap_or(0)
+    } else {
+        u32::MAX
+    };
+    if size_ptr != 0 {
+        write_u32(memory, size_ptr, data.len() as u32);
+    }
+    if buffer == 0 || (size_ptr != 0 && available < data.len() as u32) {
+        return crate::dplay::DPNERR_BUFFERTOOSMALL;
+    }
+    if write_guest_bytes_checked(memory, buffer, &data).is_err() {
+        return crate::dplay::DPNERR_INVALIDPOINTER;
+    }
+    S_OK
+}
+
+/// Read a `DPN_APPLICATION_DESC` from guest memory (x86/x64 layouts).
+fn dplay_read_app_desc(
+    memory: &MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+) -> crate::dplay::DplayAppDesc {
+    let mut desc = crate::dplay::DplayAppDesc::default();
+    if address == 0 {
+        return desc;
+    }
+    let pointer_size = guest_arch.pointer_bytes() as u64;
+    desc.flags = read_u32(memory, address + 4).unwrap_or(0);
+    desc.instance_guid = dplay_riid(memory, address + 8);
+    desc.application_guid = dplay_riid(memory, address + 24);
+    desc.max_players = read_u32(memory, address + 40).unwrap_or(0);
+    desc.current_players = read_u32(memory, address + 44).unwrap_or(0);
+    let name_ptr = read_guest_pointer(memory, address + 48, guest_arch).unwrap_or(0);
+    desc.session_name = dplay_utf16_z(memory, name_ptr);
+    let password_ptr =
+        read_guest_pointer(memory, address + 48 + pointer_size, guest_arch).unwrap_or(0);
+    desc.password = dplay_utf16_z(memory, password_ptr);
+    desc
+}
+
+/// Write a `DPN_APPLICATION_DESC` into guest memory, returning the required
+/// struct size for the guest architecture.
+fn dplay_write_app_desc(
+    runtime: &mut PeHostRuntime,
+    memory: &mut MemoryImage,
+    address: u64,
+    desc: &crate::dplay::DplayAppDesc,
+) -> AppResult<u64> {
+    let pointer_size = runtime.guest_arch.pointer_bytes() as u64;
+    let size = dplay_align(48 + pointer_size * 3 + 4, pointer_size) + pointer_size + 4;
+    if address == 0 {
+        return Ok(size);
+    }
+    write_guest_bytes(memory, address, &vec![0u8; size as usize])?;
+    write_u32(memory, address, size as u32);
+    write_u32(memory, address + 4, desc.flags);
+    write_guest_bytes(memory, address + 8, &desc.instance_guid)?;
+    write_guest_bytes(memory, address + 24, &desc.application_guid)?;
+    write_u32(memory, address + 40, desc.max_players);
+    write_u32(memory, address + 44, desc.current_players);
+    let name = runtime.alloc_zeroed(memory, (desc.session_name.len() + 1) * 2, 2)?;
+    write_guest_bytes(
+        memory,
+        name,
+        &crate::dplay::encode_utf16_bytes(&desc.session_name),
+    )?;
+    write_guest_pointer(memory, address + 48, name, runtime.guest_arch)?;
+    let password = runtime.alloc_zeroed(memory, (desc.password.len() + 1) * 2, 2)?;
+    write_guest_bytes(
+        memory,
+        password,
+        &crate::dplay::encode_utf16_bytes(&desc.password),
+    )?;
+    write_guest_pointer(
+        memory,
+        address + 48 + pointer_size,
+        password,
+        runtime.guest_arch,
+    )?;
+    Ok(size)
+}
+
+impl PeHostRuntime {
+    /// The factory/enumeration entries of the DirectPlay surface.
+    pub(crate) fn dispatch_dplay_entry(
+        &mut self,
+        thunk: &HostThunk,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        match thunk {
+            HostThunk::DirectPlay8Create => {
+                let _clsid = guest_call_arg(state, memory, 0)?;
+                let iid = dplay_riid(memory, guest_call_arg(state, memory, 1)?);
+                let out = guest_call_arg(state, memory, 2)?;
+                if out == 0 {
+                    state.set(
+                        Register::Rax,
+                        u64::from(crate::dplay::DPNERR_INVALIDPOINTER),
+                    );
+                    return Ok(());
+                }
+                if iid != crate::dplay::IID_IDIRECTPLAY8_PEER && iid != crate::dplay::IID_IUNKNOWN {
+                    write_guest_pointer(memory, out, 0, self.guest_arch)?;
+                    state.set(Register::Rax, u64::from(crate::dplay::DPNERR_NOINTERFACE));
+                    return Ok(());
+                }
+                let object = self.dplay_create_object(
+                    memory,
+                    crate::dplay::IFACE_PEER,
+                    crate::dplay::DplayObject::Peer(crate::dplay::Dplay8Peer::new()),
+                )?;
+                write_guest_pointer(memory, out, object, self.guest_arch)?;
+                state.set(Register::Rax, u64::from(crate::dplay::S_OK));
+                self.last_error = 0;
+                Ok(())
+            }
+            HostThunk::DirectPlay8AddressCreate => {
+                let iid = dplay_riid(memory, guest_call_arg(state, memory, 0)?);
+                let out = guest_call_arg(state, memory, 1)?;
+                let outer = guest_call_arg(state, memory, 2)?;
+                if out == 0 {
+                    state.set(
+                        Register::Rax,
+                        u64::from(crate::dplay::DPNERR_INVALIDPOINTER),
+                    );
+                    return Ok(());
+                }
+                if outer != 0
+                    || (iid != crate::dplay::IID_IDIRECTPLAY8_ADDRESS
+                        && iid != crate::dplay::IID_IUNKNOWN)
+                {
+                    write_guest_pointer(memory, out, 0, self.guest_arch)?;
+                    state.set(Register::Rax, u64::from(crate::dplay::DPNERR_NOINTERFACE));
+                    return Ok(());
+                }
+                let object = self.dplay_create_address_object(memory)?;
+                write_guest_pointer(memory, out, object, self.guest_arch)?;
+                state.set(Register::Rax, u64::from(crate::dplay::S_OK));
+                self.last_error = 0;
+                Ok(())
+            }
+            HostThunk::DirectPlayCreate => {
+                let _guid = guest_call_arg(state, memory, 0)?;
+                let out = guest_call_arg(state, memory, 1)?;
+                let outer = guest_call_arg(state, memory, 2)?;
+                if out == 0 {
+                    state.set(
+                        Register::Rax,
+                        u64::from(crate::dplay::DPNERR_INVALIDPOINTER),
+                    );
+                    return Ok(());
+                }
+                if outer != 0 {
+                    write_guest_pointer(memory, out, 0, self.guest_arch)?;
+                    state.set(Register::Rax, u64::from(crate::dplay::DPNERR_NOINTERFACE));
+                    return Ok(());
+                }
+                let object = self.dplay_create_object(
+                    memory,
+                    crate::dplay::IFACE_LEGACY,
+                    crate::dplay::DplayObject::Legacy(crate::dplay::LegacyPeer::new()),
+                )?;
+                write_guest_pointer(memory, out, object, self.guest_arch)?;
+                state.set(Register::Rax, u64::from(crate::dplay::S_OK));
+                self.last_error = 0;
+                Ok(())
+            }
+            HostThunk::DirectPlayEnumerateW => {
+                let callback = guest_call_arg(state, memory, 0)?;
+                let context = guest_call_arg(state, memory, 1)?;
+                if callback == 0 {
+                    state.set(Register::Rax, u64::from(crate::dplay::DPNERR_INVALIDPARAM));
+                    return Ok(());
+                }
+                // The real TCP/IP service provider this engine speaks over.
+                if !self.dplay_emit_enum_connection(
+                    state,
+                    memory,
+                    callback,
+                    context,
+                    &crate::dplay::CLSID_DP8SP_TCPIP,
+                    "Internet TCP/IP Connection For DirectPlay",
+                    None,
+                )? {
+                    state.set(Register::Rax, u64::from(crate::dplay::S_OK));
+                    return Ok(());
+                }
+                // Every session this runtime currently hosts, with its real
+                // bound endpoint.
+                for session in crate::dplay::hosted_sessions() {
+                    if !self.dplay_emit_enum_connection(
+                        state,
+                        memory,
+                        callback,
+                        context,
+                        &session.instance_guid,
+                        &session.session_name,
+                        Some(session.address),
+                    )? {
+                        break;
+                    }
+                }
+                state.set(Register::Rax, u64::from(crate::dplay::S_OK));
+                self.last_error = 0;
+                Ok(())
+            }
+            HostThunk::Dp8spCreate => {
+                let out = guest_call_arg(state, memory, 1)?;
+                if out != 0 {
+                    write_guest_pointer(memory, out, 0, self.guest_arch)?;
+                }
+                state.set(Register::Rax, u64::from(DPLAY_CLASS_E_CLASSNOTAVAILABLE));
+                Ok(())
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcUnimplInsn,
+                format!("unrouted DirectPlay entry thunk {thunk:?}"),
+            )),
+        }
+    }
+
+    /// Invoke the guest enumeration callback with a real connection/session
+    /// description (`DirectPlayEnumerateW` callback contract).
+    #[allow(clippy::too_many_arguments)]
+    fn dplay_emit_enum_connection(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        callback: u64,
+        context: u64,
+        guid: &[u8; 16],
+        name: &str,
+        address: Option<std::net::SocketAddr>,
+    ) -> AppResult<bool> {
+        let guid_memory = self.alloc_zeroed(memory, 16, 4)?;
+        write_guest_bytes(memory, guid_memory, guid)?;
+        // A TCP/IP connection blob: the SOCKADDR_IN of the real endpoint.
+        let connection = self.alloc_zeroed(memory, 16, 4)?;
+        if let Some(address) = address {
+            write_u16(memory, connection, 2); // AF_INET
+            write_u16(memory, connection + 2, address.port().to_be());
+            if let std::net::IpAddr::V4(ip) = address.ip() {
+                write_guest_bytes(memory, connection + 4, &ip.octets())?;
+            }
+        }
+        let pointer_size = self.guest_arch.pointer_bytes() as u64;
+        let name_memory = self.alloc_zeroed(memory, (name.len() + 1) * 2, 2)?;
+        write_guest_bytes(memory, name_memory, &crate::dplay::encode_utf16_bytes(name))?;
+        let dname = self.alloc_zeroed(memory, (8 + pointer_size * 2) as usize, pointer_size)?;
+        write_u32(memory, dname, (8 + pointer_size * 2) as u32);
+        write_u32(memory, dname + 4, 0);
+        write_guest_pointer(memory, dname + 8, name_memory, self.guest_arch)?;
+        write_guest_pointer(
+            memory,
+            dname + 8 + pointer_size,
+            name_memory,
+            self.guest_arch,
+        )?;
+        let result = self.execute_guest_callback(
+            state,
+            memory,
+            callback,
+            &[guid_memory, connection, 16, dname, 0, context],
+            "DirectPlayEnumerateW",
+        )?;
+        Ok(result != 0)
+    }
+
+    /// Allocate one guest object with its interface vtable and register it in
+    /// the per-process DirectPlay store with reference count 1.  This entry
+    /// point takes the store lock; use [`Self::dplay_create_object_in`] when
+    /// a runtime borrow is already held (vtable dispatch holds it for the
+    /// whole method, and the store lock is not re-entrant).
+    fn dplay_create_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        interface: u8,
+        object: crate::dplay::DplayObject,
+    ) -> AppResult<u64> {
+        let pid = self.guest_pid;
+        let mut store = crate::dplay::lock_dplay_runtimes();
+        let runtime = store.entry(pid).or_default();
+        self.dplay_create_object_in(memory, runtime, interface, object)
+    }
+
+    /// The lock-free object constructor: the caller already holds the
+    /// per-process store borrow.
+    fn dplay_create_object_in(
+        &mut self,
+        memory: &mut MemoryImage,
+        runtime: &mut crate::dplay::DplayRuntime,
+        interface: u8,
+        object: crate::dplay::DplayObject,
+    ) -> AppResult<u64> {
+        let vtable = self.dplay_vtable_in(memory, runtime, interface)?;
+        let address = self.alloc_zeroed(memory, 0x20, 16)?;
+        write_u64(memory, address, vtable);
+        runtime.objects.insert(
+            address,
+            crate::dplay::DplayObjectEntry {
+                refcount: 1,
+                object,
+            },
+        );
+        Ok(address)
+    }
+
+    /// `CoCreateInstance(CLSID_DirectPlay8Address, ..., IID_IDirectPlay8Address)`.
+    pub(crate) fn dplay_create_address_object(
+        &mut self,
+        memory: &mut MemoryImage,
+    ) -> AppResult<u64> {
+        self.dplay_create_object(
+            memory,
+            crate::dplay::IFACE_ADDRESS,
+            crate::dplay::DplayObject::Address(crate::dplay::Dplay8Address::new()),
+        )
+    }
+
+    /// Allocate (once per runtime and interface) the guest vtable for a
+    /// DirectPlay interface; every slot is a `Dplay8Method` host thunk.
+    fn dplay_vtable_in(
+        &mut self,
+        memory: &mut MemoryImage,
+        runtime: &mut crate::dplay::DplayRuntime,
+        interface: u8,
+    ) -> AppResult<u64> {
+        if let Some(address) = runtime.vtables.get(&interface) {
+            return Ok(*address);
+        }
+        let methods = crate::dplay::interface_methods(interface);
+        let thunks = methods
+            .iter()
+            .map(|(method, x86_arg_words)| HostThunk::Dplay8Method {
+                interface,
+                method: *method,
+                x86_arg_bytes: x86_arg_words.saturating_mul(4),
+            })
+            .collect::<Vec<_>>();
+        let vtable = self.alloc_guest_vtable(memory, thunks)?;
+        runtime.vtables.insert(interface, vtable);
+        Ok(vtable)
+    }
+
+    /// Dispatch one `HostThunk::Dplay8Method` vtable slot.
+    pub(crate) fn dispatch_dplay8_method(
+        &mut self,
+        thunk: &HostThunk,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let HostThunk::Dplay8Method {
+            interface, method, ..
+        } = *thunk
+        else {
+            return Err(AppError::new(
+                ReasonCode::RcUnimplInsn,
+                "dispatch_dplay8_method called with a non-DirectPlay thunk".to_string(),
+            ));
+        };
+        let this = guest_call_arg(state, memory, 0)?;
+        let pid = self.guest_pid;
+        let result = {
+            let mut store = crate::dplay::lock_dplay_runtimes();
+            let runtime = store.entry(pid).or_default();
+            if !runtime.objects.contains_key(&this) {
+                crate::dplay::DPNERR_INVALIDPARAM
+            } else {
+                match method {
+                    0 => self.dplay_query_interface(runtime, state, memory, this, interface),
+                    1 => match runtime.objects.get_mut(&this) {
+                        Some(entry) => {
+                            entry.refcount = entry.refcount.saturating_add(1);
+                            entry.refcount
+                        }
+                        None => crate::dplay::DPNERR_INVALIDPARAM,
+                    },
+                    2 => self.dplay_release_object(runtime, this),
+                    _ => match interface {
+                        crate::dplay::IFACE_ADDRESS => {
+                            self.dplay_invoke_address(runtime, state, memory, this, method)
+                        }
+                        crate::dplay::IFACE_PEER => {
+                            self.dplay_invoke_peer(runtime, state, memory, this, method)
+                        }
+                        crate::dplay::IFACE_LEGACY => {
+                            self.dplay_invoke_legacy(runtime, state, memory, this, method)
+                        }
+                        _ => crate::dplay::DPNERR_INVALIDPARAM,
+                    },
+                }
+            }
+        };
+        state.set(Register::Rax, u64::from(result));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IUnknown::QueryInterface` for every DirectPlay object.
+    fn dplay_query_interface(
+        &mut self,
+        runtime: &mut crate::dplay::DplayRuntime,
+        state: &CpuState,
+        memory: &mut MemoryImage,
+        this: u64,
+        interface: u8,
+    ) -> u32 {
+        let riid = dplay_riid(memory, xact_arg(state, memory, 1).unwrap_or(0));
+        let out = xact_arg(state, memory, 2).unwrap_or(0);
+        if out == 0 {
+            return crate::dplay::DPNERR_INVALIDPOINTER;
+        }
+        let supported = match interface {
+            crate::dplay::IFACE_ADDRESS => {
+                riid == crate::dplay::IID_IDIRECTPLAY8_ADDRESS || riid == crate::dplay::IID_IUNKNOWN
+            }
+            crate::dplay::IFACE_PEER => {
+                riid == crate::dplay::IID_IDIRECTPLAY8_PEER || riid == crate::dplay::IID_IUNKNOWN
+            }
+            _ => riid == crate::dplay::IID_IUNKNOWN,
+        };
+        if supported {
+            if let Some(entry) = runtime.objects.get_mut(&this) {
+                entry.refcount = entry.refcount.saturating_add(1);
+            }
+            let _ = write_guest_pointer(memory, out, this, self.guest_arch);
+            crate::dplay::S_OK
+        } else {
+            let _ = write_guest_pointer(memory, out, 0, self.guest_arch);
+            crate::dplay::DPNERR_NOINTERFACE
+        }
+    }
+
+    /// `IUnknown::Release`: reaching zero drops the engine object (which
+    /// performs the real close/teardown for peers).
+    fn dplay_release_object(&mut self, runtime: &mut crate::dplay::DplayRuntime, this: u64) -> u32 {
+        let refcount = match runtime.objects.get_mut(&this) {
+            Some(entry) => {
+                entry.refcount = entry.refcount.saturating_sub(1);
+                entry.refcount
+            }
+            None => return crate::dplay::DPNERR_INVALIDPARAM,
+        };
+        if refcount == 0 {
+            runtime.objects.remove(&this);
+        }
+        refcount
+    }
+
+    /// The `IDirectPlay8Address` method set.
+    fn dplay_invoke_address(
+        &mut self,
+        runtime: &mut crate::dplay::DplayRuntime,
+        state: &CpuState,
+        memory: &mut MemoryImage,
+        this: u64,
+        method: u16,
+    ) -> u32 {
+        macro_rules! arg {
+            ($index:expr) => {
+                xact_arg(state, memory, $index).unwrap_or(0)
+            };
+        }
+        macro_rules! arg_u32 {
+            ($index:expr) => {
+                xact_arg_u32(state, memory, $index).unwrap_or(0)
+            };
+        }
+        match method {
+            3 => {
+                let url = dplay_utf16_z(memory, arg!(1));
+                match runtime.objects.get_mut(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => address.build_from_url(&url),
+                    _ => crate::dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            4 => {
+                let url = dplay_ansi_z(memory, arg!(1));
+                match runtime.objects.get_mut(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => address.build_from_url(&url),
+                    _ => crate::dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            5 => {
+                let out = arg!(1);
+                if out == 0 {
+                    return crate::dplay::DPNERR_INVALIDPOINTER;
+                }
+                let duplicate = match runtime.objects.get(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => address.duplicate(),
+                    _ => return crate::dplay::DPNERR_INVALIDPARAM,
+                };
+                match self.dplay_create_object_in(
+                    memory,
+                    runtime,
+                    crate::dplay::IFACE_ADDRESS,
+                    crate::dplay::DplayObject::Address(duplicate),
+                ) {
+                    Ok(object) => {
+                        let _ = write_guest_pointer(memory, out, object, self.guest_arch);
+                        crate::dplay::S_OK
+                    }
+                    Err(_) => crate::dplay::DPNERR_OUTOFMEMORY,
+                }
+            }
+            6 => {
+                let other = arg!(1);
+                let source = match runtime.objects.get(&other) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => address.clone(),
+                    _ => return crate::dplay::DPNERR_INVALIDPARAM,
+                };
+                match runtime.objects.get_mut(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => {
+                        address.set_equal(&source);
+                        crate::dplay::S_OK
+                    }
+                    _ => crate::dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            7 => {
+                let other = arg!(1);
+                let (left, right) = match (runtime.objects.get(&this), runtime.objects.get(&other))
+                {
+                    (
+                        Some(crate::dplay::DplayObjectEntry {
+                            object: crate::dplay::DplayObject::Address(left),
+                            ..
+                        }),
+                        Some(crate::dplay::DplayObjectEntry {
+                            object: crate::dplay::DplayObject::Address(right),
+                            ..
+                        }),
+                    ) => (left.clone(), right.clone()),
+                    _ => return crate::dplay::DPNERR_INVALIDPARAM,
+                };
+                if left.is_equal(&right) {
+                    crate::dplay::DPNSUCCESS_EQUAL
+                } else {
+                    crate::dplay::DPNSUCCESS_NOTEQUAL
+                }
+            }
+            8 => match runtime.objects.get_mut(&this) {
+                Some(crate::dplay::DplayObjectEntry {
+                    object: crate::dplay::DplayObject::Address(address),
+                    ..
+                }) => {
+                    address.clear();
+                    crate::dplay::S_OK
+                }
+                _ => crate::dplay::DPNERR_INVALIDPARAM,
+            },
+            9 | 10 => {
+                let url = match runtime.objects.get(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => address.url(),
+                    _ => return crate::dplay::DPNERR_INVALIDPARAM,
+                };
+                if method == 9 {
+                    dplay_write_utf16_buffer(memory, arg!(1), arg!(2), &url)
+                } else {
+                    dplay_write_ansi_buffer(memory, arg!(1), arg!(2), &url)
+                }
+            }
+            11 | 19 => {
+                let guid = match runtime.objects.get(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => {
+                        if method == 11 {
+                            address.get_sp()
+                        } else {
+                            address.get_device()
+                        }
+                    }
+                    _ => return crate::dplay::DPNERR_INVALIDPARAM,
+                };
+                match guid {
+                    Some(guid) => {
+                        let _ = write_guest_bytes_checked(memory, arg!(1), &guid);
+                        crate::dplay::S_OK
+                    }
+                    None => crate::dplay::DPNERR_DOESNOTEXIST,
+                }
+            }
+            12 => {
+                let data = match runtime.objects.get(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => address.user_data().to_vec(),
+                    _ => return crate::dplay::DPNERR_INVALIDPARAM,
+                };
+                dplay_write_raw_buffer(memory, arg!(1), arg!(2), &data)
+            }
+            13 | 20 => {
+                let guid = dplay_riid(memory, arg!(1));
+                match runtime.objects.get_mut(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => {
+                        if method == 13 {
+                            address.set_sp(&guid)
+                        } else {
+                            address.set_device(&guid)
+                        }
+                    }
+                    _ => crate::dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            14 => {
+                let size = arg_u32!(2) as usize;
+                let data = read_guest_bytes(memory, arg!(1), size).unwrap_or_default();
+                match runtime.objects.get_mut(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => {
+                        address.set_user_data(&data);
+                        crate::dplay::S_OK
+                    }
+                    _ => crate::dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            15 => {
+                let count = match runtime.objects.get(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => address.num_components(),
+                    _ => return crate::dplay::DPNERR_INVALIDPARAM,
+                };
+                write_u32(memory, arg!(1), count);
+                crate::dplay::S_OK
+            }
+            16 => {
+                let name = dplay_utf16_z(memory, arg!(1));
+                let component = match runtime.objects.get(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => address.component(&name).cloned(),
+                    _ => return crate::dplay::DPNERR_INVALIDPARAM,
+                };
+                match component {
+                    Some(component) => {
+                        write_u32(memory, arg!(4), component.data_type);
+                        dplay_write_raw_buffer(memory, arg!(2), arg!(3), &component.data)
+                    }
+                    None => crate::dplay::DPNERR_DOESNOTEXIST,
+                }
+            }
+            17 => {
+                let index = arg_u32!(1);
+                let component = match runtime.objects.get(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => address
+                        .component_at(index)
+                        .map(|(name, component)| (name.to_string(), component.clone())),
+                    _ => return crate::dplay::DPNERR_INVALIDPARAM,
+                };
+                match component {
+                    Some((name, component)) => {
+                        let name_result = dplay_write_utf16_buffer(memory, arg!(2), arg!(3), &name);
+                        let data_result =
+                            dplay_write_raw_buffer(memory, arg!(4), arg!(5), &component.data);
+                        write_u32(memory, arg!(6), component.data_type);
+                        if name_result != crate::dplay::S_OK {
+                            name_result
+                        } else {
+                            data_result
+                        }
+                    }
+                    None => crate::dplay::DPNERR_DOESNOTEXIST,
+                }
+            }
+            18 => {
+                let name = dplay_utf16_z(memory, arg!(1));
+                let size = arg_u32!(3) as usize;
+                let data = read_guest_bytes(memory, arg!(2), size).unwrap_or_default();
+                let data_type = arg_u32!(4);
+                match runtime.objects.get_mut(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => address.add_component(&name, data_type, &data),
+                    _ => crate::dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            // BuildFromDirectPlay4Address: the legacy DPADDRESS blob format
+            // is not modeled; this is a documented gap.
+            21 => crate::dplay::DPNERR_UNSUPPORTED,
+            _ => crate::dplay::DPNERR_INVALIDPARAM,
+        }
+    }
+}
+
+impl PeHostRuntime {
+    /// The `IDirectPlay8Peer` method set.
+    fn dplay_invoke_peer(
+        &mut self,
+        runtime: &mut crate::dplay::DplayRuntime,
+        state: &CpuState,
+        memory: &mut MemoryImage,
+        this: u64,
+        method: u16,
+    ) -> u32 {
+        use crate::dplay;
+        let pointer_size = self.guest_arch.pointer_bytes() as u64;
+        macro_rules! arg {
+            ($index:expr) => {
+                xact_arg(state, memory, $index).unwrap_or(0)
+            };
+        }
+        macro_rules! arg_u32 {
+            ($index:expr) => {
+                xact_arg_u32(state, memory, $index).unwrap_or(0)
+            };
+        }
+        match method {
+            3 => {
+                let context = arg!(1);
+                let handler = arg!(2);
+                let flags = arg_u32!(3);
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.initialize(context, handler, flags),
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            4 => {
+                // One real provider: the TCP/IP transport this engine speaks.
+                let buffer = arg!(3);
+                let data_size_ptr = arg!(4);
+                let returned_ptr = arg!(5);
+                let entry_size: u32 = if pointer_size == 4 { 32 } else { 48 };
+                let available = if data_size_ptr != 0 {
+                    read_u32(memory, data_size_ptr).unwrap_or(0)
+                } else {
+                    u32::MAX
+                };
+                if data_size_ptr != 0 {
+                    write_u32(memory, data_size_ptr, entry_size);
+                }
+                let room = buffer != 0 && available >= entry_size;
+                if returned_ptr != 0 {
+                    write_u32(memory, returned_ptr, u32::from(room));
+                }
+                if !room {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                let name = match self.alloc_zeroed(memory, 80, 2) {
+                    Ok(name) => name,
+                    Err(_) => return dplay::DPNERR_OUTOFMEMORY,
+                };
+                let label = "Internet TCP/IP Connection For DirectPlay";
+                if write_guest_bytes(memory, name, &dplay::encode_utf16_bytes(label)).is_err() {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                let name_ptr_offset = if pointer_size == 4 { 20 } else { 24 };
+                let tail = if pointer_size == 4 { 24 } else { 32 };
+                let _ = write_guest_bytes_checked(memory, buffer, &vec![0u8; entry_size as usize]);
+                let _ = write_guest_bytes_checked(memory, buffer + 4, &dplay::CLSID_DP8SP_TCPIP);
+                let _ =
+                    write_guest_pointer(memory, buffer + name_ptr_offset, name, self.guest_arch);
+                let _ = write_guest_pointer(memory, buffer + tail, 0, self.guest_arch);
+                let _ =
+                    write_guest_pointer(memory, buffer + tail + pointer_size, 0, self.guest_arch);
+                dplay::S_OK
+            }
+            5 => dplay::DPNERR_INVALIDHANDLE,
+            6 => {
+                // Connect(app, host, device, security, creds, data, size,
+                //         playerContext, asyncContext, phAsync, flags).
+                let host_object = arg!(2);
+                let player_context = arg!(8);
+                let flags = arg_u32!(11);
+                let target = match runtime.objects.get(&host_object) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Address(address),
+                        ..
+                    }) => address.socket_addr(),
+                    _ => return dplay::DPNERR_INVALIDHOSTADDRESS,
+                };
+                let Some(target) = target else {
+                    return dplay::DPNERR_INVALIDHOSTADDRESS;
+                };
+                if target.port() == 0 {
+                    return dplay::DPNERR_INCOMPLETEADDRESS;
+                }
+                let name = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.local_player_name().to_string(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let name = if name.is_empty() {
+                    "DirectPlay8 Peer".to_string()
+                } else {
+                    name
+                };
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => {
+                        let result = peer.connect(target, &name, &[]);
+                        if result != dplay::S_OK {
+                            return result;
+                        }
+                        peer.set_local_context(player_context);
+                    }
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                }
+                if flags & dplay::DPNOP_SYNC != 0 {
+                    dplay::S_OK
+                } else {
+                    runtime
+                        .pending
+                        .push_back(dplay::DplayEvent::ConnectComplete {
+                            async_op: 1,
+                            context: player_context,
+                            result: dplay::S_OK,
+                            dpnid: match runtime.objects.get(&this) {
+                                Some(dplay::DplayObjectEntry {
+                                    object: dplay::DplayObject::Peer(peer),
+                                    ..
+                                }) => peer.local_dpnid(),
+                                _ => 0,
+                            },
+                        });
+                    dplay::DPNERR_PENDING
+                }
+            }
+            7 => {
+                // SendTo(dpnid, buffers, count, timeout, async, phAsync, flags).
+                let dpnid = arg_u32!(1);
+                let buffers = arg!(2);
+                let count = arg_u32!(3).min(64);
+                let flags = arg_u32!(7);
+                let stride = pointer_size * 2;
+                let mut payload = Vec::new();
+                for index in 0..count {
+                    let base = buffers + u64::from(index) * stride;
+                    let size = read_u32(memory, base).unwrap_or(0) as usize;
+                    let pointer = read_guest_pointer(memory, base + pointer_size, self.guest_arch)
+                        .unwrap_or(0);
+                    if size == 0 {
+                        continue;
+                    }
+                    match read_guest_bytes(memory, pointer, size) {
+                        Ok(bytes) => payload.extend_from_slice(&bytes),
+                        Err(_) => return dplay::DPNERR_INVALIDPOINTER,
+                    }
+                    if payload.len() > dplay::MAX_MESSAGE_PAYLOAD {
+                        return dplay::DPNERR_DATATOOLARGE;
+                    }
+                }
+                let result = match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.send_to(dpnid, &payload),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                if result != dplay::S_OK {
+                    return result;
+                }
+                if flags & dplay::DPNOP_SYNC != 0 {
+                    dplay::S_OK
+                } else {
+                    runtime.pending.push_back(dplay::DplayEvent::SendComplete {
+                        async_op: 1,
+                        context: arg!(5),
+                        result: dplay::S_OK,
+                    });
+                    dplay::DPNERR_PENDING
+                }
+            }
+            8 => {
+                let (messages, bytes) = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.send_queue(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                if arg!(2) != 0 {
+                    write_u32(memory, arg!(2), messages);
+                }
+                if arg!(3) != 0 {
+                    write_u32(memory, arg!(3), bytes);
+                }
+                dplay::S_OK
+            }
+            9 => {
+                // Host(app, devices, count, security, creds, context, flags).
+                let desc = dplay_read_app_desc(memory, arg!(1), self.guest_arch);
+                let devices = arg!(2);
+                let count = arg_u32!(3);
+                let local_context = arg!(6);
+                let mut bind = std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    0,
+                );
+                if count > 0 && devices != 0 {
+                    let first = read_guest_pointer(memory, devices, self.guest_arch).unwrap_or(0);
+                    if let Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Address(address),
+                        ..
+                    }) = runtime.objects.get(&first)
+                    {
+                        if let Some(address) = address.socket_addr() {
+                            bind = address;
+                        }
+                    }
+                }
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => {
+                        let result = peer.host(&desc, bind);
+                        if result != dplay::S_OK {
+                            return result;
+                        }
+                        peer.set_local_context(local_context);
+                    }
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                }
+                runtime.pending.push_back(dplay::DplayEvent::CreatePlayer {
+                    dpnid: dplay::HOST_PLAYER_ID,
+                    context: local_context,
+                });
+                dplay::S_OK
+            }
+            10 => {
+                let desc = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.app_desc().clone(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                match dplay_write_app_desc(self, memory, arg!(1), &desc) {
+                    Ok(size) => {
+                        let buffer = arg!(1);
+                        let size_ptr = arg!(2);
+                        if buffer == 0 {
+                            if size_ptr != 0 {
+                                write_u32(memory, size_ptr, size as u32);
+                            }
+                            dplay::DPNERR_BUFFERTOOSMALL
+                        } else {
+                            let available = if size_ptr != 0 {
+                                read_u32(memory, size_ptr).unwrap_or(0)
+                            } else {
+                                u32::MAX
+                            };
+                            if size_ptr != 0 {
+                                write_u32(memory, size_ptr, size as u32);
+                            }
+                            if available < size as u32 {
+                                dplay::DPNERR_BUFFERTOOSMALL
+                            } else {
+                                dplay::S_OK
+                            }
+                        }
+                    }
+                    Err(_) => dplay::DPNERR_OUTOFMEMORY,
+                }
+            }
+            11 => {
+                let desc = dplay_read_app_desc(memory, arg!(1), self.guest_arch);
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => {
+                        peer.set_app_desc(desc);
+                        dplay::S_OK
+                    }
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            12 => {
+                let name = dplay_utf16_z(
+                    memory,
+                    read_guest_pointer(memory, arg!(1) + 8, self.guest_arch).unwrap_or(0),
+                );
+                let data_size = read_u32(memory, arg!(1) + 8 + 2 * pointer_size).unwrap_or(0);
+                let data_ptr =
+                    read_guest_pointer(memory, arg!(1) + 8 + pointer_size, self.guest_arch)
+                        .unwrap_or(0);
+                let data =
+                    read_guest_bytes(memory, data_ptr, data_size as usize).unwrap_or_default();
+                let owner = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.local_dpnid(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => match peer.create_group(&name, owner, &data) {
+                        Ok(group_id) => {
+                            if arg!(4) != 0 {
+                                write_u32(memory, arg!(4), 1);
+                            }
+                            let _ = group_id;
+                            dplay::S_OK
+                        }
+                        Err(error) => error,
+                    },
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            13 => match runtime.objects.get_mut(&this) {
+                Some(dplay::DplayObjectEntry {
+                    object: dplay::DplayObject::Peer(peer),
+                    ..
+                }) => peer.destroy_group(arg_u32!(1)),
+                _ => dplay::DPNERR_INVALIDPARAM,
+            },
+            14 => match runtime.objects.get_mut(&this) {
+                Some(dplay::DplayObjectEntry {
+                    object: dplay::DplayObject::Peer(peer),
+                    ..
+                }) => peer.add_player_to_group(arg_u32!(1), arg_u32!(2)),
+                _ => dplay::DPNERR_INVALIDPARAM,
+            },
+            15 => match runtime.objects.get_mut(&this) {
+                Some(dplay::DplayObjectEntry {
+                    object: dplay::DplayObject::Peer(peer),
+                    ..
+                }) => peer.remove_player_from_group(arg_u32!(1), arg_u32!(2)),
+                _ => dplay::DPNERR_INVALIDPARAM,
+            },
+            16 => {
+                let name = dplay_utf16_z(
+                    memory,
+                    read_guest_pointer(memory, arg!(2) + 8, self.guest_arch).unwrap_or(0),
+                );
+                let data_size = read_u32(memory, arg!(2) + 8 + 2 * pointer_size).unwrap_or(0);
+                let data_ptr =
+                    read_guest_pointer(memory, arg!(2) + 8 + pointer_size, self.guest_arch)
+                        .unwrap_or(0);
+                let data =
+                    read_guest_bytes(memory, data_ptr, data_size as usize).unwrap_or_default();
+                let group_id = arg_u32!(1);
+                match runtime
+                    .objects
+                    .get_mut(&this)
+                    .and_then(|entry| match &mut entry.object {
+                        dplay::DplayObject::Peer(peer) => peer.group(group_id).cloned(),
+                        _ => None,
+                    }) {
+                    Some(group) => {
+                        let _ = (group, name, data);
+                        dplay::DPNERR_UNSUPPORTED
+                    }
+                    None => dplay::DPNERR_INVALIDGROUP,
+                }
+            }
+            17 => {
+                let group_id = arg_u32!(1);
+                let group = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.group(group_id).cloned(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let Some(group) = group else {
+                    return dplay::DPNERR_INVALIDGROUP;
+                };
+                let base = arg!(2);
+                let size_ptr = arg!(3);
+                let name = group.name.clone();
+                let required = (8 + 4 * pointer_size) as u32 + (name.len() as u32 + 1) * 2;
+                if size_ptr != 0 {
+                    write_u32(memory, size_ptr, required);
+                }
+                if base == 0 {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                let available = if size_ptr != 0 {
+                    read_u32(memory, size_ptr).unwrap_or(0)
+                } else {
+                    u32::MAX
+                };
+                if available < required {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                let _ = write_guest_bytes_checked(memory, base, &vec![0u8; required as usize]);
+                write_u32(memory, base, required);
+                write_u32(memory, base + 4, dplay::DPNINFO_NAME);
+                let name_memory = base + 8 + 4 * pointer_size;
+                let _ = write_guest_bytes_checked(
+                    memory,
+                    name_memory,
+                    &dplay::encode_utf16_bytes(&name),
+                );
+                let _ = write_guest_pointer(memory, base + 8, name_memory, self.guest_arch);
+                write_u32(memory, base + 8 + 2 * pointer_size, 0);
+                dplay::S_OK
+            }
+            18 => {
+                let mut ids: Vec<u32> = Vec::new();
+                if let Some(dplay::DplayObjectEntry {
+                    object: dplay::DplayObject::Peer(peer),
+                    ..
+                }) = runtime.objects.get(&this)
+                {
+                    if arg_u32!(3) & 0x0001 != 0 {
+                        ids.extend(peer.players().iter().map(|player| player.dpnid));
+                    }
+                    if arg_u32!(3) & 0x0010 != 0 {
+                        ids.extend(peer.groups().map(|group| group.group_id));
+                    }
+                }
+                let buffer = arg!(1);
+                let count_ptr = arg!(2);
+                let required = ids.len() as u32;
+                let available = if count_ptr != 0 {
+                    read_u32(memory, count_ptr).unwrap_or(0)
+                } else {
+                    u32::MAX
+                };
+                if count_ptr != 0 {
+                    write_u32(memory, count_ptr, required);
+                }
+                if buffer == 0 || available < required {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                for (index, id) in ids.iter().enumerate() {
+                    write_u32(memory, buffer + index as u64 * 4, *id);
+                }
+                dplay::S_OK
+            }
+            19 => {
+                let group = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.group(arg_u32!(1)).cloned(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let Some(group) = group else {
+                    return dplay::DPNERR_INVALIDGROUP;
+                };
+                let members: Vec<u32> = group.members.iter().copied().collect();
+                let buffer = arg!(2);
+                let count_ptr = arg!(3);
+                let required = members.len() as u32;
+                let available = if count_ptr != 0 {
+                    read_u32(memory, count_ptr).unwrap_or(0)
+                } else {
+                    u32::MAX
+                };
+                if count_ptr != 0 {
+                    write_u32(memory, count_ptr, required);
+                }
+                if buffer == 0 || available < required {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                for (index, id) in members.iter().enumerate() {
+                    write_u32(memory, buffer + index as u64 * 4, *id);
+                }
+                dplay::S_OK
+            }
+            20 => {
+                let info = arg!(1);
+                let name = dplay_utf16_z(
+                    memory,
+                    read_guest_pointer(memory, info + 8, self.guest_arch).unwrap_or(0),
+                );
+                let data_size = read_u32(memory, info + 8 + 2 * pointer_size).unwrap_or(0);
+                let data_ptr = read_guest_pointer(memory, info + 8 + pointer_size, self.guest_arch)
+                    .unwrap_or(0);
+                let data =
+                    read_guest_bytes(memory, data_ptr, data_size as usize).unwrap_or_default();
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => {
+                        peer.set_local_player_name(&name);
+                        peer.set_local_player_data(&data);
+                        dplay::S_OK
+                    }
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            21 => {
+                let dpnid = arg_u32!(1);
+                let info = arg!(2);
+                let size_ptr = arg!(3);
+                let (name, data, is_local) = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => {
+                        let local = dpnid == peer.local_dpnid();
+                        let name = if local {
+                            peer.local_player_name().to_string()
+                        } else {
+                            peer.players()
+                                .into_iter()
+                                .find(|player| player.dpnid == dpnid)
+                                .map(|player| player.name)
+                                .unwrap_or_default()
+                        };
+                        let data = if local {
+                            peer.local_player_data().to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        (name, data, local)
+                    }
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                if !is_local {
+                    let exists = matches!(
+                        runtime.objects.get(&this),
+                        Some(dplay::DplayObjectEntry {
+                            object: dplay::DplayObject::Peer(peer),
+                            ..
+                        }) if peer.player_exists(dpnid)
+                    );
+                    if !exists {
+                        return dplay::DPNERR_INVALIDPLAYER;
+                    }
+                }
+                let base_size = (8 + 4 * pointer_size) as u32;
+                let required = base_size + (name.len() as u32 + 1) * 2 + data.len() as u32;
+                if size_ptr != 0 {
+                    write_u32(memory, size_ptr, required);
+                }
+                if info == 0 {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                let available = if size_ptr != 0 {
+                    read_u32(memory, size_ptr).unwrap_or(0)
+                } else {
+                    u32::MAX
+                };
+                if available < required {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                let _ = write_guest_bytes_checked(memory, info, &vec![0u8; required as usize]);
+                write_u32(memory, info, required);
+                write_u32(memory, info + 4, dplay::DPNINFO_NAME | dplay::DPNINFO_DATA);
+                let name_memory = info + base_size as u64;
+                let _ = write_guest_bytes_checked(
+                    memory,
+                    name_memory,
+                    &dplay::encode_utf16_bytes(&name),
+                );
+                let _ = write_guest_pointer(memory, info + 8, name_memory, self.guest_arch);
+                let data_memory = name_memory + (name.len() as u64 + 1) * 2;
+                let _ = write_guest_bytes_checked(memory, data_memory, &data);
+                let _ = write_guest_pointer(
+                    memory,
+                    info + 8 + pointer_size,
+                    data_memory,
+                    self.guest_arch,
+                );
+                write_u32(memory, info + 8 + 2 * pointer_size, data.len() as u32);
+                dplay::S_OK
+            }
+            22 => {
+                let dpnid = arg_u32!(1);
+                let out = arg!(2);
+                if out == 0 {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                let addr = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer
+                        .players()
+                        .into_iter()
+                        .find(|player| player.dpnid == dpnid)
+                        .map(|player| player.addr),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let Some(addr) = addr else {
+                    return dplay::DPNERR_INVALIDPLAYER;
+                };
+                match self.dplay_create_address_for(memory, runtime, addr) {
+                    Ok(object) => {
+                        let _ = write_guest_pointer(memory, out, object, self.guest_arch);
+                        dplay::S_OK
+                    }
+                    Err(_) => dplay::DPNERR_OUTOFMEMORY,
+                }
+            }
+            23 => {
+                let array = arg!(1);
+                let count_ptr = arg!(2);
+                let local = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.local_address(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let required = u32::from(local.is_some());
+                let available = if count_ptr != 0 {
+                    read_u32(memory, count_ptr).unwrap_or(0)
+                } else {
+                    u32::MAX
+                };
+                if count_ptr != 0 {
+                    write_u32(memory, count_ptr, required);
+                }
+                if array == 0 || available < required {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                if let Some(addr) = local {
+                    match self.dplay_create_address_for(memory, runtime, addr) {
+                        Ok(object) => {
+                            let _ = write_guest_pointer(memory, array, object, self.guest_arch);
+                        }
+                        Err(_) => return dplay::DPNERR_OUTOFMEMORY,
+                    }
+                }
+                dplay::S_OK
+            }
+            24 => match runtime.objects.get_mut(&this) {
+                Some(dplay::DplayObjectEntry {
+                    object: dplay::DplayObject::Peer(peer),
+                    ..
+                }) => peer.close(),
+                _ => dplay::DPNERR_INVALIDPARAM,
+            },
+            25 => {
+                // EnumHosts(app, hostAddr, device, data, size, count, retry,
+                //           timeout, userContext, phAsync, flags).
+                let host_object = arg!(2);
+                let targets = match runtime.objects.get(&host_object) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Address(address),
+                        ..
+                    }) => match address.socket_addr() {
+                        Some(address) => vec![address],
+                        None => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                let timeout_ms = arg_u32!(8);
+                let timeout = if timeout_ms == 0 {
+                    Duration::from_millis(u64::from(dplay::DEFAULT_ENUM_TIMEOUT_MS))
+                } else {
+                    Duration::from_millis(u64::from(timeout_ms))
+                };
+                let context = arg!(9);
+                let application_guid =
+                    dplay_read_app_desc(memory, arg!(1), self.guest_arch).application_guid;
+                let results = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.enum_hosts(&application_guid, &targets, timeout),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                for session in results {
+                    runtime
+                        .pending
+                        .push_back(dplay::DplayEvent::EnumHostsResponse { context, session });
+                }
+                dplay::S_OK
+            }
+            26 => {
+                let data_size = arg_u32!(3) as usize;
+                let data = read_guest_bytes(memory, arg!(2), data_size).unwrap_or_default();
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.destroy_player(arg_u32!(1), &data),
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            27 => dplay::S_OK,
+            28 => {
+                let dpnid = arg_u32!(1);
+                let out = arg!(2);
+                let context = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) if dpnid == peer.local_dpnid() => peer.local_context(),
+                    Some(_) => 0,
+                    None => return dplay::DPNERR_INVALIDPARAM,
+                };
+                if context == 0 {
+                    return dplay::DPNERR_INVALIDPLAYER;
+                }
+                if out != 0 {
+                    let _ = write_guest_pointer(memory, out, context, self.guest_arch);
+                }
+                dplay::S_OK
+            }
+            29 => dplay::DPNERR_UNSUPPORTED,
+            30 => {
+                let caps = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.caps(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let base = arg!(1);
+                if base == 0 {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                let _ = write_guest_bytes_checked(memory, base, &vec![0u8; 20]);
+                write_u32(memory, base, 20);
+                write_u32(memory, base + 4, caps.flags);
+                write_u32(memory, base + 8, caps.connect_timeout_ms);
+                write_u32(memory, base + 12, caps.connect_retries);
+                write_u32(memory, base + 16, caps.timeout_until_keep_alive_ms);
+                dplay::S_OK
+            }
+            31 => {
+                let base = arg!(1);
+                if base == 0 {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                let caps = dplay::DplayCaps {
+                    flags: read_u32(memory, base + 4).unwrap_or(0),
+                    connect_timeout_ms: read_u32(memory, base + 8).unwrap_or(0),
+                    connect_retries: read_u32(memory, base + 12).unwrap_or(0),
+                    timeout_until_keep_alive_ms: read_u32(memory, base + 16).unwrap_or(0),
+                };
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.set_caps(&caps),
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            32 => {
+                let base = arg!(2);
+                if base == 0 {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                let caps = dplay::DplaySpCaps {
+                    flags: read_u32(memory, base + 4).unwrap_or(0),
+                    num_threads: read_u32(memory, base + 8).unwrap_or(0),
+                    default_enum_count: read_u32(memory, base + 12).unwrap_or(0),
+                    default_enum_retry_interval_ms: read_u32(memory, base + 16).unwrap_or(0),
+                    default_enum_timeout_ms: read_u32(memory, base + 20).unwrap_or(0),
+                    max_enum_payload_size: read_u32(memory, base + 24).unwrap_or(0),
+                    buffers_per_thread: read_u32(memory, base + 28).unwrap_or(0),
+                    system_buffer_size: read_u32(memory, base + 32).unwrap_or(0),
+                };
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.set_sp_caps(&caps),
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            33 => {
+                let caps = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.sp_caps(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let base = arg!(2);
+                if base == 0 {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                let _ = write_guest_bytes_checked(memory, base, &vec![0u8; 36]);
+                write_u32(memory, base, 36);
+                write_u32(memory, base + 4, caps.flags);
+                write_u32(memory, base + 8, caps.num_threads);
+                write_u32(memory, base + 12, caps.default_enum_count);
+                write_u32(memory, base + 16, caps.default_enum_retry_interval_ms);
+                write_u32(memory, base + 20, caps.default_enum_timeout_ms);
+                write_u32(memory, base + 24, caps.max_enum_payload_size);
+                write_u32(memory, base + 28, caps.buffers_per_thread);
+                write_u32(memory, base + 32, caps.system_buffer_size);
+                dplay::S_OK
+            }
+            34 => {
+                let info = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.connection_info(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let base = arg!(2);
+                if base == 0 {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                let _ = write_guest_bytes_checked(memory, base, &vec![0u8; 92]);
+                write_u32(memory, base, 92);
+                write_u32(memory, base + 4, info.round_trip_latency_ms);
+                write_u32(
+                    memory,
+                    base + 8,
+                    info.bytes_sent.min(u64::from(u32::MAX)) as u32,
+                );
+                write_u32(
+                    memory,
+                    base + 12,
+                    info.packets_sent.min(u64::from(u32::MAX)) as u32,
+                );
+                write_u32(
+                    memory,
+                    base + 16,
+                    info.bytes_received.min(u64::from(u32::MAX)) as u32,
+                );
+                write_u32(
+                    memory,
+                    base + 20,
+                    info.packets_received.min(u64::from(u32::MAX)) as u32,
+                );
+                write_u32(
+                    memory,
+                    base + 84,
+                    info.messages_received.min(u64::from(u32::MAX)) as u32,
+                );
+                dplay::S_OK
+            }
+            35 => dplay::DPNERR_UNSUPPORTED,
+            36 => match runtime.objects.get_mut(&this) {
+                Some(dplay::DplayObjectEntry {
+                    object: dplay::DplayObject::Peer(peer),
+                    ..
+                }) => {
+                    let reason = peer.close();
+                    runtime
+                        .pending
+                        .push_back(dplay::DplayEvent::TerminateSession {
+                            result: reason,
+                            data: Vec::new(),
+                        });
+                    dplay::S_OK
+                }
+                _ => dplay::DPNERR_INVALIDPARAM,
+            },
+            _ => dplay::DPNERR_INVALIDPARAM,
+        }
+    }
+
+    /// Build a real address object for a live socket address.  The caller
+    /// already holds the per-process store borrow from vtable dispatch.
+    fn dplay_create_address_for(
+        &mut self,
+        memory: &mut MemoryImage,
+        runtime: &mut crate::dplay::DplayRuntime,
+        addr: std::net::SocketAddr,
+    ) -> AppResult<u64> {
+        let mut address = crate::dplay::Dplay8Address::new();
+        let _ = address.set_hostname(&addr.ip().to_string());
+        let _ = address.set_port(addr.port());
+        let _ = address.set_sp(&crate::dplay::CLSID_DP8SP_TCPIP);
+        self.dplay_create_object_in(
+            memory,
+            runtime,
+            crate::dplay::IFACE_ADDRESS,
+            crate::dplay::DplayObject::Address(address),
+        )
+    }
+}
+
+impl PeHostRuntime {
+    /// The legacy `IDirectPlay4` method subset, backed by the same engine.
+    fn dplay_invoke_legacy(
+        &mut self,
+        runtime: &mut crate::dplay::DplayRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        this: u64,
+        method: u16,
+    ) -> u32 {
+        use crate::dplay;
+        /// `DPERR_NOMESSAGES` (`MAKE_HRESULT(1, _FACDP, 190)`).
+        const DPERR_NOMESSAGES: u32 = 0x8015_00be;
+        const DPSESSION_NEWGAME: u32 = 0x0000_0001;
+        let pointer_size = self.guest_arch.pointer_bytes() as u64;
+        macro_rules! arg {
+            ($index:expr) => {
+                xact_arg(state, memory, $index).unwrap_or(0)
+            };
+        }
+        macro_rules! arg_u32 {
+            ($index:expr) => {
+                xact_arg_u32(state, memory, $index).unwrap_or(0)
+            };
+        }
+        match method {
+            3 | 5 | 7 | 8 | 10 | 11 | 15 | 16 | 17 | 27 | 28 | 32 | 33 | 34 | 35 | 36 | 37 | 38
+            | 39 | 40 | 41 | 42 | 43 | 44 | 45 | 46 | 47 | 48 | 49 | 50 | 51 | 52 => {
+                dplay::DPNERR_UNSUPPORTED
+            }
+            4 => match runtime.objects.get_mut(&this) {
+                Some(dplay::DplayObjectEntry {
+                    object: dplay::DplayObject::Legacy(legacy),
+                    ..
+                }) => legacy.close(),
+                _ => dplay::DPNERR_INVALIDPARAM,
+            },
+            6 => {
+                let out = arg!(1);
+                let name = dplay_utf16_z(
+                    memory,
+                    read_guest_pointer(memory, arg!(2) + 8, self.guest_arch).unwrap_or(0),
+                );
+                if out == 0 {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Legacy(legacy),
+                        ..
+                    }) => match legacy.create_player(&name) {
+                        Ok(player_id) => {
+                            write_u32(memory, out, player_id);
+                            dplay::S_OK
+                        }
+                        Err(error) => error,
+                    },
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            9 => match runtime.objects.get_mut(&this) {
+                Some(dplay::DplayObjectEntry {
+                    object: dplay::DplayObject::Legacy(legacy),
+                    ..
+                }) => legacy.destroy_player(arg_u32!(1)),
+                _ => dplay::DPNERR_INVALIDPARAM,
+            },
+            12 => {
+                let callback = arg!(2);
+                let context = arg!(3);
+                if callback == 0 {
+                    return dplay::DPNERR_INVALIDPARAM;
+                }
+                let players = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Legacy(legacy),
+                        ..
+                    }) => legacy.peer.players(),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                for player in players {
+                    let name_memory =
+                        match self.alloc_zeroed(memory, (player.name.len() + 1) * 2, 2) {
+                            Ok(address) => address,
+                            Err(_) => return dplay::DPNERR_OUTOFMEMORY,
+                        };
+                    if write_guest_bytes(
+                        memory,
+                        name_memory,
+                        &dplay::encode_utf16_bytes(&player.name),
+                    )
+                    .is_err()
+                    {
+                        return dplay::DPNERR_INVALIDPARAM;
+                    }
+                    let dname = match self.alloc_zeroed(
+                        memory,
+                        (8 + pointer_size * 2) as usize,
+                        pointer_size,
+                    ) {
+                        Ok(address) => address,
+                        Err(_) => return dplay::DPNERR_OUTOFMEMORY,
+                    };
+                    write_u32(memory, dname, (8 + pointer_size * 2) as u32);
+                    write_u32(memory, dname + 4, 0);
+                    let _ = write_guest_pointer(memory, dname + 8, name_memory, self.guest_arch);
+                    let _ = write_guest_pointer(
+                        memory,
+                        dname + 8 + pointer_size,
+                        name_memory,
+                        self.guest_arch,
+                    );
+                    match self.execute_guest_callback(
+                        state,
+                        memory,
+                        callback,
+                        &[
+                            u64::from(player.dpnid),
+                            u64::from(player.flags),
+                            dname,
+                            0,
+                            context,
+                        ],
+                        "IDirectPlay4::EnumPlayers",
+                    ) {
+                        Ok(result) if result == 0 => break,
+                        Ok(_) => {}
+                        Err(_) => return dplay::DPNERR_GENERIC,
+                    }
+                }
+                dplay::S_OK
+            }
+            13 => {
+                let lpsd = arg!(1);
+                let timeout_ms = arg_u32!(2);
+                let callback = arg!(3);
+                let context = arg!(4);
+                if callback == 0 {
+                    return dplay::DPNERR_INVALIDPARAM;
+                }
+                let application_guid = if lpsd != 0 {
+                    dplay_riid(memory, lpsd + 24)
+                } else {
+                    [0u8; 16]
+                };
+                let timeout = if timeout_ms == 0 {
+                    Duration::from_millis(u64::from(dplay::DEFAULT_ENUM_TIMEOUT_MS))
+                } else {
+                    Duration::from_millis(u64::from(timeout_ms))
+                };
+                let sessions = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Legacy(legacy),
+                        ..
+                    }) => legacy.peer.enum_hosts(&application_guid, &[], timeout),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let timeout_pointer = match self.alloc_zeroed(memory, 4, 4) {
+                    Ok(address) => address,
+                    Err(_) => return dplay::DPNERR_OUTOFMEMORY,
+                };
+                write_u32(memory, timeout_pointer, timeout_ms);
+                for session in sessions {
+                    let size: u64 = 80;
+                    let desc = match self.alloc_zeroed(
+                        memory,
+                        (size + session.session_name.len() as u64 + 1) as usize,
+                        4,
+                    ) {
+                        Ok(address) => address,
+                        Err(_) => return dplay::DPNERR_OUTOFMEMORY,
+                    };
+                    write_u32(memory, desc, size as u32);
+                    write_u32(memory, desc + 4, dplay::DPNSESSION_NODPNSVR);
+                    let _ = write_guest_bytes_checked(memory, desc + 8, &session.instance_guid);
+                    let _ = write_guest_bytes_checked(memory, desc + 24, &session.application_guid);
+                    write_u32(memory, desc + 40, session.max_players);
+                    write_u32(memory, desc + 44, session.current_players);
+                    let name_memory = desc + size;
+                    let _ = write_guest_bytes_checked(
+                        memory,
+                        name_memory,
+                        &[session.session_name.as_bytes(), &[0]].concat(),
+                    );
+                    let _ = write_guest_pointer(memory, desc + 48, name_memory, self.guest_arch);
+                    match self.execute_guest_callback(
+                        state,
+                        memory,
+                        callback,
+                        &[desc, timeout_pointer, 0, context],
+                        "IDirectPlay4::EnumSessions",
+                    ) {
+                        Ok(result) if result == 0 => break,
+                        Ok(_) => {}
+                        Err(_) => return dplay::DPNERR_GENERIC,
+                    }
+                }
+                dplay::S_OK
+            }
+            14 | 19 => {
+                let (is_host, max_players) = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Legacy(legacy),
+                        ..
+                    }) => (legacy.peer.is_hosting(), legacy.max_players),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let base = if method == 14 { arg!(1) } else { arg!(2) };
+                if base == 0 {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                let _ = write_guest_bytes_checked(memory, base, &vec![0u8; 40]);
+                write_u32(memory, base, 40);
+                write_u32(memory, base + 4, if is_host { 0x0000_0002 } else { 0 });
+                write_u32(memory, base + 8, dplay::MAX_MESSAGE_PAYLOAD as u32);
+                write_u32(memory, base + 12, 0);
+                write_u32(memory, base + 16, max_players);
+                write_u32(memory, base + 20, 100_000);
+                write_u32(memory, base + 24, 1);
+                write_u32(memory, base + 28, 8);
+                write_u32(memory, base + 32, 12);
+                write_u32(memory, base + 36, dplay::DEFAULT_CONNECT_TIMEOUT_MS);
+                dplay::S_OK
+            }
+            18 => {
+                let player_id = arg_u32!(1);
+                let addr = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Legacy(legacy),
+                        ..
+                    }) => legacy.player_address(player_id),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let Some(addr) = addr else {
+                    return dplay::DPNERR_INVALIDPLAYER;
+                };
+                let buffer = arg!(2);
+                let size_ptr = arg!(3);
+                let required = 16u32;
+                if size_ptr != 0 {
+                    write_u32(memory, size_ptr, required);
+                }
+                if buffer == 0 {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                let available = if size_ptr != 0 {
+                    read_u32(memory, size_ptr).unwrap_or(0)
+                } else {
+                    u32::MAX
+                };
+                if available < required {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                // A real SOCKADDR_IN for the player's TCP/IP endpoint.
+                let _ = write_guest_bytes_checked(memory, buffer, &vec![0u8; 16]);
+                write_u16(memory, buffer, 2);
+                write_u16(memory, buffer + 2, addr.port().to_be());
+                if let std::net::IpAddr::V4(ip) = addr.ip() {
+                    let _ = write_guest_bytes_checked(memory, buffer + 4, &ip.octets());
+                }
+                dplay::S_OK
+            }
+            20 | 29 => {
+                let player_id = arg_u32!(1);
+                if method == 20 {
+                    let data = match runtime.objects.get(&this) {
+                        Some(dplay::DplayObjectEntry {
+                            object: dplay::DplayObject::Legacy(legacy),
+                            ..
+                        }) => legacy
+                            .players
+                            .get(&player_id)
+                            .map(|player| player.data.clone())
+                            .unwrap_or_default(),
+                        _ => return dplay::DPNERR_INVALIDPARAM,
+                    };
+                    dplay_write_raw_buffer(memory, arg!(2), arg!(3), &data)
+                } else {
+                    let size = arg_u32!(3) as usize;
+                    let data = read_guest_bytes(memory, arg!(2), size).unwrap_or_default();
+                    match runtime.objects.get_mut(&this) {
+                        Some(dplay::DplayObjectEntry {
+                            object: dplay::DplayObject::Legacy(legacy),
+                            ..
+                        }) => match legacy.players.get_mut(&player_id) {
+                            Some(player) => {
+                                player.data = data;
+                                dplay::S_OK
+                            }
+                            None => dplay::DPNERR_INVALIDPLAYER,
+                        },
+                        _ => dplay::DPNERR_INVALIDPARAM,
+                    }
+                }
+            }
+            21 | 30 => {
+                if method == 21 {
+                    let player_id = arg_u32!(1);
+                    let name = match runtime.objects.get(&this) {
+                        Some(dplay::DplayObjectEntry {
+                            object: dplay::DplayObject::Legacy(legacy),
+                            ..
+                        }) => legacy
+                            .players
+                            .get(&player_id)
+                            .map(|player| player.name.clone()),
+                        _ => return dplay::DPNERR_INVALIDPARAM,
+                    };
+                    let Some(name) = name else {
+                        return dplay::DPNERR_INVALIDPLAYER;
+                    };
+                    let buffer = arg!(2);
+                    let size_ptr = arg!(3);
+                    let base_size = 8 + pointer_size * 2;
+                    let required = base_size as u32 + (name.len() as u32 + 1) * 2;
+                    if size_ptr != 0 {
+                        write_u32(memory, size_ptr, required);
+                    }
+                    if buffer == 0 {
+                        return dplay::DPNERR_BUFFERTOOSMALL;
+                    }
+                    let available = if size_ptr != 0 {
+                        read_u32(memory, size_ptr).unwrap_or(0)
+                    } else {
+                        u32::MAX
+                    };
+                    if available < required {
+                        return dplay::DPNERR_BUFFERTOOSMALL;
+                    }
+                    let _ =
+                        write_guest_bytes_checked(memory, buffer, &vec![0u8; required as usize]);
+                    write_u32(memory, buffer, required);
+                    write_u32(memory, buffer + 4, 0);
+                    let name_memory = buffer + base_size as u64;
+                    let _ = write_guest_bytes_checked(
+                        memory,
+                        name_memory,
+                        &dplay::encode_utf16_bytes(&name),
+                    );
+                    let _ = write_guest_pointer(memory, buffer + 8, name_memory, self.guest_arch);
+                    let _ = write_guest_pointer(
+                        memory,
+                        buffer + 8 + pointer_size,
+                        name_memory,
+                        self.guest_arch,
+                    );
+                    dplay::S_OK
+                } else {
+                    let player_id = arg_u32!(1);
+                    let name = dplay_utf16_z(
+                        memory,
+                        read_guest_pointer(memory, arg!(2) + 8, self.guest_arch).unwrap_or(0),
+                    );
+                    match runtime.objects.get_mut(&this) {
+                        Some(dplay::DplayObjectEntry {
+                            object: dplay::DplayObject::Legacy(legacy),
+                            ..
+                        }) => match legacy.players.get_mut(&player_id) {
+                            Some(player) => {
+                                player.name = name;
+                                dplay::S_OK
+                            }
+                            None => dplay::DPNERR_INVALIDPLAYER,
+                        },
+                        _ => dplay::DPNERR_INVALIDPARAM,
+                    }
+                }
+            }
+            22 => {
+                let (name, instance, application, max) = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Legacy(legacy),
+                        ..
+                    }) => (
+                        legacy.session_name.clone(),
+                        legacy.instance_guid,
+                        legacy.app_guid,
+                        legacy.max_players,
+                    ),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let buffer = arg!(1);
+                let size_ptr = arg!(2);
+                let required = 80u32 + name.len() as u32 + 1;
+                if size_ptr != 0 {
+                    write_u32(memory, size_ptr, required);
+                }
+                if buffer == 0 {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                let available = if size_ptr != 0 {
+                    read_u32(memory, size_ptr).unwrap_or(0)
+                } else {
+                    u32::MAX
+                };
+                if available < required {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                let _ = write_guest_bytes_checked(memory, buffer, &vec![0u8; required as usize]);
+                write_u32(memory, buffer, 80);
+                write_u32(memory, buffer + 4, dplay::DPNSESSION_NODPNSVR);
+                let _ = write_guest_bytes_checked(memory, buffer + 8, &instance);
+                let _ = write_guest_bytes_checked(memory, buffer + 24, &application);
+                write_u32(memory, buffer + 40, max);
+                write_u32(memory, buffer + 44, 1);
+                let name_memory = buffer + 80;
+                let _ = write_guest_bytes_checked(
+                    memory,
+                    name_memory,
+                    &[name.as_bytes(), &[0]].concat(),
+                );
+                let _ = write_guest_pointer(memory, buffer + 48, name_memory, self.guest_arch);
+                dplay::S_OK
+            }
+            23 => match runtime.objects.get_mut(&this) {
+                Some(dplay::DplayObjectEntry {
+                    object: dplay::DplayObject::Legacy(legacy),
+                    ..
+                }) => legacy.initialize(),
+                _ => dplay::DPNERR_INVALIDPARAM,
+            },
+            24 => {
+                let lpsd = arg!(1);
+                let flags = arg_u32!(2);
+                if lpsd == 0 {
+                    return dplay::DPNERR_INVALIDPARAM;
+                }
+                let name = dplay_ansi_z(
+                    memory,
+                    read_guest_pointer(memory, lpsd + 48, self.guest_arch).unwrap_or(0),
+                );
+                let max_players = read_u32(memory, lpsd + 40).unwrap_or(0);
+                let instance = dplay_riid(memory, lpsd + 8);
+                let application = dplay_riid(memory, lpsd + 24);
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Legacy(legacy),
+                        ..
+                    }) => {
+                        if flags & DPSESSION_NEWGAME != 0 {
+                            let name = if name.is_empty() {
+                                "DirectPlay4 Session".to_string()
+                            } else {
+                                name
+                            };
+                            let result = legacy.open_host(&name, max_players);
+                            if result == dplay::S_OK && application != [0u8; 16] {
+                                legacy.app_guid = application;
+                            }
+                            result
+                        } else {
+                            let player_name = if name.is_empty() {
+                                "DirectPlay4 Player".to_string()
+                            } else {
+                                name.clone()
+                            };
+                            legacy.open_session(&instance, &player_name)
+                        }
+                    }
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            25 => {
+                let from_ptr = arg!(1);
+                let to_ptr = arg!(2);
+                let data_ptr = arg!(4);
+                let size_ptr = arg!(5);
+                let received = match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Legacy(legacy),
+                        ..
+                    }) => legacy.receive(Duration::ZERO),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                let Some(message) = received else {
+                    return DPERR_NOMESSAGES;
+                };
+                let available = if size_ptr != 0 {
+                    read_u32(memory, size_ptr).unwrap_or(0)
+                } else {
+                    u32::MAX
+                };
+                if size_ptr != 0 {
+                    write_u32(memory, size_ptr, message.data.len() as u32);
+                }
+                if data_ptr == 0 || available < message.data.len() as u32 {
+                    return dplay::DPNERR_BUFFERTOOSMALL;
+                }
+                if write_guest_bytes_checked(memory, data_ptr, &message.data).is_err() {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                if from_ptr != 0 {
+                    write_u32(memory, from_ptr, message.from_dpnid);
+                }
+                if to_ptr != 0 {
+                    let local = match runtime.objects.get(&this) {
+                        Some(dplay::DplayObjectEntry {
+                            object: dplay::DplayObject::Legacy(legacy),
+                            ..
+                        }) => legacy.local_player,
+                        _ => 0,
+                    };
+                    write_u32(memory, to_ptr, local);
+                }
+                dplay::S_OK
+            }
+            26 => {
+                let from = arg_u32!(1);
+                let to = arg_u32!(2);
+                let size = arg_u32!(5) as usize;
+                let data = read_guest_bytes(memory, arg!(4), size).unwrap_or_default();
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Legacy(legacy),
+                        ..
+                    }) => legacy.send(from, to, &data),
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                }
+            }
+            31 => {
+                let name = dplay_ansi_z(
+                    memory,
+                    read_guest_pointer(memory, arg!(1) + 48, self.guest_arch).unwrap_or(0),
+                );
+                let max_players = read_u32(memory, arg!(1) + 40).unwrap_or(0);
+                if !name.is_empty() {
+                    match runtime.objects.get_mut(&this) {
+                        Some(dplay::DplayObjectEntry {
+                            object: dplay::DplayObject::Legacy(legacy),
+                            ..
+                        }) => {
+                            legacy.session_name = name;
+                            legacy.max_players = max_players;
+                        }
+                        _ => return dplay::DPNERR_INVALIDPARAM,
+                    }
+                }
+                dplay::S_OK
+            }
+            _ => dplay::DPNERR_INVALIDPARAM,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

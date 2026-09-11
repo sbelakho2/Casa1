@@ -10,7 +10,7 @@
 
 use super::super::*;
 use super::unknown_preamble;
-use crate::media::{Guid, ImfMediaBuffer, ImfMediaType, ImfSample, MediaEventType, MfEventQueue};
+use crate::media::{Guid, ImfMediaBuffer, ImfMediaType, ImfSample, MfEventQueue};
 use crate::runtime::state::{ComStreamState, ImfByteStreamState};
 
 /// MFT_CATEGORY_VIDEO_DECODER {d6c02d4b-6833-45b4-971a-05a4b04bab91}
@@ -35,10 +35,10 @@ const E_OUTOFMEMORY: u32 = 0x8007_000E;
 #[allow(dead_code)] // reserved for the MF error surface
 const MF_E_NOT_INITIALIZED: u32 = 0xC00D_36B0;
 #[allow(dead_code)] // reserved for the MF error surface
-const MF_E_INVALIDREQUEST: u32 = 0xC00D_36A1;
+const MF_E_INVALIDREQUEST: u32 = 0xC00D_36B2;
 #[allow(dead_code)] // reserved for the MF error surface
-const MF_E_NO_MORE_TYPES: u32 = 0xC00D_36A0;
-const MF_E_UNSUPPORTED_SERVICE: u32 = 0xC00D_36C8;
+const MF_E_NO_MORE_TYPES: u32 = 0xC00D_36B9;
+const MF_E_UNSUPPORTED_SERVICE: u32 = 0xC00D_36BA;
 #[allow(dead_code)] // reserved for the MF error surface
 const MF_E_NO_SAMPLE_TIMESTAMP: u32 = 0xC00D_36A4;
 #[allow(dead_code)] // reserved for the MF error surface
@@ -48,11 +48,11 @@ const MF_E_NOTFOUND: u32 = 0xC00D_36B1;
 #[allow(dead_code)] // reserved for the MF error surface
 const MF_E_INVALIDMEDIATYPE: u32 = 0xC00D_36B4;
 #[allow(dead_code)] // reserved for the MF error surface
-const MF_E_UNSUPPORTED_BYTESTREAM_TYPE: u32 = 0xC00D_36B6;
+const MF_E_UNSUPPORTED_BYTESTREAM_TYPE: u32 = 0xC00D_36C4;
 #[allow(dead_code)] // reserved for the MF error surface
 const MF_E_TOPO_COULD_NOT_OPEN: u32 = 0xC00D_5208;
 #[allow(dead_code)] // reserved for the MF error surface
-const MF_E_UNSUPPORTED_CHARACTERISTICS: u32 = 0xC00D_36B2;
+const MF_E_UNSUPPORTED_CHARACTERISTICS: u32 = 0xC00D_3E9E;
 
 // ── Service registry GUIDs (the guest little-endian byte form) ────────────
 // The MFGetService service identifiers and the interface IIDs the service
@@ -87,6 +87,93 @@ const IID_IMF_RATE_SUPPORT: [u8; 16] = [
 const IID_IUNKNOWN: [u8; 16] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
 ];
+/// IID_IMFAttributes {2cd2d921-c447-44a7-a13c-4adabfc247e3}.
+const IID_IMF_ATTRIBUTES: [u8; 16] = [
+    0x21, 0xd9, 0xd2, 0x2c, 0x47, 0xc4, 0xa7, 0x44, 0xa1, 0x3c, 0x4a, 0xda, 0xbf, 0xc2, 0x47, 0xe3,
+];
+/// IID_IMFByteStream {ad4c1b00-4bf7-422f-9175-756693d9130d} (mfobjects.h).
+#[allow(dead_code)] // referenced by the MF service-resolution tests
+const IID_IMF_BYTE_STREAM: [u8; 16] = [
+    0x00, 0x1b, 0x4c, 0xad, 0xf7, 0x4b, 0x2f, 0x42, 0x91, 0x75, 0x75, 0x66, 0x93, 0xd9, 0x13, 0x0d,
+];
+/// IID_IMFMediaSource {279a808d-aec7-40c8-9c6b-a6b492c78a66} (mfidl.h).
+const IID_IMF_MEDIA_SOURCE: [u8; 16] = [
+    0x8d, 0x80, 0x9a, 0x27, 0xc7, 0xae, 0xc8, 0x40, 0x9c, 0x6b, 0xa6, 0xb4, 0x92, 0xc7, 0x8a, 0x66,
+];
+/// IID_IMFMediaSourceEx {3c9b2eb9-86d5-4514-a394-f56664f9f0d8} (mfidl.h).
+const IID_IMF_MEDIA_SOURCE_EX: [u8; 16] = [
+    0xb9, 0x2e, 0x9b, 0x3c, 0xd5, 0x86, 0x14, 0x45, 0xa3, 0x94, 0xf5, 0x66, 0x64, 0xf9, 0xf0, 0xd8,
+];
+/// IID_IMFPresentationDescriptor {03cb2711-24d7-4db6-a17f-f3a7a479a536}.
+#[allow(dead_code)] // referenced by the MF service-resolution tests
+const IID_IMF_PRESENTATION_DESCRIPTOR: [u8; 16] = [
+    0x11, 0x27, 0xcb, 0x03, 0xd7, 0x24, 0xb6, 0x4d, 0xa1, 0x7f, 0xf3, 0xa7, 0xa4, 0x79, 0xa5, 0x36,
+];
+/// IID_IMFStreamDescriptor {56c03d9c-9dbb-45f5-ab4b-d80f47c05938}.
+#[allow(dead_code)] // referenced by the MF service-resolution tests
+const IID_IMF_STREAM_DESCRIPTOR: [u8; 16] = [
+    0x9c, 0x3d, 0xc0, 0x56, 0xbb, 0x9d, 0xf5, 0x45, 0xab, 0x4b, 0xd8, 0x0f, 0x47, 0xc0, 0x59, 0x38,
+];
+/// IID_IMFMediaTypeHandler {e93dcf6c-4b07-4e1e-8123-aa16ed6eadf5}.
+#[allow(dead_code)] // referenced by the MF service-resolution tests
+const IID_IMF_MEDIA_TYPE_HANDLER: [u8; 16] = [
+    0x6c, 0xcf, 0x3d, 0xe9, 0x07, 0x4b, 0x1e, 0x4e, 0x81, 0x23, 0xaa, 0x16, 0xed, 0x6e, 0xad, 0xf5,
+];
+/// IID_IMFSourceReader {70ae66f2-c809-4e4f-8915-bdcb406b7993} (mfreadwrite.h).
+#[allow(dead_code)] // referenced by the MF service-resolution tests
+const IID_IMF_SOURCE_READER: [u8; 16] = [
+    0xf2, 0x66, 0xae, 0x70, 0x09, 0xc8, 0x4f, 0x4e, 0x89, 0x15, 0xbd, 0xcb, 0x40, 0x6b, 0x79, 0x93,
+];
+/// IID_IMFGetService {fa993888-4383-415a-a930-dd472a8cf6f7}.
+#[allow(dead_code)] // referenced by the MF service-resolution tests
+const IID_IMF_GET_SERVICE: [u8; 16] = [
+    0x88, 0x38, 0x99, 0xfa, 0x83, 0x43, 0x5a, 0x41, 0xa9, 0x30, 0xdd, 0x47, 0x2a, 0x8c, 0xf6, 0xf7,
+];
+/// IID_IMFMediaEvent {df598932-f10c-4e39-bba2-c308f101daa3} (mfobjects.h).
+#[allow(dead_code)] // referenced by the MF service-resolution tests
+const IID_IMF_MEDIA_EVENT: [u8; 16] = [
+    0x32, 0x89, 0x59, 0xdf, 0x0c, 0xf1, 0x39, 0x4e, 0xbb, 0xa2, 0xc3, 0x08, 0xf1, 0x01, 0xda, 0xa3,
+];
+/// MF_MEDIASOURCE_SERVICE {f09992f7-9fba-4c4a-a37f-8c47b4e1dfe7} (mfidl.h).
+const SERVICE_MF_MEDIASOURCE: [u8; 16] = [
+    0xf7, 0x92, 0x99, 0xf0, 0xba, 0x9f, 0x4a, 0x4c, 0xa3, 0x7f, 0x8c, 0x47, 0xb4, 0xe1, 0xdf, 0xe7,
+];
+/// MF_METADATA_PROVIDER_SERVICE {db214084-58a4-4d2e-b84f-6f755b2f7a0d}
+/// (mfidl.h).  No real metadata/tag parser exists in the runtime, so no
+/// provider is registered: the service stays genuinely unsupported.
+#[allow(dead_code)] // referenced by the MF service-resolution tests
+const SERVICE_MF_METADATA_PROVIDER: [u8; 16] = [
+    0x84, 0x40, 0x21, 0xdb, 0xa4, 0x58, 0x2e, 0x4d, 0xb8, 0x4f, 0x6f, 0x75, 0x5b, 0x2f, 0x7a, 0x0d,
+];
+/// MF_BYTESTREAM_ORIGIN_NAME {fc358288-3cb6-460c-a424-b6681260375a}.
+const SERVICE_MF_BYTESTREAM_ORIGIN_NAME: [u8; 16] = [
+    0x88, 0x82, 0x35, 0xfc, 0xb6, 0x3c, 0x0c, 0x46, 0xa4, 0x24, 0xb6, 0x68, 0x12, 0x60, 0x37, 0x5a,
+];
+/// MF_BYTESTREAM_CONTENT_TYPE {fc358289-3cb6-460c-a424-b6681260375a}.
+const SERVICE_MF_BYTESTREAM_CONTENT_TYPE: [u8; 16] = [
+    0x89, 0x82, 0x35, 0xfc, 0xb6, 0x3c, 0x0c, 0x46, 0xa4, 0x24, 0xb6, 0x68, 0x12, 0x60, 0x37, 0x5a,
+];
+/// The real MF_E_* failure codes used by the source side.  Values are from
+/// mferror.h.
+const MF_E_UNSUPPORTED_REPRESENTATION: u32 = 0xC00D_36B7;
+const MF_E_UNSUPPORTED_TIME_FORMAT: u32 = 0xC00D_36C5;
+const MF_E_NO_EVENTS_AVAILABLE: u32 = 0xC00D_3E80;
+const MF_E_SHUTDOWN: u32 = 0xC00D_3E85;
+/// E_FAIL — the documented answer for operations on a closed byte stream.
+const E_FAIL: u32 = 0x8000_4005;
+const E_ACCESSDENIED: u32 = 0x8007_0005;
+
+// ── MFBYTESTREAM_* and source-reader flags (mfobjects.h / mfreadwrite.h) ───
+const MFBYTESTREAM_IS_READABLE: u32 = 0x1;
+const MFBYTESTREAM_IS_WRITABLE: u32 = 0x2;
+const MFBYTESTREAM_IS_SEEKABLE: u32 = 0x4;
+const MFBYTESTREAM_DOES_NOT_USE_NETWORK: u32 = 0x800;
+/// MFBYTESTREAM_SEEK_ORIGIN (msoBegin = 0, msoCurrent = 1).
+const MSO_BEGIN: u32 = 0;
+/// MF_SOURCE_READERF_* flags (mfreadwrite.h).
+const MF_SOURCE_READERF_ENDOFSTREAM: u32 = 0x2;
+#[allow(dead_code)] // reserved for the new-stream sample flag surface
+const MF_SOURCE_READERF_NEWSTREAM: u32 = 0x4;
 
 /// MFRATE_FORWARD (mfidl.h `_MFRATE_DIRECTION`).
 const MFRATE_FORWARD: u32 = 0;
@@ -186,6 +273,12 @@ impl PeHostRuntime {
             Ok(GuestObjectKind::ImfMediaSession) => {
                 self.dispatch_mf_session_get_service(state, memory, owner, &service, &iid)
             }
+            Ok(GuestObjectKind::ImfMediaSource) => {
+                self.dispatch_mf_media_source_get_service(state, memory, owner, &service, &iid)
+            }
+            Ok(GuestObjectKind::ImfByteStream) => {
+                self.dispatch_mf_byte_stream_get_service(state, memory, owner, &service, &iid)
+            }
             _ => {
                 state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
                 Ok(())
@@ -207,6 +300,15 @@ impl PeHostRuntime {
         match kind {
             GuestObjectKind::ImfMediaSession => {
                 self.mf_sessions.contains_key(&object).then_some(object)
+            }
+            GuestObjectKind::ImfMediaSource => {
+                // A real source owns MF_MEDIASOURCE_SERVICE on itself.
+                self.mf_media_sources
+                    .contains_key(&object)
+                    .then_some(object)
+            }
+            GuestObjectKind::ImfByteStream => {
+                self.mf_byte_streams.contains_key(&object).then_some(object)
             }
             GuestObjectKind::ImfTopology => self
                 .mf_session_topologies
@@ -286,6 +388,88 @@ impl PeHostRuntime {
             return Ok(());
         }
         state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+        Ok(())
+    }
+
+    /// The media source's real provider table.  `MF_MEDIASOURCE_SERVICE` is
+    /// the documented Windows 8.1+ source service: it returns the source
+    /// object itself for `IID_IMFMediaSource`, `IID_IMFMediaSourceEx` and
+    /// `IID_IUnknown`.  `MF_METADATA_PROVIDER_SERVICE` is NOT registered:
+    /// the runtime has no real container tag/metadata parser, so no provider
+    /// is fabricated.
+    fn dispatch_mf_media_source_get_service(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        source: u64,
+        service: &[u8; 16],
+        iid: &[u8; 16],
+    ) -> AppResult<()> {
+        let out = guest_call_arg(state, memory, 3)?;
+        if service == &SERVICE_MF_MEDIASOURCE
+            && (iid == &IID_IMF_MEDIA_SOURCE
+                || iid == &IID_IMF_MEDIA_SOURCE_EX
+                || iid == &IID_IUNKNOWN)
+        {
+            write_guest_pointer(memory, out, source, self.guest_arch).ok();
+            self.add_ref_guest_object(source)?;
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+        Ok(())
+    }
+
+    /// The byte stream's attribute provider table.  A byte stream that knows
+    /// its origin/content type exposes those documented attributes
+    /// (`MF_BYTESTREAM_ORIGIN_NAME`, `MF_BYTESTREAM_CONTENT_TYPE`) through
+    /// `MFGetService`: the service GUID is the attribute key and the returned
+    /// object is an `IMFAttributes` store carrying exactly that attribute
+    /// (the same attribute the Windows byte stream would set).  Streams
+    /// without the attribute, and every other service GUID, answer
+    /// `MF_E_UNSUPPORTED_SERVICE`.
+    fn dispatch_mf_byte_stream_get_service(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        stream_object: u64,
+        service: &[u8; 16],
+        iid: &[u8; 16],
+    ) -> AppResult<()> {
+        let out = guest_call_arg(state, memory, 3)?;
+        let Some(stream) = self.mf_byte_streams.get(&stream_object) else {
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+            return Ok(());
+        };
+        let value = if service == &SERVICE_MF_BYTESTREAM_ORIGIN_NAME {
+            stream.origin_name.clone()
+        } else if service == &SERVICE_MF_BYTESTREAM_CONTENT_TYPE {
+            stream.content_type.clone()
+        } else {
+            None
+        };
+        let Some(value) = value else {
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+            return Ok(());
+        };
+        if iid != &IID_IMF_ATTRIBUTES && iid != &IID_IUNKNOWN {
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+            return Ok(());
+        }
+        let vtable = self.alloc_guest_vtable(memory, mf_attributes_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        let key = mf_guid_from_bytes(service);
+        let mut store = ImfMediaType::new();
+        store.set_string(key, value);
+        self.mf_media_types.insert(object, store);
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
@@ -816,8 +1000,196 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `MFCreateSourceReaderFromURL(pwszURL, pAttributes, ppReader)` — a
-    /// source reader wrapping the media layer's source machinery.
+    /// Allocate a guest IMFByteStream object over an open runtime file
+    /// handle (or a memory payload).
+    fn mf_alloc_byte_stream_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: crate::runtime::state::ImfByteStreamState,
+    ) -> AppResult<u64> {
+        let vtable = self.alloc_guest_vtable(memory, mf_byte_stream_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfByteStream, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            return Ok(0);
+        }
+        self.mf_byte_streams.insert(object, state);
+        Ok(object)
+    }
+
+    /// Allocate a guest IMFMediaSource object (with the IMFMediaSourceEx
+    /// vtable superset) over a presentation and its byte stream.
+    fn mf_alloc_media_source_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        presentation: crate::media::MfPresentationDescriptor,
+        byte_stream: u64,
+    ) -> AppResult<u64> {
+        let vtable = self.alloc_guest_vtable(memory, mf_media_source_ex_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaSource, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            return Ok(0);
+        }
+        self.mf_media_sources.insert(
+            object,
+            crate::media::MfMediaSource::new(presentation, byte_stream),
+        );
+        Ok(object)
+    }
+
+    /// Allocate a guest IMFSourceReader object wired to its media source.
+    fn mf_alloc_source_reader_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        reader: crate::media::SourceReader,
+        source: u64,
+    ) -> AppResult<u64> {
+        let vtable = self.alloc_guest_vtable(memory, mf_source_reader_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfSourceReader, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            return Ok(0);
+        }
+        let mut reader = reader;
+        reader.set_source(source);
+        self.mf_source_readers.insert(object, reader);
+        if let Some(source) = self.mf_media_sources.get_mut(&source) {
+            source.attach_reader(object);
+        }
+        Ok(object)
+    }
+
+    /// Read a byte stream's entire payload without moving its position.
+    fn mf_byte_stream_read_all(&mut self, stream_object: u64) -> AppResult<Vec<u8>> {
+        let Some(stream) = self.mf_byte_streams.get(&stream_object).cloned() else {
+            return Ok(Vec::new());
+        };
+        if stream.file_handle != 0 {
+            let length = self
+                .win32
+                .get_file_size_ex(stream.file_handle)
+                .unwrap_or(stream.length);
+            self.win32
+                .set_file_pointer_ex(stream.file_handle, 0, crate::win32::SeekOrigin::Begin)
+                .ok();
+            Ok(self
+                .win32
+                .read_file(stream.file_handle, length as usize)
+                .unwrap_or_default())
+        } else {
+            Ok(stream.data.clone())
+        }
+    }
+
+    /// Open a real source graph from an URL or an existing byte stream:
+    /// `(byte_stream, media_source, source_reader)` guest objects, or the
+    /// guest HRESULT when the URL has no file backend / the data is not a
+    /// supported container.
+    ///
+    /// The URL path opens the file through the runtime file tables
+    /// (`CreateFileW` semantics: GE-relative path resolution, share state,
+    /// access masks), wraps the handle in a real IMFByteStream, parses the
+    /// container, and builds the source over the parsed presentation.
+    fn mf_open_source_graph(
+        &mut self,
+        url: Option<&str>,
+        stream: Option<u64>,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Result<(u64, u64, u64), u32>> {
+        if let Some(stream_object) = stream {
+            if !self.mf_byte_streams.contains_key(&stream_object) {
+                return Ok(Err(0x8007_0006)); // ERROR_INVALID_HANDLE
+            }
+            let data = self.mf_byte_stream_read_all(stream_object)?;
+            let reader = match crate::media::SourceReader::from_data(data) {
+                Ok(reader) => reader,
+                Err(_) => return Ok(Err(MF_E_UNSUPPORTED_BYTESTREAM_TYPE)),
+            };
+            let presentation = reader.presentation(0, None);
+            let source = self.mf_alloc_media_source_object(memory, presentation, stream_object)?;
+            if source == 0 {
+                return Ok(Err(E_OUTOFMEMORY));
+            }
+            let reader_object = self.mf_alloc_source_reader_object(memory, reader, source)?;
+            if reader_object == 0 {
+                return Ok(Err(E_OUTOFMEMORY));
+            }
+            return Ok(Ok((stream_object, source, reader_object)));
+        }
+        let Some(url) = url else {
+            return Ok(Err(MF_E_UNSUPPORTED_BYTESTREAM_TYPE));
+        };
+        let path = url.strip_prefix("file://").unwrap_or(url);
+        if path.starts_with("http://") || path.starts_with("https://") {
+            // No network byte-stream handler is registered.
+            return Ok(Err(MF_E_UNSUPPORTED_BYTESTREAM_TYPE));
+        }
+        let handle = match self.win32.create_file_w(
+            path,
+            crate::ge::FileAccess::read_only(),
+            crate::ge::ShareMode::all(),
+            crate::win32::CreationDisposition::OpenExisting,
+            false,
+            false,
+            false,
+        ) {
+            Ok(handle) => handle,
+            Err(_) => return Ok(Err(0x8007_0002)), // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+        };
+        let length = self.win32.get_file_size_ex(handle).unwrap_or(0);
+        let data = match self.win32.read_file(handle, length as usize) {
+            Ok(data) => data,
+            Err(_) => {
+                self.win32.close_handle(handle).ok();
+                return Ok(Err(0x8007_0002));
+            }
+        };
+        self.win32
+            .set_file_pointer_ex(handle, 0, crate::win32::SeekOrigin::Begin)
+            .ok();
+        let reader = match crate::media::SourceReader::from_data(data) {
+            Ok(reader) => reader,
+            Err(_) => {
+                self.win32.close_handle(handle).ok();
+                return Ok(Err(MF_E_UNSUPPORTED_BYTESTREAM_TYPE));
+            }
+        };
+        let content_type = crate::media::mime_type_for_path(path).map(str::to_string);
+        let byte_stream = self.mf_alloc_byte_stream_object(
+            memory,
+            crate::runtime::state::ImfByteStreamState::from_file(
+                handle,
+                length,
+                false,
+                Some(path.to_string()),
+            ),
+        )?;
+        if byte_stream == 0 {
+            self.win32.close_handle(handle).ok();
+            return Ok(Err(E_OUTOFMEMORY));
+        }
+        if let Some(stream) = self.mf_byte_streams.get_mut(&byte_stream) {
+            stream.content_type = content_type.clone();
+        }
+        let presentation = reader.presentation(length, content_type.as_deref());
+        let source = self.mf_alloc_media_source_object(memory, presentation, byte_stream)?;
+        if source == 0 {
+            return Ok(Err(E_OUTOFMEMORY));
+        }
+        let reader_object = self.mf_alloc_source_reader_object(memory, reader, source)?;
+        if reader_object == 0 {
+            return Ok(Err(E_OUTOFMEMORY));
+        }
+        Ok(Ok((byte_stream, source, reader_object)))
+    }
+
+    /// `MFCreateSourceReaderFromURL(pwszURL, pAttributes, ppReader)` — opens
+    /// the file through the runtime file tables and creates the real byte
+    /// stream + media source + source reader graph.
     pub(crate) fn dispatch_mf_create_source_reader_from_url(
         &mut self,
         state: &mut CpuState,
@@ -834,23 +1206,13 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         }
-        let vtable = self.alloc_guest_vtable(memory, mf_source_reader_methods())?;
-        let object = self
-            .alloc_guest_object(memory, GuestObjectKind::ImfSourceReader, vtable)
-            .unwrap_or(0);
-        if object == 0 {
-            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
-            return Ok(());
+        match self.mf_open_source_graph(Some(&url), None, memory)? {
+            Ok((_byte_stream, _source, reader)) => {
+                write_guest_pointer(memory, out, reader, self.guest_arch).ok();
+                state.set(Register::Rax, u64::from(S_OK));
+            }
+            Err(hr) => state.set(Register::Rax, u64::from(hr)),
         }
-        let reader = match crate::media::SourceReader::from_url(&url)
-            .or_else(|_| crate::media::SourceReader::from_data(Vec::new()))
-        {
-            Ok(r) => r,
-            Err(_) => crate::media::SourceReader::empty(),
-        };
-        self.mf_source_readers.insert(object, reader);
-        write_guest_pointer(memory, out, object, self.guest_arch).ok();
-        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
@@ -885,7 +1247,8 @@ impl PeHostRuntime {
     }
 
     /// `MFCreateSourceReaderFromByteStream(pByteStream, pAttributes,
-    /// ppReader)` — a source reader over an MF byte stream.
+    /// ppReader)` — reads the supplied byte stream's real payload, parses the
+    /// container, and creates the media-source + reader graph over it.
     pub(crate) fn dispatch_mf_create_source_reader_from_byte_stream(
         &mut self,
         state: &mut CpuState,
@@ -898,28 +1261,13 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         }
-        let vtable = self.alloc_guest_vtable(memory, mf_source_reader_methods())?;
-        let object = self
-            .alloc_guest_object(memory, GuestObjectKind::ImfSourceReader, vtable)
-            .unwrap_or(0);
-        if object == 0 {
-            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
-            return Ok(());
+        match self.mf_open_source_graph(None, Some(stream), memory)? {
+            Ok((_byte_stream, _source, reader)) => {
+                write_guest_pointer(memory, out, reader, self.guest_arch).ok();
+                state.set(Register::Rax, u64::from(S_OK));
+            }
+            Err(hr) => state.set(Register::Rax, u64::from(hr)),
         }
-        let url = self
-            .com_streams
-            .get(&stream)
-            .map(|s: &ComStreamState| String::from_utf8_lossy(&s.data).to_string())
-            .unwrap_or_default();
-        let reader = match crate::media::SourceReader::from_url(&url)
-            .or_else(|_| crate::media::SourceReader::from_data(Vec::new()))
-        {
-            Ok(r) => r,
-            Err(_) => crate::media::SourceReader::empty(),
-        };
-        self.mf_source_readers.insert(object, reader);
-        write_guest_pointer(memory, out, object, self.guest_arch).ok();
-        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
@@ -961,23 +1309,38 @@ impl PeHostRuntime {
     }
 
     /// `MFCreatePresentationDescriptor(pStreamDescriptors, cStreamDescriptors,
-    /// ppPresentationDescriptor)` — a presentation descriptor.
+    /// ppPresentationDescriptor)` — a presentation descriptor over the
+    /// supplied real stream descriptors (NULL/0 gives the documented empty
+    /// descriptor).
     pub(crate) fn dispatch_mf_create_presentation_descriptor(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _descriptors = guest_call_arg(state, memory, 0)?;
-        let _count = guest_call_arg_u32(state, memory, 1)?;
+        let descriptors = guest_call_arg(state, memory, 0)?;
+        let count = guest_call_arg_u32(state, memory, 1)?;
         let out = guest_call_arg(state, memory, 2)?;
         if out == 0 {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         }
-        let vtable = self.alloc_guest_vtable(memory, mf_presentation_descriptor_methods())?;
-        let object = self
-            .alloc_guest_object(memory, GuestObjectKind::ImfPresentationDescriptor, vtable)
-            .unwrap_or(0);
+        let mut presentation = crate::media::MfPresentationDescriptor::empty();
+        if descriptors != 0 && count > 0 {
+            for index in 0..count {
+                let pointer = read_guest_pointer(
+                    memory,
+                    descriptors + u64::from(index) * self.guest_arch.pointer_bytes() as u64,
+                    self.guest_arch,
+                )?;
+                let Some(stream) = self.mf_stream_descriptors.get(&pointer).cloned() else {
+                    state.set(Register::Rax, u64::from(E_INVALIDARG));
+                    return Ok(());
+                };
+                presentation.streams.push(stream);
+            }
+            presentation.seekable = !presentation.streams.is_empty();
+        }
+        let object = self.alloc_mf_presentation_descriptor_object(memory, &presentation)?;
         if object == 0 {
             state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
             return Ok(());
@@ -988,7 +1351,8 @@ impl PeHostRuntime {
     }
 
     /// `MFCreateMFByteStreamOnStream(pStream, ppByteStream)` — an
-    /// IMFByteStream wrapping the IStream payload.
+    /// IMFByteStream over the IStream payload (a memory-backed readable,
+    /// seekable stream of the copied bytes).
     pub(crate) fn dispatch_mf_create_mf_byte_stream_on_stream(
         &mut self,
         state: &mut CpuState,
@@ -1000,26 +1364,102 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         }
-        let vtable = self.alloc_guest_vtable(memory, mf_byte_stream_methods())?;
-        let object = self
-            .alloc_guest_object(memory, GuestObjectKind::ImfByteStream, vtable)
-            .unwrap_or(0);
-        if object == 0 {
-            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
-            return Ok(());
-        }
         let payload = self
             .com_streams
             .get(&stream)
             .map(|s: &ComStreamState| s.data.clone())
             .unwrap_or_default();
-        self.mf_byte_streams.insert(
-            object,
-            ImfByteStreamState {
-                data: payload,
-                position: 0,
+        let object =
+            self.mf_alloc_byte_stream_object(memory, ImfByteStreamState::from_bytes(payload))?;
+        if object == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `MFCreateFile(AccessMode, OpenMode, fFileFlags, pwszFileURL,
+    /// ppIByteStream)` — a real file-backed IMFByteStream opened through the
+    /// runtime file tables.
+    pub(crate) fn dispatch_mf_create_file(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let access_mode = guest_call_arg_u32(state, memory, 0)?;
+        let open_mode = guest_call_arg_u32(state, memory, 1)?;
+        let _flags = guest_call_arg_u32(state, memory, 2)?;
+        let url_ptr = guest_call_arg(state, memory, 3)?;
+        let out = guest_call_arg(state, memory, 4)?;
+        let Some(path) = read_utf16_string(memory, url_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let (read, write) = match access_mode {
+            1 => (true, false), // MF_ACCESSMODE_READ
+            2 => (false, true), // MF_ACCESSMODE_WRITE
+            3 => (true, true),  // MF_ACCESSMODE_READWRITE
+            _ => {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+        };
+        let creation = match open_mode {
+            0 => crate::win32::CreationDisposition::OpenExisting, // FAIL_IF_NOT_EXIST
+            1 => crate::win32::CreationDisposition::CreateNew,    // FAIL_IF_EXIST
+            2 => crate::win32::CreationDisposition::CreateAlways, // RESET_IF_EXIST
+            3 => crate::win32::CreationDisposition::OpenAlways,   // APPEND_IF_EXIST
+            _ => {
+                // MF_OPENMODE_DELETE_IF_EXIST has no runtime file-table
+                // disposition; it is answered as an argument error instead
+                // of silently opening a non-deleting stream.
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+        };
+        let handle = match self.win32.create_file_w(
+            &path,
+            crate::ge::FileAccess {
+                read,
+                write,
+                delete: false,
             },
-        );
+            crate::ge::ShareMode::all(),
+            creation,
+            false,
+            false,
+            false,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                state.set(Register::Rax, u64::from(win32_error_to_hresult(&error)));
+                return Ok(());
+            }
+        };
+        let length = if read {
+            self.win32.get_file_size_ex(handle).unwrap_or(0)
+        } else {
+            0
+        };
+        let content_type = crate::media::mime_type_for_path(&path).map(str::to_string);
+        let object = self.mf_alloc_byte_stream_object(
+            memory,
+            ImfByteStreamState::from_file(handle, length, write, Some(path.clone())),
+        )?;
+        if object == 0 {
+            self.win32.close_handle(handle).ok();
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        if let Some(stream) = self.mf_byte_streams.get_mut(&object) {
+            stream.content_type = content_type;
+        }
         write_guest_pointer(memory, out, object, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -1755,19 +2195,62 @@ impl PeHostRuntime {
 
     /// `IMFMediaSession::GetDescriptorFromTopology(pTopology,
     /// ppPresentationDescriptor)` — no presentation descriptor is attached.
+    /// `IMFSession::GetDescriptorFromTopology(pTopology, ppPD)` — the real
+    /// presentation descriptor of the media source wired into the topology
+    /// graph; `MF_E_UNSUPPORTED_REPRESENTATION` when no source node carries a
+    /// media source.
     pub(crate) fn dispatch_mf_session_get_descriptor_from_topology(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let _this = guest_call_arg(state, memory, 0)?;
-        let _topology = guest_call_arg(state, memory, 1)?;
+        let topology = guest_call_arg(state, memory, 1)?;
         let out = guest_call_arg(state, memory, 2)?;
-        if out != 0 {
-            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        if !self.mf_topologies.contains_key(&topology) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
         }
-        state.set(Register::Rax, 0xc00d_36e6); // MF_E_UNSUPPORTED_REPRESENTATION
+        let source = self.mf_topology_source_objects().into_iter().next();
+        let Some(source) = source else {
+            if out != 0 {
+                write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_REPRESENTATION));
+            return Ok(());
+        };
+        let Some(presentation) = self
+            .mf_media_sources
+            .get(&source)
+            .map(|source| source.presentation().clone())
+        else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let descriptor = self.alloc_mf_presentation_descriptor_object(memory, &presentation)?;
+        if descriptor == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, descriptor, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
+    }
+
+    /// The guest IMFMediaSource objects wired into topology nodes (the
+    /// topology side of the source graph).
+    fn mf_topology_source_objects(&self) -> Vec<u64> {
+        let mut sources: Vec<u64> = self
+            .mf_topology_nodes
+            .values()
+            .map(|node| node.object)
+            .filter(|object| self.mf_media_sources.contains_key(object))
+            .collect();
+        sources.sort_unstable();
+        sources.dedup();
+        sources
     }
 
     /// `IMFSinkWriter::SetInputMediaType(dwStreamIndex, pInputMediaType,
@@ -1899,8 +2382,9 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `IMFMediaSource::GetCharacteristics(pdwCharacteristics)` — the
-    /// source is live and seekable.
+    /// `IMFMediaSource::GetCharacteristics(pdwCharacteristics)` — the real
+    /// characteristics of the parsed file presentation (seekable/pausable
+    /// local source; never live).
     pub(crate) fn dispatch_mf_media_source_get_characteristics(
         &mut self,
         state: &mut CpuState,
@@ -1908,21 +2392,343 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
         let out = guest_call_arg(state, memory, 1)?;
-        if !self.mf_media_sources.contains_key(&this) {
+        let Some(source) = self.mf_media_sources.get(&this) else {
             state.set(Register::Rax, u64::from(E_NOINTERFACE));
             return Ok(());
-        }
+        };
         if out != 0 {
-            // MFMEDIASOURCE_CAN_SEEK | MFMEDIASOURCE_CAN_PAUSE | LIVE.
-            write_guest_u32(memory, out, 0x1 | 0x2 | 0x4).ok();
+            write_guest_u32(memory, out, source.characteristics()).ok();
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
-    /// `IMFMediaSource::CreatePresentationDescriptor(ppPD)` — the
-    /// presentation descriptor object.
+    /// Allocate a guest IMFPresentationDescriptor object over a presentation
+    /// descriptor.  The object also carries the descriptor's real
+    /// `IMFAttributes` store (MF_PD_DURATION / MF_PD_SEEKABLE / ...).
+    fn alloc_mf_presentation_descriptor_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        presentation: &crate::media::MfPresentationDescriptor,
+    ) -> AppResult<u64> {
+        let vtable = self.alloc_guest_vtable(memory, mf_presentation_descriptor_methods())?;
+        let descriptor = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfPresentationDescriptor, vtable)
+            .unwrap_or(0);
+        if descriptor == 0 {
+            return Ok(0);
+        }
+        self.mf_presentation_descriptors
+            .insert(descriptor, presentation.clone());
+        self.mf_media_types
+            .insert(descriptor, presentation.attributes());
+        Ok(descriptor)
+    }
+
+    /// Allocate a guest IMFMediaEvent object carrying an exact MF event
+    /// number, status and value.
+    fn alloc_mf_event_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        mf_type: u32,
+        status: u32,
+        value: u64,
+    ) -> AppResult<u64> {
+        let vtable = self.alloc_guest_vtable(memory, mf_event_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaEvent, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            return Ok(0);
+        }
+        self.mf_media_events.insert(
+            object,
+            crate::runtime::state::MfMediaEventState {
+                event_type: mf_type,
+                status,
+                value,
+            },
+        );
+        self.mf_media_types
+            .insert(object, crate::media::ImfMediaType::new());
+        Ok(object)
+    }
+
+    /// `IMFMediaSource::CreatePresentationDescriptor(ppPD)` — a real copy of
+    /// the source's parsed presentation descriptor.
     pub(crate) fn dispatch_mf_media_source_create_presentation_descriptor(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(source) = self.mf_media_sources.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let presentation = source.presentation().clone();
+        let descriptor = self.alloc_mf_presentation_descriptor_object(memory, &presentation)?;
+        if descriptor == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, descriptor, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// The position from an `IMFMediaSource::Start` PROPVARIANT: null and
+    /// VT_EMPTY start at zero, VT_I8 is the 100-ns time, and
+    /// PRESENTATION_CURRENT_POSITION keeps the current position.
+    fn mf_start_position(
+        &self,
+        memory: &MemoryImage,
+        start_position: u64,
+        current: u64,
+    ) -> Option<u64> {
+        if start_position == 0 {
+            return Some(0);
+        }
+        let vt = read_guest_u32(memory, start_position).unwrap_or(0);
+        match vt {
+            0 => Some(0), // VT_EMPTY
+            20 => {
+                // VT_I8
+                let value = read_guest_u64(memory, start_position + 8).unwrap_or(0) as i64;
+                if value == i64::MAX {
+                    Some(current) // PRESENTATION_CURRENT_POSITION
+                } else if value < 0 {
+                    None
+                } else {
+                    Some(value as u64)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `IMFMediaSource::Start(pPD, pguidTimeFormat, pvarStartPosition)` —
+    /// the real state transition: applies the descriptor's stream selection,
+    /// seeks the attached source readers, then queues
+    /// MESourceStarted/MEStreamStarted (or MESourceSeeked on a re-start).
+    pub(crate) fn dispatch_mf_media_source_start(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let descriptor = guest_call_arg(state, memory, 1)?;
+        let time_format = guest_call_arg(state, memory, 2)?;
+        let start_position = guest_call_arg(state, memory, 3)?;
+        let Some(source) = self.mf_media_sources.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if source.state() == crate::media::MfSourceState::Shutdown {
+            state.set(Register::Rax, u64::from(MF_E_SHUTDOWN));
+            return Ok(());
+        }
+        // Only GUID_NULL (or a null pointer) time format is backed: the
+        // position is a 100-ns presentation time.
+        if time_format != 0 {
+            let bytes = memory.read_bytes(time_format, 16).unwrap_or_default();
+            if bytes.iter().any(|byte| *byte != 0) {
+                state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_TIME_FORMAT));
+                return Ok(());
+            }
+        }
+        let current = source.position();
+        let Some(position) = self.mf_start_position(memory, start_position, current) else {
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_TIME_FORMAT));
+            return Ok(());
+        };
+        // A guest presentation descriptor selects the streams the source
+        // will play.
+        if descriptor != 0 {
+            let Some(pd) = self.mf_presentation_descriptors.get(&descriptor).cloned() else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            };
+            if let Some(source) = self.mf_media_sources.get_mut(&this) {
+                for (index, stream) in pd.streams.iter().enumerate() {
+                    source
+                        .presentation_mut()
+                        .set_stream_selected(index, stream.selected);
+                }
+            }
+        }
+        let readers = self
+            .mf_media_sources
+            .get(&this)
+            .map(|source| source.readers().to_vec())
+            .unwrap_or_default();
+        for reader in readers {
+            if let Some(reader) = self.mf_source_readers.get_mut(&reader) {
+                reader.set_current_position(position);
+            }
+        }
+        let Some(source) = self.mf_media_sources.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if source.start(Some(position)).is_err() {
+            state.set(Register::Rax, u64::from(MF_E_INVALIDREQUEST));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaSource::Stop` — the real transition and events.
+    pub(crate) fn dispatch_mf_media_source_stop(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(source) = self.mf_media_sources.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        match source.stop() {
+            Ok(()) => state.set(Register::Rax, u64::from(S_OK)),
+            Err(_) => state.set(Register::Rax, u64::from(MF_E_SHUTDOWN)),
+        }
+        Ok(())
+    }
+
+    /// `IMFMediaSource::Pause` — the real transition and events.
+    pub(crate) fn dispatch_mf_media_source_pause(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(source) = self.mf_media_sources.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        match source.pause() {
+            Ok(()) => state.set(Register::Rax, u64::from(S_OK)),
+            Err(_) => state.set(Register::Rax, u64::from(MF_E_INVALIDREQUEST)),
+        }
+        Ok(())
+    }
+
+    /// `IMFMediaSource::Shutdown` — the source moves to the terminal state
+    /// (the guest object is released by the guest; the object stays alive
+    /// until its last reference drops).
+    pub(crate) fn dispatch_mf_media_source_shutdown(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(source) = self.mf_media_sources.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        source.shutdown();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaEventGenerator::GetEvent` on a media source — pulls the next
+    /// real source event (the MESource*/MEStream*/MENewStream/
+    /// MEEndOfPresentation sequence).
+    pub(crate) fn dispatch_mf_media_source_get_event(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _flags = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(source) = self.mf_media_sources.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if source.state() == crate::media::MfSourceState::Shutdown {
+            state.set(Register::Rax, u64::from(MF_E_SHUTDOWN));
+            return Ok(());
+        }
+        let Some(event) = source.get_event() else {
+            state.set(Register::Rax, u64::from(MF_E_NO_EVENTS_AVAILABLE));
+            return Ok(());
+        };
+        let value = event.pts.unwrap_or(0);
+        let object =
+            self.alloc_mf_event_object(memory, event.mf_type, event.status as u32, value)?;
+        if object == 0 && out != 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaEventGenerator::BeginGetEvent` / `EndGetEvent` — the
+    /// runtime has no MF async callback pump; synchronous `GetEvent` is the
+    /// backed path and these answer E_NOTIMPL honestly.
+    pub(crate) fn dispatch_mf_media_source_begin_get_event(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        state.set(Register::Rax, u64::from(E_NOTIMPL));
+        Ok(())
+    }
+
+    /// `IMFMediaEventGenerator::EndGetEvent`.
+    pub(crate) fn dispatch_mf_media_source_end_get_event(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(E_NOTIMPL));
+        Ok(())
+    }
+
+    /// `IMFMediaEventGenerator::QueueEvent` on a media source — the
+    /// guest-supplied event number is queued and round-trips through
+    /// `IMFMediaEvent::GetType`.
+    pub(crate) fn dispatch_mf_media_source_queue_event(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let mf_type = guest_call_arg_u32(state, memory, 1)?;
+        let _extended = guest_call_arg(state, memory, 2)?;
+        let _status = guest_call_arg_u32(state, memory, 3)?;
+        let _value = guest_call_arg(state, memory, 4)?;
+        let Some(source) = self.mf_media_sources.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        source.queue_event_number(mf_type);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaSourceEx::GetSourceAttributes(ppAttributes)` — a fresh
+    /// IMFAttributes store for the source (empty: the source exposes no
+    /// additional source attributes beyond the presentation descriptor).
+    pub(crate) fn dispatch_mf_media_source_get_source_attributes(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
@@ -1933,45 +2739,82 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_NOINTERFACE));
             return Ok(());
         }
-        let vtable = self.alloc_guest_vtable(memory, mf_presentation_descriptor_methods())?;
-        let descriptor = self
-            .alloc_guest_object(memory, GuestObjectKind::ImfPresentationDescriptor, vtable)
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let vtable = self.alloc_guest_vtable(memory, mf_attributes_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
             .unwrap_or(0);
-        if descriptor == 0 || out == 0 {
+        if object == 0 {
             state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
             return Ok(());
         }
-        self.mf_presentation_descriptors.insert(descriptor, ());
-        if out != 0 {
-            write_guest_pointer(memory, out, descriptor, self.guest_arch).ok();
-        }
+        self.mf_media_types
+            .insert(object, crate::media::ImfMediaType::new());
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
-    /// `IMFMediaSource::Start` / `Pause` / `Stop` — the source state.
-    pub(crate) fn dispatch_mf_media_source_control(
+    /// `IMFMediaSourceEx::GetStreamAttributes(dwStreamID, ppAttributes)` —
+    /// a fresh attribute store for a real presentation stream.
+    pub(crate) fn dispatch_mf_media_source_get_stream_attributes(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
+        let stream_id = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(source) = self.mf_media_sources.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if !source
+            .presentation()
+            .streams
+            .iter()
+            .any(|stream| stream.identifier == stream_id)
+        {
+            state.set(Register::Rax, 0xc00d_36b3); // MF_E_INVALIDSTREAMNUMBER
+            return Ok(());
+        }
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let vtable = self.alloc_guest_vtable(memory, mf_attributes_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        self.mf_media_types
+            .insert(object, crate::media::ImfMediaType::new());
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaSourceEx::SetD3DManager(pManager)` — the manager pointer is
+    /// retained on the source for the (currently absent) hardware decode
+    /// path; the software source accepts it like Windows does.
+    pub(crate) fn dispatch_mf_media_source_set_d3d_manager(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let manager = guest_call_arg(state, memory, 1)?;
         if !self.mf_media_sources.contains_key(&this) {
             state.set(Register::Rax, u64::from(E_NOINTERFACE));
             return Ok(());
         }
-        state.set(Register::Rax, u64::from(S_OK));
-        Ok(())
-    }
-
-    /// `IMFMediaSource::Shutdown` — release the source.
-    pub(crate) fn dispatch_mf_media_source_shutdown(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let this = guest_call_arg(state, memory, 0)?;
-        self.mf_media_sources.remove(&this);
+        self.mf_source_d3d_managers.insert(this, manager);
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -1988,14 +2831,593 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `IMFMediaSource`/`IMFMediaEventGenerator` event methods — the
-    /// source queues events on its event queue.
-    pub(crate) fn dispatch_mf_media_source_events(
+    /// Allocate a guest IMFStreamDescriptor object over a real stream
+    /// descriptor (with its IMFAttributes store).
+    fn alloc_mf_stream_descriptor_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        stream: &crate::media::MfStreamDescriptor,
+    ) -> AppResult<u64> {
+        let vtable = self.alloc_guest_vtable(memory, mf_stream_descriptor_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfStreamDescriptor, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            return Ok(0);
+        }
+        self.mf_stream_descriptors.insert(object, stream.clone());
+        self.mf_media_types
+            .insert(object, stream.attributes.clone());
+        Ok(object)
+    }
+
+    /// Allocate a guest IMFMediaTypeHandler object over a real handler
+    /// state.
+    fn alloc_mf_media_type_handler_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        handler: crate::media::MfMediaTypeHandlerState,
+    ) -> AppResult<u64> {
+        let vtable = self.alloc_guest_vtable(memory, mf_media_type_handler_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaTypeHandler, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            return Ok(0);
+        }
+        self.mf_media_type_handlers.insert(object, handler);
+        Ok(object)
+    }
+
+    /// Allocate a guest IMFMediaType object over a media type.
+    fn alloc_mf_media_type_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        media_type: crate::media::ImfMediaType,
+    ) -> AppResult<u64> {
+        let vtable = self.alloc_guest_vtable(memory, mf_media_type_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            return Ok(0);
+        }
+        self.mf_media_types.insert(object, media_type);
+        Ok(object)
+    }
+
+    /// `IMFPresentationDescriptor::GetStreamDescriptorCount(pcStreams)`.
+    pub(crate) fn dispatch_mf_presentation_descriptor_get_stream_descriptor_count(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(descriptor) = self.mf_presentation_descriptors.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out != 0 {
+            write_u32(memory, out, descriptor.streams.len() as u32);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFPresentationDescriptor::GetStreamDescriptorByIndex(index,
+    /// pfSelected, ppDescriptor)` — a real stream descriptor for the parsed
+    /// stream at `index`.
+    pub(crate) fn dispatch_mf_presentation_descriptor_get_stream_descriptor_by_index(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let index = guest_call_arg_u32(state, memory, 1)?;
+        let selected_out = guest_call_arg(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        let Some(stream) = self
+            .mf_presentation_descriptors
+            .get(&this)
+            .and_then(|descriptor| descriptor.streams.get(index as usize))
+            .cloned()
+        else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if selected_out != 0 {
+            write_u32(memory, selected_out, u32::from(stream.selected));
+        }
+        let object = self.alloc_mf_stream_descriptor_object(memory, &stream)?;
+        if object == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFPresentationDescriptor::SelectStream(index)`.
+    pub(crate) fn dispatch_mf_presentation_descriptor_select_stream(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_mf_presentation_descriptor_set_stream(state, memory, true)
+    }
+
+    /// `IMFPresentationDescriptor::DeselectStream(index)`.
+    pub(crate) fn dispatch_mf_presentation_descriptor_deselect_stream(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_mf_presentation_descriptor_set_stream(state, memory, false)
+    }
+
+    fn dispatch_mf_presentation_descriptor_set_stream(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        selected: bool,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let index = guest_call_arg_u32(state, memory, 1)?;
+        let Some(descriptor) = self.mf_presentation_descriptors.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if descriptor.set_stream_selected(index as usize, selected) {
+            state.set(Register::Rax, u64::from(S_OK));
+        } else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+        }
+        Ok(())
+    }
+
+    /// `IMFPresentationDescriptor::Clone(ppDescriptor)` — a deep copy of the
+    /// real descriptor (including the stream selection).
+    pub(crate) fn dispatch_mf_presentation_descriptor_clone(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(descriptor) = self.mf_presentation_descriptors.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let object = self.alloc_mf_presentation_descriptor_object(memory, &descriptor)?;
+        if object == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFStreamDescriptor::GetStreamIdentifier(pdwStreamIdentifier)`.
+    pub(crate) fn dispatch_mf_stream_descriptor_get_stream_identifier(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(stream) = self.mf_stream_descriptors.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out != 0 {
+            write_u32(memory, out, stream.identifier);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFStreamDescriptor::GetMediaTypeHandler(ppHandler)` — the real
+    /// handler over the stream's parsed native type.
+    pub(crate) fn dispatch_mf_stream_descriptor_get_media_type_handler(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(stream) = self.mf_stream_descriptors.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let handler = crate::media::MfMediaTypeHandlerState::new(stream.media_type);
+        let object = self.alloc_mf_media_type_handler_object(memory, handler)?;
+        if object == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaTypeHandler::IsMediaTypeSupported(pType, ppMediaType)` — a
+    /// candidate with the stream's major type is supported.
+    pub(crate) fn dispatch_mf_media_type_handler_is_media_type_supported(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let type_ptr = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(handler) = self.mf_media_type_handlers.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(candidate) = self.mf_media_types.get(&type_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(
+            Register::Rax,
+            u64::from(if handler.is_type_supported(candidate) {
+                S_OK
+            } else {
+                MF_E_INVALIDMEDIATYPE
+            }),
+        );
+        Ok(())
+    }
+
+    /// `IMFMediaTypeHandler::GetMediaTypeCount(pdwTypeCount)`.
+    pub(crate) fn dispatch_mf_media_type_handler_get_media_type_count(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(handler) = self.mf_media_type_handlers.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out != 0 {
+            write_u32(memory, out, handler.available.len() as u32);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaTypeHandler::GetMediaTypeByIndex(index, ppType)`.
+    pub(crate) fn dispatch_mf_media_type_handler_get_media_type_by_index(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let index = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(media_type) = self
+            .mf_media_type_handlers
+            .get(&this)
+            .and_then(|handler| handler.available.get(index as usize))
+            .cloned()
+        else {
+            state.set(Register::Rax, u64::from(MF_E_NO_MORE_TYPES));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let object = self.alloc_mf_media_type_object(memory, media_type)?;
+        if object == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaTypeHandler::SetCurrentMediaType(pType)`.
+    pub(crate) fn dispatch_mf_media_type_handler_set_current_media_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let type_ptr = guest_call_arg(state, memory, 1)?;
+        let Some(candidate) = self.mf_media_types.get(&type_ptr).cloned() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(handler) = self.mf_media_type_handlers.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if handler.is_type_supported(&candidate) {
+            handler.current = candidate;
+            state.set(Register::Rax, u64::from(S_OK));
+        } else {
+            state.set(Register::Rax, u64::from(MF_E_INVALIDMEDIATYPE));
+        }
+        Ok(())
+    }
+
+    /// `IMFMediaTypeHandler::GetCurrentMediaType(ppType)`.
+    pub(crate) fn dispatch_mf_media_type_handler_get_current_media_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(media_type) = self
+            .mf_media_type_handlers
+            .get(&this)
+            .map(|handler| handler.current.clone())
+        else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let object = self.alloc_mf_media_type_object(memory, media_type)?;
+        if object == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaTypeHandler::GetMajorType(pguidMajorType)`.
+    pub(crate) fn dispatch_mf_media_type_handler_get_major_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(major) = self
+            .mf_media_type_handlers
+            .get(&this)
+            .and_then(|handler| handler.current.get_guid(&crate::media::MF_MT_MAJOR_TYPE))
+        else {
+            state.set(Register::Rax, u64::from(MF_E_ATTRIBUTENOTFOUND));
+            return Ok(());
+        };
+        if out != 0 {
+            write_guest_guid(memory, out, major);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSourceReader::GetStreamSelection(index, pfSelected)`.
+    pub(crate) fn dispatch_mf_source_reader_get_stream_selection(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let index = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(reader) = self.mf_source_readers.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(track) = reader.resolve_stream_index(index) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out != 0 {
+            write_u32(memory, out, u32::from(reader.get_stream_selection(track)));
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSourceReader::SetStreamSelection(index, selected)`.
+    pub(crate) fn dispatch_mf_source_reader_set_stream_selection(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let index = guest_call_arg_u32(state, memory, 1)?;
+        let selected = guest_call_arg_u32(state, memory, 2)?;
+        let Some(reader) = self.mf_source_readers.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        reader.set_stream_selection(index, selected != 0);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSourceReader::SetCurrentMediaType(index, pdwReserved, pType)`.
+    pub(crate) fn dispatch_mf_source_reader_set_current_media_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let index = guest_call_arg_u32(state, memory, 1)?;
+        let _reserved = guest_call_arg(state, memory, 2)?;
+        let type_ptr = guest_call_arg(state, memory, 3)?;
+        let Some(media_type) = self.mf_media_types.get(&type_ptr).cloned() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(reader) = self.mf_source_readers.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(track) = reader.resolve_stream_index(index) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        match reader.set_current_media_type(track, &media_type) {
+            Ok(()) => state.set(Register::Rax, u64::from(S_OK)),
+            Err(_) => state.set(Register::Rax, u64::from(MF_E_INVALIDMEDIATYPE)),
+        }
+        Ok(())
+    }
+
+    /// `IMFSourceReader::SetCurrentPosition(guidTimeFormat, pvarPosition)`.
+    pub(crate) fn dispatch_mf_source_reader_set_current_position(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let time_format = guest_call_arg(state, memory, 1)?;
+        let position = guest_call_arg(state, memory, 2)?;
+        if time_format != 0 {
+            let bytes = memory.read_bytes(time_format, 16).unwrap_or_default();
+            if bytes.iter().any(|byte| *byte != 0) {
+                state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_TIME_FORMAT));
+                return Ok(());
+            }
+        }
+        let Some(position) = self.mf_start_position(memory, position, 0) else {
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_TIME_FORMAT));
+            return Ok(());
+        };
+        let Some(reader) = self.mf_source_readers.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        reader.set_current_position(position);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSourceReader::Flush(index)` — the reader holds no queued samples;
+    /// the flush is the real no-buffered-data contract.
+    pub(crate) fn dispatch_mf_source_reader_flush(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _index = guest_call_arg_u32(state, memory, 1)?;
+        if !self.mf_source_readers.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSourceReader::GetServiceForStream` — resolves the reader's real
+    /// source through `MF_MEDIASOURCE_SERVICE`.
+    pub(crate) fn dispatch_mf_source_reader_get_service_for_stream(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _index = guest_call_arg_u32(state, memory, 1)?;
+        let service_ptr = guest_call_arg(state, memory, 2)?;
+        let iid_ptr = guest_call_arg(state, memory, 3)?;
+        let out = guest_call_arg(state, memory, 4)?;
+        let Some(reader) = self.mf_source_readers.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let source = reader.source();
+        if source == 0 || !self.mf_media_sources.contains_key(&source) {
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+            return Ok(());
+        }
+        let mut service = [0_u8; 16];
+        let service_bytes = memory.read_bytes(service_ptr, 16).unwrap_or_default();
+        service.copy_from_slice(&service_bytes[..service_bytes.len().min(16)]);
+        let mut iid = [0_u8; 16];
+        let iid_bytes = memory.read_bytes(iid_ptr, 16).unwrap_or_default();
+        iid.copy_from_slice(&iid_bytes[..iid_bytes.len().min(16)]);
+        if service == SERVICE_MF_MEDIASOURCE
+            && (iid == IID_IMF_MEDIA_SOURCE
+                || iid == IID_IMF_MEDIA_SOURCE_EX
+                || iid == IID_IUNKNOWN)
+        {
+            self.add_ref_guest_object(source)?;
+            if out != 0 {
+                write_guest_pointer(memory, out, source, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+        Ok(())
+    }
+
+    /// `IMFSourceReader::GetPresentationAttribute(index, guidAttribute,
+    /// pvarAttribute)` — the real presentation attributes of the reader's
+    /// source (duration/seekable/file size).
+    pub(crate) fn dispatch_mf_source_reader_get_presentation_attribute(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _index = guest_call_arg_u32(state, memory, 1)?;
+        let key = read_mf_guid(memory, guest_call_arg(state, memory, 2)?);
+        let out = guest_call_arg(state, memory, 3)?;
+        let Some(reader) = self.mf_source_readers.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let source = reader.source();
+        let Some(presentation) = self
+            .mf_media_sources
+            .get(&source)
+            .map(|source| source.presentation().clone())
+        else {
+            state.set(Register::Rax, u64::from(MF_E_ATTRIBUTENOTFOUND));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if key == crate::media::MF_PD_DURATION {
+            write_guest_u32(memory, out, 21).ok(); // VT_UI8
+            write_guest_u64(memory, out + 8, presentation.duration).ok();
+        } else if key == crate::media::MF_PD_SEEKABLE {
+            write_guest_u32(memory, out, 19).ok(); // VT_UI4
+            write_guest_u32(memory, out + 8, u32::from(presentation.seekable)).ok();
+        } else if key == crate::media::MF_PD_TOTAL_FILE_SIZE {
+            write_guest_u32(memory, out, 21).ok();
+            write_guest_u64(memory, out + 8, presentation.file_size).ok();
+        } else {
+            state.set(Register::Rax, u64::from(MF_E_ATTRIBUTENOTFOUND));
+            return Ok(());
+        }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -2863,7 +4285,7 @@ impl PeHostRuntime {
         {
             Some(value) => {
                 if out != 0 {
-                    write_guest_pointer(memory, out, value, self.guest_arch).ok();
+                    write_guest_u64(memory, out, value).ok();
                 }
                 state.set(Register::Rax, u64::from(S_OK));
             }
@@ -3366,7 +4788,7 @@ impl PeHostRuntime {
         let _status = guest_call_arg_u32(state, memory, 3)?;
         let _value = guest_call_arg(state, memory, 4)?;
         if let Some(q) = self.mf_event_queues.get_mut(&this) {
-            q.queue_event_type(MediaEventType::from_u8(event_type as u8));
+            q.queue_mf_event(event_type);
             state.set(Register::Rax, u64::from(S_OK));
         } else {
             state.set(Register::Rax, u64::from(E_NOINTERFACE));
@@ -3390,32 +4812,22 @@ impl PeHostRuntime {
             .and_then(|q| q.get_event())
         {
             Some(event) => {
-                let vtable = self.alloc_guest_vtable(memory, mf_event_methods())?;
-                let object = self
-                    .alloc_guest_object(memory, GuestObjectKind::ImfMediaEvent, vtable)
-                    .unwrap_or(0);
+                let object =
+                    self.alloc_mf_event_object(memory, event.mf_type, event.status as u32, 0)?;
                 if object != 0 {
-                    self.mf_media_events.insert(
-                        object,
-                        crate::runtime::state::MfMediaEventState {
-                            event_type: event.event_type as u32,
-                            status: 0,
-                            value: 0,
-                        },
-                    );
                     if out != 0 {
                         write_guest_pointer(memory, out, object, self.guest_arch).ok();
                     }
                 }
                 state.set(Register::Rax, u64::from(S_OK));
             }
-            None => state.set(Register::Rax, 0xC00D_36E2), // MF_E_NO_EVENTS_AVAILABLE
+            None => state.set(Register::Rax, u64::from(MF_E_NO_EVENTS_AVAILABLE)),
         }
         Ok(())
     }
 
-    /// IMFMediaSession::Start — starts the session clock (the media layer
-    /// session state machine).
+    /// IMFMediaSession::Start — starts the session clock and drives the real
+    /// media sources wired into the topology graph.
     pub(crate) fn dispatch_mf_session_start(
         &mut self,
         state: &mut CpuState,
@@ -3424,6 +4836,12 @@ impl PeHostRuntime {
         let this = guest_call_arg(state, memory, 0)?;
         let _guid = guest_call_arg(state, memory, 1)?;
         let _pos = guest_call_arg(state, memory, 2)?;
+        for source in self.mf_topology_source_objects() {
+            if let Some(source) = self.mf_media_sources.get_mut(&source) {
+                let position = source.position();
+                let _ = source.start(Some(position));
+            }
+        }
         match self.mf_sessions.get_mut(&this) {
             Some(s) => {
                 let _ = s.start();
@@ -3441,6 +4859,11 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
+        for source in self.mf_topology_source_objects() {
+            if let Some(source) = self.mf_media_sources.get_mut(&source) {
+                let _ = source.pause();
+            }
+        }
         match self.mf_sessions.get_mut(&this) {
             Some(s) => {
                 let _ = s.pause();
@@ -3458,6 +4881,11 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
+        for source in self.mf_topology_source_objects() {
+            if let Some(source) = self.mf_media_sources.get_mut(&source) {
+                let _ = source.stop();
+            }
+        }
         match self.mf_sessions.get_mut(&this) {
             Some(s) => {
                 let _ = s.stop();
@@ -3475,6 +4903,11 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
+        for source in self.mf_topology_source_objects() {
+            if let Some(source) = self.mf_media_sources.get_mut(&source) {
+                let _ = source.stop();
+            }
+        }
         match self.mf_sessions.get_mut(&this) {
             Some(s) => {
                 let _ = s.stop();
@@ -3485,13 +4918,19 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// IMFMediaSession::Shutdown.
+    /// IMFMediaSession::Shutdown — shuts down the real sources wired into
+    /// the topology graph alongside the session object.
     pub(crate) fn dispatch_mf_session_shutdown(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
+        for source in self.mf_topology_source_objects() {
+            if let Some(source) = self.mf_media_sources.get_mut(&source) {
+                source.shutdown();
+            }
+        }
         self.mf_sessions.remove(&this);
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -3659,100 +5098,248 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// IMFSourceReader::GetCurrentMediaType — returns the current media type
-    /// object for the stream.
+    /// IMFSourceReader::GetCurrentMediaType — the stream's negotiated
+    /// current media type.
     pub(crate) fn dispatch_mf_source_reader_get_current_media_type(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
-        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let stream = guest_call_arg_u32(state, memory, 1)?;
         let out = guest_call_arg(state, memory, 2)?;
         if out == 0 {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         }
-        let vtable = self.alloc_guest_vtable(memory, mf_media_type_methods())?;
-        let object = self
-            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
-            .unwrap_or(0);
+        let Some(reader) = self.mf_source_readers.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(track) = reader.resolve_stream_index(stream) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let media_type = match reader.get_current_media_type(track) {
+            Ok(media_type) => media_type,
+            Err(_) => {
+                state.set(Register::Rax, u64::from(MF_E_INVALIDMEDIATYPE));
+                return Ok(());
+            }
+        };
+        let object = self.alloc_mf_media_type_object(memory, media_type)?;
         if object == 0 {
             state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
             return Ok(());
         }
-        let mt = self
-            .mf_source_readers
-            .get(&this)
-            .and_then(|r| r.get_current_media_type(0).ok())
-            .unwrap_or_default();
-        self.mf_media_types.insert(object, mt);
         write_guest_pointer(memory, out, object, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
-    /// IMFSourceReader::GetNativeMediaType — the source's native type or
-    /// `MF_E_NO_MORE_TYPES` at the end of enumeration.
+    /// IMFSourceReader::GetNativeMediaType — the stream's native type, or
+    /// `MF_E_NO_MORE_TYPES` past the end of the enumeration.
     pub(crate) fn dispatch_mf_source_reader_get_native_media_type(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
-        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let stream = guest_call_arg_u32(state, memory, 1)?;
         let index = guest_call_arg_u32(state, memory, 2)?;
         let out = guest_call_arg(state, memory, 3)?;
-        let vtable = self.alloc_guest_vtable(memory, mf_media_type_methods())?;
-        let object = self
-            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
-            .unwrap_or(0);
+        let Some(reader) = self.mf_source_readers.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(track) = reader.resolve_stream_index(stream) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        // Each demuxed track has exactly one native type: index 0.
+        if index != 0 {
+            state.set(Register::Rax, u64::from(MF_E_NO_MORE_TYPES));
+            return Ok(());
+        }
+        let media_type = match reader.get_current_media_type(track) {
+            Ok(media_type) => media_type,
+            Err(_) => {
+                state.set(Register::Rax, u64::from(MF_E_INVALIDMEDIATYPE));
+                return Ok(());
+            }
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let object = self.alloc_mf_media_type_object(memory, media_type)?;
         if object == 0 {
             state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
             return Ok(());
         }
-        // The source reader enumerates its streams' types: the demuxer's
-        // native type for the selected stream, or MF_E_NO_MORE_TYPES past
-        // the end of enumeration.
-        let reader_type = self
-            .mf_source_readers
-            .get(&this)
-            .and_then(|r| r.get_current_media_type(index).ok())
-            .or_else(|| Some(ImfMediaType::new()));
-        match reader_type {
-            Some(mt) => {
-                self.mf_media_types.insert(object, mt);
-                if out != 0 {
-                    write_guest_pointer(memory, out, object, self.guest_arch).ok();
-                }
-                state.set(Register::Rax, u64::from(S_OK));
-            }
-            None => state.set(Register::Rax, u64::from(MF_E_NO_MORE_TYPES)),
-        }
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
-    /// IMFSourceReader::ReadSample — the documented end-of-stream result for
-    /// the deterministic source model (no stream data available — the
-    /// source reader has no live source in the headless pipeline).
+    /// IMFSourceReader::ReadSample — reads the next real demuxed sample:
+    /// the sample bytes, its 100-ns timestamp/duration and the
+    /// MF_SOURCE_READERF_NEWSTREAM flag round-trip to the guest.  At the end
+    /// of the file the flags carry MF_SOURCE_READERF_ENDOFSTREAM and the
+    /// owning media source queues MEEndOfStream/MEEndOfPresentation.
     pub(crate) fn dispatch_mf_source_reader_read_sample(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
-        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let stream = guest_call_arg_u32(state, memory, 1)?;
         let _control = guest_call_arg_u32(state, memory, 2)?;
+        let actual_out = guest_call_arg(state, memory, 3)?;
         let flags_out = guest_call_arg(state, memory, 4)?;
-        let _timestamp_out = guest_call_arg(state, memory, 5)?;
+        let timestamp_out = guest_call_arg(state, memory, 5)?;
         let sample_out = guest_call_arg(state, memory, 6)?;
-        if flags_out != 0 {
-            write_u32(memory, flags_out, 0x20); // MF_SOURCE_READERF_ENDOFSTREAM
+        let Some(reader) = self.mf_source_readers.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(track) = reader.resolve_stream_index(stream) else {
+            state.set(Register::Rax, 0xc00d_36b3); // MF_E_INVALIDSTREAMNUMBER
+            return Ok(());
+        };
+        let source = reader.source();
+        let sample = match reader.read_sample(track) {
+            Ok(sample) => sample,
+            Err(_) => {
+                state.set(Register::Rax, u64::from(MF_E_INVALIDMEDIATYPE));
+                return Ok(());
+            }
+        };
+        if actual_out != 0 {
+            write_u32(memory, actual_out, track);
         }
-        if sample_out != 0 {
-            write_guest_pointer(memory, sample_out, 0, self.guest_arch).ok();
+        match sample {
+            Some(sample) => {
+                let timestamp = sample.sample_time;
+                let flags = sample.flags & MF_SOURCE_READERF_NEWSTREAM;
+                let vtable = self.alloc_guest_vtable(memory, mf_sample_methods())?;
+                let object = self
+                    .alloc_guest_object(memory, GuestObjectKind::ImfSample, vtable)
+                    .unwrap_or(0);
+                if object == 0 {
+                    state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+                    return Ok(());
+                }
+                self.mf_samples.insert(object, sample);
+                if flags_out != 0 {
+                    write_u32(memory, flags_out, flags);
+                }
+                if timestamp_out != 0 {
+                    write_guest_u64(memory, timestamp_out, timestamp as u64).ok();
+                }
+                if sample_out != 0 {
+                    write_guest_pointer(memory, sample_out, object, self.guest_arch).ok();
+                }
+            }
+            None => {
+                if flags_out != 0 {
+                    write_u32(memory, flags_out, MF_SOURCE_READERF_ENDOFSTREAM);
+                }
+                if timestamp_out != 0 {
+                    write_guest_u64(memory, timestamp_out, 0).ok();
+                }
+                if sample_out != 0 {
+                    write_guest_pointer(memory, sample_out, 0, self.guest_arch).ok();
+                }
+                // The pull side reached the end of the file: the owning
+                // source queues MEEndOfStream/MEEndOfPresentation.
+                if let Some(source_state) = self.mf_media_sources.get_mut(&source) {
+                    source_state.end_presentation();
+                }
+            }
         }
-        let _ = self.mf_source_readers.get(&this);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::GetCapabilities — the real capability mask: memory
+    /// streams are readable+seekable, file streams report the access the
+    /// runtime handle was opened with.  Local streams do not use the network.
+    pub(crate) fn dispatch_mf_byte_stream_get_capabilities(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(stream) = self.mf_byte_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        let mut capabilities = MFBYTESTREAM_IS_READABLE | MFBYTESTREAM_DOES_NOT_USE_NETWORK;
+        if stream.seekable {
+            capabilities |= MFBYTESTREAM_IS_SEEKABLE;
+        }
+        if stream.writable {
+            capabilities |= MFBYTESTREAM_IS_WRITABLE;
+        }
+        if out != 0 {
+            write_u32(memory, out, capabilities);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::SetLength — resize a memory stream, or truncate the
+    /// real file-table file through SetFilePointer + SetEndOfFile.
+    pub(crate) fn dispatch_mf_byte_stream_set_length(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let length = guest_call_arg(state, memory, 1)?;
+        let Some(mut stream) = self.mf_byte_streams.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if !stream.writable {
+            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+            return Ok(());
+        }
+        if stream.file_handle != 0 {
+            if length > i64::MAX as u64 {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+            if self
+                .win32
+                .set_file_pointer_ex(
+                    stream.file_handle,
+                    length as i64,
+                    crate::win32::SeekOrigin::Begin,
+                )
+                .and_then(|_| self.win32.set_end_of_file(stream.file_handle))
+                .is_err()
+            {
+                state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+                return Ok(());
+            }
+        } else {
+            let length = length.min(i64::MAX as u64) as usize;
+            stream.data.resize(length, 0);
+            stream.position = stream.position.min(length as u64);
+        }
+        stream.length = length;
+        self.mf_byte_streams.insert(this, stream);
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -3765,20 +5352,97 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
         let out = guest_call_arg(state, memory, 1)?;
-        let pos = self
-            .mf_byte_streams
-            .get(&this)
-            .map(|s| s.position)
-            .unwrap_or(0);
+        let Some(stream) = self.mf_byte_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        let pos = stream.position;
         if out != 0 {
-            write_guest_pointer(memory, out, pos, self.guest_arch).ok();
+            write_guest_u64(memory, out, pos).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::SetCurrentPosition — a real seek: memory streams move
+    /// their position, file streams re-point the runtime file-table handle.
+    pub(crate) fn dispatch_mf_byte_stream_set_current_position(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let position = guest_call_arg(state, memory, 1)?;
+        let Some(mut stream) = self.mf_byte_streams.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if position > i64::MAX as u64 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if stream.file_handle != 0
+            && self
+                .win32
+                .set_file_pointer_ex(
+                    stream.file_handle,
+                    position as i64,
+                    crate::win32::SeekOrigin::Begin,
+                )
+                .is_err()
+        {
+            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+            return Ok(());
+        }
+        stream.position = position;
+        self.mf_byte_streams.insert(this, stream);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::IsEndOfStream — the terminal condition against the
+    /// real stream length.
+    pub(crate) fn dispatch_mf_byte_stream_is_end_of_stream(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(stream) = self.mf_byte_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        let length = if stream.file_handle != 0 {
+            self.win32
+                .get_file_size_ex(stream.file_handle)
+                .unwrap_or(stream.length)
+        } else {
+            stream.data.len() as u64
+        };
+        if out != 0 {
+            write_u32(memory, out, u32::from(stream.position >= length));
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
     /// IMFByteStream::Read — copies from the stream payload at the current
-    /// position.
+    /// position.  File-backed streams read through the runtime file table,
+    /// so the real handle's granted access and the shared file pointer
+    /// govern the read.
     pub(crate) fn dispatch_mf_byte_stream_read(
         &mut self,
         state: &mut CpuState,
@@ -3788,22 +5452,67 @@ impl PeHostRuntime {
         let buffer = guest_call_arg(state, memory, 1)?;
         let length = guest_call_arg_u32(state, memory, 2)?;
         let read_out = guest_call_arg(state, memory, 3)?;
-        match self.mf_byte_streams.get_mut(&this) {
-            Some(s) => {
-                let available = s.data.len().saturating_sub(s.position as usize);
-                let take = available.min(length as usize);
-                for offset in 0..take {
-                    let byte = s.data[s.position as usize + offset];
-                    memory.write_u8(buffer + offset as u64, byte);
-                }
-                s.position += take as u64;
-                if read_out != 0 {
-                    write_u32(memory, read_out, take as u32);
-                }
-                state.set(Register::Rax, u64::from(S_OK));
-            }
-            None => state.set(Register::Rax, u64::from(E_NOINTERFACE)),
+        let Some(stream) = self.mf_byte_streams.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
         }
+        if length > 0 && buffer == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let (take, denied) = self.mf_byte_stream_read_bytes(this, buffer, length, memory)?;
+        if denied {
+            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+            return Ok(());
+        }
+        if read_out != 0 {
+            write_u32(memory, read_out, take);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::Write — writes at the current position (memory streams
+    /// grow their backing store; file streams write through the runtime file
+    /// table).  A non-writable stream answers E_ACCESSDENIED.
+    pub(crate) fn dispatch_mf_byte_stream_write(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let buffer = guest_call_arg(state, memory, 1)?;
+        let length = guest_call_arg_u32(state, memory, 2)?;
+        let written_out = guest_call_arg(state, memory, 3)?;
+        let Some(stream) = self.mf_byte_streams.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if !stream.writable {
+            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+            return Ok(());
+        }
+        if length > 0 && buffer == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let (written, denied) = self.mf_byte_stream_write_bytes(this, buffer, length, memory)?;
+        if denied {
+            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+            return Ok(());
+        }
+        if written_out != 0 {
+            write_u32(memory, written_out, written);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
@@ -3815,13 +5524,427 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
         let out = guest_call_arg(state, memory, 1)?;
-        let len = self
-            .mf_byte_streams
-            .get(&this)
-            .map(|s| s.data.len() as u64)
-            .unwrap_or(0);
+        let Some(stream) = self.mf_byte_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        let len = if stream.file_handle != 0 {
+            self.win32
+                .get_file_size_ex(stream.file_handle)
+                .unwrap_or(stream.length)
+        } else {
+            stream.data.len() as u64
+        };
         if out != 0 {
-            write_guest_pointer(memory, out, len, self.guest_arch).ok();
+            write_guest_u64(memory, out, len).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::Seek — MFBYTESTREAM_SEEK_ORIGIN (msoBegin/msoCurrent)
+    /// over the real stream position; the resulting position is written back.
+    pub(crate) fn dispatch_mf_byte_stream_seek(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let origin = guest_call_arg_u32(state, memory, 1)?;
+        let offset = guest_call_arg(state, memory, 2)? as i64;
+        let _flags = guest_call_arg_u32(state, memory, 3)?;
+        let out = guest_call_arg(state, memory, 4)?;
+        let Some(mut stream) = self.mf_byte_streams.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if !stream.seekable {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        let base = match origin {
+            MSO_BEGIN => 0_i128,
+            1 => stream.position as i128,
+            _ => {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+        };
+        let next = base + offset as i128;
+        if next < 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if next > i64::MAX as i128 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let next = next as u64;
+        if stream.file_handle != 0
+            && self
+                .win32
+                .set_file_pointer_ex(
+                    stream.file_handle,
+                    next as i64,
+                    crate::win32::SeekOrigin::Begin,
+                )
+                .is_err()
+        {
+            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+            return Ok(());
+        }
+        stream.position = next;
+        self.mf_byte_streams.insert(this, stream);
+        if out != 0 {
+            write_guest_u64(memory, out, next).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::Flush — flush the kernel file buffers of a file-backed
+    /// stream.
+    pub(crate) fn dispatch_mf_byte_stream_flush(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(stream) = self.mf_byte_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if stream.file_handle != 0 && self.win32.flush_file_buffers(stream.file_handle).is_err() {
+            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::Close — closes the underlying runtime file handle (a
+    /// memory stream drops its payload).
+    pub(crate) fn dispatch_mf_byte_stream_close(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(mut stream) = self.mf_byte_streams.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if stream.file_handle != 0 {
+            let handle = stream.file_handle;
+            self.win32.close_handle(handle).ok();
+            stream.file_handle = 0;
+        }
+        stream.closed = true;
+        stream.data.clear();
+        stream.length = 0;
+        self.mf_byte_streams.insert(this, stream);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::BeginRead — the runtime has no MF async callback pump,
+    /// so the read completes synchronously: the bytes are read, an
+    /// IMFAsyncResult records the completion, and EndRead retrieves it.
+    pub(crate) fn dispatch_mf_byte_stream_begin_read(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let buffer = guest_call_arg(state, memory, 1)?;
+        let length = guest_call_arg_u32(state, memory, 2)?;
+        let _callback = guest_call_arg(state, memory, 3)?;
+        let _state_object = guest_call_arg(state, memory, 4)?;
+        let Some(stream) = self.mf_byte_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if length > 0 && buffer == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let (read, access_denied) = self.mf_byte_stream_read_bytes(this, buffer, length, memory)?;
+        if access_denied {
+            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+            return Ok(());
+        }
+        let result = self.alloc_mf_async_result(memory, 0, S_OK)?;
+        if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
+            stream.last_async_result = result;
+            stream.last_async_read = read;
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// Read from a byte stream into the guest buffer, returning
+    /// `(bytes_read, access_denied)`.
+    fn mf_byte_stream_read_bytes(
+        &mut self,
+        object: u64,
+        buffer: u64,
+        length: u32,
+        memory: &mut MemoryImage,
+    ) -> AppResult<(u32, bool)> {
+        let Some(stream) = self.mf_byte_streams.get(&object).cloned() else {
+            return Ok((0, false));
+        };
+        let data = if stream.file_handle != 0 {
+            if self
+                .win32
+                .set_file_pointer_ex(
+                    stream.file_handle,
+                    stream.position as i64,
+                    crate::win32::SeekOrigin::Begin,
+                )
+                .is_err()
+            {
+                return Ok((0, true));
+            }
+            self.win32
+                .read_file(stream.file_handle, length as usize)
+                .unwrap_or_default()
+        } else {
+            let available = stream.data.len().saturating_sub(stream.position as usize);
+            let take = available.min(length as usize);
+            stream.data[stream.position as usize..stream.position as usize + take].to_vec()
+        };
+        let take = data.len() as u32;
+        if !data.is_empty() {
+            memory.map_bytes(buffer, &data);
+        }
+        if let Some(stream) = self.mf_byte_streams.get_mut(&object) {
+            stream.position = stream.position.saturating_add(u64::from(take));
+        }
+        Ok((take, false))
+    }
+
+    /// Write `length` guest bytes into a byte stream, returning `(written,
+    /// access_denied)`.
+    fn mf_byte_stream_write_bytes(
+        &mut self,
+        object: u64,
+        buffer: u64,
+        length: u32,
+        memory: &mut MemoryImage,
+    ) -> AppResult<(u32, bool)> {
+        let Some(stream) = self.mf_byte_streams.get(&object).cloned() else {
+            return Ok((0, false));
+        };
+        if !stream.writable {
+            return Ok((0, true));
+        }
+        let bytes = memory
+            .read_bytes(buffer, length as usize)
+            .unwrap_or_default();
+        if stream.file_handle != 0 {
+            if self
+                .win32
+                .set_file_pointer_ex(
+                    stream.file_handle,
+                    stream.position as i64,
+                    crate::win32::SeekOrigin::Begin,
+                )
+                .is_err()
+            {
+                return Ok((0, true));
+            }
+            let written = match self.win32.write_file(stream.file_handle, &bytes) {
+                Ok(written) => written,
+                Err(_) => return Ok((0, true)),
+            };
+            if let Some(stream) = self.mf_byte_streams.get_mut(&object) {
+                stream.position = stream.position.saturating_add(u64::from(written));
+            }
+            return Ok((written, false));
+        }
+        let start = stream.position as usize;
+        let end = start.saturating_add(bytes.len());
+        let mut data = stream.data.clone();
+        if end > data.len() {
+            data.resize(end, 0);
+        }
+        data[start..end].copy_from_slice(&bytes);
+        let written = bytes.len() as u32;
+        if let Some(stream) = self.mf_byte_streams.get_mut(&object) {
+            stream.data = data;
+            stream.length = stream.length.max(end as u64);
+            stream.position = stream.position.saturating_add(u64::from(written));
+        }
+        Ok((written, false))
+    }
+
+    /// Allocate a runtime IMFAsyncResult guest object (used by the
+    /// synchronous BeginRead/BeginWrite completions).
+    fn alloc_mf_async_result(
+        &mut self,
+        memory: &mut MemoryImage,
+        state_object: u64,
+        status: u32,
+    ) -> AppResult<u64> {
+        let vtable = self.alloc_guest_vtable(memory, mf_async_result_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfAsyncResult, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            return Ok(0);
+        }
+        self.mf_async_results.insert(
+            object,
+            crate::runtime::state::ImfAsyncResultState {
+                state_object,
+                status,
+            },
+        );
+        Ok(object)
+    }
+
+    /// Drop the runtime-side state of a guest MF object on its final release:
+    /// closes a byte stream's real file handle and forgets the per-object
+    /// source/descriptor/event/reader state.
+    pub(crate) fn destroy_mf_object_state(&mut self, address: u64) -> AppResult<()> {
+        if let Some(stream) = self.mf_byte_streams.remove(&address) {
+            if stream.file_handle != 0 {
+                self.win32.close_handle(stream.file_handle).ok();
+            }
+        }
+        self.mf_presentation_descriptors.remove(&address);
+        self.mf_stream_descriptors.remove(&address);
+        self.mf_media_type_handlers.remove(&address);
+        self.mf_media_events.remove(&address);
+        self.mf_media_types.remove(&address);
+        self.mf_source_d3d_managers.remove(&address);
+        self.mf_source_readers.remove(&address);
+        self.mf_media_sources.remove(&address);
+        self.guest_objects.remove(&address);
+        Ok(())
+    }
+
+    /// IMFByteStream::EndRead — completes a synchronous BeginRead by writing
+    /// the recorded byte count out.
+    pub(crate) fn dispatch_mf_byte_stream_end_read(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let result = guest_call_arg(state, memory, 1)?;
+        let read_out = guest_call_arg(state, memory, 2)?;
+        let Some(stream) = self.mf_byte_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if result == 0 || result != stream.last_async_result {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let read = stream.last_async_read;
+        if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
+            stream.last_async_result = 0;
+        }
+        if read_out != 0 {
+            write_u32(memory, read_out, read);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::BeginWrite — synchronous write completion (see
+    /// BeginRead).
+    pub(crate) fn dispatch_mf_byte_stream_begin_write(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let buffer = guest_call_arg(state, memory, 1)?;
+        let length = guest_call_arg_u32(state, memory, 2)?;
+        let _callback = guest_call_arg(state, memory, 3)?;
+        let _state_object = guest_call_arg(state, memory, 4)?;
+        let Some(stream) = self.mf_byte_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if !stream.writable {
+            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+            return Ok(());
+        }
+        // Drive the synchronous Write implementation, then capture the
+        // completion in an IMFAsyncResult for EndWrite.
+        let (written, denied) = self.mf_byte_stream_write_bytes(this, buffer, length, memory)?;
+        if denied {
+            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+            return Ok(());
+        }
+        let result = self.alloc_mf_async_result(memory, 0, S_OK)?;
+        if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
+            stream.last_async_result = result;
+            stream.last_async_written = written;
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFByteStream::EndWrite.
+    pub(crate) fn dispatch_mf_byte_stream_end_write(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let result = guest_call_arg(state, memory, 1)?;
+        let written_out = guest_call_arg(state, memory, 2)?;
+        let Some(stream) = self.mf_byte_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if stream.closed {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if result == 0 || result != stream.last_async_result {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let written = stream.last_async_written;
+        if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
+            stream.last_async_result = 0;
+        }
+        if written_out != 0 {
+            write_u32(memory, written_out, written);
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -4082,21 +6205,6 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// IMFPresentationDescriptor::GetStreamDescriptorCount.
-    pub(crate) fn dispatch_mf_presentation_descriptor_get_stream_descriptor_count(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
-        let out = guest_call_arg(state, memory, 1)?;
-        if out != 0 {
-            write_u32(memory, out, 0);
-        }
-        state.set(Register::Rax, u64::from(S_OK));
-        Ok(())
-    }
-
     /// IMFMediaEvent::GetType.
     pub(crate) fn dispatch_mf_event_get_type(
         &mut self,
@@ -4112,6 +6220,162 @@ impl PeHostRuntime {
             .unwrap_or(0);
         if out != 0 {
             write_u32(memory, out, event_type);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFMediaEvent::GetExtendedType — the runtime queues no extended-type
+    /// events, so the documented GUID_NULL is written.
+    pub(crate) fn dispatch_mf_event_get_extended_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if !self.mf_media_events.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if out != 0 {
+            memory.map_bytes(out, &[0_u8; 16]);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFMediaEvent::GetStatus(phrStatus) — the event's HRESULT status.
+    pub(crate) fn dispatch_mf_event_get_status(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(event) = self.mf_media_events.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out != 0 {
+            write_u32(memory, out, event.status);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFMediaEvent::GetValue(pvValue) — the event value as a VT_UI8
+    /// PROPVARIANT (the runtime's modelled values are 64-bit positions).
+    pub(crate) fn dispatch_mf_event_get_value(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(event) = self.mf_media_events.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out != 0 {
+            write_guest_u32(memory, out, 21).ok(); // VT_UI8
+            write_guest_u64(memory, out + 8, event.value).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFAsyncResult::GetState(ppunkState).
+    pub(crate) fn dispatch_mf_async_result_get_state(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(result) = self.mf_async_results.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let state_object = result.state_object;
+        if out != 0 {
+            write_guest_pointer(memory, out, state_object, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFAsyncResult::GetStatus(phrStatus).
+    pub(crate) fn dispatch_mf_async_result_get_status(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(result) = self.mf_async_results.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out != 0 {
+            write_u32(memory, out, result.status);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFAsyncResult::SetStatus(hrStatus).
+    pub(crate) fn dispatch_mf_async_result_set_status(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let status = guest_call_arg_u32(state, memory, 1)?;
+        let Some(result) = self.mf_async_results.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        result.status = status;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFAsyncResult::GetObject(ppObject) — the runtime's completion
+    /// results carry no object.
+    pub(crate) fn dispatch_mf_async_result_get_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if !self.mf_async_results.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// IMFAsyncResult::GetCallback(ppCallback) — the runtime's synchronous
+    /// completions carry no callback object.
+    pub(crate) fn dispatch_mf_async_result_get_callback(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if !self.mf_async_results.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -4338,9 +6602,26 @@ impl PeHostRuntime {
             MfMediaSourceCreatePresentationDescriptor => {
                 self.dispatch_mf_media_source_create_presentation_descriptor(state, memory)
             }
-            MfMediaSourceControl => self.dispatch_mf_media_source_control(state, memory),
+            MfMediaSourceStart => self.dispatch_mf_media_source_start(state, memory),
+            MfMediaSourceStop => self.dispatch_mf_media_source_stop(state, memory),
+            MfMediaSourcePause => self.dispatch_mf_media_source_pause(state, memory),
             MfMediaSourceShutdown => self.dispatch_mf_media_source_shutdown(state, memory),
-            MfMediaSourceEvents => self.dispatch_mf_media_source_events(state, memory),
+            MfMediaSourceGetEvent => self.dispatch_mf_media_source_get_event(state, memory),
+            MfMediaSourceBeginGetEvent => {
+                self.dispatch_mf_media_source_begin_get_event(state, memory)
+            }
+            MfMediaSourceEndGetEvent => self.dispatch_mf_media_source_end_get_event(state, memory),
+            MfMediaSourceQueueEvent => self.dispatch_mf_media_source_queue_event(state, memory),
+            MfMediaSourceGetSourceAttributes => {
+                self.dispatch_mf_media_source_get_source_attributes(state, memory)
+            }
+            MfMediaSourceGetStreamAttributes => {
+                self.dispatch_mf_media_source_get_stream_attributes(state, memory)
+            }
+            MfMediaSourceSetD3dManager => {
+                self.dispatch_mf_media_source_set_d3d_manager(state, memory)
+            }
+            MfCreateFile => self.dispatch_mf_create_file(state, memory),
             MfSourceResolverBegin => self.dispatch_mf_source_resolver_begin(state, memory),
             MftStreamAttributes => self.dispatch_mft_stream_attributes(state, memory),
             MftFixedStreams => self.dispatch_mft_fixed_streams(state, memory),
@@ -4357,14 +6638,51 @@ impl PeHostRuntime {
                 self.dispatch_mf_source_reader_get_native_media_type(state, memory)
             }
             MfSourceReaderReadSample => self.dispatch_mf_source_reader_read_sample(state, memory),
+            MfSourceReaderGetStreamSelection => {
+                self.dispatch_mf_source_reader_get_stream_selection(state, memory)
+            }
+            MfSourceReaderSetStreamSelection => {
+                self.dispatch_mf_source_reader_set_stream_selection(state, memory)
+            }
+            MfSourceReaderSetCurrentMediaType => {
+                self.dispatch_mf_source_reader_set_current_media_type(state, memory)
+            }
+            MfSourceReaderSetCurrentPosition => {
+                self.dispatch_mf_source_reader_set_current_position(state, memory)
+            }
+            MfSourceReaderFlush => self.dispatch_mf_source_reader_flush(state, memory),
+            MfSourceReaderGetServiceForStream => {
+                self.dispatch_mf_source_reader_get_service_for_stream(state, memory)
+            }
+            MfSourceReaderGetPresentationAttribute => {
+                self.dispatch_mf_source_reader_get_presentation_attribute(state, memory)
+            }
             MfSinkWriterAddStream => self.dispatch_mf_sink_writer_add_stream(state, memory),
             MfSinkWriterBeginWriting => self.dispatch_mf_sink_writer_begin_writing(state, memory),
             MfSinkWriterWriteSample => self.dispatch_mf_sink_writer_write_sample(state, memory),
             MfSinkWriterEndWriting => self.dispatch_mf_sink_writer_end_writing(state, memory),
+            MfByteStreamGetCapabilities => {
+                self.dispatch_mf_byte_stream_get_capabilities(state, memory)
+            }
+            MfByteStreamSetLength => self.dispatch_mf_byte_stream_set_length(state, memory),
             MfByteStreamGetCurrentPosition => {
                 self.dispatch_mf_byte_stream_get_current_position(state, memory)
             }
+            MfByteStreamSetCurrentPosition => {
+                self.dispatch_mf_byte_stream_set_current_position(state, memory)
+            }
+            MfByteStreamIsEndOfStream => {
+                self.dispatch_mf_byte_stream_is_end_of_stream(state, memory)
+            }
             MfByteStreamRead => self.dispatch_mf_byte_stream_read(state, memory),
+            MfByteStreamBeginRead => self.dispatch_mf_byte_stream_begin_read(state, memory),
+            MfByteStreamEndRead => self.dispatch_mf_byte_stream_end_read(state, memory),
+            MfByteStreamWrite => self.dispatch_mf_byte_stream_write(state, memory),
+            MfByteStreamBeginWrite => self.dispatch_mf_byte_stream_begin_write(state, memory),
+            MfByteStreamEndWrite => self.dispatch_mf_byte_stream_end_write(state, memory),
+            MfByteStreamSeek => self.dispatch_mf_byte_stream_seek(state, memory),
+            MfByteStreamFlush => self.dispatch_mf_byte_stream_flush(state, memory),
+            MfByteStreamClose => self.dispatch_mf_byte_stream_close(state, memory),
             MfByteStreamGetLength => self.dispatch_mf_byte_stream_get_length(state, memory),
             MfTopologyAddNode => self.dispatch_mf_topology_add_node(state, memory),
             MfTopologyGetNodeCount => self.dispatch_mf_topology_get_node_count(state, memory),
@@ -4376,7 +6694,50 @@ impl PeHostRuntime {
             MfPresentationDescriptorGetStreamDescriptorCount => {
                 self.dispatch_mf_presentation_descriptor_get_stream_descriptor_count(state, memory)
             }
+            MfPresentationDescriptorGetStreamDescriptorByIndex => self
+                .dispatch_mf_presentation_descriptor_get_stream_descriptor_by_index(state, memory),
+            MfPresentationDescriptorSelectStream => {
+                self.dispatch_mf_presentation_descriptor_select_stream(state, memory)
+            }
+            MfPresentationDescriptorDeselectStream => {
+                self.dispatch_mf_presentation_descriptor_deselect_stream(state, memory)
+            }
+            MfPresentationDescriptorClone => {
+                self.dispatch_mf_presentation_descriptor_clone(state, memory)
+            }
+            MfStreamDescriptorGetStreamIdentifier => {
+                self.dispatch_mf_stream_descriptor_get_stream_identifier(state, memory)
+            }
+            MfStreamDescriptorGetMediaTypeHandler => {
+                self.dispatch_mf_stream_descriptor_get_media_type_handler(state, memory)
+            }
+            MfMediaTypeHandlerIsMediaTypeSupported => {
+                self.dispatch_mf_media_type_handler_is_media_type_supported(state, memory)
+            }
+            MfMediaTypeHandlerGetMediaTypeCount => {
+                self.dispatch_mf_media_type_handler_get_media_type_count(state, memory)
+            }
+            MfMediaTypeHandlerGetMediaTypeByIndex => {
+                self.dispatch_mf_media_type_handler_get_media_type_by_index(state, memory)
+            }
+            MfMediaTypeHandlerSetCurrentMediaType => {
+                self.dispatch_mf_media_type_handler_set_current_media_type(state, memory)
+            }
+            MfMediaTypeHandlerGetCurrentMediaType => {
+                self.dispatch_mf_media_type_handler_get_current_media_type(state, memory)
+            }
+            MfMediaTypeHandlerGetMajorType => {
+                self.dispatch_mf_media_type_handler_get_major_type(state, memory)
+            }
             MfEventGetType => self.dispatch_mf_event_get_type(state, memory),
+            MfEventGetExtendedType => self.dispatch_mf_event_get_extended_type(state, memory),
+            MfEventGetStatus => self.dispatch_mf_event_get_status(state, memory),
+            MfEventGetValue => self.dispatch_mf_event_get_value(state, memory),
+            MfAsyncResultGetState => self.dispatch_mf_async_result_get_state(state, memory),
+            MfAsyncResultGetStatus => self.dispatch_mf_async_result_get_status(state, memory),
+            MfAsyncResultSetStatus => self.dispatch_mf_async_result_set_status(state, memory),
+            MfAsyncResultGetObject => self.dispatch_mf_async_result_get_object(state, memory),
+            MfAsyncResultGetCallback => self.dispatch_mf_async_result_get_callback(state, memory),
             MfActivateGetCount => self.dispatch_mf_activate_get_count(state, memory),
             MfActivateGetItem => self.dispatch_mf_activate_get_item(state, memory),
             MfActivateGetGuid => self.dispatch_mf_activate_get_guid(state, memory),
@@ -4565,12 +6926,22 @@ fn mf_session_methods() -> Vec<HostThunk> {
     methods
 }
 
-/// The IMFSourceReader vtable.
+/// The IMFSourceReader vtable (the true Windows order: GetStreamSelection,
+/// SetStreamSelection, GetNativeMediaType, GetCurrentMediaType,
+/// SetCurrentMediaType, SetCurrentPosition, ReadSample, Flush,
+/// GetServiceForStream, GetPresentationAttribute).
 fn mf_source_reader_methods() -> Vec<HostThunk> {
     let mut methods = unknown_preamble();
-    methods.push(HostThunk::MfSourceReaderGetCurrentMediaType);
+    methods.push(HostThunk::MfSourceReaderGetStreamSelection);
+    methods.push(HostThunk::MfSourceReaderSetStreamSelection);
     methods.push(HostThunk::MfSourceReaderGetNativeMediaType);
+    methods.push(HostThunk::MfSourceReaderGetCurrentMediaType);
+    methods.push(HostThunk::MfSourceReaderSetCurrentMediaType);
+    methods.push(HostThunk::MfSourceReaderSetCurrentPosition);
     methods.push(HostThunk::MfSourceReaderReadSample);
+    methods.push(HostThunk::MfSourceReaderFlush);
+    methods.push(HostThunk::MfSourceReaderGetServiceForStream);
+    methods.push(HostThunk::MfSourceReaderGetPresentationAttribute);
     methods
 }
 
@@ -4593,12 +6964,27 @@ fn mf_sink_writer_methods() -> Vec<HostThunk> {
     methods
 }
 
-/// The IMFByteStream vtable.
+/// The IMFByteStream vtable (the true Windows order: GetCapabilities,
+/// GetLength, SetLength, GetCurrentPosition, SetCurrentPosition,
+/// IsEndOfStream, Read, BeginRead, EndRead, Write, BeginWrite, EndWrite,
+/// Seek, Flush, Close).
 fn mf_byte_stream_methods() -> Vec<HostThunk> {
     let mut methods = unknown_preamble();
-    methods.push(HostThunk::MfByteStreamGetCurrentPosition);
-    methods.push(HostThunk::MfByteStreamRead);
+    methods.push(HostThunk::MfByteStreamGetCapabilities);
     methods.push(HostThunk::MfByteStreamGetLength);
+    methods.push(HostThunk::MfByteStreamSetLength);
+    methods.push(HostThunk::MfByteStreamGetCurrentPosition);
+    methods.push(HostThunk::MfByteStreamSetCurrentPosition);
+    methods.push(HostThunk::MfByteStreamIsEndOfStream);
+    methods.push(HostThunk::MfByteStreamRead);
+    methods.push(HostThunk::MfByteStreamBeginRead);
+    methods.push(HostThunk::MfByteStreamEndRead);
+    methods.push(HostThunk::MfByteStreamWrite);
+    methods.push(HostThunk::MfByteStreamBeginWrite);
+    methods.push(HostThunk::MfByteStreamEndWrite);
+    methods.push(HostThunk::MfByteStreamSeek);
+    methods.push(HostThunk::MfByteStreamFlush);
+    methods.push(HostThunk::MfByteStreamClose);
     methods
 }
 
@@ -4649,18 +7035,90 @@ pub(crate) fn mf_dxgi_device_manager_methods() -> Vec<HostThunk> {
     methods
 }
 
-/// The IMFPresentationDescriptor vtable.
+/// The IMFPresentationDescriptor vtable: the IMFAttributes base followed by
+/// GetStreamDescriptorCount, GetStreamDescriptorByIndex, SelectStream,
+/// DeselectStream, Clone.
 fn mf_presentation_descriptor_methods() -> Vec<HostThunk> {
-    let mut methods = unknown_preamble();
+    let mut methods = mf_attributes_methods();
     methods.push(HostThunk::MfPresentationDescriptorGetStreamDescriptorCount);
+    methods.push(HostThunk::MfPresentationDescriptorGetStreamDescriptorByIndex);
+    methods.push(HostThunk::MfPresentationDescriptorSelectStream);
+    methods.push(HostThunk::MfPresentationDescriptorDeselectStream);
+    methods.push(HostThunk::MfPresentationDescriptorClone);
     methods
 }
 
-/// The IMFMediaEvent vtable.
-#[allow(dead_code)] // the event-object vtable builder
-fn mf_event_methods() -> Vec<HostThunk> {
+/// The IMFStreamDescriptor vtable: the IMFAttributes base followed by
+/// GetStreamIdentifier and GetMediaTypeHandler.
+fn mf_stream_descriptor_methods() -> Vec<HostThunk> {
+    let mut methods = mf_attributes_methods();
+    methods.push(HostThunk::MfStreamDescriptorGetStreamIdentifier);
+    methods.push(HostThunk::MfStreamDescriptorGetMediaTypeHandler);
+    methods
+}
+
+/// The IMFMediaTypeHandler vtable (the true order: IsMediaTypeSupported,
+/// GetMediaTypeCount, GetMediaTypeByIndex, SetCurrentMediaType,
+/// GetCurrentMediaType, GetMajorType).
+fn mf_media_type_handler_methods() -> Vec<HostThunk> {
     let mut methods = unknown_preamble();
+    methods.push(HostThunk::MfMediaTypeHandlerIsMediaTypeSupported);
+    methods.push(HostThunk::MfMediaTypeHandlerGetMediaTypeCount);
+    methods.push(HostThunk::MfMediaTypeHandlerGetMediaTypeByIndex);
+    methods.push(HostThunk::MfMediaTypeHandlerSetCurrentMediaType);
+    methods.push(HostThunk::MfMediaTypeHandlerGetCurrentMediaType);
+    methods.push(HostThunk::MfMediaTypeHandlerGetMajorType);
+    methods
+}
+
+/// The IMFMediaSource vtable: the IMFMediaEventGenerator base (GetEvent,
+/// BeginGetEvent, EndGetEvent, QueueEvent) followed by GetCharacteristics,
+/// CreatePresentationDescriptor, Start, Stop, Pause, Shutdown.
+fn mf_media_source_methods() -> Vec<HostThunk> {
+    let mut methods = unknown_preamble();
+    methods.push(HostThunk::MfMediaSourceGetEvent);
+    methods.push(HostThunk::MfMediaSourceBeginGetEvent);
+    methods.push(HostThunk::MfMediaSourceEndGetEvent);
+    methods.push(HostThunk::MfMediaSourceQueueEvent);
+    methods.push(HostThunk::MfMediaSourceGetCharacteristics);
+    methods.push(HostThunk::MfMediaSourceCreatePresentationDescriptor);
+    methods.push(HostThunk::MfMediaSourceStart);
+    methods.push(HostThunk::MfMediaSourceStop);
+    methods.push(HostThunk::MfMediaSourcePause);
+    methods.push(HostThunk::MfMediaSourceShutdown);
+    methods
+}
+
+/// The IMFMediaSourceEx vtable: the IMFMediaSource methods followed by
+/// GetSourceAttributes, GetStreamAttributes and SetD3DManager.
+fn mf_media_source_ex_methods() -> Vec<HostThunk> {
+    let mut methods = mf_media_source_methods();
+    methods.push(HostThunk::MfMediaSourceGetSourceAttributes);
+    methods.push(HostThunk::MfMediaSourceGetStreamAttributes);
+    methods.push(HostThunk::MfMediaSourceSetD3dManager);
+    methods
+}
+
+/// The IMFMediaEvent vtable: the IMFAttributes base followed by GetType,
+/// GetExtendedType, GetStatus and GetValue.
+fn mf_event_methods() -> Vec<HostThunk> {
+    let mut methods = mf_attributes_methods();
     methods.push(HostThunk::MfEventGetType);
+    methods.push(HostThunk::MfEventGetExtendedType);
+    methods.push(HostThunk::MfEventGetStatus);
+    methods.push(HostThunk::MfEventGetValue);
+    methods
+}
+
+/// The IMFAsyncResult vtable (GetState, GetStatus, SetStatus, GetObject,
+/// GetCallback) used by the synchronous BeginRead/BeginWrite completions.
+fn mf_async_result_methods() -> Vec<HostThunk> {
+    let mut methods = unknown_preamble();
+    methods.push(HostThunk::MfAsyncResultGetState);
+    methods.push(HostThunk::MfAsyncResultGetStatus);
+    methods.push(HostThunk::MfAsyncResultSetStatus);
+    methods.push(HostThunk::MfAsyncResultGetObject);
+    methods.push(HostThunk::MfAsyncResultGetCallback);
     methods
 }
 
@@ -4744,6 +7202,17 @@ fn mft_transform_methods() -> Vec<HostThunk> {
 fn read_mf_guid(memory: &MemoryImage, pointer: u64) -> Guid {
     let bytes = memory.read_bytes(pointer, 16).unwrap_or_default();
     mf_guid_from_bytes(&bytes)
+}
+
+/// Map a runtime file-open failure to the Win32 HRESULT a guest expects.
+fn win32_error_to_hresult(error: &crate::error::AppError) -> u32 {
+    use crate::reason::ReasonCode;
+    match error.code {
+        ReasonCode::RcFsNotFound => 0x8007_0002, // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+        ReasonCode::RcFsAlreadyExists => 0x8007_00B7, // HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)
+        ReasonCode::RcHelperPermissionDenied => E_ACCESSDENIED,
+        _ => 0x8007_0003, // HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)
+    }
 }
 
 /// A GUID from the guest little-endian bytes (the data1..data4 fields).
@@ -4946,6 +7415,35 @@ mod tests {
             // The media-session service answered with the wrong interface.
             write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_MEDIA_SESSION);
             write_guest_guid_bytes(&mut memory, iid, &IID_IMF_RATE_CONTROL);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_SERVICE as u64);
+
+            // The source-side services belong to real sources / byte streams,
+            // never to the session object.
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_MEDIASOURCE);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_MEDIA_SOURCE);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_SERVICE as u64);
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_BYTESTREAM_ORIGIN_NAME);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_ATTRIBUTES);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_SERVICE as u64);
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_METADATA_PROVIDER);
             let hr = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
@@ -5337,6 +7835,1291 @@ mod tests {
                 &[session as u32, guid as u32, iid as u32, 0],
             );
             assert_eq!(hr, E_INVALIDARG as u64);
+        })
+    }
+
+    // =======================================================================
+    // Real source-side tests: file-table byte streams, media sources,
+    // descriptors, events and service resolution.
+    // =======================================================================
+
+    /// A minimal but fully valid MP4: `ftyp` + `moov` (one `vide` track with
+    /// two 4-byte samples described by real `stbl` tables) + `mdat`.  The
+    /// `stco` chunk offset is patched to the real `mdat` payload, so the
+    /// demuxer reads the actual sample bytes.
+    fn minimal_mp4_file() -> Vec<u8> {
+        fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(payload);
+            out
+        }
+
+        let ftyp = boxed(b"ftyp", b"mp42\0\0\0\0");
+        let mut tkhd_payload = vec![0_u8; 12];
+        tkhd_payload.extend_from_slice(&1_u32.to_be_bytes());
+        let tkhd = boxed(b"tkhd", &tkhd_payload);
+        let mut mdhd_payload = vec![0_u8; 12];
+        mdhd_payload.extend_from_slice(&600_u32.to_be_bytes()); // timescale
+        mdhd_payload.extend_from_slice(&1200_u32.to_be_bytes()); // duration (2 s)
+        mdhd_payload.extend_from_slice(&[0_u8; 4]);
+        let mdhd = boxed(b"mdhd", &mdhd_payload);
+        let mut hdlr_payload = vec![0_u8; 8];
+        hdlr_payload.extend_from_slice(b"vide");
+        hdlr_payload.extend_from_slice(&[0_u8; 12]);
+        let hdlr = boxed(b"hdlr", &hdlr_payload);
+        let stsd = boxed(b"stsd", &[0_u8; 8]);
+        let mut stts_payload = vec![0_u8; 4];
+        stts_payload.extend_from_slice(&1_u32.to_be_bytes());
+        stts_payload.extend_from_slice(&2_u32.to_be_bytes());
+        stts_payload.extend_from_slice(&600_u32.to_be_bytes());
+        let stts = boxed(b"stts", &stts_payload);
+        let mut stsc_payload = vec![0_u8; 4];
+        stsc_payload.extend_from_slice(&1_u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1_u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&2_u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1_u32.to_be_bytes());
+        let stsc = boxed(b"stsc", &stsc_payload);
+        let mut stsz_payload = vec![0_u8; 4];
+        stsz_payload.extend_from_slice(&0_u32.to_be_bytes());
+        stsz_payload.extend_from_slice(&2_u32.to_be_bytes());
+        stsz_payload.extend_from_slice(&4_u32.to_be_bytes());
+        stsz_payload.extend_from_slice(&4_u32.to_be_bytes());
+        let stsz = boxed(b"stsz", &stsz_payload);
+        let mut stco_payload = vec![0_u8; 4];
+        stco_payload.extend_from_slice(&1_u32.to_be_bytes());
+        stco_payload.extend_from_slice(&0_u32.to_be_bytes()); // patched below
+        let stco = boxed(b"stco", &stco_payload);
+        let stbl = boxed(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+        let minf = boxed(b"minf", &stbl);
+        let mdia = boxed(b"mdia", &[mdhd, hdlr, minf].concat());
+        let trak = boxed(b"trak", &[tkhd, mdia].concat());
+        let moov = boxed(b"moov", &trak);
+        let mdat = boxed(b"mdat", b"DATA0123");
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&moov);
+        let samples_offset = file.len() as u32 + 8;
+        file.extend_from_slice(&mdat);
+        let stco_type = file
+            .windows(4)
+            .position(|window| window == b"stco")
+            .expect("stco box present");
+        let offset_at = stco_type + 12;
+        file[offset_at..offset_at + 4].copy_from_slice(&samples_offset.to_be_bytes());
+        file
+    }
+
+    /// Write bytes into the sandbox at a guest-visible Windows path.
+    fn write_sandbox_file(runtime: &PeHostRuntime, guest_path: &str, bytes: &[u8]) {
+        let host_path = runtime
+            .win32
+            .ge()
+            .host_path_for_windows_path(guest_path)
+            .expect("host path");
+        if let Some(parent) = host_path.parent() {
+            std::fs::create_dir_all(parent).expect("create sandbox dir");
+        }
+        std::fs::write(&host_path, bytes).expect("write sandbox file");
+    }
+
+    /// Write a NUL-terminated UTF-16 string into guest memory.
+    fn write_utf16(memory: &mut MemoryImage, address: u64, value: &str) {
+        let mut bytes = Vec::with_capacity(value.len() * 2 + 2);
+        for unit in value.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0, 0]);
+        memory.map_bytes(address, &bytes);
+    }
+
+    /// The real source graph created by `MFCreateSourceReaderFromURL`.
+    struct SourceGraph {
+        reader: u64,
+        source: u64,
+        byte_stream: u64,
+    }
+
+    fn create_source_graph(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        guest_path: &str,
+    ) -> SourceGraph {
+        let create_reader: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateSourceReaderFromUrl);
+        let url = 0x42_000;
+        write_utf16(memory, url, guest_path);
+        let reader_out = 0x41_000;
+        let hr = dispatch_x86_thunk(
+            runtime,
+            memory,
+            create_reader,
+            &[url as u32, 0, reader_out as u32],
+        );
+        assert_eq!(hr, 0, "MFCreateSourceReaderFromURL");
+        let reader = read_guest_pointer(memory, reader_out, GuestArch::X86).unwrap();
+        assert_ne!(reader, 0);
+        let source = runtime.mf_source_readers.get(&reader).unwrap().source();
+        assert_ne!(source, 0, "the reader is wired to a real source");
+        let byte_stream = runtime.mf_media_sources.get(&source).unwrap().byte_stream();
+        assert_ne!(byte_stream, 0, "the source is wired to a byte stream");
+        SourceGraph {
+            reader,
+            source,
+            byte_stream,
+        }
+    }
+
+    /// Pull one source event and answer its real MF event number, or the
+    /// HRESULT when the queue is empty.
+    fn pull_source_event_type(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        source: u64,
+    ) -> u64 {
+        let get_event: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceGetEvent);
+        let get_type: u64 = runtime.alloc_host_thunk(HostThunk::MfEventGetType);
+        let event_out = 0x44_400;
+        let hr = dispatch_x86_thunk(
+            runtime,
+            memory,
+            get_event,
+            &[source as u32, 0, event_out as u32],
+        );
+        if hr != 0 {
+            return hr;
+        }
+        let event = read_guest_pointer(memory, event_out, GuestArch::X86).unwrap();
+        assert_ne!(event, 0);
+        let type_out = 0x44_410;
+        let hr = dispatch_x86_thunk(runtime, memory, get_type, &[event as u32, type_out as u32]);
+        assert_eq!(hr, 0);
+        u64::from(read_guest_u32(memory, type_out).unwrap())
+    }
+
+    #[test]
+    fn mf_source_reader_from_url_builds_real_byte_stream_and_source() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-source-graph");
+            let mut memory = MemoryImage::default();
+            let mp4 = minimal_mp4_file();
+            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &mp4);
+            let graph = create_source_graph(&mut runtime, &mut memory, "C:\\media\\clip.mp4");
+
+            // The presentation is the real parsed file: one track, real
+            // duration (1200/600 s), seekable, real file size.
+            let source = runtime.mf_media_sources.get(&graph.source).unwrap();
+            assert_eq!(source.state(), crate::media::MfSourceState::Stopped);
+            assert_eq!(source.readers(), &[graph.reader]);
+            let presentation = source.presentation().clone();
+            assert_eq!(presentation.streams.len(), 1);
+            assert_eq!(presentation.streams[0].identifier, 1);
+            assert_eq!(presentation.duration, 20_000_000);
+            assert!(presentation.seekable);
+            assert_eq!(presentation.file_size, mp4.len() as u64);
+
+            // The byte stream is backed by a real runtime file-table handle.
+            let stream = runtime.mf_byte_streams.get(&graph.byte_stream).unwrap();
+            assert_ne!(stream.file_handle, 0);
+            assert_eq!(stream.length, mp4.len() as u64);
+            assert!(stream.seekable);
+            assert!(!stream.writable);
+            assert_eq!(stream.content_type.as_deref(), Some("video/mp4"));
+            assert_eq!(stream.origin_name.as_deref(), Some("C:\\media\\clip.mp4"));
+
+            // IMFByteStream::GetLength / Read / IsEndOfStream / Seek over the
+            // real file bytes.
+            let get_length: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamGetLength);
+            let length_out = 0x43_100;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_length,
+                    &[graph.byte_stream as u32, length_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u64(&memory, length_out).unwrap(),
+                mp4.len() as u64
+            );
+
+            let read: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamRead);
+            let buffer = 0x43_200;
+            let read_out = 0x43_210;
+            // The stream starts at byte 0 of the real file.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    read,
+                    &[graph.byte_stream as u32, buffer as u32, 8, read_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, read_out).unwrap(), 8);
+            assert_eq!(memory.read_bytes(buffer, 8).unwrap(), mp4[..8].to_vec());
+
+            // Seek to the real sample payload and read it back.
+            let seek: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamSeek);
+            let position_out = 0x43_230;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    seek,
+                    &[
+                        graph.byte_stream as u32,
+                        0,
+                        (mp4.len() - 8) as u32,
+                        0,
+                        position_out as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u64(&memory, position_out).unwrap(),
+                (mp4.len() - 8) as u64
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    read,
+                    &[graph.byte_stream as u32, buffer as u32, 8, read_out as u32]
+                ),
+                0
+            );
+            assert_eq!(memory.read_bytes(buffer, 8).unwrap(), b"DATA0123".to_vec());
+
+            let at_end: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamIsEndOfStream);
+            let end_out = 0x43_220;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    at_end,
+                    &[graph.byte_stream as u32, end_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, end_out).unwrap(), 1);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    seek,
+                    &[graph.byte_stream as u32, 0, 0, 0, position_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u64(&memory, position_out).unwrap(), 0);
+
+            // MFGetService: the source owns MF_MEDIASOURCE_SERVICE for
+            // IMFMediaSource/IMFMediaSourceEx/IUnknown only.
+            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
+            let guid = 0x44_000;
+            let iid = 0x44_100;
+            let out = 0x44_200;
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_MEDIASOURCE);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_MEDIA_SOURCE_EX);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[graph.source as u32, guid as u32, iid as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
+                graph.source
+            );
+
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_SOURCE_READER);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[graph.source as u32, guid as u32, iid as u32, out as u32]
+                ),
+                MF_E_UNSUPPORTED_SERVICE as u64
+            );
+
+            // The metadata provider stays genuinely unsupported (no real tag
+            // parser exists).
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_METADATA_PROVIDER);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_ATTRIBUTES);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[graph.source as u32, guid as u32, iid as u32, out as u32]
+                ),
+                MF_E_UNSUPPORTED_SERVICE as u64
+            );
+
+            // The byte stream exposes its real origin/content-type attributes
+            // through the attribute services.
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_BYTESTREAM_ORIGIN_NAME);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_ATTRIBUTES);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[
+                        graph.byte_stream as u32,
+                        guid as u32,
+                        iid as u32,
+                        out as u32
+                    ]
+                ),
+                0
+            );
+            let origin_attrs = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            let origin_key = Guid::from_bytes_le(&SERVICE_MF_BYTESTREAM_ORIGIN_NAME);
+            assert_eq!(
+                runtime
+                    .mf_media_types
+                    .get(&origin_attrs)
+                    .unwrap()
+                    .get_string(&origin_key),
+                Some("C:\\media\\clip.mp4")
+            );
+
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_BYTESTREAM_CONTENT_TYPE);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[
+                        graph.byte_stream as u32,
+                        guid as u32,
+                        iid as u32,
+                        out as u32
+                    ]
+                ),
+                0
+            );
+            let content_attrs = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            let content_key = Guid::from_bytes_le(&SERVICE_MF_BYTESTREAM_CONTENT_TYPE);
+            assert_eq!(
+                runtime
+                    .mf_media_types
+                    .get(&content_attrs)
+                    .unwrap()
+                    .get_string(&content_key),
+                Some("video/mp4")
+            );
+
+            // A wrong interface for a backed attribute, and a service the
+            // byte stream does not own.
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_GET_SERVICE);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[
+                        graph.byte_stream as u32,
+                        guid as u32,
+                        iid as u32,
+                        out as u32
+                    ]
+                ),
+                MF_E_UNSUPPORTED_SERVICE as u64
+            );
+            // Every sibling MF interface IID stays unsupported for the
+            // byte-stream attribute services.
+            for wrong_iid in [
+                IID_IMF_BYTE_STREAM,
+                IID_IMF_PRESENTATION_DESCRIPTOR,
+                IID_IMF_STREAM_DESCRIPTOR,
+                IID_IMF_MEDIA_TYPE_HANDLER,
+                IID_IMF_MEDIA_EVENT,
+            ] {
+                write_guest_guid_bytes(&mut memory, iid, &wrong_iid);
+                assert_eq!(
+                    dispatch_x86_thunk(
+                        &mut runtime,
+                        &mut memory,
+                        get_service,
+                        &[
+                            graph.byte_stream as u32,
+                            guid as u32,
+                            iid as u32,
+                            out as u32
+                        ]
+                    ),
+                    MF_E_UNSUPPORTED_SERVICE as u64
+                );
+            }
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_METADATA_PROVIDER);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[
+                        graph.byte_stream as u32,
+                        guid as u32,
+                        iid as u32,
+                        out as u32
+                    ]
+                ),
+                MF_E_UNSUPPORTED_SERVICE as u64
+            );
+        })
+    }
+
+    #[test]
+    fn mf_source_reader_reads_real_samples_and_queues_end_of_presentation() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-read-sample");
+            let mut memory = MemoryImage::default();
+            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &minimal_mp4_file());
+            let graph = create_source_graph(&mut runtime, &mut memory, "C:\\media\\clip.mp4");
+
+            let read_sample: u64 = runtime.alloc_host_thunk(HostThunk::MfSourceReaderReadSample);
+            let actual_out = 0x43_300;
+            let flags_out = 0x43_310;
+            let timestamp_out = 0x43_320;
+            let sample_out = 0x43_330;
+            let args = [
+                graph.reader as u32,
+                0xFFFF_FFFC, // MF_SOURCE_READER_FIRST_VIDEO_STREAM
+                0,
+                actual_out as u32,
+                flags_out as u32,
+                timestamp_out as u32,
+                sample_out as u32,
+            ];
+
+            // First sample: the real bytes, first sample timestamp and the
+            // MF_SOURCE_READERF_NEWSTREAM flag.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, read_sample, &args),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, actual_out).unwrap(), 0);
+            assert_ne!(read_guest_u32(&memory, flags_out).unwrap() & 0x4, 0);
+            assert_eq!(read_guest_u64(&memory, timestamp_out).unwrap(), 0);
+            let sample = read_guest_pointer(&memory, sample_out, GuestArch::X86).unwrap();
+            assert_eq!(runtime.mf_samples.get(&sample).unwrap().buffer, b"DATA");
+
+            // Second sample: 1 second later in 100-ns units.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, read_sample, &args),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, flags_out).unwrap() & 0x4, 0);
+            assert_eq!(read_guest_u64(&memory, timestamp_out).unwrap(), 10_000_000);
+            let sample = read_guest_pointer(&memory, sample_out, GuestArch::X86).unwrap();
+            assert_eq!(runtime.mf_samples.get(&sample).unwrap().buffer, b"0123");
+
+            // Third read: the documented end-of-stream result.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, read_sample, &args),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, flags_out).unwrap(),
+                MF_SOURCE_READERF_ENDOFSTREAM
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, sample_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            // EOF queued MEEndOfStream then MEEndOfPresentation on the source.
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                212
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                211
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                MF_E_NO_EVENTS_AVAILABLE as u64
+            );
+        })
+    }
+
+    #[test]
+    fn mf_media_source_state_machine_seeks_the_attached_reader() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-source-states");
+            let mut memory = MemoryImage::default();
+            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &minimal_mp4_file());
+            let graph = create_source_graph(&mut runtime, &mut memory, "C:\\media\\clip.mp4");
+
+            let start: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceStart);
+            let pause: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourcePause);
+            let stop: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceStop);
+            let shutdown: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceShutdown);
+
+            // Start at the beginning: MESourceStarted/MENewStream/
+            // MEStreamStarted, then the real Started state.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    start,
+                    &[graph.source as u32, 0, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                runtime.mf_media_sources.get(&graph.source).unwrap().state(),
+                crate::media::MfSourceState::Started
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                201
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                205
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                202
+            );
+
+            // Pause is only legal from Started.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, pause, &[graph.source as u32]),
+                0
+            );
+            assert_eq!(
+                runtime.mf_media_sources.get(&graph.source).unwrap().state(),
+                crate::media::MfSourceState::Paused
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                209
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                210
+            );
+
+            // A second Start is a real seek: MESourceSeeked/MEStreamSeeked and
+            // the new 100-ns position.
+            let position = 0x45_000;
+            write_u32(&mut memory, position, 20); // VT_I8
+            write_guest_u64(&mut memory, position + 8, 5_000_000).expect("propvariant");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    start,
+                    &[graph.source as u32, 0, 0, position as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                runtime.mf_media_sources.get(&graph.source).unwrap().state(),
+                crate::media::MfSourceState::Started
+            );
+            assert_eq!(
+                runtime
+                    .mf_media_sources
+                    .get(&graph.source)
+                    .unwrap()
+                    .position(),
+                5_000_000
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                203
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                204
+            );
+
+            // The seek reached the attached reader: 5 s is past the 2 s
+            // presentation, so the next ReadSample reports EOF and queues the
+            // end-of-presentation events.
+            let read_sample: u64 = runtime.alloc_host_thunk(HostThunk::MfSourceReaderReadSample);
+            let flags_out = 0x43_310;
+            let sample_out = 0x43_330;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    read_sample,
+                    &[
+                        graph.reader as u32,
+                        0xFFFF_FFFC,
+                        0,
+                        0x43_300,
+                        flags_out as u32,
+                        0x43_320,
+                        sample_out as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, flags_out).unwrap(),
+                MF_SOURCE_READERF_ENDOFSTREAM
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                212
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                211
+            );
+            assert_eq!(
+                runtime.mf_media_sources.get(&graph.source).unwrap().state(),
+                crate::media::MfSourceState::Stopped
+            );
+
+            // Stop from the (ended) stopped state still answers the real
+            // MESourceStopped/MEStreamStopped events.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, stop, &[graph.source as u32]),
+                0
+            );
+            assert_eq!(
+                runtime.mf_media_sources.get(&graph.source).unwrap().state(),
+                crate::media::MfSourceState::Stopped
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                207
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                208
+            );
+
+            // Pause from Stopped is the real invalid-request error.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, pause, &[graph.source as u32]),
+                MF_E_INVALIDREQUEST as u64
+            );
+
+            // Shutdown is terminal.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, shutdown, &[graph.source as u32]),
+                0
+            );
+            assert_eq!(
+                runtime.mf_media_sources.get(&graph.source).unwrap().state(),
+                crate::media::MfSourceState::Shutdown
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    start,
+                    &[graph.source as u32, 0, 0, 0]
+                ),
+                MF_E_SHUTDOWN as u64
+            );
+        })
+    }
+
+    #[test]
+    fn mf_presentation_descriptor_exposes_real_file_metadata() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-descriptor");
+            let mut memory = MemoryImage::default();
+            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &minimal_mp4_file());
+            let graph = create_source_graph(&mut runtime, &mut memory, "C:\\media\\clip.mp4");
+
+            let create_pd: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaSourceCreatePresentationDescriptor);
+            let count: u64 = runtime
+                .alloc_host_thunk(HostThunk::MfPresentationDescriptorGetStreamDescriptorCount);
+            let by_index: u64 = runtime
+                .alloc_host_thunk(HostThunk::MfPresentationDescriptorGetStreamDescriptorByIndex);
+            let select: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfPresentationDescriptorSelectStream);
+            let deselect: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfPresentationDescriptorDeselectStream);
+            let clone: u64 = runtime.alloc_host_thunk(HostThunk::MfPresentationDescriptorClone);
+            let attr_u64: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetUint64);
+            let attr_u32: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetUint32);
+            let sd_identifier: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfStreamDescriptorGetStreamIdentifier);
+            let sd_handler: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfStreamDescriptorGetMediaTypeHandler);
+            let handler_count: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaTypeHandlerGetMediaTypeCount);
+            let handler_major: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaTypeHandlerGetMajorType);
+            let handler_current: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaTypeHandlerGetCurrentMediaType);
+            let handler_supported: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaTypeHandlerIsMediaTypeSupported);
+
+            let pd_out = 0x41_400;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_pd,
+                    &[graph.source as u32, pd_out as u32]
+                ),
+                0
+            );
+            let pd = read_guest_pointer(&memory, pd_out, GuestArch::X86).unwrap();
+            assert_ne!(pd, 0);
+
+            // The real duration/seekable attributes parsed from mdhd.
+            let key = 0x45_100;
+            let value = 0x45_200;
+            write_guest_guid_bytes(
+                &mut memory,
+                key,
+                &crate::media::MF_PD_DURATION.to_bytes_le(),
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    attr_u64,
+                    &[pd as u32, key as u32, value as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u64(&memory, value).unwrap(), 20_000_000);
+            write_guest_guid_bytes(
+                &mut memory,
+                key,
+                &crate::media::MF_PD_SEEKABLE.to_bytes_le(),
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    attr_u32,
+                    &[pd as u32, key as u32, value as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
+
+            // One real stream descriptor.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, count, &[pd as u32, value as u32]),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
+            let selected_out = 0x45_300;
+            let sd_out = 0x45_310;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    by_index,
+                    &[pd as u32, 0, selected_out as u32, sd_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, selected_out).unwrap(), 1);
+            let sd = read_guest_pointer(&memory, sd_out, GuestArch::X86).unwrap();
+            assert_ne!(sd, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    sd_identifier,
+                    &[sd as u32, value as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
+
+            // The handler enumerates the parsed native media type.
+            let handler_out = 0x45_320;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    sd_handler,
+                    &[sd as u32, handler_out as u32]
+                ),
+                0
+            );
+            let handler = read_guest_pointer(&memory, handler_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    handler_count,
+                    &[handler as u32, value as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    handler_major,
+                    &[handler as u32, key as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                memory.read_bytes(key, 16).unwrap(),
+                crate::media::MFMediaType_Video.to_bytes_le().to_vec()
+            );
+            let media_type_out = 0x45_330;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    handler_current,
+                    &[handler as u32, media_type_out as u32]
+                ),
+                0
+            );
+            let media_type = read_guest_pointer(&memory, media_type_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    handler_supported,
+                    &[handler as u32, media_type as u32, 0]
+                ),
+                0
+            );
+
+            // Stream selection is real state and Clone is a real copy.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, deselect, &[pd as u32, 0]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    by_index,
+                    &[pd as u32, 0, selected_out as u32, sd_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, selected_out).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, select, &[pd as u32, 0]),
+                0
+            );
+            let clone_out = 0x45_340;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    clone,
+                    &[pd as u32, clone_out as u32]
+                ),
+                0
+            );
+            let cloned = read_guest_pointer(&memory, clone_out, GuestArch::X86).unwrap();
+            assert_ne!(cloned, pd);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    count,
+                    &[cloned as u32, value as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
+        })
+    }
+
+    #[test]
+    fn mf_create_file_byte_stream_reads_writes_and_seeks_real_files() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-create-file");
+            let mut memory = MemoryImage::default();
+            let mp4 = minimal_mp4_file();
+            write_sandbox_file(&runtime, "C:\\media\\input.mp4", &mp4);
+
+            let create: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateFile);
+            let url = 0x42_000;
+            write_utf16(&mut memory, url, "C:\\media\\input.mp4");
+            let stream_out = 0x41_500;
+            // MF_ACCESSMODE_READ=1, MF_OPENMODE_FAIL_IF_NOT_EXIST=0.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[1, 0, 0, url as u32, stream_out as u32]
+                ),
+                0
+            );
+            let stream = read_guest_pointer(&memory, stream_out, GuestArch::X86).unwrap();
+            assert_ne!(runtime.mf_byte_streams.get(&stream).unwrap().file_handle, 0);
+
+            // A missing file answers the real file-not-found HRESULT.
+            let missing = 0x42_100;
+            write_utf16(&mut memory, missing, "C:\\media\\missing.mp4");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[1, 0, 0, missing as u32, stream_out as u32]
+                ),
+                0x8007_0002
+            );
+
+            // Read the real file start, then seek to the sample payload.
+            let read: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamRead);
+            let buffer = 0x43_400;
+            let read_out = 0x43_410;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    read,
+                    &[stream as u32, buffer as u32, 8, read_out as u32]
+                ),
+                0
+            );
+            assert_eq!(memory.read_bytes(buffer, 8).unwrap(), mp4[..8].to_vec());
+            let set_position: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfByteStreamSetCurrentPosition);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_position,
+                    &[stream as u32, (mp4.len() - 8) as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    read,
+                    &[stream as u32, buffer as u32, 8, read_out as u32]
+                ),
+                0
+            );
+            assert_eq!(memory.read_bytes(buffer, 8).unwrap(), b"DATA0123".to_vec());
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_position,
+                    &[stream as u32, (mp4.len() - 4) as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    read,
+                    &[stream as u32, buffer as u32, 4, read_out as u32]
+                ),
+                0
+            );
+            assert_eq!(memory.read_bytes(buffer, 4).unwrap(), b"0123".to_vec());
+
+            // A read-only stream denies Write.
+            let write: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamWrite);
+            let written_out = 0x43_420;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    write,
+                    &[stream as u32, buffer as u32, 4, written_out as u32]
+                ),
+                E_ACCESSDENIED as u64
+            );
+
+            // A writable stream really writes through the file table.
+            let writable_path = 0x42_200;
+            write_utf16(&mut memory, writable_path, "C:\\media\\output.bin");
+            let writable_out = 0x41_520;
+            // MF_ACCESSMODE_READWRITE=3, MF_OPENMODE_RESET_IF_EXIST=2.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[3, 2, 0, writable_path as u32, writable_out as u32]
+                ),
+                0
+            );
+            let writable = read_guest_pointer(&memory, writable_out, GuestArch::X86).unwrap();
+            memory.map_bytes(buffer, b"WXYZ");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    write,
+                    &[writable as u32, buffer as u32, 4, written_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, written_out).unwrap(), 4);
+            let flush: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamFlush);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, flush, &[writable as u32]),
+                0
+            );
+            let close: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamClose);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[writable as u32]),
+                0
+            );
+            let host_path = runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path("C:\\media\\output.bin")
+                .expect("host path");
+            assert_eq!(std::fs::read(&host_path).unwrap(), b"WXYZ".to_vec());
+
+            // A closed stream fails subsequent operations.
+            let get_length: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamGetLength);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_length,
+                    &[writable as u32, stream_out as u32]
+                ),
+                E_FAIL as u64
+            );
+
+            // FAIL_IF_EXIST on an existing file answers the real
+            // already-exists HRESULT.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[1, 1, 0, writable_path as u32, stream_out as u32]
+                ),
+                0x8007_00B7
+            );
+        })
+    }
+
+    #[test]
+    fn mf_create_source_reader_from_byte_stream_uses_the_real_stream() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-reader-from-stream");
+            let mut memory = MemoryImage::default();
+            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &minimal_mp4_file());
+
+            let create_file: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateFile);
+            let url = 0x42_000;
+            write_utf16(&mut memory, url, "C:\\media\\clip.mp4");
+            let stream_out = 0x41_500;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_file,
+                    &[1, 0, 0, url as u32, stream_out as u32]
+                ),
+                0
+            );
+            let stream = read_guest_pointer(&memory, stream_out, GuestArch::X86).unwrap();
+
+            let create_reader: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfCreateSourceReaderFromByteStream);
+            let reader_out = 0x41_000;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_reader,
+                    &[stream as u32, 0, reader_out as u32]
+                ),
+                0
+            );
+            let reader = read_guest_pointer(&memory, reader_out, GuestArch::X86).unwrap();
+            let source = runtime.mf_source_readers.get(&reader).unwrap().source();
+            assert_ne!(source, 0);
+            assert_eq!(
+                runtime.mf_media_sources.get(&source).unwrap().byte_stream(),
+                stream,
+                "the source consumes the supplied real byte stream"
+            );
+
+            // A handle that is not a runtime byte stream is invalid.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_reader,
+                    &[0x0000_DEAD, 0, reader_out as u32]
+                ),
+                0x8007_0006
+            );
+        })
+    }
+
+    #[test]
+    fn mf_topology_source_graph_resolves_descriptor_and_drives_the_source() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-topology-source");
+            let mut memory = MemoryImage::default();
+            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &minimal_mp4_file());
+            let graph = create_source_graph(&mut runtime, &mut memory, "C:\\media\\clip.mp4");
+
+            let create_topology: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateTopology);
+            let create_node: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateTopologyNode);
+            let set_object: u64 = runtime.alloc_host_thunk(HostThunk::MfTopologyNodeSetObject);
+            let add_node: u64 = runtime.alloc_host_thunk(HostThunk::MfTopologyAddNode);
+            let create_session: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMediaSession);
+            let set_topology: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionSetTopology);
+            let get_descriptor: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfSessionGetDescriptorFromTopology);
+            let session_start: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionStart);
+            let session_stop: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionStop);
+
+            let topology_out = 0x41_600;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_topology,
+                    &[topology_out as u32]
+                ),
+                0
+            );
+            let topology = read_guest_pointer(&memory, topology_out, GuestArch::X86).unwrap();
+            let node_out = 0x41_610;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_node,
+                    &[1, node_out as u32] // MF_TOPOLOGY_SOURCESTREAM_NODE
+                ),
+                0
+            );
+            let node = read_guest_pointer(&memory, node_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    add_node,
+                    &[topology as u32, node as u32]
+                ),
+                0
+            );
+            let session_out = 0x41_620;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_session,
+                    &[0, session_out as u32]
+                ),
+                0
+            );
+            let session = read_guest_pointer(&memory, session_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_topology,
+                    &[session as u32, 0, topology as u32]
+                ),
+                0
+            );
+
+            // Without a source object the topology has no representation.
+            let descriptor_out = 0x41_630;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_descriptor,
+                    &[session as u32, topology as u32, descriptor_out as u32]
+                ),
+                MF_E_UNSUPPORTED_REPRESENTATION as u64
+            );
+
+            // Wire the real source into the node, then resolve its real
+            // presentation descriptor through the session.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_object,
+                    &[node as u32, graph.source as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_descriptor,
+                    &[session as u32, topology as u32, descriptor_out as u32]
+                ),
+                0
+            );
+            let pd = read_guest_pointer(&memory, descriptor_out, GuestArch::X86).unwrap();
+            assert_ne!(pd, 0);
+            let count: u64 = runtime
+                .alloc_host_thunk(HostThunk::MfPresentationDescriptorGetStreamDescriptorCount);
+            let value = 0x45_500;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, count, &[pd as u32, value as u32]),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
+
+            // Session Start/Stop drive the real source state machine and
+            // queue its events.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    session_start,
+                    &[session as u32, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                runtime.mf_media_sources.get(&graph.source).unwrap().state(),
+                crate::media::MfSourceState::Started
+            );
+            assert_eq!(
+                pull_source_event_type(&mut runtime, &mut memory, graph.source),
+                201
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, session_stop, &[session as u32]),
+                0
+            );
+            assert_eq!(
+                runtime.mf_media_sources.get(&graph.source).unwrap().state(),
+                crate::media::MfSourceState::Stopped
+            );
         })
     }
 }

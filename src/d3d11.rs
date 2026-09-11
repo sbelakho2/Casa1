@@ -1061,6 +1061,9 @@ pub struct D3d11Device {
     /// Active rendering predicate id (set via `set_predication`). Draws are
     /// skipped while a bound predicate reports false.
     predication: Option<u64>,
+    /// Number of present-time backbuffer syncs performed directly from the
+    /// host-visible d3d11 pixels (no intermediate staging buffer allocated).
+    zero_copy_present_syncs: u64,
 }
 
 impl D3d11Device {
@@ -1086,6 +1089,18 @@ impl D3d11Device {
     /// `store+depth-discard` action rather than a plain `store`.
     pub fn memoryless_depth_targets(&self) -> bool {
         self.backend.capabilities().memoryless_render_targets
+    }
+
+    /// Read-only access to the graphics backend that serves this device.
+    pub fn backend(&self) -> &GraphicsBackend {
+        &self.backend
+    }
+
+    /// Number of present-time backbuffer syncs written directly from the
+    /// host-visible d3d11 resource bytes without allocating an intermediate
+    /// staging buffer.
+    pub fn zero_copy_present_sync_count(&self) -> u64 {
+        self.zero_copy_present_syncs
     }
 
     pub fn swapchain_state(&self) -> Option<SwapchainState> {
@@ -1703,7 +1718,11 @@ impl D3d11Device {
             record.backend_id
         };
         self.promote_texture_cpu_write_usage(resource)?;
-        self.backend.overwrite_resource_bytes(backend_id, bytes)?;
+        // Mapped memory is host-visible by definition: classify the write so
+        // host-visible resources are counted as zero-copy updates and
+        // device-private resources as staged uploads.
+        self.backend
+            .overwrite_resource_host_visible(backend_id, bytes)?;
         Ok(())
     }
 
@@ -1879,21 +1898,24 @@ impl D3d11Device {
             // d3d11 side we only see `SwapchainState`.  For the overwhelmingly
             // common single-backbuffer swapchain the index is 0; with N
             // backbuffers we mirror all of them so whichever index is
-            // presented gets fresh pixels. A single staging buffer is reused
-            // across backbuffers to avoid a full allocation+copy per
-            // backbuffer per present, and mirror failures are propagated:
-            // this sync is the only path that makes the live window show
-            // rendered pixels.
-            let mut staging: Vec<u8> = Vec::new();
+            // presented gets fresh pixels.
+            //
+            // The d3d11 resource bytes *are* the host-visible rendered pixels,
+            // so the sync writes them directly into the backend resource with
+            // no intermediate staging allocation or copy (counted in
+            // `zero_copy_present_syncs`). Borrows are taken through disjoint
+            // fields so the source bytes stay borrowed only for the duration
+            // of each write; mirror failures are propagated because this sync
+            // is the only path that makes the live window show rendered
+            // pixels.
             for &backbuffer_id in &state.backbuffers {
-                let bytes = match self.resource(backbuffer_id) {
-                    Ok(record) => &record.bytes,
-                    Err(_) => continue,
+                let source_bytes = match self.resources.get(&backbuffer_id) {
+                    Some(record) => record.bytes.as_slice(),
+                    None => continue,
                 };
-                staging.clear();
-                staging.extend_from_slice(bytes);
                 self.backend
-                    .overwrite_resource_bytes(backbuffer_id, &staging)?;
+                    .overwrite_resource_bytes(backbuffer_id, source_bytes)?;
+                self.zero_copy_present_syncs += 1;
             }
         }
         let present = self
@@ -2170,7 +2192,11 @@ impl D3d11Device {
                         record.digest = None;
                         record.backend_id
                     };
-                    self.backend.overwrite_resource_bytes(backend_id, bytes)?;
+                    // The payload already lives in host memory; classify the
+                    // write so host-visible resources hit the in-place
+                    // (zero-copy) path and private ones count as staged.
+                    self.backend
+                        .overwrite_resource_host_visible(backend_id, bytes)?;
                 }
                 RecordedCommand::CopyResource { src, dst } => {
                     let source_bytes = self.resource(*src)?.bytes.clone();
@@ -2485,11 +2511,17 @@ impl D3d11Device {
         }
 
         self.next_fence_value += 1;
-        let backend_plan = self.backend.execute_command_lists(
-            self.queue,
-            &immutable_streams,
-            Some((self.fence, self.next_fence_value)),
-        )?;
+        // Independent streams are translated concurrently (results are applied
+        // in submission order by the shared execution path, so the plan and
+        // resource contents are identical to serial execution).
+        let signal = Some((self.fence, self.next_fence_value));
+        let backend_plan = if immutable_streams.len() > 1 {
+            self.backend
+                .execute_command_lists_parallel(self.queue, &immutable_streams, signal)?
+        } else {
+            self.backend
+                .execute_command_lists(self.queue, &immutable_streams, signal)?
+        };
         stats.executed_command_lists = immutable_streams.len();
         let (resource_digests, signature, hash) = if capture_submission {
             let resource_digests = self.collect_resource_digests();
@@ -4427,6 +4459,7 @@ fn create_device_internal_with_backend(
         counters: BTreeMap::new(),
         class_linkage: BTreeMap::new(),
         predication: None,
+        zero_copy_present_syncs: 0,
     })
 }
 
@@ -4792,6 +4825,122 @@ mod tests {
         assert_eq!(frame.width, 2);
         assert_eq!(frame.height, 1);
         assert_eq!(&frame.bytes[..uploaded.len()], &uploaded);
+    }
+
+    #[test]
+    fn present_backbuffer_sync_is_zero_copy_and_content_correct() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 2,
+                height: 1,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+
+        let backbuffers = device
+            .swapchain_state()
+            .expect("swapchain state")
+            .backbuffers
+            .len();
+        assert!(backbuffers >= 2);
+        assert_eq!(device.zero_copy_present_sync_count(), 0);
+
+        let backbuffer = device
+            .swapchain_backbuffer(0)
+            .expect("swapchain backbuffer");
+        let first = [0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff];
+        device
+            .update_subresource(backbuffer, &first)
+            .expect("update first frame");
+        device
+            .present_swapchain(1, false, true)
+            .expect("present first frame");
+
+        // One direct host-memory sync per backbuffer, with no staging buffer.
+        assert_eq!(
+            device.zero_copy_present_sync_count(),
+            backbuffers as u64,
+            "each present must sync backbuffers directly from host pixels"
+        );
+        let frame = device.presented_frame().expect("first presented frame");
+        assert_eq!(&frame.bytes[..first.len()], &first);
+
+        let second = [0xa0, 0xb0, 0xc0, 0xff, 0xd0, 0xe0, 0xf0, 0xff];
+        device
+            .update_subresource(backbuffer, &second)
+            .expect("update second frame");
+        device
+            .present_swapchain(1, false, true)
+            .expect("present second frame");
+        assert_eq!(
+            device.zero_copy_present_sync_count(),
+            2 * backbuffers as u64
+        );
+        let frame = device.presented_frame().expect("second presented frame");
+        assert_eq!(&frame.bytes[..second.len()], &second);
+    }
+
+    #[test]
+    fn update_subresource_counts_the_host_visible_zero_copy_path() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 2,
+                height: 1,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+
+        let streamed = device
+            .create_buffer(
+                "streamed-vertex-buffer",
+                4096,
+                ResourceUsageHint::Buffer {
+                    role: crate::gfx::BufferRole::Vertex,
+                    cpu_write_frequent: true,
+                },
+            )
+            .expect("create streamed buffer");
+        let backend_id = device.resource(streamed).expect("resource").backend_id;
+        let storage = device
+            .backend()
+            .resource_storage_mode(backend_id)
+            .expect("storage mode");
+        let before = device.backend().translation_stats();
+
+        let payload = vec![0x5au8; 4096];
+        device
+            .update_subresource(streamed, &payload)
+            .expect("update subresource");
+        device.submit_immediate().expect("submit");
+
+        let after = device.backend().translation_stats();
+        match storage {
+            crate::gfx::MetalStorageMode::Shared => assert_eq!(
+                after.zero_copy_updates,
+                before.zero_copy_updates + 1,
+                "host-visible resource updates must count as zero-copy"
+            ),
+            _ => assert_eq!(
+                after.staged_copies,
+                before.staged_copies + 1,
+                "device-private updates must count as staged uploads"
+            ),
+        }
+        assert_eq!(
+            device.resource(streamed).expect("resource").bytes,
+            payload,
+            "the update must still land in the resource contents"
+        );
     }
 
     #[test]

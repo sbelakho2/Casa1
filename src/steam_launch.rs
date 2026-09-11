@@ -659,6 +659,7 @@ pub fn create_steam_job(
         steam_ipc: profile.steam_ipc,
         window_width,
         window_height,
+        thread_start: None,
     };
 
     Ok(job)

@@ -8100,6 +8100,17 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         WindowsVersion::Any,
         SupportPolicy::OptionalFeature,
     ),
+    meta(
+        "dpaddr.dll",
+        "DirectPlay8AddressCreate",
+        0,
+        Subsystem::Diagnostics,
+        LastErrorBehavior::UndefinedOnSuccess,
+        ImplementationLevel::Implemented,
+        ArchMask::ANY,
+        WindowsVersion::Any,
+        SupportPolicy::OptionalFeature,
+    ),
     // dpapi.dll (registered surface)
     meta(
         "dpapi.dll",
@@ -12747,6 +12758,17 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         SupportPolicy::OptionalFeature,
     ),
     // mfplat.dll (registered surface)
+    meta(
+        "mfplat.dll",
+        "MFCreateFile",
+        0,
+        Subsystem::Audio,
+        LastErrorBehavior::UndefinedOnSuccess,
+        ImplementationLevel::Implemented,
+        ArchMask::ANY,
+        WindowsVersion::Any,
+        SupportPolicy::OptionalFeature,
+    ),
     meta(
         "mfplat.dll",
         "MFCreateMFByteStreamOnStream",

@@ -973,7 +973,48 @@ impl D3d12Runtime {
         // set is also reset so both stay bounded across frames.
         self.drain_pending_immediate_writes();
         self.clear_aliasing_overlaps();
-        self.backend.execute_command_lists(queue, streams, signal)
+        if streams.len() > 1 {
+            // Independent streams are translated concurrently; effects are
+            // applied in submission order by the shared execution path, so
+            // the plan and resource contents match serial execution exactly.
+            self.backend
+                .execute_command_lists_parallel(queue, streams, signal)
+        } else {
+            self.backend.execute_command_lists(queue, streams, signal)
+        }
+    }
+
+    /// Execute command streams with explicit parallel translation of
+    /// independent streams. Results are identical to
+    /// [`execute_command_lists`](Self::execute_command_lists); counters in
+    /// [`GraphicsBackend::translation_stats`] report the parallel work.
+    pub fn execute_command_lists_parallel(
+        &mut self,
+        queue: CommandQueueId,
+        streams: &[ImmutableCommandStream],
+        signal: Option<(FenceId, u64)>,
+    ) -> AppResult<MetalCommandBufferPlan> {
+        self.drain_pending_immediate_writes();
+        self.clear_aliasing_overlaps();
+        self.backend
+            .execute_command_lists_parallel(queue, streams, signal)
+    }
+
+    /// Analyse barrier hazards across command streams without executing them.
+    pub fn analyze_barriers(
+        &self,
+        streams: &[ImmutableCommandStream],
+    ) -> AppResult<crate::gfx::BarrierAnalysis> {
+        self.backend.analyze_barriers(streams)
+    }
+
+    /// Translate a batch of descriptor heaps into Metal bindings, reusing the
+    /// revision cache for heaps whose descriptors did not change.
+    pub fn translate_descriptor_tables(
+        &self,
+        heaps: &[DescriptorHeapId],
+    ) -> AppResult<Vec<Vec<MetalBinding>>> {
+        self.backend.translate_descriptor_tables(heaps)
     }
 
     pub fn create_fence(&mut self, initial_value: u64) -> FenceId {
@@ -2651,5 +2692,220 @@ mod tests {
                 assert!(D3d12Runtime::static_sampler_to_metal_desc(&sampler).is_err());
             }
         }
+    }
+
+    fn d3d12_two_independent_lists() -> (D3d12Runtime, Vec<ImmutableCommandStream>) {
+        let mut runtime = D3d12Runtime::new();
+        let format = DxgiFormat::R8G8B8A8Unorm;
+        let resource_a = runtime
+            .create_committed_resource(ResourceDesc {
+                name: "d3d12-parallel-a".to_string(),
+                format,
+                heap: HeapType::Default,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Generic,
+            })
+            .expect("create resource a");
+        let resource_b = runtime
+            .create_committed_resource(ResourceDesc {
+                name: "d3d12-parallel-b".to_string(),
+                format,
+                heap: HeapType::Default,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Generic,
+            })
+            .expect("create resource b");
+        let heap_a = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        runtime
+            .write_descriptor(
+                heap_a,
+                0,
+                ViewDescriptor::Rtv {
+                    resource: resource_a,
+                    format,
+                },
+            )
+            .expect("rtv a");
+        let heap_b = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        runtime
+            .write_descriptor(
+                heap_b,
+                0,
+                ViewDescriptor::Rtv {
+                    resource: resource_b,
+                    format,
+                },
+            )
+            .expect("rtv b");
+        let root_signature = runtime.create_root_signature(RootSignatureDesc::default());
+        let pipeline_state = runtime.create_pipeline_state(
+            root_signature,
+            PipelineStateDesc {
+                label: "d3d12-parallel".to_string(),
+                compute: false,
+                render_target_formats: vec![format],
+                depth_format: None,
+            },
+        );
+        let allocator = runtime.create_command_allocator();
+        let mut streams = Vec::new();
+        for heap in [heap_a, heap_b] {
+            let list = runtime.create_graphics_command_list(allocator, pipeline_state, false);
+            runtime
+                .record_begin_render_pass(list, vec![format], None, "clear", "store")
+                .expect("begin pass");
+            runtime.record_clear_rtv(list, heap, 0).expect("clear rtv");
+            runtime.record_draw(list, 3).expect("draw");
+            streams.push(runtime.close_command_list(list).expect("close list"));
+        }
+        (runtime, streams)
+    }
+
+    #[test]
+    fn d3d12_parallel_execution_matches_serial_and_counts_batches() {
+        let (mut runtime, streams) = d3d12_two_independent_lists();
+        let queue = runtime.create_command_queue();
+        let mut parallel_runtime = runtime.clone();
+        let serial_fence = runtime.create_fence(0);
+        let parallel_fence = parallel_runtime.create_fence(0);
+
+        let serial_plan = runtime
+            .backend_mut()
+            .execute_command_lists(queue, &streams, Some((serial_fence, 1)))
+            .expect("serial execution");
+        let parallel_plan = parallel_runtime
+            .execute_command_lists(queue, &streams, Some((parallel_fence, 1)))
+            .expect("parallel execution");
+
+        assert_eq!(
+            serial_plan, parallel_plan,
+            "parallel translation must produce the serial plan"
+        );
+        assert_eq!(serial_plan.render_passes.len(), 2);
+        let serial_stats = runtime.backend().translation_stats();
+        assert_eq!(serial_stats.parallel_translation_batches, 0);
+        assert_eq!(serial_stats.streams_translated_in_parallel, 0);
+        let parallel_stats = parallel_runtime.backend().translation_stats();
+        assert_eq!(parallel_stats.parallel_translation_batches, 1);
+        assert_eq!(parallel_stats.streams_translated_in_parallel, 2);
+        assert_eq!(parallel_stats.streams_translated_serially, 0);
+        assert_eq!(runtime.fence_value(serial_fence).expect("fence"), 1);
+        assert_eq!(
+            parallel_runtime.fence_value(parallel_fence).expect("fence"),
+            1
+        );
+    }
+
+    #[test]
+    fn d3d12_noop_transition_is_elided_and_counted() {
+        let mut runtime = D3d12Runtime::new();
+        let format = DxgiFormat::R8G8B8A8Unorm;
+        let resource = runtime
+            .create_committed_resource(ResourceDesc {
+                name: "d3d12-elide".to_string(),
+                format,
+                heap: HeapType::Default,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::PixelShaderResource,
+                usage_hint: ResourceUsageHint::Generic,
+            })
+            .expect("create resource");
+        let heap = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        runtime
+            .write_descriptor(heap, 0, ViewDescriptor::Rtv { resource, format })
+            .expect("rtv");
+        let root_signature = runtime.create_root_signature(RootSignatureDesc::default());
+        let pipeline_state = runtime.create_pipeline_state(
+            root_signature,
+            PipelineStateDesc {
+                label: "d3d12-elide".to_string(),
+                compute: false,
+                render_target_formats: vec![format],
+                depth_format: None,
+            },
+        );
+        let allocator = runtime.create_command_allocator();
+        let list = runtime.create_graphics_command_list(allocator, pipeline_state, false);
+        runtime
+            .record_begin_render_pass(list, vec![format], None, "clear", "store")
+            .expect("begin pass");
+        runtime.record_clear_rtv(list, heap, 0).expect("clear rtv");
+        runtime
+            .record_transition(
+                list,
+                resource,
+                0,
+                ResourceState::PixelShaderResource,
+                ResourceState::PixelShaderResource,
+            )
+            .expect("no-op transition");
+        runtime.record_draw(list, 3).expect("draw");
+        let stream = runtime.close_command_list(list).expect("close");
+
+        let analysis = runtime
+            .analyze_barriers(&[stream.clone()])
+            .expect("barrier analysis");
+        assert_eq!(analysis.transitions_considered, 1);
+        assert_eq!(analysis.transitions_elided, 1);
+        assert_eq!(analysis.transitions_required, 0);
+
+        let queue = runtime.create_command_queue();
+        let plan = runtime
+            .execute_command_lists(queue, &[stream], None)
+            .expect("execute");
+        assert_eq!(
+            plan.render_passes.len(),
+            1,
+            "elided barrier must not split the render pass"
+        );
+        assert_eq!(plan.render_passes[0].draw_calls, 1);
+        let stats = runtime.backend().translation_stats();
+        assert_eq!(stats.barriers_elided, 1);
+        assert_eq!(stats.barriers_required, 0);
+    }
+
+    #[test]
+    fn d3d12_descriptor_table_batches_reuse_unchanged_heaps() {
+        let mut runtime = D3d12Runtime::new();
+        let format = DxgiFormat::R8G8B8A8Unorm;
+        let resource = runtime
+            .create_committed_resource(ResourceDesc {
+                name: "d3d12-table".to_string(),
+                format,
+                heap: HeapType::Default,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Generic,
+            })
+            .expect("create resource");
+        let heap = runtime.create_descriptor_heap(DescriptorHeapType::CbvSrvUav, 1);
+        runtime
+            .write_descriptor(heap, 0, ViewDescriptor::Srv { resource, format })
+            .expect("srv");
+
+        let first = runtime
+            .translate_descriptor_tables(&[heap])
+            .expect("first batch");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].len(), 1);
+        let stats = runtime.backend().translation_stats();
+        assert_eq!(stats.descriptor_table_batches, 1);
+        assert_eq!(stats.descriptor_table_uploads, 1);
+        assert_eq!(stats.descriptor_table_reuses, 0);
+
+        let second = runtime
+            .translate_descriptor_tables(&[heap])
+            .expect("second batch");
+        assert_eq!(second, first);
+        let stats = runtime.backend().translation_stats();
+        assert_eq!(stats.descriptor_table_batches, 2);
+        assert_eq!(stats.descriptor_table_uploads, 1);
+        assert_eq!(stats.descriptor_table_reuses, 1);
     }
 }

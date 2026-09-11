@@ -1273,19 +1273,23 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "dplay.dll",
         "DirectPlayCreate",
         None,
-        SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "Models a machine with no DirectPlay runtime: class creation answers \
-         REGDB_E_CLASSNOTREG.  No DirectPlay sessions can exist.",
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Creates a real legacy IDirectPlay4 object over the software DirectPlay8 \
+         peer engine: real UDP host/connect, session and player state, enumeration, \
+         send/receive with real datagrams and the documented DirectPlay error codes.  \
+         Group replication, lobby registration and async handler callbacks are not \
+         wired yet.",
     ),
     semantic_override(
         "dplay.dll",
         "DirectPlayEnumerateW",
         None,
-        SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "No DirectPlay sessions exist in the modeled environment; enumeration \
-         completes with zero sessions.",
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Enumerates the real TCP/IP service provider plus every session actually \
+         hosted by the runtime by invoking the guest's DPENUMSESSIONS callback with \
+         real provider and session records.",
     ),
     semantic_override(
         "dpnet.dll",
@@ -1293,8 +1297,9 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         None,
         SemanticFidelity::SyntheticEnvironment,
         SubsystemCapability::Absent,
-        "No DirectPlay8 service provider: class creation answers \
-         REGDB_E_CLASSNOTREG.",
+        "DirectPlay8 peers run directly on the UDP transport, so separate service-\
+         provider objects are not created: the call answers \
+         CLASS_E_CLASSNOTAVAILABLE.",
     ),
     semantic_override(
         "dpaddr.dll",
@@ -1516,11 +1521,11 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         None,
         SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
-        "Real service-provider table on the session object graph: MFGetService \
-         resolves the owner (session, topology object, topology node) and returns \
-         real service objects — the session itself (MF_MEDIASESSION_SERVICE) and \
-         genuine IMFRateControl/IMFRateSupport (MF_RATE_CONTROL_SERVICE) backed by \
-         real session rate state; genuinely unowned service GUIDs answer \
+        "Real service-provider table on the runtime object graph: MFGetService \
+         resolves the owner (session, topology object/node, real media source, real \
+         byte stream) and returns real service objects — the session itself, genuine \
+         IMFRateControl/IMFRateSupport, MF_MEDIASOURCE_SERVICE on real sources and \
+         byte-stream attribute services; genuinely unowned GUIDs answer \
          MF_E_UNSUPPORTED_SERVICE.",
     ),
     // ── GDI+: the drawing surface is real and the former limits are too ─────
@@ -1570,15 +1575,14 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         SubsystemCapability::Partial,
         "Creates a real child guest process through the same machinery CreateProcessW \
          uses (real pid, image, environment/cwd, kernel handle, exit sync) with real \
-         NTSTATUS failure paths, and the first NtCreateThreadEx on the child launches \
-         the real casa1-runner host execution of the image with the child's exit code \
-         bridged to the process handle.  Remaining native blast radius: the host \
-         child starts at the image entry point (the recorded start routine/parameter \
-         are not injected), CREATE_SUSPENDED is recorded but the host child starts \
-         immediately, additional threads get real thread objects without injection \
-         into the running child, terminating the child records the exit code without \
-         killing an already-spawned runner, and non-NULL image-backed sections are \
-         not modeled (STATUS_INVALID_IMAGE_FORMAT).",
+         NTSTATUS failure paths; image-backed SEC_IMAGE sections are resolved through \
+         the real section registry, the first NtCreateThreadEx launches the real \
+         casa1-runner host execution with the caller's start routine actually injected \
+         (verified end to end), CREATE_SUSPENDED defers the host launch until \
+         NtResumeThread and a suspended child terminated before resume never runs, \
+         NtTerminateProcess kills the tracked host child and records the exit code, \
+         and NtQueryInformationThread reports the child's real process id, TEB and \
+         start address.",
     ),
     semantic_override(
         "ntdll.dll",

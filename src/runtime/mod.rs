@@ -63,6 +63,7 @@ use crate::pe::{self, ApiSetResolver, ExportSymbol, ExportTarget, ImportSymbol, 
 use crate::real_fs::{RealFilesystem, WindowsPathResolver, parse_ntfs_path};
 use crate::real_win32::BCryptContext;
 use crate::reason::ReasonCode;
+use crate::runtime::dispatch::com::ComMethod;
 use crate::runtime::dispatch::dshow::dshow_filter_graph_methods;
 use crate::runtime::dispatch::mf::mf_dxgi_device_manager_methods;
 use crate::shader::parse_dxil_container;
@@ -1492,6 +1493,13 @@ pub struct PeExecutionOptions {
     /// workload workaround for services the workload cannot execute — see
     /// [`crate::win32::NamedPipeService::create_compat_listener`]).
     pub compat_named_pipes: Vec<String>,
+    /// Optional first-thread start routine/parameter for a child created by
+    /// `NtCreateProcess` + `NtCreateThreadEx` (the runner job's
+    /// `thread_start`): the guest begins executing at this preferred-base
+    /// address with this thread parameter instead of the image entry point,
+    /// exactly like the Windows thread-start semantics.  `None` for every
+    /// ordinary run.
+    pub thread_start: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3892,6 +3900,11 @@ pub enum HostThunk {
     ComDispatchGetIDsOfNames,
     /// `IDispatch::Invoke` vtable thunk.
     ComDispatchInvoke,
+    /// A COM interface method dispatched through a runtime COM vtable
+    /// (IStream/IStorage/IConnectionPoint/IDispatch/ITypeInfo/...).  The
+    /// payload identifies the method and its ABI argument set; the
+    /// implementation lives in `runtime::dispatch::com`.
+    ComMethod(ComMethod),
     /// `SysAllocString` — allocates a BSTR.
     SysAllocString,
     /// `SysReAllocString` — re-allocates a BSTR.
@@ -4520,6 +4533,8 @@ pub enum HostThunk {
     NtWaitForMultipleObjects,
     /// `NtDelayExecution` — ntdll!NtDelayExecution
     NtDelayExecution,
+    /// `NtTestAlert` — ntdll!NtTestAlert (deliver this thread's queued APCs)
+    NtTestAlert,
     /// `NtCreateSection` — ntdll!NtCreateSection
     NtCreateSection,
     /// `NtMapViewOfSection` — ntdll!NtMapViewOfSection
@@ -5621,6 +5636,21 @@ pub enum HostThunk {
         method: u16,
         x86_arg_bytes: u8,
     },
+    /// One vtable slot of a real DirectPlay guest object: an
+    /// `IDirectPlay8Address`, an `IDirectPlay8Peer`, or the legacy
+    /// `IDirectPlay4` object returned by `DirectPlayCreate`.  `interface` is a
+    /// `crate::dplay::IFACE_*` id, `method` the vtable index (including the
+    /// three `IUnknown` slots), and `x86_arg_bytes` the stdcall argument byte
+    /// count the 32-bit dispatcher pops on return.
+    /// See `crate::dplay` and `dispatch::final_scraps`.
+    Dplay8Method {
+        interface: u8,
+        method: u16,
+        x86_arg_bytes: u8,
+    },
+    /// `DirectPlay8AddressCreate(iid, out, outer)` — the dpaddr.dll address
+    /// factory handing out a real `IDirectPlay8Address` object.
+    DirectPlay8AddressCreate,
     NtCreateFileMapping,
     NtCreateProcess,
     ImfAsyncResult,
@@ -5943,6 +5973,13 @@ pub enum HostThunk {
     MfSourceReaderGetCurrentMediaType,
     MfSourceReaderGetNativeMediaType,
     MfSourceReaderReadSample,
+    MfSourceReaderGetStreamSelection,
+    MfSourceReaderSetStreamSelection,
+    MfSourceReaderSetCurrentMediaType,
+    MfSourceReaderSetCurrentPosition,
+    MfSourceReaderFlush,
+    MfSourceReaderGetServiceForStream,
+    MfSourceReaderGetPresentationAttribute,
     MfSinkWriterAddStream,
     MfSinkWriterBeginWriting,
     MfSinkWriterWriteSample,
@@ -5950,6 +5987,18 @@ pub enum HostThunk {
     MfByteStreamGetCurrentPosition,
     MfByteStreamRead,
     MfByteStreamGetLength,
+    MfByteStreamGetCapabilities,
+    MfByteStreamSetLength,
+    MfByteStreamSetCurrentPosition,
+    MfByteStreamIsEndOfStream,
+    MfByteStreamWrite,
+    MfByteStreamBeginRead,
+    MfByteStreamEndRead,
+    MfByteStreamBeginWrite,
+    MfByteStreamEndWrite,
+    MfByteStreamSeek,
+    MfByteStreamFlush,
+    MfByteStreamClose,
     MfTopologyAddNode,
     MfTopologyGetNodeCount,
     MfTopologyNodeGetObject,
@@ -5971,9 +6020,38 @@ pub enum HostThunk {
     IDispatchGetTypeInfo,
     MfMediaSourceGetCharacteristics,
     MfMediaSourceCreatePresentationDescriptor,
-    MfMediaSourceControl,
+    MfMediaSourceStart,
+    MfMediaSourceStop,
+    MfMediaSourcePause,
     MfMediaSourceShutdown,
-    MfMediaSourceEvents,
+    MfMediaSourceGetEvent,
+    MfMediaSourceBeginGetEvent,
+    MfMediaSourceEndGetEvent,
+    MfMediaSourceQueueEvent,
+    MfMediaSourceGetSourceAttributes,
+    MfMediaSourceGetStreamAttributes,
+    MfMediaSourceSetD3dManager,
+    MfPresentationDescriptorGetStreamDescriptorByIndex,
+    MfPresentationDescriptorSelectStream,
+    MfPresentationDescriptorDeselectStream,
+    MfPresentationDescriptorClone,
+    MfStreamDescriptorGetStreamIdentifier,
+    MfStreamDescriptorGetMediaTypeHandler,
+    MfMediaTypeHandlerIsMediaTypeSupported,
+    MfMediaTypeHandlerGetMediaTypeCount,
+    MfMediaTypeHandlerGetMediaTypeByIndex,
+    MfMediaTypeHandlerSetCurrentMediaType,
+    MfMediaTypeHandlerGetCurrentMediaType,
+    MfMediaTypeHandlerGetMajorType,
+    MfEventGetExtendedType,
+    MfEventGetStatus,
+    MfEventGetValue,
+    MfAsyncResultGetState,
+    MfAsyncResultGetStatus,
+    MfAsyncResultSetStatus,
+    MfAsyncResultGetObject,
+    MfAsyncResultGetCallback,
+    MfCreateFile,
     MfSourceResolverBegin,
     MftStreamAttributes,
     MftFixedStreams,
@@ -6642,6 +6720,48 @@ pub fn execute_with_options(
         mapped.selected_base,
     )?;
     state.rip = mapped.selected_base + image.address_of_entry_point as u64;
+    // NtCreateThreadEx on a native child passes the FIRST thread's start
+    // routine/parameter: the child's first thread genuinely begins at that
+    // address, not at the image entry point.  The address is a guest VA in
+    // the image's PREFERRED mapping (the caller never saw this process's
+    // chosen base), so rebase it into this mapping; the thread parameter is
+    // delivered through the thread-start ABI (x86: `[esp+4]`; x64: `rcx`).
+    if let Some((start_address, start_parameter)) = options.thread_start {
+        let preferred_image_end = image.image_base + image.size_of_image as u64;
+        if !(image.image_base..preferred_image_end).contains(&start_address) {
+            return Err(AppError::new(
+                ReasonCode::RcUnimplInsn,
+                format!(
+                    "NtCreateThreadEx start routine {start_address:#x} is outside the child image \
+                     ({:#x}..{preferred_image_end:#x})",
+                    image.image_base
+                ),
+            ));
+        }
+        state.rip = mapped.selected_base + (start_address - image.image_base);
+        if guest_arch == GuestArch::X64 {
+            // x64 thread entry: the parameter arrives in RCX.  Leave the
+            // shadow space and a zero return address under it so a routine
+            // that returns ends at RIP=0 (the main-loop exit) like the
+            // image entry point does.
+            let rsp = stack_top - guest_pointer_bytes - 0x20;
+            write_guest_pointer(&mut memory, rsp, 0, guest_arch)?;
+            state.set(Register::Rsp, rsp);
+            state.set(Register::Rcx, start_parameter);
+        } else {
+            // x86 stdcall thread entry: the parameter is at `[esp+4]` above
+            // the synthetic return address.
+            let rsp = stack_top - 2 * guest_pointer_bytes;
+            write_guest_pointer(&mut memory, rsp, 0, guest_arch)?;
+            write_guest_pointer(
+                &mut memory,
+                rsp + guest_pointer_bytes,
+                start_parameter,
+                guest_arch,
+            )?;
+            state.set(Register::Rsp, rsp);
+        }
+    }
     crate::live::live_trace(&format!(
         "[pe] before main loop — entry_rip={:#x} live_session={}",
         state.rip,
@@ -11233,6 +11353,10 @@ impl PeHostRuntime {
                 steam_ipc: false,
                 window_width: None,
                 window_height: None,
+                // CreateProcessW children run their image from the entry
+                // point; only an NtCreateThreadEx first thread injects a
+                // start routine.
+                thread_start: None,
             };
 
             // Serialise the job to a temporary JSON file.
@@ -11320,40 +11444,59 @@ impl PeHostRuntime {
         Ok(result)
     }
 
-    /// Spawn casa1-runner with a job file and wait for it to complete.
-    /// Returns the exit code (u32::MAX on failure).
-    fn spawn_runner_and_wait(runner_path: &Path, job_path: &Path) -> u32 {
-        let child_result = std::process::Command::new(runner_path)
+    /// Spawn casa1-runner as a child process for a serialized job, WITHOUT
+    /// waiting: the caller owns the returned `Child` (the native-child
+    /// launch path tracks its pid for `NtTerminateProcess`).
+    pub(crate) fn spawn_runner_process(
+        runner_path: &Path,
+        job_path: &Path,
+    ) -> AppResult<std::process::Child> {
+        std::process::Command::new(runner_path)
             .arg("--job")
             .arg(job_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .spawn();
-        match child_result {
-            Ok(child) => {
-                // Use wait_with_output() to capture stdout while waiting.
-                // child.wait() would close stdout handles, making stdout.take() return None.
-                match child.wait_with_output() {
-                    Ok(output) => {
-                        let output_str = String::from_utf8_lossy(&output.stdout);
-                        // Try to extract the actual child PE exit code from the JSON output.
-                        if let Ok(outcome) =
-                            serde_json::from_str::<crate::runner::RunnerOutcome>(&output_str)
-                        {
-                            outcome.canonical_output.exit_code as u32
-                        } else {
-                            // Fallback: use the process exit code.
-                            output.status.code().map(|c| c as u32).unwrap_or(u32::MAX)
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[pe_runtime] failed to wait for casa1-runner: {e:?}");
-                        u32::MAX
-                    }
+            .spawn()
+            .map_err(|error| {
+                AppError::from_io(
+                    ReasonCode::RcRunnerSpawnFailed,
+                    format!("failed to spawn casa1-runner: {error}"),
+                    &error,
+                )
+            })
+    }
+
+    /// Wait for a spawned casa1-runner child and return its guest exit code
+    /// (extracted from the runner's JSON outcome on stdout; `u32::MAX` when
+    /// the wait fails or the child died without a parseable outcome).
+    pub(crate) fn finish_runner_child(child: std::process::Child) -> u32 {
+        match child.wait_with_output() {
+            Ok(output) => {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                // Try to extract the actual child PE exit code from the JSON output.
+                if let Ok(outcome) =
+                    serde_json::from_str::<crate::runner::RunnerOutcome>(&output_str)
+                {
+                    outcome.canonical_output.exit_code as u32
+                } else {
+                    // Fallback: use the process exit code.
+                    output.status.code().map(|c| c as u32).unwrap_or(u32::MAX)
                 }
             }
             Err(e) => {
-                eprintln!("[pe_runtime] failed to spawn casa1-runner: {e:?}");
+                eprintln!("[pe_runtime] failed to wait for casa1-runner: {e:?}");
+                u32::MAX
+            }
+        }
+    }
+
+    /// Spawn casa1-runner with a job file and wait for it to complete.
+    /// Returns the exit code (u32::MAX on failure).
+    fn spawn_runner_and_wait(runner_path: &Path, job_path: &Path) -> u32 {
+        match Self::spawn_runner_process(runner_path, job_path) {
+            Ok(child) => Self::finish_runner_child(child),
+            Err(error) => {
+                eprintln!("[pe_runtime] failed to spawn casa1-runner: {error:?}");
                 u32::MAX
             }
         }
@@ -29066,7 +29209,7 @@ impl PeHostRuntime {
                     self.push_trace("ole32", "CoCreateGuid", BTreeMap::new(), json!(0));
                 }
             }
-            ref thunk @ (HostThunk::MfSessionSetTopology | HostThunk::MfSessionGetSessionCapabilities | HostThunk::MfSessionGetFullTopology | HostThunk::MfSessionGetDescriptorFromTopology | HostThunk::MfSinkWriterSetInputMediaType | HostThunk::MfSinkWriterFlush | HostThunk::MfSinkWriterGetStatistics | HostThunk::MfSinkWriterSendStreamSample | HostThunk::MfSinkWriterNotifyEndOfSegment | HostThunk::MfSinkWriterGetServiceForStream | HostThunk::IDispatchGetTypeInfoCount | HostThunk::IDispatchGetTypeInfo | HostThunk::MfMediaSourceGetCharacteristics | HostThunk::MfMediaSourceCreatePresentationDescriptor | HostThunk::MfMediaSourceControl | HostThunk::MfMediaSourceShutdown | HostThunk::MfMediaSourceEvents | HostThunk::MfSourceResolverBegin | HostThunk::MftStreamAttributes | HostThunk::MftFixedStreams | HostThunk::MftProcessEvent | HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfAttrGetItem | HostThunk::MfAttrGetItemType | HostThunk::MfAttrCompareItem | HostThunk::MfAttrCompare | HostThunk::MfAttrGetAllocatedString | HostThunk::MfAttrGetAllocatedBlob | HostThunk::MfAttrGetUnknown | HostThunk::MfAttrSetItem | HostThunk::MfAttrSetUnknown | HostThunk::MfAttrDeleteAllItems | HostThunk::MfAttrLockStore | HostThunk::MfAttrUnlockStore | HostThunk::MfAttrCopyAllItems | HostThunk::MfSampleSetSampleFlags | HostThunk::MfSampleGetSampleFlags | HostThunk::MfSampleGetTotalLength | HostThunk::MfSampleCopyToBuffer | HostThunk::MfSampleConvertToContiguousBuffer | HostThunk::MfMediaTypeIsEqual | HostThunk::MfMediaTypeGetRepresentation | HostThunk::MfMediaTypeFreeRepresentation | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType | HostThunk::MfActivateGetCount | HostThunk::MfActivateGetItem | HostThunk::MfActivateGetGuid | HostThunk::MfActivateGetString | HostThunk::MfActivateActivateObject | HostThunk::MfActivateShutdownObject | HostThunk::MfTransformGetStreamLimits | HostThunk::MfTransformGetStreamCounts | HostThunk::MfTransformGetStreamIds | HostThunk::MfTransformGetStreamInfo | HostThunk::MfTransformGetAttributes | HostThunk::MfTransformGetInputAvailableType | HostThunk::MfTransformGetOutputAvailableType | HostThunk::MfTransformSetInputType | HostThunk::MfTransformSetOutputType | HostThunk::MfTransformGetInputCurrentType | HostThunk::MfTransformGetOutputCurrentType | HostThunk::MfTransformGetInputStatus | HostThunk::MfTransformGetOutputStatus | HostThunk::MfTransformProcessInput | HostThunk::MfTransformProcessOutput | HostThunk::MfTransformProcessMessage | HostThunk::MfRateControlSetRate | HostThunk::MfRateControlGetRate | HostThunk::MfRateSupportGetSlowestRate | HostThunk::MfRateSupportGetFastestRate | HostThunk::MfRateSupportIsRateSupported | HostThunk::MftTransformUnsupported) => {
+            ref thunk @ (HostThunk::MfSessionSetTopology | HostThunk::MfSessionGetSessionCapabilities | HostThunk::MfSessionGetFullTopology | HostThunk::MfSessionGetDescriptorFromTopology | HostThunk::MfSinkWriterSetInputMediaType | HostThunk::MfSinkWriterFlush | HostThunk::MfSinkWriterGetStatistics | HostThunk::MfSinkWriterSendStreamSample | HostThunk::MfSinkWriterNotifyEndOfSegment | HostThunk::MfSinkWriterGetServiceForStream | HostThunk::IDispatchGetTypeInfoCount | HostThunk::IDispatchGetTypeInfo | HostThunk::MfMediaSourceGetCharacteristics | HostThunk::MfMediaSourceCreatePresentationDescriptor | HostThunk::MfMediaSourceStart | HostThunk::MfMediaSourceStop | HostThunk::MfMediaSourcePause | HostThunk::MfMediaSourceShutdown | HostThunk::MfMediaSourceGetEvent | HostThunk::MfMediaSourceBeginGetEvent | HostThunk::MfMediaSourceEndGetEvent | HostThunk::MfMediaSourceQueueEvent | HostThunk::MfMediaSourceGetSourceAttributes | HostThunk::MfMediaSourceGetStreamAttributes | HostThunk::MfMediaSourceSetD3dManager | HostThunk::MfCreateFile | HostThunk::MfByteStreamGetCapabilities | HostThunk::MfByteStreamSetLength | HostThunk::MfByteStreamSetCurrentPosition | HostThunk::MfByteStreamIsEndOfStream | HostThunk::MfByteStreamBeginRead | HostThunk::MfByteStreamEndRead | HostThunk::MfByteStreamWrite | HostThunk::MfByteStreamBeginWrite | HostThunk::MfByteStreamEndWrite | HostThunk::MfByteStreamSeek | HostThunk::MfByteStreamFlush | HostThunk::MfByteStreamClose | HostThunk::MfSourceReaderGetStreamSelection | HostThunk::MfSourceReaderSetStreamSelection | HostThunk::MfSourceReaderSetCurrentMediaType | HostThunk::MfSourceReaderSetCurrentPosition | HostThunk::MfSourceReaderFlush | HostThunk::MfSourceReaderGetServiceForStream | HostThunk::MfSourceReaderGetPresentationAttribute | HostThunk::MfPresentationDescriptorGetStreamDescriptorByIndex | HostThunk::MfPresentationDescriptorSelectStream | HostThunk::MfPresentationDescriptorDeselectStream | HostThunk::MfPresentationDescriptorClone | HostThunk::MfStreamDescriptorGetStreamIdentifier | HostThunk::MfStreamDescriptorGetMediaTypeHandler | HostThunk::MfMediaTypeHandlerIsMediaTypeSupported | HostThunk::MfMediaTypeHandlerGetMediaTypeCount | HostThunk::MfMediaTypeHandlerGetMediaTypeByIndex | HostThunk::MfMediaTypeHandlerSetCurrentMediaType | HostThunk::MfMediaTypeHandlerGetCurrentMediaType | HostThunk::MfMediaTypeHandlerGetMajorType | HostThunk::MfEventGetExtendedType | HostThunk::MfEventGetStatus | HostThunk::MfEventGetValue | HostThunk::MfAsyncResultGetState | HostThunk::MfAsyncResultGetStatus | HostThunk::MfAsyncResultSetStatus | HostThunk::MfAsyncResultGetObject | HostThunk::MfAsyncResultGetCallback | HostThunk::MfSourceResolverBegin | HostThunk::MftStreamAttributes | HostThunk::MftFixedStreams | HostThunk::MftProcessEvent | HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfAttrGetItem | HostThunk::MfAttrGetItemType | HostThunk::MfAttrCompareItem | HostThunk::MfAttrCompare | HostThunk::MfAttrGetAllocatedString | HostThunk::MfAttrGetAllocatedBlob | HostThunk::MfAttrGetUnknown | HostThunk::MfAttrSetItem | HostThunk::MfAttrSetUnknown | HostThunk::MfAttrDeleteAllItems | HostThunk::MfAttrLockStore | HostThunk::MfAttrUnlockStore | HostThunk::MfAttrCopyAllItems | HostThunk::MfSampleSetSampleFlags | HostThunk::MfSampleGetSampleFlags | HostThunk::MfSampleGetTotalLength | HostThunk::MfSampleCopyToBuffer | HostThunk::MfSampleConvertToContiguousBuffer | HostThunk::MfMediaTypeIsEqual | HostThunk::MfMediaTypeGetRepresentation | HostThunk::MfMediaTypeFreeRepresentation | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType | HostThunk::MfActivateGetCount | HostThunk::MfActivateGetItem | HostThunk::MfActivateGetGuid | HostThunk::MfActivateGetString | HostThunk::MfActivateActivateObject | HostThunk::MfActivateShutdownObject | HostThunk::MfTransformGetStreamLimits | HostThunk::MfTransformGetStreamCounts | HostThunk::MfTransformGetStreamIds | HostThunk::MfTransformGetStreamInfo | HostThunk::MfTransformGetAttributes | HostThunk::MfTransformGetInputAvailableType | HostThunk::MfTransformGetOutputAvailableType | HostThunk::MfTransformSetInputType | HostThunk::MfTransformSetOutputType | HostThunk::MfTransformGetInputCurrentType | HostThunk::MfTransformGetOutputCurrentType | HostThunk::MfTransformGetInputStatus | HostThunk::MfTransformGetOutputStatus | HostThunk::MfTransformProcessInput | HostThunk::MfTransformProcessOutput | HostThunk::MfTransformProcessMessage | HostThunk::MfRateControlSetRate | HostThunk::MfRateControlGetRate | HostThunk::MfRateSupportGetSlowestRate | HostThunk::MfRateSupportGetFastestRate | HostThunk::MfRateSupportIsRateSupported | HostThunk::MftTransformUnsupported) => {
 
                 self.dispatch_mf_or_com(thunk, state, memory)?;
             }
@@ -29160,13 +29303,13 @@ impl PeHostRuntime {
             ref thunk @ (HostThunk::WtGetSignatureInfo | HostThunk::WtHelperGetProvPrivateDataFromChain | HostThunk::WtHelperGetProvSignerFromChain | HostThunk::WtHelperProvDataFromStateData | HostThunk::CryptDecodeObject | HostThunk::CryptEncodeObject | HostThunk::CryptExportPkcs8 | HostThunk::FreeContextBuffer | HostThunk::QuerySecurityPackageInfoW | HostThunk::SspiInitialize | HostThunk::InitSecurityInterfaceW | HostThunk::SslGetDataToWrite | HostThunk::SslLoadCertificate | HostThunk::CryptUiDlgCertMgr | HostThunk::CryptUiDlgSelectCertificateW | HostThunk::CryptUiDlgSelectStoreW | HostThunk::CryptUiDlgViewCertificateW) => {
                 self.dispatch_trust(thunk, state, memory)?;
             }
-            ref thunk @ (HostThunk::ImageListGetIcon | HostThunk::ImageListGetIconSize | HostThunk::ImageListSetIconSize | HostThunk::PropertySheetW | HostThunk::CmFreeDeviceIdList | HostThunk::CmGetDevNodeStatus | HostThunk::CmGetDeviceIdListW | HostThunk::CmGetDeviceIdListSizeW | HostThunk::CmLocateDevNodeW | HostThunk::PowerGetActiveScheme | HostThunk::PowerReadACValue | HostThunk::PowerReadDCValue | HostThunk::PowerSetActiveScheme | HostThunk::WimApplyImage | HostThunk::WimCloseHandle | HostThunk::WimCreateFile | HostThunk::WimLoadImage | HostThunk::WimUnmountImageHandle | HostThunk::RoActivateInstance | HostThunk::RoGetActivationFactory | HostThunk::RoInitialize | HostThunk::RoUninitialize | HostThunk::CreateXmlReader | HostThunk::CreateXmlReaderInputWithEncoding | HostThunk::CreateXmlWriter | HostThunk::CreateXmlWriterOutputWithEncoding | HostThunk::CoInternetIsFeatureEnabled | HostThunk::CoInternetSetFeatureEnabled | HostThunk::ObtainUserAgentString | HostThunk::UrlDownloadToCacheFileW | HostThunk::UrlDownloadToFileW | HostThunk::WinHttpCrackUrl | HostThunk::WinHttpCreateUrl | HostThunk::WinHttpDetectAutoProxyConfigUrl | HostThunk::WinHttpTimeFromSystemTime | HostThunk::WinHttpTimeToSystemTime | HostThunk::SpCreateObjectFromKey | HostThunk::SpCreateObjectFromToken | HostThunk::SpEnumTokens | HostThunk::SpGetCategoryFromId | HostThunk::SpGetDescription | HostThunk::RasDial | HostThunk::RasEnumConnections | HostThunk::RasGetConnectionStatus | HostThunk::RasGetErrorString | HostThunk::RasHangUp | HostThunk::RasSetEntryProperties | HostThunk::WmiClose | HostThunk::WmiConnect | HostThunk::WmiInitialize | HostThunk::WmiQuery | HostThunk::UiaGetPatternProvider | HostThunk::UiaGetRuntimeId | HostThunk::UiaGetUpdatedCache | HostThunk::UiaLookupId | HostThunk::UiaNavigate | HostThunk::UiaRaiseAutomationEvent | HostThunk::UiaRaiseAutomationPropertyChangedEvent | HostThunk::AccessibleObjectFromEvent | HostThunk::AccessibleObjectFromPoint | HostThunk::AccessibleObjectFromWindow | HostThunk::GetAccessibleObjectFromWindow | HostThunk::GetOleaccVersionInfo | HostThunk::WindowFromAccessibleObject | HostThunk::DhcpCApiCleanup | HostThunk::DhcpCApiInitialize | HostThunk::DhcpReleaseParams | HostThunk::DhcpRenewParams | HostThunk::DhcpRequestParams | HostThunk::DnsFlushResolverCache | HostThunk::DnsQueryConfig | HostThunk::DnsQueryW | HostThunk::DnsRecordListFree | HostThunk::DiInstallDevice | HostThunk::DiInstallDriverW | HostThunk::DiUninstallDevice | HostThunk::UpdateDriverForPlugAndPlayDevicesW | HostThunk::WtsEnumerateSessionsW | HostThunk::WtsFreeMemory | HostThunk::WtsQuerySessionInformationW | HostThunk::WtsQueryUserToken | HostThunk::CreateVssBackupComponents | HostThunk::VssFreeComponent | HostThunk::VssFreeSnapshotProperties | HostThunk::VssFreeWriterMetadata | HostThunk::CreateTextServices | HostThunk::ITextDocument | HostThunk::RichEdit10AnsiWndClass | HostThunk::ShutdownTextServices | HostThunk::Dp8spCreate | HostThunk::DirectPlay8Create | HostThunk::DirectSoundCaptureCreate8 | HostThunk::DirectSoundCaptureEnumerateW | HostThunk::DirectSoundCreate8 | HostThunk::DirectSoundEnumerateW) => {
+            ref thunk @ (HostThunk::ImageListGetIcon | HostThunk::ImageListGetIconSize | HostThunk::ImageListSetIconSize | HostThunk::PropertySheetW | HostThunk::CmFreeDeviceIdList | HostThunk::CmGetDevNodeStatus | HostThunk::CmGetDeviceIdListW | HostThunk::CmGetDeviceIdListSizeW | HostThunk::CmLocateDevNodeW | HostThunk::PowerGetActiveScheme | HostThunk::PowerReadACValue | HostThunk::PowerReadDCValue | HostThunk::PowerSetActiveScheme | HostThunk::WimApplyImage | HostThunk::WimCloseHandle | HostThunk::WimCreateFile | HostThunk::WimLoadImage | HostThunk::WimUnmountImageHandle | HostThunk::RoActivateInstance | HostThunk::RoGetActivationFactory | HostThunk::RoInitialize | HostThunk::RoUninitialize | HostThunk::CreateXmlReader | HostThunk::CreateXmlReaderInputWithEncoding | HostThunk::CreateXmlWriter | HostThunk::CreateXmlWriterOutputWithEncoding | HostThunk::CoInternetIsFeatureEnabled | HostThunk::CoInternetSetFeatureEnabled | HostThunk::ObtainUserAgentString | HostThunk::UrlDownloadToCacheFileW | HostThunk::UrlDownloadToFileW | HostThunk::WinHttpCrackUrl | HostThunk::WinHttpCreateUrl | HostThunk::WinHttpDetectAutoProxyConfigUrl | HostThunk::WinHttpTimeFromSystemTime | HostThunk::WinHttpTimeToSystemTime | HostThunk::SpCreateObjectFromKey | HostThunk::SpCreateObjectFromToken | HostThunk::SpEnumTokens | HostThunk::SpGetCategoryFromId | HostThunk::SpGetDescription | HostThunk::RasDial | HostThunk::RasEnumConnections | HostThunk::RasGetConnectionStatus | HostThunk::RasGetErrorString | HostThunk::RasHangUp | HostThunk::RasSetEntryProperties | HostThunk::WmiClose | HostThunk::WmiConnect | HostThunk::WmiInitialize | HostThunk::WmiQuery | HostThunk::UiaGetPatternProvider | HostThunk::UiaGetRuntimeId | HostThunk::UiaGetUpdatedCache | HostThunk::UiaLookupId | HostThunk::UiaNavigate | HostThunk::UiaRaiseAutomationEvent | HostThunk::UiaRaiseAutomationPropertyChangedEvent | HostThunk::AccessibleObjectFromEvent | HostThunk::AccessibleObjectFromPoint | HostThunk::AccessibleObjectFromWindow | HostThunk::GetAccessibleObjectFromWindow | HostThunk::GetOleaccVersionInfo | HostThunk::WindowFromAccessibleObject | HostThunk::DhcpCApiCleanup | HostThunk::DhcpCApiInitialize | HostThunk::DhcpReleaseParams | HostThunk::DhcpRenewParams | HostThunk::DhcpRequestParams | HostThunk::DnsFlushResolverCache | HostThunk::DnsQueryConfig | HostThunk::DnsQueryW | HostThunk::DnsRecordListFree | HostThunk::DiInstallDevice | HostThunk::DiInstallDriverW | HostThunk::DiUninstallDevice | HostThunk::UpdateDriverForPlugAndPlayDevicesW | HostThunk::WtsEnumerateSessionsW | HostThunk::WtsFreeMemory | HostThunk::WtsQuerySessionInformationW | HostThunk::WtsQueryUserToken | HostThunk::CreateVssBackupComponents | HostThunk::VssFreeComponent | HostThunk::VssFreeSnapshotProperties | HostThunk::VssFreeWriterMetadata | HostThunk::CreateTextServices | HostThunk::ITextDocument | HostThunk::RichEdit10AnsiWndClass | HostThunk::ShutdownTextServices | HostThunk::DirectSoundCaptureCreate8 | HostThunk::DirectSoundCaptureEnumerateW | HostThunk::DirectSoundCreate8 | HostThunk::DirectSoundEnumerateW) => {
                 self.dispatch_system_sweep(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::AtlModuleAddTermFunc | HostThunk::AtlModuleLoadTypeLib | HostThunk::AtlModuleRegisterServer | HostThunk::AtlModuleRegisterTypeLib | HostThunk::AtlModuleUnregisterServer | HostThunk::AtlModuleUnregisterTypeLib | HostThunk::AtlModuleUpdateRegistryFromResource | HostThunk::WicCreateAvifDecoder | HostThunk::WicCreateAvifEncoder | HostThunk::WicCreateHeifDecoder | HostThunk::WicCreateHeifEncoder | HostThunk::WicCreateWebpDecoder | HostThunk::WicCreateWebpEncoder | HostThunk::DllInstall | HostThunk::OverlayCreateHook | HostThunk::OverlayHookWindow | HostThunk::OverlayPresent | HostThunk::OverlayReset | HostThunk::OverlayUnhookWindow | HostThunk::CndInit | HostThunk::MtxDestroy | HostThunk::MtxInit | HostThunk::MtxLock | HostThunk::MtxUnlock | HostThunk::SteamBGetSteamId | HostThunk::SteamBIsSubscribedApp | HostThunk::SteamBLoggedOn | HostThunk::SteamNotifyOfLogin | HostThunk::SteamNotifyOfLogoff | HostThunk::CCSpecificHandler | HostThunk::CurrentException | HostThunk::CurrentExceptionContext | HostThunk::ProcessingThrow | HostThunk::Chkstk | HostThunk::CertSrvBackupEnd | HostThunk::CertSrvBackupPrepare | HostThunk::CertSrvRestoreEnd | HostThunk::CertSrvRestorePrepare | HostThunk::D3dx10CompileFromFile | HostThunk::D3dx10CreateTextureFromFileW | HostThunk::D3dx10GetImageInfoFromFile | HostThunk::D3dx10SaveTextureToMemory | HostThunk::GameuxShfolderpath | HostThunk::GameExplorerInitialize | HostThunk::GameExplorerSetUserAccess | HostThunk::GameExplorerVerifyAccess | HostThunk::ClrCreateManagedInstance | HostThunk::GetClrRuntimeHost | HostThunk::CreateHtmlPropertyPage | HostThunk::IeFrameFactoryConstructor | HostThunk::ShowHtmlDialogEx | HostThunk::IhtmlDocument2 | HostThunk::DsBind | HostThunk::DsBindWithCred | HostThunk::DsMakeSpnW | HostThunk::DsUnbind | HostThunk::AdsBuildEnumerator | HostThunk::AdsGetObject | HostThunk::AdsOpenObject | HostThunk::CertSrvAdminGetCa | HostThunk::CertSrvAdminGetCert | HostThunk::CertSrvAdminSetCa | HostThunk::D3d10CreateDevice1 | HostThunk::D3d10CreateDeviceAndSwapChain1 | HostThunk::Dhcpv6ReleaseParams | HostThunk::Dhcpv6RenewParams | HostThunk::Dhcpv6RequestParams | HostThunk::GetdfDIJoystick | HostThunk::FwpsFilter | HostThunk::FwpsOpenToken | HostThunk::FwpsQueryTokenInformation | HostThunk::IeGetFrameComponent | HostThunk::IeGetWriteableHlink | HostThunk::IeHlink | HostThunk::LoadPerfCounterTextStringsW | HostThunk::SetServiceAsTrusted | HostThunk::UnloadPerfCounterTextStringsW | HostThunk::MsiFormatRecordW | HostThunk::MsiGetLastErrorRecord | HostThunk::MsiProcessMessage | HostThunk::ApplyPatchToFileExW | HostThunk::ApplyPatchToFileW | HostThunk::GetPatchFileSignature | HostThunk::PrintUiEntry | HostThunk::PrintUiToDevice | HostThunk::PrintUiToFile | HostThunk::SamCloseHandle | HostThunk::SamConnect | HostThunk::SamOpenDomain | HostThunk::ScGenerateRelativeName | HostThunk::ScRemoveAllPrivileges | HostThunk::ScSetSecurityDescriptor | HostThunk::RnrCancelQuery | HostThunk::RnrInitialize | HostThunk::RnrQuery | HostThunk::WinStationCloseServer | HostThunk::WinStationEnumerate | HostThunk::WinStationOpenServer | HostThunk::CreateFx) => {
                 self.dispatch_long_tail(thunk, state, memory)?;
             }
-            ref thunk @ (HostThunk::CredSspGetClientCredential | HostThunk::CredSspGetServerCredential | HostThunk::DirectPlayCreate | HostThunk::DirectPlayEnumerateW | HostThunk::KerbLogon | HostThunk::KerbRetrieveTicket | HostThunk::NetGetAnyDcName | HostThunk::NetGetDcName | HostThunk::NetWkstaSetInfo | HostThunk::X3dAudioInitialize | HostThunk::Xact3CreateEngine | HostThunk::Xact3CreateEngineWithFlags | HostThunk::NtCreateFileMapping | HostThunk::ImfAsyncResult | HostThunk::ImfGetService | HostThunk::BrowserServerEnum | HostThunk::GdipCreateGraphics | HostThunk::ActivateAudioInterfaceAsync | HostThunk::NetServerGetInfo | HostThunk::DsBindToTopology | HostThunk::IPersistFile | HostThunk::IActiveScript | HostThunk::ID3d12Heap | HostThunk::ImfMediaSink) => {
+            ref thunk @ (HostThunk::CredSspGetClientCredential | HostThunk::CredSspGetServerCredential | HostThunk::KerbLogon | HostThunk::KerbRetrieveTicket | HostThunk::NetGetAnyDcName | HostThunk::NetGetDcName | HostThunk::NetWkstaSetInfo | HostThunk::X3dAudioInitialize | HostThunk::Xact3CreateEngine | HostThunk::Xact3CreateEngineWithFlags | HostThunk::NtCreateFileMapping | HostThunk::ImfAsyncResult | HostThunk::ImfGetService | HostThunk::BrowserServerEnum | HostThunk::GdipCreateGraphics | HostThunk::ActivateAudioInterfaceAsync | HostThunk::NetServerGetInfo | HostThunk::DsBindToTopology | HostThunk::IPersistFile | HostThunk::IActiveScript | HostThunk::ID3d12Heap | HostThunk::ImfMediaSink) => {
                 self.dispatch_final_scraps(thunk, state, memory)?;
             }
             // ── the real XACT3 guest-object vtables: every slot is a
@@ -29174,6 +29317,20 @@ impl PeHostRuntime {
             //    (see `crate::xact` and `dispatch::final_scraps`) ──
             ref thunk @ HostThunk::Xact3Method { .. } => {
                 self.dispatch_final_scraps(thunk, state, memory)?;
+            }
+            // ── DirectPlay: the real software DirectPlay8 peer engine (see
+            //    `crate::dplay` and `dispatch::final_scraps`) — every vtable
+            //    slot is a distinct host thunk carrying its interface/method
+            //    identity, and the factories hand out real objects ──
+            ref thunk @ HostThunk::Dplay8Method { .. } => {
+                self.dispatch_dplay8_method(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::DirectPlay8Create
+            | HostThunk::DirectPlay8AddressCreate
+            | HostThunk::DirectPlayCreate
+            | HostThunk::DirectPlayEnumerateW
+            | HostThunk::Dp8spCreate) => {
+                self.dispatch_dplay_entry(thunk, state, memory)?;
             }
             // ── the real dispatches that left the final-scraps group: each
             //    one performs its genuine operation (see
@@ -29457,62 +29614,13 @@ impl PeHostRuntime {
                 );
             }
             HostThunk::ComDispatchGetIDsOfNames => {
-                let _this = guest_call_arg(state, memory, 0)?;
-                let _riid = guest_call_arg(state, memory, 1)?;
-                let rgsz_names = guest_call_arg(state, memory, 2)?;
-                let c_names = guest_call_arg_u32(state, memory, 3)?;
-                let _lcid = guest_call_arg_u32(state, memory, 4)?;
-                let rg_disp_id = guest_call_arg(state, memory, 5)?;
-                for i in 0..c_names.min(256) {
-                    if rgsz_names != 0 && rg_disp_id != 0 {
-                        let name_ptr =
-                            read_guest_pointer(memory, rgsz_names + (i as u64) * 8, self.guest_arch)
-                                .unwrap_or(0);
-                        let _name = if name_ptr != 0 {
-                            read_utf16_string(memory, name_ptr).unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
-                        // Assign DISPID = i for each name
-                        write_u32(memory, rg_disp_id + (i as u64) * 4, i);
-                    }
-                }
-                state.set(Register::Rax, 0);
-                self.last_error = 0;
-                self.push_trace(
-                    "oleaut32",
-                    "IDispatch::GetIDsOfNames",
-                    BTreeMap::new(),
-                    json!(0),
-                );
+                self.dispatch_com_method(ComMethod::DispatchGetIDsOfNames, state, memory)?;
             }
             HostThunk::ComDispatchInvoke => {
-                let _this = guest_call_arg(state, memory, 0)?;
-                let disp_id = guest_call_arg(state, memory, 1)? as i32;
-                let _riid = guest_call_arg(state, memory, 2)?;
-                let _lcid = guest_call_arg_u32(state, memory, 3)?;
-                let _w_flags = guest_call_arg_u32(state, memory, 4)? as u16;
-                let _disp_params = guest_call_arg(state, memory, 5)?;
-                let p_var_result = guest_call_arg(state, memory, 6)?;
-                let _excep_info = guest_call_arg(state, memory, 7)?;
-                let _pu_arg_err = guest_call_arg(state, memory, 8)?;
-                // Return VT_EMPTY for now
-                if p_var_result != 0 {
-                    let variant_size = match self.guest_arch {
-                        GuestArch::X86 => 16,
-                        GuestArch::X64 => 24,
-                    };
-                    let empty_var = vec![0_u8; variant_size];
-                    memory.map_bytes(p_var_result, &empty_var);
-                }
-                state.set(Register::Rax, 0);
-                self.last_error = 0;
-                self.push_trace(
-                    "oleaut32",
-                    "IDispatch::Invoke",
-                    BTreeMap::from([("dispid".to_string(), json!(disp_id))]),
-                    json!(0),
-                );
+                self.dispatch_com_method(ComMethod::DispatchInvoke, state, memory)?;
+            }
+            HostThunk::ComMethod(method) => {
+                self.dispatch_com_method(method, state, memory)?;
             }
             HostThunk::SysAllocString => {
                 let src_ptr = guest_call_arg(state, memory, 0)?;
@@ -31624,8 +31732,16 @@ impl PeHostRuntime {
                 let overlapped_ptr = guest_call_arg(state, memory, 3)?;
                 let timeout_ms = guest_call_arg_u32(state, memory, 4)?;
 
-                match self.win32.dequeue_io_completion_packets(completion_port, 1) {
-                    Ok(mut packets) => {
+                // Non-consuming readiness first: a queued packet is handed
+                // out immediately (timeout 0 is a poll); otherwise the thread
+                // parks on the scheduler's CompletionPort wait, whose resume
+                // path writes the guest out-parameters from the real packet
+                // and reports WAIT_TIMEOUT / ERROR_ABANDONED_WAIT_0 without
+                // consuming anything.
+                match self.win32.get_queued_completion_status(completion_port, 0) {
+                    Ok(crate::win32::CompletionPortWaitOutcome::Packets(mut packets))
+                        if !packets.is_empty() =>
+                    {
                         let packet = packets.remove(0);
                         if bytes_transferred_ptr != 0 {
                             write_u32(memory, bytes_transferred_ptr, packet.bytes_transferred);
@@ -31652,7 +31768,10 @@ impl PeHostRuntime {
                             }),
                         );
                     }
-                    Err(error) if error.code == ReasonCode::RcWin32Timeout => {
+                    Ok(crate::win32::CompletionPortWaitOutcome::Packets(_))
+                    | Ok(crate::win32::CompletionPortWaitOutcome::TimedOut)
+                        if timeout_ms == 0 =>
+                    {
                         if bytes_transferred_ptr != 0 {
                             write_u32(memory, bytes_transferred_ptr, 0);
                         }
@@ -31664,6 +31783,49 @@ impl PeHostRuntime {
                         }
                         state.set(Register::Rax, 0);
                         self.last_error = crate::win32::WAIT_TIMEOUT;
+                    }
+                    Ok(crate::win32::CompletionPortWaitOutcome::Packets(_))
+                    | Ok(crate::win32::CompletionPortWaitOutcome::TimedOut) => {
+                        // The out-parameters are zeroed for a timeout resume
+                        // (the scheduler overwrites them when a packet is
+                        // taken), then the thread parks.
+                        if bytes_transferred_ptr != 0 {
+                            write_u32(memory, bytes_transferred_ptr, 0);
+                        }
+                        if completion_key_ptr != 0 {
+                            write_guest_pointer(memory, completion_key_ptr, 0, self.guest_arch)?;
+                        }
+                        if overlapped_ptr != 0 {
+                            write_guest_pointer(memory, overlapped_ptr, 0, self.guest_arch)?;
+                        }
+                        let now = self.win32.get_tick_count64();
+                        self.parked_wait = Some(GuestWait {
+                            objects: Vec::new(),
+                            wait_all: false,
+                            deadline_ticks: (timeout_ms != u32::MAX)
+                                .then(|| now.saturating_add(timeout_ms as u64)),
+                            alertable: false,
+                            operation: WaitOperation::CompletionPort {
+                                port: completion_port,
+                                bytes_ptr: bytes_transferred_ptr,
+                                key_ptr: completion_key_ptr,
+                                overlapped_ptr,
+                            },
+                        });
+                        // Fall through: the dispatch epilogue parks the thread.
+                    }
+                    Ok(crate::win32::CompletionPortWaitOutcome::Closed) => {
+                        if bytes_transferred_ptr != 0 {
+                            write_u32(memory, bytes_transferred_ptr, 0);
+                        }
+                        if completion_key_ptr != 0 {
+                            write_guest_pointer(memory, completion_key_ptr, 0, self.guest_arch)?;
+                        }
+                        if overlapped_ptr != 0 {
+                            write_guest_pointer(memory, overlapped_ptr, 0, self.guest_arch)?;
+                        }
+                        state.set(Register::Rax, 0);
+                        self.last_error = crate::win32::ERROR_ABANDONED_WAIT_0;
                     }
                     Err(error) => {
                         state.set(Register::Rax, 0);
@@ -31679,17 +31841,40 @@ impl PeHostRuntime {
                 let timeout_ms = guest_call_arg_u32(state, memory, 4)?;
                 let _alertable = guest_call_arg_u32(state, memory, 5)? != 0;
 
-                match self.win32.dequeue_io_completion_packets(completion_port, entry_count) {
-                    Ok(packets) => {
-                        let pointer_bytes = if self.guest_arch == GuestArch::X64 { 8 } else { 4 };
-                        let entry_stride = if self.guest_arch == GuestArch::X64 { 32 } else { 16 };
-                        for (index, packet) in packets.iter().enumerate() {
-                            let entry = entries_ptr + (index * entry_stride) as u64;
-                            write_guest_pointer(memory, entry, packet.completion_key, self.guest_arch)?;
-                            write_guest_pointer(memory, entry + pointer_bytes as u64, packet.overlapped, self.guest_arch)?;
-                            write_guest_pointer(memory, entry + (pointer_bytes as u64 * 2), packet.internal, self.guest_arch)?;
-                            write_u32(memory, entry + (pointer_bytes as u64 * 3), packet.bytes_transferred);
-                        }
+                let write_entries = |runtime: &mut PeHostRuntime,
+                                     memory: &mut MemoryImage,
+                                     packets: &[crate::win32::IoCompletionPacket]|
+                 -> AppResult<()> {
+                    let pointer_bytes = if runtime.guest_arch == GuestArch::X64 { 8 } else { 4 };
+                    let entry_stride = if runtime.guest_arch == GuestArch::X64 { 32 } else { 16 };
+                    for (index, packet) in packets.iter().enumerate() {
+                        let entry = entries_ptr + (index * entry_stride) as u64;
+                        write_guest_pointer(memory, entry, packet.completion_key, runtime.guest_arch)?;
+                        write_guest_pointer(
+                            memory,
+                            entry + pointer_bytes as u64,
+                            packet.overlapped,
+                            runtime.guest_arch,
+                        )?;
+                        write_guest_pointer(
+                            memory,
+                            entry + (pointer_bytes as u64 * 2),
+                            packet.internal,
+                            runtime.guest_arch,
+                        )?;
+                        write_u32(memory, entry + (pointer_bytes as u64 * 3), packet.bytes_transferred);
+                    }
+                    Ok(())
+                };
+
+                match self
+                    .win32
+                    .get_queued_completion_status_ex(completion_port, entry_count, 0)
+                {
+                    Ok(crate::win32::CompletionPortWaitOutcome::Packets(packets))
+                        if !packets.is_empty() =>
+                    {
+                        write_entries(self, memory, &packets)?;
                         if removed_count_ptr != 0 {
                             write_u32(memory, removed_count_ptr, packets.len() as u32);
                         }
@@ -31706,12 +31891,43 @@ impl PeHostRuntime {
                             json!(packets.len() as u32),
                         );
                     }
-                    Err(error) if error.code == ReasonCode::RcWin32Timeout => {
+                    Ok(crate::win32::CompletionPortWaitOutcome::Packets(_))
+                    | Ok(crate::win32::CompletionPortWaitOutcome::TimedOut)
+                        if timeout_ms == 0 =>
+                    {
                         if removed_count_ptr != 0 {
                             write_u32(memory, removed_count_ptr, 0);
                         }
                         state.set(Register::Rax, 0);
                         self.last_error = crate::win32::WAIT_TIMEOUT;
+                    }
+                    Ok(crate::win32::CompletionPortWaitOutcome::Packets(_))
+                    | Ok(crate::win32::CompletionPortWaitOutcome::TimedOut) => {
+                        if removed_count_ptr != 0 {
+                            write_u32(memory, removed_count_ptr, 0);
+                        }
+                        let now = self.win32.get_tick_count64();
+                        self.parked_wait = Some(GuestWait {
+                            objects: Vec::new(),
+                            wait_all: false,
+                            deadline_ticks: (timeout_ms != u32::MAX)
+                                .then(|| now.saturating_add(timeout_ms as u64)),
+                            alertable: false,
+                            operation: WaitOperation::CompletionPortEx {
+                                port: completion_port,
+                                entries_ptr,
+                                entry_count: entry_count as u32,
+                                removed_ptr: removed_count_ptr,
+                            },
+                        });
+                        // Fall through: the dispatch epilogue parks the thread.
+                    }
+                    Ok(crate::win32::CompletionPortWaitOutcome::Closed) => {
+                        if removed_count_ptr != 0 {
+                            write_u32(memory, removed_count_ptr, 0);
+                        }
+                        state.set(Register::Rax, 0);
+                        self.last_error = crate::win32::ERROR_ABANDONED_WAIT_0;
                     }
                     Err(error) => {
                         state.set(Register::Rax, 0);
@@ -55771,6 +55987,36 @@ impl PeHostRuntime {
             HostThunk::NtDelayExecution => {
                 self.dispatch_nt_delay_execution(state, memory)?;
             }
+            HostThunk::NtTestAlert => {
+                // `NtTestAlert` delivers the calling thread's pending APCs
+                // immediately (FIFO) and reports STATUS_USER_APC when it
+                // delivered at least one, STATUS_SUCCESS otherwise.
+                let (status, apc_entries) = self.win32.test_alert();
+                // The runtime wake markers mirror these APCs; drop them so a
+                // later parked alertable wait does not spuriously report
+                // WAIT_IO_COMPLETION for an already-delivered APC.
+                let current_tid = self.win32.current_thread_id();
+                if let Some(queue) = self.apc_queues.get_mut(&u64::from(current_tid)) {
+                    let count = queue.pending_count();
+                    if count > 0 {
+                        let _ = queue.deliver_apcs(count);
+                    }
+                }
+                for apc in apc_entries {
+                    if apc.callback == 0 {
+                        continue;
+                    }
+                    let _ = self.execute_guest_callback(
+                        state,
+                        memory,
+                        apc.callback,
+                        &[apc.context],
+                        "ApcCallback",
+                    );
+                }
+                state.set(Register::Rax, u64::from(status));
+                self.last_error = 0;
+            }
             HostThunk::NtCreateSection => {
                 self.dispatch_nt_create_section(state, memory)?;
             }
@@ -57498,25 +57744,40 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
-                    // Look up the thread ID from the handle
-                    let thread_id = self.win32.thread_id_for_handle(h_thread).unwrap_or(0);
-                    // Queue the APC to the target thread's APC queue.
-                    // If we don't have a queue for this thread yet, create one.
-                    let apc_queue = self.apc_queues.entry(thread_id as u64).or_default();
-                    apc_queue.queue_user_apc(pfn_apc, dw_data);
-                    state.set(Register::Rax, 1);
-                    self.last_error = 0;
-                    self.push_trace(
-                        "thread",
-                        "QueueUserAPC",
-                        BTreeMap::from([
-                            ("callback".to_string(), json!(format!("{pfn_apc:#x}"))),
-                            ("thread_handle".to_string(), json!(format!("{h_thread:#x}"))),
-                            ("context".to_string(), json!(format!("{dw_data:#x}"))),
-                            ("thread_id".to_string(), json!(thread_id)),
-                        ]),
-                        json!(1),
-                    );
+                    // Enqueue into the REAL win32 per-thread APC FIFO (the
+                    // delivery primitive at alertable wait boundaries); the
+                    // runtime wake queue mirrors the enqueue so the scheduler
+                    // wakes a parked alertable wait for this thread.
+                    match self.win32.queue_user_apc(h_thread, pfn_apc, dw_data) {
+                        Ok(()) => {
+                            let thread_id =
+                                self.win32.thread_id_for_handle(h_thread).unwrap_or(0);
+                            self.apc_queues
+                                .entry(thread_id as u64)
+                                .or_default()
+                                .queue_user_apc(pfn_apc, dw_data);
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "thread",
+                                "QueueUserAPC",
+                                BTreeMap::from([
+                                    ("callback".to_string(), json!(format!("{pfn_apc:#x}"))),
+                                    (
+                                        "thread_handle".to_string(),
+                                        json!(format!("{h_thread:#x}")),
+                                    ),
+                                    ("context".to_string(), json!(format!("{dw_data:#x}"))),
+                                    ("thread_id".to_string(), json!(thread_id)),
+                                ]),
+                                json!(1),
+                            );
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
+                    }
                 }
             }
             // -- Phase 4.4: Thread pool APIs -----------------------------------------------
@@ -63421,102 +63682,29 @@ impl PeHostRuntime {
             }
             // L8 — IMoniker methods
             HostThunk::MonikerBindToStorage => {
-                // IMoniker::BindToStorage(bindCtx, pmkToLeft, riid, ppvObj)
-                let _this = guest_call_arg(state, memory, 0)?;
-                let _bind_ctx = guest_call_arg(state, memory, 1)?;
-                let _pmk_to_left = guest_call_arg(state, memory, 2)?;
-                let _riid = guest_call_arg(state, memory, 3)?;
-                let out_ptr = guest_call_arg(state, memory, 4)?;
-                if out_ptr != 0 {
-                    write_guest_pointer(memory, out_ptr, 0, self.guest_arch)?;
-                }
-                state.set(Register::Rax, 0x80040101); // MK_E_NOOBJECT
-                self.last_error = 0;
+                self.dispatch_com_moniker_bind_to_storage(state, memory)?;
             }
             HostThunk::MonikerGetDisplayName => {
-                // IMoniker::GetDisplayName(bindCtx, pmkToLeft, ppszDisplayName)
-                let _this = guest_call_arg(state, memory, 0)?;
-                let _bind_ctx = guest_call_arg(state, memory, 1)?;
-                let _pmk_to_left = guest_call_arg(state, memory, 2)?;
-                let name_out = guest_call_arg(state, memory, 3)?;
-                if name_out != 0 {
-                    // Return a sentinel display name
-                    let name = "res://";
-                    let name_ptr = self.alloc_utf16_string(memory, name)?;
-                    write_guest_pointer(memory, name_out, name_ptr, self.guest_arch)?;
-                }
-                state.set(Register::Rax, 0);
-                self.last_error = 0;
+                self.dispatch_com_moniker_get_display_name(state, memory)?;
             }
             // L9 — Additional IMoniker methods (Gap 8.2)
             HostThunk::MonikerBindToObject => {
-                // IMoniker::BindToObject(bindCtx, pmkToLeft, riid, ppvObj)
-                let _this = guest_call_arg(state, memory, 0)?;
-                let _bind_ctx = guest_call_arg(state, memory, 1)?;
-                let _pmk_to_left = guest_call_arg(state, memory, 2)?;
-                let _riid = guest_call_arg(state, memory, 3)?;
-                let out_ptr = guest_call_arg(state, memory, 4)?;
-                if out_ptr != 0 {
-                    write_guest_pointer(memory, out_ptr, 0, self.guest_arch)?;
-                }
-                state.set(Register::Rax, 0x80040101); // MK_E_NOOBJECT
-                self.last_error = 0;
+                self.dispatch_com_moniker_bind_to_object(state, memory)?;
             }
             HostThunk::MonikerReduce => {
-                // IMoniker::Reduce(bindCtx, dwReduceHowFar, ppmkToLeft, ppmkReduced)
-                let _this = guest_call_arg(state, memory, 0)?;
-                let _bind_ctx = guest_call_arg(state, memory, 1)?;
-                let _reduce_how_far = guest_call_arg_u32(state, memory, 2)?;
-                let _ppmk_to_left = guest_call_arg(state, memory, 3)?;
-                let reduced_out = guest_call_arg(state, memory, 4)?;
-                if reduced_out != 0 {
-                    write_guest_pointer(memory, reduced_out, 0, self.guest_arch)?;
-                }
-                state.set(Register::Rax, 0x80040109); // MK_E_REDUCED_TO_SELF
-                self.last_error = 0;
+                self.dispatch_com_moniker_reduce(state, memory)?;
             }
             HostThunk::MonikerComposeWith => {
-                // IMoniker::ComposeWith(pmkRight, fOnlyIfNotGeneric, ppmkComposite)
-                let _this = guest_call_arg(state, memory, 0)?;
-                let _pmk_right = guest_call_arg(state, memory, 1)?;
-                let _f_only_if_not_generic = guest_call_arg(state, memory, 2)?;
-                let composite_out = guest_call_arg(state, memory, 3)?;
-                if composite_out != 0 {
-                    write_guest_pointer(memory, composite_out, 0, self.guest_arch)?;
-                }
-                state.set(Register::Rax, 0x80040102); // MK_E_SYNTAX
-                self.last_error = 0;
+                self.dispatch_com_moniker_compose_with(state, memory)?;
             }
             HostThunk::MonikerEnum => {
-                // IMoniker::Enum(fForward, ppenumMoniker)
-                let _this = guest_call_arg(state, memory, 0)?;
-                let _f_forward = guest_call_arg(state, memory, 1)?;
-                let enum_out = guest_call_arg(state, memory, 2)?;
-                if enum_out != 0 {
-                    write_guest_pointer(memory, enum_out, 0, self.guest_arch)?; // null enumerator
-                }
-                state.set(Register::Rax, 0); // S_OK
-                self.last_error = 0;
+                self.dispatch_com_moniker_enum(state, memory)?;
             }
             HostThunk::MonikerIsSystemMoniker => {
-                // IMoniker::IsSystemMoniker(pdwMksys)
-                let _this = guest_call_arg(state, memory, 0)?;
-                let pdw_mksys = guest_call_arg(state, memory, 1)?;
-                if pdw_mksys != 0 {
-                    memory.write_u32(pdw_mksys, 0);
-                }
-                state.set(Register::Rax, 1); // S_FALSE
-                self.last_error = 0;
+                self.dispatch_com_moniker_is_system_moniker(state, memory)?;
             }
             HostThunk::MonikerHash => {
-                // IMoniker::Hash(pdwHash)
-                let _this = guest_call_arg(state, memory, 0)?;
-                let pdw_hash = guest_call_arg(state, memory, 1)?;
-                if pdw_hash != 0 {
-                    memory.write_u32(pdw_hash, 0);
-                }
-                state.set(Register::Rax, 0x80004001); // E_NOTIMPL
-                self.last_error = 0;
+                self.dispatch_com_moniker_hash(state, memory)?;
             }
             // ── L1 — IEnumIDList methods ──────────────────────────────────────
             HostThunk::EnumIDListNext => {
@@ -66863,9 +67051,30 @@ impl PeHostRuntime {
             | GuestObjectKind::ComStdDispatch
             | GuestObjectKind::ComTypeInfo
             | GuestObjectKind::ComPropertyBag) => {
+                // COM object teardown: the per-object state maps are keyed by
+                // the guest pointer, so dropping the last reference forgets
+                // the state alongside the object.
+                self.com_streams.remove(&address);
+                self.com_storages.remove(&address);
+                self.com_data_objects.remove(&address);
+                self.com_ole_sites.remove(&address);
+                self.com_object_sites.remove(&address);
+                self.com_connection_points.remove(&address);
+                self.com_enum_variants.remove(&address);
+                self.com_bind_ctx_params.remove(&address);
+                self.com_moniker_names.remove(&address);
+                self.com_monikers.remove(&address);
+                self.com_type_infos.remove(&address);
                 self.guest_objects.remove(&address);
                 let _ = kind;
             }
+            GuestObjectKind::ImfByteStream
+            | GuestObjectKind::ImfPresentationDescriptor
+            | GuestObjectKind::ImfStreamDescriptor
+            | GuestObjectKind::ImfMediaTypeHandler
+            | GuestObjectKind::ImfMediaSource
+            | GuestObjectKind::ImfSourceReader
+            | GuestObjectKind::ImfMediaEvent => self.destroy_mf_object_state(address)?,
             kind @ (GuestObjectKind::ImfAttributes
             | GuestObjectKind::ImfMediaType
             | GuestObjectKind::ImfMediaBuffer
@@ -66874,15 +67083,10 @@ impl PeHostRuntime {
             | GuestObjectKind::ImfMediaSession
             | GuestObjectKind::ImfPresentationClock
             | GuestObjectKind::ImfSinkWriter
-            | GuestObjectKind::ImfSourceReader
             | GuestObjectKind::ImfSourceResolver
             | GuestObjectKind::ImfTopology
-            | GuestObjectKind::ImfPresentationDescriptor
-            | GuestObjectKind::ImfMediaEvent
             | GuestObjectKind::ImfMediaSink
             | GuestObjectKind::ImfAsyncResult
-            | GuestObjectKind::ImfMediaSource
-            | GuestObjectKind::ImfByteStream
             | GuestObjectKind::ImfTopologyNode
             | GuestObjectKind::ImfDxgiDeviceManager
             | GuestObjectKind::DshowClassFactory
@@ -66994,6 +67198,9 @@ impl PeHostRuntime {
                 self.guest_objects.remove(&address);
             }
             GuestObjectKind::ComDispatch => {
+                self.com_servers.remove(&address);
+                self.com_type_infos.remove(&address);
+                self.com_connection_points.remove(&address);
                 self.guest_objects.remove(&address);
             }
             GuestObjectKind::XapoEffect => {
@@ -67186,6 +67393,13 @@ impl PeHostRuntime {
         iid: &str,
         _flags: u32,
     ) -> AppResult<Option<u64>> {
+        // The runtime's in-process automation/event-source class: a real
+        // IDispatch property/method server with an IConnectionPointContainer
+        // for sink advice (the runtime's synthetic in-process class table).
+        if clsid.eq_ignore_ascii_case(crate::runtime::dispatch::com::COM_AUTOMATION_SERVER_CLSID) {
+            let server = self.alloc_com_automation_server(memory, "ICasa1Automation")?;
+            return Ok(Some(server));
+        }
         // Shell Link CLSID
         if clsid.eq_ignore_ascii_case(SHELL_LINK_CLSID) && is_shell_link_interface_iid(iid) {
             let shell_link_object = self.alloc_shell_link_object(memory)?;
@@ -67216,6 +67430,14 @@ impl PeHostRuntime {
             let vtable = self.alloc_guest_vtable(memory, methods)?;
             let object = self.alloc_guest_object(memory, GuestObjectKind::DirectSound8, vtable)?;
             return Ok(Some(object));
+        }
+        // CLSID_DirectPlay8Address ({934A9523-A3CA-4BC5-ADA0-D6D95D979421}):
+        // a real IDirectPlay8Address object from the DirectPlay engine.
+        if clsid.eq_ignore_ascii_case("{934A9523-A3CA-4BC5-ADA0-D6D95D979421}")
+            && (iid.eq_ignore_ascii_case("{83783300-4063-4C8A-9DB3-82830A7FEB31}")
+                || iid.eq_ignore_ascii_case(IID_IUNKNOWN))
+        {
+            return self.dplay_create_address_object(memory).map(Some);
         }
         // XAudio2 CLSID
         if clsid.eq_ignore_ascii_case("{609ED052-35B5-4F10-9BE6-39650F9781D4}") {
@@ -80430,6 +80652,11 @@ impl HostThunk {
             ("dpaddr.dll", ImportSymbol::ByName { name, .. }) if name == "DP8SPCreate" => {
                 Self::Dp8spCreate
             }
+            ("dpaddr.dll", ImportSymbol::ByName { name, .. })
+                if name == "DirectPlay8AddressCreate" =>
+            {
+                Self::DirectPlay8AddressCreate
+            }
             ("gdiplus.dll", ImportSymbol::ByName { name, .. }) if name == "GdipCreateGraphics" => {
                 Self::GdipCreateGraphics
             }
@@ -81552,6 +81779,9 @@ impl HostThunk {
                 if name == "MFCreateMFByteStreamOnStream" =>
             {
                 Self::MfCreateMfByteStreamOnStream
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateFile" => {
+                Self::MfCreateFile
             }
             ("mfplat.dll", ImportSymbol::ByName { name, .. })
                 if name == "MFCreateMediaBufferFromMediaType" =>
@@ -85037,6 +85267,9 @@ impl HostThunk {
             }
             ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtDelayExecution" => {
                 Self::NtDelayExecution
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtTestAlert" => {
+                Self::NtTestAlert
             }
             ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateSection" => {
                 Self::NtCreateSection
@@ -89520,6 +89753,7 @@ impl HostThunk {
             | Self::TimeGetTime
             | Self::DwmFlush
             | Self::CreateMenu
+            | Self::NtTestAlert
             | Self::DelayLoadResolve { .. } => 0,
             Self::QueryPerformanceCounter
             | Self::QueryPerformanceFrequency
@@ -90854,6 +91088,11 @@ impl HostThunk {
             // thunk itself (see `crate::xact`).
             Self::Xact3CreateEngine | Self::Xact3CreateEngineWithFlags => 8,
             Self::Xact3Method { x86_arg_bytes, .. } => u64::from(*x86_arg_bytes),
+            // DirectPlay: the guest-object vtable methods carry their stdcall
+            // argument byte count on the thunk itself (see `crate::dplay`).
+            Self::Dplay8Method { x86_arg_bytes, .. } => u64::from(*x86_arg_bytes),
+            Self::DirectPlay8AddressCreate => 12,
+            Self::ComMethod(method) => method.x86_arg_bytes(),
             _ => 0,
         }
     }
@@ -119523,7 +119762,7 @@ mod tests {
                 stream_handle,
                 ComStreamState {
                     data: stream_png,
-                    position: 0,
+                    ..Default::default()
                 },
             );
             let from_stream_out = 0x30_420_u64;
@@ -122543,7 +122782,7 @@ mod tests {
                 stream_handle,
                 ComStreamState {
                     data: Vec::new(),
-                    position: 0,
+                    ..Default::default()
                 },
             );
             assert_eq!(
@@ -124608,6 +124847,392 @@ mod tests {
             assert_eq!(memory.read_u32(entries_ptr as u64).unwrap(), 0xCAFE);
             assert_eq!(memory.read_u32(entries_ptr as u64 + 4).unwrap(), 0xBEEF);
             assert_eq!(memory.read_u32(entries_ptr as u64 + 12).unwrap(), 9);
+        })
+    }
+
+    // ── APC + completion-port scheduler wiring ─────────────────────────────
+    //
+    // The GQCS/GQCSEx thunks park on the scheduler's CompletionPort waits;
+    // `QueueUserAPC` enqueues into the win32 FIFO, and alertable waits
+    // deliver those APCs through `execute_guest_callback`.
+
+    const GQCS_CONTINUATION: u64 = 0x42_000;
+    const GQCS_FLAG_PTR: u64 = 0x42_010;
+
+    /// Repoint the (single) parked completion-port waiter at a test
+    /// continuation: `mov dword ptr [GQCS_FLAG_PTR], eax; ret` with a zeroed
+    /// stack sentinel, so the pumped thread records the resume code and ends.
+    fn resume_parked_completion_port_waiter(runtime: &mut PeHostRuntime, memory: &mut MemoryImage) {
+        let mut parked = runtime
+            .pending_guest_threads
+            .pop_front()
+            .expect("a parked completion-port waiter");
+        parked.state.rip = GQCS_CONTINUATION;
+        parked.state.set(Register::Rsp, 0x10_F00);
+        runtime.pending_guest_threads.push_back(parked);
+        memory.map_bytes(GQCS_CONTINUATION, &[0xA3, 0x10, 0x20, 0x04, 0x00, 0xC3]);
+        memory.map_bytes(GQCS_FLAG_PTR, &[0u8; 4]);
+        memory.map_bytes(0x10_F00, &[0u8; 4]);
+    }
+
+    #[test]
+    fn get_queued_completion_status_blocks_until_packet_posted() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("gqcs-blocks");
+            let mut memory = MemoryImage::default();
+            let create_port = runtime.alloc_host_thunk(HostThunk::CreateIoCompletionPort);
+            let get_status = runtime.alloc_host_thunk(HostThunk::GetQueuedCompletionStatus);
+            let port = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_port,
+                &[u32::MAX, 0, 0x77, 1],
+            );
+            assert_ne!(port, 0);
+
+            let bytes_ptr = 0x41_000_u64;
+            let key_ptr = 0x41_004_u64;
+            let overlapped_ptr = 0x41_008_u64;
+            memory.map_bytes(bytes_ptr, &[0u8; 12]);
+
+            // An empty port with a finite timeout parks the caller.
+            let before_packet = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_status,
+                &[
+                    port as u32,
+                    bytes_ptr as u32,
+                    key_ptr as u32,
+                    overlapped_ptr as u32,
+                    5_000,
+                ],
+            );
+            assert_eq!(before_packet, 0, "GQCS must not return before a packet");
+            assert_eq!(runtime.pending_guest_threads.len(), 1, "GQCS parked");
+
+            resume_parked_completion_port_waiter(&mut runtime, &mut memory);
+            runtime
+                .win32
+                .post_queued_completion_status(port as u32, 42, 0xABCD, 0x1234)
+                .expect("post packet");
+            let outcome = runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump blocked GQCS");
+            assert!(outcome.did_work);
+            assert!(runtime.pending_guest_threads.is_empty());
+
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(memory.read_u32(bytes_ptr).unwrap(), 42);
+            assert_eq!(memory.read_u32(key_ptr).unwrap(), 0xABCD);
+            assert_eq!(memory.read_u32(overlapped_ptr).unwrap(), 0x1234);
+            assert_eq!(
+                memory.read_u32(GQCS_FLAG_PTR).unwrap(),
+                1,
+                "GQCS returned TRUE"
+            );
+        })
+    }
+
+    #[test]
+    fn get_queued_completion_status_ex_blocks_until_packet_posted() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("gqcs-ex-blocks");
+            let mut memory = MemoryImage::default();
+            let create_port = runtime.alloc_host_thunk(HostThunk::CreateIoCompletionPort);
+            let get_status_ex = runtime.alloc_host_thunk(HostThunk::GetQueuedCompletionStatusEx);
+            let port = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_port,
+                &[u32::MAX, 0, 0x88, 1],
+            );
+            assert_ne!(port, 0);
+
+            let entries_ptr = 0x41_100_u64;
+            let removed_ptr = 0x41_200_u64;
+            memory.map_bytes(entries_ptr, &[0u8; 64]);
+            memory.map_bytes(removed_ptr, &[0u8; 4]);
+
+            let before_packet = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_status_ex,
+                &[
+                    port as u32,
+                    entries_ptr as u32,
+                    4,
+                    removed_ptr as u32,
+                    5_000,
+                    0,
+                ],
+            );
+            assert_eq!(before_packet, 0, "GQCSEx must not return before packets");
+            assert_eq!(runtime.pending_guest_threads.len(), 1, "GQCSEx parked");
+
+            resume_parked_completion_port_waiter(&mut runtime, &mut memory);
+            runtime
+                .win32
+                .post_queued_completion_status(port as u32, 5, 0xA1, 0xB1)
+                .expect("post first");
+            runtime
+                .win32
+                .post_queued_completion_status(port as u32, 6, 0xA2, 0xB2)
+                .expect("post second");
+            runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump blocked GQCSEx");
+            assert!(runtime.pending_guest_threads.is_empty());
+
+            // x86 OVERLAPPED_ENTRY stride 16: key, overlapped, internal, bytes.
+            assert_eq!(memory.read_u32(removed_ptr).unwrap(), 2);
+            assert_eq!(memory.read_u32(entries_ptr).unwrap(), 0xA1);
+            assert_eq!(memory.read_u32(entries_ptr + 4).unwrap(), 0xB1);
+            assert_eq!(memory.read_u32(entries_ptr + 12).unwrap(), 5);
+            assert_eq!(memory.read_u32(entries_ptr + 16).unwrap(), 0xA2);
+            assert_eq!(memory.read_u32(entries_ptr + 20).unwrap(), 0xB2);
+            assert_eq!(memory.read_u32(entries_ptr + 28).unwrap(), 6);
+            assert_eq!(memory.read_u32(GQCS_FLAG_PTR).unwrap(), 1);
+            assert_eq!(runtime.last_error, 0);
+        })
+    }
+
+    #[test]
+    fn get_queued_completion_status_timeout_consumes_no_packet() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("gqcs-timeout");
+            let mut memory = MemoryImage::default();
+            let create_port = runtime.alloc_host_thunk(HostThunk::CreateIoCompletionPort);
+            let get_status = runtime.alloc_host_thunk(HostThunk::GetQueuedCompletionStatus);
+            let port = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_port,
+                &[u32::MAX, 0, 0x99, 1],
+            );
+            assert_ne!(port, 0);
+
+            let bytes_ptr = 0x41_000_u64;
+            let key_ptr = 0x41_004_u64;
+            let overlapped_ptr = 0x41_008_u64;
+            // Pre-fill with garbage: the timeout resume must zero them.
+            memory.map_bytes(bytes_ptr, &[0xAAu8; 12]);
+
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_status,
+                &[
+                    port as u32,
+                    bytes_ptr as u32,
+                    key_ptr as u32,
+                    overlapped_ptr as u32,
+                    50,
+                ],
+            );
+            assert_eq!(runtime.pending_guest_threads.len(), 1, "GQCS parked");
+            resume_parked_completion_port_waiter(&mut runtime, &mut memory);
+
+            // Advance the guest clock past the 50 ms deadline.
+            runtime.win32.record_sleep_observation(1_000, 1_000);
+            runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump timed-out GQCS");
+            assert!(runtime.pending_guest_threads.is_empty());
+
+            assert_eq!(runtime.last_error, crate::win32::WAIT_TIMEOUT);
+            assert_eq!(
+                memory.read_u32(GQCS_FLAG_PTR).unwrap(),
+                0,
+                "GQCS returned FALSE"
+            );
+            assert_eq!(memory.read_u32(bytes_ptr).unwrap(), 0);
+            assert_eq!(memory.read_u32(key_ptr).unwrap(), 0);
+            assert_eq!(memory.read_u32(overlapped_ptr).unwrap(), 0);
+
+            // The timed-out wait consumed nothing: a later post stays queued.
+            runtime
+                .win32
+                .post_queued_completion_status(port as u32, 3, 0x1111, 0x2222)
+                .expect("post after timeout");
+            let port_state = runtime
+                .win32
+                .io_completion_port_state(port as u32)
+                .expect("port state");
+            assert_eq!(port_state.queued_packet_count(), 1, "packet not consumed");
+        })
+    }
+
+    #[test]
+    fn get_queued_completion_status_closed_port_is_abandoned() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("gqcs-closed");
+            let mut memory = MemoryImage::default();
+            let create_port = runtime.alloc_host_thunk(HostThunk::CreateIoCompletionPort);
+            let get_status = runtime.alloc_host_thunk(HostThunk::GetQueuedCompletionStatus);
+            let port = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_port,
+                &[u32::MAX, 0, 0xAA, 1],
+            );
+            assert_ne!(port, 0);
+
+            let bytes_ptr = 0x41_000_u64;
+            let key_ptr = 0x41_004_u64;
+            let overlapped_ptr = 0x41_008_u64;
+            memory.map_bytes(bytes_ptr, &[0u8; 12]);
+
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_status,
+                &[
+                    port as u32,
+                    bytes_ptr as u32,
+                    key_ptr as u32,
+                    overlapped_ptr as u32,
+                    u32::MAX,
+                ],
+            );
+            assert_eq!(runtime.pending_guest_threads.len(), 1, "GQCS parked");
+            resume_parked_completion_port_waiter(&mut runtime, &mut memory);
+            runtime.win32.close_handle(port as u32).expect("close port");
+
+            runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump closed-port GQCS");
+            assert!(runtime.pending_guest_threads.is_empty());
+            assert_eq!(runtime.last_error, crate::win32::ERROR_ABANDONED_WAIT_0);
+            assert_eq!(
+                memory.read_u32(GQCS_FLAG_PTR).unwrap(),
+                0,
+                "GQCS returned FALSE"
+            );
+        })
+    }
+
+    #[test]
+    fn user_apc_delivered_only_at_alertable_wait() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("apc-alertable");
+            let mut memory = MemoryImage::default();
+            let queue_apc = runtime.alloc_host_thunk(HostThunk::QueueUserAPC);
+            let wait_ex = runtime.alloc_host_thunk(HostThunk::WaitForSingleObjectEx);
+            let apc_callback = 0x43_000_u64;
+            let apc_flag = 0x43_100_u64;
+            // mov eax, 0xABCD; mov [apc_flag], eax; ret
+            memory.map_bytes(
+                apc_callback,
+                &[
+                    0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x31, 0x04, 0x00, 0xC3,
+                ],
+            );
+            memory.map_bytes(apc_flag, &[0u8; 4]);
+
+            let (event_handle, _created) = runtime.win32.create_event(false, false, false, None);
+            let thread_handle = runtime.win32.current_thread_handle();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    queue_apc,
+                    &[apc_callback as u32, thread_handle, 7],
+                ),
+                1,
+                "QueueUserAPC succeeds"
+            );
+            let thread_id = runtime.win32.current_thread_id();
+            assert_eq!(runtime.win32.pending_apc_count(thread_id), 1);
+
+            // A NON-alertable wait never delivers the queued APC.
+            let non_alertable =
+                dispatch_x86_thunk(&mut runtime, &mut memory, wait_ex, &[event_handle, 0, 0]);
+            assert_eq!(non_alertable, u64::from(crate::win32::WAIT_TIMEOUT));
+            assert_eq!(memory.read_u32(apc_flag).unwrap(), 0, "APC must not run");
+            assert_eq!(
+                runtime.win32.pending_apc_count(thread_id),
+                1,
+                "still queued"
+            );
+
+            // An alertable wait delivers it FIFO and reports WAIT_IO_COMPLETION.
+            let alertable =
+                dispatch_x86_thunk(&mut runtime, &mut memory, wait_ex, &[event_handle, 0, 1]);
+            assert_eq!(alertable, u64::from(crate::win32::WAIT_IO_COMPLETION));
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(memory.read_u32(apc_flag).unwrap(), 0xABCD, "APC ran");
+            assert_eq!(runtime.win32.pending_apc_count(thread_id), 0, "drained");
+        })
+    }
+
+    #[test]
+    fn nt_test_alert_returns_user_apc_only_when_delivered() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("nt-test-alert");
+            let mut memory = MemoryImage::default();
+            let test_alert = runtime.alloc_host_thunk(HostThunk::NtTestAlert);
+            let queue_apc = runtime.alloc_host_thunk(HostThunk::QueueUserAPC);
+            let apc_callback = 0x43_000_u64;
+            let apc_flag = 0x43_100_u64;
+            // mov eax, 0xABCD; mov [apc_flag], eax; ret
+            memory.map_bytes(
+                apc_callback,
+                &[
+                    0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x31, 0x04, 0x00, 0xC3,
+                ],
+            );
+            memory.map_bytes(apc_flag, &[0u8; 4]);
+
+            // Empty queue: STATUS_SUCCESS.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, test_alert, &[]),
+                0
+            );
+
+            let thread_handle = runtime.win32.current_thread_handle();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    queue_apc,
+                    &[apc_callback as u32, thread_handle, 0],
+                ),
+                1
+            );
+            // A queued APC is delivered immediately: STATUS_USER_APC.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, test_alert, &[]),
+                u64::from(crate::win32::STATUS_USER_APC),
+                "NtTestAlert reports STATUS_USER_APC when it delivered"
+            );
+            assert_eq!(memory.read_u32(apc_flag).unwrap(), 0xABCD, "APC ran");
+            // Queue drained: the next call reports STATUS_SUCCESS.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, test_alert, &[]),
+                0,
+                "NtTestAlert reports STATUS_SUCCESS with an empty queue"
+            );
+
+            // The ntdll import maps to the host thunk.
+            let import = ResolvedImport {
+                requested_module: "ntdll.dll".to_string(),
+                resolved_module: "ntdll.dll".to_string(),
+                symbol: ImportSymbol::ByName {
+                    hint: 0,
+                    name: "NtTestAlert".to_string(),
+                },
+                iat_rva: 0x4000,
+                export: ExportSymbol {
+                    ordinal: 0,
+                    name: Some("NtTestAlert".to_string()),
+                    target: ExportTarget::Rva(0x5000),
+                },
+            };
+            assert!(matches!(
+                HostThunk::from_import(&import),
+                HostThunk::NtTestAlert
+            ));
         })
     }
 
@@ -132300,17 +132925,32 @@ mod tests {
             runtime.com_streams.insert(
                 stream_obj,
                 ComStreamState {
-                    data: b"fake-mp4".to_vec(),
-                    position: 0,
+                    data: crate::media::minimal_mp4_fixture(),
+                    ..Default::default()
                 },
             );
+            // Wrap the IStream payload in a real IMFByteStream, then build the
+            // source-reader graph over it (which parses the real container).
+            let create_byte_stream: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfCreateMfByteStreamOnStream);
+            let byte_stream_out = 0x41_050;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_byte_stream,
+                &[stream_obj as u32, byte_stream_out as u32],
+            );
+            assert_eq!(hr, 0, "MFCreateMFByteStreamOnStream");
+            let byte_stream = read_guest_pointer(&memory, byte_stream_out, GuestArch::X86).unwrap();
+            assert_ne!(byte_stream, 0);
             let reader_out = 0x41_000;
-            dispatch_x86_thunk(
+            let hr = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
                 create_reader,
-                &[stream_obj as u32, 0, reader_out as u32],
+                &[byte_stream as u32, 0, reader_out as u32],
             );
+            assert_eq!(hr, 0, "MFCreateSourceReaderFromByteStream");
             let reader = read_guest_pointer(&memory, reader_out, GuestArch::X86).unwrap();
             assert_ne!(reader, 0);
             assert!(runtime.mf_source_readers.contains_key(&reader));
@@ -132464,7 +133104,7 @@ mod tests {
                     get_service,
                     &[manager as u32, handle as u32, 0, lock_out as u32]
                 ),
-                0xC00D_36C8
+                0xC00D_36BA // MF_E_UNSUPPORTED_SERVICE (mferror.h)
             );
 
             assert_eq!(
@@ -135120,9 +135760,10 @@ mod tests {
             let dp_out = 0x41_200_u64;
             assert_eq!(
                 dispatch_x86_thunk(&mut runtime, &mut memory, dp_create, &[0, dp_out as u32, 0]),
-                0x8004_0153
+                0,
+                "the legacy DirectPlay object is real"
             );
-            assert_eq!(
+            assert_ne!(
                 read_guest_pointer(&memory, dp_out, GuestArch::X86).unwrap(),
                 0
             );
@@ -135325,6 +135966,185 @@ mod tests {
                 "LPF direct not requested must not be written"
             );
         })
+    }
+
+    /// Build a minimal, genuinely runnable x86 PE32 image carrying two
+    /// `kernel32!ExitProcess` call sites: the entry point calls
+    /// `ExitProcess(entry_exit_code)` and a second routine at
+    /// `image_base + 0x1010` calls `ExitProcess(second_exit_code)`.  The
+    /// image maps at its preferred base (no DYNAMIC_BASE, no relocations) so
+    /// guest VAs are stable, and it imports exactly one symbol.  Returns
+    /// `(bytes, image_base, entry_va, second_va)`.
+    fn build_exit_process_pe32(
+        entry_exit_code: u32,
+        second_exit_code: u32,
+    ) -> (Vec<u8>, u64, u64, u64) {
+        const IMAGE_BASE: u32 = 0x0040_0000;
+        const ENTRY_RVA: u32 = 0x1000;
+        const SECOND_RVA: u32 = 0x1010;
+        const RDATA_RVA: u32 = 0x2000;
+        const FILE_ALIGN: u32 = 0x200;
+        const SECTION_ALIGN: u32 = 0x1000;
+        const SIZE_OF_HEADERS: u32 = 0x200;
+        // .rdata layout (RVA addrs):
+        //   0x2000 import descriptor (ILT 0x2028 / name 0x2038 / IAT 0x2030)
+        //   0x2014 null import descriptor
+        //   0x2028 ILT entry → 0x2045, terminator
+        //   0x2030 IAT entry → 0x2045, terminator
+        //   0x2038 "kernel32.dll\0"
+        //   0x2045 hint (0) + "ExitProcess\0"
+        const IMPORT_DESCRIPTOR_RVA: u32 = RDATA_RVA;
+        const ILT_RVA: u32 = RDATA_RVA + 0x28;
+        const IAT_RVA: u32 = RDATA_RVA + 0x30;
+        const DLL_NAME_RVA: u32 = RDATA_RVA + 0x38;
+        const HINT_NAME_RVA: u32 = RDATA_RVA + 0x45;
+        const IMPORT_DIRECTORY_SIZE: u32 = RDATA_RVA + 0x53 - RDATA_RVA;
+
+        let mut text = vec![0_u8; FILE_ALIGN as usize];
+        // push exit_code; call dword ptr [IAT]; ret
+        let iat_va = (IMAGE_BASE + IAT_RVA) as u32;
+        let emit_exit_routine = |text: &mut Vec<u8>, offset: usize, code: u32| {
+            text[offset] = 0x6A; // push imm8
+            text[offset + 1] = code as u8;
+            text[offset + 2] = 0xFF; // call dword ptr [abs32]
+            text[offset + 3] = 0x15;
+            text[offset + 4..offset + 8].copy_from_slice(&iat_va.to_le_bytes());
+            text[offset + 8] = 0xC3; // ret
+        };
+        emit_exit_routine(
+            &mut text,
+            (ENTRY_RVA - SECTION_ALIGN) as usize,
+            entry_exit_code,
+        );
+        emit_exit_routine(
+            &mut text,
+            (SECOND_RVA - SECTION_ALIGN) as usize,
+            second_exit_code,
+        );
+
+        let mut rdata = vec![0_u8; FILE_ALIGN as usize];
+        let rdata_offset = |rva: u32| (rva - RDATA_RVA) as usize;
+        // Import descriptor: OriginalFirstThunk, TimeDateStamp, ForwarderChain,
+        // Name, FirstThunk.
+        rdata[rdata_offset(IMPORT_DESCRIPTOR_RVA)..rdata_offset(IMPORT_DESCRIPTOR_RVA) + 4]
+            .copy_from_slice(&ILT_RVA.to_le_bytes());
+        rdata[rdata_offset(IMPORT_DESCRIPTOR_RVA) + 12..rdata_offset(IMPORT_DESCRIPTOR_RVA) + 16]
+            .copy_from_slice(&DLL_NAME_RVA.to_le_bytes());
+        rdata[rdata_offset(IMPORT_DESCRIPTOR_RVA) + 16..rdata_offset(IMPORT_DESCRIPTOR_RVA) + 20]
+            .copy_from_slice(&IAT_RVA.to_le_bytes());
+        // ILT + IAT entries point at the hint/name table.
+        rdata[rdata_offset(ILT_RVA)..rdata_offset(ILT_RVA) + 4]
+            .copy_from_slice(&HINT_NAME_RVA.to_le_bytes());
+        rdata[rdata_offset(IAT_RVA)..rdata_offset(IAT_RVA) + 4]
+            .copy_from_slice(&HINT_NAME_RVA.to_le_bytes());
+        rdata[rdata_offset(DLL_NAME_RVA)..rdata_offset(DLL_NAME_RVA) + 12]
+            .copy_from_slice(b"kernel32.dll");
+        // Hint 0 + "ExitProcess" NUL.
+        rdata[rdata_offset(HINT_NAME_RVA) + 2..rdata_offset(HINT_NAME_RVA) + 13]
+            .copy_from_slice(b"ExitProcess");
+
+        let mut bytes = vec![0_u8; SIZE_OF_HEADERS as usize];
+        bytes[0..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x40_u32.to_le_bytes());
+        bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+        // COFF header.
+        bytes[0x44..0x46].copy_from_slice(&0x014c_u16.to_le_bytes()); // i386
+        bytes[0x46..0x48].copy_from_slice(&2_u16.to_le_bytes()); // sections
+        bytes[0x48..0x4c].copy_from_slice(&0_u32.to_le_bytes()); // timestamp
+        bytes[0x54..0x56].copy_from_slice(&0xe0_u16.to_le_bytes()); // optional size
+        bytes[0x56..0x58].copy_from_slice(&0x0102_u16.to_le_bytes()); // EXECUTABLE_IMAGE | 32BIT
+        // Optional header (PE32).
+        let opt = 0x58;
+        bytes[opt..opt + 2].copy_from_slice(&0x010b_u16.to_le_bytes());
+        bytes[opt + 4..opt + 8].copy_from_slice(&FILE_ALIGN.to_le_bytes()); // SizeOfCode
+        bytes[opt + 8..opt + 12].copy_from_slice(&FILE_ALIGN.to_le_bytes()); // SizeOfInitializedData
+        bytes[opt + 16..opt + 20].copy_from_slice(&ENTRY_RVA.to_le_bytes());
+        bytes[opt + 20..opt + 24].copy_from_slice(&ENTRY_RVA.to_le_bytes()); // BaseOfCode
+        bytes[opt + 24..opt + 28].copy_from_slice(&RDATA_RVA.to_le_bytes()); // BaseOfData
+        bytes[opt + 28..opt + 32].copy_from_slice(&IMAGE_BASE.to_le_bytes());
+        bytes[opt + 32..opt + 36].copy_from_slice(&SECTION_ALIGN.to_le_bytes());
+        bytes[opt + 36..opt + 40].copy_from_slice(&FILE_ALIGN.to_le_bytes());
+        bytes[opt + 40..opt + 42].copy_from_slice(&6_u16.to_le_bytes()); // OS major
+        bytes[opt + 48..opt + 50].copy_from_slice(&6_u16.to_le_bytes()); // subsystem major
+        bytes[opt + 56..opt + 60].copy_from_slice(&0x3000_u32.to_le_bytes()); // SizeOfImage
+        bytes[opt + 60..opt + 64].copy_from_slice(&SIZE_OF_HEADERS.to_le_bytes());
+        bytes[opt + 68..opt + 70].copy_from_slice(&3_u16.to_le_bytes()); // CONSOLE
+        bytes[opt + 72..opt + 76].copy_from_slice(&0x10_0000_u32.to_le_bytes()); // stack reserve
+        bytes[opt + 76..opt + 80].copy_from_slice(&0x1000_u32.to_le_bytes()); // stack commit
+        bytes[opt + 80..opt + 84].copy_from_slice(&0x10_0000_u32.to_le_bytes()); // heap reserve
+        bytes[opt + 84..opt + 88].copy_from_slice(&0x1000_u32.to_le_bytes()); // heap commit
+        bytes[opt + 92..opt + 96].copy_from_slice(&16_u32.to_le_bytes()); // NumberOfRvaAndSizes
+        // DataDirectory[1] = import table (offset 0x60 + 8).
+        bytes[opt + 0x68..opt + 0x6c].copy_from_slice(&IMPORT_DESCRIPTOR_RVA.to_le_bytes());
+        bytes[opt + 0x6c..opt + 0x70].copy_from_slice(&IMPORT_DIRECTORY_SIZE.to_le_bytes());
+        // Section headers.
+        let section_table = 0x44 + 20 + 0xe0;
+        let section = |name: &[u8; 8],
+                       virtual_size: u32,
+                       virtual_address: u32,
+                       raw_size: u32,
+                       raw_ptr: u32,
+                       characteristics: u32,
+                       at: usize,
+                       bytes: &mut Vec<u8>| {
+            bytes[at..at + 8].copy_from_slice(name);
+            bytes[at + 8..at + 12].copy_from_slice(&virtual_size.to_le_bytes());
+            bytes[at + 12..at + 16].copy_from_slice(&virtual_address.to_le_bytes());
+            bytes[at + 16..at + 20].copy_from_slice(&raw_size.to_le_bytes());
+            bytes[at + 20..at + 24].copy_from_slice(&raw_ptr.to_le_bytes());
+            bytes[at + 36..at + 40].copy_from_slice(&characteristics.to_le_bytes());
+        };
+        section(
+            b".text\0\0\0",
+            FILE_ALIGN,
+            ENTRY_RVA,
+            FILE_ALIGN,
+            SIZE_OF_HEADERS,
+            0x6000_0020,
+            section_table as usize,
+            &mut bytes,
+        );
+        section(
+            b".rdata\0\0",
+            FILE_ALIGN,
+            RDATA_RVA,
+            FILE_ALIGN,
+            SIZE_OF_HEADERS + FILE_ALIGN,
+            0x4000_0040,
+            section_table as usize + 40,
+            &mut bytes,
+        );
+        bytes.extend_from_slice(&text);
+        bytes.extend_from_slice(&rdata);
+        (
+            bytes,
+            IMAGE_BASE as u64,
+            (IMAGE_BASE + ENTRY_RVA) as u64,
+            (IMAGE_BASE + SECOND_RVA) as u64,
+        )
+    }
+
+    /// Stage a guest script as a real, executable host file inside the GE.
+    #[cfg(unix)]
+    fn stage_guest_script(
+        runtime: &PeHostRuntime,
+        guest_path: &str,
+        script: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let host_program = runtime
+            .win32
+            .guest_path_to_host_path(guest_path)
+            .expect("resolve guest script");
+        std::fs::create_dir_all(host_program.parent().expect("script parent"))
+            .expect("create script dirs");
+        std::fs::write(&host_program, script).expect("write guest script");
+        let mut permissions = std::fs::metadata(&host_program)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&host_program, permissions).expect("make script executable");
+        host_program
     }
 
     #[test]
@@ -135731,6 +136551,787 @@ mod tests {
                     .any(|thread| thread.handle == thread_handle),
                 "a host-launched child thread must not also run in this runtime"
             );
+        })
+    }
+
+    /// `NtCreateProcess` accepts an image-backed section: `NtCreateSection`
+    /// over a real staged PE file with SEC_IMAGE, then NtCreateProcess with
+    /// the section (or any duplicate of its handle) births the child from
+    /// that image.  Non-image sections keep STATUS_INVALID_IMAGE_FORMAT.
+    #[cfg(unix)]
+    #[test]
+    fn nt_create_process_accepts_image_backed_section() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("nt-image-section");
+            let image = "C:\\Games\\NativeDemo\\sectioned.exe";
+            let (pe_bytes, _, _, _) = build_exit_process_pe32(1, 2);
+            let host_program = runtime
+                .win32
+                .guest_path_to_host_path(image)
+                .expect("host path");
+            std::fs::create_dir_all(host_program.parent().expect("parent")).expect("create dirs");
+            std::fs::write(&host_program, &pe_bytes).expect("write staged PE");
+
+            let file = runtime
+                .win32
+                .create_file_w(
+                    image,
+                    FileAccess::read_only(),
+                    ShareMode::all(),
+                    crate::win32::CreationDisposition::OpenExisting,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("open staged PE");
+
+            let mut memory = MemoryImage::default();
+            let nt_create_section = runtime.alloc_host_thunk(HostThunk::NtCreateSection);
+            let nt_create_process = runtime.alloc_host_thunk(HostThunk::NtCreateProcess);
+            let section_ptr = 0x41_000_u64;
+            memory.map_bytes(section_ptr, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_section,
+                &[
+                    section_ptr as u32,
+                    0x001F_FFFF,
+                    0,
+                    0,
+                    crate::ntdll::PAGE_EXECUTE_READ,
+                    0x0100_0000, // SEC_IMAGE
+                    file,
+                ],
+            );
+            assert_eq!(status, 0, "NtCreateSection status");
+            let section = read_u32(&memory, section_ptr).expect("section handle");
+            assert_ne!(section, 0);
+
+            let handle_out = 0x42_000_u64;
+            memory.map_bytes(handle_out, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, section, 0, 0],
+            );
+            assert_eq!(status, 0, "NtCreateProcess on an image section");
+            let child = read_guest_pointer(&memory, handle_out, GuestArch::X86).unwrap() as u32;
+            let child_state = runtime.win32.process_state(child).expect("child process");
+            assert!(
+                child_state.executable.eq_ignore_ascii_case(image),
+                "the child is born from the section's image: {}",
+                child_state.executable
+            );
+
+            // A duplicate handle to the SAME section resolves the same image
+            // (the registry is keyed by object identity, not handle value).
+            let duplicate = runtime
+                .win32
+                .duplicate_handle(section, 0, false, true, false)
+                .expect("duplicate section handle");
+            memory.map_bytes(handle_out, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, duplicate, 0, 0],
+            );
+            assert_eq!(
+                status, 0,
+                "NtCreateProcess on a duplicated image-section handle"
+            );
+
+            // A file-backed section WITHOUT image semantics stays a data
+            // section: the child image cannot be resolved.
+            memory.map_bytes(section_ptr, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_section,
+                &[
+                    section_ptr as u32,
+                    0x001F_FFFF,
+                    0,
+                    0,
+                    crate::ntdll::PAGE_READONLY,
+                    0x0800_0000, // SEC_COMMIT
+                    file,
+                ],
+            );
+            assert_eq!(status, 0, "data section creation");
+            let data_section = read_u32(&memory, section_ptr).expect("data section handle");
+            memory.map_bytes(handle_out, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, data_section, 0, 0],
+            );
+            assert_eq!(
+                status, 0xC000_007B,
+                "a data section is not an executable image"
+            );
+
+            // A SEC_IMAGE request over a non-PE file is not an image section
+            // either.
+            let plain = "C:\\Games\\NativeDemo\\not-an-image.dat";
+            std::fs::write(
+                runtime.win32.guest_path_to_host_path(plain).unwrap(),
+                b"not a PE",
+            )
+            .unwrap();
+            let plain_file = runtime
+                .win32
+                .create_file_w(
+                    plain,
+                    FileAccess::read_only(),
+                    ShareMode::all(),
+                    crate::win32::CreationDisposition::OpenExisting,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("open plain file");
+            memory.map_bytes(section_ptr, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_section,
+                &[
+                    section_ptr as u32,
+                    0x001F_FFFF,
+                    0,
+                    0,
+                    crate::ntdll::PAGE_READONLY,
+                    0x0100_0000,
+                    plain_file,
+                ],
+            );
+            assert_eq!(status, 0);
+            let plain_section = read_u32(&memory, section_ptr).expect("plain section handle");
+            memory.map_bytes(handle_out, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, plain_section, 0, 0],
+            );
+            assert_eq!(
+                status, 0xC000_007B,
+                "SEC_IMAGE over a non-PE file is not an image section"
+            );
+        })
+    }
+
+    /// The `NtCreateThreadEx` start routine genuinely runs in the launched
+    /// host child: the child PE's entry point exits 42 while the caller's
+    /// start routine exits 7, and the child's observed exit code is 7.
+    #[cfg(unix)]
+    #[test]
+    fn nt_create_thread_ex_injects_start_routine_into_host_child() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("nt-start-routine-child");
+            let image = "C:\\Games\\NativeDemo\\start-routine.exe";
+            let (pe_bytes, image_base, entry_va, second_va) = build_exit_process_pe32(42, 7);
+            let host_program = runtime
+                .win32
+                .guest_path_to_host_path(image)
+                .expect("host path");
+            std::fs::create_dir_all(host_program.parent().expect("parent")).expect("create dirs");
+            std::fs::write(&host_program, &pe_bytes).expect("write staged PE");
+            let file = runtime
+                .win32
+                .create_file_w(
+                    image,
+                    FileAccess::read_only(),
+                    ShareMode::all(),
+                    crate::win32::CreationDisposition::OpenExisting,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("open staged PE");
+
+            let mut memory = MemoryImage::default();
+            let nt_create_section = runtime.alloc_host_thunk(HostThunk::NtCreateSection);
+            let nt_create_process = runtime.alloc_host_thunk(HostThunk::NtCreateProcess);
+            let nt_create_thread = runtime.alloc_host_thunk(HostThunk::NtCreateThreadEx);
+            let section_ptr = 0x41_000_u64;
+            memory.map_bytes(section_ptr, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_section,
+                &[
+                    section_ptr as u32,
+                    0x001F_FFFF,
+                    0,
+                    0,
+                    crate::ntdll::PAGE_EXECUTE_READ,
+                    0x0100_0000,
+                    file,
+                ],
+            );
+            assert_eq!(status, 0);
+            let section = read_u32(&memory, section_ptr).expect("section handle");
+            let handle_out = 0x42_000_u64;
+            memory.map_bytes(handle_out, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, section, 0, 0],
+            );
+            assert_eq!(status, 0);
+            let child = read_guest_pointer(&memory, handle_out, GuestArch::X86).unwrap() as u32;
+            let child_pid = runtime
+                .win32
+                .process_state(child)
+                .expect("child process")
+                .process_id;
+
+            let thread_ptr = 0x43_000_u64;
+            memory.map_bytes(thread_ptr, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_thread,
+                &[
+                    thread_ptr as u32,
+                    0x1F03FF,
+                    0,
+                    child,
+                    second_va as u32,
+                    0x1234,
+                    0, // create_suspended = FALSE
+                    0,
+                    0,
+                    0x1000,
+                ],
+            );
+            assert_eq!(status, 0);
+            let thread_handle =
+                read_guest_pointer(&memory, thread_ptr, GuestArch::X86).unwrap() as u32;
+            assert_ne!(thread_handle, 0);
+
+            // The host launch is what carries the injected start routine; a
+            // fallback schedule would not run it in the child at all.
+            let launch = runtime
+                .trace_events
+                .iter()
+                .rev()
+                .find(|event| event.call_id == "NtCreateThreadEx")
+                .expect("NtCreateThreadEx trace");
+            assert_eq!(
+                launch
+                    .parameters
+                    .get("host_launched")
+                    .and_then(|value| value.as_bool()),
+                Some(true),
+                "the PE child must launch through casa1-runner (note: {:?})",
+                launch.parameters.get("launch_note")
+            );
+            assert_eq!(
+                launch
+                    .parameters
+                    .get("deferred")
+                    .and_then(|value| value.as_bool()),
+                Some(false)
+            );
+
+            // The child exits with the START ROUTINE's code (7), not the
+            // image entry point's (42): the routine really ran in the child.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut exit_code = None;
+            while std::time::Instant::now() < deadline {
+                if let Ok(crate::win32::WaitStatus::Object0) =
+                    runtime.win32.wait_for_single_object(child, 50, false, None)
+                {
+                    exit_code = runtime
+                        .win32
+                        .get_exit_code_process(child)
+                        .expect("exit code");
+                    break;
+                }
+            }
+            assert_eq!(
+                exit_code,
+                Some(7),
+                "the injected start routine must be what ran in the host child \
+                 (image_base={image_base:#x}, entry={entry_va:#x}, start={second_va:#x}, \
+                 child_pid={child_pid})"
+            );
+            // The runtime-side record still reports the caller's routine.
+            let info = crate::runtime::dispatch::final_scraps::native_child_thread_info(
+                runtime.guest_pid,
+                thread_handle,
+            )
+            .expect("native child thread record");
+            assert_eq!(info.process_id, child_pid);
+            assert_eq!(info.start_address, second_va);
+        })
+    }
+
+    /// `NtCreateThreadEx(create_suspended=TRUE)` defers the host run until the
+    /// first `NtResumeThread`; a child terminated before that resume never
+    /// launches.
+    #[cfg(unix)]
+    #[test]
+    fn nt_create_thread_ex_create_suspended_defers_host_launch() {
+        with_big_stack(|| {
+            let (mut runtime, temp) = test_runtime("nt-create-suspended");
+            let image = "C:\\Games\\NativeDemo\\suspended-child.sh";
+            runtime.main_module_path = image.to_string();
+            let marker = temp.path().join("deferred-child-ran.txt");
+            stage_guest_script(
+                &runtime,
+                image,
+                &format!("#!/bin/sh\necho ran > '{}'\nexit 0\n", marker.display()),
+            );
+            let never_image = "C:\\Games\\NativeDemo\\terminated-child.sh";
+            let never = temp.path().join("suspended-terminated-ran.txt");
+            stage_guest_script(
+                &runtime,
+                never_image,
+                &format!("#!/bin/sh\necho ran > '{}'\nexit 0\n", never.display()),
+            );
+
+            let mut memory = MemoryImage::default();
+            let nt_create_process = runtime.alloc_host_thunk(HostThunk::NtCreateProcess);
+            let nt_create_thread = runtime.alloc_host_thunk(HostThunk::NtCreateThreadEx);
+            let nt_resume = runtime.alloc_host_thunk(HostThunk::NtResumeThread);
+            let nt_terminate_process = runtime.alloc_host_thunk(HostThunk::NtTerminateProcess);
+            let handle_out = 0x41_000_u64;
+            let thread_ptr = 0x42_000_u64;
+
+            // Child A: suspended, then resumed → the host run starts.
+            memory.map_bytes(handle_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_create_process,
+                    &[handle_out as u32, 0x1F1FFF, 0, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+            let child = read_guest_pointer(&memory, handle_out, GuestArch::X86).unwrap() as u32;
+            let child_pid = runtime
+                .win32
+                .process_state(child)
+                .expect("child process")
+                .process_id;
+            memory.map_bytes(thread_ptr, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_create_thread,
+                    &[
+                        thread_ptr as u32,
+                        0x1F03FF,
+                        0,
+                        child,
+                        0x40_200,
+                        0,
+                        1, // create_suspended = TRUE
+                        0,
+                        0,
+                        0x1000,
+                    ],
+                ),
+                0
+            );
+            let thread = read_guest_pointer(&memory, thread_ptr, GuestArch::X86).unwrap() as u32;
+            let launch = runtime
+                .trace_events
+                .iter()
+                .rev()
+                .find(|event| event.call_id == "NtCreateThreadEx")
+                .expect("NtCreateThreadEx trace");
+            assert_eq!(
+                launch
+                    .parameters
+                    .get("deferred")
+                    .and_then(|value| value.as_bool()),
+                Some(true),
+                "CREATE_SUSPENDED must defer the host launch"
+            );
+            assert_eq!(
+                launch
+                    .parameters
+                    .get("host_launched")
+                    .and_then(|value| value.as_bool()),
+                Some(false)
+            );
+            assert!(
+                crate::runtime::dispatch::final_scraps::native_child_host_pid(
+                    runtime.guest_pid,
+                    child_pid
+                )
+                .is_none(),
+                "no host child exists before the resume"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !marker.exists(),
+                "a CREATE_SUSPENDED child must not run before resume"
+            );
+            let thread_id = runtime
+                .win32
+                .thread_id_for_handle(thread)
+                .expect("thread record");
+            assert_eq!(runtime.win32.thread_suspend_count(thread_id).unwrap(), 1);
+
+            // Resume → the host run starts and genuinely executes the image.
+            let prev_ptr = 0x43_000_u64;
+            memory.map_bytes(prev_ptr, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_resume,
+                    &[thread, prev_ptr as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_u32(&memory, prev_ptr).unwrap(),
+                1,
+                "the previous suspend count"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(marker.exists(), "the resumed child must run its image");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut exit = None;
+            while std::time::Instant::now() < deadline {
+                if let Ok(crate::win32::WaitStatus::Object0) =
+                    runtime.win32.wait_for_single_object(child, 50, false, None)
+                {
+                    exit = runtime.win32.get_exit_code_process(child).unwrap();
+                    break;
+                }
+            }
+            assert_eq!(exit, Some(0));
+
+            // Child B: suspended, terminated before resume → never launches.
+            runtime.main_module_path = never_image.to_string();
+            memory.map_bytes(handle_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_create_process,
+                    &[handle_out as u32, 0x1F1FFF, 0, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+            let child_b = read_guest_pointer(&memory, handle_out, GuestArch::X86).unwrap() as u32;
+            memory.map_bytes(thread_ptr, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_create_thread,
+                    &[
+                        thread_ptr as u32,
+                        0x1F03FF,
+                        0,
+                        child_b,
+                        0x40_200,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0x1000,
+                    ],
+                ),
+                0
+            );
+            let thread_b = read_guest_pointer(&memory, thread_ptr, GuestArch::X86).unwrap() as u32;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_terminate_process,
+                    &[child_b, 9],
+                ),
+                0
+            );
+            assert_eq!(
+                runtime.win32.get_exit_code_process(child_b).unwrap(),
+                Some(9)
+            );
+            // A resume after the termination cannot launch anything.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, nt_resume, &[thread_b, 0]),
+                0xC000_004A,
+                "STATUS_THREAD_IS_TERMINATING"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !never.exists(),
+                "a child terminated before resume must never launch"
+            );
+        })
+    }
+
+    /// `NtTerminateProcess` kills an already-spawned host child and records
+    /// the requested exit code on the process object.
+    #[cfg(unix)]
+    #[test]
+    fn nt_terminate_process_kills_running_host_child() {
+        with_big_stack(|| {
+            let (mut runtime, temp) = test_runtime("nt-kill-host-child");
+            let image = "C:\\Games\\NativeDemo\\long-child.sh";
+            runtime.main_module_path = image.to_string();
+            let marker = temp.path().join("long-child-started.txt");
+            stage_guest_script(
+                &runtime,
+                image,
+                &format!(
+                    "#!/bin/sh\necho started > '{}'\nexec sleep 30\n",
+                    marker.display()
+                ),
+            );
+
+            let mut memory = MemoryImage::default();
+            let nt_create_process = runtime.alloc_host_thunk(HostThunk::NtCreateProcess);
+            let nt_create_thread = runtime.alloc_host_thunk(HostThunk::NtCreateThreadEx);
+            let nt_terminate_process = runtime.alloc_host_thunk(HostThunk::NtTerminateProcess);
+            let handle_out = 0x41_000_u64;
+            let thread_ptr = 0x42_000_u64;
+            memory.map_bytes(handle_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_create_process,
+                    &[handle_out as u32, 0x1F1FFF, 0, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+            let child = read_guest_pointer(&memory, handle_out, GuestArch::X86).unwrap() as u32;
+            let child_pid = runtime
+                .win32
+                .process_state(child)
+                .expect("child process")
+                .process_id;
+            memory.map_bytes(thread_ptr, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_create_thread,
+                    &[
+                        thread_ptr as u32,
+                        0x1F03FF,
+                        0,
+                        child,
+                        0x40_200,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0x1000,
+                    ],
+                ),
+                0
+            );
+
+            // The host child is genuinely running.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                marker.exists(),
+                "the host child must be running before the kill"
+            );
+            let host_pid = crate::runtime::dispatch::final_scraps::native_child_host_pid(
+                runtime.guest_pid,
+                child_pid,
+            )
+            .expect("tracked host pid");
+
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, nt_terminate_process, &[child, 9],),
+                0
+            );
+            assert_eq!(
+                runtime.win32.get_exit_code_process(child).unwrap(),
+                Some(9),
+                "the requested exit code is recorded"
+            );
+            assert_eq!(
+                runtime
+                    .win32
+                    .wait_for_single_object(child, 0, false, None)
+                    .unwrap(),
+                crate::win32::WaitStatus::Object0,
+                "the process handle signals the termination"
+            );
+            // The host process is really gone (kill(pid, 0) reports ESRCH
+            // once the waiter thread reaped it).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut gone = false;
+            while std::time::Instant::now() < deadline {
+                let alive = unsafe { libc::kill(host_pid as i32, 0) } == 0;
+                if !alive && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                gone,
+                "the running host child must be killed (pid {host_pid})"
+            );
+        })
+    }
+
+    /// `NtQueryInformationThread` reports a host-launched child thread's real
+    /// Win32StartAddress, TEB and child UniqueProcessId.
+    #[cfg(unix)]
+    #[test]
+    fn nt_query_information_thread_reports_host_child_thread() {
+        with_big_stack(|| {
+            let (mut runtime, temp) = test_runtime("nt-query-child-thread");
+            let image = "C:\\Games\\NativeDemo\\query-child.sh";
+            runtime.main_module_path = image.to_string();
+            let marker = temp.path().join("query-child-started.txt");
+            stage_guest_script(
+                &runtime,
+                image,
+                &format!(
+                    "#!/bin/sh\necho started > '{}'\nexec sleep 5\n",
+                    marker.display()
+                ),
+            );
+
+            let mut memory = MemoryImage::default();
+            let nt_create_process = runtime.alloc_host_thunk(HostThunk::NtCreateProcess);
+            let nt_create_thread = runtime.alloc_host_thunk(HostThunk::NtCreateThreadEx);
+            let nt_query = runtime.alloc_host_thunk(HostThunk::NtQueryInformationThread);
+            let handle_out = 0x41_000_u64;
+            let thread_ptr = 0x42_000_u64;
+            memory.map_bytes(handle_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_create_process,
+                    &[handle_out as u32, 0x1F1FFF, 0, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+            let child = read_guest_pointer(&memory, handle_out, GuestArch::X86).unwrap() as u32;
+            let child_pid = runtime
+                .win32
+                .process_state(child)
+                .expect("child process")
+                .process_id;
+            let start_address = 0x40_200_u32;
+            memory.map_bytes(thread_ptr, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_create_thread,
+                    &[
+                        thread_ptr as u32,
+                        0x1F03FF,
+                        0,
+                        child,
+                        start_address,
+                        0x1234,
+                        0,
+                        0,
+                        0,
+                        0x1000,
+                    ],
+                ),
+                0
+            );
+            let thread = read_guest_pointer(&memory, thread_ptr, GuestArch::X86).unwrap() as u32;
+            let thread_id = runtime
+                .win32
+                .thread_id_for_handle(thread)
+                .expect("thread record");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(marker.exists(), "the host child must be running");
+
+            // THREAD_BASIC_INFORMATION: UniqueProcessId is the CHILD pid and
+            // the TEB belongs to the child thread record.
+            let info = 0x44_000_u64;
+            memory.map_bytes(info, &[0; 48]);
+            let ret_len = 0x45_000_u64;
+            memory.map_bytes(ret_len, &[0; 4]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_query,
+                &[
+                    thread,
+                    crate::ntdll::THREAD_BASIC_INFORMATION_CLASS,
+                    info as u32,
+                    28,
+                    ret_len as u32,
+                ],
+            );
+            assert_eq!(status, 0, "NtQueryInformationThread status");
+            assert_ne!(read_u32(&memory, ret_len).unwrap(), 0);
+            assert_eq!(
+                read_u32(&memory, info + 8).unwrap(),
+                child_pid,
+                "UniqueProcessId is the child process id"
+            );
+            assert_eq!(
+                read_u32(&memory, info + 12).unwrap(),
+                thread_id,
+                "UniqueThreadId is the child thread id"
+            );
+            assert_ne!(
+                read_u32(&memory, info + 4).unwrap(),
+                0,
+                "a real child TEB is reported"
+            );
+
+            // THREAD_QUERY_SET_WIN32_START_ADDRESS: the caller's real start
+            // routine, not 0.
+            let start_out = 0x46_000_u64;
+            memory.map_bytes(start_out, &[0; 8]);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_query,
+                &[
+                    thread,
+                    crate::ntdll::THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS,
+                    start_out as u32,
+                    4,
+                    ret_len as u32,
+                ],
+            );
+            assert_eq!(status, 0);
+            assert_eq!(
+                read_u32(&memory, start_out).unwrap(),
+                start_address,
+                "the real Win32StartAddress"
+            );
+
+            // The child exits after its sleep; keep the marker assertion
+            // before the test ends so the child never outlives the GE root
+            // unexpectedly.
+            let _ = temp;
         })
     }
 
@@ -149173,6 +150774,11 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             target: ExportTarget::Rva(0x24120),
         },
         ExportSymbol {
+            ordinal: 20,
+            name: Some("MFCreateFile".to_string()),
+            target: ExportTarget::Rva(0x24130),
+        },
+        ExportSymbol {
             ordinal: 90,
             name: Some("IMFAsyncResult".to_string()),
             target: ExportTarget::Rva(0x24200),
@@ -154545,11 +156151,18 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
         ),
         (
             "dpaddr.dll".to_string(),
-            vec![ExportSymbol {
-                ordinal: 1,
-                name: Some("DP8SPCreate".to_string()),
-                target: ExportTarget::Rva(0x88000),
-            }],
+            vec![
+                ExportSymbol {
+                    ordinal: 1,
+                    name: Some("DP8SPCreate".to_string()),
+                    target: ExportTarget::Rva(0x88000),
+                },
+                ExportSymbol {
+                    ordinal: 2,
+                    name: Some("DirectPlay8AddressCreate".to_string()),
+                    target: ExportTarget::Rva(0x88010),
+                },
+            ],
         ),
         // ── DirectShow ────────────────────────────────────────────────────────────
         (

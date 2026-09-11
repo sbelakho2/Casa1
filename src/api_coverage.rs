@@ -7807,6 +7807,16 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:evidence_final_scraps_surfaces",
     ),
     conformance(
+        "dpaddr.dll",
+        "DirectPlay8AddressCreate",
+        "casa1-conformance:guest_address_vtable_url_round_trip",
+    ),
+    conformance(
+        "mfplat.dll",
+        "MFCreateFile",
+        "casa1-conformance:mf_create_file_byte_stream_reads_writes_and_seeks_real_files",
+    ),
+    conformance(
         "x3daudio1_7.dll",
         "X3DAudioInitialize",
         "casa1-conformance:evidence_final_scraps_surfaces",

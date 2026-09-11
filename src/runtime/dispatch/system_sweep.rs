@@ -675,17 +675,9 @@ impl PeHostRuntime {
                 state.set(Register::Rax, u64::from(S_OK));
                 Ok(())
             }
-            // ── dpnet ──
-            HostThunk::DirectPlay8Create | HostThunk::Dp8spCreate => {
-                let _clsid = guest_call_arg(state, memory, 0)?;
-                let _iid = guest_call_arg(state, memory, 1)?;
-                let out = guest_call_arg(state, memory, 2)?;
-                if out != 0 {
-                    write_guest_pointer(memory, out, 0, self.guest_arch).ok();
-                }
-                state.set(Register::Rax, 0x8004_0153); // REGDB_E_CLASSNOTREG
-                Ok(())
-            }
+            // ── dpnet: DirectPlay8Create / DP8SPCreate are routed to the real
+            //    DirectPlay engine dispatcher (see `dispatch::final_scraps`
+            //    and `crate::dplay`) ──
             // ── dsound ──
             HostThunk::DirectSoundCreate8 | HostThunk::DirectSoundCaptureCreate8 => {
                 let _device = guest_call_arg(state, memory, 0)?;

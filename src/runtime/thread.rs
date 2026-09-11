@@ -31,11 +31,31 @@ impl PeHostRuntime {
 }
 
 impl PeHostRuntime {
+    /// Drain the CURRENT guest thread's pending APCs from the win32 FIFO
+    /// (the real queue `QueueUserAPC` enqueues into) and clear the matching
+    /// runtime wake markers the scheduler's alertable-readiness probe reads.
+    /// Entries are freed in FIFO enqueue order; the caller executes the
+    /// guest callbacks.
+    pub(crate) fn take_current_thread_apcs(&mut self) -> Vec<crate::win32::ApcRequest> {
+        let current_tid = self.win32.current_thread_id();
+        // The runtime `GuestApcQueue` is only a wake signal for parked
+        // alertable waits (scheduler::wait_satisfiable reads it); the win32
+        // FIFO below is the single source of truth for the callbacks, so the
+        // marker entries are consumed without being executed.
+        if let Some(queue) = self.apc_queues.get_mut(&u64::from(current_tid)) {
+            let count = queue.pending_count();
+            if count > 0 {
+                let _ = queue.deliver_apcs(count);
+            }
+        }
+        self.win32.take_pending_apcs(current_tid)
+    }
+
     /// Deliver pending APCs for the CURRENT guest thread (alertable wait
-    /// points: `SleepEx`/`WaitForSingleObjectEx`).  Each queued APC callback
-    /// is executed in the guest via the standard callback machinery; returns
-    /// true when at least one APC was delivered, in which case the caller
-    /// must report WAIT_IO_COMPLETION (0xC0).
+    /// points: `SleepEx`/`WaitForSingleObjectEx`/`NtDelayExecution`).  Each
+    /// queued APC callback is executed in the guest via the standard callback
+    /// machinery; returns true when at least one APC was delivered, in which
+    /// case the caller must report WAIT_IO_COMPLETION (0xC0).
     ///
     /// The queue is keyed by the guest thread ID (`QueueUserAPC` resolves
     /// the target handle to a thread ID), and `current_thread_id` reflects
@@ -46,22 +66,17 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<bool> {
-        let current_tid = self.win32.current_thread_id() as u64;
-        // `deliver_apcs(max_count)` allocates a Vec with `max_count`
-        // capacity, so the count must stay sane (usize::MAX overflows);
-        // pending_count() bounds it to what the queue actually holds.
-        let apc_entries = self
-            .apc_queues
-            .get_mut(&current_tid)
-            .map(|queue| {
-                let count = queue.pending_count().max(1);
-                queue.deliver_apcs(count)
-            })
-            .unwrap_or_default();
+        let apc_entries = self.take_current_thread_apcs();
         if apc_entries.is_empty() {
             return Ok(false);
         }
         for apc in apc_entries {
+            if apc.callback == 0 {
+                // Legacy token-only diagnostic entry: counts as delivered
+                // (the caller reports WAIT_IO_COMPLETION) but has no guest
+                // callback to run.
+                continue;
+            }
             let _ = self.execute_guest_callback(
                 state,
                 memory,

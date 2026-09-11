@@ -207,6 +207,8 @@ pub(crate) enum GuestObjectKind {
     ImfAsyncResult,
     ImfMediaSource,
     ImfByteStream,
+    ImfStreamDescriptor,
+    ImfMediaTypeHandler,
     ImfTopologyNode,
     ImfDxgiDeviceManager,
     /// A guest IMFRateControl / IMFRateSupport service object handed out by
@@ -544,26 +546,54 @@ pub(crate) struct DllInfo {
     pub tls_callbacks: Vec<u64>,
 }
 
-#[allow(dead_code)] // runtime state retained for future import paths
-/// helpers and `IStorage::CreateStream`).
-#[derive(Debug, Clone)]
-pub(crate) struct ComStreamState {
-    /// The stream bytes.
-    #[allow(dead_code)] // consumed by the IStream thunks through the storage map
-    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
-    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
-    pub(crate) data: Vec<u8>,
-    /// Current read/write position.
-    #[allow(dead_code)] // consumed by the IStream thunks
-    pub(crate) position: u64,
+/// A byte-range lock held on a guest IStream (IStream::LockRegion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ComStreamLock {
+    pub(crate) offset: u64,
+    pub(crate) size: u64,
+    pub(crate) lock_type: u32,
 }
 
-/// State for a guest IStorage object.
-#[derive(Debug, Clone)]
+/// State for a guest IStream object (IStream / ISequentialStream).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ComStreamState {
+    /// The stream bytes.
+    pub(crate) data: Vec<u8>,
+    /// Current read/write position.
+    pub(crate) position: u64,
+    /// Element name reported by IStream::Stat.
+    pub(crate) name: String,
+    /// Host path backing this stream (the real file layer): Commit flushes
+    /// the bytes, Revert reloads them.
+    pub(crate) host_path: Option<String>,
+    /// The in-memory bytes differ from the host file (a Commit is pending).
+    pub(crate) dirty: bool,
+    /// Byte-range locks held through LockRegion/UnlockRegion.
+    pub(crate) locks: Vec<ComStreamLock>,
+}
+
+/// State for a guest IStorage object: an in-memory compound-storage element
+/// table, optionally backed by a real host directory (each stream is a file
+/// in the directory).
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ComStorageState {
-    /// Streams inside this storage: name -> bytes.
-    #[allow(dead_code)] // consumed by the IStorage thunks
+    /// In-memory streams inside this storage: name -> bytes.
     pub(crate) streams: HashMap<String, Vec<u8>>,
+    /// Real host directory backing this storage (file moniker binding).
+    pub(crate) host_dir: Option<String>,
+    /// Child storage objects by element name.
+    pub(crate) child_storages: HashMap<String, u64>,
+    /// Live streams created/opened from this storage, by element name (the
+    /// storage view of a stream's bytes).
+    pub(crate) stream_objects: HashMap<String, u64>,
+    /// Storage CLSID (IStorage::SetClass / Stat).
+    pub(crate) clsid: Option<[u8; 16]>,
+    /// Element creation order (IStorage::EnumElements enumeration).
+    pub(crate) element_order: Vec<String>,
+    /// The open-mode bits recorded at creation (STGM_*).
+    pub(crate) mode: u32,
+    /// The storage's element name.
+    pub(crate) name: String,
 }
 
 /// State for a guest IDataObject (drag-and-drop payload holder).
@@ -574,12 +604,94 @@ pub(crate) struct ComDataObjectState {
     pub(crate) formats: HashMap<u32, Vec<u8>>,
 }
 
-/// State for a guest IConnectionPoint (OLE sink connection point).
-#[derive(Debug, Clone)]
+/// State for a guest IConnectionPoint (OLE sink connection point) or the
+/// IConnectionPointContainer interface object released alongside it.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ComConnectionPointState {
-    /// Sink interface pointers registered via Advise.
-    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
-    pub(crate) sinks: Vec<u64>,
+    /// The owner server object.
+    pub(crate) owner: u64,
+    /// The connection interface IID (zero for the container-shaped object).
+    pub(crate) iid: [u8; 16],
+    /// Advised sinks: (cookie, sink interface pointer).
+    pub(crate) sinks: Vec<(u32, u64)>,
+    /// Child connection points keyed by IID string (container objects).
+    pub(crate) points: HashMap<String, u64>,
+    /// True while the object serves IConnectionPointContainer (the points
+    /// map is meaningful); false for an IConnectionPoint.
+    pub(crate) is_container: bool,
+}
+
+/// A typed automation value held by the runtime's in-process automation
+/// server (IDispatch property store).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ComValue {
+    Empty,
+    I4(i32),
+    Bool(bool),
+    Double(f64),
+    Bstr(String),
+    Object(u64),
+}
+
+/// State for the runtime's in-process IDispatch automation server.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ComServerState {
+    /// The registered dispatch table name (the IDispatch interface name).
+    pub(crate) table: String,
+    /// Current property values.
+    pub(crate) properties: BTreeMap<String, ComValue>,
+    /// Resolved name -> DISPID cache (the per-interface assignment cache).
+    pub(crate) dispid_cache: HashMap<String, i32>,
+    /// The lazily created IConnectionPointContainer interface object.
+    pub(crate) container: u64,
+}
+
+/// The moniker form a guest IMoniker object models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ComMonikerKind {
+    #[default]
+    File,
+    Class,
+    Url,
+}
+
+/// State for a guest IMoniker object created by MkParseDisplayName.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ComMonikerState {
+    /// The moniker form (file path / class id / URL).
+    pub(crate) kind: ComMonikerKind,
+    /// The display name as parsed (e.g. `file:C:\game.exe`).
+    pub(crate) display_name: String,
+    /// The scheme payload (path, CLSID text or URL).
+    pub(crate) payload: String,
+    /// The resolved host path for file monikers.
+    pub(crate) host_path: Option<String>,
+}
+
+/// State for a guest ITypeInfo object generated from a registered dispatch
+/// method table.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ComTypeInfoState {
+    /// The dispatch table name this ITypeInfo describes.
+    pub(crate) table: String,
+    /// The owning interface object (for ITypeInfo::Invoke routing).
+    pub(crate) owner: u64,
+    /// iTInfo index passed to IDispatch::GetTypeInfo.
+    pub(crate) index: u32,
+}
+
+/// One recorded event delivery through IConnectionPoint::Advise sinks.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // read by the connection-point event tests
+pub(crate) struct ComFiredEvent {
+    /// The event source (automation server object).
+    pub(crate) source: u64,
+    /// The event DISPID.
+    pub(crate) dispid: i32,
+    /// The sink the event was delivered to.
+    pub(crate) sink: u64,
+    /// The HRESULT the sink's Invoke returned.
+    pub(crate) hr: u32,
 }
 
 /// State for a guest IEnumVARIANT.
@@ -595,13 +707,70 @@ pub(crate) struct ComEnumVariantState {
 }
 
 /// State for a guest IMFByteStream.
-#[derive(Debug, Clone)]
+///
+/// The stream is either memory-backed (the bytes copied from an IStream by
+/// `MFCreateMFByteStreamOnStream`) or file-backed (a real runtime file-table
+/// handle opened by `MFCreateFile`/the source-reader URL paths).  Every
+/// operation on a file-backed stream goes through the Win32 subsystem's
+/// file-table APIs, so the byte stream honors the real handle's access
+/// rights, sharing and file pointer.
+#[derive(Debug, Clone, Default)]
 #[allow(dead_code)] // MF byte-stream state (consumed by the MF thunk paths)
 pub(crate) struct ImfByteStreamState {
-    /// Stream bytes.
+    /// Stream bytes (memory-backed streams).
     pub(crate) data: Vec<u8>,
     /// Current position.
     pub(crate) position: u64,
+    /// The runtime file-table handle backing the stream (0 = memory-backed).
+    pub(crate) file_handle: u32,
+    /// The known stream length in bytes (cached for file-backed streams).
+    pub(crate) length: u64,
+    /// Whether the stream accepts writes.
+    pub(crate) writable: bool,
+    /// Whether the stream is seekable.
+    pub(crate) seekable: bool,
+    /// Whether `Close` has run (all further operations fail).
+    pub(crate) closed: bool,
+    /// The original URL / path (MF_BYTESTREAM_ORIGIN_NAME).
+    pub(crate) origin_name: Option<String>,
+    /// The MIME type of the content (MF_BYTESTREAM_CONTENT_TYPE).
+    pub(crate) content_type: Option<String>,
+    /// The IMFAsyncResult object of the last synchronous `BeginRead`/`Seek`
+    /// completion (0 when none is pending).
+    pub(crate) last_async_result: u64,
+    /// The byte count of the last synchronous `BeginRead` completion.
+    pub(crate) last_async_read: u32,
+    /// The byte count of the last synchronous `BeginWrite` completion.
+    pub(crate) last_async_written: u32,
+}
+
+impl ImfByteStreamState {
+    /// A memory-backed readable/seekable byte stream over `data`.
+    pub(crate) fn from_bytes(data: Vec<u8>) -> Self {
+        Self {
+            length: data.len() as u64,
+            seekable: true,
+            data,
+            ..Default::default()
+        }
+    }
+
+    /// A file-table-backed byte stream over an open runtime handle.
+    pub(crate) fn from_file(
+        handle: u32,
+        length: u64,
+        writable: bool,
+        origin_name: Option<String>,
+    ) -> Self {
+        Self {
+            file_handle: handle,
+            length,
+            writable,
+            seekable: true,
+            origin_name,
+            ..Default::default()
+        }
+    }
 }
 
 /// State for a guest IMFMediaSink.
@@ -626,13 +795,10 @@ pub(crate) struct ImfAsyncResultState {
     pub(crate) status: u32,
 }
 
-/// State for a guest IMFMediaSource (created by the source resolver).
-#[derive(Debug, Clone)]
-pub(crate) struct ImfMediaSourceState {
-    /// The underlying source reader the source wraps.
-    #[allow(dead_code)] // MF source-reader state (consumed by the MF thunk paths)
-    pub(crate) source_reader: u64,
-}
+/// State for a guest IMFMediaSource (created by the source-reader paths and
+/// the source resolver): the real media-layer source model (presentation
+/// descriptor, state machine, event queue, byte-stream/reader graph edges).
+pub(crate) type ImfMediaSourceState = crate::media::MfMediaSource;
 
 /// The Media Foundation runtime state managed by MFStartup/MFShutdown.
 #[derive(Debug, Clone, Default)]
@@ -1654,6 +1820,17 @@ pub(crate) struct PeHostRuntime {
     pub(crate) com_type_libraries: HashMap<String, String>,
     /// Next connection-point cookie.
     pub(crate) com_next_conn_cookie: u32,
+    /// The runtime's in-process IDispatch automation servers.
+    pub(crate) com_servers: HashMap<u64, ComServerState>,
+    /// Guest moniker objects created by MkParseDisplayName.
+    pub(crate) com_monikers: HashMap<u64, ComMonikerState>,
+    /// Guest ITypeInfo objects generated from the registered dispatch tables.
+    pub(crate) com_type_infos: HashMap<u64, ComTypeInfoState>,
+    /// Event deliveries recorded by the connection-point machinery.
+    pub(crate) com_fired_events: Vec<ComFiredEvent>,
+    /// Deliveries recorded by the runtime's modeled IDispatch event sinks
+    /// (the Advise target used to observe firing end to end).
+    pub(crate) com_sink_invocations: Vec<(u64, i32, Vec<ComValue>)>,
     // ──
     /// MFStartup/MFShutdown runtime state.
     pub(crate) mf_runtime: MfRuntimeState,
@@ -1775,6 +1952,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) mf_async_results: HashMap<u64, ImfAsyncResultState>,
     /// Guest IMFMediaSource object -> source state.
     pub(crate) mf_media_sources: HashMap<u64, ImfMediaSourceState>,
+    /// IMFMediaSourceEx::SetD3DManager registrations (source -> manager).
+    pub(crate) mf_source_d3d_managers: HashMap<u64, u64>,
     /// Guest IMFMediaSession object -> its topology object.
     pub(crate) mf_session_topologies: HashMap<u64, u64>,
     /// IMFTopologyNode object -> node state.
@@ -1787,7 +1966,11 @@ pub(crate) struct PeHostRuntime {
     /// IMFSourceResolver object -> resolver (stateless).
     pub(crate) mf_source_resolvers: HashMap<u64, ()>,
     /// IMFPresentationDescriptor object -> descriptor.
-    pub(crate) mf_presentation_descriptors: HashMap<u64, ()>,
+    pub(crate) mf_presentation_descriptors: HashMap<u64, crate::media::MfPresentationDescriptor>,
+    /// IMFStreamDescriptor object -> stream descriptor.
+    pub(crate) mf_stream_descriptors: HashMap<u64, crate::media::MfStreamDescriptor>,
+    /// IMFMediaTypeHandler object -> media-type handler.
+    pub(crate) mf_media_type_handlers: HashMap<u64, crate::media::MfMediaTypeHandlerState>,
     /// Guest IMFMediaEvent object -> (type, status).
     /// Guest IMFPresentationDescriptor object -> stream count.
     /// Guest IMFMediaBuffer object -> locked guest pointer (Lock/Unlock).
@@ -2330,6 +2513,11 @@ impl PeHostRuntime {
             com_ps_clsids: HashMap::new(),
             com_type_libraries: HashMap::new(),
             com_next_conn_cookie: 1,
+            com_servers: HashMap::new(),
+            com_monikers: HashMap::new(),
+            com_type_infos: HashMap::new(),
+            com_fired_events: Vec::new(),
+            com_sink_invocations: Vec::new(),
             mf_runtime: MfRuntimeState::default(),
             mf_media_types: HashMap::new(),
             mf_media_buffers: HashMap::new(),
@@ -2389,12 +2577,15 @@ impl PeHostRuntime {
             mf_sinks: HashMap::new(),
             mf_async_results: HashMap::new(),
             mf_media_sources: HashMap::new(),
+            mf_source_d3d_managers: HashMap::new(),
             mf_session_topologies: HashMap::new(),
             mf_topology_nodes: HashMap::new(),
             mf_locked_buffer_data: HashMap::new(),
             mf_source_resolvers: HashMap::new(),
             mf_media_events: HashMap::new(),
             mf_presentation_descriptors: HashMap::new(),
+            mf_stream_descriptors: HashMap::new(),
+            mf_media_type_handlers: HashMap::new(),
             mf_buffer_locks: HashMap::new(),
 
             com_security_initialized: false,

@@ -296,11 +296,12 @@ fn semantic_axes_keep_callable_separate_from_exact() {
         .expect("DirectPlayCreate entry");
     assert_eq!(
         direct_play.semantic_fidelity,
-        SemanticFidelity::SyntheticEnvironment
+        SemanticFidelity::Restricted,
+        "the software DirectPlay8 peer engine now backs the legacy object"
     );
     assert_eq!(
         direct_play.subsystem_capability,
-        SubsystemCapability::Absent
+        SubsystemCapability::Partial
     );
     let dc_query = database
         .lookup("netutils.dll", "NetGetDCName")

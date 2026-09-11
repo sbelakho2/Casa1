@@ -1564,6 +1564,20 @@ impl Win32Subsystem {
         Ok(self.handle_entry(handle)?.descriptor.clone())
     }
 
+    /// The object-manager identity behind a handle.  Every handle to the
+    /// SAME object (duplicates, name-resolved opens, inherited copies)
+    /// resolves to the same [`ObjectId`], so per-object state keyed by this
+    /// id (e.g. a section's image backing) stays correct across aliases —
+    /// unlike keying by the handle value, which a duplicate changes.
+    ///
+    /// [`ObjectId`]: crate::runtime::object_manager::ObjectId
+    pub fn handle_object_identity(
+        &self,
+        handle: Handle,
+    ) -> AppResult<crate::runtime::object_manager::ObjectId> {
+        Ok(self.process.handle_table.entry(handle)?.object_id)
+    }
+
     pub fn set_handle_information(
         &mut self,
         handle: Handle,
@@ -2478,40 +2492,42 @@ impl Win32Subsystem {
         timeout_ms: u32,
     ) -> AppResult<WaitStatus> {
         let entry = self.handle_entry(handle)?;
-        match &entry.object {
-            KernelObject::Process(_) => {
+        let sync = match &entry.object {
+            KernelObject::Process(process) => {
                 // Waits require SYNCHRONIZE in the granted access mask.
                 Self::require_access(&entry, SYNCHRONIZE)?;
-            }
-            _ => return invalid_handle("handle is not a process"),
-        }
-        let entry = self.handle_entry(handle)?;
-        if let KernelObject::Process(process) = &entry.object {
-            if process.exit_code.is_some() {
-                Ok(WaitStatus::Object0)
-            } else if let Some(ref sync) = process.exit_sync {
-                // Real blocking wait using the condvar.
-                let (lock, cvar) = &**sync;
-                let mut guard = lock.lock().unwrap();
-                if guard.is_some() {
+                if process.exit_code.is_some() {
                     return Ok(WaitStatus::Object0);
                 }
-                if timeout_ms == 0 {
-                    return Ok(WaitStatus::Timeout);
-                }
-                let timeout = Duration::from_millis(timeout_ms as u64);
-                let result = cvar.wait_timeout(guard, timeout).unwrap();
-                guard = result.0;
-                if guard.is_some() {
-                    Ok(WaitStatus::Object0)
-                } else {
-                    Ok(WaitStatus::Timeout)
-                }
-            } else {
-                Ok(WaitStatus::Timeout)
+                process.exit_sync.clone()
             }
-        } else {
-            invalid_handle("handle is not a process")
+            _ => return invalid_handle("handle is not a process"),
+        };
+        let Some(sync) = sync else {
+            return Ok(WaitStatus::Timeout);
+        };
+        // Real blocking wait using the condvar.
+        let (lock, cvar) = &*sync;
+        let mut guard = lock.lock().unwrap();
+        if guard.is_none() && timeout_ms != 0 {
+            let timeout = Duration::from_millis(timeout_ms as u64);
+            guard = cvar.wait_timeout(guard, timeout).unwrap().0;
+        }
+        match *guard {
+            Some(code) => {
+                drop(guard);
+                // A completed exit-sync means the real host child exited:
+                // record its code on the process object so GetExitCodeProcess
+                // / NtQueryInformationProcess report the SAME value the wait
+                // observed (a terminate-recorded code is never overwritten).
+                if let Ok(KernelObject::Process(process)) = self.handle_object_mut(handle)
+                    && process.exit_code.is_none()
+                {
+                    process.exit_code = Some(code);
+                }
+                Ok(WaitStatus::Object0)
+            }
+            None => Ok(WaitStatus::Timeout),
         }
     }
 

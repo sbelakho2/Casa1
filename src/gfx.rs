@@ -2,7 +2,7 @@ use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use crate::util;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::process::{Command as HostCommand, Stdio};
@@ -1303,6 +1303,242 @@ pub struct MetalCommandBufferPlan {
     pub signaled_fences: Vec<(FenceId, u64)>,
 }
 
+/// Observability counters for command-stream translation optimisations.
+///
+/// Every field is updated by real work performed during translation or
+/// execution of a command stream; nothing is estimated. The counters are
+/// per-[`GraphicsBackend`] instance (not process-global) so concurrent tests
+/// observe only their own work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranslationStats {
+    /// Number of stream batches translated with more than one worker thread.
+    pub parallel_translation_batches: u64,
+    /// Number of streams translated concurrently inside a parallel batch.
+    pub streams_translated_in_parallel: u64,
+    /// Number of streams translated on the calling thread (dependent or lone).
+    pub streams_translated_serially: u64,
+    /// Number of commands (including nested bundle commands) translated.
+    pub commands_translated: u64,
+    /// Barrier/total accounting from hazard analysis.
+    pub barriers_considered: u64,
+    pub barriers_required: u64,
+    pub barriers_elided: u64,
+    pub transitions_required: u64,
+    pub transitions_elided: u64,
+    pub uav_barriers_required: u64,
+    pub uav_barriers_elided: u64,
+    pub aliasing_barriers_required: u64,
+    pub aliasing_barriers_elided: u64,
+    /// Resource updates written directly into host-visible storage.
+    pub zero_copy_updates: u64,
+    /// Resource updates that represent a staged (device-private) upload.
+    pub staged_copies: u64,
+    /// Batched descriptor-table translation calls.
+    pub descriptor_table_batches: u64,
+    /// Descriptor tables translated (cached entry missing or stale).
+    pub descriptor_table_uploads: u64,
+    /// Descriptor-table translations served from the cache unchanged.
+    pub descriptor_table_reuses: u64,
+}
+
+/// Per-kind barrier-hazard accounting produced by analysing a command stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BarrierAnalysis {
+    pub barriers_considered: u64,
+    pub barriers_required: u64,
+    pub barriers_elided: u64,
+    pub transitions_considered: u64,
+    pub transitions_required: u64,
+    pub transitions_elided: u64,
+    pub uav_barriers_considered: u64,
+    pub uav_barriers_required: u64,
+    pub uav_barriers_elided: u64,
+    pub aliasing_barriers_considered: u64,
+    pub aliasing_barriers_required: u64,
+    pub aliasing_barriers_elided: u64,
+    pub split_barriers_considered: u64,
+    pub split_barriers_required: u64,
+    pub split_barriers_elided: u64,
+}
+
+impl BarrierAnalysis {
+    /// Fold this analysis into per-backend translation counters.
+    pub fn merge_into(&self, stats: &mut TranslationStats) {
+        stats.barriers_considered += self.barriers_considered;
+        stats.barriers_required += self.barriers_required;
+        stats.barriers_elided += self.barriers_elided;
+        stats.transitions_required += self.transitions_required;
+        stats.transitions_elided += self.transitions_elided;
+        stats.uav_barriers_required += self.uav_barriers_required;
+        stats.uav_barriers_elided += self.uav_barriers_elided;
+        stats.aliasing_barriers_required += self.aliasing_barriers_required;
+        stats.aliasing_barriers_elided += self.aliasing_barriers_elided;
+    }
+}
+
+/// A barrier command resolved into the form the hazard analyser understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslatedBarrier {
+    Transition {
+        resource: ResourceId,
+        subresource: u32,
+        from: ResourceState,
+        to: ResourceState,
+    },
+    SplitBarrierBegin {
+        resource: ResourceId,
+        subresource: u32,
+        from: ResourceState,
+        to: ResourceState,
+    },
+    SplitBarrierEnd {
+        resource: ResourceId,
+        subresource: u32,
+        from: ResourceState,
+        to: ResourceState,
+    },
+    Uav {
+        resource: ResourceId,
+    },
+    Aliasing {
+        before: Option<ResourceId>,
+        after: Option<ResourceId>,
+    },
+}
+
+/// A [`Command`] translated into backend form with all lookups resolved.
+///
+/// Translation is a pure function of the command, the owning pipeline state,
+/// and the referenced descriptor heaps; execution-side effects (byte copies,
+/// plan updates) happen only when a translated command is applied. Splitting
+/// the two phases is what makes independent streams translatable in parallel
+/// while their effects are still applied in submission order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranslatedCommand {
+    Barrier(TranslatedBarrier),
+    SetRootConstants {
+        values: Vec<u32>,
+    },
+    BeginRenderPass {
+        color_formats: Vec<MtlPixelFormat>,
+        depth_format: Option<MtlPixelFormat>,
+        load_action: String,
+        store_action: String,
+    },
+    /// A descriptor that failed view-kind validation; recorded as a plan
+    /// validation error exactly like the serial path.
+    ValidationError {
+        message: String,
+    },
+    ClearRtv {
+        resource: ResourceId,
+        color_formats: Vec<MtlPixelFormat>,
+        depth_format: Option<MtlPixelFormat>,
+    },
+    ClearDsv {
+        resource: ResourceId,
+        color_formats: Vec<MtlPixelFormat>,
+        depth_format: MtlPixelFormat,
+    },
+    Draw {
+        vertices: u32,
+    },
+    DrawInstanced {
+        vertices: u32,
+        instances: u32,
+    },
+    Dispatch {
+        x: u32,
+        y: u32,
+        z: u32,
+    },
+    DispatchMesh {
+        x: u32,
+        y: u32,
+        z: u32,
+    },
+    CopyResource {
+        src: ResourceId,
+        dst: ResourceId,
+    },
+    CopyBufferRegion {
+        dst: ResourceId,
+        dst_offset: u64,
+        src: ResourceId,
+        src_offset: u64,
+        size: u64,
+    },
+    CopyResourceRegion {
+        dst: ResourceId,
+        dst_x: u32,
+        dst_y: u32,
+        src: ResourceId,
+        src_x: u32,
+        src_y: u32,
+        width: u32,
+        height: u32,
+    },
+    ResolveSubresource {
+        dst: ResourceId,
+        src: ResourceId,
+        format: u32,
+        resolve_mode: u32,
+    },
+    ExecuteBundle {
+        commands: Vec<TranslatedCommand>,
+    },
+    DispatchRays {
+        raygen_address: u64,
+        miss_address: u64,
+        hit_address: u64,
+        callable_address: u64,
+        width: u32,
+        height: u32,
+        depth: u32,
+    },
+}
+
+impl TranslatedCommand {
+    /// Number of source commands represented, counting nested bundle commands.
+    pub fn source_command_count(&self) -> u64 {
+        match self {
+            TranslatedCommand::ExecuteBundle { commands } => {
+                1 + commands
+                    .iter()
+                    .map(TranslatedCommand::source_command_count)
+                    .sum::<u64>()
+            }
+            _ => 1,
+        }
+    }
+}
+
+/// A translated command stream plus the dependency analysis that grouped it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslatedStream {
+    pub id: CommandListId,
+    pub commands: Vec<TranslatedCommand>,
+    /// Earlier streams in the same submission that share a resource with this
+    /// one, and therefore had to be translated before it.
+    pub depends_on: Vec<usize>,
+    /// Which translation batch this stream belonged to.
+    pub batch_index: usize,
+    /// True when the stream was translated on a worker thread.
+    pub parallel: bool,
+}
+
+/// The path an update took into resource storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceUpdatePath {
+    /// The resource storage is host-visible: the bytes were written in place
+    /// and no staging copy/upload was created.
+    HostVisibleInPlace,
+    /// The resource is device-private: on real Metal the write would go
+    /// through a staging buffer, so it is accounted as a staged upload.
+    StagedUpload,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SceneSpec {
     pub name: String,
@@ -1334,6 +1570,17 @@ struct ResourceRecord {
 struct DescriptorHeapRecord {
     ty: DescriptorHeapType,
     descriptors: Vec<Option<ViewDescriptor>>,
+    /// Monotonic revision bumped on every descriptor mutation; the
+    /// translation cache reuses an entry only while its revision matches.
+    revision: u64,
+}
+
+/// Cache of translated descriptor tables, keyed by heap and validated by the
+/// heap's revision. Owned by [`GraphicsBackend`] behind a `RefCell` because
+/// `translate_descriptor_heap` is an observation-only operation.
+#[derive(Debug, Clone, Default)]
+struct DescriptorTranslationCache {
+    entries: BTreeMap<DescriptorHeapId, (u64, Vec<MetalBinding>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1397,6 +1644,10 @@ pub struct GraphicsBackend {
     /// API that presents through this backend; labels every `PresentedFrame`
     /// produced by [`presented_frame`](Self::presented_frame).
     frame_source: FrameSource,
+    /// Per-instance observability counters for translation optimisations.
+    translation_stats: std::cell::RefCell<TranslationStats>,
+    /// Cache of translated descriptor tables (revision-validated).
+    descriptor_translation_cache: std::cell::RefCell<DescriptorTranslationCache>,
 }
 
 impl std::fmt::Debug for GraphicsBackend {
@@ -1425,6 +1676,11 @@ impl std::fmt::Debug for GraphicsBackend {
                     .map(|_| "FnMut(PresentedFrame)"),
             )
             .field("frame_source", &self.frame_source)
+            .field("translation_stats", &self.translation_stats)
+            .field(
+                "descriptor_translation_cache",
+                &self.descriptor_translation_cache,
+            )
             .finish()
     }
 }
@@ -1451,6 +1707,10 @@ impl Clone for GraphicsBackend {
             pending_split_barriers: self.pending_split_barriers.clone(),
             frame_published_callback: None,
             frame_source: self.frame_source,
+            translation_stats: std::cell::RefCell::new(*self.translation_stats.borrow()),
+            descriptor_translation_cache: std::cell::RefCell::new(
+                self.descriptor_translation_cache.borrow().clone(),
+            ),
         }
     }
 }
@@ -1470,6 +1730,579 @@ struct ExecutionPlanState {
     raytrace_passes: u32,
     validation_errors: Vec<String>,
     root_constants_log: Vec<Vec<u32>>,
+    /// Barrier-hazard tracking across every stream of one execution.
+    hazards: HazardTracker,
+}
+
+impl ExecutionPlanState {
+    fn new() -> Self {
+        Self {
+            active_pass: None,
+            render_passes: Vec::new(),
+            compute_passes: 0,
+            blit_passes: 0,
+            raytrace_passes: 0,
+            validation_errors: Vec::new(),
+            root_constants_log: Vec::new(),
+            hazards: HazardTracker::default(),
+        }
+    }
+}
+
+/// Tracks resource hazards across a command stream so provably redundant
+/// barriers can be elided.
+///
+/// The rules are deliberately conservative: a barrier is elided only when its
+/// effect is already established by an earlier barrier in the same execution
+/// (or, for transitions, when the requested destination state is already the
+/// tracked state). Any unknown access — draws and dispatches, whose bound
+/// resources are not carried by the command — forces subsequent barriers to
+/// remain required.
+#[derive(Debug, Default)]
+struct HazardTracker {
+    /// Last state established for a subresource by a required transition.
+    states: BTreeMap<SubresourceKey, ResourceState>,
+    /// Resources synchronised by a required UAV/aliasing barrier.
+    synchronized_resources: BTreeSet<ResourceId>,
+    /// Subresources written since their last synchronising barrier.
+    dirty: BTreeSet<SubresourceKey>,
+    /// True when a draw/dispatch (whose accesses are unknown) happened since
+    /// the last required barrier.
+    gpu_work_since_barrier: bool,
+    analysis: BarrierAnalysis,
+}
+
+impl HazardTracker {
+    fn decide_barrier(&mut self, barrier: &TranslatedBarrier) -> bool {
+        match barrier {
+            TranslatedBarrier::Transition {
+                resource,
+                subresource,
+                from,
+                to,
+            } => self.transition(*resource, *subresource, *from, *to),
+            TranslatedBarrier::SplitBarrierBegin { .. }
+            | TranslatedBarrier::SplitBarrierEnd { .. } => self.split(),
+            TranslatedBarrier::Uav { resource } => self.uav(*resource),
+            TranslatedBarrier::Aliasing { before, after } => self.aliasing(*before, *after),
+        }
+    }
+
+    fn transition(
+        &mut self,
+        resource: ResourceId,
+        subresource: u32,
+        from: ResourceState,
+        to: ResourceState,
+    ) -> bool {
+        self.analysis.barriers_considered += 1;
+        self.analysis.transitions_considered += 1;
+        let key = (resource, 0, subresource);
+        let already_in_target_state = self.states.get(&key).copied() == Some(to);
+        if from == to || already_in_target_state {
+            // A redundant transition establishes nothing; seed the tracked
+            // state when this is the first barrier seen for the subresource.
+            self.states.entry(key).or_insert(to);
+            self.analysis.barriers_elided += 1;
+            self.analysis.transitions_elided += 1;
+            false
+        } else {
+            self.states.insert(key, to);
+            self.dirty.remove(&key);
+            self.analysis.barriers_required += 1;
+            self.analysis.transitions_required += 1;
+            true
+        }
+    }
+
+    fn uav(&mut self, resource: ResourceId) -> bool {
+        self.analysis.barriers_considered += 1;
+        self.analysis.uav_barriers_considered += 1;
+        let has_dirty_writes = self.dirty.iter().any(|(dirty, _, _)| *dirty == resource);
+        let already_synchronized = self.synchronized_resources.contains(&resource);
+        // The first UAV barrier for a resource is always required: earlier
+        // submissions may have written it, and that hazard is not visible
+        // from this stream alone.
+        let required = has_dirty_writes || self.gpu_work_since_barrier || !already_synchronized;
+        if required {
+            self.synchronized_resources.insert(resource);
+            self.dirty.retain(|(dirty, _, _)| *dirty != resource);
+            self.gpu_work_since_barrier = false;
+            self.analysis.barriers_required += 1;
+            self.analysis.uav_barriers_required += 1;
+            true
+        } else {
+            self.analysis.barriers_elided += 1;
+            self.analysis.uav_barriers_elided += 1;
+            false
+        }
+    }
+
+    fn aliasing(&mut self, before: Option<ResourceId>, after: Option<ResourceId>) -> bool {
+        self.analysis.barriers_considered += 1;
+        self.analysis.aliasing_barriers_considered += 1;
+        let endpoint_ready = |tracker: &Self, endpoint: Option<ResourceId>| match endpoint {
+            Some(resource) => {
+                tracker.synchronized_resources.contains(&resource)
+                    && !tracker.dirty.iter().any(|(dirty, _, _)| *dirty == resource)
+            }
+            // A missing endpoint (a full aliasing barrier) cannot be proven
+            // redundant.
+            None => false,
+        };
+        let required = self.gpu_work_since_barrier
+            || !endpoint_ready(self, before)
+            || !endpoint_ready(self, after);
+        if required {
+            for resource in [before, after].into_iter().flatten() {
+                self.synchronized_resources.insert(resource);
+                self.dirty.retain(|(dirty, _, _)| *dirty != resource);
+            }
+            self.gpu_work_since_barrier = false;
+            self.analysis.barriers_required += 1;
+            self.analysis.aliasing_barriers_required += 1;
+            true
+        } else {
+            self.analysis.barriers_elided += 1;
+            self.analysis.aliasing_barriers_elided += 1;
+            false
+        }
+    }
+
+    /// Split barriers are matched begin/end pairs whose scheduling semantics
+    /// cannot be proven redundant from a single stream, so they stay required.
+    fn split(&mut self) -> bool {
+        self.analysis.barriers_considered += 1;
+        self.analysis.split_barriers_considered += 1;
+        self.analysis.barriers_required += 1;
+        self.analysis.split_barriers_required += 1;
+        self.gpu_work_since_barrier = false;
+        true
+    }
+
+    fn record_write(&mut self, resource: ResourceId, subresource: u32) {
+        self.dirty.insert((resource, 0, subresource));
+    }
+
+    fn record_gpu_work(&mut self) {
+        self.gpu_work_since_barrier = true;
+    }
+}
+
+/// Record the hazards a translated non-barrier command introduces.
+///
+/// Bundle commands are only recursed into when `recurse_bundles` is set: the
+/// apply path observes nested commands itself as it applies them.
+fn observe_translated_hazards(
+    tracker: &mut HazardTracker,
+    command: &TranslatedCommand,
+    recurse_bundles: bool,
+) {
+    match command {
+        TranslatedCommand::Barrier(_) => {}
+        TranslatedCommand::ExecuteBundle { commands } => {
+            if recurse_bundles {
+                for nested in commands {
+                    observe_translated_hazards(tracker, nested, true);
+                }
+            }
+        }
+        TranslatedCommand::ClearRtv { resource, .. }
+        | TranslatedCommand::ClearDsv { resource, .. } => tracker.record_write(*resource, 0),
+        TranslatedCommand::Draw { .. }
+        | TranslatedCommand::DrawInstanced { .. }
+        | TranslatedCommand::Dispatch { .. }
+        | TranslatedCommand::DispatchMesh { .. }
+        | TranslatedCommand::DispatchRays { .. } => tracker.record_gpu_work(),
+        TranslatedCommand::CopyResource { dst, .. }
+        | TranslatedCommand::CopyBufferRegion { dst, .. }
+        | TranslatedCommand::CopyResourceRegion { dst, .. }
+        | TranslatedCommand::ResolveSubresource { dst, .. } => tracker.record_write(*dst, 0),
+        TranslatedCommand::SetRootConstants { .. } | TranslatedCommand::BeginRenderPass { .. } => {}
+        TranslatedCommand::ValidationError { .. } => {}
+    }
+}
+
+/// The read-only backend state command translation consults.
+///
+/// Cloning this snapshot (descriptor heaps, pipeline states, and the
+/// command-list → pipeline mapping) produces a `Sync` value that scoped
+/// worker threads can share, which is what makes independent-stream
+/// translation genuinely concurrent without touching [`GraphicsBackend`].
+#[derive(Debug, Clone, Default)]
+struct TranslationSnapshot {
+    descriptor_heaps: BTreeMap<DescriptorHeapId, DescriptorHeapRecord>,
+    command_list_pipelines: BTreeMap<CommandListId, PipelineStateId>,
+    pipeline_states: BTreeMap<PipelineStateId, PipelineStateDesc>,
+}
+
+impl TranslationSnapshot {
+    fn from_backend(backend: &GraphicsBackend) -> Self {
+        Self {
+            descriptor_heaps: backend.descriptor_heaps.clone(),
+            command_list_pipelines: backend
+                .command_lists
+                .iter()
+                .map(|(id, record)| (*id, record.pipeline_state))
+                .collect(),
+            pipeline_states: backend.pipeline_states.clone(),
+        }
+    }
+
+    fn pipeline_for_stream(&self, list: CommandListId) -> AppResult<PipelineStateDesc> {
+        let pipeline_state = self.command_list_pipelines.get(&list).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown command list {list}"),
+            )
+        })?;
+        self.pipeline_states
+            .get(pipeline_state)
+            .cloned()
+            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown pipeline state"))
+    }
+
+    fn descriptor_at(&self, heap: DescriptorHeapId, index: usize) -> AppResult<ViewDescriptor> {
+        self.descriptor_heaps
+            .get(&heap)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("unknown descriptor heap {heap}"),
+                )
+            })?
+            .descriptors
+            .get(index)
+            .and_then(Clone::clone)
+            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "descriptor slot is empty"))
+    }
+
+    fn translate_commands(
+        &self,
+        commands: &[Command],
+        pipeline: &PipelineStateDesc,
+    ) -> AppResult<Vec<TranslatedCommand>> {
+        commands
+            .iter()
+            .map(|command| self.translate_command(command, pipeline))
+            .collect()
+    }
+
+    fn translate_command(
+        &self,
+        command: &Command,
+        pipeline: &PipelineStateDesc,
+    ) -> AppResult<TranslatedCommand> {
+        Ok(match command {
+            Command::Transition {
+                resource,
+                subresource,
+                from,
+                to,
+            } => TranslatedCommand::Barrier(TranslatedBarrier::Transition {
+                resource: *resource,
+                subresource: *subresource,
+                from: *from,
+                to: *to,
+            }),
+            Command::SplitBarrierBegin {
+                resource,
+                subresource,
+                from,
+                to,
+            } => TranslatedCommand::Barrier(TranslatedBarrier::SplitBarrierBegin {
+                resource: *resource,
+                subresource: *subresource,
+                from: *from,
+                to: *to,
+            }),
+            Command::SplitBarrierEnd {
+                resource,
+                subresource,
+                from,
+                to,
+            } => TranslatedCommand::Barrier(TranslatedBarrier::SplitBarrierEnd {
+                resource: *resource,
+                subresource: *subresource,
+                from: *from,
+                to: *to,
+            }),
+            Command::UavBarrier { resource } => {
+                TranslatedCommand::Barrier(TranslatedBarrier::Uav {
+                    resource: *resource,
+                })
+            }
+            Command::AliasingBarrier { before, after } => {
+                TranslatedCommand::Barrier(TranslatedBarrier::Aliasing {
+                    before: *before,
+                    after: *after,
+                })
+            }
+            Command::SetRootConstants { values } => TranslatedCommand::SetRootConstants {
+                values: values.clone(),
+            },
+            Command::BeginRenderPass {
+                color_formats,
+                depth_format,
+                load_action,
+                store_action,
+            } => {
+                let mapped_color_formats = color_formats
+                    .iter()
+                    .map(|format| format_mapping(*format).map(|mapping| mapping.metal))
+                    .collect::<AppResult<Vec<_>>>()?;
+                let mapped_depth_format = depth_format
+                    .map(|format| format_mapping(format).map(|mapping| mapping.metal))
+                    .transpose()?;
+                TranslatedCommand::BeginRenderPass {
+                    color_formats: mapped_color_formats,
+                    depth_format: mapped_depth_format,
+                    load_action: load_action.clone(),
+                    store_action: store_action.clone(),
+                }
+            }
+            Command::ClearRtv { heap, index } => {
+                let descriptor = self.descriptor_at(*heap, *index)?;
+                let ViewDescriptor::Rtv { resource, format } = descriptor else {
+                    return Ok(TranslatedCommand::ValidationError {
+                        message: "invalid RTV attachment".to_string(),
+                    });
+                };
+                let mapping = format_mapping(format)?;
+                let depth_format = pipeline
+                    .depth_format
+                    .map(format_mapping)
+                    .transpose()?
+                    .map(|mapping| mapping.metal);
+                TranslatedCommand::ClearRtv {
+                    resource,
+                    color_formats: vec![mapping.metal],
+                    depth_format,
+                }
+            }
+            Command::ClearDsv { heap, index } => {
+                let descriptor = self.descriptor_at(*heap, *index)?;
+                let ViewDescriptor::Dsv { resource, format } = descriptor else {
+                    return Ok(TranslatedCommand::ValidationError {
+                        message: "invalid DSV attachment".to_string(),
+                    });
+                };
+                let mapping = format_mapping(format)?;
+                let color_format = pipeline
+                    .render_target_formats
+                    .first()
+                    .map(|format| format_mapping(*format))
+                    .transpose()?
+                    .map(|mapping| mapping.metal);
+                let color_formats = color_format.map(|format| vec![format]).unwrap_or_default();
+                TranslatedCommand::ClearDsv {
+                    resource,
+                    color_formats,
+                    depth_format: mapping.metal,
+                }
+            }
+            Command::Draw { vertices } => TranslatedCommand::Draw {
+                vertices: *vertices,
+            },
+            Command::DrawInstanced {
+                vertices,
+                instances,
+            } => TranslatedCommand::DrawInstanced {
+                vertices: *vertices,
+                instances: *instances,
+            },
+            Command::Dispatch { x, y, z } => TranslatedCommand::Dispatch {
+                x: *x,
+                y: *y,
+                z: *z,
+            },
+            Command::DispatchMesh { x, y, z } => TranslatedCommand::DispatchMesh {
+                x: *x,
+                y: *y,
+                z: *z,
+            },
+            Command::CopyResource { src, dst } => TranslatedCommand::CopyResource {
+                src: *src,
+                dst: *dst,
+            },
+            Command::CopyBufferRegion {
+                dst,
+                dst_offset,
+                src,
+                src_offset,
+                size,
+            } => TranslatedCommand::CopyBufferRegion {
+                dst: *dst,
+                dst_offset: *dst_offset,
+                src: *src,
+                src_offset: *src_offset,
+                size: *size,
+            },
+            Command::CopyResourceRegion {
+                dst,
+                dst_x,
+                dst_y,
+                dst_z: _,
+                src,
+                src_x,
+                src_y,
+                src_z: _,
+                width,
+                height,
+                depth: _,
+            } => TranslatedCommand::CopyResourceRegion {
+                dst: *dst,
+                dst_x: *dst_x,
+                dst_y: *dst_y,
+                src: *src,
+                src_x: *src_x,
+                src_y: *src_y,
+                width: *width,
+                height: *height,
+            },
+            Command::ResolveSubresource {
+                dst,
+                src,
+                format,
+                resolve_mode,
+            } => TranslatedCommand::ResolveSubresource {
+                dst: *dst,
+                src: *src,
+                format: *format,
+                resolve_mode: *resolve_mode,
+            },
+            Command::ExecuteBundle { bundle_commands } => TranslatedCommand::ExecuteBundle {
+                commands: self.translate_commands(bundle_commands, pipeline)?,
+            },
+            Command::DispatchRays {
+                raygen_address,
+                miss_address,
+                hit_address,
+                callable_address,
+                width,
+                height,
+                depth,
+            } => TranslatedCommand::DispatchRays {
+                raygen_address: *raygen_address,
+                miss_address: *miss_address,
+                hit_address: *hit_address,
+                callable_address: *callable_address,
+                width: *width,
+                height: *height,
+                depth: *depth,
+            },
+        })
+    }
+}
+
+/// Resources a command stream touches, used to group independent streams.
+#[derive(Debug, Clone, Default)]
+struct StreamAccess {
+    reads: BTreeSet<ResourceId>,
+    writes: BTreeSet<ResourceId>,
+}
+
+impl StreamAccess {
+    fn touches(&self, resource: ResourceId) -> bool {
+        self.reads.contains(&resource) || self.writes.contains(&resource)
+    }
+
+    fn intersects(&self, other: &StreamAccess) -> bool {
+        self.reads.iter().any(|resource| other.touches(*resource))
+            || self.writes.iter().any(|resource| other.touches(*resource))
+    }
+
+    fn merge(&mut self, other: &StreamAccess) {
+        self.reads.extend(other.reads.iter().copied());
+        self.writes.extend(other.writes.iter().copied());
+    }
+}
+
+fn record_command_access(
+    snapshot: &TranslationSnapshot,
+    command: &Command,
+    access: &mut StreamAccess,
+) {
+    match command {
+        Command::Transition { resource, .. }
+        | Command::SplitBarrierBegin { resource, .. }
+        | Command::SplitBarrierEnd { resource, .. }
+        | Command::UavBarrier { resource } => {
+            // Barriers order accesses: any other stream touching the resource
+            // must be translated after this one.
+            access.reads.insert(*resource);
+            access.writes.insert(*resource);
+        }
+        Command::AliasingBarrier { before, after } => {
+            for resource in [before, after].into_iter().flatten() {
+                access.reads.insert(*resource);
+                access.writes.insert(*resource);
+            }
+        }
+        Command::ClearRtv { heap, index } => {
+            if let Ok(ViewDescriptor::Rtv { resource, .. }) = snapshot.descriptor_at(*heap, *index)
+            {
+                access.writes.insert(resource);
+            }
+        }
+        Command::ClearDsv { heap, index } => {
+            if let Ok(ViewDescriptor::Dsv { resource, .. }) = snapshot.descriptor_at(*heap, *index)
+            {
+                access.writes.insert(resource);
+            }
+        }
+        Command::CopyResource { src, dst }
+        | Command::CopyBufferRegion { src, dst, .. }
+        | Command::CopyResourceRegion { src, dst, .. }
+        | Command::ResolveSubresource { src, dst, .. } => {
+            access.reads.insert(*src);
+            access.writes.insert(*dst);
+        }
+        Command::ExecuteBundle { bundle_commands } => {
+            for nested in bundle_commands {
+                record_command_access(snapshot, nested, access);
+            }
+        }
+        Command::SetRootConstants { .. }
+        | Command::BeginRenderPass { .. }
+        | Command::Draw { .. }
+        | Command::DrawInstanced { .. }
+        | Command::Dispatch { .. }
+        | Command::DispatchMesh { .. }
+        | Command::DispatchRays { .. } => {}
+    }
+}
+
+fn stream_access(snapshot: &TranslationSnapshot, commands: &[Command]) -> StreamAccess {
+    let mut access = StreamAccess::default();
+    for command in commands {
+        record_command_access(snapshot, command, &mut access);
+    }
+    access
+}
+
+/// Group streams into batches of mutually independent work. A stream joins the
+/// current batch only when it shares no resource with any stream already in
+/// that batch; conflicting streams start a new batch, which is translated
+/// after the earlier ones (order preservation for dependent commands).
+fn batch_streams(accesses: &[StreamAccess]) -> Vec<Vec<usize>> {
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_access = StreamAccess::default();
+    for (index, access) in accesses.iter().enumerate() {
+        if current.is_empty() || !access.intersects(&current_access) {
+            current.push(index);
+            current_access.merge(access);
+        } else {
+            batches.push(std::mem::take(&mut current));
+            current_access = access.clone();
+            current.push(index);
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 impl GraphicsBackend {
@@ -1537,6 +2370,10 @@ impl GraphicsBackend {
             timestamps: 1,
             subresource_states: BTreeMap::new(),
             pending_split_barriers: Vec::new(),
+            translation_stats: std::cell::RefCell::new(TranslationStats::default()),
+            descriptor_translation_cache: std::cell::RefCell::new(
+                DescriptorTranslationCache::default(),
+            ),
         }
     }
 
@@ -1886,10 +2723,14 @@ impl GraphicsBackend {
 
     /// Destroy a descriptor heap.
     pub fn destroy_descriptor_heap(&mut self, heap: DescriptorHeapId) -> AppResult<()> {
-        self.descriptor_heaps
-            .remove(&heap)
-            .map(|_| ())
-            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown descriptor heap"))
+        self.descriptor_heaps.remove(&heap).ok_or_else(|| {
+            AppError::new(ReasonCode::RcD3dInvalidState, "unknown descriptor heap")
+        })?;
+        self.descriptor_translation_cache
+            .get_mut()
+            .entries
+            .remove(&heap);
+        Ok(())
     }
 
     /// Destroy a command list (drops its recorded commands).
@@ -1991,6 +2832,7 @@ impl GraphicsBackend {
             DescriptorHeapRecord {
                 ty,
                 descriptors: vec![None; count],
+                revision: 0,
             },
         );
         id
@@ -2011,6 +2853,7 @@ impl GraphicsBackend {
             )
         })?;
         *slot = Some(descriptor);
+        heap_record.revision = heap_record.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -2044,6 +2887,7 @@ impl GraphicsBackend {
                 )
             })?;
         slice.clone_from_slice(&source);
+        destination.revision = destination.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -2069,12 +2913,31 @@ impl GraphicsBackend {
         Ok(self.descriptor_heap(heap)?.ty)
     }
 
+    /// Translate a descriptor heap into Metal bindings.
+    ///
+    /// The translation is cached by the heap's descriptor revision: a second
+    /// call for an unchanged heap reuses the cached bindings (`descriptor_table_reuses`
+    /// counter), while any `write_descriptor`/`copy_descriptors` bump in the
+    /// heap's revision forces a fresh translation (`descriptor_table_uploads`).
     pub fn translate_descriptor_heap(
         &self,
         heap: DescriptorHeapId,
     ) -> AppResult<Vec<MetalBinding>> {
         let heap_record = self.descriptor_heap(heap)?;
-        Ok(heap_record
+        let revision = heap_record.revision;
+        let cached = self
+            .descriptor_translation_cache
+            .borrow()
+            .entries
+            .get(&heap)
+            .cloned();
+        if let Some((cached_revision, bindings)) = cached
+            && cached_revision == revision
+        {
+            self.translation_stats.borrow_mut().descriptor_table_reuses += 1;
+            return Ok(bindings);
+        }
+        let bindings = heap_record
             .descriptors
             .iter()
             .enumerate()
@@ -2083,7 +2946,38 @@ impl GraphicsBackend {
                     .as_ref()
                     .map(|descriptor| metal_binding(slot as u32, descriptor))
             })
-            .collect())
+            .collect::<Vec<_>>();
+        self.descriptor_translation_cache
+            .borrow_mut()
+            .entries
+            .insert(heap, (revision, bindings.clone()));
+        self.translation_stats.borrow_mut().descriptor_table_uploads += 1;
+        Ok(bindings)
+    }
+
+    /// Batched descriptor-table translation for the D3D12 descriptor-heap
+    /// path: every requested table is translated in one call, and tables whose
+    /// descriptors did not change are served from the revision cache instead
+    /// of being re-uploaded.
+    pub fn translate_descriptor_tables(
+        &self,
+        heaps: &[DescriptorHeapId],
+    ) -> AppResult<Vec<Vec<MetalBinding>>> {
+        self.translation_stats.borrow_mut().descriptor_table_batches += 1;
+        heaps
+            .iter()
+            .map(|&heap| self.translate_descriptor_heap(heap))
+            .collect()
+    }
+
+    /// Snapshot of this backend's translation counters.
+    pub fn translation_stats(&self) -> TranslationStats {
+        *self.translation_stats.borrow()
+    }
+
+    /// Reset the translation counters (useful for per-frame measurements).
+    pub fn reset_translation_stats(&mut self) {
+        *self.translation_stats.get_mut() = TranslationStats::default();
     }
 
     pub fn create_root_signature(&mut self, desc: RootSignatureDesc) -> RootSignatureId {
@@ -2646,169 +3540,136 @@ impl GraphicsBackend {
         })
     }
 
-    /// Mutable state accumulated while executing a command stream.
+    /// Apply a translated command, driving the render-pass / compute-pass /
+    /// blit-pass planning state machine and executing its CPU-side effects.
     ///
-    /// Process a single [`Command`] during [`execute_command_lists`], driving the
-    /// render-pass / compute-pass / blit-pass planning state machine.
-    ///
-    /// This is extracted as a separate method so that [`Command::ExecuteBundle`]
-    /// can recursively re-dispatch each of the bundle's commands through the same
-    /// processing logic without duplicating the match arms.
-    fn process_execution_command(
+    /// This is the single execution path shared by the serial and parallel
+    /// execution methods, which is what guarantees the two produce identical
+    /// plans and byte-level results.
+    fn apply_translated_command(
         &mut self,
-        command: &Command,
-        pipeline: &PipelineStateDesc,
+        command: &TranslatedCommand,
         plan: &mut ExecutionPlanState,
     ) -> AppResult<()> {
+        if !matches!(command, TranslatedCommand::Barrier(_)) {
+            observe_translated_hazards(&mut plan.hazards, command, false);
+        }
         match command {
-            Command::Transition { .. }
-            | Command::SplitBarrierBegin { .. }
-            | Command::SplitBarrierEnd { .. }
-            | Command::UavBarrier { .. }
-            | Command::AliasingBarrier { .. } => {
-                if let Some(pass) = plan.active_pass.take() {
-                    plan.render_passes.push(pass);
+            TranslatedCommand::Barrier(barrier) => {
+                // A barrier the hazard analysis proves redundant must not split
+                // the active render pass: that is the real elision this path
+                // performs. Required barriers keep the submission boundary.
+                if plan.hazards.decide_barrier(barrier) {
+                    if let Some(pass) = plan.active_pass.take() {
+                        plan.render_passes.push(pass);
+                    }
                 }
             }
-            Command::SetRootConstants { values } => {
+            TranslatedCommand::ValidationError { message } => {
+                plan.validation_errors.push(message.clone());
+            }
+            TranslatedCommand::SetRootConstants { values } => {
                 if let Some(pass) = plan.active_pass.take() {
                     plan.render_passes.push(pass);
                 }
                 plan.root_constants_log.push(values.clone());
             }
-            Command::BeginRenderPass {
+            TranslatedCommand::BeginRenderPass {
                 color_formats,
                 depth_format,
                 load_action,
                 store_action,
-            } => {
-                let mapped_color_formats = color_formats
-                    .iter()
-                    .map(|format| format_mapping(*format).map(|mapping| mapping.metal))
-                    .collect::<AppResult<Vec<_>>>()?;
-                let mapped_depth_format = depth_format
-                    .map(|format| format_mapping(format).map(|mapping| mapping.metal))
-                    .transpose()?;
-                match &mut plan.active_pass {
-                    Some(pass)
-                        if self.capabilities.mesh_shaders
-                            && pass.can_merge_with(
-                                &mapped_color_formats,
-                                mapped_depth_format,
-                                load_action,
-                            ) =>
-                    {
-                        pass.merge_store_action(store_action);
-                    }
-                    Some(_) => {
+            } => match &mut plan.active_pass {
+                Some(pass)
+                    if self.capabilities.mesh_shaders
+                        && pass.can_merge_with(color_formats, *depth_format, load_action) =>
+                {
+                    pass.merge_store_action(store_action);
+                }
+                Some(_) => {
+                    plan.render_passes
+                        .push(plan.active_pass.take().expect("active pass"));
+                    plan.active_pass = Some(RenderPassPlan {
+                        color_formats: color_formats.clone(),
+                        depth_format: *depth_format,
+                        draw_calls: 0,
+                        load_action: load_action.clone(),
+                        store_action: store_action.clone(),
+                    });
+                }
+                None => {
+                    plan.active_pass = Some(RenderPassPlan {
+                        color_formats: color_formats.clone(),
+                        depth_format: *depth_format,
+                        draw_calls: 0,
+                        load_action: load_action.clone(),
+                        store_action: store_action.clone(),
+                    });
+                }
+            },
+            TranslatedCommand::ClearRtv {
+                color_formats,
+                depth_format,
+                ..
+            } => match &mut plan.active_pass {
+                Some(pass) => {
+                    if pass.color_formats != *color_formats || pass.depth_format != *depth_format {
                         plan.render_passes
                             .push(plan.active_pass.take().expect("active pass"));
                         plan.active_pass = Some(RenderPassPlan {
-                            color_formats: mapped_color_formats,
-                            depth_format: mapped_depth_format,
-                            draw_calls: 0,
-                            load_action: load_action.clone(),
-                            store_action: store_action.clone(),
-                        });
-                    }
-                    None => {
-                        plan.active_pass = Some(RenderPassPlan {
-                            color_formats: mapped_color_formats,
-                            depth_format: mapped_depth_format,
-                            draw_calls: 0,
-                            load_action: load_action.clone(),
-                            store_action: store_action.clone(),
-                        });
-                    }
-                }
-            }
-            Command::ClearRtv { heap, index } => {
-                let descriptor = self.descriptor_at(*heap, *index)?;
-                let ViewDescriptor::Rtv { format, .. } = descriptor else {
-                    plan.validation_errors
-                        .push("invalid RTV attachment".to_string());
-                    return Ok(());
-                };
-                let mapping = format_mapping(format)?;
-                let depth_format = pipeline
-                    .depth_format
-                    .map(format_mapping)
-                    .transpose()?
-                    .map(|mapping| mapping.metal);
-                match &mut plan.active_pass {
-                    Some(pass) => {
-                        if pass.color_formats != vec![mapping.metal]
-                            || pass.depth_format != depth_format
-                        {
-                            plan.render_passes
-                                .push(plan.active_pass.take().expect("active pass"));
-                            plan.active_pass = Some(RenderPassPlan {
-                                color_formats: vec![mapping.metal],
-                                depth_format,
-                                draw_calls: 0,
-                                load_action: "clear".to_string(),
-                                store_action: "store".to_string(),
-                            });
-                        } else {
-                            pass.load_action = "clear".to_string();
-                        }
-                    }
-                    None => {
-                        plan.active_pass = Some(RenderPassPlan {
-                            color_formats: vec![mapping.metal],
-                            depth_format,
+                            color_formats: color_formats.clone(),
+                            depth_format: *depth_format,
                             draw_calls: 0,
                             load_action: "clear".to_string(),
                             store_action: "store".to_string(),
                         });
-                    }
-                }
-            }
-            Command::ClearDsv { heap, index } => {
-                let descriptor = self.descriptor_at(*heap, *index)?;
-                let ViewDescriptor::Dsv { format, .. } = descriptor else {
-                    plan.validation_errors
-                        .push("invalid DSV attachment".to_string());
-                    return Ok(());
-                };
-                let mapping = format_mapping(format)?;
-                let color_format = pipeline
-                    .render_target_formats
-                    .first()
-                    .map(|format| format_mapping(*format))
-                    .transpose()?
-                    .map(|mapping| mapping.metal);
-                let color_formats = color_format.map(|f| vec![f]).unwrap_or_default();
-                match &mut plan.active_pass {
-                    Some(pass)
-                        if pass.depth_format == Some(mapping.metal)
-                            && pass.color_formats == color_formats =>
-                    {
+                    } else {
                         pass.load_action = "clear".to_string();
                     }
-                    Some(_) => {
-                        plan.render_passes
-                            .push(plan.active_pass.take().expect("active pass"));
-                        plan.active_pass = Some(RenderPassPlan {
-                            color_formats,
-                            depth_format: Some(mapping.metal),
-                            draw_calls: 0,
-                            load_action: "clear".to_string(),
-                            store_action: "store".to_string(),
-                        });
-                    }
-                    None => {
-                        plan.active_pass = Some(RenderPassPlan {
-                            color_formats,
-                            depth_format: Some(mapping.metal),
-                            draw_calls: 0,
-                            load_action: "clear".to_string(),
-                            store_action: "store".to_string(),
-                        });
-                    }
                 }
-            }
-            Command::Draw { .. } | Command::DrawInstanced { .. } => {
+                None => {
+                    plan.active_pass = Some(RenderPassPlan {
+                        color_formats: color_formats.clone(),
+                        depth_format: *depth_format,
+                        draw_calls: 0,
+                        load_action: "clear".to_string(),
+                        store_action: "store".to_string(),
+                    });
+                }
+            },
+            TranslatedCommand::ClearDsv {
+                color_formats,
+                depth_format,
+                ..
+            } => match &mut plan.active_pass {
+                Some(pass)
+                    if pass.depth_format == Some(*depth_format)
+                        && pass.color_formats == *color_formats =>
+                {
+                    pass.load_action = "clear".to_string();
+                }
+                Some(_) => {
+                    plan.render_passes
+                        .push(plan.active_pass.take().expect("active pass"));
+                    plan.active_pass = Some(RenderPassPlan {
+                        color_formats: color_formats.clone(),
+                        depth_format: Some(*depth_format),
+                        draw_calls: 0,
+                        load_action: "clear".to_string(),
+                        store_action: "store".to_string(),
+                    });
+                }
+                None => {
+                    plan.active_pass = Some(RenderPassPlan {
+                        color_formats: color_formats.clone(),
+                        depth_format: Some(*depth_format),
+                        draw_calls: 0,
+                        load_action: "clear".to_string(),
+                        store_action: "store".to_string(),
+                    });
+                }
+            },
+            TranslatedCommand::Draw { .. } | TranslatedCommand::DrawInstanced { .. } => {
                 if let Some(pass) = &mut plan.active_pass {
                     pass.draw_calls += 1;
                 } else {
@@ -2816,13 +3677,13 @@ impl GraphicsBackend {
                         .push("draw without active render pass".to_string());
                 }
             }
-            Command::Dispatch { .. } => {
+            TranslatedCommand::Dispatch { .. } => {
                 if let Some(pass) = plan.active_pass.take() {
                     plan.render_passes.push(pass);
                 }
                 plan.compute_passes += 1;
             }
-            Command::DispatchMesh { .. } => {
+            TranslatedCommand::DispatchMesh { .. } => {
                 // Mesh shader dispatches require an active render pass
                 // (they generate geometry for rasterization).
                 if let Some(pass) = &mut plan.active_pass {
@@ -2832,14 +3693,14 @@ impl GraphicsBackend {
                         .push("dispatch mesh without active render pass".to_string());
                 }
             }
-            Command::CopyResource { src, dst } => {
+            TranslatedCommand::CopyResource { src, dst } => {
                 if let Some(pass) = plan.active_pass.take() {
                     plan.render_passes.push(pass);
                 }
                 plan.blit_passes += 1;
                 self.copy_resource_bytes(*src, *dst)?;
             }
-            Command::CopyBufferRegion {
+            TranslatedCommand::CopyBufferRegion {
                 dst,
                 dst_offset,
                 src,
@@ -2881,18 +3742,15 @@ impl GraphicsBackend {
                 }
                 dst_bytes.bytes[dst_start..dst_end].copy_from_slice(&src_bytes[src_start..src_end]);
             }
-            Command::CopyResourceRegion {
+            TranslatedCommand::CopyResourceRegion {
                 dst,
                 dst_x,
                 dst_y,
-                dst_z: _,
                 src,
                 src_x,
                 src_y,
-                src_z: _,
                 width,
                 height,
-                depth: _,
             } => {
                 if let Some(pass) = plan.active_pass.take() {
                     plan.render_passes.push(pass);
@@ -2963,22 +3821,22 @@ impl GraphicsBackend {
                         .copy_from_slice(&src_bytes[src_row_start..src_row_end]);
                 }
             }
-            Command::ResolveSubresource { dst, src, .. } => {
+            TranslatedCommand::ResolveSubresource { dst, src, .. } => {
                 if let Some(pass) = plan.active_pass.take() {
                     plan.render_passes.push(pass);
                 }
                 plan.blit_passes += 1;
                 self.copy_resource_bytes(*src, *dst)?;
             }
-            Command::ExecuteBundle { bundle_commands } => {
-                // Recursively process each command in the bundle. Bundle
+            TranslatedCommand::ExecuteBundle { commands } => {
+                // Recursively apply each command in the bundle. Bundle
                 // commands inherit the parent list's pipeline state and
                 // render-pass context — they execute as if inlined.
-                for cmd in bundle_commands {
-                    self.process_execution_command(cmd, pipeline, plan)?;
+                for command in commands {
+                    self.apply_translated_command(command, plan)?;
                 }
             }
-            Command::DispatchRays { .. } => {
+            TranslatedCommand::DispatchRays { .. } => {
                 // Raytracing dispatches are independent of render passes.
                 // End any active render pass and count as a raytrace pass.
                 if let Some(pass) = plan.active_pass.take() {
@@ -2990,48 +3848,16 @@ impl GraphicsBackend {
         Ok(())
     }
 
-    pub fn execute_command_lists(
+    fn finish_execution_plan(
         &mut self,
-        _queue: CommandQueueId,
-        lists: &[ImmutableCommandStream],
+        mut plan: ExecutionPlanState,
         signal_fence: Option<(FenceId, u64)>,
     ) -> AppResult<MetalCommandBufferPlan> {
-        let mut plan = ExecutionPlanState {
-            active_pass: None,
-            render_passes: Vec::new(),
-            compute_passes: 0,
-            blit_passes: 0,
-            raytrace_passes: 0,
-            validation_errors: Vec::new(),
-            root_constants_log: Vec::new(),
-        };
-
-        for stream in lists {
-            let pipeline = self
-                .pipeline_states
-                .get(
-                    &self
-                        .command_lists
-                        .get(&stream.id)
-                        .ok_or_else(|| {
-                            AppError::new(
-                                ReasonCode::RcD3dInvalidState,
-                                format!("unknown command list {}", stream.id),
-                            )
-                        })?
-                        .pipeline_state,
-                )
-                .ok_or_else(|| {
-                    AppError::new(ReasonCode::RcD3dInvalidState, "unknown pipeline state")
-                })?
-                .clone();
-            for command in &stream.commands {
-                self.process_execution_command(command, &pipeline, &mut plan)?;
-            }
-        }
         if let Some(pass) = plan.active_pass.take() {
             plan.render_passes.push(pass);
         }
+        let analysis = plan.hazards.analysis;
+        analysis.merge_into(self.translation_stats.get_mut());
 
         let mut signaled_fences = Vec::new();
         if let Some((fence, value)) = signal_fence {
@@ -3048,6 +3874,196 @@ impl GraphicsBackend {
             root_constants_log: plan.root_constants_log,
             signaled_fences,
         })
+    }
+
+    /// Translate a set of command streams serially. This is the reference
+    /// translation used to prove that parallel translation is byte-identical.
+    pub fn translate_command_streams(
+        &self,
+        lists: &[ImmutableCommandStream],
+    ) -> AppResult<Vec<TranslatedStream>> {
+        let snapshot = TranslationSnapshot::from_backend(self);
+        let accesses = lists
+            .iter()
+            .map(|stream| stream_access(&snapshot, &stream.commands))
+            .collect::<Vec<_>>();
+        let mut streams = Vec::with_capacity(lists.len());
+        for (index, stream) in lists.iter().enumerate() {
+            let pipeline = snapshot.pipeline_for_stream(stream.id)?;
+            let depends_on = (0..index)
+                .filter(|&other| accesses[index].intersects(&accesses[other]))
+                .collect();
+            streams.push(TranslatedStream {
+                id: stream.id,
+                commands: snapshot.translate_commands(&stream.commands, &pipeline)?,
+                depends_on,
+                batch_index: index,
+                parallel: false,
+            });
+        }
+        Ok(streams)
+    }
+
+    /// Translate command streams concurrently where the hazard analysis proves
+    /// them independent.
+    ///
+    /// Streams are grouped into batches: a stream joins the current batch only
+    /// when it shares no resource with any stream already in that batch.
+    /// Batches are translated in submission order, so a stream that depends on
+    /// an earlier one is translated after it (and, if it is the only stream in
+    /// its batch, on the calling thread) — dependent commands keep their order.
+    /// Every stream's effects are still applied later in submission order.
+    pub fn translate_streams_parallel(
+        &self,
+        lists: &[ImmutableCommandStream],
+    ) -> AppResult<Vec<TranslatedStream>> {
+        let snapshot = TranslationSnapshot::from_backend(self);
+        let mut pipelines = Vec::with_capacity(lists.len());
+        let mut accesses = Vec::with_capacity(lists.len());
+        for stream in lists {
+            pipelines.push(snapshot.pipeline_for_stream(stream.id)?);
+            accesses.push(stream_access(&snapshot, &stream.commands));
+        }
+        let batches = batch_streams(&accesses);
+        let mut translated: Vec<Option<Vec<TranslatedCommand>>> = vec![None; lists.len()];
+        let mut depends_on: Vec<Vec<usize>> = vec![Vec::new(); lists.len()];
+        let mut batch_indexes = vec![0usize; lists.len()];
+        let mut parallel_flags = vec![false; lists.len()];
+
+        for (batch_index, batch) in batches.iter().enumerate() {
+            for &stream_index in batch {
+                depends_on[stream_index] = (0..stream_index)
+                    .filter(|&other| accesses[stream_index].intersects(&accesses[other]))
+                    .collect();
+                batch_indexes[stream_index] = batch_index;
+            }
+            if batch.len() == 1 {
+                let stream_index = batch[0];
+                translated[stream_index] =
+                    Some(snapshot.translate_commands(
+                        &lists[stream_index].commands,
+                        &pipelines[stream_index],
+                    )?);
+                continue;
+            }
+            for &stream_index in batch {
+                parallel_flags[stream_index] = true;
+            }
+            std::thread::scope(|scope| -> AppResult<()> {
+                let handles = batch
+                    .iter()
+                    .map(|&stream_index| {
+                        let snapshot = &snapshot;
+                        let commands = &lists[stream_index].commands;
+                        let pipeline = &pipelines[stream_index];
+                        scope.spawn(move || snapshot.translate_commands(commands, pipeline))
+                    })
+                    .collect::<Vec<_>>();
+                let mut results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    let commands = handle.join().map_err(|_| {
+                        AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            "parallel command translation thread panicked",
+                        )
+                    })??;
+                    results.push(commands);
+                }
+                for (&stream_index, commands) in batch.iter().zip(results) {
+                    translated[stream_index] = Some(commands);
+                }
+                Ok(())
+            })?;
+        }
+
+        let mut streams = Vec::with_capacity(lists.len());
+        {
+            let mut stats = self.translation_stats.borrow_mut();
+            stats.parallel_translation_batches +=
+                batches.iter().filter(|batch| batch.len() > 1).count() as u64;
+            for (index, stream) in lists.iter().enumerate() {
+                let commands = translated[index].take().expect("translated stream");
+                if parallel_flags[index] {
+                    stats.streams_translated_in_parallel += 1;
+                } else {
+                    stats.streams_translated_serially += 1;
+                }
+                stats.commands_translated += commands
+                    .iter()
+                    .map(TranslatedCommand::source_command_count)
+                    .sum::<u64>();
+                streams.push(TranslatedStream {
+                    id: stream.id,
+                    depends_on: std::mem::take(&mut depends_on[index]),
+                    commands,
+                    batch_index: batch_indexes[index],
+                    parallel: parallel_flags[index],
+                });
+            }
+        }
+        Ok(streams)
+    }
+
+    /// Analyse barrier hazards over command streams without executing them.
+    ///
+    /// Returns the required/elided barrier accounting; the same analysis runs
+    /// during execution and feeds [`translation_stats`](Self::translation_stats).
+    pub fn analyze_barriers(&self, lists: &[ImmutableCommandStream]) -> AppResult<BarrierAnalysis> {
+        let snapshot = TranslationSnapshot::from_backend(self);
+        let mut tracker = HazardTracker::default();
+        for stream in lists {
+            let pipeline = snapshot.pipeline_for_stream(stream.id)?;
+            for command in snapshot.translate_commands(&stream.commands, &pipeline)? {
+                match &command {
+                    TranslatedCommand::Barrier(barrier) => {
+                        tracker.decide_barrier(barrier);
+                    }
+                    other => observe_translated_hazards(&mut tracker, other, true),
+                }
+            }
+        }
+        Ok(tracker.analysis)
+    }
+
+    pub fn execute_command_lists(
+        &mut self,
+        _queue: CommandQueueId,
+        lists: &[ImmutableCommandStream],
+        signal_fence: Option<(FenceId, u64)>,
+    ) -> AppResult<MetalCommandBufferPlan> {
+        let snapshot = TranslationSnapshot::from_backend(self);
+        let mut plan = ExecutionPlanState::new();
+
+        for stream in lists {
+            let pipeline = snapshot.pipeline_for_stream(stream.id)?;
+            for command in &stream.commands {
+                let translated = snapshot.translate_command(command, &pipeline)?;
+                self.translation_stats.get_mut().commands_translated +=
+                    translated.source_command_count();
+                self.apply_translated_command(&translated, &mut plan)?;
+            }
+        }
+        self.finish_execution_plan(plan, signal_fence)
+    }
+
+    /// Execute command streams using parallel translation for independent
+    /// streams. The translated commands are applied in submission order by the
+    /// same code path as [`execute_command_lists`](Self::execute_command_lists),
+    /// so the resulting plan and resource contents are identical.
+    pub fn execute_command_lists_parallel(
+        &mut self,
+        _queue: CommandQueueId,
+        lists: &[ImmutableCommandStream],
+        signal_fence: Option<(FenceId, u64)>,
+    ) -> AppResult<MetalCommandBufferPlan> {
+        let streams = self.translate_streams_parallel(lists)?;
+        let mut plan = ExecutionPlanState::new();
+        for stream in &streams {
+            for command in &stream.commands {
+                self.apply_translated_command(command, &mut plan)?;
+            }
+        }
+        self.finish_execution_plan(plan, signal_fence)
     }
 
     pub fn create_fence(&mut self, initial_value: u64) -> FenceId {
@@ -3132,6 +4148,98 @@ impl GraphicsBackend {
         }
         resource.bytes[..bytes.len()].copy_from_slice(bytes);
         Ok(())
+    }
+
+    /// Overwrite a resource from bytes whose storage is already owned by the
+    /// caller.
+    ///
+    /// When the incoming buffer is exactly the resource size it is *moved*
+    /// into the resource record — no element is copied — which is the
+    /// zero-copy path for updates whose host-visible pixels/mapped memory
+    /// already exist. The returned [`ResourceUpdatePath`] records whether the
+    /// destination is host-visible (no staging required on a real device) or
+    /// device-private (a staged upload) and the per-instance counters are
+    /// updated accordingly.
+    pub fn overwrite_resource_bytes_owned(
+        &mut self,
+        resource: ResourceId,
+        bytes: Vec<u8>,
+    ) -> AppResult<ResourceUpdatePath> {
+        let record = self.resource_mut(resource)?;
+        if bytes.len() > record.bytes.len() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "resource write out of bounds",
+            ));
+        }
+        let path = if record.storage_mode == MetalStorageMode::Shared {
+            ResourceUpdatePath::HostVisibleInPlace
+        } else {
+            ResourceUpdatePath::StagedUpload
+        };
+        if bytes.len() == record.bytes.len() {
+            record.bytes = bytes;
+        } else {
+            record.bytes[..bytes.len()].copy_from_slice(&bytes);
+        }
+        self.record_update_path(path);
+        Ok(path)
+    }
+
+    /// Write a region of a resource, classifying the update path by the
+    /// resource's storage mode.
+    ///
+    /// A `Shared` resource is host-visible on Metal: the bytes are written
+    /// directly into the existing host mapping and no staging buffer is
+    /// needed (counted as `zero_copy_updates`). A device-private resource
+    /// would require a staging upload (counted as `staged_copies`) even though
+    /// this CPU-side emulation writes the shadow storage in place.
+    pub fn update_resource_region(
+        &mut self,
+        resource: ResourceId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> AppResult<ResourceUpdatePath> {
+        let path = {
+            let record = self.resource(resource)?;
+            if record.storage_mode == MetalStorageMode::Shared {
+                ResourceUpdatePath::HostVisibleInPlace
+            } else {
+                ResourceUpdatePath::StagedUpload
+            }
+        };
+        self.write_resource_bytes(resource, offset, bytes)?;
+        self.record_update_path(path);
+        Ok(path)
+    }
+
+    /// Overwrite a resource from host-visible memory (mapped pixels or an
+    /// upload buffer), classifying the update path. See
+    /// [`update_resource_region`](Self::update_resource_region).
+    pub fn overwrite_resource_host_visible(
+        &mut self,
+        resource: ResourceId,
+        bytes: &[u8],
+    ) -> AppResult<ResourceUpdatePath> {
+        let path = {
+            let record = self.resource(resource)?;
+            if record.storage_mode == MetalStorageMode::Shared {
+                ResourceUpdatePath::HostVisibleInPlace
+            } else {
+                ResourceUpdatePath::StagedUpload
+            }
+        };
+        self.overwrite_resource_bytes(resource, bytes)?;
+        self.record_update_path(path);
+        Ok(path)
+    }
+
+    fn record_update_path(&mut self, path: ResourceUpdatePath) {
+        let stats = self.translation_stats.get_mut();
+        match path {
+            ResourceUpdatePath::HostVisibleInPlace => stats.zero_copy_updates += 1,
+            ResourceUpdatePath::StagedUpload => stats.staged_copies += 1,
+        }
     }
 
     pub fn readback(
@@ -4501,5 +5609,501 @@ mod tests {
         let state = backend.swapchain_state(swapchain).expect("swapchain state");
 
         assert_eq!(state.max_frame_latency, 3);
+    }
+
+    fn parallel_test_resource(
+        backend: &mut GraphicsBackend,
+        name: &str,
+        state: ResourceState,
+    ) -> ResourceId {
+        backend
+            .create_resource(ResourceDesc {
+                name: name.to_string(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                heap: HeapType::Default,
+                size: 64,
+                subresources: 1,
+                initial_state: state,
+                usage_hint: ResourceUsageHint::Generic,
+            })
+            .expect("create resource")
+    }
+
+    #[test]
+    fn parallel_translation_matches_serial_and_keeps_dependent_streams_ordered() {
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
+        let format = DxgiFormat::R8G8B8A8Unorm;
+        let resource_a = parallel_test_resource(&mut backend, "parallel-a", ResourceState::Common);
+        let resource_b = parallel_test_resource(&mut backend, "parallel-b", ResourceState::Common);
+        let heap_a = backend.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        backend
+            .write_descriptor(
+                heap_a,
+                0,
+                ViewDescriptor::Rtv {
+                    resource: resource_a,
+                    format,
+                },
+            )
+            .expect("write rtv a");
+        let heap_b = backend.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        backend
+            .write_descriptor(
+                heap_b,
+                0,
+                ViewDescriptor::Rtv {
+                    resource: resource_b,
+                    format,
+                },
+            )
+            .expect("write rtv b");
+        let allocator = backend.create_command_allocator();
+        let root_signature = backend.create_root_signature(RootSignatureDesc::default());
+        let pipeline = backend.create_pipeline_state(
+            root_signature,
+            PipelineStateDesc {
+                label: "parallel".to_string(),
+                compute: false,
+                render_target_formats: vec![format],
+                depth_format: None,
+            },
+        );
+
+        let mut streams = Vec::new();
+        for (heap, draws) in [(heap_a, 3u32), (heap_b, 3u32), (heap_a, 6u32)] {
+            let list = backend.create_graphics_command_list(allocator, pipeline, false);
+            backend
+                .record_begin_render_pass(list, vec![format], None, "clear", "store")
+                .expect("begin pass");
+            backend.record_clear_rtv(list, heap, 0).expect("clear rtv");
+            backend.record_draw(list, draws).expect("draw");
+            streams.push(backend.close_command_list(list).expect("close list"));
+        }
+
+        let serial_translation = backend
+            .translate_command_streams(&streams)
+            .expect("serial translation");
+        backend.reset_translation_stats();
+        let parallel_translation = backend
+            .translate_streams_parallel(&streams)
+            .expect("parallel translation");
+
+        assert_eq!(parallel_translation.len(), 3);
+        for (serial, parallel) in serial_translation.iter().zip(&parallel_translation) {
+            assert_eq!(serial.id, parallel.id);
+            assert_eq!(
+                serial.commands, parallel.commands,
+                "parallel translation must be byte-identical to serial translation"
+            );
+        }
+        // Streams 0 and 1 touch disjoint resources and share a batch; stream 2
+        // touches resource_a and therefore depends on stream 0.
+        assert_eq!(parallel_translation[2].depends_on, vec![0]);
+        assert_eq!(parallel_translation[0].batch_index, 0);
+        assert_eq!(parallel_translation[1].batch_index, 0);
+        assert_eq!(parallel_translation[2].batch_index, 1);
+        assert!(parallel_translation[0].parallel);
+        assert!(parallel_translation[1].parallel);
+        assert!(
+            !parallel_translation[2].parallel,
+            "dependent stream stays ordered"
+        );
+
+        let stats = backend.translation_stats();
+        assert_eq!(stats.parallel_translation_batches, 1);
+        assert_eq!(stats.streams_translated_in_parallel, 2);
+        assert_eq!(stats.streams_translated_serially, 1);
+        assert_eq!(stats.commands_translated, 9);
+
+        // The same streams executed serially and in parallel produce the same
+        // plan and the same resource contents.
+        let mut serial_backend = backend.clone();
+        let mut parallel_backend = backend.clone();
+        let serial_fence = serial_backend.create_fence(0);
+        let plan_serial = serial_backend
+            .execute_command_lists(0, &streams, Some((serial_fence, 1)))
+            .expect("serial execution");
+        let parallel_fence = parallel_backend.create_fence(0);
+        let plan_parallel = parallel_backend
+            .execute_command_lists_parallel(0, &streams, Some((parallel_fence, 1)))
+            .expect("parallel execution");
+
+        assert_eq!(plan_serial, plan_parallel);
+        assert_eq!(plan_serial.render_passes.len(), 3);
+        let draws: u32 = plan_serial
+            .render_passes
+            .iter()
+            .map(|pass| pass.draw_calls)
+            .sum();
+        assert_eq!(draws, 3);
+        assert_eq!(serial_backend.fence_value(serial_fence).expect("fence"), 1);
+        assert_eq!(
+            parallel_backend.fence_value(parallel_fence).expect("fence"),
+            1
+        );
+    }
+
+    #[test]
+    fn hazard_free_stream_elides_redundant_transition_and_keeps_pass_intact() {
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
+        let format = DxgiFormat::R8G8B8A8Unorm;
+        let resource = parallel_test_resource(
+            &mut backend,
+            "elide-safe",
+            ResourceState::PixelShaderResource,
+        );
+        let heap = backend.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        backend
+            .write_descriptor(heap, 0, ViewDescriptor::Rtv { resource, format })
+            .expect("write rtv");
+        let allocator = backend.create_command_allocator();
+        let root_signature = backend.create_root_signature(RootSignatureDesc::default());
+        let pipeline = backend.create_pipeline_state(
+            root_signature,
+            PipelineStateDesc {
+                label: "elide-safe".to_string(),
+                compute: false,
+                render_target_formats: vec![format],
+                depth_format: None,
+            },
+        );
+        let list = backend.create_graphics_command_list(allocator, pipeline, false);
+        backend
+            .record_begin_render_pass(list, vec![format], None, "clear", "store")
+            .expect("begin pass");
+        backend.record_clear_rtv(list, heap, 0).expect("clear");
+        // A transition to the state the subresource is already in: provably
+        // redundant, so it must be elided and must not split the render pass.
+        backend
+            .record_transition(
+                list,
+                resource,
+                0,
+                ResourceState::PixelShaderResource,
+                ResourceState::PixelShaderResource,
+            )
+            .expect("record no-op transition");
+        backend.record_draw(list, 3).expect("draw");
+        let stream = backend.close_command_list(list).expect("close");
+
+        let analysis = backend
+            .analyze_barriers(&[stream.clone()])
+            .expect("analysis");
+        assert_eq!(analysis.transitions_considered, 1);
+        assert_eq!(analysis.transitions_required, 0);
+        assert_eq!(analysis.transitions_elided, 1);
+        assert_eq!(analysis.barriers_elided, 1);
+
+        backend.reset_translation_stats();
+        let plan = backend
+            .execute_command_lists(0, &[stream], None)
+            .expect("execute");
+        assert_eq!(plan.render_passes.len(), 1);
+        assert_eq!(plan.render_passes[0].draw_calls, 1);
+        assert!(plan.validation_errors.is_empty());
+        let stats = backend.translation_stats();
+        assert_eq!(stats.barriers_required, 0);
+        assert_eq!(stats.barriers_elided, 1);
+    }
+
+    #[test]
+    fn hazardous_stream_keeps_required_transition_and_splits_pass() {
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
+        let format = DxgiFormat::R8G8B8A8Unorm;
+        let resource = parallel_test_resource(
+            &mut backend,
+            "elide-unsafe",
+            ResourceState::PixelShaderResource,
+        );
+        let heap = backend.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        backend
+            .write_descriptor(heap, 0, ViewDescriptor::Rtv { resource, format })
+            .expect("write rtv");
+        let allocator = backend.create_command_allocator();
+        let root_signature = backend.create_root_signature(RootSignatureDesc::default());
+        let pipeline = backend.create_pipeline_state(
+            root_signature,
+            PipelineStateDesc {
+                label: "elide-unsafe".to_string(),
+                compute: false,
+                render_target_formats: vec![format],
+                depth_format: None,
+            },
+        );
+        let list = backend.create_graphics_command_list(allocator, pipeline, false);
+        backend
+            .record_begin_render_pass(list, vec![format], None, "clear", "store")
+            .expect("begin pass");
+        backend.record_clear_rtv(list, heap, 0).expect("clear");
+        // A real state change is a true hazard and must never be elided.
+        backend
+            .record_transition(
+                list,
+                resource,
+                0,
+                ResourceState::PixelShaderResource,
+                ResourceState::CopySource,
+            )
+            .expect("record transition");
+        backend
+            .record_begin_render_pass(list, vec![format], None, "load", "store")
+            .expect("second pass");
+        backend.record_draw(list, 3).expect("draw");
+        let stream = backend.close_command_list(list).expect("close");
+
+        let analysis = backend
+            .analyze_barriers(&[stream.clone()])
+            .expect("analysis");
+        assert_eq!(analysis.transitions_considered, 1);
+        assert_eq!(analysis.transitions_required, 1);
+        assert_eq!(analysis.transitions_elided, 0);
+        assert_eq!(analysis.barriers_elided, 0);
+
+        backend.reset_translation_stats();
+        let plan = backend
+            .execute_command_lists(0, &[stream], None)
+            .expect("execute");
+        // The required barrier ends the first pass, so the second pass carries
+        // the draw exactly as it did before elision existed.
+        assert_eq!(plan.render_passes.len(), 2);
+        assert_eq!(plan.render_passes[0].draw_calls, 0);
+        assert_eq!(plan.render_passes[1].draw_calls, 1);
+        let stats = backend.translation_stats();
+        assert_eq!(stats.barriers_required, 1);
+        assert_eq!(stats.barriers_elided, 0);
+    }
+
+    #[test]
+    fn duplicate_uav_and_aliasing_barriers_are_elided_only_when_no_work_intervenes() {
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
+        let resource_a = parallel_test_resource(&mut backend, "uav-a", ResourceState::Common);
+        let resource_b = parallel_test_resource(&mut backend, "uav-b", ResourceState::Common);
+        let allocator = backend.create_command_allocator();
+        let root_signature = backend.create_root_signature(RootSignatureDesc::default());
+        let pipeline = backend.create_pipeline_state(
+            root_signature,
+            PipelineStateDesc {
+                label: "barriers".to_string(),
+                compute: true,
+                render_target_formats: Vec::new(),
+                depth_format: None,
+            },
+        );
+
+        let clean = backend.create_graphics_command_list(allocator, pipeline, false);
+        backend
+            .record_uav_barrier(clean, resource_a)
+            .expect("first uav barrier");
+        backend
+            .record_uav_barrier(clean, resource_a)
+            .expect("second uav barrier");
+        backend
+            .record_aliasing_barrier(clean, Some(resource_a), Some(resource_b))
+            .expect("first aliasing barrier");
+        backend
+            .record_aliasing_barrier(clean, Some(resource_a), Some(resource_b))
+            .expect("second aliasing barrier");
+        let clean = backend.close_command_list(clean).expect("close clean");
+        let analysis = backend
+            .analyze_barriers(&[clean.clone()])
+            .expect("analysis");
+        assert_eq!(analysis.uav_barriers_considered, 2);
+        assert_eq!(analysis.uav_barriers_required, 1);
+        assert_eq!(analysis.uav_barriers_elided, 1);
+        assert_eq!(analysis.aliasing_barriers_considered, 2);
+        assert_eq!(analysis.aliasing_barriers_required, 1);
+        assert_eq!(analysis.aliasing_barriers_elided, 1);
+
+        // A write-capable command between the barriers makes the second pair
+        // hazardous, so nothing may be elided.
+        let hazardous = backend.create_graphics_command_list(allocator, pipeline, false);
+        backend
+            .record_uav_barrier(hazardous, resource_a)
+            .expect("first uav barrier");
+        backend
+            .record_copy_buffer_region(hazardous, resource_a, 0, resource_b, 0, 8)
+            .expect("copy into a");
+        backend
+            .record_uav_barrier(hazardous, resource_a)
+            .expect("second uav barrier");
+        backend
+            .record_aliasing_barrier(hazardous, Some(resource_a), Some(resource_b))
+            .expect("first aliasing barrier");
+        backend
+            .record_dispatch(hazardous, 1, 1, 1)
+            .expect("dispatch");
+        backend
+            .record_aliasing_barrier(hazardous, Some(resource_a), Some(resource_b))
+            .expect("second aliasing barrier");
+        let hazardous = backend
+            .close_command_list(hazardous)
+            .expect("close hazardous");
+        let analysis = backend.analyze_barriers(&[hazardous]).expect("analysis");
+        assert_eq!(analysis.uav_barriers_required, 2);
+        assert_eq!(analysis.uav_barriers_elided, 0);
+        assert_eq!(analysis.aliasing_barriers_required, 2);
+        assert_eq!(analysis.aliasing_barriers_elided, 0);
+    }
+
+    #[test]
+    fn zero_copy_updates_write_host_visible_resources_without_staging() {
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
+        let upload = backend
+            .create_resource(ResourceDesc {
+                name: "host-visible".to_string(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                heap: HeapType::Upload,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::GenericRead,
+                usage_hint: ResourceUsageHint::Generic,
+            })
+            .expect("create upload resource");
+        assert_eq!(
+            backend.resource_storage_mode(upload).expect("storage"),
+            MetalStorageMode::Shared
+        );
+
+        let path = backend
+            .update_resource_region(upload, 4, &[1, 2, 3, 4])
+            .expect("host-visible update");
+        assert_eq!(path, ResourceUpdatePath::HostVisibleInPlace);
+        assert_eq!(
+            &backend.resource(upload).expect("resource").bytes[4..8],
+            &[1, 2, 3, 4]
+        );
+        let stats = backend.translation_stats();
+        assert_eq!(stats.zero_copy_updates, 1);
+        assert_eq!(stats.staged_copies, 0);
+
+        let owned = vec![9u8; 64];
+        let path = backend
+            .overwrite_resource_bytes_owned(upload, owned.clone())
+            .expect("owned overwrite");
+        assert_eq!(path, ResourceUpdatePath::HostVisibleInPlace);
+        assert_eq!(backend.resource(upload).expect("resource").bytes, owned);
+        assert_eq!(backend.translation_stats().zero_copy_updates, 2);
+
+        let private = backend
+            .create_resource(ResourceDesc {
+                name: "device-private".to_string(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                heap: HeapType::Default,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Generic,
+            })
+            .expect("create private resource");
+        assert_eq!(
+            backend.resource_storage_mode(private).expect("storage"),
+            MetalStorageMode::Private
+        );
+        let path = backend
+            .overwrite_resource_bytes_owned(private, vec![7u8; 64])
+            .expect("private overwrite");
+        assert_eq!(path, ResourceUpdatePath::StagedUpload);
+        assert_eq!(
+            backend.resource(private).expect("resource").bytes,
+            vec![7u8; 64]
+        );
+        let stats = backend.translation_stats();
+        assert_eq!(stats.zero_copy_updates, 2);
+        assert_eq!(stats.staged_copies, 1);
+    }
+
+    #[test]
+    fn descriptor_table_batching_reuses_unchanged_tables() {
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
+        let format = DxgiFormat::R8G8B8A8Unorm;
+        let resource_a = parallel_test_resource(&mut backend, "table-a", ResourceState::Common);
+        let resource_b = parallel_test_resource(&mut backend, "table-b", ResourceState::Common);
+        let heap_a = backend.create_descriptor_heap(DescriptorHeapType::CbvSrvUav, 2);
+        backend
+            .write_descriptor(
+                heap_a,
+                0,
+                ViewDescriptor::Srv {
+                    resource: resource_a,
+                    format,
+                },
+            )
+            .expect("srv");
+        backend
+            .write_descriptor(
+                heap_a,
+                1,
+                ViewDescriptor::Cbv {
+                    resource: resource_a,
+                    size: 16,
+                },
+            )
+            .expect("cbv");
+        let heap_b = backend.create_descriptor_heap(DescriptorHeapType::CbvSrvUav, 1);
+        backend
+            .write_descriptor(
+                heap_b,
+                0,
+                ViewDescriptor::Srv {
+                    resource: resource_b,
+                    format,
+                },
+            )
+            .expect("srv b");
+
+        let first = backend
+            .translate_descriptor_tables(&[heap_a, heap_b])
+            .expect("first batch");
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].len(), 2);
+        assert_eq!(first[1].len(), 1);
+        let stats = backend.translation_stats();
+        assert_eq!(stats.descriptor_table_batches, 1);
+        assert_eq!(stats.descriptor_table_uploads, 2);
+        assert_eq!(stats.descriptor_table_reuses, 0);
+
+        let second = backend
+            .translate_descriptor_tables(&[heap_a, heap_b])
+            .expect("second batch");
+        assert_eq!(second, first, "unchanged tables must reuse cached bindings");
+        let stats = backend.translation_stats();
+        assert_eq!(stats.descriptor_table_batches, 2);
+        assert_eq!(stats.descriptor_table_uploads, 2);
+        assert_eq!(stats.descriptor_table_reuses, 2);
+
+        backend
+            .write_descriptor(
+                heap_a,
+                0,
+                ViewDescriptor::Uav {
+                    resource: resource_a,
+                    format,
+                },
+            )
+            .expect("change descriptor");
+        let third = backend
+            .translate_descriptor_tables(&[heap_a, heap_b])
+            .expect("third batch");
+        assert_ne!(third[0], first[0], "changed table must be retranslated");
+        assert_eq!(third[1], first[1], "unchanged table still reuses cache");
+        let stats = backend.translation_stats();
+        assert_eq!(stats.descriptor_table_batches, 3);
+        assert_eq!(stats.descriptor_table_uploads, 3);
+        assert_eq!(stats.descriptor_table_reuses, 3);
+
+        let before = backend.translation_stats().descriptor_table_reuses;
+        backend
+            .translate_descriptor_heap(heap_b)
+            .expect("single heap translate");
+        assert_eq!(
+            backend.translation_stats().descriptor_table_reuses,
+            before + 1
+        );
     }
 }

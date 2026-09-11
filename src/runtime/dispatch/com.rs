@@ -34,10 +34,13 @@ const CLR_E_SHIM_RUNTIMELOAD: u32 = 0x8013_1701;
 const STG_E_INVALIDFUNCTION: u32 = 0x8003_0001;
 #[allow(dead_code)] // reserved for the COM surface
 const MK_E_SYNTAX: u32 = 0x8004_01E4;
+const MK_E_NOOBJECT: u32 = 0x8004_01E5;
+const MK_E_REDUCED_TO_SELF: u32 = 0x8004_0109;
 #[allow(dead_code)] // reserved for the COM surface
 const CO_E_RELEASED: u32 = 0x8004_0006;
-#[allow(dead_code)] // reserved for the COM surface
-const DISP_E_PARAMNOTFOUND: u32 = 0x8002_0005;
+const DISP_E_PARAMNOTFOUND: u32 = 0x8002_0004;
+const DISP_E_TYPEMISMATCH: u32 = 0x8002_0005;
+const DISP_E_MEMBERNOTFOUND: u32 = 0x8002_0003;
 #[allow(dead_code)] // reserved for the COM surface
 const DISP_E_UNKNOWNNAME: u32 = 0x8002_0006;
 #[allow(dead_code)] // reserved for the COM surface
@@ -1039,7 +1042,7 @@ impl PeHostRuntime {
         let c_args = read_guest_u32(memory, dispparams).unwrap_or(0);
         let rgvarg = read_guest_pointer(memory, dispparams + 8, self.guest_arch).unwrap_or(0);
         if position >= c_args || rgvarg == 0 {
-            state.set(Register::Rax, 0x8002_0004); // DISP_E_PARAMNOTFOUND
+            state.set(Register::Rax, u64::from(DISP_E_PARAMNOTFOUND));
             return Ok(());
         }
         // rgvarg[0] is the LAST argument; position 0 is the rightmost.
@@ -1087,43 +1090,67 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `DispGetIDsOfNames` — no typeinfo is registered: every name is
-    /// unknown.
+    /// `DispGetIDsOfNames(pdisp, rgszNames, cNames, lcid, rgdispid)` — the
+    /// OLEAUT32 helper routes into the target object's real registered
+    /// dispatch table (the same per-interface DISPID assignment the IDispatch
+    /// vtable methods use).
     pub(crate) fn dispatch_ole_disp_get_ids_of_names(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _dispatch = guest_call_arg(state, memory, 0)?;
-        let _riid = guest_call_arg(state, memory, 1)?;
-        let _names = guest_call_arg(state, memory, 2)?;
-        let count = guest_call_arg_u32(state, memory, 3)?;
+        let dispatch = guest_call_arg(state, memory, 0)?;
+        let names = guest_call_arg(state, memory, 1)?;
+        let count = guest_call_arg_u32(state, memory, 2)?;
+        let lcid = guest_call_arg_u32(state, memory, 3)?;
         let ids = guest_call_arg(state, memory, 4)?;
-        let _flags = guest_call_arg_u32(state, memory, 5)?;
-        for i in 0..count {
-            write_guest_u32(memory, ids + (i as u64 * 4), 0xffff_ffff).ok();
-        }
-        state.set(Register::Rax, 0x8002_0006); // DISP_E_UNKNOWNNAME
+        let hr = self.com_get_ids_of_names(memory, dispatch, names, count, lcid, ids)?;
+        state.set(Register::Rax, u64::from(hr));
         Ok(())
     }
 
-    /// `DispInvoke` — no members are registered.
+    /// `DispInvoke(pvInstance, ptinfo, dispidMember, wFlags, pdispparams,
+    /// pvarResult, pexcepinfo, puArgErr)` — invoke through the registered
+    /// method table, using the ITypeInfo's owner when the instance is NULL
+    /// (the exact DispInvoke contract).
     pub(crate) fn dispatch_ole_disp_invoke(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _dispatch = guest_call_arg(state, memory, 0)?;
-        let _dispid = guest_call_arg_u32(state, memory, 1)?;
-        let _riid = guest_call_arg(state, memory, 2)?;
-        let _lcid = guest_call_arg_u32(state, memory, 3)?;
-        let _flags = guest_call_arg_u32(state, memory, 4)?;
-        let _params = guest_call_arg(state, memory, 5)?;
-        let result = guest_call_arg(state, memory, 6)?;
-        if result != 0 {
-            write_guest_u32(memory, result, 0).ok();
+        let instance = guest_call_arg(state, memory, 0)?;
+        let type_info = guest_call_arg(state, memory, 1)?;
+        let dispid = self.com_arg_i32(state, memory, 2);
+        let flags = guest_call_arg_u32(state, memory, 3)? as u16;
+        let params = guest_call_arg(state, memory, 4)?;
+        let result = guest_call_arg(state, memory, 5)?;
+        let _exception = guest_call_arg(state, memory, 6)?;
+        let argument_error = guest_call_arg(state, memory, 7)?;
+        let target = match self.com_type_infos.get(&type_info) {
+            Some(info) => {
+                if instance != 0 {
+                    instance
+                } else {
+                    info.owner
+                }
+            }
+            None => instance,
+        };
+        if target == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
         }
-        state.set(Register::Rax, 0x8002_0003); // DISP_E_MEMBERNOTFOUND
+        let hr = self.invoke_automation_member(
+            state,
+            memory,
+            target,
+            dispid,
+            flags,
+            params,
+            result,
+            argument_error,
+        )?;
+        state.set(Register::Rax, u64::from(hr));
         Ok(())
     }
 
@@ -1264,19 +1291,15 @@ impl PeHostRuntime {
         self.com_marshal_next_oid = self.com_marshal_next_oid.wrapping_add(1);
         self.com_marshal_records
             .insert(oid, (Self::guid_bytes_to_string(&iid), object));
-        // The stream object itself: a guest COM stream with the marshal
-        // record's oid as its payload handle.
-        let stream = self.alloc_guest_object(memory, GuestObjectKind::ComStream, 0);
-        let stream = stream.unwrap_or(0);
-        if stream != 0 {
-            self.com_streams.insert(
-                stream,
-                crate::runtime::state::ComStreamState {
-                    data: oid.to_le_bytes().to_vec(),
-                    position: 0,
-                },
-            );
-        }
+        // The stream object itself: a real guest IStream whose payload is
+        // the marshal record's oid (the interface pointer is resolved by
+        // CoGetInterfaceAndReleaseStream).
+        let stream = self.alloc_com_stream_object(
+            memory,
+            oid.to_le_bytes().to_vec(),
+            "CoMarshalInterThreadInterfaceInStream",
+            None,
+        )?;
         write_guest_pointer(memory, out, stream, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -1299,6 +1322,11 @@ impl PeHostRuntime {
             }
         }
         self.com_streams.remove(&stream);
+        // The marshal stream is consumed by the call: release the guest
+        // object (dropping its last reference tears down the stream state).
+        if self.guest_objects.contains_key(&stream) {
+            let _ = self.release_guest_object(stream);
+        }
         if out != 0 {
             write_guest_pointer(memory, out, object, self.guest_arch).ok();
         }
@@ -1330,37 +1358,8 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `MkParseDisplayName(pbc, szUserName, pchEaten, ppmk)` — parses
-    /// `file:...` monikers into a moniker object.
-    pub(crate) fn dispatch_com_mk_parse_display_name(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let name_ptr = guest_call_arg(state, memory, 1)?;
-        let eaten_out = guest_call_arg(state, memory, 2)?;
-        let out = guest_call_arg(state, memory, 3)?;
-        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
-            state.set(Register::Rax, u64::from(MK_E_SYNTAX));
-            return Ok(());
-        };
-        let moniker = self
-            .alloc_guest_object(memory, GuestObjectKind::ComFileMoniker, 0)
-            .unwrap_or(0);
-        if moniker == 0 {
-            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
-            return Ok(());
-        }
-        self.com_moniker_names.insert(moniker, name.clone());
-        if eaten_out != 0 {
-            write_u32(memory, eaten_out, name.encode_utf16().count() as u32);
-        }
-        if out != 0 {
-            write_guest_pointer(memory, out, moniker, self.guest_arch).ok();
-        }
-        state.set(Register::Rax, u64::from(S_OK));
-        Ok(())
-    }
+    // MkParseDisplayName lives with the moniker implementation below (the
+    // real scheme/ProgID/path parsing and bind behavior).
 
     // ── OLE misc ────────────────────────────────────────────────────────────
 
@@ -1868,6 +1867,3815 @@ impl PeHostRuntime {
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
+
+    // ── The COM interface method surface (vtable thunks) ────────────────────
+
+    /// Dispatch one method of a runtime COM interface vtable.  Every object
+    /// built by the `alloc_com_*` allocators carries these thunks; `this`
+    /// (argument 0) identifies the guest object and its state map.
+    pub(crate) fn dispatch_com_method(
+        &mut self,
+        method: ComMethod,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        match method {
+            ComMethod::QueryInterface => self.com_query_interface_method(state, memory),
+            // IStream / ISequentialStream
+            ComMethod::StreamRead => self.com_stream_read(state, memory),
+            ComMethod::StreamWrite => self.com_stream_write(state, memory),
+            ComMethod::StreamSeek => self.com_stream_seek(state, memory),
+            ComMethod::StreamSetSize => self.com_stream_set_size(state, memory),
+            ComMethod::StreamCopyTo => self.com_stream_copy_to(state, memory),
+            ComMethod::StreamCommit => self.com_stream_commit(state, memory),
+            ComMethod::StreamRevert => self.com_stream_revert(state, memory),
+            ComMethod::StreamLockRegion => self.com_stream_lock_region(state, memory),
+            ComMethod::StreamUnlockRegion => self.com_stream_unlock_region(state, memory),
+            ComMethod::StreamStat => self.com_stream_stat(state, memory),
+            ComMethod::StreamClone => self.com_stream_clone(state, memory),
+            // IStorage
+            ComMethod::StorageCreateStream => self.com_storage_create_stream(state, memory),
+            ComMethod::StorageOpenStream => self.com_storage_open_stream(state, memory),
+            ComMethod::StorageCreateStorage => self.com_storage_create_storage(state, memory),
+            ComMethod::StorageOpenStorage => self.com_storage_open_storage(state, memory),
+            ComMethod::StorageCopyTo => self.com_storage_copy_to(state, memory),
+            ComMethod::StorageMoveElement => self.com_storage_move_element(state, memory),
+            ComMethod::StorageCommit => self.com_storage_commit(state, memory),
+            ComMethod::StorageRevert => self.com_storage_revert(state, memory),
+            ComMethod::StorageEnumElements => self.com_storage_enum_elements(state, memory),
+            ComMethod::StorageDestroyElement => self.com_storage_destroy_element(state, memory),
+            ComMethod::StorageRenameElement => self.com_storage_rename_element(state, memory),
+            ComMethod::StorageSetElementTimes => self.com_storage_set_element_times(state, memory),
+            ComMethod::StorageSetClass => self.com_storage_set_class(state, memory),
+            ComMethod::StorageSetStateBits => self.com_storage_set_state_bits(state, memory),
+            ComMethod::StorageStat => self.com_storage_stat(state, memory),
+            // IConnectionPointContainer
+            ComMethod::EnumConnectionPoints => {
+                self.com_container_enum_connection_points(state, memory)
+            }
+            ComMethod::FindConnectionPoint => {
+                self.com_container_find_connection_point(state, memory)
+            }
+            // IConnectionPoint
+            ComMethod::GetConnectionInterface => {
+                self.com_connection_point_get_interface(state, memory)
+            }
+            ComMethod::GetConnectionPointContainer => {
+                self.com_connection_point_get_container(state, memory)
+            }
+            ComMethod::Advise => self.com_connection_point_advise(state, memory),
+            ComMethod::Unadvise => self.com_connection_point_unadvise(state, memory),
+            ComMethod::EnumConnections => self.com_connection_point_enum_connections(state, memory),
+            // IEnum{ConnectionPoints,Connections} and IEnumSTATSTG share the
+            // snapshot-enumerator implementation.
+            ComMethod::EnumNext => self.com_enum_next(state, memory),
+            ComMethod::EnumSkip => self.com_enum_skip(state, memory),
+            ComMethod::EnumReset => self.com_enum_reset(state, memory),
+            ComMethod::EnumClone => self.com_enum_clone(state, memory),
+            // IDispatch
+            ComMethod::DispatchGetTypeInfoCount => {
+                self.com_dispatch_get_type_info_count(state, memory)
+            }
+            ComMethod::DispatchGetTypeInfo => self.com_dispatch_get_type_info(state, memory),
+            ComMethod::DispatchGetIDsOfNames => {
+                self.com_dispatch_get_ids_of_names_impl(state, memory)
+            }
+            ComMethod::DispatchInvoke => self.com_dispatch_invoke_impl(state, memory),
+            // ITypeInfo
+            ComMethod::TypeInfoGetTypeAttr => self.com_type_info_get_type_attr(state, memory),
+            ComMethod::TypeInfoGetFuncDesc => self.com_type_info_get_func_desc(state, memory),
+            ComMethod::TypeInfoGetVarDesc => self.com_type_info_get_var_desc(state, memory),
+            ComMethod::TypeInfoGetNames => self.com_type_info_get_names(state, memory),
+            ComMethod::TypeInfoGetIDsOfNames => self.com_type_info_get_ids_of_names(state, memory),
+            ComMethod::TypeInfoInvoke => self.com_type_info_invoke(state, memory),
+            ComMethod::TypeInfoGetDocumentation => {
+                self.com_type_info_get_documentation(state, memory)
+            }
+            ComMethod::TypeInfoReleaseTypeAttr
+            | ComMethod::TypeInfoReleaseFuncDesc
+            | ComMethod::TypeInfoReleaseVarDesc => {
+                state.set(Register::Rax, u64::from(S_OK));
+                Ok(())
+            }
+            ComMethod::TypeInfoUnsupported => self.com_type_info_unsupported(state, memory),
+            // The automation server's dual interface.
+            ComMethod::ServerGetValue => self.com_server_get_value(state, memory),
+            ComMethod::ServerPutValue => self.com_server_put_value(state, memory),
+            ComMethod::ServerGetName => self.com_server_get_name(state, memory),
+            ComMethod::ServerPutName => self.com_server_put_name(state, memory),
+            ComMethod::ServerGetCount => self.com_server_get_count(state, memory),
+            ComMethod::ServerAdd => self.com_server_add(state, memory),
+            ComMethod::ServerReset => self.com_server_reset(state, memory),
+            ComMethod::ServerFireValueChanged => self.com_server_fire_value_changed(state, memory),
+            // The runtime's modeled event sink.
+            ComMethod::SinkInvoke => self.com_sink_invoke(state, memory),
+        }
+    }
+
+    /// Read one guest call argument as a signed i32.
+    fn com_arg_i32(&self, state: &CpuState, memory: &MemoryImage, index: usize) -> i32 {
+        guest_call_arg(state, memory, index).unwrap_or(0) as u32 as i32
+    }
+
+    /// Read one guest call argument as a signed 64-bit value: x86 stdcall
+    /// passes LARGE_INTEGER by value across two 4-byte stack slots; x64 uses
+    /// the register/stack convention.
+    fn com_arg_i64(&self, state: &CpuState, memory: &MemoryImage, index: usize) -> i64 {
+        match self.guest_arch {
+            GuestArch::X86 => memory
+                .read_u64(state.get(Register::Rsp) + (index as u64 * 4))
+                .unwrap_or(0) as i64,
+            GuestArch::X64 => match index {
+                0 => state.get(Register::Rcx) as i64,
+                1 => state.get(Register::Rdx) as i64,
+                2 => state.get(Register::R8) as i64,
+                3 => state.get(Register::R9) as i64,
+                _ => memory
+                    .read_u64(state.get(Register::Rsp) + 0x20 + ((index - 4) as u64 * 8))
+                    .unwrap_or(0) as i64,
+            },
+        }
+    }
+
+    fn com_variant_size(&self) -> u64 {
+        match self.guest_arch {
+            GuestArch::X86 => 16,
+            GuestArch::X64 => 24,
+        }
+    }
+
+    fn com_variant_data_offset(&self) -> u64 {
+        match self.guest_arch {
+            GuestArch::X86 => 8,
+            GuestArch::X64 => 16,
+        }
+    }
+
+    /// Allocate a guest BSTR (the CoTaskMem/SysAllocString layout) holding
+    /// `text` and return the data pointer.
+    pub(crate) fn alloc_com_bstr(
+        &mut self,
+        memory: &mut MemoryImage,
+        text: &str,
+    ) -> AppResult<u64> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let len = (units.len() * 2) as u32;
+        let base = self.alloc_heap(memory, units.len() * 2 + 2, false)?;
+        self.com_task_allocations.insert(base, units.len() * 2 + 2);
+        write_u32(memory, base, len + 2);
+        for (index, unit) in units.iter().enumerate() {
+            memory.write_u16(base + 4 + (index as u64 * 2), *unit);
+        }
+        memory.write_u16(base + 4 + (units.len() as u64 * 2), 0);
+        Ok(base + 4)
+    }
+
+    /// Write a VT_EMPTY guest VARIANT.
+    fn write_variant_empty(&self, memory: &mut MemoryImage, ptr: u64) {
+        if ptr == 0 {
+            return;
+        }
+        let size = self.com_variant_size() as usize;
+        let _ = memory.map_bytes(ptr, &vec![0_u8; size]);
+    }
+
+    fn write_variant_i4(&self, memory: &mut MemoryImage, ptr: u64, value: i32) {
+        self.write_variant_empty(memory, ptr);
+        memory.write_u16(ptr, 3); // VT_I4
+        memory.write_u32(ptr + self.com_variant_data_offset(), value as u32);
+    }
+
+    fn write_variant_bool(&self, memory: &mut MemoryImage, ptr: u64, value: bool) {
+        self.write_variant_empty(memory, ptr);
+        memory.write_u16(ptr, 11); // VT_BOOL
+        memory.write_u16(
+            ptr + self.com_variant_data_offset(),
+            if value { 0xffff } else { 0 },
+        );
+    }
+
+    fn write_variant_bstr(&self, memory: &mut MemoryImage, ptr: u64, bstr: u64) {
+        self.write_variant_empty(memory, ptr);
+        memory.write_u16(ptr, 8); // VT_BSTR
+        write_guest_pointer(
+            memory,
+            ptr + self.com_variant_data_offset(),
+            bstr,
+            self.guest_arch,
+        )
+        .ok();
+    }
+
+    fn write_variant_object(&self, memory: &mut MemoryImage, ptr: u64, object: u64) {
+        self.write_variant_empty(memory, ptr);
+        memory.write_u16(ptr, 9); // VT_DISPATCH
+        write_guest_pointer(
+            memory,
+            ptr + self.com_variant_data_offset(),
+            object,
+            self.guest_arch,
+        )
+        .ok();
+    }
+
+    fn write_variant_double(&self, memory: &mut MemoryImage, ptr: u64, value: f64) {
+        self.write_variant_empty(memory, ptr);
+        memory.write_u16(ptr, 5); // VT_R8
+        memory.write_u64(ptr + self.com_variant_data_offset(), value.to_bits());
+    }
+
+    fn write_variant_value(
+        &mut self,
+        memory: &mut MemoryImage,
+        ptr: u64,
+        value: &ComValue,
+    ) -> AppResult<()> {
+        if ptr == 0 {
+            return Ok(());
+        }
+        match value {
+            ComValue::Empty => self.write_variant_empty(memory, ptr),
+            ComValue::I4(number) => self.write_variant_i4(memory, ptr, *number),
+            ComValue::Bool(flag) => self.write_variant_bool(memory, ptr, *flag),
+            ComValue::Double(number) => self.write_variant_double(memory, ptr, *number),
+            ComValue::Bstr(text) => {
+                let bstr = self.alloc_com_bstr(memory, text)?;
+                self.write_variant_bstr(memory, ptr, bstr);
+            }
+            ComValue::Object(object) => self.write_variant_object(memory, ptr, *object),
+        }
+        Ok(())
+    }
+
+    /// Read a guest VARIANT into a typed `ComValue`; `None` for a VARIANT
+    /// type the automation surface does not model.
+    fn read_variant_value(
+        &mut self,
+        memory: &mut MemoryImage,
+        ptr: u64,
+    ) -> AppResult<Option<ComValue>> {
+        if ptr == 0 {
+            return Ok(None);
+        }
+        let vt = memory.read_u16(ptr).unwrap_or(0);
+        let offset = self.com_variant_data_offset();
+        Ok(match vt {
+            0 | 1 => Some(ComValue::Empty), // VT_EMPTY / VT_NULL
+            2 => Some(ComValue::I4(
+                memory.read_u16(ptr + offset).unwrap_or(0) as i16 as i32,
+            )), // VT_I2
+            3 | 22 => Some(ComValue::I4(
+                memory.read_u32(ptr + offset).unwrap_or(0) as i32
+            )), // VT_I4 / VT_INT
+            11 => Some(ComValue::Bool(
+                memory.read_u16(ptr + offset).unwrap_or(0) != 0,
+            )),
+            5 => Some(ComValue::Double(f64::from_bits(
+                memory.read_u64(ptr + offset).unwrap_or(0),
+            ))),
+            8 | 31 => {
+                let bstr = read_guest_pointer(memory, ptr + offset, self.guest_arch).unwrap_or(0);
+                Some(ComValue::Bstr(
+                    read_utf16_string(memory, bstr).unwrap_or_default(),
+                ))
+            }
+            9 | 13 => {
+                let object = read_guest_pointer(memory, ptr + offset, self.guest_arch).unwrap_or(0);
+                Some(ComValue::Object(object))
+            }
+            _ => None,
+        })
+    }
+
+    fn write_statstg(
+        &mut self,
+        memory: &mut MemoryImage,
+        ptr: u64,
+        name: &str,
+        kind: u32,
+        size: u64,
+        mode: u32,
+        locks_supported: u32,
+        clsid: Option<[u8; 16]>,
+    ) -> AppResult<()> {
+        if ptr == 0 {
+            return Ok(());
+        }
+        let name_ptr = if name.is_empty() {
+            0
+        } else {
+            self.alloc_utf16_string(memory, name)?
+        };
+        let ticks = guest_filetime_ticks(&self.win32);
+        match self.guest_arch {
+            GuestArch::X86 => {
+                memory.map_bytes(ptr, &[0_u8; 72]);
+                write_u32(memory, ptr, name_ptr as u32);
+                write_u32(memory, ptr + 4, kind);
+                write_u64(memory, ptr + 8, size);
+                write_u32(memory, ptr + 16, (ticks & 0xFFFF_FFFF) as u32);
+                write_u32(memory, ptr + 20, (ticks >> 32) as u32);
+                write_u32(memory, ptr + 24, (ticks & 0xFFFF_FFFF) as u32);
+                write_u32(memory, ptr + 28, (ticks >> 32) as u32);
+                write_u32(memory, ptr + 32, (ticks & 0xFFFF_FFFF) as u32);
+                write_u32(memory, ptr + 36, (ticks >> 32) as u32);
+                write_u32(memory, ptr + 40, mode);
+                write_u32(memory, ptr + 44, locks_supported);
+                if let Some(bytes) = clsid {
+                    for (index, byte) in bytes.iter().enumerate() {
+                        memory.write_u8(ptr + 48 + index as u64, *byte);
+                    }
+                }
+                write_u32(memory, ptr + 64, 0);
+                write_u32(memory, ptr + 68, 0);
+            }
+            GuestArch::X64 => {
+                memory.map_bytes(ptr, &[0_u8; 80]);
+                write_u64(memory, ptr, name_ptr);
+                write_u32(memory, ptr + 8, kind);
+                write_u64(memory, ptr + 16, size);
+                write_u32(memory, ptr + 24, (ticks & 0xFFFF_FFFF) as u32);
+                write_u32(memory, ptr + 28, (ticks >> 32) as u32);
+                write_u32(memory, ptr + 32, (ticks & 0xFFFF_FFFF) as u32);
+                write_u32(memory, ptr + 36, (ticks >> 32) as u32);
+                write_u32(memory, ptr + 40, (ticks & 0xFFFF_FFFF) as u32);
+                write_u32(memory, ptr + 44, (ticks >> 32) as u32);
+                write_u32(memory, ptr + 48, mode);
+                write_u32(memory, ptr + 52, locks_supported);
+                if let Some(bytes) = clsid {
+                    for (index, byte) in bytes.iter().enumerate() {
+                        memory.write_u8(ptr + 56 + index as u64, *byte);
+                    }
+                }
+                write_u32(memory, ptr + 72, 0);
+                write_u32(memory, ptr + 76, 0);
+            }
+        }
+        Ok(())
+    }
+
+    // ── IUnknown ────────────────────────────────────────────────────────────
+
+    fn com_query_interface_method(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let riid_ptr = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        if riid_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let iid: [u8; 16] =
+            std::array::from_fn(|index| memory.read_u8(riid_ptr + index as u64).unwrap_or(0));
+        let kind = self.guest_object_kind(this).ok();
+        let mut interface = 0_u64;
+        let mut supported = false;
+        if iid == COM_IID_IUNKNOWN {
+            supported = kind.is_some();
+            interface = this;
+        } else if let Some(kind) = kind {
+            supported = match kind {
+                GuestObjectKind::ComStream => {
+                    if iid == COM_IID_ISTREAM || iid == COM_IID_ISEQUENTIALSTREAM {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                GuestObjectKind::ComStorage => {
+                    if iid == COM_IID_ISTORAGE {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                GuestObjectKind::ComFileMoniker | GuestObjectKind::UrlMoniker => {
+                    if iid == COM_IID_IMONIKER {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                GuestObjectKind::ComEnumVariant => {
+                    if iid == COM_IID_IENUMVARIANT {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                GuestObjectKind::ComBindCtx => {
+                    if iid == COM_IID_IBINDCTX {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                GuestObjectKind::ComConnectionPoint => {
+                    let is_container = self
+                        .com_connection_points
+                        .get(&this)
+                        .map(|entry| entry.is_container)
+                        .unwrap_or(false);
+                    if is_container && iid == COM_IID_ICONNECTIONPOINTCONTAINER {
+                        interface = this;
+                        true
+                    } else if !is_container && iid == COM_IID_ICONNECTIONPOINT {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                GuestObjectKind::ComTypeInfo => {
+                    if iid == COM_IID_ITYPEINFO {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                GuestObjectKind::ComDispatch => {
+                    if iid == COM_IID_IDISPATCH {
+                        interface = this;
+                        true
+                    } else if iid == COM_IID_ICONNECTIONPOINTCONTAINER
+                        && self
+                            .com_servers
+                            .get(&this)
+                            .and_then(|server| com_dispatch_table(&server.table))
+                            .is_some()
+                    {
+                        self.alloc_com_connection_point_container(memory, this)?;
+                        interface = self
+                            .com_servers
+                            .get(&this)
+                            .map(|server| server.container)
+                            .unwrap_or(0);
+                        interface != 0
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+        }
+        if supported && interface != 0 {
+            self.add_ref_guest_object(interface)?;
+            write_guest_pointer(memory, out, interface, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+        } else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+        }
+        Ok(())
+    }
+
+    // ── IStream / ISequentialStream ─────────────────────────────────────────
+
+    fn com_stream_read(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let buffer = guest_call_arg(state, memory, 1)?;
+        let count = guest_call_arg_u32(state, memory, 2)? as usize;
+        let read_out = guest_call_arg(state, memory, 3)?;
+        if count > 0 && buffer == 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        }
+        let Some(stream) = self.com_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let position = stream.position as usize;
+        let available = stream.data.len().saturating_sub(position);
+        let to_read = count.min(available);
+        if to_read > 0 {
+            let bytes = stream.data[position..position + to_read].to_vec();
+            memory.map_bytes(buffer, &bytes);
+        }
+        if let Some(stream) = self.com_streams.get_mut(&this) {
+            stream.position = (position + to_read) as u64;
+        }
+        if read_out != 0 {
+            write_u32(memory, read_out, to_read as u32);
+        }
+        state.set(
+            Register::Rax,
+            if to_read == count {
+                u64::from(S_OK)
+            } else {
+                u64::from(S_FALSE)
+            },
+        );
+        Ok(())
+    }
+
+    fn com_stream_write(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let buffer = guest_call_arg(state, memory, 1)?;
+        let count = guest_call_arg_u32(state, memory, 2)? as usize;
+        let written_out = guest_call_arg(state, memory, 3)?;
+        if count > 0 && buffer == 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        }
+        let Some(stream) = self.com_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let position = stream.position as usize;
+        let bytes = if count > 0 {
+            memory.read_bytes(buffer, count).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if let Some(stream) = self.com_streams.get_mut(&this) {
+            let end = position + bytes.len();
+            if stream.data.len() < end {
+                stream.data.resize(end, 0);
+            }
+            stream.data[position..end].copy_from_slice(&bytes);
+            stream.position = end as u64;
+            stream.dirty = true;
+        }
+        if written_out != 0 {
+            write_u32(memory, written_out, bytes.len() as u32);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_stream_seek(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let movement = self.com_arg_i64(state, memory, 1);
+        let (origin_index, new_index) = match self.guest_arch {
+            GuestArch::X86 => (3, 4),
+            GuestArch::X64 => (2, 3),
+        };
+        let origin = guest_call_arg(state, memory, origin_index)? as u32;
+        let new_out = guest_call_arg(state, memory, new_index)?;
+        let Some(stream) = self.com_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let base = match origin {
+            0 => 0_i128,                    // STREAM_SEEK_SET
+            1 => stream.position as i128,   // STREAM_SEEK_CUR
+            2 => stream.data.len() as i128, // STREAM_SEEK_END
+            _ => {
+                state.set(Register::Rax, u64::from(STG_E_INVALIDFUNCTION));
+                return Ok(());
+            }
+        };
+        let target = base + movement as i128;
+        if target < 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDFUNCTION));
+            return Ok(());
+        }
+        if let Some(stream) = self.com_streams.get_mut(&this) {
+            stream.position = target as u64;
+        }
+        if new_out != 0 {
+            write_u64(memory, new_out, target as u64);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_stream_set_size(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let new_size = self.com_arg_i64(state, memory, 1);
+        if new_size < 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDFUNCTION));
+            return Ok(());
+        }
+        let Some(stream) = self.com_streams.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        stream.data.resize(new_size as usize, 0);
+        stream.dirty = true;
+        if stream.position > new_size as u64 {
+            stream.position = new_size as u64;
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_stream_copy_to(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let destination = guest_call_arg(state, memory, 1)?;
+        let count = self.com_arg_i64(state, memory, 2);
+        let (read_index, written_index) = match self.guest_arch {
+            GuestArch::X86 => (4, 5),
+            GuestArch::X64 => (3, 4),
+        };
+        let read_out = guest_call_arg(state, memory, read_index)?;
+        let written_out = guest_call_arg(state, memory, written_index)?;
+        if count < 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDFUNCTION));
+            return Ok(());
+        }
+        let Some(source) = self.com_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let start = source.position as usize;
+        let available = source.data.len().saturating_sub(start);
+        let to_copy = (count as usize).min(available);
+        let bytes = source.data[start..start + to_copy].to_vec();
+        let Some(destination_stream) = self.com_streams.get_mut(&destination) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let destination_position = destination_stream.position as usize;
+        let end = destination_position + to_copy;
+        if destination_stream.data.len() < end {
+            destination_stream.data.resize(end, 0);
+        }
+        destination_stream.data[destination_position..end].copy_from_slice(&bytes);
+        destination_stream.position = end as u64;
+        destination_stream.dirty = true;
+        if let Some(source) = self.com_streams.get_mut(&this) {
+            source.position = (start + to_copy) as u64;
+        }
+        if read_out != 0 {
+            write_u32(memory, read_out, to_copy as u32);
+        }
+        if written_out != 0 {
+            write_u32(memory, written_out, to_copy as u32);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_stream_commit(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(stream) = self.com_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if let (Some(path), true) = (&stream.host_path, stream.dirty) {
+            let path = path.clone();
+            let bytes = stream.data.clone();
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(&path, &bytes).is_err() {
+                state.set(Register::Rax, u64::from(STG_E_ACCESSDENIED));
+                return Ok(());
+            }
+            if let Some(stream) = self.com_streams.get_mut(&this) {
+                stream.dirty = false;
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_stream_revert(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(stream) = self.com_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if let Some(path) = stream.host_path.clone() {
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            if let Some(stream) = self.com_streams.get_mut(&this) {
+                stream.data = bytes;
+                stream.dirty = false;
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_stream_lock_region(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let offset = self.com_arg_i64(state, memory, 1);
+        let (size_index, type_index) = match self.guest_arch {
+            GuestArch::X86 => (3, 5),
+            GuestArch::X64 => (2, 3),
+        };
+        let size = self.com_arg_i64(state, memory, size_index);
+        let lock_type = guest_call_arg(state, memory, type_index)? as u32;
+        if offset < 0 || size < 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDFUNCTION));
+            return Ok(());
+        }
+        let Some(stream) = self.com_streams.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let lock = crate::runtime::state::ComStreamLock {
+            offset: offset as u64,
+            size: size as u64,
+            lock_type,
+        };
+        if stream
+            .locks
+            .iter()
+            .any(|held| held.offset == lock.offset && held.size == lock.size)
+        {
+            // Overlapping/duplicate regions are rejected (STG_E_INVALIDFUNCTION),
+            // mirroring the compound-file lock-region contract.
+            state.set(Register::Rax, u64::from(STG_E_INVALIDFUNCTION));
+            return Ok(());
+        }
+        stream.locks.push(lock);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_stream_unlock_region(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let offset = self.com_arg_i64(state, memory, 1);
+        let (size_index, type_index) = match self.guest_arch {
+            GuestArch::X86 => (3, 5),
+            GuestArch::X64 => (2, 3),
+        };
+        let size = self.com_arg_i64(state, memory, size_index);
+        let lock_type = guest_call_arg(state, memory, type_index)? as u32;
+        let Some(stream) = self.com_streams.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let before = stream.locks.len();
+        stream.locks.retain(|held| {
+            !(held.offset == offset.max(0) as u64
+                && held.size == size.max(0) as u64
+                && held.lock_type == lock_type)
+        });
+        state.set(
+            Register::Rax,
+            if stream.locks.len() == before {
+                u64::from(STG_E_INVALIDFUNCTION)
+            } else {
+                u64::from(S_OK)
+            },
+        );
+        Ok(())
+    }
+
+    fn com_stream_stat(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let stat_ptr = guest_call_arg(state, memory, 1)?;
+        let flags = guest_call_arg(state, memory, 2)? as u32;
+        let Some(stream) = self.com_streams.get(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let name = if flags & STATFLAG_NONAME != 0 {
+            String::new()
+        } else {
+            stream.name.clone()
+        };
+        let size = stream.data.len() as u64;
+        self.write_statstg(memory, stat_ptr, &name, 2, size, 2, 3, None)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_stream_clone(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(stream) = self.com_streams.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let clone = self.alloc_com_stream_object(
+            memory,
+            stream.data.clone(),
+            &stream.name,
+            stream.host_path.clone(),
+        )?;
+        if let Some(clone_stream) = self.com_streams.get_mut(&clone) {
+            clone_stream.position = stream.position;
+            clone_stream.locks = stream.locks.clone();
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, clone, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    // ── IStorage ────────────────────────────────────────────────────────────
+
+    fn com_storage_element_path(&self, storage: u64, name: &str) -> Option<String> {
+        let state = self.com_storages.get(&storage)?;
+        let directory = state.host_dir.as_ref()?;
+        Some(format!("{directory}/{name}"))
+    }
+
+    fn com_storage_create_stream(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let mode = guest_call_arg_u32(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 4)?;
+        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        }
+        if !self.com_storages.contains_key(&this) {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        }
+        let host_path = self.com_storage_element_path(this, &name);
+        if host_path
+            .as_ref()
+            .is_some_and(|path| std::path::Path::new(path).exists())
+        {
+            state.set(Register::Rax, u64::from(STG_E_FILEALREADYEXISTS));
+            return Ok(());
+        }
+        if let Some(storage) = self.com_storages.get_mut(&this) {
+            if storage.streams.contains_key(&name) {
+                state.set(Register::Rax, u64::from(STG_E_FILEALREADYEXISTS));
+                return Ok(());
+            }
+            storage.streams.insert(name.clone(), Vec::new());
+            storage.element_order.push(name.clone());
+        }
+        let stream = self.alloc_com_stream_object(memory, Vec::new(), &name, host_path)?;
+        if let Some(stream_state) = self.com_streams.get_mut(&stream) {
+            stream_state.dirty = true;
+        }
+        if let Some(storage) = self.com_storages.get_mut(&this) {
+            storage.stream_objects.insert(name.clone(), stream);
+        }
+        let _ = mode;
+        write_guest_pointer(memory, out, stream, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_open_stream(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let mode = guest_call_arg_u32(state, memory, 3)?;
+        let out = guest_call_arg(state, memory, 5)?;
+        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        }
+        let (live, host_dir, mapped) = match self.com_storages.get(&this) {
+            Some(storage) => (
+                storage.stream_objects.get(&name).copied(),
+                storage.host_dir.clone(),
+                storage.streams.get(&name).cloned(),
+            ),
+            None => {
+                state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+                return Ok(());
+            }
+        };
+        let live_bytes = live
+            .and_then(|stream| self.com_streams.get(&stream))
+            .map(|stream| stream.data.clone());
+        let bytes = if let Some(data) = live_bytes.or(mapped) {
+            data
+        } else if let Some(directory) = host_dir {
+            match std::fs::read(format!("{directory}/{name}")) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
+                    return Ok(());
+                }
+            }
+        } else {
+            state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
+            return Ok(());
+        };
+        let host_path = self.com_storage_element_path(this, &name);
+        let stream = self.alloc_com_stream_object(memory, bytes, &name, host_path)?;
+        let _ = mode;
+        write_guest_pointer(memory, out, stream, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_create_storage(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let _mode = guest_call_arg_u32(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 4)?;
+        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        }
+        let Some(storage) = self.com_storages.get(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if storage.child_storages.contains_key(&name) {
+            state.set(Register::Rax, u64::from(STG_E_FILEALREADYEXISTS));
+            return Ok(());
+        }
+        let host_dir = storage
+            .host_dir
+            .as_ref()
+            .map(|directory| format!("{directory}/{name}"));
+        let child = self.alloc_com_storage_object(memory, host_dir, &name, 0)?;
+        if let Some(parent) = self.com_storages.get_mut(&this) {
+            parent.child_storages.insert(name.clone(), child);
+            parent.element_order.push(name);
+        }
+        write_guest_pointer(memory, out, child, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_open_storage(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let _mode = guest_call_arg_u32(state, memory, 3)?;
+        let out = guest_call_arg(state, memory, 5)?;
+        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        }
+        let Some(storage) = self.com_storages.get(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if let Some(child) = storage.child_storages.get(&name).copied() {
+            self.add_ref_guest_object(child)?;
+            write_guest_pointer(memory, out, child, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        let host_dir = storage
+            .host_dir
+            .as_ref()
+            .map(|directory| format!("{directory}/{name}"));
+        let exists_on_disk = host_dir
+            .as_ref()
+            .is_some_and(|directory| std::path::Path::new(directory).is_dir());
+        if !exists_on_disk {
+            state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
+            return Ok(());
+        }
+        let child = self.alloc_com_storage_object(memory, host_dir, &name, 0)?;
+        if let Some(parent) = self.com_storages.get_mut(&this) {
+            parent.child_storages.insert(name.clone(), child);
+            parent.element_order.push(name);
+        }
+        write_guest_pointer(memory, out, child, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_copy_to(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let destination = guest_call_arg(state, memory, 4)?;
+        if !self.com_storages.contains_key(&this) || !self.com_storages.contains_key(&destination) {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        }
+        let snapshot = self.com_storages.get(&this).cloned().unwrap_or_default();
+        if let Some(target) = self.com_storages.get_mut(&destination) {
+            for (name, data) in &snapshot.streams {
+                target
+                    .streams
+                    .entry(name.clone())
+                    .or_insert_with(|| data.clone());
+                if !target.element_order.contains(name) {
+                    target.element_order.push(name.clone());
+                }
+            }
+            for (name, child) in &snapshot.child_storages {
+                target.child_storages.entry(name.clone()).or_insert(*child);
+                if !target.element_order.contains(name) {
+                    target.element_order.push(name.clone());
+                }
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_move_element(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let old_ptr = guest_call_arg(state, memory, 1)?;
+        let new_ptr = guest_call_arg(state, memory, 2)?;
+        let flags = guest_call_arg_u32(state, memory, 3)?;
+        let old_name = read_utf16_string(memory, old_ptr).unwrap_or_default();
+        let new_name = read_utf16_string(memory, new_ptr).unwrap_or_default();
+        let move_stream = flags & STGMOVE_MOVE != 0;
+        if !move_stream && flags & STGMOVE_COPY == 0 {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDFUNCTION));
+            return Ok(());
+        }
+        let Some(storage) = self.com_storages.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if let Some(data) = storage.streams.get(&old_name).cloned() {
+            storage.streams.insert(new_name.clone(), data);
+            if move_stream {
+                storage.streams.remove(&old_name);
+            }
+            if !storage.element_order.contains(&new_name) {
+                storage.element_order.push(new_name);
+            }
+        } else if let Some(child) = storage.child_storages.remove(&old_name) {
+            storage.child_storages.insert(new_name.clone(), child);
+            if !storage.element_order.contains(&new_name) {
+                storage.element_order.push(new_name);
+            }
+        } else {
+            state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_commit(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(storage) = self.com_storages.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if let Some(directory) = &storage.host_dir {
+            if std::fs::create_dir_all(directory).is_err() {
+                state.set(Register::Rax, u64::from(STG_E_ACCESSDENIED));
+                return Ok(());
+            }
+            for (name, data) in &storage.streams {
+                if std::fs::write(format!("{directory}/{name}"), data).is_err() {
+                    state.set(Register::Rax, u64::from(STG_E_ACCESSDENIED));
+                    return Ok(());
+                }
+            }
+        }
+        // Streams handed out by this storage flush their own host files.
+        let streams: Vec<u64> = self
+            .com_streams
+            .iter()
+            .filter(|(_, stream)| {
+                storage.host_dir.as_ref().is_some_and(|directory| {
+                    stream
+                        .host_path
+                        .as_ref()
+                        .is_some_and(|path| path.starts_with(directory))
+                })
+            })
+            .map(|(object, _)| *object)
+            .collect();
+        for stream in streams {
+            let dirty = self
+                .com_streams
+                .get(&stream)
+                .map(|entry| entry.dirty)
+                .unwrap_or(false);
+            if dirty {
+                let _ = self.com_stream_commit_for(&stream);
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_stream_commit_for(&mut self, stream: &u64) -> AppResult<()> {
+        let Some(state) = self.com_streams.get(stream) else {
+            return Ok(());
+        };
+        if let (Some(path), true) = (&state.host_path, state.dirty) {
+            let path = path.clone();
+            let bytes = state.data.clone();
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(path, bytes);
+            if let Some(state) = self.com_streams.get_mut(stream) {
+                state.dirty = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn com_storage_revert(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(storage) = self.com_storages.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if let Some(directory) = &storage.host_dir {
+            let mut reloaded = std::collections::HashMap::new();
+            if let Ok(entries) = std::fs::read_dir(directory) {
+                for entry in entries.flatten() {
+                    if entry.path().is_file() {
+                        if let Ok(bytes) = std::fs::read(entry.path()) {
+                            if let Some(name) = entry.file_name().to_str() {
+                                reloaded.insert(name.to_string(), bytes);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(storage) = self.com_storages.get_mut(&this) {
+                storage.streams = reloaded;
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_enum_elements(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 4)?;
+        let Some(storage) = self.com_storages.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let mut items = Vec::new();
+        for name in &storage.element_order {
+            let is_stream = storage.streams.contains_key(name);
+            if is_stream {
+                let size = storage
+                    .stream_objects
+                    .get(name)
+                    .and_then(|stream| self.com_streams.get(stream))
+                    .map(|stream| stream.data.len())
+                    .or_else(|| storage.streams.get(name).map(Vec::len))
+                    .unwrap_or(0) as u64;
+                let descriptor = self.alloc_zeroed(memory, 72, 8)?;
+                self.write_statstg(memory, descriptor, name, 2, size, 2, 0, None)?;
+                items.push(pointer_bytes_bytes(
+                    descriptor,
+                    self.guest_arch.pointer_bytes() as u64,
+                ));
+            } else if let Some(child) = storage.child_storages.get(name) {
+                let child_clsid = self.com_storages.get(child).and_then(|entry| entry.clsid);
+                let descriptor = self.alloc_zeroed(memory, 72, 8)?;
+                self.write_statstg(memory, descriptor, name, 1, 0, 0, 0, child_clsid)?;
+                items.push(pointer_bytes_bytes(
+                    descriptor,
+                    self.guest_arch.pointer_bytes() as u64,
+                ));
+            }
+        }
+        let enumerator = self.alloc_com_enum_object(memory, items)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, enumerator, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_destroy_element(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let name = read_utf16_string(memory, name_ptr).unwrap_or_default();
+        let host_path = self.com_storage_element_path(this, &name);
+        let Some(storage) = self.com_storages.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let removed = storage.streams.remove(&name).is_some()
+            || storage.child_storages.remove(&name).is_some();
+        storage.element_order.retain(|element| element != &name);
+        if !removed {
+            state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
+            return Ok(());
+        }
+        if let Some(path) = host_path {
+            let path = std::path::PathBuf::from(path);
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(path);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_rename_element(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let old_ptr = guest_call_arg(state, memory, 1)?;
+        let new_ptr = guest_call_arg(state, memory, 2)?;
+        let old_name = read_utf16_string(memory, old_ptr).unwrap_or_default();
+        let new_name = read_utf16_string(memory, new_ptr).unwrap_or_default();
+        let old_path = self.com_storage_element_path(this, &old_name);
+        let new_path = self.com_storage_element_path(this, &new_name);
+        let Some(storage) = self.com_storages.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if let Some(data) = storage.streams.remove(&old_name) {
+            storage.streams.insert(new_name.clone(), data);
+        } else if let Some(child) = storage.child_storages.remove(&old_name) {
+            storage.child_storages.insert(new_name.clone(), child);
+        } else {
+            state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
+            return Ok(());
+        }
+        for element in storage.element_order.iter_mut() {
+            if element == &old_name {
+                *element = new_name.clone();
+            }
+        }
+        if let (Some(old_path), Some(new_path)) = (old_path, new_path) {
+            let _ = std::fs::rename(old_path, new_path);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_set_element_times(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let _create_ptr = guest_call_arg(state, memory, 2)?;
+        let _access_ptr = guest_call_arg(state, memory, 3)?;
+        let modify_ptr = guest_call_arg(state, memory, 4)?;
+        let name = read_utf16_string(memory, name_ptr).unwrap_or_default();
+        let Some(host_path) = self.com_storage_element_path(this, &name) else {
+            state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
+            return Ok(());
+        };
+        if !std::path::Path::new(&host_path).exists() {
+            state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
+            return Ok(());
+        }
+        // Apply the modification time through the real file layer.
+        if modify_ptr != 0 {
+            let ticks = memory.read_u64(modify_ptr).unwrap_or(0);
+            if let Some(system_time) = filetime_to_system_time(ticks) {
+                if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&host_path) {
+                    let times = std::fs::FileTimes::new().set_modified(system_time);
+                    let _ = file.set_times(times);
+                }
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_set_class(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let clsid_ptr = guest_call_arg(state, memory, 1)?;
+        let Some(storage) = self.com_storages.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if clsid_ptr == 0 {
+            storage.clsid = None;
+        } else {
+            let bytes = memory.read_bytes(clsid_ptr, 16).unwrap_or_default();
+            if bytes.len() == 16 {
+                let mut clsid = [0_u8; 16];
+                clsid.copy_from_slice(&bytes);
+                storage.clsid = Some(clsid);
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_set_state_bits(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if !self.com_storages.contains_key(&this) {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        }
+        let _bits = guest_call_arg_u32(state, memory, 1)?;
+        let _mask = guest_call_arg_u32(state, memory, 2)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_storage_stat(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let stat_ptr = guest_call_arg(state, memory, 1)?;
+        let flags = guest_call_arg(state, memory, 2)? as u32;
+        let Some(storage) = self.com_storages.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let name = if flags & STATFLAG_NONAME != 0 {
+            String::new()
+        } else {
+            storage.name.clone()
+        };
+        self.write_statstg(
+            memory,
+            stat_ptr,
+            &name,
+            1,
+            0,
+            storage.mode,
+            0,
+            storage.clsid,
+        )?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_enum_next(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let count = guest_call_arg_u32(state, memory, 1)? as usize;
+        let out = guest_call_arg(state, memory, 2)?;
+        let fetched_out = guest_call_arg(state, memory, 3)?;
+        let Some(enumerator) = self.com_enum_variants.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let item_size = enumerator.items.first().map(Vec::len).unwrap_or(0);
+        let remaining = enumerator.items.len().saturating_sub(enumerator.current);
+        let to_fetch = if count == 0 { 0 } else { count.min(remaining) };
+        if count > 0 && out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let start = enumerator.current;
+        let items: Vec<Vec<u8>> = enumerator.items[start..start + to_fetch].to_vec();
+        for (index, item) in items.iter().enumerate() {
+            let target = out + index as u64 * item_size as u64;
+            memory.map_bytes(target, item);
+        }
+        if let Some(enumerator) = self.com_enum_variants.get_mut(&this) {
+            enumerator.current = start + to_fetch;
+        }
+        if fetched_out != 0 {
+            write_u32(memory, fetched_out, to_fetch as u32);
+        }
+        state.set(
+            Register::Rax,
+            if to_fetch == count {
+                u64::from(S_OK)
+            } else {
+                u64::from(S_FALSE)
+            },
+        );
+        Ok(())
+    }
+
+    fn com_enum_skip(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let count = guest_call_arg_u32(state, memory, 1)? as usize;
+        let Some(enumerator) = self.com_enum_variants.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let remaining = enumerator.items.len().saturating_sub(enumerator.current);
+        let skipped = count.min(remaining);
+        enumerator.current += skipped;
+        state.set(
+            Register::Rax,
+            if skipped == count {
+                u64::from(S_OK)
+            } else {
+                u64::from(S_FALSE)
+            },
+        );
+        Ok(())
+    }
+
+    fn com_enum_reset(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(enumerator) = self.com_enum_variants.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        enumerator.current = 0;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_enum_clone(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(enumerator) = self.com_enum_variants.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let clone = self.alloc_com_enum_object(memory, enumerator.items.clone())?;
+        if let Some(clone_state) = self.com_enum_variants.get_mut(&clone) {
+            clone_state.current = enumerator.current;
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, clone, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    // ── IConnectionPointContainer / IConnectionPoint ────────────────────────
+
+    fn com_container_enum_connection_points(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(container) = self.com_connection_points.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let mut points: Vec<u64> = container.points.values().copied().collect();
+        points.sort_unstable();
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let items = points
+            .iter()
+            .map(|point| pointer_bytes_bytes(*point, pointer_bytes))
+            .collect();
+        let enumerator = self.alloc_com_enum_object(memory, items)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, enumerator, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_container_find_connection_point(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let riid_ptr = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out == 0 || riid_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let iid: [u8; 16] =
+            std::array::from_fn(|index| memory.read_u8(riid_ptr + index as u64).unwrap_or(0));
+        let key = Self::guid_bytes_to_string(&iid);
+        let point = self
+            .com_connection_points
+            .get(&this)
+            .and_then(|container| container.points.get(&key).copied());
+        match point {
+            Some(point) => {
+                self.add_ref_guest_object(point)?;
+                write_guest_pointer(memory, out, point, self.guest_arch).ok();
+                state.set(Register::Rax, u64::from(S_OK));
+            }
+            None => state.set(Register::Rax, u64::from(CONNECT_E_NOCONNECTION)),
+        }
+        Ok(())
+    }
+
+    fn com_connection_point_get_interface(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(point) = self.com_connection_points.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        for (index, byte) in point.iid.iter().enumerate() {
+            memory.write_u8(out + index as u64, *byte);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_connection_point_get_container(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let owner = self
+            .com_connection_points
+            .get(&this)
+            .map(|point| point.owner)
+            .unwrap_or(0);
+        if owner == 0 || out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let container = self.alloc_com_connection_point_container(memory, owner)?;
+        self.add_ref_guest_object(container)?;
+        write_guest_pointer(memory, out, container, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_connection_point_advise(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let sink = guest_call_arg(state, memory, 1)?;
+        let cookie_out = guest_call_arg(state, memory, 2)?;
+        if sink == 0 || cookie_out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        if !self.com_connection_points.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        // The advised sink is reference-counted through its own AddRef
+        // (the runtime's guest-object table when the sink is a runtime
+        // object; the sink's vtable otherwise).
+        if self.guest_objects.contains_key(&sink) {
+            self.add_ref_guest_object(sink)?;
+        }
+        let cookie = self.com_next_conn_cookie;
+        self.com_next_conn_cookie = self.com_next_conn_cookie.wrapping_add(1).max(1);
+        if let Some(point) = self.com_connection_points.get_mut(&this) {
+            point.sinks.push((cookie, sink));
+        }
+        write_u32(memory, cookie_out, cookie);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_connection_point_unadvise(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let cookie = guest_call_arg_u32(state, memory, 1)?;
+        let Some(point) = self.com_connection_points.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(index) = point
+            .sinks
+            .iter()
+            .position(|(advised_cookie, _)| *advised_cookie == cookie)
+        else {
+            state.set(Register::Rax, u64::from(CONNECT_E_NOCONNECTION));
+            return Ok(());
+        };
+        let (_, sink) = point.sinks.remove(index);
+        if self.guest_objects.contains_key(&sink) {
+            self.release_guest_object(sink)?;
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_connection_point_enum_connections(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(point) = self.com_connection_points.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let sinks: Vec<(u32, u64)> = point.sinks.clone();
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let items = sinks
+            .iter()
+            .map(|(cookie, sink)| connect_data_bytes(*sink, *cookie, pointer_bytes))
+            .collect();
+        let enumerator = self.alloc_com_enum_object(memory, items)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, enumerator, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    // ── COM object allocators (real vtables + state) ────────────────────────
+
+    /// Create a guest IStream over `data`, optionally backed by a real host
+    /// path (Commit/Revert flush/reload the file).
+    pub(crate) fn alloc_com_stream_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        data: Vec<u8>,
+        name: &str,
+        host_path: Option<String>,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::StreamRead),
+            HostThunk::ComMethod(ComMethod::StreamWrite),
+            HostThunk::ComMethod(ComMethod::StreamSeek),
+            HostThunk::ComMethod(ComMethod::StreamSetSize),
+            HostThunk::ComMethod(ComMethod::StreamCopyTo),
+            HostThunk::ComMethod(ComMethod::StreamCommit),
+            HostThunk::ComMethod(ComMethod::StreamRevert),
+            HostThunk::ComMethod(ComMethod::StreamLockRegion),
+            HostThunk::ComMethod(ComMethod::StreamUnlockRegion),
+            HostThunk::ComMethod(ComMethod::StreamStat),
+            HostThunk::ComMethod(ComMethod::StreamClone),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComStream, vtable)?;
+        self.com_streams.insert(
+            object,
+            crate::runtime::state::ComStreamState {
+                data,
+                name: name.to_string(),
+                host_path,
+                ..Default::default()
+            },
+        );
+        Ok(object)
+    }
+
+    /// Create a guest IStream reading an existing real file.
+    pub(crate) fn alloc_com_stream_from_file(
+        &mut self,
+        memory: &mut MemoryImage,
+        host_path: &str,
+    ) -> AppResult<u64> {
+        let data = std::fs::read(host_path).unwrap_or_default();
+        let name = std::path::Path::new(host_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
+        self.alloc_com_stream_object(memory, data, &name, Some(host_path.to_string()))
+    }
+
+    /// Create a guest IStorage, optionally over a real host directory.
+    pub(crate) fn alloc_com_storage_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        host_dir: Option<String>,
+        name: &str,
+        mode: u32,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::StorageCreateStream),
+            HostThunk::ComMethod(ComMethod::StorageOpenStream),
+            HostThunk::ComMethod(ComMethod::StorageCreateStorage),
+            HostThunk::ComMethod(ComMethod::StorageOpenStorage),
+            HostThunk::ComMethod(ComMethod::StorageCopyTo),
+            HostThunk::ComMethod(ComMethod::StorageMoveElement),
+            HostThunk::ComMethod(ComMethod::StorageCommit),
+            HostThunk::ComMethod(ComMethod::StorageRevert),
+            HostThunk::ComMethod(ComMethod::StorageEnumElements),
+            HostThunk::ComMethod(ComMethod::StorageDestroyElement),
+            HostThunk::ComMethod(ComMethod::StorageRenameElement),
+            HostThunk::ComMethod(ComMethod::StorageSetElementTimes),
+            HostThunk::ComMethod(ComMethod::StorageSetClass),
+            HostThunk::ComMethod(ComMethod::StorageSetStateBits),
+            HostThunk::ComMethod(ComMethod::StorageStat),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComStorage, vtable)?;
+        let mut streams = HashMap::new();
+        if let Some(directory) = &host_dir {
+            if let Ok(entries) = std::fs::read_dir(directory) {
+                for entry in entries.flatten() {
+                    if entry.path().is_file() {
+                        if let (Some(file_name), Ok(bytes)) =
+                            (entry.file_name().to_str(), std::fs::read(entry.path()))
+                        {
+                            streams.insert(file_name.to_string(), bytes);
+                        }
+                    }
+                }
+            }
+        }
+        let element_order = streams.keys().cloned().collect();
+        self.com_storages.insert(
+            object,
+            crate::runtime::state::ComStorageState {
+                streams,
+                host_dir,
+                element_order,
+                mode,
+                name: name.to_string(),
+                ..Default::default()
+            },
+        );
+        Ok(object)
+    }
+
+    /// Create the IConnectionPointContainer interface object for `owner`
+    /// (idempotent: the owner's server state caches it).
+    pub(crate) fn alloc_com_connection_point_container(
+        &mut self,
+        memory: &mut MemoryImage,
+        owner: u64,
+    ) -> AppResult<u64> {
+        if let Some(server) = self.com_servers.get(&owner) {
+            if server.container != 0 {
+                return Ok(server.container);
+            }
+        }
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::EnumConnectionPoints),
+            HostThunk::ComMethod(ComMethod::FindConnectionPoint),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object =
+            self.alloc_guest_object(memory, GuestObjectKind::ComConnectionPoint, vtable)?;
+        self.com_connection_points.insert(
+            object,
+            crate::runtime::state::ComConnectionPointState {
+                owner,
+                is_container: true,
+                ..Default::default()
+            },
+        );
+        if let Some(server) = self.com_servers.get_mut(&owner) {
+            server.container = object;
+        }
+        Ok(object)
+    }
+
+    /// Create an IConnectionPoint for `iid` on `owner`.
+    pub(crate) fn alloc_com_connection_point(
+        &mut self,
+        memory: &mut MemoryImage,
+        owner: u64,
+        iid: [u8; 16],
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::GetConnectionInterface),
+            HostThunk::ComMethod(ComMethod::GetConnectionPointContainer),
+            HostThunk::ComMethod(ComMethod::Advise),
+            HostThunk::ComMethod(ComMethod::Unadvise),
+            HostThunk::ComMethod(ComMethod::EnumConnections),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object =
+            self.alloc_guest_object(memory, GuestObjectKind::ComConnectionPoint, vtable)?;
+        self.com_connection_points.insert(
+            object,
+            crate::runtime::state::ComConnectionPointState {
+                owner,
+                iid,
+                is_container: false,
+                ..Default::default()
+            },
+        );
+        let container = self.alloc_com_connection_point_container(memory, owner)?;
+        let key = Self::guid_bytes_to_string(&iid);
+        if let Some(container_state) = self.com_connection_points.get_mut(&container) {
+            container_state.points.insert(key, object);
+        }
+        Ok(object)
+    }
+
+    /// Create a snapshot enumerator object (IEnumConnectionPoints,
+    /// IEnumConnections, IEnumSTATSTG) over pre-encoded items.
+    pub(crate) fn alloc_com_enum_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        items: Vec<Vec<u8>>,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::EnumNext),
+            HostThunk::ComMethod(ComMethod::EnumSkip),
+            HostThunk::ComMethod(ComMethod::EnumReset),
+            HostThunk::ComMethod(ComMethod::EnumClone),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComEnumVariant, vtable)?;
+        self.com_enum_variants.insert(
+            object,
+            crate::runtime::state::ComEnumVariantState { items, current: 0 },
+        );
+        Ok(object)
+    }
+
+    // ── IDispatch / ITypeInfo ───────────────────────────────────────────────
+
+    /// Create the runtime's in-process automation server: a real IDispatch
+    /// dual interface with a registered method table plus an
+    /// IConnectionPointContainer whose connection point fires the table's
+    /// events when the server's state changes.
+    pub(crate) fn alloc_com_automation_server(
+        &mut self,
+        memory: &mut MemoryImage,
+        table: &str,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::DispatchGetTypeInfoCount),
+            HostThunk::ComMethod(ComMethod::DispatchGetTypeInfo),
+            HostThunk::ComMethod(ComMethod::DispatchGetIDsOfNames),
+            HostThunk::ComMethod(ComMethod::DispatchInvoke),
+            HostThunk::ComMethod(ComMethod::ServerGetValue),
+            HostThunk::ComMethod(ComMethod::ServerPutValue),
+            HostThunk::ComMethod(ComMethod::ServerGetName),
+            HostThunk::ComMethod(ComMethod::ServerPutName),
+            HostThunk::ComMethod(ComMethod::ServerGetCount),
+            HostThunk::ComMethod(ComMethod::ServerAdd),
+            HostThunk::ComMethod(ComMethod::ServerReset),
+            HostThunk::ComMethod(ComMethod::ServerFireValueChanged),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComDispatch, vtable)?;
+        self.com_servers.insert(
+            object,
+            crate::runtime::state::ComServerState {
+                table: table.to_string(),
+                ..Default::default()
+            },
+        );
+        // The event connection point exists from creation: sinks can advise
+        // before the first state change.
+        self.alloc_com_connection_point(memory, object, COM_AUTOMATION_EVENTS_IID)?;
+        Ok(object)
+    }
+
+    /// Create the runtime's modeled IDispatch event sink (records every
+    /// delivered event in `com_sink_invocations`).  The sink is the Advise
+    /// target the connection-point tests attach to a server.
+    #[allow(dead_code)] // exercised by the connection-point test sinks
+    pub(crate) fn alloc_com_sink_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        table: &str,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::DispatchGetTypeInfoCount),
+            HostThunk::ComMethod(ComMethod::DispatchGetTypeInfo),
+            HostThunk::ComMethod(ComMethod::DispatchGetIDsOfNames),
+            HostThunk::ComMethod(ComMethod::SinkInvoke),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComDispatch, vtable)?;
+        self.com_servers.insert(
+            object,
+            crate::runtime::state::ComServerState {
+                table: table.to_string(),
+                ..Default::default()
+            },
+        );
+        Ok(object)
+    }
+
+    fn com_server_get_property(&self, server: u64, name: &str) -> ComValue {
+        if let Some(state) = self.com_servers.get(&server) {
+            if let Some(value) = state.properties.get(name) {
+                return value.clone();
+            }
+        }
+        match name {
+            "Value" => ComValue::I4(0),
+            "Name" => ComValue::Bstr(String::new()),
+            "Count" => ComValue::I4(
+                self.com_servers
+                    .get(&server)
+                    .map(|state| state.properties.len() as i32)
+                    .unwrap_or(0),
+            ),
+            _ => ComValue::Empty,
+        }
+    }
+
+    fn com_server_set_property(&mut self, server: u64, name: &str, value: ComValue) {
+        if let Some(state) = self.com_servers.get_mut(&server) {
+            state.properties.insert(name.to_string(), value);
+        }
+    }
+
+    fn com_server_get_value(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let value = self.com_server_get_property(this, "Value");
+        self.write_variant_value(memory, out, &value)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_server_put_value(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let value_ptr = guest_call_arg(state, memory, 1)?;
+        let value = self.read_variant_value(memory, value_ptr)?;
+        let Some(value) = value else {
+            state.set(Register::Rax, u64::from(DISP_E_TYPEMISMATCH));
+            return Ok(());
+        };
+        let previous = self.com_server_get_property(this, "Value");
+        self.com_server_set_property(this, "Value", value.clone());
+        if previous != value {
+            self.fire_automation_event(state, memory, this, 10, &[value])?;
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_server_get_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let value = self.com_server_get_property(this, "Name");
+        self.write_variant_value(memory, out, &value)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_server_put_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let value_ptr = guest_call_arg(state, memory, 1)?;
+        let value = self.read_variant_value(memory, value_ptr)?;
+        let Some(value) = value else {
+            state.set(Register::Rax, u64::from(DISP_E_TYPEMISMATCH));
+            return Ok(());
+        };
+        self.com_server_set_property(this, "Name", value);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_server_get_count(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let value = self.com_server_get_property(this, "Count");
+        self.write_variant_value(memory, out, &value)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_server_add(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let left = self.com_arg_i32(state, memory, 1);
+        let right = self.com_arg_i32(state, memory, 2);
+        let out = guest_call_arg(state, memory, 3)?;
+        if !self.com_servers.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        self.write_variant_i4(memory, out, left.wrapping_add(right));
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_server_reset(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if let Some(server) = self.com_servers.get_mut(&this) {
+            server.properties.clear();
+        } else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        self.fire_automation_event(state, memory, this, 11, &[])?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_server_fire_value_changed(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let value = self.com_arg_i32(state, memory, 1);
+        if !self.com_servers.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        self.fire_automation_event(state, memory, this, 10, &[ComValue::I4(value)])?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_dispatch_get_type_info_count(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let count = if self
+            .com_servers
+            .get(&this)
+            .and_then(|server| com_dispatch_table(&server.table))
+            .is_some()
+        {
+            1
+        } else {
+            0
+        };
+        if out != 0 {
+            write_u32(memory, out, count);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_dispatch_get_type_info(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let index = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let table = self
+            .com_servers
+            .get(&this)
+            .map(|server| server.table.clone());
+        let Some(table) = table.filter(|table| com_dispatch_table(table).is_some()) else {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        };
+        if index != 0 {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        }
+        let existing = self
+            .com_type_infos
+            .iter()
+            .find(|(_, info)| info.owner == this && info.index == index)
+            .map(|(object, _)| *object);
+        let type_info = match existing {
+            Some(object) => object,
+            None => self.alloc_com_type_info_object(memory, &table, this, index)?,
+        };
+        self.add_ref_guest_object(type_info)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, type_info, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_dispatch_get_ids_of_names_impl(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _riid = guest_call_arg(state, memory, 1)?;
+        let names_ptr = guest_call_arg(state, memory, 2)?;
+        let count = guest_call_arg_u32(state, memory, 3)?;
+        let _lcid = guest_call_arg_u32(state, memory, 4)?;
+        let ids_ptr = guest_call_arg(state, memory, 5)?;
+        if names_ptr == 0 || ids_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let table_name = match self.com_servers.get(&this) {
+            Some(server) => server.table.clone(),
+            None => {
+                // ITypeInfo serves its own table through the same path.
+                match self.com_type_infos.get(&this) {
+                    Some(info) => info.table.clone(),
+                    None => {
+                        state.set(Register::Rax, u64::from(E_NOINTERFACE));
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let mut all_found = true;
+        for index in 0..count.min(256) {
+            let name_ptr = read_guest_pointer(
+                memory,
+                names_ptr + index as u64 * pointer_bytes,
+                self.guest_arch,
+            )
+            .unwrap_or(0);
+            let name = read_utf16_string(memory, name_ptr).unwrap_or_default();
+            let dispid = self.com_resolve_dispid(this, &table_name, &name);
+            match dispid {
+                Some(dispid) => write_u32(memory, ids_ptr + index as u64 * 4, dispid as u32),
+                None => {
+                    all_found = false;
+                    write_u32(memory, ids_ptr + index as u64 * 4, DISPID_UNKNOWN as u32);
+                }
+            }
+        }
+        state.set(
+            Register::Rax,
+            if all_found {
+                u64::from(S_OK)
+            } else {
+                u64::from(DISP_E_UNKNOWNNAME)
+            },
+        );
+        Ok(())
+    }
+
+    /// Resolve one automation name to its DISPID: the registered table
+    /// first, then (and persistently) the server's dynamic cache with stable
+    /// monotonically assigned DISPIDs.
+    fn com_resolve_dispid(&mut self, object: u64, table: &str, name: &str) -> Option<i32> {
+        if name.is_empty() {
+            return Some(DISPID_VALUE);
+        }
+        if let Some(member) = com_dispatch_member_by_name(table, name) {
+            if let Some(server) = self.com_servers.get_mut(&object) {
+                server
+                    .dispid_cache
+                    .entry(name.to_string())
+                    .or_insert(member.dispid);
+            }
+            return Some(member.dispid);
+        }
+        if let Some(server) = self.com_servers.get(&object) {
+            if let Some(dispid) = server.dispid_cache.get(name) {
+                return Some(*dispid);
+            }
+        }
+        None
+    }
+
+    fn com_dispatch_invoke_impl(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let dispid = self.com_arg_i32(state, memory, 1);
+        let _riid = guest_call_arg(state, memory, 2)?;
+        let _lcid = guest_call_arg_u32(state, memory, 3)?;
+        let flags = guest_call_arg_u32(state, memory, 4)? as u16;
+        let params = guest_call_arg(state, memory, 5)?;
+        let result = guest_call_arg(state, memory, 6)?;
+        let _exception = guest_call_arg(state, memory, 7)?;
+        let argument_error = guest_call_arg(state, memory, 8)?;
+        let hr = self.invoke_automation_member(
+            state,
+            memory,
+            this,
+            dispid,
+            flags,
+            params,
+            result,
+            argument_error,
+        )?;
+        state.set(Register::Rax, u64::from(hr));
+        Ok(())
+    }
+
+    /// The shared automation invocation used by IDispatch::Invoke, the
+    /// server's dual-interface vtable methods and ITypeInfo::Invoke.
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_automation_member(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        server: u64,
+        dispid: i32,
+        flags: u16,
+        params: u64,
+        result: u64,
+        argument_error: u64,
+    ) -> AppResult<u32> {
+        let table_name = match self.com_servers.get(&server) {
+            Some(server) => server.table.clone(),
+            None => return Ok(E_NOINTERFACE),
+        };
+        let Some(member) = com_dispatch_member_for(&table_name, dispid, flags) else {
+            return Ok(DISP_E_MEMBERNOTFOUND);
+        };
+        let reversed = self.read_dispparams_values(memory, params);
+        let logical: Vec<ComValue> = reversed.iter().rev().cloned().collect();
+        if flags & DISPATCH_PROPERTYPUT != 0 {
+            if member.kind != ComMemberKind::PropertyPut {
+                return Ok(DISP_E_MEMBERNOTFOUND);
+            }
+            let Some(value) = logical.first().cloned() else {
+                if argument_error != 0 {
+                    write_u32(memory, argument_error, 0);
+                }
+                return Ok(DISP_E_BADPARAMCOUNT);
+            };
+            let previous = self.com_server_get_property(server, member.name);
+            self.com_server_set_property(server, member.name, value.clone());
+            if member.name == "Value" && previous != value {
+                self.fire_automation_event(state, memory, server, 10, &[value])?;
+            }
+            self.write_variant_empty(memory, result);
+            return Ok(S_OK);
+        }
+        if flags & DISPATCH_METHOD != 0 && member.kind == ComMemberKind::Method {
+            match member.name {
+                "Add" => {
+                    if logical.len() < 2 {
+                        return Ok(DISP_E_BADPARAMCOUNT);
+                    }
+                    let left = com_value_as_i4(&logical[0]);
+                    let right = com_value_as_i4(&logical[1]);
+                    self.write_variant_i4(memory, result, left.wrapping_add(right));
+                    return Ok(S_OK);
+                }
+                "Reset" => {
+                    if let Some(server_state) = self.com_servers.get_mut(&server) {
+                        server_state.properties.clear();
+                    }
+                    self.fire_automation_event(state, memory, server, 11, &[])?;
+                    self.write_variant_empty(memory, result);
+                    return Ok(S_OK);
+                }
+                "FireValueChanged" => {
+                    let value = logical.first().map(com_value_as_i4).unwrap_or(0);
+                    self.fire_automation_event(state, memory, server, 10, &[ComValue::I4(value)])?;
+                    self.write_variant_empty(memory, result);
+                    return Ok(S_OK);
+                }
+                _ => return Ok(DISP_E_MEMBERNOTFOUND),
+            }
+        }
+        if flags & DISPATCH_PROPERTYGET != 0 {
+            let value = self.com_server_get_property(server, member.name);
+            self.write_variant_value(memory, result, &value)?;
+            return Ok(S_OK);
+        }
+        Ok(DISP_E_MEMBERNOTFOUND)
+    }
+
+    fn com_type_info_get_type_attr(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(info) = self.com_type_infos.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        };
+        let table = com_dispatch_table(&info.table);
+        let methods = table
+            .map(|members| {
+                members
+                    .iter()
+                    .filter(|m| m.kind != ComMemberKind::PropertyGet)
+                    .count()
+            })
+            .unwrap_or(0) as u16;
+        let variables = table
+            .map(|members| {
+                members
+                    .iter()
+                    .filter(|m| m.kind == ComMemberKind::PropertyGet)
+                    .count()
+            })
+            .unwrap_or(0) as u16;
+        let descriptor = self.alloc_zeroed(memory, 80, 8)?;
+        let guid = com_dispatch_table_iid(&info.table);
+        for (index, byte) in guid.iter().enumerate() {
+            memory.write_u8(descriptor + index as u64, *byte);
+        }
+        write_u32(memory, descriptor + 16, 0); // lcid
+        write_u32(memory, descriptor + 20, 0); // dwReserved
+        write_u32(memory, descriptor + 24, DISPID_UNKNOWN as u32); // memidConstructor
+        write_u32(memory, descriptor + 28, DISPID_UNKNOWN as u32); // memidDestructor
+        write_u32(memory, descriptor + 32, 0); // lpstrSchema
+        write_u32(memory, descriptor + 36, 0); // cbSizeInstance
+        write_u32(memory, descriptor + 40, 4); // TKIND_DISPATCH
+        write_u16(memory, descriptor + 44, methods);
+        write_u16(memory, descriptor + 46, variables);
+        write_u16(memory, descriptor + 48, 1); // cImplTypes (IDispatch)
+        write_u16(memory, descriptor + 50, 28); // cbSizeVft (7 IDispatch slots)
+        write_u16(memory, descriptor + 52, 4); // cbAlignment
+        write_u16(memory, descriptor + 54, 0); // wTypeFlags
+        write_u16(memory, descriptor + 56, 1); // wMajorVerNum
+        write_u16(memory, descriptor + 58, 0); // wMinorVerNum
+        write_u16(memory, descriptor + 60, 0); // tdescAlias union
+        write_u16(memory, descriptor + 64, 26); // VT_PTR tdescAlias.vt
+        write_u32(memory, descriptor + 68, 0); // idldescType.dwReserved
+        write_u16(memory, descriptor + 72, 0); // idldescType.wIDLFlags
+        if out != 0 {
+            write_guest_pointer(memory, out, descriptor, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_type_info_get_func_desc(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let index = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(info) = self.com_type_infos.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        };
+        let Some(table) = com_dispatch_table(&info.table) else {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        };
+        let Some(member) = table.get(index as usize) else {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        };
+        let descriptor = self.alloc_zeroed(memory, 56, 8)?;
+        write_u32(memory, descriptor, member.dispid as u32); // memid
+        write_u32(memory, descriptor + 4, 0); // lprgscode
+        write_u32(memory, descriptor + 8, 0); // lprgelemdescParam
+        write_u32(memory, descriptor + 12, 4); // FUNC_DISPATCH
+        write_u32(
+            memory,
+            descriptor + 16,
+            match member.kind {
+                ComMemberKind::Method => 1,      // INVOKE_FUNC
+                ComMemberKind::PropertyGet => 2, // INVOKE_PROPERTYGET
+                ComMemberKind::PropertyPut => 4, // INVOKE_PROPERTYPUT
+            },
+        );
+        write_u32(memory, descriptor + 20, 4); // CC_STDCALL
+        write_u16(memory, descriptor + 24, member.args); // cParams
+        write_u16(memory, descriptor + 26, 0); // cParamsOpt
+        write_u16(memory, descriptor + 28, member.slot as u16); // oVft
+        write_u16(memory, descriptor + 30, 0); // cScodes
+        // elemdescFunc: tdesc.vt = the member's return VARTYPE (VT_EMPTY for
+        // methods without a result); PARAMDESC flags zero.
+        write_u32(memory, descriptor + 32, 0);
+        write_u16(memory, descriptor + 36, member.returns);
+        write_u16(memory, descriptor + 40, 0); // elemdescFunc.paramdesc.wParamFlags
+        write_u16(memory, descriptor + 48, 0); // wFuncFlags
+        if out != 0 {
+            write_guest_pointer(memory, out, descriptor, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_type_info_get_var_desc(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let out = guest_call_arg(state, memory, 2)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+        Ok(())
+    }
+
+    fn com_type_info_get_names(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let memid = self.com_arg_i32(state, memory, 1);
+        let names_ptr = guest_call_arg(state, memory, 2)?;
+        let max_names = guest_call_arg_u32(state, memory, 3)?;
+        let count_out = guest_call_arg(state, memory, 4)?;
+        let Some(info) = self.com_type_infos.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        };
+        if names_ptr == 0 || max_names == 0 || count_out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let name = if memid == DISPID_UNKNOWN {
+            info.table.clone()
+        } else {
+            match com_dispatch_member(&info.table, memid) {
+                Some(member) => member.name.to_string(),
+                None => {
+                    write_u32(memory, count_out, 0);
+                    state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                    return Ok(());
+                }
+            }
+        };
+        let bstr = self.alloc_com_bstr(memory, &name)?;
+        write_guest_pointer(memory, names_ptr, bstr, self.guest_arch).ok();
+        write_u32(memory, count_out, 1);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `ITypeInfo::GetIDsOfNames(rgszNames, cNames, pMemId)` — the same
+    /// registered table lookup, with the ITypeInfo argument layout.
+    fn com_type_info_get_ids_of_names(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let names = guest_call_arg(state, memory, 1)?;
+        let count = guest_call_arg_u32(state, memory, 2)?;
+        let ids = guest_call_arg(state, memory, 3)?;
+        let hr = self.com_get_ids_of_names(memory, this, names, count, 0, ids)?;
+        state.set(Register::Rax, u64::from(hr));
+        Ok(())
+    }
+
+    fn com_type_info_invoke(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let instance = guest_call_arg(state, memory, 1)?;
+        let memid = self.com_arg_i32(state, memory, 2);
+        let _riid = guest_call_arg(state, memory, 3)?;
+        let _lcid = guest_call_arg_u32(state, memory, 4)?;
+        let flags = guest_call_arg_u32(state, memory, 5)? as u16;
+        let params = guest_call_arg(state, memory, 6)?;
+        let result = guest_call_arg(state, memory, 7)?;
+        let _exception = guest_call_arg(state, memory, 8)?;
+        let argument_error = guest_call_arg(state, memory, 9)?;
+        let owner = self
+            .com_type_infos
+            .get(&this)
+            .map(|info| info.owner)
+            .unwrap_or(0);
+        let target = if instance != 0 { instance } else { owner };
+        let hr = self.invoke_automation_member(
+            state,
+            memory,
+            target,
+            memid,
+            flags,
+            params,
+            result,
+            argument_error,
+        )?;
+        state.set(Register::Rax, u64::from(hr));
+        Ok(())
+    }
+
+    fn com_type_info_get_documentation(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let memid = self.com_arg_i32(state, memory, 1);
+        let name_out = guest_call_arg(state, memory, 2)?;
+        let doc_out = guest_call_arg(state, memory, 3)?;
+        let context_out = guest_call_arg(state, memory, 4)?;
+        let help_out = guest_call_arg(state, memory, 5)?;
+        let Some(info) = self.com_type_infos.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        };
+        let name = if memid == DISPID_UNKNOWN {
+            info.table.clone()
+        } else {
+            match com_dispatch_member(&info.table, memid) {
+                Some(member) => member.name.to_string(),
+                None => {
+                    state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                    return Ok(());
+                }
+            }
+        };
+        if name_out != 0 {
+            let bstr = self.alloc_com_bstr(memory, &name)?;
+            write_guest_pointer(memory, name_out, bstr, self.guest_arch).ok();
+        }
+        if doc_out != 0 {
+            let bstr = self.alloc_com_bstr(memory, "")?;
+            write_guest_pointer(memory, doc_out, bstr, self.guest_arch).ok();
+        }
+        if context_out != 0 {
+            write_u32(memory, context_out, 0);
+        }
+        if help_out != 0 {
+            write_guest_pointer(memory, help_out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_type_info_unsupported(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _ = memory;
+        state.set(Register::Rax, u64::from(E_NOTIMPL));
+        Ok(())
+    }
+
+    /// Create the ITypeInfo object generated from a registered dispatch
+    /// table.
+    pub(crate) fn alloc_com_type_info_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        table: &str,
+        owner: u64,
+        index: u32,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::TypeInfoGetTypeAttr),
+            HostThunk::ComMethod(ComMethod::TypeInfoUnsupported), // GetTypeComp
+            HostThunk::ComMethod(ComMethod::TypeInfoGetFuncDesc),
+            HostThunk::ComMethod(ComMethod::TypeInfoGetVarDesc),
+            HostThunk::ComMethod(ComMethod::TypeInfoGetNames),
+            HostThunk::ComMethod(ComMethod::TypeInfoUnsupported), // GetRefTypeOfImplType
+            HostThunk::ComMethod(ComMethod::TypeInfoUnsupported), // GetImplTypeFlags
+            HostThunk::ComMethod(ComMethod::TypeInfoGetIDsOfNames),
+            HostThunk::ComMethod(ComMethod::TypeInfoInvoke),
+            HostThunk::ComMethod(ComMethod::TypeInfoGetDocumentation),
+            HostThunk::ComMethod(ComMethod::TypeInfoUnsupported), // GetDllEntry
+            HostThunk::ComMethod(ComMethod::TypeInfoUnsupported), // GetRefTypeInfo
+            HostThunk::ComMethod(ComMethod::TypeInfoUnsupported), // AddressOfMember
+            HostThunk::ComMethod(ComMethod::TypeInfoUnsupported), // CreateInstance
+            HostThunk::ComMethod(ComMethod::TypeInfoUnsupported), // GetMops
+            HostThunk::ComMethod(ComMethod::TypeInfoUnsupported), // GetContainingTypeLib
+            HostThunk::ComMethod(ComMethod::TypeInfoReleaseTypeAttr),
+            HostThunk::ComMethod(ComMethod::TypeInfoReleaseFuncDesc),
+            HostThunk::ComMethod(ComMethod::TypeInfoReleaseVarDesc),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComTypeInfo, vtable)?;
+        self.com_type_infos.insert(
+            object,
+            crate::runtime::state::ComTypeInfoState {
+                table: table.to_string(),
+                owner,
+                index,
+            },
+        );
+        Ok(object)
+    }
+
+    // ── Event firing through the advised sinks ──────────────────────────────
+
+    /// Deliver one automation event to every advised sink of the server's
+    /// connection point, recording each delivery.
+    fn fire_automation_event(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        source: u64,
+        dispid: i32,
+        args: &[ComValue],
+    ) -> AppResult<()> {
+        let container = match self.com_servers.get(&source) {
+            Some(server) if server.container != 0 => server.container,
+            _ => return Ok(()),
+        };
+        let points: Vec<u64> = self
+            .com_connection_points
+            .get(&container)
+            .map(|container| container.points.values().copied().collect())
+            .unwrap_or_default();
+        let mut sinks = Vec::new();
+        for point in &points {
+            if let Some(point_state) = self.com_connection_points.get(point) {
+                sinks.extend(point_state.sinks.iter().map(|(_, sink)| *sink));
+            }
+        }
+        for sink in sinks {
+            let hr = self.invoke_dispatch_sink(state, memory, sink, dispid, args)?;
+            self.com_fired_events
+                .push(crate::runtime::state::ComFiredEvent {
+                    source,
+                    dispid,
+                    sink,
+                    hr,
+                });
+        }
+        Ok(())
+    }
+
+    /// Call `sink->IDispatch::Invoke(dispid, DISPATCH_METHOD, params, ...)`
+    /// through the sink's real vtable slot: a guest-code sink runs through
+    /// the guest callback path, a runtime sink through the dispatch path.
+    fn invoke_dispatch_sink(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        sink: u64,
+        dispid: i32,
+        args: &[ComValue],
+    ) -> AppResult<u32> {
+        let vtable = read_guest_pointer(memory, sink, self.guest_arch).unwrap_or(0);
+        if vtable == 0 {
+            return Ok(E_UNEXPECTED);
+        }
+        let slot = 6_u64; // IDispatch::Invoke
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let function =
+            read_guest_pointer(memory, vtable + slot * pointer_bytes, self.guest_arch).unwrap_or(0);
+        if function == 0 {
+            return Ok(E_UNEXPECTED);
+        }
+        let (params, result, exception, argument_error) =
+            self.build_dispatch_invocation(memory, args)?;
+        let call_args = [
+            sink,
+            dispid as u32 as u64,
+            0,
+            0,
+            DISPATCH_METHOD as u64,
+            params,
+            result,
+            exception,
+            argument_error,
+        ];
+        let hr = if self.host_thunks.contains_key(&function) {
+            let frame = self.alloc_zeroed(memory, 0x100, 4)?;
+            write_u32(memory, frame, 0); // synthetic return address
+            for (index, argument) in call_args.iter().enumerate() {
+                write_u32(memory, frame + 4 + index as u64 * 4, *argument as u32);
+            }
+            let saved_rsp = state.get(Register::Rsp);
+            let saved_rip = state.rip;
+            state.set(Register::Rsp, frame);
+            let dispatched = self.dispatch_import(function, state, memory);
+            state.set(Register::Rsp, saved_rsp);
+            state.rip = saved_rip;
+            match dispatched {
+                Ok(_) => state.get(Register::Rax) as u32,
+                Err(_) => E_UNEXPECTED,
+            }
+        } else {
+            self.execute_guest_callback(state, memory, function, &call_args, "IDispatch::Invoke")?
+                as u32
+        };
+        Ok(hr)
+    }
+
+    fn com_sink_invoke(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let dispid = self.com_arg_i32(state, memory, 1);
+        let params = guest_call_arg(state, memory, 5)?;
+        let result = guest_call_arg(state, memory, 6)?;
+        let values = self.read_dispparams_values(memory, params);
+        self.com_sink_invocations
+            .push((this, dispid, values.clone()));
+        self.write_variant_empty(memory, result);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// Read a DISPPARAMS' rgvarg array into types, in `rgvarg` order (the
+    /// array is stored reversed: index 0 is the last argument).
+    fn read_dispparams_values(&mut self, memory: &mut MemoryImage, params: u64) -> Vec<ComValue> {
+        if params == 0 {
+            return Vec::new();
+        }
+        let count_offset = match self.guest_arch {
+            GuestArch::X86 => 8,
+            GuestArch::X64 => 16,
+        };
+        let count = memory.read_u32(params + count_offset).unwrap_or(0) as usize;
+        let rgvarg = read_guest_pointer(memory, params, self.guest_arch).unwrap_or(0);
+        let mut values = Vec::with_capacity(count);
+        for index in 0..count.min(256) {
+            let variant = rgvarg + index as u64 * self.com_variant_size();
+            match self.read_variant_value(memory, variant) {
+                Ok(Some(value)) => values.push(value),
+                _ => values.push(ComValue::Empty),
+            }
+        }
+        values
+    }
+
+    /// Build the guest DISPPARAMS + result + EXCEPINFO block for a sink
+    /// invocation with the given logical argument order.
+    fn build_dispatch_invocation(
+        &mut self,
+        memory: &mut MemoryImage,
+        args: &[ComValue],
+    ) -> AppResult<(u64, u64, u64, u64)> {
+        let count = args.len();
+        let variant_size = self.com_variant_size();
+        let rgvarg = if count == 0 {
+            0
+        } else {
+            self.alloc_zeroed(memory, (variant_size * count as u64) as usize, 8)?
+        };
+        // DISPPARAMS stores the arguments reversed: rgvarg[0] is the last.
+        for (index, argument) in args.iter().enumerate() {
+            let position = count - 1 - index;
+            let variant = rgvarg + position as u64 * variant_size;
+            self.write_variant_value(memory, variant, argument)?;
+        }
+        let params_size = match self.guest_arch {
+            GuestArch::X86 => 16,
+            GuestArch::X64 => 24,
+        };
+        let params = self.alloc_zeroed(memory, params_size, 8)?;
+        write_guest_pointer(memory, params, rgvarg, self.guest_arch).ok();
+        let count_offset = match self.guest_arch {
+            GuestArch::X86 => 8,
+            GuestArch::X64 => 16,
+        };
+        write_u32(memory, params + count_offset, count as u32);
+        let result = self.alloc_zeroed(memory, variant_size as usize, 8)?;
+        let exception = self.alloc_zeroed(
+            memory,
+            match self.guest_arch {
+                GuestArch::X86 => 32,
+                GuestArch::X64 => 64,
+            },
+            8,
+        )?;
+        let argument_error = self.alloc_zeroed(memory, 4, 4)?;
+        Ok((params, result, exception, argument_error))
+    }
+
+    /// The shared `GetIDsOfNames` body (IDispatch and ITypeInfo share the
+    /// registered table lookup).
+    fn com_get_ids_of_names(
+        &mut self,
+        memory: &mut MemoryImage,
+        this: u64,
+        names_ptr: u64,
+        count: u32,
+        _lcid: u32,
+        ids_ptr: u64,
+    ) -> AppResult<u32> {
+        if names_ptr == 0 || ids_ptr == 0 {
+            return Ok(E_POINTER);
+        }
+        let table_name = match self.com_servers.get(&this) {
+            Some(server) => server.table.clone(),
+            None => match self.com_type_infos.get(&this) {
+                Some(info) => info.table.clone(),
+                None => return Ok(E_NOINTERFACE),
+            },
+        };
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let mut all_found = true;
+        for index in 0..count.min(256) {
+            let name_ptr = read_guest_pointer(
+                memory,
+                names_ptr + index as u64 * pointer_bytes,
+                self.guest_arch,
+            )
+            .unwrap_or(0);
+            let name = read_utf16_string(memory, name_ptr).unwrap_or_default();
+            match self.com_resolve_dispid(this, &table_name, &name) {
+                Some(dispid) => write_u32(memory, ids_ptr + index as u64 * 4, dispid as u32),
+                None => {
+                    all_found = false;
+                    write_u32(memory, ids_ptr + index as u64 * 4, DISPID_UNKNOWN as u32);
+                }
+            }
+        }
+        Ok(if all_found { S_OK } else { DISP_E_UNKNOWNNAME })
+    }
+
+    // ── IMoniker: real parse + bind ─────────────────────────────────────────
+
+    /// `MkParseDisplayName(pbc, szUserName, pchEaten, ppmk)` — parse the
+    /// moniker forms the runtime models: `file:`/bare Windows paths (file
+    /// monikers over the real filesystem), `clsid:` GUIDs and registered
+    /// ProgIDs (class monikers), and http(s) URLs (URL monikers).  Malformed
+    /// names fail with `MK_E_SYNTAX` and `pchEaten` reports the consumed
+    /// prefix for the parsed forms.
+    pub(crate) fn dispatch_com_mk_parse_display_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let eaten_out = guest_call_arg(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        let Some(raw_name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(MK_E_SYNTAX));
+            return Ok(());
+        };
+        let Some((moniker_state, eaten)) = self.parse_com_display_name(&raw_name) else {
+            if out != 0 {
+                write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(MK_E_SYNTAX));
+            return Ok(());
+        };
+        let moniker = match self.alloc_com_moniker_object(memory, moniker_state) {
+            Ok(moniker) => moniker,
+            Err(_) => {
+                state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+                return Ok(());
+            }
+        };
+        if eaten_out != 0 {
+            write_u32(memory, eaten_out, eaten);
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, moniker, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// Parse one display name into a moniker state plus the number of
+    /// consumed UTF-16 units; `None` for a name the runtime cannot model.
+    fn parse_com_display_name(
+        &mut self,
+        raw_name: &str,
+    ) -> Option<(crate::runtime::state::ComMonikerState, u32)> {
+        // Leading whitespace is consumed like the real MkParseDisplayName.
+        let leading = raw_name.len() - raw_name.trim_start().len();
+        let name = raw_name.trim_start();
+        let eaten = raw_name.encode_utf16().count() as u32;
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("file:") {
+            let mut payload = &name[5..];
+            if let Some(rest) = payload.strip_prefix("//") {
+                payload = rest;
+            }
+            if payload.is_empty() {
+                return None;
+            }
+            let host_path = self
+                .win32
+                .guest_path_to_host_path(payload)
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+            return Some((
+                crate::runtime::state::ComMonikerState {
+                    kind: crate::runtime::state::ComMonikerKind::File,
+                    display_name: name.to_string(),
+                    payload: payload.to_string(),
+                    host_path,
+                },
+                eaten,
+            ));
+        }
+        if lower.starts_with("clsid:") {
+            let payload = &name[6..];
+            if Self::parse_guid_string(payload).is_none() {
+                return None;
+            }
+            return Some((
+                crate::runtime::state::ComMonikerState {
+                    kind: crate::runtime::state::ComMonikerKind::Class,
+                    display_name: name.to_string(),
+                    payload: payload.to_string(),
+                    host_path: None,
+                },
+                eaten,
+            ));
+        }
+        if lower.starts_with("http:") || lower.starts_with("https:") {
+            return Some((
+                crate::runtime::state::ComMonikerState {
+                    kind: crate::runtime::state::ComMonikerKind::Url,
+                    display_name: name.to_string(),
+                    payload: name.to_string(),
+                    host_path: None,
+                },
+                eaten,
+            ));
+        }
+        // A bare Windows path (`C:\...`, `\\server\share`, or a path with a
+        // directory separator) is a file moniker.
+        let looks_like_path = name.len() >= 2
+            && name.as_bytes()[1] == b':'
+            && name.chars().nth(2).is_some_and(|c| c == '\\' || c == '/')
+            || name.starts_with("\\\\")
+            || name.contains('\\');
+        if looks_like_path {
+            let host_path = self
+                .win32
+                .guest_path_to_host_path(name)
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+            return Some((
+                crate::runtime::state::ComMonikerState {
+                    kind: crate::runtime::state::ComMonikerKind::File,
+                    display_name: name.to_string(),
+                    payload: name.to_string(),
+                    host_path,
+                },
+                eaten,
+            ));
+        }
+        // A registered ProgID (HKCR\<progid>\CLSID) is a class moniker.
+        if !name.is_empty() {
+            let key = format!("{name}\\CLSID");
+            if let Some(value) = self
+                .win32
+                .registry_get_value("HKCR", &key, "", RegistryView::Native)
+                .ok()
+                .flatten()
+            {
+                let clsid = value.data.as_str().map(str::to_string).unwrap_or_default();
+                if Self::parse_guid_string(&clsid).is_some() {
+                    return Some((
+                        crate::runtime::state::ComMonikerState {
+                            kind: crate::runtime::state::ComMonikerKind::Class,
+                            display_name: name.to_string(),
+                            payload: clsid,
+                            host_path: None,
+                        },
+                        eaten,
+                    ));
+                }
+            }
+        }
+        let _ = leading;
+        None
+    }
+
+    /// Create a guest IMoniker object for a parsed display name.
+    pub(crate) fn alloc_com_moniker_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        moniker_state: crate::runtime::state::ComMonikerState,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::MonikerBindToObject,
+            HostThunk::MonikerBindToStorage,
+            HostThunk::MonikerReduce,
+            HostThunk::MonikerComposeWith,
+            HostThunk::MonikerGetDisplayName,
+            HostThunk::MonikerEnum,
+            HostThunk::MonikerIsSystemMoniker,
+            HostThunk::MonikerHash,
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComFileMoniker, vtable)?;
+        self.com_moniker_names
+            .insert(object, moniker_state.display_name.clone());
+        self.com_monikers.insert(object, moniker_state);
+        Ok(object)
+    }
+
+    pub(crate) fn dispatch_com_moniker_bind_to_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let riid_ptr = guest_call_arg(state, memory, 3)?;
+        let out = guest_call_arg(state, memory, 4)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        let riid = if riid_ptr != 0 {
+            std::array::from_fn(|index| memory.read_u8(riid_ptr + index as u64).unwrap_or(0))
+        } else {
+            COM_IID_IUNKNOWN
+        };
+        match self.com_moniker_object_for(this) {
+            ComMonikerKind::File => {
+                let Some(host_path) = self
+                    .com_monikers
+                    .get(&this)
+                    .and_then(|moniker| moniker.host_path.clone())
+                else {
+                    state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+                    return Ok(());
+                };
+                if !std::path::Path::new(&host_path).exists() {
+                    state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+                    return Ok(());
+                }
+                let is_link = host_path.to_ascii_lowercase().ends_with(".lnk");
+                if is_link {
+                    let object = self.alloc_shell_link_object(memory)?;
+                    self.add_ref_guest_object(object)?;
+                    write_guest_pointer(memory, out, object, self.guest_arch).ok();
+                    state.set(Register::Rax, u64::from(S_OK));
+                    return Ok(());
+                }
+                let bytes = std::fs::read(&host_path).unwrap_or_default();
+                if let Some(clsid) = ole_embedded_clsid(&bytes) {
+                    let clsid_text = Self::guid_bytes_to_string(&clsid);
+                    match self.try_create_com_object(memory, &clsid_text, IID_IUNKNOWN, 0)? {
+                        Some(object) => {
+                            self.add_ref_guest_object(object)?;
+                            write_guest_pointer(memory, out, object, self.guest_arch).ok();
+                            state.set(Register::Rax, u64::from(S_OK));
+                        }
+                        None => state.set(Register::Rax, u64::from(REGDB_E_CLASSNOTREG)),
+                    }
+                } else {
+                    // No handler is registered for a plain file: the honest
+                    // moniker-bind answer.
+                    state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+                }
+                let _ = riid;
+                Ok(())
+            }
+            ComMonikerKind::Class => {
+                let payload = self
+                    .com_monikers
+                    .get(&this)
+                    .map(|moniker| moniker.payload.clone())
+                    .unwrap_or_default();
+                match Self::parse_guid_string(&payload) {
+                    Some(_) => {
+                        match self.try_create_com_object(memory, &payload, IID_IUNKNOWN, 0)? {
+                            Some(object) => {
+                                self.add_ref_guest_object(object)?;
+                                write_guest_pointer(memory, out, object, self.guest_arch).ok();
+                                state.set(Register::Rax, u64::from(S_OK));
+                            }
+                            None => state.set(Register::Rax, u64::from(REGDB_E_CLASSNOTREG)),
+                        }
+                    }
+                    None => state.set(Register::Rax, u64::from(MK_E_NOOBJECT)),
+                }
+                Ok(())
+            }
+            ComMonikerKind::Url => {
+                // The runtime models no URL object handlers: the honest
+                // MK_E_NOOBJECT (a real bind would need a protocol handler).
+                state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_com_moniker_bind_to_storage(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let riid_ptr = guest_call_arg(state, memory, 3)?;
+        let out = guest_call_arg(state, memory, 4)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        let riid = if riid_ptr != 0 {
+            std::array::from_fn(|index| memory.read_u8(riid_ptr + index as u64).unwrap_or(0))
+        } else {
+            COM_IID_IUNKNOWN
+        };
+        let kind = self.com_moniker_object_for(this);
+        if kind == ComMonikerKind::Url {
+            state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+            return Ok(());
+        }
+        let Some(host_path) = self
+            .com_monikers
+            .get(&this)
+            .and_then(|moniker| moniker.host_path.clone())
+        else {
+            state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+            return Ok(());
+        };
+        let path = std::path::Path::new(&host_path);
+        if !path.exists() {
+            state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+            return Ok(());
+        }
+        let want_storage = riid == COM_IID_ISTORAGE;
+        let want_stream = riid == COM_IID_ISTREAM || riid == COM_IID_ISEQUENTIALSTREAM;
+        let wants_default = riid == COM_IID_IUNKNOWN || riid.iter().all(|byte| *byte == 0);
+        if path.is_dir() {
+            if want_stream {
+                state.set(Register::Rax, u64::from(E_NOINTERFACE));
+                return Ok(());
+            }
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_string();
+            let storage = self.alloc_com_storage_object(memory, Some(host_path), &name, 0)?;
+            self.add_ref_guest_object(storage)?;
+            write_guest_pointer(memory, out, storage, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        if want_storage {
+            // File storages bind through the containing directory with the
+            // file exposed as a stream element.
+            let (directory, file_name) = match (path.parent(), path.file_name()) {
+                (Some(directory), Some(file_name)) => (
+                    directory.to_string_lossy().to_string(),
+                    file_name.to_string_lossy().to_string(),
+                ),
+                _ => {
+                    state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+                    return Ok(());
+                }
+            };
+            let storage = self.alloc_com_storage_object(memory, Some(directory), &file_name, 0)?;
+            self.add_ref_guest_object(storage)?;
+            write_guest_pointer(memory, out, storage, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        if want_stream || wants_default {
+            let stream = self.alloc_com_stream_from_file(memory, &host_path)?;
+            self.add_ref_guest_object(stream)?;
+            write_guest_pointer(memory, out, stream, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(E_NOINTERFACE));
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_com_moniker_reduce(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let reduced_out = guest_call_arg(state, memory, 4)?;
+        if reduced_out != 0 {
+            write_guest_pointer(memory, reduced_out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(MK_E_REDUCED_TO_SELF));
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_com_moniker_compose_with(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let composite_out = guest_call_arg(state, memory, 3)?;
+        if composite_out != 0 {
+            write_guest_pointer(memory, composite_out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(E_NOTIMPL));
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_com_moniker_get_display_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        let name = self
+            .com_monikers
+            .get(&this)
+            .map(|moniker| moniker.display_name.clone())
+            .or_else(|| self.com_moniker_names.get(&this).cloned())
+            .unwrap_or_default();
+        if name.is_empty() {
+            state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+            return Ok(());
+        }
+        let bstr = self.alloc_com_bstr(memory, &name)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, bstr, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_com_moniker_enum(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let out = guest_call_arg(state, memory, 2)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_com_moniker_is_system_moniker(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let code = match self.com_moniker_object_for(this) {
+            ComMonikerKind::File => 2,  // MKSYS_FILEMONIKER
+            ComMonikerKind::Class => 6, // MKSYS_CLASSMONIKER
+            ComMonikerKind::Url => 7,   // MKSYS_OBJREFMONIKER (URL moniker family)
+        };
+        if out != 0 {
+            write_u32(memory, out, code);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_com_moniker_hash(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let name = self
+            .com_monikers
+            .get(&this)
+            .map(|moniker| moniker.display_name.clone())
+            .unwrap_or_default();
+        let mut hash: u32 = 0;
+        for unit in name.encode_utf16() {
+            hash = (hash << 4).wrapping_add(unit as u32);
+            let top = hash & 0xF000_0000;
+            if top != 0 {
+                hash ^= top >> 24;
+            }
+            hash &= !0xF000_0000;
+        }
+        if out != 0 {
+            write_u32(memory, out, hash);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_moniker_object_for(&self, object: u64) -> crate::runtime::state::ComMonikerKind {
+        if let Some(moniker) = self.com_monikers.get(&object) {
+            return moniker.kind;
+        }
+        if matches!(
+            self.guest_object_kind(object),
+            Ok(GuestObjectKind::UrlMoniker)
+        ) {
+            return crate::runtime::state::ComMonikerKind::Url;
+        }
+        crate::runtime::state::ComMonikerKind::File
+    }
+}
+
+/// Encode one pointer-sized value as raw little-endian bytes.
+fn pointer_bytes_bytes(value: u64, pointer_bytes: u64) -> Vec<u8> {
+    value.to_le_bytes()[..pointer_bytes as usize].to_vec()
+}
+
+/// Encode one CONNECTDATA (interface pointer + cookie) for the guest
+/// architecture.
+fn connect_data_bytes(sink: u64, cookie: u32, pointer_bytes: u64) -> Vec<u8> {
+    let mut bytes = pointer_bytes_bytes(sink, pointer_bytes);
+    bytes.extend_from_slice(&cookie.to_le_bytes());
+    if pointer_bytes == 8 {
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+    }
+    bytes
+}
+
+/// Convert a Windows FILETIME tick count into a `SystemTime` (the IStorage
+/// element-time path); returns `None` for an unrepresentable value.
+fn filetime_to_system_time(ticks: u64) -> Option<std::time::SystemTime> {
+    const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
+    const WINDOWS_EPOCH_OFFSET_SECONDS: u64 = 11_644_473_600;
+    let seconds = ticks / WINDOWS_TICKS_PER_SECOND;
+    let nanos = ((ticks % WINDOWS_TICKS_PER_SECOND) * 100) as u32;
+    let unix_seconds = seconds.checked_sub(WINDOWS_EPOCH_OFFSET_SECONDS)?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(unix_seconds, nanos))
+}
+
+// ── COM interface method identities (the vtable thunk payloads) ────────────
+
+/// Every runtime COM interface method dispatched through a guest vtable.
+/// The variant doubles as the ABI identity of one vtable slot: the
+/// dispatcher pops `x86_arg_bytes()` bytes after the stdcall call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComMethod {
+    QueryInterface,
+    StreamRead,
+    StreamWrite,
+    StreamSeek,
+    StreamSetSize,
+    StreamCopyTo,
+    StreamCommit,
+    StreamRevert,
+    StreamLockRegion,
+    StreamUnlockRegion,
+    StreamStat,
+    StreamClone,
+    StorageCreateStream,
+    StorageOpenStream,
+    StorageCreateStorage,
+    StorageOpenStorage,
+    StorageCopyTo,
+    StorageMoveElement,
+    StorageCommit,
+    StorageRevert,
+    StorageEnumElements,
+    StorageDestroyElement,
+    StorageRenameElement,
+    StorageSetElementTimes,
+    StorageSetClass,
+    StorageSetStateBits,
+    StorageStat,
+    EnumConnectionPoints,
+    FindConnectionPoint,
+    GetConnectionInterface,
+    GetConnectionPointContainer,
+    Advise,
+    Unadvise,
+    EnumConnections,
+    EnumNext,
+    EnumSkip,
+    EnumReset,
+    EnumClone,
+    DispatchGetTypeInfoCount,
+    DispatchGetTypeInfo,
+    DispatchGetIDsOfNames,
+    DispatchInvoke,
+    TypeInfoGetTypeAttr,
+    TypeInfoGetFuncDesc,
+    TypeInfoGetVarDesc,
+    TypeInfoGetNames,
+    TypeInfoGetIDsOfNames,
+    TypeInfoInvoke,
+    TypeInfoGetDocumentation,
+    TypeInfoReleaseTypeAttr,
+    TypeInfoReleaseFuncDesc,
+    TypeInfoReleaseVarDesc,
+    TypeInfoUnsupported,
+    ServerGetValue,
+    ServerPutValue,
+    ServerGetName,
+    ServerPutName,
+    ServerGetCount,
+    ServerAdd,
+    ServerReset,
+    ServerFireValueChanged,
+    SinkInvoke,
+}
+
+impl ComMethod {
+    /// The stdcall argument bytes the x86 dispatcher pops after the call.
+    pub fn x86_arg_bytes(&self) -> u64 {
+        match self {
+            ComMethod::QueryInterface => 12,
+            ComMethod::StreamRead | ComMethod::StreamWrite => 16,
+            ComMethod::StreamSeek => 20,
+            ComMethod::StreamSetSize => 12,
+            ComMethod::StreamCopyTo => 24,
+            ComMethod::StreamCommit => 8,
+            ComMethod::StreamRevert => 4,
+            ComMethod::StreamLockRegion | ComMethod::StreamUnlockRegion => 24,
+            ComMethod::StreamStat => 12,
+            ComMethod::StreamClone => 8,
+            ComMethod::StorageCreateStream | ComMethod::StorageCreateStorage => 20,
+            ComMethod::StorageOpenStream | ComMethod::StorageOpenStorage => 24,
+            ComMethod::StorageCopyTo => 20,
+            ComMethod::StorageMoveElement => 16,
+            ComMethod::StorageCommit => 8,
+            ComMethod::StorageRevert => 4,
+            ComMethod::StorageEnumElements => 20,
+            ComMethod::StorageDestroyElement => 8,
+            ComMethod::StorageRenameElement => 12,
+            ComMethod::StorageSetElementTimes => 20,
+            ComMethod::StorageSetClass => 8,
+            ComMethod::StorageSetStateBits => 12,
+            ComMethod::StorageStat => 12,
+            ComMethod::EnumConnectionPoints
+            | ComMethod::GetConnectionInterface
+            | ComMethod::GetConnectionPointContainer
+            | ComMethod::EnumConnections
+            | ComMethod::EnumSkip
+            | ComMethod::EnumClone
+            | ComMethod::DispatchGetTypeInfoCount
+            | ComMethod::TypeInfoGetTypeAttr
+            | ComMethod::TypeInfoReleaseTypeAttr
+            | ComMethod::TypeInfoReleaseFuncDesc
+            | ComMethod::TypeInfoReleaseVarDesc
+            | ComMethod::ServerGetValue
+            | ComMethod::ServerPutValue
+            | ComMethod::ServerGetName
+            | ComMethod::ServerPutName
+            | ComMethod::ServerGetCount
+            | ComMethod::ServerFireValueChanged => 8,
+            ComMethod::FindConnectionPoint
+            | ComMethod::Advise
+            | ComMethod::EnumNext
+            | ComMethod::DispatchGetTypeInfo
+            | ComMethod::TypeInfoGetFuncDesc
+            | ComMethod::TypeInfoGetVarDesc => 12,
+            ComMethod::Unadvise => 8,
+            ComMethod::TypeInfoGetIDsOfNames => 16,
+            ComMethod::EnumReset => 4,
+            ComMethod::DispatchGetIDsOfNames => 24,
+            ComMethod::DispatchInvoke => 36,
+            ComMethod::TypeInfoGetNames => 20,
+            ComMethod::TypeInfoInvoke => 40,
+            ComMethod::TypeInfoGetDocumentation => 24,
+            ComMethod::TypeInfoUnsupported => 4,
+            ComMethod::ServerAdd => 16,
+            ComMethod::ServerReset => 4,
+            ComMethod::SinkInvoke => 36,
+        }
+    }
+}
+
+// ── COM error/status constants used by the interface methods ───────────────
+
+const E_NOTIMPL: u32 = 0x8000_4001;
+const E_POINTER: u32 = 0x8000_4003;
+const E_UNEXPECTED: u32 = 0x8000_FFFF;
+const CONNECT_E_NOCONNECTION: u32 = 0x8004_0200;
+const STG_E_FILENOTFOUND: u32 = 0x8003_0002;
+const STG_E_ACCESSDENIED: u32 = 0x8003_0005;
+const STG_E_INVALIDPOINTER: u32 = 0x8003_0009;
+const STG_E_FILEALREADYEXISTS: u32 = 0x8003_0050;
+const TYPE_E_ELEMENTNOTFOUND: u32 = 0x8002_802B;
+const DISPID_UNKNOWN: i32 = -1;
+const DISPID_VALUE: i32 = 0;
+const DISPATCH_METHOD: u16 = 0x0001;
+const DISPATCH_PROPERTYGET: u16 = 0x0002;
+const DISPATCH_PROPERTYPUT: u16 = 0x0004;
+const STATFLAG_NONAME: u32 = 0x0000_0002;
+const STGMOVE_MOVE: u32 = 0x0000_0001;
+const STGMOVE_COPY: u32 = 0x0000_0002;
+
+// ── The COM interface IIDs the runtime objects answer to ──────────────────
+
+const COM_IID_IUNKNOWN: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IDISPATCH: [u8; 16] = [
+    0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_ITYPEINFO: [u8; 16] = [
+    0x01, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_ISTREAM: [u8; 16] = [
+    0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_ISEQUENTIALSTREAM: [u8; 16] = [
+    0x30, 0x3a, 0x73, 0x0c, 0x1c, 0x2a, 0xce, 0x11, 0xad, 0xe5, 0x00, 0xaa, 0x00, 0x44, 0x77, 0x3d,
+];
+const COM_IID_ISTORAGE: [u8; 16] = [
+    0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IMONIKER: [u8; 16] = [
+    0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IENUMVARIANT: [u8; 16] = [
+    0x04, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IBINDCTX: [u8; 16] = [
+    0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_ICONNECTIONPOINT: [u8; 16] = [
+    0x86, 0xb2, 0x96, 0xb1, 0xb4, 0xba, 0x1a, 0x10, 0xb6, 0x9c, 0x00, 0xaa, 0x00, 0x34, 0x1d, 0x07,
+];
+const COM_IID_ICONNECTIONPOINTCONTAINER: [u8; 16] = [
+    0x84, 0xb2, 0x96, 0xb1, 0xb4, 0xba, 0x1a, 0x10, 0xb6, 0x9c, 0x00, 0xaa, 0x00, 0x34, 0x1d, 0x07,
+];
+
+/// The runtime's in-process automation/event-source class CLSID.  This is a
+/// synthetic-environment class: the runtime's in-process class table models
+/// a real IDispatch server with connection points (the behavior is real; the
+/// class identity is the runtime's own).
+pub const COM_AUTOMATION_SERVER_CLSID: &str = "{C1A50001-0000-4000-8000-000000000001}";
+
+/// The automation server's event dispinterface IID (synthetic for the same
+/// reason: the event sink contract it carries is fully implemented).
+pub const COM_AUTOMATION_EVENTS_IID: [u8; 16] = [
+    0x02, 0x00, 0xa5, 0xc1, 0x00, 0x00, 0x00, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+];
+
+// ── The registered dispatch method tables ─────────────────────────────────
+
+/// The callable kind of one registered automation member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComMemberKind {
+    PropertyGet,
+    PropertyPut,
+    Method,
+}
+
+/// One registered automation member: the real per-interface DISPID
+/// assignment (`GetIDsOfNames` resolves from these tables).
+#[derive(Debug, Clone, Copy)]
+struct ComDispatchMember {
+    name: &'static str,
+    dispid: i32,
+    kind: ComMemberKind,
+    /// Argument count (for FUNCDESC generation).
+    args: u16,
+    /// Return VARTYPE (VT_EMPTY = 0 when there is no result).
+    returns: u16,
+    /// The dual-interface vtable slot this member's method lives at.
+    slot: u32,
+}
+
+use ComMemberKind::{Method as MemberMethod, PropertyGet as MemberGet, PropertyPut as MemberPut};
+
+/// `ICasa1Automation` — the automation server's dual-interface table.
+static CASA1_AUTOMATION_TABLE: &[ComDispatchMember] = &[
+    ComDispatchMember {
+        name: "Value",
+        dispid: 1,
+        kind: MemberGet,
+        args: 0,
+        returns: 3,
+        slot: 7,
+    },
+    ComDispatchMember {
+        name: "Value",
+        dispid: 1,
+        kind: MemberPut,
+        args: 1,
+        returns: 0,
+        slot: 8,
+    },
+    ComDispatchMember {
+        name: "Name",
+        dispid: 2,
+        kind: MemberGet,
+        args: 0,
+        returns: 8,
+        slot: 9,
+    },
+    ComDispatchMember {
+        name: "Name",
+        dispid: 2,
+        kind: MemberPut,
+        args: 1,
+        returns: 0,
+        slot: 10,
+    },
+    ComDispatchMember {
+        name: "Count",
+        dispid: 3,
+        kind: MemberGet,
+        args: 0,
+        returns: 3,
+        slot: 11,
+    },
+    ComDispatchMember {
+        name: "Add",
+        dispid: 4,
+        kind: MemberMethod,
+        args: 2,
+        returns: 3,
+        slot: 12,
+    },
+    ComDispatchMember {
+        name: "Reset",
+        dispid: 5,
+        kind: MemberMethod,
+        args: 0,
+        returns: 0,
+        slot: 13,
+    },
+    ComDispatchMember {
+        name: "FireValueChanged",
+        dispid: 6,
+        kind: MemberMethod,
+        args: 1,
+        returns: 0,
+        slot: 14,
+    },
+];
+
+/// `ICasa1AutomationEvents` — the connection point's event dispinterface.
+static CASA1_AUTOMATION_EVENTS_TABLE: &[ComDispatchMember] = &[
+    ComDispatchMember {
+        name: "OnValueChanged",
+        dispid: 10,
+        kind: MemberMethod,
+        args: 1,
+        returns: 0,
+        slot: 0,
+    },
+    ComDispatchMember {
+        name: "OnReset",
+        dispid: 11,
+        kind: MemberMethod,
+        args: 0,
+        returns: 0,
+        slot: 0,
+    },
+];
+
+fn com_dispatch_table(name: &str) -> Option<&'static [ComDispatchMember]> {
+    match name {
+        "ICasa1Automation" => Some(CASA1_AUTOMATION_TABLE),
+        "ICasa1AutomationEvents" => Some(CASA1_AUTOMATION_EVENTS_TABLE),
+        _ => None,
+    }
+}
+
+/// The interface IID a table describes (the TYPEATTR guid): the automation
+/// class reuses its own class-family GUID shape.
+fn com_dispatch_table_iid(table: &str) -> [u8; 16] {
+    if table.starts_with("ICasa1AutomationEvents") {
+        COM_AUTOMATION_EVENTS_IID
+    } else {
+        [
+            0x01, 0x00, 0xa5, 0xc1, 0x00, 0x00, 0x00, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]
+    }
+}
+
+/// The first table entry for a DISPID.  Property get and put entries share a
+/// DISPID; the invocation flags select the matching entry (a get entry when
+/// both exist).
+fn com_dispatch_member(table: &str, dispid: i32) -> Option<&'static ComDispatchMember> {
+    let members = com_dispatch_table(table)?;
+    members
+        .iter()
+        .find(|member| member.dispid == dispid && member.kind != ComMemberKind::PropertyPut)
+        .or_else(|| members.iter().find(|member| member.dispid == dispid))
+}
+
+/// The table entry matching an invocation: property puts select the put
+/// entry sharing the DISPID, everything else selects the get/method entry.
+fn com_dispatch_member_for(
+    table: &str,
+    dispid: i32,
+    flags: u16,
+) -> Option<&'static ComDispatchMember> {
+    let members = com_dispatch_table(table)?;
+    if flags & DISPATCH_PROPERTYPUT != 0 {
+        members
+            .iter()
+            .find(|member| member.dispid == dispid && member.kind == ComMemberKind::PropertyPut)
+    } else {
+        com_dispatch_member(table, dispid)
+    }
+}
+
+fn com_dispatch_member_by_name(table: &str, name: &str) -> Option<&'static ComDispatchMember> {
+    let members = com_dispatch_table(table)?;
+    members
+        .iter()
+        .find(|member| member.name.eq_ignore_ascii_case(name))
+}
+
+fn com_value_as_i4(value: &ComValue) -> i32 {
+    match value {
+        ComValue::I4(number) => *number,
+        ComValue::Bool(flag) => i32::from(*flag),
+        ComValue::Double(number) => *number as i32,
+        ComValue::Bstr(text) => text.parse::<i32>().unwrap_or(0),
+        ComValue::Object(object) => *object as u32 as i32,
+        ComValue::Empty => 0,
+    }
 }
 
 /// The CLSID embedded in an OLE compound document (the header's CLSID
@@ -1882,4 +5690,1230 @@ fn ole_embedded_clsid(bytes: &[u8]) -> Option<[u8; 16]> {
         return None;
     }
     Some(clsid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{Fixture, dispatch_x86, with_big_stack, x86_fixture};
+    use super::*;
+
+    const OUT: u64 = 0x41_000;
+    const BUF: u64 = 0x41_100;
+    const STAT: u64 = 0x41_200;
+    const COOKIE: u64 = 0x41_300;
+    const IID_PTR: u64 = 0x41_400;
+    const VARIANT: u64 = 0x41_500;
+    const NAME: u64 = 0x41_600;
+    const NAMES: u64 = 0x41_800;
+    const IDS: u64 = 0x41_900;
+
+    fn guest_ptr(fixture: &Fixture, address: u64) -> u64 {
+        read_guest_pointer(&fixture.memory, address, GuestArch::X86).unwrap()
+    }
+
+    /// Invoke one vtable slot through the object's real vtable: read the
+    /// function pointer, resolve the host thunk the runtime installed and
+    /// dispatch it with the x86 stack ABI (exactly what the guest does).
+    fn call_slot(fixture: &mut Fixture, object: u64, slot: u64, args: &[u32]) -> u32 {
+        let vtable = read_guest_pointer(&fixture.memory, object, GuestArch::X86).unwrap();
+        let function =
+            read_guest_pointer(&fixture.memory, vtable + slot * 4, GuestArch::X86).unwrap();
+        let thunk = fixture
+            .runtime
+            .host_thunks
+            .get(&function)
+            .cloned()
+            .unwrap_or_else(|| panic!("vtable slot {slot} is not a host thunk"));
+        dispatch_x86(fixture, thunk, args) as u32
+    }
+
+    fn write_iid(fixture: &mut Fixture, ptr: u64, iid: &[u8; 16]) {
+        fixture.memory.map_bytes(ptr, iid);
+    }
+
+    fn write_utf16(fixture: &mut Fixture, ptr: u64, text: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        fixture.memory.map_bytes(ptr, &bytes);
+        bytes
+    }
+
+    fn read_variant_i4(fixture: &Fixture, ptr: u64) -> i32 {
+        assert_eq!(fixture.memory.read_u16(ptr).unwrap(), 3, "VT_I4");
+        fixture.memory.read_u32(ptr + 8).unwrap() as i32
+    }
+
+    fn create_server(fixture: &mut Fixture) -> u64 {
+        fixture
+            .runtime
+            .alloc_com_automation_server(&mut fixture.memory, "ICasa1Automation")
+            .unwrap()
+    }
+
+    // ── Streams ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stream_vtable_has_real_read_seek_stat_lock_and_clone_semantics() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-stream");
+            let stream = fixture
+                .runtime
+                .alloc_com_stream_object(
+                    &mut fixture.memory,
+                    b"0123456789".to_vec(),
+                    "data.bin",
+                    None,
+                )
+                .unwrap();
+
+            // Read 4 bytes at the initial position.
+            fixture.memory.map_bytes(BUF, &[0_u8; 16]);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    3,
+                    &[stream as u32, BUF as u32, 4, OUT as u32]
+                ),
+                0,
+                "IStream::Read"
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 4);
+            assert_eq!(fixture.memory.read_bytes(BUF, 4).unwrap(), b"0123");
+
+            // Seek to offset 4 (SET).
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    5,
+                    &[stream as u32, 4, 0, 0, OUT as u32]
+                ),
+                0,
+                "IStream::Seek"
+            );
+            assert_eq!(fixture.memory.read_u64(OUT).unwrap(), 4);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    3,
+                    &[stream as u32, BUF as u32, 2, OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_bytes(BUF, 2).unwrap(), b"45");
+
+            // Write extends the stream in place.
+            fixture.memory.map_bytes(BUF, b"XY");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    4,
+                    &[stream as u32, BUF as u32, 2, OUT as u32]
+                ),
+                0,
+                "IStream::Write"
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 2);
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_streams
+                    .get(&stream)
+                    .unwrap()
+                    .data
+                    .clone(),
+                b"012345XY89".to_vec()
+            );
+
+            // CopyTo walks the source position into the destination.
+            let destination = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, Vec::new(), "copy", None)
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    7,
+                    &[
+                        stream as u32,
+                        destination as u32,
+                        5,
+                        0,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                    ]
+                ),
+                0,
+                "IStream::CopyTo"
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_streams
+                    .get(&destination)
+                    .unwrap()
+                    .data
+                    .clone(),
+                b"89".to_vec()
+            );
+
+            // Stat reports the real type/size/name.
+            fixture.memory.map_bytes(STAT, &[0_u8; 72]);
+            assert_eq!(
+                call_slot(&mut fixture, stream, 12, &[stream as u32, STAT as u32, 0]),
+                0,
+                "IStream::Stat"
+            );
+            assert_eq!(
+                fixture.memory.read_u32(STAT + 4).unwrap(),
+                2,
+                "STGTY_STREAM"
+            );
+            assert_eq!(fixture.memory.read_u64(STAT + 8).unwrap(), 10);
+            let stat_name = guest_ptr(&fixture, STAT);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, stat_name).unwrap(),
+                "data.bin"
+            );
+
+            // LockRegion records the region; a duplicate is rejected; Unlock
+            // consumes the exact region.
+            assert_eq!(
+                call_slot(&mut fixture, stream, 10, &[stream as u32, 0, 0, 4, 0, 1]),
+                0,
+                "IStream::LockRegion"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 10, &[stream as u32, 0, 0, 4, 0, 1]),
+                STG_E_INVALIDFUNCTION
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 11, &[stream as u32, 0, 0, 4, 0, 1]),
+                0,
+                "IStream::UnlockRegion"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 11, &[stream as u32, 0, 0, 4, 0, 1]),
+                STG_E_INVALIDFUNCTION
+            );
+
+            // Clone copies the bytes and the position.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, stream, 13, &[stream as u32, OUT as u32]),
+                0,
+                "IStream::Clone"
+            );
+            let clone = guest_ptr(&fixture, OUT);
+            assert_ne!(clone, stream);
+            let clone_state = fixture.runtime.com_streams.get(&clone).unwrap();
+            assert_eq!(clone_state.data, b"012345XY89".to_vec());
+            assert_eq!(clone_state.position, 10);
+
+            // The stream answers IStream/ISequentialStream/IUnknown and
+            // rejects unrelated interfaces.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    0,
+                    &[stream as u32, IID_PTR as u32, OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), stream);
+        })
+    }
+
+    #[test]
+    fn stream_file_backing_commits_and_reverts_over_the_real_file() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-stream-file");
+            let host_path = fixture._temp.path().join("backing.bin");
+            std::fs::write(&host_path, b"disk").unwrap();
+            let stream = fixture
+                .runtime
+                .alloc_com_stream_from_file(&mut fixture.memory, host_path.to_str().unwrap())
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_streams
+                    .get(&stream)
+                    .unwrap()
+                    .data
+                    .clone(),
+                b"disk".to_vec()
+            );
+
+            // Seek to the end and append through Write, then Commit.
+            assert_eq!(
+                call_slot(&mut fixture, stream, 5, &[stream as u32, 0, 0, 2, 0]),
+                0
+            );
+            fixture.memory.map_bytes(BUF, b"-live");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    4,
+                    &[stream as u32, BUF as u32, 5, OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 8, &[stream as u32, 0]),
+                0,
+                "IStream::Commit"
+            );
+            assert_eq!(std::fs::read(&host_path).unwrap(), b"disk-live".to_vec());
+
+            // An out-of-band change is observed by Revert.
+            std::fs::write(&host_path, b"external").unwrap();
+            assert_eq!(
+                call_slot(&mut fixture, stream, 9, &[stream as u32]),
+                0,
+                "IStream::Revert"
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_streams
+                    .get(&stream)
+                    .unwrap()
+                    .data
+                    .clone(),
+                b"external".to_vec()
+            );
+        })
+    }
+
+    // ── Storage ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn storage_creates_opens_and_enumerates_streams_over_a_real_directory() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-storage");
+            let directory = fixture._temp.path().join("store");
+            std::fs::create_dir_all(&directory).unwrap();
+            let storage = fixture
+                .runtime
+                .alloc_com_storage_object(
+                    &mut fixture.memory,
+                    Some(directory.to_string_lossy().to_string()),
+                    "store",
+                    0,
+                )
+                .unwrap();
+
+            // CreateStream + Write + storage Commit writes the real file.
+            write_utf16(&mut fixture, NAME, "element.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    3,
+                    &[storage as u32, NAME as u32, 0x1002, 0, OUT as u32]
+                ),
+                0,
+                "IStorage::CreateStream"
+            );
+            let stream = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, b"payload");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    4,
+                    &[stream as u32, BUF as u32, 7, OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 8, &[stream as u32, 0]),
+                0,
+                "IStream::Commit writes the host file"
+            );
+            assert_eq!(
+                std::fs::read(directory.join("element.bin")).unwrap(),
+                b"payload".to_vec()
+            );
+
+            // OpenStream returns a fresh stream over the committed bytes.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    4,
+                    &[storage as u32, NAME as u32, 0, 0x1000, 0, OUT as u32]
+                ),
+                0,
+                "IStorage::OpenStream"
+            );
+            let reopened = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_streams
+                    .get(&reopened)
+                    .unwrap()
+                    .data
+                    .clone(),
+                b"payload".to_vec()
+            );
+
+            // Missing elements answer STG_E_FILENOTFOUND.
+            write_utf16(&mut fixture, NAME, "missing.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    4,
+                    &[storage as u32, NAME as u32, 0, 0x1000, 0, OUT as u32]
+                ),
+                STG_E_FILENOTFOUND
+            );
+
+            // EnumElements lists the element with its STATSTG.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    11,
+                    &[storage as u32, 0, 0, 0, OUT as u32]
+                ),
+                0,
+                "IStorage::EnumElements"
+            );
+            let enumerator = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+            let fetched = OUT + 4;
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 1, BUF as u32, fetched as u32]
+                ),
+                0,
+                "IEnumSTATSTG::Next"
+            );
+            assert_eq!(fixture.memory.read_u32(fetched).unwrap(), 1);
+            let descriptor = guest_ptr(&fixture, BUF);
+            assert_eq!(fixture.memory.read_u32(descriptor + 4).unwrap(), 2);
+            assert_eq!(fixture.memory.read_u64(descriptor + 8).unwrap(), 7);
+            let element_name = guest_ptr(&fixture, descriptor);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, element_name).unwrap(),
+                "element.bin"
+            );
+
+            // DestroyElement removes the real file and the element.
+            write_utf16(&mut fixture, NAME, "element.bin");
+            assert_eq!(
+                call_slot(&mut fixture, storage, 12, &[storage as u32, NAME as u32]),
+                0,
+                "IStorage::DestroyElement"
+            );
+            assert!(!directory.join("element.bin").exists());
+        })
+    }
+
+    // ── Connection points and events ────────────────────────────────────────
+
+    #[test]
+    fn connection_points_advise_bookkeeping_enumeration_and_event_firing() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-cp");
+            let server = create_server(&mut fixture);
+            let sink = fixture
+                .runtime
+                .alloc_com_sink_object(&mut fixture.memory, "ISink")
+                .unwrap();
+
+            // QI(ID_IConnectionPointContainer) on the server hands out the
+            // container interface object.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ICONNECTIONPOINTCONTAINER);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    0,
+                    &[server as u32, IID_PTR as u32, OUT as u32]
+                ),
+                0,
+                "server QueryInterface(IConnectionPointContainer)"
+            );
+            let container = guest_ptr(&fixture, OUT);
+            assert_ne!(container, 0);
+
+            // FindConnectionPoint(events IID) returns the event point; an
+            // unrelated IID is CONNECT_E_NOCONNECTION.
+            write_iid(&mut fixture, IID_PTR, &COM_AUTOMATION_EVENTS_IID);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    4,
+                    &[container as u32, IID_PTR as u32, OUT as u32]
+                ),
+                0,
+                "FindConnectionPoint"
+            );
+            let point = guest_ptr(&fixture, OUT);
+            assert_ne!(point, 0);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDISPATCH);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    4,
+                    &[container as u32, IID_PTR as u32, OUT as u32]
+                ),
+                CONNECT_E_NOCONNECTION
+            );
+
+            // The point reports its interface and owner container.
+            write_iid(&mut fixture, IID_PTR, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(&mut fixture, point, 3, &[point as u32, IID_PTR as u32]),
+                0
+            );
+            assert_eq!(
+                fixture.memory.read_bytes(IID_PTR, 16).unwrap(),
+                COM_AUTOMATION_EVENTS_IID.to_vec()
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, point, 4, &[point as u32, OUT as u32]),
+                0
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), container);
+
+            // Advise the sink; the cookie is recorded.
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    point,
+                    5,
+                    &[point as u32, sink as u32, COOKIE as u32]
+                ),
+                0,
+                "IConnectionPoint::Advise"
+            );
+            let cookie = fixture.memory.read_u32(COOKIE).unwrap();
+            assert_ne!(cookie, 0);
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_connection_points
+                    .get(&point)
+                    .unwrap()
+                    .sinks,
+                vec![(cookie, sink)]
+            );
+
+            // EnumConnections enumerates the (sink, cookie) CONNECTDATA.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, point, 7, &[point as u32, OUT as u32]),
+                0,
+                "EnumConnections"
+            );
+            let connections = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 16]);
+            let fetched = OUT + 4;
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    connections,
+                    3,
+                    &[connections as u32, 1, BUF as u32, fetched as u32]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(fetched).unwrap(), 1);
+            assert_eq!(guest_ptr(&fixture, BUF), sink);
+            assert_eq!(fixture.memory.read_u32(BUF + 4).unwrap(), cookie);
+
+            // EnumConnectionPoints enumerates the point itself.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, container, 3, &[container as u32, OUT as u32]),
+                0,
+                "EnumConnectionPoints"
+            );
+            let points = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    points,
+                    3,
+                    &[points as u32, 1, BUF as u32, fetched as u32]
+                ),
+                0
+            );
+            assert_eq!(guest_ptr(&fixture, BUF), point);
+
+            // A server state change (put_Value) fires OnValueChanged into the
+            // advised sink through its real IDispatch::Invoke slot.
+            fixture
+                .runtime
+                .write_variant_i4(&mut fixture.memory, VARIANT, 42);
+            assert_eq!(
+                call_slot(&mut fixture, server, 8, &[server as u32, VARIANT as u32]),
+                0,
+                "put_Value"
+            );
+            assert_eq!(
+                fixture.runtime.com_sink_invocations,
+                vec![(sink, 10, vec![ComValue::I4(42)])]
+            );
+            let fired = fixture.runtime.com_fired_events.last().unwrap();
+            assert_eq!(fired.source, server);
+            assert_eq!(fired.dispid, 10);
+            assert_eq!(fired.sink, sink);
+            assert_eq!(fired.hr, 0);
+
+            // Unadvise removes the sink: the next change fires nothing.
+            assert_eq!(
+                call_slot(&mut fixture, point, 6, &[point as u32, cookie]),
+                0,
+                "IConnectionPoint::Unadvise"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, point, 6, &[point as u32, cookie]),
+                CONNECT_E_NOCONNECTION
+            );
+            fixture
+                .runtime
+                .write_variant_i4(&mut fixture.memory, VARIANT, 43);
+            let fired_before = fixture.runtime.com_fired_events.len();
+            assert_eq!(
+                call_slot(&mut fixture, server, 8, &[server as u32, VARIANT as u32]),
+                0
+            );
+            assert_eq!(fixture.runtime.com_fired_events.len(), fired_before);
+        })
+    }
+
+    // ── IDispatch / ITypeInfo ───────────────────────────────────────────────
+
+    #[test]
+    fn idispatch_assigns_dispids_and_invokes_the_same_state_as_the_vtable() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-dispatch");
+            let server = create_server(&mut fixture);
+
+            // GetIDsOfNames resolves the registered table names.
+            write_utf16(&mut fixture, NAME, "Value");
+            write_utf16(&mut fixture, NAME + 0x40, "Add");
+            write_utf16(&mut fixture, NAME + 0x80, "Missing");
+            fixture.memory.map_bytes(NAMES, &[0_u8; 16]);
+            write_u32(&mut fixture.memory, NAMES, NAME as u32);
+            write_u32(&mut fixture.memory, NAMES + 4, (NAME + 0x40) as u32);
+            write_u32(&mut fixture.memory, NAMES + 8, (NAME + 0x80) as u32);
+            fixture.memory.map_bytes(IDS, &[0_u8; 12]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    5,
+                    &[server as u32, 0, NAMES as u32, 3, 0, IDS as u32]
+                ),
+                DISP_E_UNKNOWNNAME,
+                "GetIDsOfNames reports the unknown name"
+            );
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 1, "Value");
+            assert_eq!(fixture.memory.read_u32(IDS + 4).unwrap(), 4, "Add");
+            assert_eq!(
+                fixture.memory.read_u32(IDS + 8).unwrap(),
+                DISPID_UNKNOWN as u32,
+                "Missing"
+            );
+            // The known-name subset succeeds and caches the dynamic name.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    5,
+                    &[server as u32, 0, NAMES as u32, 2, 0, IDS as u32]
+                ),
+                0
+            );
+            let cache = &fixture
+                .runtime
+                .com_servers
+                .get(&server)
+                .unwrap()
+                .dispid_cache;
+            assert_eq!(cache.get("Value"), Some(&1));
+            assert_eq!(cache.get("Add"), Some(&4));
+            assert!(!cache.contains_key("Missing"));
+
+            // GetTypeInfoCount/GetTypeInfo return the table's ITypeInfo.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, server, 3, &[server as u32, OUT as u32]),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 1);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, server, 4, &[server as u32, 0, OUT as u32]),
+                0,
+                "GetTypeInfo(0)"
+            );
+            let type_info = guest_ptr(&fixture, OUT);
+            assert_ne!(type_info, 0);
+            assert_eq!(
+                call_slot(&mut fixture, server, 4, &[server as u32, 1, OUT as u32]),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // IDispatch::Invoke property put writes the same state the
+            // vtable get_Value reads.
+            let (params, result, exception, argument_error) = fixture
+                .runtime
+                .build_dispatch_invocation(&mut fixture.memory, &[ComValue::I4(7)])
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    6,
+                    &[
+                        server as u32,
+                        1,
+                        0,
+                        0,
+                        u64::from(DISPATCH_PROPERTYPUT) as u32,
+                        params as u32,
+                        result as u32,
+                        exception as u32,
+                        argument_error as u32,
+                    ]
+                ),
+                0,
+                "Invoke(Value, PUT)"
+            );
+            fixture.memory.map_bytes(VARIANT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(&mut fixture, server, 7, &[server as u32, VARIANT as u32]),
+                0,
+                "vtable get_Value"
+            );
+            assert_eq!(read_variant_i4(&fixture, VARIANT), 7);
+
+            // A method invocation through Invoke routes to the vtable method
+            // state (Add is slot 12); both paths return the same result.
+            let (params, result, exception, argument_error) = fixture
+                .runtime
+                .build_dispatch_invocation(&mut fixture.memory, &[ComValue::I4(3), ComValue::I4(4)])
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    6,
+                    &[
+                        server as u32,
+                        4,
+                        0,
+                        0,
+                        u64::from(DISPATCH_METHOD) as u32,
+                        params as u32,
+                        result as u32,
+                        exception as u32,
+                        argument_error as u32,
+                    ]
+                ),
+                0,
+                "Invoke(Add)"
+            );
+            assert_eq!(read_variant_i4(&fixture, result), 7);
+            fixture.memory.map_bytes(VARIANT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    12,
+                    &[server as u32, 3, 4, VARIANT as u32]
+                ),
+                0,
+                "vtable Add"
+            );
+            assert_eq!(read_variant_i4(&fixture, VARIANT), 7);
+
+            // Reset clears the properties and fires OnReset.
+            let (params, result, exception, argument_error) = fixture
+                .runtime
+                .build_dispatch_invocation(&mut fixture.memory, &[])
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    6,
+                    &[
+                        server as u32,
+                        5,
+                        0,
+                        0,
+                        u64::from(DISPATCH_METHOD) as u32,
+                        params as u32,
+                        result as u32,
+                        exception as u32,
+                        argument_error as u32,
+                    ]
+                ),
+                0,
+                "Invoke(Reset)"
+            );
+            fixture.memory.map_bytes(VARIANT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(&mut fixture, server, 11, &[server as u32, VARIANT as u32]),
+                0,
+                "vtable get_Count"
+            );
+            assert_eq!(read_variant_i4(&fixture, VARIANT), 0);
+
+            // Unknown members are DISP_E_MEMBERNOTFOUND.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    6,
+                    &[server as u32, 99, 0, 0, 2, 0, 0, 0, 0]
+                ),
+                DISP_E_MEMBERNOTFOUND
+            );
+
+            // ITypeInfo reflects the registered table: GetTypeAttr,
+            // GetFuncDesc, GetNames and GetDocumentation.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, type_info, 3, &[type_info as u32, OUT as u32]),
+                0,
+                "ITypeInfo::GetTypeAttr"
+            );
+            let attrs = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                fixture.memory.read_u32(attrs + 40).unwrap(),
+                4,
+                "TKIND_DISPATCH"
+            );
+            assert!(fixture.memory.read_u16(attrs + 44).unwrap() > 0, "cFuncs");
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    5,
+                    &[type_info as u32, 6, OUT as u32]
+                ),
+                0,
+                "ITypeInfo::GetFuncDesc(Reset)"
+            );
+            let func_desc = guest_ptr(&fixture, OUT);
+            assert_eq!(fixture.memory.read_u32(func_desc).unwrap(), 5, "memid");
+
+            fixture.memory.map_bytes(NAMES, &[0_u8; 8]);
+            fixture.memory.map_bytes(OUT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    7,
+                    &[type_info as u32, 4, NAMES as u32, 2, OUT as u32]
+                ),
+                0,
+                "ITypeInfo::GetNames(Add)"
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 1);
+            let add_name = guest_ptr(&fixture, NAMES);
+            assert_eq!(read_utf16_string(&fixture.memory, add_name).unwrap(), "Add");
+
+            // ITypeInfo::Invoke with a NULL instance routes to the owner.
+            let (params, result, exception, argument_error) = fixture
+                .runtime
+                .build_dispatch_invocation(&mut fixture.memory, &[ComValue::I4(4), ComValue::I4(7)])
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    11,
+                    &[
+                        type_info as u32,
+                        0,
+                        4,
+                        0,
+                        0,
+                        u64::from(DISPATCH_METHOD) as u32,
+                        params as u32,
+                        result as u32,
+                        exception as u32,
+                        argument_error as u32,
+                    ]
+                ),
+                0,
+                "ITypeInfo::Invoke(Add)"
+            );
+            assert_eq!(read_variant_i4(&fixture, result), 11);
+        })
+    }
+
+    #[test]
+    fn disp_helper_exports_route_into_the_registered_tables() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-disp-exports");
+            let server = create_server(&mut fixture);
+            write_utf16(&mut fixture, NAME, "Value");
+            fixture.memory.map_bytes(NAMES, &[0_u8; 8]);
+            write_u32(&mut fixture.memory, NAMES, NAME as u32);
+            fixture.memory.map_bytes(IDS, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleDispGetIdsOfNames,
+                    &[server as u32, NAMES as u32, 1, 0, IDS as u32]
+                ),
+                0,
+                "DispGetIDsOfNames"
+            );
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 1);
+
+            // DispInvoke with the registered typeinfo routes to the instance.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, server, 4, &[server as u32, 0, OUT as u32]),
+                0
+            );
+            let type_info = guest_ptr(&fixture, OUT);
+            let (params, result, exception, argument_error) = fixture
+                .runtime
+                .build_dispatch_invocation(&mut fixture.memory, &[ComValue::I4(5), ComValue::I4(6)])
+                .unwrap();
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleDispInvoke,
+                    &[
+                        server as u32,
+                        type_info as u32,
+                        4,
+                        u64::from(DISPATCH_METHOD) as u32,
+                        params as u32,
+                        result as u32,
+                        exception as u32,
+                        argument_error as u32,
+                    ]
+                ),
+                0,
+                "DispInvoke"
+            );
+            assert_eq!(read_variant_i4(&fixture, result), 11);
+        })
+    }
+
+    // ── Monikers ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn moniker_parses_binds_and_reports_real_state() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-moniker");
+            let guest_path = "C:\\payload.bin";
+            let host_path = fixture
+                .runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path(guest_path)
+                .unwrap();
+            if let Some(parent) = host_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&host_path, b"moniker-bytes").unwrap();
+            let display = format!("file:{guest_path}");
+            write_utf16(&mut fixture, NAME, &display);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::MkParseDisplayName,
+                    &[0, NAME as u32, COOKIE as u32, OUT as u32]
+                ),
+                0,
+                "MkParseDisplayName(file:)"
+            );
+            let moniker = guest_ptr(&fixture, OUT);
+            assert_ne!(moniker, 0);
+            assert_eq!(
+                fixture.memory.read_u32(COOKIE).unwrap(),
+                display.encode_utf16().count() as u32
+            );
+
+            // GetDisplayName returns the parsed name as a BSTR.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    7,
+                    &[moniker as u32, 0, 0, OUT as u32]
+                ),
+                0,
+                "GetDisplayName"
+            );
+            let bstr = guest_ptr(&fixture, OUT);
+            assert_eq!(read_utf16_string(&fixture.memory, bstr).unwrap(), display);
+
+            // IsSystemMoniker reports MKSYS_FILEMONIKER; Hash is stable.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 9, &[moniker as u32, OUT as u32]),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 2);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 10, &[moniker as u32, OUT as u32]),
+                0
+            );
+            let hash = fixture.memory.read_u32(OUT).unwrap();
+            assert_ne!(hash, 0, "a non-empty display name hashes");
+
+            // BindToStorage over IStream yields the real file bytes.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    4,
+                    &[moniker as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                0,
+                "BindToStorage(IStream)"
+            );
+            let stream = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 16]);
+            let read_out = OUT + 8;
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    3,
+                    &[stream as u32, BUF as u32, 13, read_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                fixture.memory.read_bytes(BUF, 13).unwrap(),
+                b"moniker-bytes".to_vec()
+            );
+
+            // Plain files have no object handler: the honest MK_E_NOOBJECT.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    3,
+                    &[moniker as u32, 0, 0, 0, OUT as u32]
+                ),
+                MK_E_NOOBJECT
+            );
+
+            // Reduce/Enum/ComposeWith report the modeled answers.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    5,
+                    &[moniker as u32, 0, 0, 0, OUT as u32]
+                ),
+                MK_E_REDUCED_TO_SELF
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 8, &[moniker as u32, 1, OUT as u32]),
+                0
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    6,
+                    &[moniker as u32, moniker as u32, 0, OUT as u32]
+                ),
+                E_NOTIMPL
+            );
+
+            // A malformed name is MK_E_SYNTAX and creates no object.
+            write_utf16(&mut fixture, NAME, "not a moniker");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::MkParseDisplayName,
+                    &[0, NAME as u32, COOKIE as u32, OUT as u32]
+                ),
+                u64::from(MK_E_SYNTAX)
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+        })
+    }
+
+    #[test]
+    fn class_moniker_binds_through_the_class_table() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-class-moniker");
+            let display = format!("clsid:{}", COM_AUTOMATION_SERVER_CLSID);
+            write_utf16(&mut fixture, NAME, &display);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::MkParseDisplayName,
+                    &[0, NAME as u32, COOKIE as u32, OUT as u32]
+                ),
+                0
+            );
+            let moniker = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 9, &[moniker as u32, OUT as u32]),
+                0
+            );
+            assert_eq!(
+                fixture.memory.read_u32(OUT).unwrap(),
+                6,
+                "MKSYS_CLASSMONIKER"
+            );
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    3,
+                    &[moniker as u32, 0, 0, 0, OUT as u32]
+                ),
+                0,
+                "class moniker BindToObject"
+            );
+            let server = guest_ptr(&fixture, OUT);
+            assert_ne!(server, 0);
+            assert!(fixture.runtime.com_servers.contains_key(&server));
+
+            // The bound object is a real IDispatch server.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDISPATCH);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    0,
+                    &[server as u32, IID_PTR as u32, OUT as u32]
+                ),
+                0,
+                "bound server QueryInterface(IDispatch)"
+            );
+
+            // An unregistered class is REGDB_E_CLASSNOTREG.
+            let unknown = "clsid:{11111111-2222-3333-4444-555555555555}";
+            write_utf16(&mut fixture, NAME, unknown);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::MkParseDisplayName,
+                    &[0, NAME as u32, COOKIE as u32, OUT as u32]
+                ),
+                0
+            );
+            let unknown_moniker = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    unknown_moniker,
+                    3,
+                    &[unknown_moniker as u32, 0, 0, 0, OUT as u32]
+                ),
+                REGDB_E_CLASSNOTREG
+            );
+        })
+    }
+
+    // ── Marshal stream ──────────────────────────────────────────────────────
+
+    #[test]
+    fn marshal_stream_is_a_real_istream_and_resolves_the_record() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-marshal");
+            let server = create_server(&mut fixture);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDISPATCH);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CoMarshalInterThreadInterfaceInStream,
+                    &[IID_PTR as u32, server as u32, OUT as u32]
+                ),
+                0
+            );
+            let stream = guest_ptr(&fixture, OUT);
+            assert_ne!(stream, 0);
+
+            // The payload is readable through the real IStream vtable.
+            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+            let read_out = OUT + 0x10;
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    3,
+                    &[stream as u32, BUF as u32, 8, read_out as u32]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(read_out).unwrap(), 8);
+
+            // The resolver consumes and releases the stream.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDISPATCH);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CoGetInterfaceAndReleaseStream,
+                    &[stream as u32, IID_PTR as u32, OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), server);
+            assert!(!fixture.runtime.guest_objects.contains_key(&stream));
+            assert!(!fixture.runtime.com_streams.contains_key(&stream));
+        })
+    }
 }

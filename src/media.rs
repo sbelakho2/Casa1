@@ -584,6 +584,33 @@ pub enum MediaEventType {
     TopologyLoaded,
     /// Rate change (slow motion, fast forward, etc.).
     RateChanged,
+    /// `MENewPresentation` — a new presentation descriptor is available.
+    NewPresentation,
+    /// `MESourceStarted`.
+    SourceStarted,
+    /// `MESourceStopped`.
+    SourceStopped,
+    /// `MESourcePaused`.
+    SourcePaused,
+    /// `MESourceSeeked`.
+    SourceSeeked,
+    /// `MEStreamStarted`.
+    StreamStarted,
+    /// `MEStreamStopped`.
+    StreamStopped,
+    /// `MEStreamPaused`.
+    StreamPaused,
+    /// `MEStreamSeeked`.
+    StreamSeeked,
+    /// `MENewStream` — a new stream appeared on the source.
+    NewStream,
+    /// `MEUpdatedStream`.
+    UpdatedStream,
+    /// `MEEndOfStream` — a stream reached the end of its data.
+    EndOfStream,
+    /// `MEEndOfPresentation` — the source reached the end of the
+    /// presentation.
+    EndOfPresentation,
 }
 
 impl MediaEventType {
@@ -604,6 +631,70 @@ impl MediaEventType {
             _ => Self::Error,
         }
     }
+
+    /// The documented Windows `MF_EVENT_TYPE` number of this event (the
+    /// values from `mfobjects.h`'s `__MIDL___MIDL_itf_mfobjects_0000_0012_0001`
+    /// enum).  The guest-visible `IMFMediaEvent::GetType` answers these.
+    pub fn mf_event_number(self) -> u32 {
+        match self {
+            Self::Error => 1,               // MEError
+            Self::SessionStarted => 103,    // MESessionStarted
+            Self::SessionPaused => 104,     // MESessionPaused
+            Self::SessionStopped => 105,    // MESessionStopped
+            Self::SessionShutdown => 106,   // MESessionClosed
+            Self::SessionEnded => 107,      // MESessionEnded
+            Self::RateChanged => 108,       // MESessionRateChanged
+            Self::TopologySet => 101,       // MESessionTopologySet
+            Self::TopologyLoaded => 111,    // MESessionTopologyStatus
+            Self::NewPresentation => 113,   // MENewPresentation
+            Self::BufferingStarted => 122,  // MEBufferingStarted
+            Self::BufferingStopped => 123,  // MEBufferingStopped
+            Self::SourceStarted => 201,     // MESourceStarted
+            Self::StreamStarted => 202,     // MEStreamStarted
+            Self::SourceSeeked => 203,      // MESourceSeeked
+            Self::StreamSeeked => 204,      // MEStreamSeeked
+            Self::NewStream => 205,         // MENewStream
+            Self::UpdatedStream => 206,     // MEUpdatedStream
+            Self::SourceStopped => 207,     // MESourceStopped
+            Self::StreamStopped => 208,     // MEStreamStopped
+            Self::SourcePaused => 209,      // MESourcePaused
+            Self::StreamPaused => 210,      // MEStreamPaused
+            Self::EndOfPresentation => 211, // MEEndOfPresentation
+            Self::EndOfStream => 212,       // MEEndOfStream
+        }
+    }
+
+    /// The reverse of [`Self::mf_event_number`] for the event types the
+    /// runtime models; unknown numbers are the generic Error event.
+    pub fn from_mf_number(value: u32) -> Self {
+        match value {
+            1 => Self::Error,
+            101 => Self::TopologySet,
+            103 => Self::SessionStarted,
+            104 => Self::SessionPaused,
+            105 => Self::SessionStopped,
+            106 => Self::SessionShutdown,
+            107 => Self::SessionEnded,
+            108 => Self::RateChanged,
+            111 => Self::TopologyLoaded,
+            113 => Self::NewPresentation,
+            122 => Self::BufferingStarted,
+            123 => Self::BufferingStopped,
+            201 => Self::SourceStarted,
+            202 => Self::StreamStarted,
+            203 => Self::SourceSeeked,
+            204 => Self::StreamSeeked,
+            205 => Self::NewStream,
+            206 => Self::UpdatedStream,
+            207 => Self::SourceStopped,
+            208 => Self::StreamStopped,
+            209 => Self::SourcePaused,
+            210 => Self::StreamPaused,
+            211 => Self::EndOfPresentation,
+            212 => Self::EndOfStream,
+            _ => Self::Error,
+        }
+    }
 }
 
 impl MediaEventType {
@@ -621,6 +712,19 @@ impl MediaEventType {
             MediaEventType::TopologySet => "METopologySet",
             MediaEventType::TopologyLoaded => "METopologyLoaded",
             MediaEventType::RateChanged => "MERateChanged",
+            MediaEventType::NewPresentation => "MENewPresentation",
+            MediaEventType::SourceStarted => "MESourceStarted",
+            MediaEventType::SourceStopped => "MESourceStopped",
+            MediaEventType::SourcePaused => "MESourcePaused",
+            MediaEventType::SourceSeeked => "MESourceSeeked",
+            MediaEventType::StreamStarted => "MEStreamStarted",
+            MediaEventType::StreamStopped => "MEStreamStopped",
+            MediaEventType::StreamPaused => "MEStreamPaused",
+            MediaEventType::StreamSeeked => "MEStreamSeeked",
+            MediaEventType::NewStream => "MENewStream",
+            MediaEventType::UpdatedStream => "MEUpdatedStream",
+            MediaEventType::EndOfStream => "MEEndOfStream",
+            MediaEventType::EndOfPresentation => "MEEndOfPresentation",
         }
     }
 }
@@ -630,6 +734,10 @@ impl MediaEventType {
 pub struct MediaEvent {
     /// The type of event.
     pub event_type: MediaEventType,
+    /// The exact guest-visible `MF_EVENT_TYPE` number.  For the modelled
+    /// event types this is [`MediaEventType::mf_event_number`]; events queued
+    /// directly from a guest `QueueEvent` keep the guest-supplied number.
+    pub mf_type: u32,
     /// Optional HRESULT-like status code.
     pub status: i32,
     /// Optional data associated with the event (e.g., error message).
@@ -643,6 +751,7 @@ impl MediaEvent {
     pub fn new(event_type: MediaEventType) -> Self {
         Self {
             event_type,
+            mf_type: event_type.mf_event_number(),
             status: 0,
             data: None,
             pts: None,
@@ -653,7 +762,20 @@ impl MediaEvent {
     pub fn with_status(event_type: MediaEventType, status: i32) -> Self {
         Self {
             event_type,
+            mf_type: event_type.mf_event_number(),
             status,
+            data: None,
+            pts: None,
+        }
+    }
+
+    /// Create a media event from the exact `MF_EVENT_TYPE` number (the
+    /// number the guest passed to `IMFMediaEventGenerator::QueueEvent`).
+    pub fn with_mf_type(mf_type: u32) -> Self {
+        Self {
+            event_type: MediaEventType::from_mf_number(mf_type),
+            mf_type,
+            status: 0,
             data: None,
             pts: None,
         }
@@ -668,6 +790,7 @@ impl MediaEvent {
     pub fn with_error_status(status: i32, message: impl Into<String>) -> Self {
         Self {
             event_type: MediaEventType::Error,
+            mf_type: MediaEventType::Error.mf_event_number(),
             status,
             data: Some(message.into()),
             pts: None,
@@ -878,6 +1001,13 @@ impl MfEventQueue {
     /// Queue an event by type.
     pub fn queue_event_type(&mut self, event_type: MediaEventType) {
         self.queue_event(MediaEvent::new(event_type));
+    }
+
+    /// Queue an event by its exact `MF_EVENT_TYPE` number (the guest-supplied
+    /// `IMFMediaEventGenerator::QueueEvent` contract: the number round-trips
+    /// through `IMFMediaEvent::GetType` unchanged).
+    pub fn queue_mf_event(&mut self, mf_type: u32) {
+        self.queue_event(MediaEvent::with_mf_type(mf_type));
     }
 
     /// Get the next pending event, if any.
@@ -2984,6 +3114,9 @@ impl Mp4Demuxer {
 
             match child_type {
                 b"trak" => {
+                    // `read_trak` expects the reader positioned at the trak
+                    // payload, so step over this box's own header first.
+                    self.position += 8;
                     let track = self.read_trak(child_end)?;
                     self.tracks.push(track);
                 }
@@ -3077,6 +3210,8 @@ impl Mp4Demuxer {
                     }
                 }
                 b"mdia" => {
+                    // `read_mdia` expects the mdia payload.
+                    self.position += 8;
                     self.read_mdia(&mut track, child_end)?;
                 }
                 _ => {}
@@ -3153,6 +3288,8 @@ impl Mp4Demuxer {
                     }
                 }
                 b"minf" => {
+                    // `read_minf` expects the minf payload.
+                    self.position += 8;
                     self.read_minf(track, child_end)?;
                 }
                 _ => {}
@@ -3182,6 +3319,8 @@ impl Mp4Demuxer {
             };
 
             if child_type == b"stbl" {
+                // `read_stbl` expects the stbl payload.
+                self.position += 8;
                 self.read_stbl(track, child_end)?;
             }
 
@@ -3550,6 +3689,12 @@ pub struct SourceReader {
     demuxer: Mp4Demuxer,
     selected_streams: Vec<u32>,
     decoder: Option<Box<dyn MftTransform>>,
+    /// The guest IMFMediaSource object this reader pulls from (0 when the
+    /// reader was created without a source).
+    source: u64,
+    /// The negotiated current media type per stream (absent = the native
+    /// track type).
+    current_types: HashMap<u32, ImfMediaType>,
 }
 
 impl SourceReader {
@@ -3560,6 +3705,8 @@ impl SourceReader {
             demuxer: Mp4Demuxer::new(Vec::new()),
             selected_streams: Vec::new(),
             decoder: None,
+            source: 0,
+            current_types: HashMap::new(),
         }
     }
 
@@ -3582,13 +3729,68 @@ impl SourceReader {
             demuxer,
             selected_streams: Vec::new(),
             decoder: None,
+            source: 0,
+            current_types: HashMap::new(),
         })
+    }
+
+    /// The real presentation descriptor parsed from the underlying file.
+    pub fn presentation(
+        &self,
+        file_size: u64,
+        mime_type: Option<&str>,
+    ) -> MfPresentationDescriptor {
+        MfPresentationDescriptor::from_mp4(&self.demuxer, file_size, mime_type)
+    }
+
+    /// The guest media-source object this reader pulls from.
+    pub fn source(&self) -> u64 {
+        self.source
+    }
+
+    /// Wire this reader to its source object (the graph edge the runtime
+    /// reports through `GetServiceForStream` and the EOF notification).
+    pub fn set_source(&mut self, source: u64) {
+        self.source = source;
+    }
+
+    /// Resolve an IMFSourceReader stream index (`MF_SOURCE_READER_*`) to the
+    /// concrete demuxer track index.
+    pub fn resolve_stream_index(&self, stream_index: u32) -> Option<u32> {
+        match stream_index {
+            0xFFFF_FFFF => None, // MF_SOURCE_READER_INVALID_STREAM_INDEX
+            0xFFFF_FFFE => {
+                // MF_SOURCE_READER_ANY_STREAM: the first selected stream.
+                if self.selected_streams.is_empty() {
+                    (self.demuxer.track_count() > 0).then_some(0)
+                } else {
+                    self.selected_streams.first().copied()
+                }
+            }
+            0xFFFF_FFFC => {
+                // MF_SOURCE_READER_FIRST_VIDEO_STREAM
+                self.demuxer
+                    .tracks()
+                    .iter()
+                    .position(|track| track.media_type.is_video())
+                    .map(|index| index as u32)
+            }
+            0xFFFF_FFFD => {
+                // MF_SOURCE_READER_FIRST_AUDIO_STREAM
+                self.demuxer
+                    .tracks()
+                    .iter()
+                    .position(|track| track.media_type.is_audio())
+                    .map(|index| index as u32)
+            }
+            index => ((index as usize) < self.demuxer.track_count()).then_some(index),
+        }
     }
 
     /// Select a stream for reading.
     pub fn select_stream(&mut self, stream_index: u32) {
         // MF uses MF_SOURCE_READER_FIRST_VIDEO_STREAM, etc.
-        if stream_index == 0xFFFFFFFB {
+        if stream_index == 0xFFFF_FFFC {
             // MF_SOURCE_READER_FIRST_VIDEO_STREAM: select first video track
             for (i, track) in self.demuxer.tracks().iter().enumerate() {
                 if track.media_type.is_video() {
@@ -3596,7 +3798,7 @@ impl SourceReader {
                     return;
                 }
             }
-        } else if stream_index == 0xFFFFFFFC {
+        } else if stream_index == 0xFFFF_FFFD {
             // MF_SOURCE_READER_FIRST_AUDIO_STREAM: select first audio track
             for (i, track) in self.demuxer.tracks().iter().enumerate() {
                 if track.media_type.is_audio() {
@@ -3617,11 +3819,44 @@ impl SourceReader {
         self.selected_streams.contains(&stream_index)
     }
 
-    /// Get the current media type for a stream.
+    /// Set a stream's selection state (IMFSourceReader::SetStreamSelection).
+    /// `MF_SOURCE_READER_ALL_STREAMS`/`ANY_STREAM` select/deselect every
+    /// stream; `FIRST_VIDEO_STREAM`/`FIRST_AUDIO_STREAM` resolve to the
+    /// first matching track.
+    pub fn set_stream_selection(&mut self, stream_index: u32, selected: bool) {
+        match stream_index {
+            0xFFFF_FFFE => {
+                // MF_SOURCE_READER_ALL_STREAMS / ANY_STREAM
+                self.selected_streams.clear();
+                if selected {
+                    self.selected_streams = (0..self.demuxer.track_count() as u32).collect();
+                }
+            }
+            index => {
+                let Some(track) = self.resolve_stream_index(index) else {
+                    return;
+                };
+                if selected {
+                    if !self.selected_streams.contains(&track) {
+                        self.selected_streams.push(track);
+                    }
+                } else {
+                    self.selected_streams.retain(|entry| *entry != track);
+                }
+            }
+        }
+    }
+
+    /// Get the current media type for a stream: the negotiated current type
+    /// when one was set, otherwise the track's native type.
     pub fn get_current_media_type(&self, stream_index: u32) -> AppResult<ImfMediaType> {
         let idx = stream_index as usize;
         if let Some(track) = self.demuxer.get_track(idx) {
-            Ok(track.media_type.clone())
+            Ok(self
+                .current_types
+                .get(&stream_index)
+                .cloned()
+                .unwrap_or_else(|| track.media_type.clone()))
         } else {
             Err(AppError::new(
                 ReasonCode::RcMediaInvalid,
@@ -3635,13 +3870,26 @@ impl SourceReader {
         self.demuxer.track_count()
     }
 
-    /// Set the current media type for a stream (output type).
+    /// Set the current media type for a stream (output type).  A type whose
+    /// major type differs from the track's native type is rejected.
     pub fn set_current_media_type(
         &mut self,
-        _stream_index: u32,
-        _media_type: &ImfMediaType,
+        stream_index: u32,
+        media_type: &ImfMediaType,
     ) -> AppResult<()> {
-        // Would negotiate with decoder here
+        let Some(track) = self.demuxer.get_track(stream_index as usize) else {
+            return Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                format!("Stream {stream_index} not found"),
+            ));
+        };
+        if media_type.get_guid(&MF_MT_MAJOR_TYPE) != track.media_type.get_guid(&MF_MT_MAJOR_TYPE) {
+            return Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "media type major type does not match the stream",
+            ));
+        }
+        self.current_types.insert(stream_index, media_type.clone());
         Ok(())
     }
 
@@ -3670,7 +3918,7 @@ impl SourceReader {
                 sample.sample_time = Self::to_hns(sample_info.pts, scale);
                 sample.sample_duration = Self::to_hns(sample_info.duration as u64, scale);
                 if is_first {
-                    sample.flags |= 1; // MF_SOURCE_READER_FLAG_NEW_STREAM
+                    sample.flags |= 0x4; // MF_SOURCE_READERF_NEWSTREAM
                 }
             }
             Ok(Some(sample))
@@ -3917,6 +4165,447 @@ impl Default for PresentationClock {
 }
 
 // ===========================================================================
+// Real MF source model (IMFMediaSource / IMFPresentationDescriptor /
+// IMFStreamDescriptor / IMFMediaTypeHandler / source ownership)
+// ===========================================================================
+
+/// The media source state machine (IMFMediaSource::Start/Stop/Pause/Shutdown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MfSourceState {
+    /// Created, never started (or stopped after a presentation ended).
+    Stopped,
+    /// Started: events are flowing.
+    Started,
+    /// Paused.
+    Paused,
+    /// Shut down: no further operations are legal.
+    Shutdown,
+}
+
+impl MfSourceState {
+    /// Human-readable state name (diagnostics + tests).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stopped => "Stopped",
+            Self::Started => "Started",
+            Self::Paused => "Paused",
+            Self::Shutdown => "Shutdown",
+        }
+    }
+}
+
+/// The `MFMEDIASOURCE_CHARACTERISTICS` flags (mfidl.h).
+pub const MFMEDIASOURCE_IS_LIVE: u32 = 0x1;
+/// The source can seek (a real presentation duration exists).
+pub const MFMEDIASOURCE_CAN_SEEK: u32 = 0x2;
+/// The source can pause.
+pub const MFMEDIASOURCE_CAN_PAUSE: u32 = 0x4;
+/// Seeking is slow (no random-access stream table).
+pub const MFMEDIASOURCE_HAS_SLOW_SEEK: u32 = 0x8;
+/// The source has multiple presentations.
+pub const MFMEDIASOURCE_HAS_MULTIPLE_PRESENTATIONS: u32 = 0x10;
+/// The source can skip forward.
+pub const MFMEDIASOURCE_CAN_SKIPFORWARD: u32 = 0x20;
+/// The source can skip backward.
+pub const MFMEDIASOURCE_CAN_SKIPBACKWARD: u32 = 0x40;
+/// The source does not use the network.
+pub const MFMEDIASOURCE_DOES_NOT_USE_NETWORK: u32 = 0x80;
+
+/// A real stream descriptor: one parsed container track.
+#[derive(Debug, Clone)]
+pub struct MfStreamDescriptor {
+    /// The stream identifier (the MP4 track id; unique in the file).
+    pub identifier: u32,
+    /// Whether the stream is selected in the presentation descriptor.
+    pub selected: bool,
+    /// The native media type parsed from the track.
+    pub media_type: ImfMediaType,
+    /// The descriptor's attribute store (MF_SD_STREAM_NAME etc.).
+    pub attributes: ImfMediaType,
+}
+
+impl MfStreamDescriptor {
+    /// A stream descriptor for a parsed track.
+    pub fn new(identifier: u32, media_type: ImfMediaType) -> Self {
+        let mut attributes = ImfMediaType::new();
+        attributes.set_string(MF_SD_STREAM_NAME, format!("Stream {identifier}"));
+        Self {
+            identifier,
+            selected: true,
+            media_type,
+            attributes,
+        }
+    }
+}
+
+/// MF_SD_STREAM_NAME {4f1b099d-d314-41e5-a781-7fefaa4c501f}.
+pub const MF_SD_STREAM_NAME: Guid = Guid::new(
+    0x4f1b099d,
+    0xd314,
+    0x41e5,
+    [0xa7, 0x81, 0x7f, 0xef, 0xaa, 0x4c, 0x50, 0x1f],
+);
+
+/// MF_PD_DURATION {6c990d33-bb8e-477a-8598-0d5d96fcd88a}.
+pub const MF_PD_DURATION: Guid = Guid::new(
+    0x6c990d33,
+    0xbb8e,
+    0x477a,
+    [0x85, 0x98, 0x0d, 0x5d, 0x96, 0xfc, 0xd8, 0x8a],
+);
+/// MF_PD_TOTAL_FILE_SIZE {6c990d34-bb8e-477a-8598-0d5d96fcd88a}.
+pub const MF_PD_TOTAL_FILE_SIZE: Guid = Guid::new(
+    0x6c990d34,
+    0xbb8e,
+    0x477a,
+    [0x85, 0x98, 0x0d, 0x5d, 0x96, 0xfc, 0xd8, 0x8a],
+);
+/// MF_PD_MIME_TYPE {6c990d37-bb8e-477a-8598-0d5d96fcd88a}.
+pub const MF_PD_MIME_TYPE: Guid = Guid::new(
+    0x6c990d37,
+    0xbb8e,
+    0x477a,
+    [0x85, 0x98, 0x0d, 0x5d, 0x96, 0xfc, 0xd8, 0x8a],
+);
+/// MF_PD_SEEKABLE {6c990d3d-bb8e-477a-8598-0d5d96fcd88a}.
+pub const MF_PD_SEEKABLE: Guid = Guid::new(
+    0x6c990d3d,
+    0xbb8e,
+    0x477a,
+    [0x85, 0x98, 0x0d, 0x5d, 0x96, 0xfc, 0xd8, 0x8a],
+);
+
+/// A real presentation descriptor built from a parsed container.
+#[derive(Debug, Clone)]
+pub struct MfPresentationDescriptor {
+    /// Duration in 100-nanosecond units (0 when the container has none).
+    pub duration: u64,
+    /// Whether the presentation is seekable.
+    pub seekable: bool,
+    /// Total file size in bytes.
+    pub file_size: u64,
+    /// The container MIME type (e.g. "video/mp4") when known.
+    pub mime_type: Option<String>,
+    /// The stream descriptors.
+    pub streams: Vec<MfStreamDescriptor>,
+}
+
+impl MfPresentationDescriptor {
+    /// A descriptor with no streams (used only where Windows also answers an
+    /// empty descriptor, e.g. `MFCreatePresentationDescriptor(NULL, 0)`).
+    pub fn empty() -> Self {
+        Self {
+            duration: 0,
+            seekable: false,
+            file_size: 0,
+            mime_type: None,
+            streams: Vec::new(),
+        }
+    }
+
+    /// Build the real descriptor for a parsed MP4 file: duration from the
+    /// track `mdhd` durations (converted to 100-ns units), one stream per
+    /// parsed track, seekable because the file has a random-access sample
+    /// table.
+    pub fn from_mp4(demuxer: &Mp4Demuxer, file_size: u64, mime_type: Option<&str>) -> Self {
+        let mut duration: u64 = 0;
+        let mut streams = Vec::with_capacity(demuxer.track_count());
+        for track in demuxer.tracks() {
+            let scale = u64::from(track.timescale).max(1);
+            let track_duration = track
+                .duration
+                .saturating_mul(10_000_000)
+                .checked_div(scale)
+                .unwrap_or(0);
+            duration = duration.max(track_duration);
+            streams.push(MfStreamDescriptor::new(track.id, track.media_type.clone()));
+        }
+        Self {
+            duration,
+            seekable: demuxer.track_count() > 0,
+            file_size,
+            mime_type: mime_type.map(str::to_string),
+            streams,
+        }
+    }
+
+    /// The `IMFAttributes` store of the descriptor: the real duration,
+    /// seekability, file size and MIME type parsed from the file.
+    pub fn attributes(&self) -> ImfMediaType {
+        let mut store = ImfMediaType::new();
+        store.set_uint64(MF_PD_DURATION, self.duration);
+        store.set_uint32(MF_PD_SEEKABLE, u32::from(self.seekable));
+        store.set_uint64(MF_PD_TOTAL_FILE_SIZE, self.file_size);
+        if let Some(mime) = &self.mime_type {
+            store.set_string(MF_PD_MIME_TYPE, mime.clone());
+        }
+        store
+    }
+
+    /// Whether the stream at an index is selected (with index bounds check).
+    pub fn stream_selected(&self, index: usize) -> Option<bool> {
+        self.streams.get(index).map(|stream| stream.selected)
+    }
+
+    /// Select/deselect the stream at an index (real selection state).
+    pub fn set_stream_selected(&mut self, index: usize, selected: bool) -> bool {
+        match self.streams.get_mut(index) {
+            Some(stream) => {
+                stream.selected = selected;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The `IMFMediaTypeHandler` state: the negotiated current type and the
+/// native types the handler can return.
+#[derive(Debug, Clone, Default)]
+pub struct MfMediaTypeHandlerState {
+    /// The current media type.
+    pub current: ImfMediaType,
+    /// The available (native) media types.
+    pub available: Vec<ImfMediaType>,
+}
+
+impl MfMediaTypeHandlerState {
+    /// A handler over a single native type.
+    pub fn new(media_type: ImfMediaType) -> Self {
+        Self {
+            current: media_type.clone(),
+            available: vec![media_type],
+        }
+    }
+
+    /// Whether a candidate shares the handler's major type (the media-type
+    /// compatibility rule the source enforces).
+    pub fn is_type_supported(&self, candidate: &ImfMediaType) -> bool {
+        candidate.get_guid(&MF_MT_MAJOR_TYPE) == self.current.get_guid(&MF_MT_MAJOR_TYPE)
+    }
+}
+
+/// A real media source over a byte stream (a parsed file presentation).
+///
+/// The source owns the presentation descriptor derived from the file and an
+/// `IMFMediaEventGenerator`-style queue: `Start`/`Stop`/`Pause`/`Shutdown`
+/// move the real state machine and queue the documented MF events
+/// (`MESourceStarted`, `MENewStream`, `MEStreamStarted`, ...); reaching the
+/// end of the file through an attached source reader queues
+/// `MEEndOfStream`/`MEEndOfPresentation`.
+#[derive(Debug, Clone)]
+pub struct MfMediaSource {
+    /// The source state machine.
+    state: MfSourceState,
+    /// The real presentation descriptor.
+    presentation: MfPresentationDescriptor,
+    /// The source's event queue.
+    queue: MfEventQueue,
+    /// The byte-stream object the source reads (0 when none).
+    byte_stream: u64,
+    /// The attached source-reader objects (the pull side of the graph).
+    readers: Vec<u64>,
+    /// Whether the MENewStream events were already sent for this
+    /// presentation.
+    new_streams_sent: bool,
+    /// Whether MEEndOfPresentation was already sent for this presentation.
+    end_sent: bool,
+    /// The current start position in 100-ns units.
+    position: u64,
+}
+
+impl MfMediaSource {
+    /// A source over a presentation and its backing byte stream.
+    pub fn new(presentation: MfPresentationDescriptor, byte_stream: u64) -> Self {
+        Self {
+            state: MfSourceState::Stopped,
+            presentation,
+            queue: MfEventQueue::with_max(256),
+            byte_stream,
+            readers: Vec::new(),
+            new_streams_sent: false,
+            end_sent: false,
+            position: 0,
+        }
+    }
+
+    /// The current state.
+    pub fn state(&self) -> MfSourceState {
+        self.state
+    }
+
+    /// The real presentation descriptor.
+    pub fn presentation(&self) -> &MfPresentationDescriptor {
+        &self.presentation
+    }
+
+    /// Mutable access to the presentation (stream selection).
+    pub fn presentation_mut(&mut self) -> &mut MfPresentationDescriptor {
+        &mut self.presentation
+    }
+
+    /// The backing byte-stream object.
+    pub fn byte_stream(&self) -> u64 {
+        self.byte_stream
+    }
+
+    /// The attached source readers.
+    pub fn readers(&self) -> &[u64] {
+        &self.readers
+    }
+
+    /// Attach a source reader (the reader that pulls samples from this
+    /// source).  Attaching is idempotent.
+    pub fn attach_reader(&mut self, reader: u64) {
+        if !self.readers.contains(&reader) {
+            self.readers.push(reader);
+        }
+    }
+
+    /// The current presentation position in 100-ns units.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// The `MFMEDIASOURCE_CHARACTERISTICS` of this source: a real local file
+    /// presentation is seekable, pausable, skippable and does not use the
+    /// network.  A live source would set `MFMEDIASOURCE_IS_LIVE`; this model
+    /// has no live sources.
+    pub fn characteristics(&self) -> u32 {
+        let mut flags = MFMEDIASOURCE_CAN_PAUSE | MFMEDIASOURCE_DOES_NOT_USE_NETWORK;
+        if self.presentation.seekable {
+            flags |= MFMEDIASOURCE_CAN_SEEK
+                | MFMEDIASOURCE_CAN_SKIPFORWARD
+                | MFMEDIASOURCE_CAN_SKIPBACKWARD;
+        }
+        flags
+    }
+
+    /// Queue a raw MF event number on the source's queue.
+    pub fn queue_event_number(&mut self, mf_type: u32) {
+        self.queue.queue_mf_event(mf_type);
+    }
+
+    /// Queue an event with an attached value (the event's PROPVARIANT value).
+    pub fn queue_event_number_with_value(&mut self, mf_type: u32, value: u64) {
+        let mut event = MediaEvent::with_mf_type(mf_type);
+        event.pts = Some(value);
+        self.queue.queue_event(event);
+    }
+
+    /// Pull the next event from the source queue.
+    pub fn get_event(&mut self) -> Option<MediaEvent> {
+        self.queue.get_event()
+    }
+
+    /// The number of queued events.
+    pub fn event_count(&self) -> usize {
+        self.queue.event_count()
+    }
+
+    /// `IMFMediaSource::Start`: enters the Started state and queues
+    /// `MESourceStarted` (or `MESourceSeeked` when already started), the
+    /// `MENewStream` events for each stream on the first start, and the
+    /// per-stream `MEStreamStarted` events.  The position is in 100-ns units.
+    pub fn start(&mut self, position: Option<u64>) -> AppResult<()> {
+        if self.state == MfSourceState::Shutdown {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "cannot start a shut-down media source",
+            ));
+        }
+        let was_started = matches!(self.state, MfSourceState::Started | MfSourceState::Paused);
+        self.position = position.unwrap_or(0);
+        self.state = MfSourceState::Started;
+        self.end_sent = false;
+        if was_started {
+            self.queue_event_number(203); // MESourceSeeked
+            for _ in 0..self.presentation.streams.len() {
+                self.queue_event_number(204); // MEStreamSeeked
+            }
+        } else {
+            self.queue_event_number_with_value(201, self.position); // MESourceStarted
+            if !self.new_streams_sent {
+                self.new_streams_sent = true;
+                for _ in 0..self.presentation.streams.len() {
+                    self.queue_event_number(205); // MENewStream
+                }
+            }
+            for _ in 0..self.presentation.streams.len() {
+                self.queue_event_number(202); // MEStreamStarted
+            }
+        }
+        Ok(())
+    }
+
+    /// `IMFMediaSource::Stop`: queue `MESourceStopped` and the per-stream
+    /// `MEStreamStopped` events.
+    pub fn stop(&mut self) -> AppResult<()> {
+        if self.state == MfSourceState::Shutdown {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "cannot stop a shut-down media source",
+            ));
+        }
+        self.state = MfSourceState::Stopped;
+        self.queue_event_number(207); // MESourceStopped
+        for _ in 0..self.presentation.streams.len() {
+            self.queue_event_number(208); // MEStreamStopped
+        }
+        Ok(())
+    }
+
+    /// `IMFMediaSource::Pause`: queue `MESourcePaused` and the per-stream
+    /// `MEStreamPaused` events (only legal from Started).
+    pub fn pause(&mut self) -> AppResult<()> {
+        match self.state {
+            MfSourceState::Started => {
+                self.state = MfSourceState::Paused;
+                self.queue_event_number(209); // MESourcePaused
+                for _ in 0..self.presentation.streams.len() {
+                    self.queue_event_number(210); // MEStreamPaused
+                }
+                Ok(())
+            }
+            MfSourceState::Shutdown => Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "cannot pause a shut-down media source",
+            )),
+            _ => Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "cannot pause a source that is not started",
+            )),
+        }
+    }
+
+    /// `IMFMediaSource::Shutdown`.
+    pub fn shutdown(&mut self) {
+        self.state = MfSourceState::Shutdown;
+    }
+
+    /// The end of the presentation was reached on the pull side: queue
+    /// `MEEndOfStream` for each selected stream followed by
+    /// `MEEndOfPresentation` exactly once, and move back to Stopped.
+    pub fn end_presentation(&mut self) {
+        if self.end_sent || self.state == MfSourceState::Shutdown {
+            return;
+        }
+        self.end_sent = true;
+        let selected_streams = self
+            .presentation
+            .streams
+            .iter()
+            .filter(|stream| stream.selected)
+            .count();
+        for _ in 0..selected_streams {
+            self.queue_event_number(212); // MEEndOfStream
+        }
+        self.queue_event_number(211); // MEEndOfPresentation
+        self.state = MfSourceState::Stopped;
+    }
+}
+
+// ===========================================================================
 // MF API Stub Functions (updated)
 // ===========================================================================
 
@@ -3982,6 +4671,17 @@ pub fn detect_container_from_extension(path: &str) -> Option<ContainerKind> {
         Some(ContainerKind::Wmv)
     } else {
         None
+    }
+}
+
+/// The MIME type for a media file path (the `MF_BYTESTREAM_CONTENT_TYPE` a
+/// byte stream over the file reports).  Derived from the real file
+/// extension; `None` when the extension is not a known media container.
+pub fn mime_type_for_path(path: &str) -> Option<&'static str> {
+    match detect_container_from_extension(path)? {
+        ContainerKind::Mp4 => Some("video/mp4"),
+        ContainerKind::Ogg => Some("application/ogg"),
+        ContainerKind::Wmv => Some("video/x-ms-wmv"),
     }
 }
 
@@ -4419,6 +5119,77 @@ fn resolve_path(path: &str) -> String {
 // ===========================================================================
 // Tests
 // ===========================================================================
+
+/// A minimal but fully valid MP4 test fixture: `ftyp` + `moov` (one `vide`
+/// track with two 4-byte samples described by real `stbl` tables) + `mdat`.
+/// The `stco` chunk offset is patched to the real `mdat` payload, so the
+/// demuxer reads the actual sample bytes.  Shared by the media-layer and
+/// dispatch tests.
+#[cfg(test)]
+pub(crate) fn minimal_mp4_fixture() -> Vec<u8> {
+    fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    let ftyp = boxed(b"ftyp", b"mp42\0\0\0\0");
+    let mut tkhd_payload = vec![0_u8; 12];
+    tkhd_payload.extend_from_slice(&1_u32.to_be_bytes());
+    let tkhd = boxed(b"tkhd", &tkhd_payload);
+    let mut mdhd_payload = vec![0_u8; 12];
+    mdhd_payload.extend_from_slice(&600_u32.to_be_bytes()); // timescale
+    mdhd_payload.extend_from_slice(&1200_u32.to_be_bytes()); // duration (2 s)
+    mdhd_payload.extend_from_slice(&[0_u8; 4]);
+    let mdhd = boxed(b"mdhd", &mdhd_payload);
+    let mut hdlr_payload = vec![0_u8; 8];
+    hdlr_payload.extend_from_slice(b"vide");
+    hdlr_payload.extend_from_slice(&[0_u8; 12]);
+    let hdlr = boxed(b"hdlr", &hdlr_payload);
+    let stsd = boxed(b"stsd", &[0_u8; 8]);
+    let mut stts_payload = vec![0_u8; 4];
+    stts_payload.extend_from_slice(&1_u32.to_be_bytes());
+    stts_payload.extend_from_slice(&2_u32.to_be_bytes());
+    stts_payload.extend_from_slice(&600_u32.to_be_bytes());
+    let stts = boxed(b"stts", &stts_payload);
+    let mut stsc_payload = vec![0_u8; 4];
+    stsc_payload.extend_from_slice(&1_u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1_u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&2_u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1_u32.to_be_bytes());
+    let stsc = boxed(b"stsc", &stsc_payload);
+    let mut stsz_payload = vec![0_u8; 4];
+    stsz_payload.extend_from_slice(&0_u32.to_be_bytes());
+    stsz_payload.extend_from_slice(&2_u32.to_be_bytes());
+    stsz_payload.extend_from_slice(&4_u32.to_be_bytes());
+    stsz_payload.extend_from_slice(&4_u32.to_be_bytes());
+    let stsz = boxed(b"stsz", &stsz_payload);
+    let mut stco_payload = vec![0_u8; 4];
+    stco_payload.extend_from_slice(&1_u32.to_be_bytes());
+    stco_payload.extend_from_slice(&0_u32.to_be_bytes()); // patched below
+    let stco = boxed(b"stco", &stco_payload);
+    let stbl = boxed(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+    let minf = boxed(b"minf", &stbl);
+    let mdia = boxed(b"mdia", &[mdhd, hdlr, minf].concat());
+    let trak = boxed(b"trak", &[tkhd, mdia].concat());
+    let moov = boxed(b"moov", &trak);
+    let mdat = boxed(b"mdat", b"DATA0123");
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&moov);
+    let samples_offset = file.len() as u32 + 8;
+    file.extend_from_slice(&mdat);
+    let stco_type = file
+        .windows(4)
+        .position(|window| window == b"stco")
+        .expect("stco box present");
+    let offset_at = stco_type + 12;
+    file[offset_at..offset_at + 4].copy_from_slice(&samples_offset.to_be_bytes());
+    file
+}
 
 #[cfg(test)]
 mod tests {

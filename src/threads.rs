@@ -956,17 +956,23 @@ impl GuestTimerQueue {
 /// with a specific mutex at creation time — the association happens at wait time.
 ///
 /// This implementation uses an internal `Condvar` for actual blocking and a
-/// `wake_generation` counter that lets poll-based waiters (such as the
-/// pe_runtime dispatch loop) detect wake events without blocking on the
-/// condvar directly.
+/// `wake_generation` counter that lets waiters snapshot the state before
+/// blocking and re-check it after a wake.  Waiters block on the condvar until
+/// a real state change (wake or deadline) — there is no interval ticking.
 pub struct GuestConditionVariable {
     inner: Condvar,
-    /// Monotonically increasing counter incremented on each wake.  Poll-based
-    /// waiters snapshot this value before sleeping and compare afterwards to
-    /// detect wake events.
+    /// Monotonically increasing counter incremented on each wake.  Waiters
+    /// snapshot this value before blocking and compare afterwards to detect
+    /// wake events.
     wake_generation: AtomicU64,
     /// Tracks the number of threads currently waiting (for diagnostics).
     waiter_count: AtomicU32,
+    /// Number of `wake`/`wake_all` notifications issued (diagnostics/tests).
+    wake_count: AtomicU64,
+    /// Number of iterations executed by `sleep_with_polling` across all
+    /// callers (diagnostics/tests; used to prove waits are wake-driven rather
+    /// than interval-driven).
+    poll_iterations: AtomicU64,
 }
 
 impl GuestConditionVariable {
@@ -975,6 +981,8 @@ impl GuestConditionVariable {
             inner: Condvar::new(),
             wake_generation: AtomicU64::new(0),
             waiter_count: AtomicU32::new(0),
+            wake_count: AtomicU64::new(0),
+            poll_iterations: AtomicU64::new(0),
         }
     }
 
@@ -989,6 +997,19 @@ impl GuestConditionVariable {
     /// Return the number of threads currently waiting on this condition variable.
     pub fn waiter_count(&self) -> u32 {
         self.waiter_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of wake notifications issued via [`wake`](Self::wake) or
+    /// [`wake_all`](Self::wake_all) (diagnostics/tests).
+    pub fn wake_count(&self) -> u64 {
+        self.wake_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of iterations executed by [`sleep_with_polling`](Self::sleep_with_polling)
+    /// across all callers (diagnostics/tests).  A genuinely event-driven wait
+    /// stays at a small constant count regardless of the timeout length.
+    pub fn poll_iterations(&self) -> u64 {
+        self.poll_iterations.load(Ordering::Relaxed)
     }
 
     /// Sleep on the condition variable while releasing the associated critical
@@ -1037,15 +1058,16 @@ impl GuestConditionVariable {
         result
     }
 
-    /// Polling-aware sleep: snapshots the generation, invokes the pump closure
-    /// periodically, and returns `true` when a wake is detected or `false` on
-    /// timeout.
+    /// Event-driven wait: snapshots the wake generation, pumps pending work
+    /// once, then blocks on the condition variable until a wake is delivered
+    /// or the monotonic deadline expires.
     ///
     /// This is designed for the pe_runtime dispatch loop which needs to pump
-    /// pending guest threads while waiting on a condition variable.
-    ///
-    /// The `pump` closure is called on each iteration to allow the caller to
-    /// process pending work (e.g., pump guest threads).
+    /// pending guest threads while waiting on a condition variable.  There is
+    /// no fixed tick: a quiet wait blocks for the whole remaining duration and
+    /// performs a small constant number of iterations.  A `pump` that reports
+    /// progress (`true`) is re-invoked immediately, because that is real work,
+    /// not polling.
     pub fn sleep_with_polling<F: FnMut() -> bool>(
         &self,
         timeout_ms: Option<u64>,
@@ -1055,27 +1077,43 @@ impl GuestConditionVariable {
         self.waiter_count.fetch_add(1, Ordering::Relaxed);
 
         let deadline = timeout_ms.map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
-        // Adaptive sleep between pump iterations: short when the pump reports
-        // activity, backing off (up to 50 ms) while idle so an idle waiter
-        // does not busy-poll ~200 times/second.
-        let mut backoff_ms = 1u64;
+        let lock = std::sync::Mutex::new(());
+
         let result = loop {
-            // Check if a wake occurred
+            self.poll_iterations.fetch_add(1, Ordering::Relaxed);
+
             if self.wake_generation.load(Ordering::Acquire) != generation {
                 break true;
             }
-            // Check timeout
-            if deadline.is_some_and(|dl| std::time::Instant::now() >= dl) {
-                break false;
+
+            let remaining = match deadline {
+                Some(dl) => {
+                    let now = std::time::Instant::now();
+                    if now >= dl {
+                        break false;
+                    }
+                    dl - now
+                }
+                // No deadline: block until a real wake.  The predicate below
+                // re-arms on spurious wakeups, so the ceiling is only a
+                // defensive bound, not a polling tick.
+                None => Duration::from_secs(24 * 60 * 60),
+            };
+
+            if pump() {
+                // The pump made progress; re-check state without blocking.
+                continue;
             }
-            // Call the pump closure. If it returns false (no more work to pump),
-            // sleep briefly to avoid busy-waiting; if it does work, poll again
-            // immediately with a reset backoff.
-            if !pump() {
-                std::thread::sleep(Duration::from_millis(backoff_ms));
-                backoff_ms = (backoff_ms * 2).min(50);
-            } else {
-                backoff_ms = 1;
+
+            let (guard, wait_result) = self
+                .inner
+                .wait_timeout_while(lock_with_recovery(&lock), remaining, |_| {
+                    self.wake_generation.load(Ordering::Acquire) == generation
+                })
+                .unwrap_or_else(PoisonError::into_inner);
+            drop(guard);
+            if !wait_result.timed_out() {
+                break true;
             }
         };
 
@@ -1085,12 +1123,14 @@ impl GuestConditionVariable {
 
     /// Wake one waiting thread.
     pub fn wake(&self) {
+        self.wake_count.fetch_add(1, Ordering::Relaxed);
         self.wake_generation.fetch_add(1, Ordering::Release);
         self.inner.notify_one();
     }
 
     /// Wake all waiting threads.
     pub fn wake_all(&self) {
+        self.wake_count.fetch_add(1, Ordering::Relaxed);
         self.wake_generation.fetch_add(1, Ordering::Release);
         self.inner.notify_all();
     }
@@ -1533,8 +1573,10 @@ impl Default for GuestFiberManager {
 /// maintains a fixed number of worker threads that dequeue and process items:
 /// workers move whole `ThreadPoolWorkItem`s (callback **and** context/flags)
 /// to a completed queue that the runtime drains, and service due timers.
-/// Workers block on a condvar when idle (no polling); a short timed wait is
-/// kept so timers are still serviced while the pool is idle.
+/// Workers block on a condvar when idle — no polling.  When timers are
+/// pending, the wait is a monotonic deadline computed from the earliest due
+/// time (never a fixed tick); queue/timer/shutdown changes notify the workers
+/// immediately.
 pub struct EnhancedGuestThreadPool {
     /// Shared work queue.
     work_queue: Arc<Mutex<VecDeque<ThreadPoolWorkItem>>>,
@@ -1553,14 +1595,19 @@ pub struct EnhancedGuestThreadPool {
     num_workers: usize,
     /// Completed work items (whole items: callback + context + flags).
     completed_queue: Arc<Mutex<VecDeque<ThreadPoolWorkItem>>>,
+    /// Signals that a completed item was pushed, so `dequeue_completed_timeout`
+    /// blocks until work is actually available.
+    completed_available: Arc<Condvar>,
     /// Monotonic clock epoch for timer due-time computation.
     epoch: std::time::Instant,
+    /// Bumped whenever the timer queue changes (create/delete), so idle
+    /// workers re-evaluate their timer deadline instead of sleeping past a
+    /// newly-created timer.
+    timer_generation: Arc<AtomicU64>,
 }
 
 /// Cap on the completed queue and wait-registration list.
 const ENHANCED_POOL_CAP: usize = 4096;
-/// How long an idle worker sleeps between timer-servicing passes.
-const ENHANCED_POOL_TIMER_POLL_MS: u64 = 100;
 
 /// A wait registration (for RegisterWaitForSingleObject).
 #[derive(Debug, Clone)]
@@ -1581,8 +1628,12 @@ struct WaitRegistration {
 }
 
 /// Push an item to the completed queue, bounding growth if the runtime does
-/// not drain it.
-fn push_completed_item(queue: &Mutex<VecDeque<ThreadPoolWorkItem>>, item: ThreadPoolWorkItem) {
+/// not drain it, and wake a blocked `dequeue_completed_timeout` waiter.
+fn push_completed_item(
+    queue: &Mutex<VecDeque<ThreadPoolWorkItem>>,
+    available: &Condvar,
+    item: ThreadPoolWorkItem,
+) {
     let mut q = lock_with_recovery(queue);
     if q.len() >= ENHANCED_POOL_CAP {
         eprintln!(
@@ -1592,6 +1643,8 @@ fn push_completed_item(queue: &Mutex<VecDeque<ThreadPoolWorkItem>>, item: Thread
         return;
     }
     q.push_back(item);
+    drop(q);
+    available.notify_one();
 }
 
 impl EnhancedGuestThreadPool {
@@ -1605,7 +1658,9 @@ impl EnhancedGuestThreadPool {
             shutdown: Arc::new(AtomicBool::new(false)),
             num_workers,
             completed_queue: Arc::new(Mutex::new(VecDeque::new())),
+            completed_available: Arc::new(Condvar::new()),
             epoch: std::time::Instant::now(),
+            timer_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1617,7 +1672,9 @@ impl EnhancedGuestThreadPool {
                 let timer_queue = self.timer_queue.clone();
                 let completed_queue = self.completed_queue.clone();
                 let work_available = self.work_available.clone();
+                let completed_available = self.completed_available.clone();
                 let shutdown = self.shutdown.clone();
+                let timer_generation = self.timer_generation.clone();
                 let epoch = self.epoch;
 
                 let handle = std::thread::spawn(move || {
@@ -1626,23 +1683,38 @@ impl EnhancedGuestThreadPool {
                             return;
                         }
 
-                        // Service due timers: their callbacks are delivered
-                        // through the completed queue like ordinary work.
+                        // Snapshot the timer generation *before* evaluating
+                        // due timers: a concurrent create/delete bumps the
+                        // generation and notifies, and the wait predicate below
+                        // re-checks it so a wake cannot be missed between the
+                        // evaluation and the blocking wait.
+                        let timer_gen = timer_generation.load(Ordering::Acquire);
+
+                        // Service due timers in due-time order (ties broken by
+                        // handle). Removal/rescheduling happens under the same
+                        // lock as collection, so a due timer is delivered
+                        // exactly once even with several workers. Their
+                        // callbacks are delivered through the completed queue
+                        // like ordinary work.
                         let now_ms = epoch.elapsed().as_millis() as u64;
-                        let (due_items, removals, reschedules) = {
-                            let tq = lock_with_recovery(&timer_queue);
-                            let mut due_items = Vec::new();
+                        let (due_items, next_due_ms) = {
+                            let mut tq = lock_with_recovery(&timer_queue);
+                            let mut due = Vec::new();
                             let mut removals = Vec::new();
                             let mut reschedules = Vec::new();
                             for (&handle, timer) in &tq.timers {
                                 if !timer.active || timer.due_time_ms > now_ms {
                                     continue;
                                 }
-                                due_items.push(ThreadPoolWorkItem {
-                                    callback: timer.callback,
-                                    context: timer.context,
-                                    flags: 0,
-                                });
+                                due.push((
+                                    timer.due_time_ms,
+                                    handle,
+                                    ThreadPoolWorkItem {
+                                        callback: timer.callback,
+                                        context: timer.context,
+                                        flags: 0,
+                                    },
+                                ));
                                 if timer.period_ms > 0 {
                                     let mut next = timer.due_time_ms;
                                     while next <= now_ms {
@@ -1653,10 +1725,6 @@ impl EnhancedGuestThreadPool {
                                     removals.push(handle);
                                 }
                             }
-                            (due_items, removals, reschedules)
-                        };
-                        if !removals.is_empty() || !reschedules.is_empty() {
-                            let mut tq = lock_with_recovery(&timer_queue);
                             for h in &removals {
                                 tq.timers.remove(h);
                             }
@@ -1665,9 +1733,20 @@ impl EnhancedGuestThreadPool {
                                     t.due_time_ms = *next;
                                 }
                             }
-                        }
+                            due.sort_by_key(|(due_ms, handle, _)| (*due_ms, *handle));
+                            let next_due_ms = tq
+                                .timers
+                                .values()
+                                .filter(|t| t.active)
+                                .map(|t| t.due_time_ms)
+                                .min();
+                            (
+                                due.into_iter().map(|(_, _, item)| item).collect::<Vec<_>>(),
+                                next_due_ms,
+                            )
+                        };
                         for item in due_items {
-                            push_completed_item(&completed_queue, item);
+                            push_completed_item(&completed_queue, &completed_available, item);
                         }
 
                         // Dequeue a work item; the whole item (callback,
@@ -1677,22 +1756,31 @@ impl EnhancedGuestThreadPool {
                             queue.pop_front()
                         };
                         if let Some(item) = work {
-                            push_completed_item(&completed_queue, item);
-                        } else {
-                            // Block until work arrives or shutdown. The
-                            // timeout is required so idle workers keep
-                            // servicing timers.
-                            let mut queue = lock_with_recovery(&work_queue);
-                            let (guard, _) = work_available
-                                .wait_timeout_while(
-                                    queue,
-                                    Duration::from_millis(ENHANCED_POOL_TIMER_POLL_MS),
-                                    |q| q.is_empty() && !shutdown.load(Ordering::Acquire),
-                                )
-                                .unwrap_or_else(PoisonError::into_inner);
-                            queue = guard;
-                            drop(queue);
+                            push_completed_item(&completed_queue, &completed_available, item);
+                            continue;
                         }
+
+                        // Nothing to do: block until work arrives, the timer
+                        // queue changes, shutdown, or the next timer deadline
+                        // (a monotonic `due - now` duration, never a fixed
+                        // tick). With no timers this waits indefinitely and is
+                        // woken by queue_work/create_timer/shutdown.
+                        let wait = match next_due_ms {
+                            Some(due_ms) => {
+                                let elapsed_ms = epoch.elapsed().as_millis() as u64;
+                                Duration::from_millis(due_ms.saturating_sub(elapsed_ms))
+                            }
+                            None => Duration::from_secs(24 * 60 * 60),
+                        };
+                        let queue = lock_with_recovery(&work_queue);
+                        let (guard, _) = work_available
+                            .wait_timeout_while(queue, wait, |q| {
+                                q.is_empty()
+                                    && !shutdown.load(Ordering::Acquire)
+                                    && timer_generation.load(Ordering::Acquire) == timer_gen
+                            })
+                            .unwrap_or_else(PoisonError::into_inner);
+                        drop(guard);
                     }
                 });
 
@@ -1716,6 +1804,32 @@ impl EnhancedGuestThreadPool {
         lock_with_recovery(&self.completed_queue).pop_front()
     }
 
+    /// Block until a completed work item is available or `timeout_ms` elapses.
+    ///
+    /// Uses a monotonic deadline and the completed-queue condvar, so the
+    /// caller is woken by an actual completion rather than polling.
+    pub fn dequeue_completed_timeout(&self, timeout_ms: u64) -> Option<ThreadPoolWorkItem> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut queue = lock_with_recovery(&self.completed_queue);
+        loop {
+            if let Some(item) = queue.pop_front() {
+                return Some(item);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (guard, wait_result) = self
+                .completed_available
+                .wait_timeout(queue, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner);
+            queue = guard;
+            if wait_result.timed_out() && queue.is_empty() {
+                return None;
+            }
+        }
+    }
+
     /// Create a timer that fires at the specified due time and period.
     pub fn create_timer(
         &self,
@@ -1732,12 +1846,16 @@ impl EnhancedGuestThreadPool {
             due_time_ms,
             period_ms,
         );
+        self.timer_generation.fetch_add(1, Ordering::Release);
         self.work_available.notify_one();
     }
 
-    /// Delete a timer.
+    /// Delete a timer. Idle workers are woken so a pending deadline for the
+    /// cancelled timer is recomputed immediately.
     pub fn delete_timer(&self, handle: u64) {
         lock_with_recovery(&self.timer_queue).delete_timer(handle);
+        self.timer_generation.fetch_add(1, Ordering::Release);
+        self.work_available.notify_one();
     }
 
     /// Register a wait for a handle.
@@ -2032,21 +2150,32 @@ mod tests {
         let mutex_clone = mutex.clone();
         let acquired = Arc::new(AtomicBool::new(false));
         let acquired_clone = acquired.clone();
+        let (waiting_tx, waiting_rx) = crossbeam_channel::bounded::<()>(1);
 
         let handle = thread::spawn(move || {
+            waiting_tx.send(()).unwrap();
             mutex_clone.acquire(2);
             acquired_clone.store(true, Ordering::SeqCst);
             mutex_clone.release(2);
         });
 
-        // Thread 2 should be blocked
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // The worker is committed to acquiring; while thread 1 owns the mutex
+        // neither the worker nor another try_acquire can proceed. No timing
+        // assumption is needed.
+        waiting_rx.recv().unwrap();
         assert!(!acquired.load(Ordering::SeqCst));
+        assert!(!mutex.try_acquire(3), "mutex still owned by thread 1");
 
-        // Release from thread 1
+        // Release from thread 1 — the worker is woken by the condvar.
+        let t0 = std::time::Instant::now();
         mutex.release(1);
         handle.join().unwrap();
         assert!(acquired.load(Ordering::SeqCst));
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "mutex handoff latency too high: {:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]
@@ -2058,16 +2187,32 @@ mod tests {
         let sem_clone = sem.clone();
         let waited = Arc::new(AtomicBool::new(false));
         let waited_clone = waited.clone();
+        let (waiting_tx, waiting_rx) = crossbeam_channel::bounded::<()>(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
 
         let handle = thread::spawn(move || {
+            waiting_tx.send(()).unwrap();
             sem_clone.wait();
             waited_clone.store(true, Ordering::SeqCst);
+            done_tx.send(()).unwrap();
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        waiting_rx.recv().unwrap();
+        // No release yet: the waiter must still be blocked (negative check
+        // with a bounded timeout, not a fixed tick loop).
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
         assert!(!waited.load(Ordering::SeqCst));
 
+        let t0 = std::time::Instant::now();
         sem.release(1).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_millis(1000))
+            .expect("release must wake the waiter promptly");
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "semaphore wake latency too high: {:?}",
+            t0.elapsed()
+        );
         handle.join().unwrap();
         assert!(waited.load(Ordering::SeqCst));
     }
@@ -2136,6 +2281,101 @@ mod tests {
         // Basic smoke test — wake should not panic
         cv.wake();
         cv.wake_all();
+        assert_eq!(cv.wake_count(), 2);
+    }
+
+    #[test]
+    fn condition_variable_wake_is_immediate() {
+        use std::sync::Arc;
+
+        let cv = Arc::new(GuestConditionVariable::new());
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<bool>(1);
+        let cv2 = Arc::clone(&cv);
+
+        let waiter = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let woke = cv2.sleep_with_polling(Some(5_000), || false);
+            done_tx.send(woke).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        // Wait (bounded) until the waiter is actually blocked on the condvar.
+        let spin_deadline = std::time::Instant::now() + Duration::from_millis(2_000);
+        while cv.waiter_count() == 0 && std::time::Instant::now() < spin_deadline {
+            std::hint::spin_loop();
+        }
+        assert!(cv.waiter_count() > 0, "waiter never registered");
+
+        let wakes_before = cv.wake_count();
+        let t0 = std::time::Instant::now();
+        cv.wake();
+        let woke = done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("wake must be delivered promptly");
+        let latency = t0.elapsed();
+
+        assert!(woke, "waiter must report a wake, not a timeout");
+        assert!(
+            latency < Duration::from_millis(250),
+            "wake latency too high: {latency:?}"
+        );
+        assert_eq!(cv.wake_count(), wakes_before + 1, "wake counter");
+        assert_eq!(cv.waiter_count(), 0, "waiter must deregister");
+        assert!(
+            cv.poll_iterations() <= 4,
+            "event-driven wake took {} iterations",
+            cv.poll_iterations()
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn condition_variable_timeout_honours_deadline() {
+        let cv = GuestConditionVariable::new();
+        let t0 = std::time::Instant::now();
+        let woke = cv.sleep_with_polling(Some(200), || false);
+        let elapsed = t0.elapsed();
+
+        assert!(!woke, "quiet wait must report a timeout");
+        assert!(
+            elapsed >= Duration::from_millis(185),
+            "deadline returned early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "deadline drifted late: {elapsed:?}"
+        );
+        assert!(
+            cv.poll_iterations() <= 4,
+            "quiet wait must be event-driven, took {} iterations",
+            cv.poll_iterations()
+        );
+        assert_eq!(cv.wake_count(), 0, "no wake was delivered");
+        assert_eq!(cv.waiter_count(), 0, "waiter must deregister");
+    }
+
+    #[test]
+    fn condition_variable_quiet_wait_does_not_poll() {
+        let cv = GuestConditionVariable::new();
+        let pump_calls = AtomicU64::new(0);
+        let woke = cv.sleep_with_polling(Some(200), || {
+            pump_calls.fetch_add(1, Ordering::Relaxed);
+            false
+        });
+        assert!(!woke);
+
+        let iterations = cv.poll_iterations();
+        let pumps = pump_calls.load(Ordering::Relaxed);
+        assert!(
+            iterations <= 4,
+            "quiet 200 ms wait performed {iterations} iterations (interval-driven?)"
+        );
+        assert!(
+            pumps <= 2,
+            "quiet 200 ms wait pumped {pumps} times (interval-driven?)"
+        );
+        assert_eq!(cv.wake_count(), 0);
     }
 
     #[test]
@@ -2192,6 +2432,79 @@ mod tests {
         // No panic = success
     }
 
+    #[test]
+    fn enhanced_thread_pool_timer_fires_at_due_time_in_order() {
+        let mut pool = EnhancedGuestThreadPool::new(2);
+        pool.start();
+        // Created out of due-time order: delivery must be due-time ordered.
+        pool.create_timer(3, 0x300, 0, 80, 0);
+        pool.create_timer(1, 0x100, 0, 30, 0);
+        pool.create_timer(2, 0x200, 0, 50, 0);
+
+        let t0 = std::time::Instant::now();
+        let first = pool
+            .dequeue_completed_timeout(1_000)
+            .expect("first timer must fire");
+        let second = pool
+            .dequeue_completed_timeout(1_000)
+            .expect("second timer must fire");
+        let third = pool
+            .dequeue_completed_timeout(1_000)
+            .expect("third timer must fire");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            [first.callback, second.callback, third.callback],
+            [0x100, 0x200, 0x300],
+            "timers must fire in due-time order"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(75),
+            "timers fired before their deadlines: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "timers fired late: {elapsed:?}"
+        );
+        // Exactly once each: nothing left over.
+        assert!(pool.dequeue_completed().is_none());
+    }
+
+    #[test]
+    fn enhanced_thread_pool_timer_delete_cancels() {
+        let mut pool = EnhancedGuestThreadPool::new(1);
+        pool.start();
+        pool.create_timer(1, 0xBAD, 0, 60, 0);
+        pool.delete_timer(1);
+        assert!(
+            pool.dequeue_completed_timeout(250).is_none(),
+            "cancelled timer must not fire"
+        );
+        assert!(pool.dequeue_completed().is_none());
+    }
+
+    #[test]
+    fn enhanced_thread_pool_periodic_timer_repeats_and_cancels() {
+        let mut pool = EnhancedGuestThreadPool::new(1);
+        pool.start();
+        pool.create_timer(1, 0x777, 0, 20, 40);
+
+        let first = pool
+            .dequeue_completed_timeout(1_000)
+            .expect("first period must fire");
+        let second = pool
+            .dequeue_completed_timeout(1_000)
+            .expect("second period must fire");
+        assert_eq!(first.callback, 0x777);
+        assert_eq!(second.callback, 0x777);
+
+        pool.delete_timer(1);
+        assert!(
+            pool.dequeue_completed_timeout(150).is_none(),
+            "periodic timer must stop after delete"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Concurrency stress tests (Q6)
     // ------------------------------------------------------------------
@@ -2234,27 +2547,36 @@ mod tests {
         let sem = Arc::new(GuestSemaphore::new(4, 10));
         let mut handles = Vec::new();
         let num_threads = 8;
-        let reached = Arc::new(AtomicU32::new(0));
+        let (passed_tx, passed_rx) = crossbeam_channel::unbounded::<()>();
 
         for _ in 0..num_threads {
             let s = Arc::clone(&sem);
-            let r = Arc::clone(&reached);
+            let tx = passed_tx.clone();
             handles.push(std::thread::spawn(move || {
                 s.wait();
-                r.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.send(());
                 // Don't release – tests that wait blocks correctly
             }));
         }
+        drop(passed_tx);
 
-        // Give threads time to block on semaphore
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // At most 4 should have gotten through (initial count = 4)
-        let passed = reached.load(Ordering::SeqCst);
+        // Exactly the initial count (4) gets through; the rest stay blocked.
+        // Event-driven: each pass is reported over a channel, no sleep tick.
+        let mut passed = 0u32;
+        while passed < 4 {
+            passed_rx
+                .recv_timeout(Duration::from_millis(1_000))
+                .expect("initial semaphore count must admit 4 waiters");
+            passed += 1;
+        }
         assert!(
-            passed <= 4,
-            "more threads passed semaphore than count allowed: {passed}"
+            passed_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "more threads passed the semaphore than its initial count"
         );
-        assert!(passed > 0, "no threads passed semaphore");
+        for h in handles {
+            // Remaining waiters stay blocked by design; detach them.
+            let _ = h;
+        }
     }
 
     #[test]
@@ -2315,12 +2637,12 @@ mod tests {
         let total_expected = num_producers * items_per_producer;
         let received = Arc::new(AtomicU32::new(0));
 
-        let mut handles = Vec::new();
-
-        // Producers
+        // Producers run to completion first, so every real packet is enqueued
+        // ahead of the sentinels below (the bounded channel has room for all).
+        let mut producers = Vec::new();
         for pid in 0..num_producers {
             let port = Arc::clone(&iocp);
-            handles.push(std::thread::spawn(move || {
+            producers.push(std::thread::spawn(move || {
                 for i in 0..items_per_producer {
                     let _ = port.post(IoCompletionPacket {
                         completion_key: pid as u64,
@@ -2331,29 +2653,49 @@ mod tests {
                 }
             }));
         }
+        for h in producers {
+            h.join().expect("producer panicked");
+        }
 
-        // Consumers
+        // One sentinel per consumer lets each consumer stop its blocking
+        // dequeue — no timeout tick loop.
+        for _ in 0..num_consumers {
+            iocp.post(IoCompletionPacket {
+                completion_key: u64::MAX,
+                overlapped: 0,
+                bytes_transferred: 0,
+                error_code: 0,
+            })
+            .expect("sentinel post");
+        }
+
+        let mut consumers = Vec::new();
         for _ in 0..num_consumers {
             let port = Arc::clone(&iocp);
             let rcvd = Arc::clone(&received);
-            handles.push(std::thread::spawn(move || {
-                while rcvd.load(Ordering::SeqCst) < total_expected as u32 {
-                    if let Some(_pkt) = port.dequeue(Some(10)) {
-                        rcvd.fetch_add(1, Ordering::SeqCst);
-                    } else {
-                        break;
+            consumers.push(std::thread::spawn(move || {
+                loop {
+                    match port.dequeue(None) {
+                        Some(pkt) => {
+                            if pkt.completion_key == u64::MAX {
+                                break;
+                            }
+                            rcvd.fetch_add(1, Ordering::SeqCst);
+                        }
+                        None => break,
                     }
                 }
             }));
         }
-
-        for h in handles {
-            h.join().expect("thread panicked");
+        for h in consumers {
+            h.join().expect("consumer panicked");
         }
 
-        // At least some items were transferred
-        let final_count = received.load(Ordering::SeqCst);
-        assert!(final_count > 0, "no items transferred via IOCP");
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            total_expected as u32,
+            "all posted packets must be transferred"
+        );
     }
 
     // ── Mutex behavior tests ───────────────────────────────────────────
@@ -2406,16 +2748,26 @@ mod tests {
         let mx = Arc::new(GuestMutex::new());
         mx.acquire(1);
 
+        let (started_tx, started_rx) = crossbeam_channel::bounded::<()>(1);
         let mx2 = Arc::clone(&mx);
         let h = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
             mx2.acquire(2);
             mx2.release(2);
         });
 
-        // Give the thread a moment to block, then release
-        std::thread::sleep(Duration::from_millis(10));
+        // The worker is committed to acquiring; while thread 1 owns the mutex
+        // the worker cannot proceed. Release wakes it via the condvar.
+        started_rx.recv().unwrap();
+        assert!(!mx.try_acquire(3), "mutex still owned by thread 1");
+        let t0 = std::time::Instant::now();
         mx.release(1);
         h.join().expect("thread should complete");
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "mutex handoff latency too high: {:?}",
+            t0.elapsed()
+        );
     }
 
     // ── Event behavior tests ───────────────────────────────────────────
@@ -2458,11 +2810,23 @@ mod tests {
     fn event_blocking_wait() {
         let ev = Arc::new(GuestEvent::new(false, false));
         let ev2 = Arc::clone(&ev);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
+        let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
         let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
             ev2.set();
         });
-        ev.wait(); // should block until set
+
+        ready_rx.recv().unwrap();
+        let t0 = std::time::Instant::now();
+        go_tx.send(()).unwrap();
+        ev.wait(); // woken by set(), not by a timing tick
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "event wake latency too high: {:?}",
+            t0.elapsed()
+        );
         h.join().expect("thread should complete");
     }
 
@@ -2498,11 +2862,23 @@ mod tests {
     fn semaphore_blocking_wait() {
         let sem = Arc::new(GuestSemaphore::new(0, 2));
         let sem2 = Arc::clone(&sem);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
+        let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
         let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
             sem2.release(1).expect("release");
         });
-        sem.wait(); // should block until released
+
+        ready_rx.recv().unwrap();
+        let t0 = std::time::Instant::now();
+        go_tx.send(()).unwrap();
+        sem.wait(); // woken by release(), not by a timing tick
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "semaphore wake latency too high: {:?}",
+            t0.elapsed()
+        );
         h.join().expect("thread should complete");
     }
 }
