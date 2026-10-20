@@ -4420,6 +4420,8 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "section50_win32_nt_consistency"
     ),
     conformance_evidence!("ntdll.dll", "NtCreateKey", "section47_ntdll"),
+    conformance_evidence!("ntdll.dll", "NtLoadDriver", "driver_service_load_unload"),
+    conformance_evidence!("ntdll.dll", "NtUnloadDriver", "driver_service_load_unload"),
     conformance_evidence!(
         "ntdll.dll",
         "NtCreateSection",
@@ -7815,6 +7817,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "mfplat.dll",
         "MFCreateFile",
         "casa1-conformance:mf_create_file_byte_stream_reads_writes_and_seeks_real_files",
+    ),
+    conformance(
+        "mfplat.dll",
+        "MFCreateTempFile",
+        "casa1-conformance:mf_create_temp_file_creates_delete_on_close_streams",
     ),
     conformance(
         "msi.dll",

@@ -1510,13 +1510,13 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         None,
         SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
-        "Real service-provider table on the session object graph: MFGetService \
-         resolves the owner (session, topology object, topology node) and returns \
-         real service objects — the session itself (MF_MEDIASESSION_SERVICE) and \
-         genuine IMFRateControl/IMFRateSupport (MF_RATE_CONTROL_SERVICE) backed by \
-         real session rate state with release-to-forget semantics; service GUIDs the \
-         object genuinely does not own answer MF_E_UNSUPPORTED_SERVICE (correct \
-         Windows behavior).  Media-source/sink services await those objects.",
+        "Real service-provider table on the runtime object graph: MFGetService \
+         resolves the owner (session, topology object/node, real media source, real \
+         byte stream) and returns real service objects — the session itself, genuine \
+         IMFRateControl/IMFRateSupport backed by real session rate state, \
+         MF_MEDIASOURCE_SERVICE on real sources, a real IMFMetadata provider over \
+         parsed MP4 ilst tags, and byte-stream attribute services; genuinely unowned \
+         GUIDs answer MF_E_UNSUPPORTED_SERVICE.",
     ),
     semantic_override(
         "mfplat.dll",
@@ -1527,8 +1527,9 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "Real service-provider table on the runtime object graph: MFGetService \
          resolves the owner (session, topology object/node, real media source, real \
          byte stream) and returns real service objects — the session itself, genuine \
-         IMFRateControl/IMFRateSupport, MF_MEDIASOURCE_SERVICE on real sources and \
-         byte-stream attribute services; genuinely unowned GUIDs answer \
+         IMFRateControl/IMFRateSupport, MF_MEDIASOURCE_SERVICE on real sources, real \
+         byte-stream attribute services and a real IMFMetadata provider over the \
+         parsed MP4 ilst tag map; genuinely unowned GUIDs answer \
          MF_E_UNSUPPORTED_SERVICE.",
     ),
     // ── GDI+: the drawing surface is real and the former limits are too ─────

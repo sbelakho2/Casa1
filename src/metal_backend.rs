@@ -29,6 +29,7 @@ use core_foundation::string::CFString;
 use core_graphics_types::geometry::CGSize;
 use metal::foreign_types::ForeignType;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -1430,17 +1431,40 @@ pub fn create_texture_from_io_surface(
     width: u64,
     height: u64,
 ) -> Option<metal::Texture> {
+    create_texture_from_io_surface_plane(device, io_surface_ptr, format, width, height, 0)
+}
+
+/// Create a Metal texture aliasing one plane of an `IOSurface`.
+///
+/// `plane` is 0 for single-plane BGRA/RGBA surfaces and for the luma plane of
+/// a planar NV12 surface; 1 selects the interleaved CbCr plane. For a plane
+/// with chroma subsampling pass the luma width/height and this routine halves
+/// them for plane 1.
+pub fn create_texture_from_io_surface_plane(
+    device: &metal::DeviceRef,
+    io_surface_ptr: *mut std::ffi::c_void,
+    format: metal::MTLPixelFormat,
+    width: u64,
+    height: u64,
+    plane: u64,
+) -> Option<metal::Texture> {
     use metal::foreign_types::{ForeignType, ForeignTypeRef};
 
     if io_surface_ptr.is_null() || width == 0 || height == 0 {
         return None;
     }
 
+    let (plane_width, plane_height) = if plane == 0 {
+        (width, height)
+    } else {
+        (width.div_ceil(2), height.div_ceil(2))
+    };
+
     let descriptor = metal::TextureDescriptor::new();
     descriptor.set_texture_type(metal::MTLTextureType::D2);
     descriptor.set_pixel_format(format);
-    descriptor.set_width(width);
-    descriptor.set_height(height);
+    descriptor.set_width(plane_width);
+    descriptor.set_height(plane_height);
     descriptor.set_usage(metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget);
     descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
     descriptor.set_sample_count(1);
@@ -1449,8 +1473,6 @@ pub fn create_texture_from_io_surface(
     unsafe {
         let device_obj = device.as_ptr() as *mut objc::runtime::Object;
         let descriptor_obj = descriptor.as_ptr() as *mut objc::runtime::Object;
-        // NSUInteger plane index (0 for single-plane BGRA/RGBA surfaces).
-        let plane: u64 = 0;
         let texture: *mut metal::MTLTexture = msg_send![
             device_obj,
             newTextureWithDescriptor: descriptor_obj
@@ -1475,18 +1497,30 @@ pub fn create_texture_from_io_surface(
 /// the caller must `CFRelease`), or `None` if the dimensions are zero or the
 /// allocation fails.
 pub fn create_io_surface(width: u32, height: u32) -> Option<*mut std::ffi::c_void> {
+    // 'BGRA' four-character code (0x42475241) — 8 bits per channel.
+    create_io_surface_with_format(width, height, 0x4247_5241, 4)
+}
+
+/// Allocate an `IOSurface` with an explicit pixel format and bytes-per-element.
+///
+/// Used by [`IoSurfacePresentChannel`] to allocate an RGBA8 surface (`'RGBA'`,
+/// `0x52474241`) or a BGRA8 surface (`'BGRA'`, `0x42475241`) matching the DXGI
+/// backbuffer format, so the Metal texture and the guest pixels share one
+/// layout with no per-frame conversion.
+pub fn create_io_surface_with_format(
+    width: u32,
+    height: u32,
+    pixel_format: u32,
+    bytes_per_element: u32,
+) -> Option<*mut std::ffi::c_void> {
     use core_foundation::base::TCFType;
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::number::CFNumber;
     use core_foundation::string::CFString;
 
-    if width == 0 || height == 0 {
+    if width == 0 || height == 0 || bytes_per_element == 0 {
         return None;
     }
-
-    // 'BGRA' four-character code (0x42475241) — 8 bits per channel.
-    const PIXEL_FORMAT_BGRA: i64 = 0x4247_5241;
-    const BYTES_PER_ELEMENT: i64 = 4;
 
     let pairs = [
         (
@@ -1499,11 +1533,11 @@ pub fn create_io_surface(width: u32, height: u32) -> Option<*mut std::ffi::c_voi
         ),
         (
             CFString::from_static_string("IOSurfaceBytesPerElement"),
-            CFNumber::from(BYTES_PER_ELEMENT),
+            CFNumber::from(bytes_per_element as i64),
         ),
         (
             CFString::from_static_string("IOSurfacePixelFormat"),
-            CFNumber::from(PIXEL_FORMAT_BGRA),
+            CFNumber::from(pixel_format as i64),
         ),
     ];
     let dict = CFDictionary::from_CFType_pairs(
@@ -1553,6 +1587,17 @@ pub struct IoSurfaceRef(*mut std::ffi::c_void);
 // `CFRetain`/`CFRelease` are atomic.  We do not expose interior mutation.
 unsafe impl Send for IoSurfaceRef {}
 unsafe impl Sync for IoSurfaceRef {}
+
+impl Clone for IoSurfaceRef {
+    fn clone(&self) -> Self {
+        // SAFETY: `self.0` is a live `+1` IOSurfaceRef; CFRetain returns the
+        // same object with an additional reference that the clone owns.
+        unsafe {
+            core_foundation::base::CFRetain(self.0 as core_foundation::base::CFTypeRef);
+        }
+        Self(self.0)
+    }
+}
 
 impl IoSurfaceRef {
     /// Wrap a `+1` retained `IOSurfaceRef`, taking ownership.
@@ -1655,6 +1700,867 @@ impl Drop for IoSurfaceLockGuard {
         unsafe {
             let _ = IOSurfaceUnlock(self.surface, self.options, std::ptr::null_mut());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CoreVideo CVMetalTextureCache bridge (CVPixelBuffer / IOSurface -> MTLTexture)
+// ---------------------------------------------------------------------------
+
+type CvReturn = i32;
+
+/// Function table resolved from the CoreVideo framework at runtime.
+///
+/// Resolving through `dlopen`/`dlsym` (rather than hard-linking every symbol)
+/// is the capability probe: hosts without the CVMetalTextureCache entry points
+/// report the zero-copy path as unavailable instead of failing to load.
+#[derive(Clone, Copy)]
+struct CvApi {
+    create_pixel_buffer: unsafe extern "C" fn(
+        *const std::ffi::c_void,
+        usize,
+        usize,
+        u32,
+        *const std::ffi::c_void,
+        *mut *mut std::ffi::c_void,
+    ) -> CvReturn,
+    lock_base_address: unsafe extern "C" fn(*mut std::ffi::c_void, u64) -> CvReturn,
+    unlock_base_address: unsafe extern "C" fn(*mut std::ffi::c_void, u64) -> CvReturn,
+    get_base_address: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void,
+    get_bytes_per_row: unsafe extern "C" fn(*mut std::ffi::c_void) -> usize,
+    get_base_address_of_plane:
+        unsafe extern "C" fn(*mut std::ffi::c_void, usize) -> *mut std::ffi::c_void,
+    get_bytes_per_row_of_plane: unsafe extern "C" fn(*mut std::ffi::c_void, usize) -> usize,
+    create_cache: unsafe extern "C" fn(
+        *const std::ffi::c_void,
+        *const std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *const std::ffi::c_void,
+        *mut *mut std::ffi::c_void,
+    ) -> CvReturn,
+    create_texture_from_image: unsafe extern "C" fn(
+        *const std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *const std::ffi::c_void,
+        u64,
+        usize,
+        usize,
+        usize,
+        *mut *mut std::ffi::c_void,
+    ) -> CvReturn,
+    get_texture: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void,
+}
+
+static CV_API: OnceLock<Option<CvApi>> = OnceLock::new();
+
+fn cv_api() -> Option<&'static CvApi> {
+    CV_API
+        .get_or_init(|| {
+            // SAFETY: dlopen/dlsym only resolve documented CoreVideo symbols;
+            // the framework file is a fixed system path.
+            unsafe {
+                let handle = libc::dlopen(
+                    c"/System/Library/Frameworks/CoreVideo.framework/CoreVideo".as_ptr(),
+                    libc::RTLD_LAZY | libc::RTLD_LOCAL,
+                );
+                if handle.is_null() {
+                    return None;
+                }
+                macro_rules! sym {
+                    ($name:literal, $ty:ty) => {{
+                        let pointer = libc::dlsym(
+                            handle,
+                            concat!($name, "\0").as_ptr() as *const libc::c_char,
+                        );
+                        if pointer.is_null() {
+                            return None;
+                        }
+                        std::mem::transmute_copy::<*mut std::ffi::c_void, $ty>(&pointer)
+                    }};
+                }
+                Some(CvApi {
+                    create_pixel_buffer: sym!(
+                        "CVPixelBufferCreate",
+                        unsafe extern "C" fn(
+                            *const std::ffi::c_void,
+                            usize,
+                            usize,
+                            u32,
+                            *const std::ffi::c_void,
+                            *mut *mut std::ffi::c_void,
+                        ) -> CvReturn
+                    ),
+                    lock_base_address: sym!(
+                        "CVPixelBufferLockBaseAddress",
+                        unsafe extern "C" fn(*mut std::ffi::c_void, u64) -> CvReturn
+                    ),
+                    unlock_base_address: sym!(
+                        "CVPixelBufferUnlockBaseAddress",
+                        unsafe extern "C" fn(*mut std::ffi::c_void, u64) -> CvReturn
+                    ),
+                    get_base_address: sym!(
+                        "CVPixelBufferGetBaseAddress",
+                        unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void
+                    ),
+                    get_bytes_per_row: sym!(
+                        "CVPixelBufferGetBytesPerRow",
+                        unsafe extern "C" fn(*mut std::ffi::c_void) -> usize
+                    ),
+                    get_base_address_of_plane: sym!(
+                        "CVPixelBufferGetBaseAddressOfPlane",
+                        unsafe extern "C" fn(*mut std::ffi::c_void, usize) -> *mut std::ffi::c_void
+                    ),
+                    get_bytes_per_row_of_plane: sym!(
+                        "CVPixelBufferGetBytesPerRowOfPlane",
+                        unsafe extern "C" fn(*mut std::ffi::c_void, usize) -> usize
+                    ),
+                    create_cache: sym!(
+                        "CVMetalTextureCacheCreate",
+                        unsafe extern "C" fn(
+                            *const std::ffi::c_void,
+                            *const std::ffi::c_void,
+                            *mut std::ffi::c_void,
+                            *const std::ffi::c_void,
+                            *mut *mut std::ffi::c_void,
+                        ) -> CvReturn
+                    ),
+                    create_texture_from_image: sym!(
+                        "CVMetalTextureCacheCreateTextureFromImage",
+                        unsafe extern "C" fn(
+                            *const std::ffi::c_void,
+                            *mut std::ffi::c_void,
+                            *mut std::ffi::c_void,
+                            *const std::ffi::c_void,
+                            u64,
+                            usize,
+                            usize,
+                            usize,
+                            *mut *mut std::ffi::c_void,
+                        ) -> CvReturn
+                    ),
+                    get_texture: sym!(
+                        "CVMetalTextureGetTexture",
+                        unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void
+                    ),
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// True when this host exposes CoreVideo's CVMetalTextureCache API and a Metal
+/// device. When false callers must use the IOSurface direct-texture path or
+/// the verified CPU fallback.
+pub fn cv_metal_texture_cache_available() -> bool {
+    cv_api().is_some() && metal::Device::system_default().is_some()
+}
+
+/// True when the IOSurface entry points backing [`IoSurfacePresentChannel`]
+/// can be resolved. macOS always ships IOSurface; the dynamic probe reports a
+/// stripped environment as unavailable instead of crashing at load time.
+pub fn iosurface_capability_available() -> bool {
+    // SAFETY: dlsym only inspects the process symbol table.
+    unsafe {
+        !libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"IOSurfaceCreate".as_ptr() as *const libc::c_char,
+        )
+        .is_null()
+            && !libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"IOSurfaceGetBaseAddress".as_ptr() as *const libc::c_char,
+            )
+            .is_null()
+    }
+}
+
+const CV_PIXEL_FORMAT_BGRA: u32 = 0x4247_5241; // 'BGRA'
+const CV_PIXEL_FORMAT_420F: u32 = 0x3432_3066; // '420f' NV12 full range
+
+/// An owned, IOSurface-backed `CVPixelBuffer`.
+///
+/// Pixel writes go straight into the locked surface base address; the matching
+/// [`CvMetalTextureCache::create_texture_from_pixel_buffer`] texture aliases
+/// that same storage, so no frame-sized CPU `Vec` is created between the
+/// producer and the GPU.
+pub struct CvPixelBuffer {
+    ptr: *mut std::ffi::c_void,
+    width: u32,
+    height: u32,
+    pixel_format: u32,
+}
+
+unsafe impl Send for CvPixelBuffer {}
+unsafe impl Sync for CvPixelBuffer {}
+
+impl std::fmt::Debug for CvPixelBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CvPixelBuffer")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pixel_format", &self.pixel_format)
+            .finish()
+    }
+}
+
+impl CvPixelBuffer {
+    fn create(width: u32, height: u32, pixel_format: u32) -> Option<Self> {
+        use core_foundation::base::TCFType;
+        use core_foundation::boolean::CFBoolean;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::string::CFString;
+
+        let api = cv_api()?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let empty: [(core_foundation::base::CFType, core_foundation::base::CFType); 0] = [];
+        let surface_properties = CFDictionary::from_CFType_pairs(&empty);
+        let pairs = [
+            (
+                CFString::from_static_string("IOSurfaceProperties").as_CFType(),
+                surface_properties.as_CFType(),
+            ),
+            (
+                CFString::from_static_string("MetalCompatibility").as_CFType(),
+                CFBoolean::true_value().as_CFType(),
+            ),
+        ];
+        let attributes = CFDictionary::from_CFType_pairs(&pairs);
+        let mut buffer = std::ptr::null_mut();
+        // SAFETY: `attributes` is a live CFDictionary and `buffer` receives a
+        // +1 CVPixelBuffer reference owned by the returned wrapper.
+        let rc = unsafe {
+            (api.create_pixel_buffer)(
+                std::ptr::null(),
+                width as usize,
+                height as usize,
+                pixel_format,
+                attributes.as_concrete_TypeRef().cast(),
+                &mut buffer,
+            )
+        };
+        if rc != 0 || buffer.is_null() {
+            None
+        } else {
+            Some(Self {
+                ptr: buffer,
+                width,
+                height,
+                pixel_format,
+            })
+        }
+    }
+
+    /// Create a BGRA8 pixel buffer backed by an IOSurface.
+    pub fn new_bgra8(width: u32, height: u32) -> Option<Self> {
+        Self::create(width, height, CV_PIXEL_FORMAT_BGRA)
+    }
+
+    /// Create a full-range NV12 (`420f`) pixel buffer backed by an IOSurface.
+    pub fn new_nv12(width: u32, height: u32) -> Option<Self> {
+        Self::create(width, height, CV_PIXEL_FORMAT_420F)
+    }
+
+    pub fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.ptr
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn pixel_format(&self) -> u32 {
+        self.pixel_format
+    }
+
+    fn with_locked_plane<T>(
+        &self,
+        plane: Option<usize>,
+        flags: u64,
+        body: impl FnOnce(*mut u8, usize, usize) -> AppResult<T>,
+    ) -> AppResult<T> {
+        let api = cv_api().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "CVPixelBuffer: CoreVideo is unavailable on this host",
+            )
+        })?;
+        // SAFETY: every FFI call targets the live +1 CVPixelBuffer owned by
+        // `self`; the base address is only used while the buffer is locked.
+        unsafe {
+            let lock_rc = (api.lock_base_address)(self.ptr, flags);
+            if lock_rc != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("CVPixelBufferLockBaseAddress failed ({lock_rc:#x})"),
+                ));
+            }
+            let result = (|| {
+                let (base, bytes_per_row, plane_height) = match plane {
+                    Some(index) => {
+                        let rows = if index == 0 {
+                            self.height as usize
+                        } else {
+                            (self.height as usize).div_ceil(2)
+                        };
+                        (
+                            (api.get_base_address_of_plane)(self.ptr, index),
+                            (api.get_bytes_per_row_of_plane)(self.ptr, index),
+                            rows,
+                        )
+                    }
+                    None => (
+                        (api.get_base_address)(self.ptr),
+                        (api.get_bytes_per_row)(self.ptr),
+                        self.height as usize,
+                    ),
+                };
+                if base.is_null() {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "CVPixelBuffer: null base address",
+                    ));
+                }
+                body(base as *mut u8, bytes_per_row, plane_height)
+            })();
+            let _ = (api.unlock_base_address)(self.ptr, flags);
+            result
+        }
+    }
+
+    fn copy_rows_into(
+        destination: *mut u8,
+        destination_stride: usize,
+        source: &[u8],
+        source_stride: usize,
+        rows: usize,
+        row_bytes: usize,
+    ) -> AppResult<()> {
+        if destination_stride < row_bytes {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "CVPixelBuffer: destination stride {destination_stride} < row bytes {row_bytes}"
+                ),
+            ));
+        }
+        let required = source_stride.checked_mul(rows).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "CVPixelBuffer: source dimensions overflow",
+            )
+        })?;
+        if source.len() < required {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "CVPixelBuffer: source has {} bytes, need {required}",
+                    source.len()
+                ),
+            ));
+        }
+        for row in 0..rows {
+            let src = &source[row * source_stride..row * source_stride + row_bytes];
+            // SAFETY: the destination base was obtained from a locked buffer
+            // and `row_bytes <= destination_stride`; `row` is within the plane.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    destination.add(row * destination_stride),
+                    row_bytes,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Write tightly packed BGRA8 pixels directly into the surface mapping.
+    pub fn fill_bgra8(&self, pixels: &[u8]) -> AppResult<()> {
+        if self.pixel_format != CV_PIXEL_FORMAT_BGRA {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "CVPixelBuffer: fill_bgra8 requires a BGRA8 buffer",
+            ));
+        }
+        let row_bytes = self.width as usize * 4;
+        let expected = row_bytes * self.height as usize;
+        if pixels.len() != expected {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "CVPixelBuffer: expected {expected} BGRA bytes for {}x{}, got {}",
+                    self.width,
+                    self.height,
+                    pixels.len()
+                ),
+            ));
+        }
+        self.with_locked_plane(None, 0, |base, stride, rows| {
+            Self::copy_rows_into(base, stride, pixels, row_bytes, rows, row_bytes)
+        })
+    }
+
+    /// Read tightly packed BGRA8 pixels straight from the surface mapping.
+    pub fn read_bgra8(&self) -> AppResult<Vec<u8>> {
+        if self.pixel_format != CV_PIXEL_FORMAT_BGRA {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "CVPixelBuffer: read_bgra8 requires a BGRA8 buffer",
+            ));
+        }
+        let row_bytes = self.width as usize * 4;
+        self.with_locked_plane(None, 1, |base, stride, rows| {
+            if stride < row_bytes {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "CVPixelBuffer: bytesPerRow smaller than width * 4",
+                ));
+            }
+            let mut out = vec![0u8; row_bytes * rows];
+            for row in 0..rows {
+                // SAFETY: base is mapped for the locked plane and
+                // `row_bytes <= stride`; `rows` is the plane height.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        base.add(row * stride),
+                        out.as_mut_ptr().add(row * row_bytes),
+                        row_bytes,
+                    );
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Fill the luma/chroma planes of an NV12 buffer directly in the surface.
+    pub fn fill_nv12(&self, luma: &[u8], chroma: &[u8]) -> AppResult<()> {
+        if self.pixel_format != CV_PIXEL_FORMAT_420F {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "CVPixelBuffer: fill_nv12 requires an NV12 (420f) buffer",
+            ));
+        }
+        let width = self.width as usize;
+        let luma_row_bytes = width;
+        let chroma_rows = (self.height as usize).div_ceil(2);
+        self.with_locked_plane(Some(0), 0, |base, stride, rows| {
+            Self::copy_rows_into(base, stride, luma, luma_row_bytes, rows, luma_row_bytes)
+        })?;
+        self.with_locked_plane(Some(1), 0, |base, stride, rows| {
+            let rows = rows.min(chroma_rows);
+            Self::copy_rows_into(base, stride, chroma, luma_row_bytes, rows, luma_row_bytes)
+        })
+    }
+
+    /// Read a plane's tightly packed bytes (0 = Y, 1 = CbCr for NV12).
+    pub fn read_plane(&self, plane: usize) -> AppResult<Vec<u8>> {
+        let row_bytes = self.width as usize;
+        self.with_locked_plane(Some(plane), 1, |base, stride, rows| {
+            if stride < row_bytes {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "CVPixelBuffer: plane stride smaller than plane width",
+                ));
+            }
+            let mut out = vec![0u8; row_bytes * rows];
+            for row in 0..rows {
+                // SAFETY: same bounds argument as `read_bgra8`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        base.add(row * stride),
+                        out.as_mut_ptr().add(row * row_bytes),
+                        row_bytes,
+                    );
+                }
+            }
+            Ok(out)
+        })
+    }
+}
+
+impl Drop for CvPixelBuffer {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is a +1 CVPixelBuffer reference owned by self.
+        unsafe {
+            core_foundation::base::CFRelease(self.ptr as core_foundation::base::CFTypeRef);
+        }
+    }
+}
+
+/// An owned `CVMetalTextureCacheRef` that turns IOSurface-backed pixel buffers
+/// into `MTLTexture`s without copying pixels.
+pub struct CvMetalTextureCache {
+    cache: *mut std::ffi::c_void,
+}
+
+unsafe impl Send for CvMetalTextureCache {}
+unsafe impl Sync for CvMetalTextureCache {}
+
+impl std::fmt::Debug for CvMetalTextureCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CvMetalTextureCache").finish()
+    }
+}
+
+impl CvMetalTextureCache {
+    /// Create a texture cache for `device`, or `None` when the host lacks the
+    /// CVMetalTextureCache capability.
+    pub fn new(device: &metal::DeviceRef) -> Option<Self> {
+        use metal::foreign_types::ForeignTypeRef;
+        let api = cv_api()?;
+        let mut cache = std::ptr::null_mut();
+        // SAFETY: `device` is a live MTLDevice; cache creation only reads it.
+        let rc = unsafe {
+            (api.create_cache)(
+                std::ptr::null(),
+                std::ptr::null(),
+                device.as_ptr() as *mut std::ffi::c_void,
+                std::ptr::null(),
+                &mut cache,
+            )
+        };
+        if rc != 0 || cache.is_null() {
+            None
+        } else {
+            Some(Self { cache })
+        }
+    }
+
+    /// Create a Metal texture alias for `pixel_buffer` (BGRA8 plane 0, or the
+    /// Y / CbCr planes of NV12). The returned texture retains the underlying
+    /// IOSurface, so the pixel buffer may be released immediately.
+    pub fn create_texture_from_pixel_buffer(
+        &self,
+        pixel_buffer: &CvPixelBuffer,
+        format: metal::MTLPixelFormat,
+        plane: usize,
+    ) -> Option<metal::Texture> {
+        let api = cv_api()?;
+        let width = if plane == 0 {
+            pixel_buffer.width as usize
+        } else {
+            (pixel_buffer.width as usize).div_ceil(2)
+        };
+        let height = if plane == 0 {
+            pixel_buffer.height as usize
+        } else {
+            (pixel_buffer.height as usize).div_ceil(2)
+        };
+        let mut cv_texture = std::ptr::null_mut();
+        // SAFETY: cache and pixel buffer are live; `cv_texture` receives a +1
+        // CVMetalTexture reference released below after retaining its texture.
+        let rc = unsafe {
+            (api.create_texture_from_image)(
+                std::ptr::null(),
+                self.cache,
+                pixel_buffer.ptr,
+                std::ptr::null(),
+                format as u64,
+                width,
+                height,
+                plane,
+                &mut cv_texture,
+            )
+        };
+        if rc != 0 || cv_texture.is_null() {
+            return None;
+        }
+        // SAFETY: `CVMetalTextureGetTexture` returns the wrapper's MTLTexture.
+        // Retain it before releasing the CVMetalTexture so the returned object
+        // owns a +1 reference.
+        unsafe {
+            let texture_pointer = (api.get_texture)(cv_texture);
+            if texture_pointer.is_null() {
+                core_foundation::base::CFRelease(cv_texture as core_foundation::base::CFTypeRef);
+                return None;
+            }
+            let texture_object = texture_pointer as *mut objc::runtime::Object;
+            let _: *mut objc::runtime::Object = msg_send![texture_object, retain];
+            core_foundation::base::CFRelease(cv_texture as core_foundation::base::CFTypeRef);
+            Some(metal::Texture::from_ptr(
+                texture_object as *mut metal::MTLTexture,
+            ))
+        }
+    }
+}
+
+impl Drop for CvMetalTextureCache {
+    fn drop(&mut self) {
+        // SAFETY: `self.cache` is a +1 CVMetalTextureCacheRef owned by self.
+        unsafe {
+            core_foundation::base::CFRelease(self.cache as core_foundation::base::CFTypeRef);
+        }
+    }
+}
+
+/// Create the two plane textures of an IOSurface-backed NV12 buffer.
+///
+/// Plane 0 uses `R8Unorm` (luma) and plane 1 uses `RG8Unorm` (interleaved
+/// CbCr). The returned textures alias the surface storage; no pixels are
+/// copied.
+pub fn create_nv12_textures_from_io_surface(
+    device: &metal::DeviceRef,
+    io_surface_ptr: *mut std::ffi::c_void,
+    width: u64,
+    height: u64,
+) -> Option<(metal::Texture, metal::Texture)> {
+    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        return None;
+    }
+    let luma = create_texture_from_io_surface_plane(
+        device,
+        io_surface_ptr,
+        metal::MTLPixelFormat::R8Unorm,
+        width,
+        height,
+        0,
+    )?;
+    let chroma = create_texture_from_io_surface_plane(
+        device,
+        io_surface_ptr,
+        metal::MTLPixelFormat::RG8Unorm,
+        width,
+        height,
+        1,
+    )?;
+    Some((luma, chroma))
+}
+
+/// A zero-copy present channel: one IOSurface plus the Metal texture that
+/// aliases it.
+///
+/// `write_pixels` copies rows straight into the locked IOSurface mapping (the
+/// host-visible upload, counted by the caller as a zero-copy upload) and
+/// `metal_texture` returns the aliasing `MTLTexture` that the present path
+/// binds. There is no intermediate frame `Vec` maintained by this type.
+#[derive(Clone)]
+pub struct IoSurfacePresentChannel {
+    surface: IoSurfaceRef,
+    device: metal::Device,
+    texture: Option<metal::Texture>,
+    width: u32,
+    height: u32,
+    pixel_format: metal::MTLPixelFormat,
+    texture_builds: u32,
+}
+
+impl std::fmt::Debug for IoSurfacePresentChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoSurfacePresentChannel")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pixel_format", &self.pixel_format)
+            .field("texture_builds", &self.texture_builds)
+            .finish()
+    }
+}
+
+impl IoSurfacePresentChannel {
+    /// Allocate an IOSurface matching `pixel_format` and prepare the Metal
+    /// device. Fails (so the caller can fall back) when the format is not an
+    /// 8-bit four-channel layout or the surface allocation fails.
+    pub fn new(width: u32, height: u32, pixel_format: metal::MTLPixelFormat) -> AppResult<Self> {
+        if width == 0 || height == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("IOSurface present channel: invalid dimensions {width}x{height}"),
+            ));
+        }
+        let (format_code, bytes_per_element) = match pixel_format {
+            metal::MTLPixelFormat::BGRA8Unorm | metal::MTLPixelFormat::BGRA8Unorm_sRGB => {
+                (0x4247_5241, 4)
+            }
+            metal::MTLPixelFormat::RGBA8Unorm | metal::MTLPixelFormat::RGBA8Unorm_sRGB => {
+                (0x5247_4241, 4)
+            }
+            other => {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "IOSurface present channel: unsupported pixel format {other:?} \
+                         (expected BGRA8/RGBA8)"
+                    ),
+                ));
+            }
+        };
+        let surface = create_io_surface_with_format(width, height, format_code, bytes_per_element)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("IOSurface allocation failed for {width}x{height}"),
+                )
+            })?;
+        let device = metal::Device::system_default().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "IOSurface present channel: no Metal device",
+            )
+        })?;
+        Ok(Self {
+            surface: IoSurfaceRef::new(surface),
+            device,
+            texture: None,
+            width,
+            height,
+            pixel_format,
+            texture_builds: 0,
+        })
+    }
+
+    pub fn surface_ptr(&self) -> *mut std::ffi::c_void {
+        self.surface.as_ptr()
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn pixel_format(&self) -> metal::MTLPixelFormat {
+        self.pixel_format
+    }
+
+    /// Number of MTLTexture objects this channel has created. A stable value
+    /// across repeated presents proves the aliasing texture is reused rather
+    /// than leaked per frame.
+    pub fn texture_builds(&self) -> u32 {
+        self.texture_builds
+    }
+
+    pub fn has_texture(&self) -> bool {
+        self.texture.is_some()
+    }
+
+    /// Write a full BGRA8/RGBA8 frame directly into the IOSurface mapping.
+    pub fn write_pixels(&mut self, pixels: &[u8]) -> AppResult<()> {
+        let expected = self.width as usize * self.height as usize * 4;
+        if pixels.len() != expected {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "IOSurface present channel: {}x{} {} requires {expected} bytes, got {}",
+                    self.width,
+                    self.height,
+                    match self.pixel_format {
+                        metal::MTLPixelFormat::BGRA8Unorm
+                        | metal::MTLPixelFormat::BGRA8Unorm_sRGB => "BGRA8",
+                        _ => "RGBA8",
+                    },
+                    pixels.len()
+                ),
+            ));
+        }
+        unsafe {
+            let lock_rc = IOSurfaceLock(self.surface.as_ptr(), 0, std::ptr::null_mut());
+            if lock_rc != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("IOSurface lock failed ({lock_rc:#x})"),
+                ));
+            }
+            let _guard = IoSurfaceLockGuard::new(self.surface.as_ptr(), 0);
+            let base = IOSurfaceGetBaseAddress(self.surface.as_ptr()) as *mut u8;
+            if base.is_null() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "IOSurface base address is null",
+                ));
+            }
+            let stride = IOSurfaceGetBytesPerRow(self.surface.as_ptr());
+            let row_bytes = self.width as usize * 4;
+            if stride < row_bytes {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("IOSurface stride {stride} < row bytes {row_bytes}"),
+                ));
+            }
+            for row in 0..self.height as usize {
+                std::ptr::copy_nonoverlapping(
+                    pixels.as_ptr().add(row * row_bytes),
+                    base.add(row * stride),
+                    row_bytes,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the current surface contents as tightly packed bytes. Used for
+    /// verification/export; the present path itself never calls this.
+    pub fn read_pixels(&self) -> AppResult<Vec<u8>> {
+        let row_bytes = self.width as usize * 4;
+        let mut out = vec![0u8; row_bytes * self.height as usize];
+        unsafe {
+            let lock_rc = IOSurfaceLock(self.surface.as_ptr(), 1, std::ptr::null_mut());
+            if lock_rc != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("IOSurface read lock failed ({lock_rc:#x})"),
+                ));
+            }
+            let _guard = IoSurfaceLockGuard::new(self.surface.as_ptr(), 1);
+            let base = IOSurfaceGetBaseAddress(self.surface.as_ptr()) as *const u8;
+            if base.is_null() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "IOSurface base address is null",
+                ));
+            }
+            let stride = IOSurfaceGetBytesPerRow(self.surface.as_ptr());
+            if stride < row_bytes {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("IOSurface stride {stride} < row bytes {row_bytes}"),
+                ));
+            }
+            for row in 0..self.height as usize {
+                std::ptr::copy_nonoverlapping(
+                    base.add(row * stride),
+                    out.as_mut_ptr().add(row * row_bytes),
+                    row_bytes,
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return (creating on first use) the MTLTexture that aliases the surface.
+    /// The texture is cached and released when the channel drops.
+    pub fn metal_texture(&mut self) -> AppResult<&metal::TextureRef> {
+        if self.texture.is_none() {
+            let texture = create_texture_from_io_surface(
+                &self.device,
+                self.surface.as_ptr(),
+                self.pixel_format,
+                self.width as u64,
+                self.height as u64,
+            )
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "IOSurface present channel: Metal refused a {}x{} {:?} texture",
+                        self.width, self.height, self.pixel_format
+                    ),
+                )
+            })?;
+            self.texture = Some(texture);
+            self.texture_builds += 1;
+        }
+        Ok(self
+            .texture
+            .as_ref()
+            .expect("texture populated above")
+            .as_ref())
     }
 }
 
@@ -8759,6 +9665,184 @@ mod tests {
         unsafe {
             core_foundation::base::CFRelease(surface as core_foundation::base::CFTypeRef);
         }
+    }
+
+    fn read_texture_bytes(
+        device: &metal::DeviceRef,
+        texture: &metal::TextureRef,
+        bytes_per_pixel: usize,
+    ) -> Vec<u8> {
+        let width = texture.width() as usize;
+        let height = texture.height() as usize;
+        let row_bytes = width * bytes_per_pixel;
+        let length = row_bytes * height;
+        let buffer = device.new_buffer(length as u64, metal::MTLResourceOptions::StorageModeShared);
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture_to_buffer(
+            texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize {
+                width: width as u64,
+                height: height as u64,
+                depth: 1,
+            },
+            &buffer,
+            0,
+            row_bytes as u64,
+            length as u64,
+            metal::MTLBlitOption::None,
+        );
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        // SAFETY: the blit completed and the shared buffer holds `length`
+        // bytes written by the GPU.
+        unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, length).to_vec() }
+    }
+
+    fn render_clear(
+        device: &metal::DeviceRef,
+        texture: &metal::TextureRef,
+        color: (f64, f64, f64, f64),
+    ) {
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        let descriptor = create_render_pass_descriptor(texture, Some(color));
+        let encoder = command_buffer.new_render_command_encoder(&descriptor);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
+
+    #[test]
+    fn iosurface_channel_rejects_bad_dimensions_and_formats() {
+        let error = IoSurfacePresentChannel::new(0, 16, metal::MTLPixelFormat::BGRA8Unorm)
+            .expect_err("zero width must be rejected");
+        assert!(error.to_string().contains("invalid dimensions"));
+
+        let error = IoSurfacePresentChannel::new(16, 16, metal::MTLPixelFormat::R8Unorm)
+            .expect_err("single-channel formats are not presentable");
+        assert!(error.to_string().contains("unsupported pixel format"));
+
+        let mut channel = IoSurfacePresentChannel::new(4, 2, metal::MTLPixelFormat::BGRA8Unorm)
+            .expect("create BGRA8 channel");
+        let error = channel
+            .write_pixels(&[0u8; 8])
+            .expect_err("short frame must be rejected");
+        assert!(error.to_string().contains("requires 32 bytes"));
+    }
+
+    #[test]
+    fn iosurface_channel_roundtrips_pixels_through_metal_texture() {
+        let device = MetalDevice::system_default().unwrap();
+        let mut channel = IoSurfacePresentChannel::new(4, 3, metal::MTLPixelFormat::BGRA8Unorm)
+            .expect("create BGRA8 channel");
+        let pixels: Vec<u8> = (0..4 * 3 * 4).map(|index| (index * 13) as u8).collect();
+        channel.write_pixels(&pixels).expect("fill surface");
+
+        let texture = {
+            let texture = channel.metal_texture().expect("Metal texture alias");
+            assert_eq!(texture.width(), 4);
+            assert_eq!(texture.height(), 3);
+            assert_eq!(texture.pixel_format(), metal::MTLPixelFormat::BGRA8Unorm);
+            read_texture_bytes(device.device(), texture, 4)
+        };
+        assert_eq!(channel.texture_builds(), 1);
+
+        assert_eq!(texture, pixels, "Metal must read the surface pixels");
+
+        // Repeated present-like accesses must reuse the aliasing texture.
+        for _ in 0..8 {
+            channel.write_pixels(&pixels).expect("rewrite surface");
+            channel.metal_texture().expect("cached texture");
+        }
+        assert_eq!(
+            channel.texture_builds(),
+            1,
+            "texture must not be leaked per frame"
+        );
+        assert_eq!(channel.read_pixels().expect("surface readback"), pixels);
+    }
+
+    #[test]
+    fn metal_render_writes_are_visible_in_iosurface() {
+        let device = MetalDevice::system_default().unwrap();
+        let mut channel = IoSurfacePresentChannel::new(8, 8, metal::MTLPixelFormat::BGRA8Unorm)
+            .expect("create BGRA8 channel");
+        {
+            let texture = channel.metal_texture().expect("Metal texture alias");
+            // Clear to opaque green; BGRA bytes are [0, 255, 0, 255].
+            render_clear(device.device(), texture, (0.0, 1.0, 0.0, 1.0));
+        }
+        let pixels = channel.read_pixels().expect("read surface");
+        assert_eq!(&pixels[..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn cv_pixel_buffer_bgra8_aliases_cvm_metal_texture() {
+        if !cv_metal_texture_cache_available() {
+            return;
+        }
+        let device = MetalDevice::system_default().unwrap();
+        let cache = CvMetalTextureCache::new(device.device()).expect("CVMetalTextureCache");
+        let pixel_buffer = CvPixelBuffer::new_bgra8(8, 4).expect("CVPixelBuffer");
+        let pixels: Vec<u8> = (0..8 * 4 * 4).map(|index| (index * 7) as u8).collect();
+        pixel_buffer.fill_bgra8(&pixels).expect("fill pixel buffer");
+
+        let texture = cache
+            .create_texture_from_pixel_buffer(&pixel_buffer, metal::MTLPixelFormat::BGRA8Unorm, 0)
+            .expect("texture from CVPixelBuffer");
+        assert_eq!(texture.width(), 8);
+        assert_eq!(texture.height(), 4);
+        assert_eq!(
+            read_texture_bytes(device.device(), &texture, 4),
+            pixels,
+            "GPU must observe pixels written through the pixel buffer"
+        );
+
+        // The reverse direction proves the texture aliases the same storage.
+        render_clear(device.device(), &texture, (1.0, 0.0, 0.0, 1.0));
+        let readback = pixel_buffer.read_bgra8().expect("pixel buffer readback");
+        assert_eq!(&readback[..4], &[0, 0, 255, 255]);
+        assert_eq!(pixel_buffer.pixel_format(), CV_PIXEL_FORMAT_BGRA);
+    }
+
+    #[test]
+    fn cv_pixel_buffer_nv12_exposes_two_plane_textures() {
+        if !cv_metal_texture_cache_available() {
+            return;
+        }
+        let device = MetalDevice::system_default().unwrap();
+        let cache = CvMetalTextureCache::new(device.device()).expect("CVMetalTextureCache");
+        let pixel_buffer = CvPixelBuffer::new_nv12(8, 8).expect("NV12 CVPixelBuffer");
+        let luma = vec![128u8; 8 * 8];
+        let chroma = vec![64u8; 8 * 4];
+        pixel_buffer
+            .fill_nv12(&luma, &chroma)
+            .expect("fill NV12 planes");
+
+        let luma_texture = cache
+            .create_texture_from_pixel_buffer(&pixel_buffer, metal::MTLPixelFormat::R8Unorm, 0)
+            .expect("luma texture");
+        let chroma_texture = cache
+            .create_texture_from_pixel_buffer(&pixel_buffer, metal::MTLPixelFormat::RG8Unorm, 1)
+            .expect("chroma texture");
+        assert_eq!((luma_texture.width(), luma_texture.height()), (8, 8));
+        assert_eq!((chroma_texture.width(), chroma_texture.height()), (4, 4));
+        assert_eq!(
+            chroma_texture.pixel_format(),
+            metal::MTLPixelFormat::RG8Unorm
+        );
+        assert_eq!(
+            read_texture_bytes(device.device(), &luma_texture, 1),
+            luma,
+            "luma plane must alias the pixel buffer surface"
+        );
+        assert_eq!(pixel_buffer.read_plane(1).expect("chroma readback"), chroma);
     }
 
     #[test]

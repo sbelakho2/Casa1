@@ -12,6 +12,7 @@ use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use crate::util;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -3876,6 +3877,8 @@ pub struct SourceReader {
     /// The negotiated current media type per stream (absent = the native
     /// track type).
     current_types: HashMap<u32, ImfMediaType>,
+    /// The real container metadata tags parsed from the file.
+    metadata: MfMetadataTags,
 }
 
 impl SourceReader {
@@ -3888,6 +3891,7 @@ impl SourceReader {
             decoder: None,
             source: 0,
             current_types: HashMap::new(),
+            metadata: MfMetadataTags::default(),
         }
     }
 
@@ -3904,6 +3908,7 @@ impl SourceReader {
 
     /// Create a new source reader from in-memory data.
     pub fn from_data(data: Vec<u8>) -> AppResult<Self> {
+        let metadata = MfMetadataTags::parse_mp4(&data);
         let mut demuxer = Mp4Demuxer::new(data);
         demuxer.parse()?;
         Ok(Self {
@@ -3912,6 +3917,7 @@ impl SourceReader {
             decoder: None,
             source: 0,
             current_types: HashMap::new(),
+            metadata,
         })
     }
 
@@ -3927,6 +3933,11 @@ impl SourceReader {
     /// The guest media-source object this reader pulls from.
     pub fn source(&self) -> u64 {
         self.source
+    }
+
+    /// The real container metadata tags parsed from the reader's payload.
+    pub fn metadata(&self) -> &MfMetadataTags {
+        &self.metadata
     }
 
     /// Wire this reader to its source object (the graph edge the runtime
@@ -4540,6 +4551,177 @@ impl MfPresentationDescriptor {
     }
 }
 
+/// Metadata tags parsed from a real MP4 `moov.udta.meta.ilst` box (with the
+/// `moov.meta.ilst` variant also accepted).  Keys are the four-character
+/// iTunes atoms (`©nam`, `©ART`, `©alb`, `©day`, ...) and values are the
+/// UTF-8/UTF-16 text payloads of their `data` atoms.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MfMetadataTags {
+    /// The parsed tag map (sorted by property name).
+    pub properties: BTreeMap<String, String>,
+}
+
+impl MfMetadataTags {
+    /// Parse the metadata tags out of an MP4 file.  Malformed, truncated or
+    /// missing atoms are skipped; a file with no `ilst` yields an empty map.
+    pub fn parse_mp4(data: &[u8]) -> Self {
+        let mut tags = Self::default();
+        for (kind, payload_start, box_end) in mp4_boxes(data, 0, data.len()) {
+            if kind == *b"moov" {
+                parse_moov_metadata(data, payload_start, box_end, &mut tags);
+            }
+        }
+        tags
+    }
+
+    /// The property names, sorted.
+    pub fn property_names(&self) -> Vec<String> {
+        self.properties.keys().cloned().collect()
+    }
+}
+
+/// Iterate the MP4 boxes in `[start, end)` as `(type, payload_start,
+/// box_end)`, tolerating truncated size fields.
+fn mp4_boxes(data: &[u8], start: usize, end: usize) -> Vec<([u8; 4], usize, usize)> {
+    let mut boxes = Vec::new();
+    let mut offset = start;
+    while offset + 8 <= end {
+        let size = u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        let mut kind = [0_u8; 4];
+        kind.copy_from_slice(&data[offset + 4..offset + 8]);
+        let (header, size) = if size == 1 {
+            if offset + 16 > end {
+                break;
+            }
+            let large = u64::from_be_bytes([
+                data[offset + 8],
+                data[offset + 9],
+                data[offset + 10],
+                data[offset + 11],
+                data[offset + 12],
+                data[offset + 13],
+                data[offset + 14],
+                data[offset + 15],
+            ]);
+            (16, usize::try_from(large).unwrap_or(usize::MAX))
+        } else if size == 0 {
+            (8, end - offset)
+        } else {
+            (8, size)
+        };
+        if size < header || offset.saturating_add(size) > end {
+            break;
+        }
+        boxes.push((kind, offset + header, offset + size));
+        offset = offset.saturating_add(size);
+    }
+    boxes
+}
+
+/// Find `udta.meta.ilst` (or `meta.ilst`) inside a `moov` payload.
+fn parse_moov_metadata(data: &[u8], start: usize, end: usize, tags: &mut MfMetadataTags) {
+    for (kind, payload_start, box_end) in mp4_boxes(data, start, end) {
+        match &kind {
+            b"udta" => {
+                for (child, child_start, child_end) in mp4_boxes(data, payload_start, box_end) {
+                    if child == *b"meta" {
+                        parse_meta_metadata(data, child_start, child_end, tags);
+                    }
+                }
+            }
+            b"meta" => parse_meta_metadata(data, payload_start, box_end, tags),
+            _ => {}
+        }
+    }
+}
+
+/// Parse a `meta` box: a FullBox (4-byte version/flags) containing `hdlr`
+/// and `ilst`, with the non-FullBox variant also accepted.
+fn parse_meta_metadata(data: &[u8], start: usize, end: usize, tags: &mut MfMetadataTags) {
+    let mut child_start = start;
+    let looks_like_box = start + 8 <= end
+        && u32::from_be_bytes([
+            data[start],
+            data[start + 1],
+            data[start + 2],
+            data[start + 3],
+        ]) >= 8
+        && data[start + 4..start + 8]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b' ' || *byte == 0xa9);
+    if !looks_like_box {
+        child_start = start.saturating_add(4);
+    }
+    for (kind, payload_start, box_end) in mp4_boxes(data, child_start, end) {
+        if kind == *b"ilst" {
+            parse_ilst(data, payload_start, box_end, tags);
+        }
+    }
+}
+
+/// Parse an `ilst` box: every child is a tag atom whose payload holds one or
+/// more `data` atoms.
+fn parse_ilst(data: &[u8], start: usize, end: usize, tags: &mut MfMetadataTags) {
+    for (kind, payload_start, box_end) in mp4_boxes(data, start, end) {
+        let Some(name) = mp4_tag_name(&kind) else {
+            continue;
+        };
+        if tags.properties.contains_key(&name) {
+            continue;
+        }
+        for (child, child_start, child_end) in mp4_boxes(data, payload_start, box_end) {
+            if child != *b"data" || child_start + 8 > child_end {
+                continue;
+            }
+            let value_type = u32::from_be_bytes([
+                data[child_start],
+                data[child_start + 1],
+                data[child_start + 2],
+                data[child_start + 3],
+            ]) & 0x00ff_ffff;
+            let text_start = child_start + 8;
+            let raw = &data[text_start..child_end];
+            let value = match value_type {
+                1 | 0 => String::from_utf8_lossy(raw),
+                2 => {
+                    let units: Vec<u16> = raw
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                        .collect();
+                    std::borrow::Cow::Owned(String::from_utf16_lossy(&units))
+                }
+                _ => continue,
+            };
+            let value = value.trim_end_matches('\0').to_string();
+            if !value.is_empty() {
+                tags.properties.insert(name.clone(), value);
+                break;
+            }
+        }
+    }
+}
+
+/// Convert a four-character MP4 atom name (including the 0xA9 copyright
+/// prefix used by iTunes tags) to a property name.
+fn mp4_tag_name(kind: &[u8; 4]) -> Option<String> {
+    let mut name = String::new();
+    for byte in kind {
+        if *byte == 0xa9 {
+            name.push('©');
+        } else if byte.is_ascii_graphic() || *byte == b' ' {
+            name.push(char::from(*byte));
+        } else {
+            return None;
+        }
+    }
+    Some(name)
+}
+
 /// The `IMFMediaTypeHandler` state: the negotiated current type and the
 /// native types the handler can return.
 #[derive(Debug, Clone, Default)]
@@ -4593,6 +4775,8 @@ pub struct MfMediaSource {
     end_sent: bool,
     /// The current start position in 100-ns units.
     position: u64,
+    /// The container metadata tags parsed from the backing file.
+    metadata: MfMetadataTags,
 }
 
 impl MfMediaSource {
@@ -4607,7 +4791,18 @@ impl MfMediaSource {
             new_streams_sent: false,
             end_sent: false,
             position: 0,
+            metadata: MfMetadataTags::default(),
         }
+    }
+
+    /// Attach the container metadata parsed from the source's file.
+    pub fn set_metadata(&mut self, metadata: MfMetadataTags) {
+        self.metadata = metadata;
+    }
+
+    /// The container metadata parsed from the source's file.
+    pub fn metadata(&self) -> &MfMetadataTags {
+        &self.metadata
     }
 
     /// The current state.
@@ -6198,6 +6393,74 @@ mod tests {
         let mut demuxer = Mp4Demuxer::new(data);
         let _result = demuxer.parse();
         assert!(_result.is_err(), "expected Err, got {_result:?}");
+    }
+
+    #[test]
+    fn test_mp4_metadata_ilst_parses_real_tag_atoms() {
+        fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(payload);
+            out
+        }
+        fn data_atom(text: &str) -> Vec<u8> {
+            let mut payload = vec![0_u8, 0, 0, 1, 0, 0, 0, 0]; // UTF-8, locale 0
+            payload.extend_from_slice(text.as_bytes());
+            boxed(b"data", &payload)
+        }
+        let items = [
+            boxed(b"\xa9nam", &data_atom("Song Title")),
+            boxed(b"\xa9ART", &data_atom("The Artist")),
+            boxed(b"\xa9alb", &data_atom("The Album")),
+            boxed(b"\xa9day", &data_atom("2024")),
+        ]
+        .concat();
+        let ilst = boxed(b"ilst", &items);
+        let meta = boxed(b"meta", &[&[0_u8; 4][..], &ilst].concat());
+        let udta = boxed(b"udta", &meta);
+        let moov = boxed(b"moov", &udta);
+
+        let tags = MfMetadataTags::parse_mp4(&moov);
+        assert_eq!(tags.properties.get("©nam"), Some(&"Song Title".to_string()));
+        assert_eq!(tags.properties.get("©ART"), Some(&"The Artist".to_string()));
+        assert_eq!(tags.properties.get("©alb"), Some(&"The Album".to_string()));
+        assert_eq!(tags.properties.get("©day"), Some(&"2024".to_string()));
+        assert_eq!(tags.property_names().len(), 4);
+    }
+
+    #[test]
+    fn test_mp4_metadata_missing_and_malformed_atoms_are_ignored() {
+        fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut data_payload = vec![0_u8, 0, 0, 1, 0, 0, 0, 0];
+        data_payload.extend_from_slice(b"Kept");
+        let good_item = boxed(b"\xa9nam", &boxed(b"data", &data_payload));
+        // A second item claims a size far beyond the ilst payload.
+        let mut malformed = Vec::new();
+        malformed.extend_from_slice(&10_000_u32.to_be_bytes());
+        malformed.extend_from_slice(b"\xa9ART");
+        let ilst = boxed(b"ilst", &[&good_item[..], &malformed].concat());
+        let meta = boxed(b"meta", &[&[0_u8; 4][..], &ilst].concat());
+        let moov = boxed(b"moov", &boxed(b"udta", &meta));
+
+        let tags = MfMetadataTags::parse_mp4(&moov);
+        assert_eq!(tags.properties.get("©nam"), Some(&"Kept".to_string()));
+        assert_eq!(tags.properties.get("©ART"), None);
+
+        // No metadata boxes at all is an empty (not an error) tag map.
+        let ftyp = boxed(b"ftyp", b"mp42");
+        let moov = boxed(b"moov", &[]);
+        assert!(
+            MfMetadataTags::parse_mp4(&[ftyp, moov].concat())
+                .properties
+                .is_empty()
+        );
     }
 
     // =======================================================================

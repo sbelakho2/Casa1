@@ -1064,6 +1064,18 @@ pub struct D3d11Device {
     /// Number of present-time backbuffer syncs performed directly from the
     /// host-visible d3d11 pixels (no intermediate staging buffer allocated).
     zero_copy_present_syncs: u64,
+    /// IOSurface-backed present channels, one per swapchain backbuffer.
+    /// Empty means the capability probe or allocation failed and presents use
+    /// the verified host-visible fallback.
+    iosurface_channels: Vec<crate::metal_backend::IoSurfacePresentChannel>,
+    /// Presents that bound the IOSurface-backed Metal texture.
+    iosurface_presents: u64,
+    /// Frame writes that landed directly in the IOSurface mapping (no staging
+    /// Vec upload).
+    zero_copy_uploads: u64,
+    /// Present-time uploads through the fallback host-visible path because no
+    /// IOSurface channel was available.
+    fallback_uploads: u64,
 }
 
 impl D3d11Device {
@@ -1101,6 +1113,36 @@ impl D3d11Device {
     /// staging buffer.
     pub fn zero_copy_present_sync_count(&self) -> u64 {
         self.zero_copy_present_syncs
+    }
+
+    /// Presents that bound an IOSurface-backed Metal texture.
+    pub fn iosurface_present_count(&self) -> u64 {
+        self.iosurface_presents
+    }
+
+    /// Writes that went directly into the IOSurface mapping.
+    pub fn zero_copy_upload_count(&self) -> u64 {
+        self.zero_copy_uploads
+    }
+
+    /// Present-time uploads that had to use the fallback path.
+    pub fn fallback_upload_count(&self) -> u64 {
+        self.fallback_uploads
+    }
+
+    /// True when the swapchain is presenting through the IOSurface-backed
+    /// Metal texture instead of the host-visible fallback.
+    pub fn iosurface_zero_copy_active(&self) -> bool {
+        !self.iosurface_channels.is_empty()
+    }
+
+    /// Number of MTLTextures the presented channel has built (1 on the
+    /// zero-copy path, regardless of how many frames were presented).
+    pub fn iosurface_texture_builds(&self) -> u32 {
+        self.iosurface_channels
+            .first()
+            .map(|channel| channel.texture_builds())
+            .unwrap_or(0)
     }
 
     pub fn swapchain_state(&self) -> Option<SwapchainState> {
@@ -1860,6 +1902,141 @@ impl D3d11Device {
         !self.immediate.commands.is_empty()
     }
 
+    /// Publish the current backbuffer contents for present.
+    ///
+    /// On the IOSurface path every backbuffer is written directly into the
+    /// surface mapping and the aliasing Metal texture is ensured; the present
+    /// itself performs no staging upload. If the capability probe or surface
+    /// allocation failed, the verified host-visible sync is used instead and
+    /// counted in `fallback_uploads`.
+    fn sync_present_backbuffers(&mut self) -> AppResult<()> {
+        let state = self.swapchain_state().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "device does not own a swapchain to present",
+            )
+        })?;
+        let backbuffer_ids = state.backbuffers.clone();
+        let Self {
+            resources,
+            backend,
+            iosurface_channels,
+            iosurface_presents,
+            zero_copy_uploads,
+            fallback_uploads,
+            zero_copy_present_syncs,
+            ..
+        } = self;
+        if !iosurface_channels.is_empty() {
+            if iosurface_channels.len() != backbuffer_ids.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "IOSurface present: {} channels for {} backbuffers",
+                        iosurface_channels.len(),
+                        backbuffer_ids.len()
+                    ),
+                ));
+            }
+            for (index, (channel, backbuffer_id)) in iosurface_channels
+                .iter_mut()
+                .zip(backbuffer_ids.iter())
+                .enumerate()
+            {
+                if channel.width() != state.desc.width || channel.height() != state.desc.height {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        format!(
+                            "IOSurface present: swapchain {}x{} does not match channel {} at {index} ({}x{})",
+                            state.desc.width,
+                            state.desc.height,
+                            index,
+                            channel.width(),
+                            channel.height()
+                        ),
+                    ));
+                }
+                let expected_format = crate::metal_backend::dxgi_to_metal_format(state.desc.format);
+                if channel.pixel_format() != expected_format {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        format!(
+                            "IOSurface present: swapchain format {:?} ({expected_format:?}) does not \
+                             match channel {index} {:?}",
+                            state.desc.format,
+                            channel.pixel_format()
+                        ),
+                    ));
+                }
+                let source = resources
+                    .get(backbuffer_id)
+                    .ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!("swapchain backbuffer {backbuffer_id} is missing"),
+                        )
+                    })?
+                    .bytes
+                    .as_slice();
+                channel.write_pixels(source)?;
+                *zero_copy_uploads += 1;
+            }
+            // Bind the presented backbuffer's aliasing Metal texture (the gfx
+            // backend presents index 0).
+            iosurface_channels[0].metal_texture()?;
+            *iosurface_presents += 1;
+        } else {
+            for backbuffer_id in &backbuffer_ids {
+                let source = resources
+                    .get(backbuffer_id)
+                    .ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!("swapchain backbuffer {backbuffer_id} is missing"),
+                        )
+                    })?
+                    .bytes
+                    .as_slice();
+                backend.overwrite_resource_bytes(*backbuffer_id, source)?;
+                *zero_copy_present_syncs += 1;
+                *fallback_uploads += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write an update straight into the IOSurface when `resource` is a
+    /// current swapchain backbuffer. Non-backbuffer resources and the fallback
+    /// path are left untouched.
+    fn write_backbuffer_to_iosurface(
+        &mut self,
+        resource: D3d11ResourceId,
+        bytes: &[u8],
+    ) -> AppResult<()> {
+        if self.iosurface_channels.is_empty() {
+            return Ok(());
+        }
+        let index = self
+            .swapchain_state()
+            .and_then(|state| state.backbuffers.iter().position(|id| *id == resource));
+        let Some(index) = index else {
+            return Ok(());
+        };
+        let channel = match self.iosurface_channels.get_mut(index) {
+            Some(channel) => channel,
+            None => return Ok(()),
+        };
+        let expected = channel.width() as usize * channel.height() as usize * 4;
+        if bytes.len() != expected {
+            // Partial updates (sub-rectangles/rows) leave the surface write to
+            // the next present, which always publishes the full backbuffer.
+            return Ok(());
+        }
+        channel.write_pixels(bytes)?;
+        self.zero_copy_uploads += 1;
+        Ok(())
+    }
+
     pub fn present_swapchain(
         &mut self,
         sync_interval: u32,
@@ -1878,46 +2055,11 @@ impl D3d11Device {
                 "device does not own a swapchain to present",
             )
         })?;
-        // ── Sync the d3d11-side backbuffer pixels into the gfx backend ──────
-        // The d3d11 command-list executor (submit_immediate, above) writes real
-        // pixels into the per-resource `bytes` vectors — e.g. ClearRenderTargetView
-        // fills the backbuffer with the clear color, and CPU-side
-        // UpdateSubresource/map writes land here too.  But the gfx
-        // `GraphicsBackend` keeps its OWN copy of each swapchain backbuffer's
-        // bytes, and `presented_frame()` (which feeds the live minifb window)
-        // reads from THAT copy.  Without this sync, the live window always
-        // shows the gfx backbuffer's zero-initialized bytes (solid black),
-        // even though the d3d11 side rendered correctly.
-        //
-        // We mirror the backbuffer about to be presented into the gfx resource
-        // of the same id, so the existing Present→channel→minifb pipeline
-        // carries real pixels.
-        if let Some(state) = self.swapchain_state() {
-            // The gfx backend presents backbuffer index
-            // `presented_backbuffer_index` (held on SwapchainRecord); from the
-            // d3d11 side we only see `SwapchainState`.  For the overwhelmingly
-            // common single-backbuffer swapchain the index is 0; with N
-            // backbuffers we mirror all of them so whichever index is
-            // presented gets fresh pixels.
-            //
-            // The d3d11 resource bytes *are* the host-visible rendered pixels,
-            // so the sync writes them directly into the backend resource with
-            // no intermediate staging allocation or copy (counted in
-            // `zero_copy_present_syncs`). Borrows are taken through disjoint
-            // fields so the source bytes stay borrowed only for the duration
-            // of each write; mirror failures are propagated because this sync
-            // is the only path that makes the live window show rendered
-            // pixels.
-            for &backbuffer_id in &state.backbuffers {
-                let source_bytes = match self.resources.get(&backbuffer_id) {
-                    Some(record) => record.bytes.as_slice(),
-                    None => continue,
-                };
-                self.backend
-                    .overwrite_resource_bytes(backbuffer_id, source_bytes)?;
-                self.zero_copy_present_syncs += 1;
-            }
-        }
+        // ── Publish the rendered backbuffer pixels ─────────────────────────
+        // Zero-copy path: the pixels are written straight into the IOSurface
+        // mapping and present binds the aliasing Metal texture. Fallback: the
+        // previous host-visible sync into the gfx backend resource.
+        self.sync_present_backbuffers()?;
         let present = self
             .backend
             .present(swapchain, sync_interval, allow_tearing)?;
@@ -1941,6 +2083,20 @@ impl D3d11Device {
                 "device does not own a swapchain to export",
             )
         })?;
+        if let Some(channel) = self.iosurface_channels.first() {
+            let state = self.backend.swapchain_state(swapchain)?;
+            let bytes = channel.read_pixels()?;
+            return Ok(crate::gfx::PresentedFrame {
+                width: channel.width(),
+                height: channel.height(),
+                format: state.desc.format,
+                bytes,
+                source: crate::gfx::FrameSource::DxgiD3D11,
+                stride: channel.width() as usize * 4,
+                sequence: self.iosurface_presents,
+                timestamp: std::time::Instant::now(),
+            });
+        }
         self.backend.presented_frame(swapchain)
     }
 
@@ -2197,6 +2353,7 @@ impl D3d11Device {
                     // (zero-copy) path and private ones count as staged.
                     self.backend
                         .overwrite_resource_host_visible(backend_id, bytes)?;
+                    self.write_backbuffer_to_iosurface(*resource, bytes)?;
                 }
                 RecordedCommand::CopyResource { src, dst } => {
                     let source_bytes = self.resource(*src)?.bytes.clone();
@@ -4367,8 +4524,28 @@ fn create_device_internal_with_backend(
             )
             .with_hint("request feature level 10_1, or 11_0 on mesh-shader-capable GPUs")
         })?;
+    let mut iosurface_channels = Vec::new();
     let swapchain = match swapchain_desc {
-        Some(desc) => Some(backend.create_swapchain(desc)?),
+        Some(desc) => {
+            let id = backend.create_swapchain(desc.clone())?;
+            // Capability + allocation probe: on failure the channels stay
+            // empty and presents use the verified host-visible fallback.
+            let format = crate::metal_backend::dxgi_to_metal_format(desc.format);
+            for _ in 0..desc.buffer_count.max(1) {
+                match crate::metal_backend::IoSurfacePresentChannel::new(
+                    desc.width,
+                    desc.height,
+                    format,
+                ) {
+                    Ok(channel) => iosurface_channels.push(channel),
+                    Err(_) => {
+                        iosurface_channels.clear();
+                        break;
+                    }
+                }
+            }
+            Some(id)
+        }
         None => None,
     };
     let mut resources = BTreeMap::new();
@@ -4460,6 +4637,10 @@ fn create_device_internal_with_backend(
         class_linkage: BTreeMap::new(),
         predication: None,
         zero_copy_present_syncs: 0,
+        iosurface_channels,
+        iosurface_presents: 0,
+        zero_copy_uploads: 0,
+        fallback_uploads: 0,
     })
 }
 
@@ -4861,12 +5042,21 @@ mod tests {
             .present_swapchain(1, false, true)
             .expect("present first frame");
 
-        // One direct host-memory sync per backbuffer, with no staging buffer.
-        assert_eq!(
-            device.zero_copy_present_sync_count(),
-            backbuffers as u64,
-            "each present must sync backbuffers directly from host pixels"
-        );
+        // One direct host-memory sync per backbuffer, with no staging buffer,
+        // when the IOSurface capability is unavailable. On the IOSurface path
+        // the same pixels travel through the surface and no legacy sync occurs.
+        if device.iosurface_zero_copy_active() {
+            assert_eq!(device.zero_copy_present_sync_count(), 0);
+            assert_eq!(device.fallback_upload_count(), 0);
+            assert_eq!(device.iosurface_present_count(), 1);
+            assert_eq!(device.iosurface_texture_builds(), 1);
+        } else {
+            assert_eq!(
+                device.zero_copy_present_sync_count(),
+                backbuffers as u64,
+                "each present must sync backbuffers directly from host pixels"
+            );
+        }
         let frame = device.presented_frame().expect("first presented frame");
         assert_eq!(&frame.bytes[..first.len()], &first);
 
@@ -4877,12 +5067,160 @@ mod tests {
         device
             .present_swapchain(1, false, true)
             .expect("present second frame");
-        assert_eq!(
-            device.zero_copy_present_sync_count(),
-            2 * backbuffers as u64
-        );
+        if device.iosurface_zero_copy_active() {
+            assert_eq!(device.zero_copy_present_sync_count(), 0);
+            assert_eq!(device.fallback_upload_count(), 0);
+            assert_eq!(device.iosurface_present_count(), 2);
+            assert_eq!(device.iosurface_texture_builds(), 1);
+        } else {
+            assert_eq!(
+                device.zero_copy_present_sync_count(),
+                2 * backbuffers as u64
+            );
+        }
         let frame = device.presented_frame().expect("second presented frame");
         assert_eq!(&frame.bytes[..second.len()], &second);
+    }
+
+    #[test]
+    fn iosurface_present_rejects_mismatched_channel_dimensions() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 2,
+                height: 1,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+        if !device.iosurface_zero_copy_active() {
+            return;
+        }
+        // Replace the presented channel with a surface of the wrong size: the
+        // present must fail rather than silently publishing a stretched frame.
+        device.iosurface_channels[0] = crate::metal_backend::IoSurfacePresentChannel::new(
+            3,
+            1,
+            crate::metal_backend::dxgi_to_metal_format(DxgiFormat::B8G8R8A8Unorm),
+        )
+        .expect("mismatched channel allocation");
+        let error = device
+            .present_swapchain(1, false, true)
+            .expect_err("mismatched dimensions must be rejected");
+        assert!(
+            error.to_string().contains("does not match channel"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn present_falls_back_and_counts_uploads_when_iosurface_is_unavailable() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 2,
+                height: 1,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+        let backbuffers = device
+            .swapchain_state()
+            .expect("swapchain state")
+            .backbuffers
+            .len() as u64;
+        // Simulate the surface-allocation/capability probe failing after
+        // device creation: the verified host-visible path must take over and
+        // account every upload.
+        device.iosurface_channels.clear();
+        assert!(!device.iosurface_zero_copy_active());
+
+        let backbuffer = device
+            .swapchain_backbuffer(0)
+            .expect("swapchain backbuffer");
+        let pixels = [0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe];
+        device
+            .update_subresource(backbuffer, &pixels)
+            .expect("update backbuffer");
+        device
+            .present_swapchain(1, false, true)
+            .expect("fallback present");
+
+        assert_eq!(device.fallback_upload_count(), backbuffers);
+        assert_eq!(device.iosurface_present_count(), 0);
+        assert_eq!(device.zero_copy_present_sync_count(), backbuffers);
+        let frame = device.presented_frame().expect("presented frame");
+        assert_eq!(&frame.bytes[..pixels.len()], &pixels);
+    }
+
+    #[test]
+    fn iosurface_present_path_roundtrips_without_fallback_uploads() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+        if !device.iosurface_zero_copy_active() {
+            // Capability gate: the verified fallback path is exercised below.
+            return;
+        }
+
+        let backbuffer = device
+            .swapchain_backbuffer(0)
+            .expect("swapchain backbuffer");
+        let pixels: Vec<u8> = (0..4 * 2 * 4).map(|index| (index * 11) as u8).collect();
+        device
+            .update_subresource(backbuffer, &pixels)
+            .expect("update backbuffer");
+        device
+            .present_swapchain(1, false, true)
+            .expect("present through IOSurface");
+
+        assert_eq!(
+            device.fallback_upload_count(),
+            0,
+            "IOSurface present must not fall back to CPU staging uploads"
+        );
+        assert_eq!(
+            device.zero_copy_present_sync_count(),
+            0,
+            "no legacy gfx-backend sync on the IOSurface path"
+        );
+        assert_eq!(device.iosurface_present_count(), 1);
+        assert!(
+            device.zero_copy_upload_count() >= 1,
+            "updates and presents write directly into the IOSurface"
+        );
+        let frame = device.presented_frame().expect("presented frame");
+        assert_eq!(
+            frame.bytes, pixels,
+            "pixels must round-trip through surface"
+        );
+
+        for _ in 0..8 {
+            device
+                .present_swapchain(1, false, true)
+                .expect("repeat present");
+        }
+        assert_eq!(
+            device.iosurface_texture_builds(),
+            1,
+            "the aliasing texture is reused across frames (no per-frame leak)"
+        );
+        assert_eq!(device.fallback_upload_count(), 0);
     }
 
     #[test]

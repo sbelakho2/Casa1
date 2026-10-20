@@ -209,6 +209,7 @@ pub(crate) enum GuestObjectKind {
     ImfByteStream,
     ImfStreamDescriptor,
     ImfMediaTypeHandler,
+    ImfMetadata,
     ImfTopologyNode,
     ImfDxgiDeviceManager,
     /// A guest IMFRateControl / IMFRateSupport service object handed out by
@@ -728,6 +729,8 @@ pub(crate) struct ImfByteStreamState {
     pub(crate) length: u64,
     /// Whether the stream accepts writes.
     pub(crate) writable: bool,
+    /// Whether the backing file is deleted when the stream closes/releases.
+    pub(crate) delete_on_close: bool,
     /// Whether the stream is seekable.
     pub(crate) seekable: bool,
     /// Whether `Close` has run (all further operations fail).
@@ -770,6 +773,38 @@ impl ImfByteStreamState {
             seekable: true,
             origin_name,
             ..Default::default()
+        }
+    }
+}
+
+/// State for a guest IMFMetadata service object handed out by
+/// `MFGetService(MF_METADATA_PROVIDER_SERVICE)` over a real media source.
+/// The property map is the parsed container tag map (plus guest edits).
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // MF metadata state (consumed by the IMFMetadata thunks)
+pub(crate) struct ImfMetadataState {
+    /// The current RFC-1766 language.
+    pub(crate) language: Option<String>,
+    /// The languages for which metadata is available.
+    pub(crate) languages: Vec<String>,
+    /// The metadata property map.
+    pub(crate) properties: std::collections::BTreeMap<String, String>,
+}
+
+impl ImfMetadataState {
+    /// Build the metadata provider state from parsed container tags.  MP4
+    /// `ilst` tags carry no per-language split, so they are exposed as the
+    /// default `en-US` language.
+    pub(crate) fn from_tags(tags: crate::media::MfMetadataTags) -> Self {
+        let languages = if tags.properties.is_empty() {
+            Vec::new()
+        } else {
+            vec!["en-US".to_string()]
+        };
+        Self {
+            language: languages.first().cloned(),
+            languages,
+            properties: tags.properties,
         }
     }
 }
@@ -1856,6 +1891,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) mf_source_readers: HashMap<u64, crate::media::SourceReader>,
     /// Guest IMFByteStream object -> byte stream state.
     pub(crate) mf_byte_streams: HashMap<u64, ImfByteStreamState>,
+    /// Guest IMFMetadata service object -> metadata state.
+    pub(crate) mf_metadata: HashMap<u64, ImfMetadataState>,
     /// Guest IMFDXGIDeviceManager object -> device manager state.
     pub(crate) mf_dxgi_device_managers: HashMap<u64, MfDxgiDeviceManagerState>,
     /// The OpenGL 1.1 fixed-function guest state.
@@ -2532,6 +2569,7 @@ impl PeHostRuntime {
             mf_sink_writers: HashMap::new(),
             mf_source_readers: HashMap::new(),
             mf_byte_streams: HashMap::new(),
+            mf_metadata: HashMap::new(),
             mf_dxgi_device_managers: HashMap::new(),
             opengl: OpenGlGuestState::default(),
             wic: WicState::default(),

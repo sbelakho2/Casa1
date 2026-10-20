@@ -250,6 +250,7 @@ pub mod workloads {
 }
 pub mod casak;
 pub mod driver_image;
+pub mod driver_island;
 pub mod wsl;
 pub mod x3daudio;
 pub mod xact;

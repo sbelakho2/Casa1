@@ -4150,6 +4150,12 @@ impl GraphicsBackend {
         Ok(())
     }
 
+    /// Borrow a resource's host-visible bytes without cloning, for zero-copy
+    /// consumers such as an IOSurface present channel.
+    pub fn resource_bytes(&self, resource: ResourceId) -> AppResult<&[u8]> {
+        Ok(self.resource(resource)?.bytes.as_slice())
+    }
+
     /// Overwrite a resource from bytes whose storage is already owned by the
     /// caller.
     ///

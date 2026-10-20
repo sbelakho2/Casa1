@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-20T12:34:05Z",
+  "generated_at": "2026-10-20T14:31:09Z",
   "per_dll": {
     "activeds.dll": {
       "total": 3,
@@ -1550,20 +1550,20 @@
       "capability_absent": 0
     },
     "mfplat.dll": {
-      "total": 29,
-      "implemented": 29,
+      "total": 30,
+      "implemented": 30,
       "partial": 0,
       "stub": 0,
       "unsupported": 0,
-      "differential_tested": 29,
-      "conformance_tested": 29,
+      "differential_tested": 30,
+      "conformance_tested": 30,
       "transitional_partial": 0,
-      "exact": 28,
+      "exact": 29,
       "restricted": 1,
       "approximate": 0,
       "synthetic_environment": 0,
       "canned_failure": 0,
-      "capability_full": 28,
+      "capability_full": 29,
       "capability_partial": 1,
       "capability_absent": 0
     },
@@ -2234,20 +2234,20 @@
       "capability_absent": 0
     },
     "ntdll.dll": {
-      "total": 69,
-      "implemented": 69,
+      "total": 71,
+      "implemented": 71,
       "partial": 0,
       "stub": 0,
       "unsupported": 0,
-      "differential_tested": 69,
-      "conformance_tested": 69,
+      "differential_tested": 71,
+      "conformance_tested": 71,
       "transitional_partial": 0,
-      "exact": 67,
+      "exact": 69,
       "restricted": 2,
       "approximate": 0,
       "synthetic_environment": 0,
       "canned_failure": 0,
-      "capability_full": 67,
+      "capability_full": 69,
       "capability_partial": 2,
       "capability_absent": 0
     },
@@ -14919,7 +14919,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Real service-provider table on the session object graph: MFGetService resolves the owner (session, topology object, topology node) and returns real service objects — the session itself (MF_MEDIASESSION_SERVICE) and genuine IMFRateControl/IMFRateSupport (MF_RATE_CONTROL_SERVICE) backed by real session rate state with release-to-forget semantics; service GUIDs the object genuinely does not own answer MF_E_UNSUPPORTED_SERVICE (correct Windows behavior).  Media-source/sink services await those objects."
+      "detail": "Real service-provider table on the runtime object graph: MFGetService resolves the owner (session, topology object/node, real media source, real byte stream) and returns real service objects — the session itself, genuine IMFRateControl/IMFRateSupport backed by real session rate state, MF_MEDIASOURCE_SERVICE on real sources, a real IMFMetadata provider over parsed MP4 ilst tags, and byte-stream attribute services; genuinely unowned GUIDs answer MF_E_UNSUPPORTED_SERVICE."
     },
     {
       "dll": "mf.dll",
@@ -15054,6 +15054,16 @@
     {
       "dll": "mfplat.dll",
       "export": "MFCreateFile",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
+      "support_policy": "OptionalFeature",
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
+    },
+    {
+      "dll": "mfplat.dll",
+      "export": "MFCreateTempFile",
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
@@ -15219,7 +15229,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Real service-provider table on the runtime object graph: MFGetService resolves the owner (session, topology object/node, real media source, real byte stream) and returns real service objects — the session itself, genuine IMFRateControl/IMFRateSupport, MF_MEDIASOURCE_SERVICE on real sources and byte-stream attribute services; genuinely unowned GUIDs answer MF_E_UNSUPPORTED_SERVICE."
+      "detail": "Real service-provider table on the runtime object graph: MFGetService resolves the owner (session, topology object/node, real media source, real byte stream) and returns real service objects — the session itself, genuine IMFRateControl/IMFRateSupport, MF_MEDIASOURCE_SERVICE on real sources, real byte-stream attribute services and a real IMFMetadata provider over the parsed MP4 ilst tag map; genuinely unowned GUIDs answer MF_E_UNSUPPORTED_SERVICE."
     },
     {
       "dll": "mfplat.dll",
@@ -18234,6 +18244,26 @@
     {
       "dll": "ntdll.dll",
       "export": "NtCreateFile",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
+      "support_policy": "Required",
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtLoadDriver",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
+      "support_policy": "Required",
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtUnloadDriver",
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "Required",

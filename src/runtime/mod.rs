@@ -1778,6 +1778,10 @@ pub enum HostThunk {
     XAudio2Create,
     GuestObjectAddRef,
     GuestObjectRelease,
+    /// A kernel API shim owned by the driver island (`driver_island.rs`).
+    DriverIslandShim {
+        function: crate::driver_island::DriverShim,
+    },
     UnsupportedMethod {
         name: String,
     },
@@ -4545,6 +4549,10 @@ pub enum HostThunk {
     NtQuerySection,
     /// `NtCreateFile` — ntdll!NtCreateFile
     NtCreateFile,
+    /// `NtLoadDriver` — ntdll!NtLoadDriver
+    NtLoadDriver,
+    /// `NtUnloadDriver` — ntdll!NtUnloadDriver
+    NtUnloadDriver,
     /// `NtDeviceIoControlFile` — ntdll!NtDeviceIoControlFile
     NtDeviceIoControlFile,
     /// `NtCreateKey` — ntdll!NtCreateKey
@@ -6085,6 +6093,15 @@ pub enum HostThunk {
     MfAsyncResultGetObject,
     MfAsyncResultGetCallback,
     MfCreateFile,
+    MfCreateTempFile,
+    MfMetadataSetLanguage,
+    MfMetadataGetLanguage,
+    MfMetadataGetAllLanguages,
+    MfMetadataDeleteLanguage,
+    MfMetadataSetProperty,
+    MfMetadataGetProperty,
+    MfMetadataDeleteProperty,
+    MfMetadataGetAllPropertyNames,
     MfSourceResolverBegin,
     MftStreamAttributes,
     MftFixedStreams,
@@ -6277,16 +6294,21 @@ pub fn find_casa1_runner_binary() -> AppResult<PathBuf> {
         }
     }
 
-    // 2. Cargo target directory (dev/test)
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let manifest_path = PathBuf::from(manifest_dir);
+    // 2. Cargo target directory (dev/test), honoring CARGO_TARGET_DIR.
+    let target_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("CARGO_MANIFEST_DIR").map(|dir| PathBuf::from(dir).join("target"))
+        });
+    if let Some(target_root) = target_root {
         for &profile in &["debug", "release"] {
-            let candidate = manifest_path
-                .join("target")
-                .join(profile)
-                .join("casa1-runner");
+            let candidate = target_root.join(profile).join("casa1-runner");
             if candidate.exists() {
                 return Ok(candidate);
+            }
+            let candidate_exe = target_root.join(profile).join("casa1-runner.exe");
+            if candidate_exe.exists() {
+                return Ok(candidate_exe);
             }
         }
     }
@@ -29242,7 +29264,7 @@ impl PeHostRuntime {
                     self.push_trace("ole32", "CoCreateGuid", BTreeMap::new(), json!(0));
                 }
             }
-            ref thunk @ (HostThunk::MfSessionSetTopology | HostThunk::MfSessionGetSessionCapabilities | HostThunk::MfSessionGetFullTopology | HostThunk::MfSessionGetDescriptorFromTopology | HostThunk::MfSinkWriterSetInputMediaType | HostThunk::MfSinkWriterFlush | HostThunk::MfSinkWriterGetStatistics | HostThunk::MfSinkWriterSendStreamSample | HostThunk::MfSinkWriterNotifyEndOfSegment | HostThunk::MfSinkWriterGetServiceForStream | HostThunk::IDispatchGetTypeInfoCount | HostThunk::IDispatchGetTypeInfo | HostThunk::MfMediaSourceGetCharacteristics | HostThunk::MfMediaSourceCreatePresentationDescriptor | HostThunk::MfMediaSourceStart | HostThunk::MfMediaSourceStop | HostThunk::MfMediaSourcePause | HostThunk::MfMediaSourceShutdown | HostThunk::MfMediaSourceGetEvent | HostThunk::MfMediaSourceBeginGetEvent | HostThunk::MfMediaSourceEndGetEvent | HostThunk::MfMediaSourceQueueEvent | HostThunk::MfMediaSourceCancelGetEvent | HostThunk::MfMediaSourceGetSourceAttributes | HostThunk::MfMediaSourceGetStreamAttributes | HostThunk::MfMediaSourceSetD3dManager | HostThunk::MfCreateFile | HostThunk::MfByteStreamGetCapabilities | HostThunk::MfByteStreamSetLength | HostThunk::MfByteStreamSetCurrentPosition | HostThunk::MfByteStreamIsEndOfStream | HostThunk::MfByteStreamBeginRead | HostThunk::MfByteStreamEndRead | HostThunk::MfByteStreamWrite | HostThunk::MfByteStreamBeginWrite | HostThunk::MfByteStreamEndWrite | HostThunk::MfByteStreamSeek | HostThunk::MfByteStreamFlush | HostThunk::MfByteStreamClose | HostThunk::MfSourceReaderGetStreamSelection | HostThunk::MfSourceReaderSetStreamSelection | HostThunk::MfSourceReaderSetCurrentMediaType | HostThunk::MfSourceReaderSetCurrentPosition | HostThunk::MfSourceReaderFlush | HostThunk::MfSourceReaderGetServiceForStream | HostThunk::MfSourceReaderGetPresentationAttribute | HostThunk::MfPresentationDescriptorGetStreamDescriptorByIndex | HostThunk::MfPresentationDescriptorSelectStream | HostThunk::MfPresentationDescriptorDeselectStream | HostThunk::MfPresentationDescriptorClone | HostThunk::MfStreamDescriptorGetStreamIdentifier | HostThunk::MfStreamDescriptorGetMediaTypeHandler | HostThunk::MfMediaTypeHandlerIsMediaTypeSupported | HostThunk::MfMediaTypeHandlerGetMediaTypeCount | HostThunk::MfMediaTypeHandlerGetMediaTypeByIndex | HostThunk::MfMediaTypeHandlerSetCurrentMediaType | HostThunk::MfMediaTypeHandlerGetCurrentMediaType | HostThunk::MfMediaTypeHandlerGetMajorType | HostThunk::MfEventGetExtendedType | HostThunk::MfEventGetStatus | HostThunk::MfEventGetValue | HostThunk::MfAsyncResultGetState | HostThunk::MfAsyncResultGetStatus | HostThunk::MfAsyncResultSetStatus | HostThunk::MfAsyncResultGetObject | HostThunk::MfAsyncResultGetCallback | HostThunk::MfSourceResolverBegin | HostThunk::MftStreamAttributes | HostThunk::MftFixedStreams | HostThunk::MftProcessEvent | HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfAttrGetItem | HostThunk::MfAttrGetItemType | HostThunk::MfAttrCompareItem | HostThunk::MfAttrCompare | HostThunk::MfAttrGetAllocatedString | HostThunk::MfAttrGetAllocatedBlob | HostThunk::MfAttrGetUnknown | HostThunk::MfAttrSetItem | HostThunk::MfAttrSetUnknown | HostThunk::MfAttrDeleteAllItems | HostThunk::MfAttrLockStore | HostThunk::MfAttrUnlockStore | HostThunk::MfAttrCopyAllItems | HostThunk::MfSampleSetSampleFlags | HostThunk::MfSampleGetSampleFlags | HostThunk::MfSampleGetTotalLength | HostThunk::MfSampleCopyToBuffer | HostThunk::MfSampleConvertToContiguousBuffer | HostThunk::MfMediaTypeIsEqual | HostThunk::MfMediaTypeGetRepresentation | HostThunk::MfMediaTypeFreeRepresentation | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType | HostThunk::MfActivateGetCount | HostThunk::MfActivateGetItem | HostThunk::MfActivateGetGuid | HostThunk::MfActivateGetString | HostThunk::MfActivateActivateObject | HostThunk::MfActivateShutdownObject | HostThunk::MfTransformGetStreamLimits | HostThunk::MfTransformGetStreamCounts | HostThunk::MfTransformGetStreamIds | HostThunk::MfTransformGetStreamInfo | HostThunk::MfTransformGetAttributes | HostThunk::MfTransformGetInputAvailableType | HostThunk::MfTransformGetOutputAvailableType | HostThunk::MfTransformSetInputType | HostThunk::MfTransformSetOutputType | HostThunk::MfTransformGetInputCurrentType | HostThunk::MfTransformGetOutputCurrentType | HostThunk::MfTransformGetInputStatus | HostThunk::MfTransformGetOutputStatus | HostThunk::MfTransformProcessInput | HostThunk::MfTransformProcessOutput | HostThunk::MfTransformProcessMessage | HostThunk::MfRateControlSetRate | HostThunk::MfRateControlGetRate | HostThunk::MfRateSupportGetSlowestRate | HostThunk::MfRateSupportGetFastestRate | HostThunk::MfRateSupportIsRateSupported | HostThunk::MftTransformUnsupported) => {
+            ref thunk @ (HostThunk::MfSessionSetTopology | HostThunk::MfSessionGetSessionCapabilities | HostThunk::MfSessionGetFullTopology | HostThunk::MfSessionGetDescriptorFromTopology | HostThunk::MfSinkWriterSetInputMediaType | HostThunk::MfSinkWriterFlush | HostThunk::MfSinkWriterGetStatistics | HostThunk::MfSinkWriterSendStreamSample | HostThunk::MfSinkWriterNotifyEndOfSegment | HostThunk::MfSinkWriterGetServiceForStream | HostThunk::IDispatchGetTypeInfoCount | HostThunk::IDispatchGetTypeInfo | HostThunk::MfMediaSourceGetCharacteristics | HostThunk::MfMediaSourceCreatePresentationDescriptor | HostThunk::MfMediaSourceStart | HostThunk::MfMediaSourceStop | HostThunk::MfMediaSourcePause | HostThunk::MfMediaSourceShutdown | HostThunk::MfMediaSourceGetEvent | HostThunk::MfMediaSourceBeginGetEvent | HostThunk::MfMediaSourceEndGetEvent | HostThunk::MfMediaSourceQueueEvent | HostThunk::MfMediaSourceCancelGetEvent | HostThunk::MfMediaSourceGetSourceAttributes | HostThunk::MfMediaSourceGetStreamAttributes | HostThunk::MfMediaSourceSetD3dManager | HostThunk::MfCreateFile | HostThunk::MfCreateTempFile | HostThunk::MfMetadataSetLanguage | HostThunk::MfMetadataGetLanguage | HostThunk::MfMetadataGetAllLanguages | HostThunk::MfMetadataDeleteLanguage | HostThunk::MfMetadataSetProperty | HostThunk::MfMetadataGetProperty | HostThunk::MfMetadataDeleteProperty | HostThunk::MfMetadataGetAllPropertyNames | HostThunk::MfByteStreamGetCapabilities | HostThunk::MfByteStreamSetLength | HostThunk::MfByteStreamSetCurrentPosition | HostThunk::MfByteStreamIsEndOfStream | HostThunk::MfByteStreamBeginRead | HostThunk::MfByteStreamEndRead | HostThunk::MfByteStreamWrite | HostThunk::MfByteStreamBeginWrite | HostThunk::MfByteStreamEndWrite | HostThunk::MfByteStreamSeek | HostThunk::MfByteStreamFlush | HostThunk::MfByteStreamClose | HostThunk::MfSourceReaderGetStreamSelection | HostThunk::MfSourceReaderSetStreamSelection | HostThunk::MfSourceReaderSetCurrentMediaType | HostThunk::MfSourceReaderSetCurrentPosition | HostThunk::MfSourceReaderFlush | HostThunk::MfSourceReaderGetServiceForStream | HostThunk::MfSourceReaderGetPresentationAttribute | HostThunk::MfPresentationDescriptorGetStreamDescriptorByIndex | HostThunk::MfPresentationDescriptorSelectStream | HostThunk::MfPresentationDescriptorDeselectStream | HostThunk::MfPresentationDescriptorClone | HostThunk::MfStreamDescriptorGetStreamIdentifier | HostThunk::MfStreamDescriptorGetMediaTypeHandler | HostThunk::MfMediaTypeHandlerIsMediaTypeSupported | HostThunk::MfMediaTypeHandlerGetMediaTypeCount | HostThunk::MfMediaTypeHandlerGetMediaTypeByIndex | HostThunk::MfMediaTypeHandlerSetCurrentMediaType | HostThunk::MfMediaTypeHandlerGetCurrentMediaType | HostThunk::MfMediaTypeHandlerGetMajorType | HostThunk::MfEventGetExtendedType | HostThunk::MfEventGetStatus | HostThunk::MfEventGetValue | HostThunk::MfAsyncResultGetState | HostThunk::MfAsyncResultGetStatus | HostThunk::MfAsyncResultSetStatus | HostThunk::MfAsyncResultGetObject | HostThunk::MfAsyncResultGetCallback | HostThunk::MfSourceResolverBegin | HostThunk::MftStreamAttributes | HostThunk::MftFixedStreams | HostThunk::MftProcessEvent | HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfAttrGetItem | HostThunk::MfAttrGetItemType | HostThunk::MfAttrCompareItem | HostThunk::MfAttrCompare | HostThunk::MfAttrGetAllocatedString | HostThunk::MfAttrGetAllocatedBlob | HostThunk::MfAttrGetUnknown | HostThunk::MfAttrSetItem | HostThunk::MfAttrSetUnknown | HostThunk::MfAttrDeleteAllItems | HostThunk::MfAttrLockStore | HostThunk::MfAttrUnlockStore | HostThunk::MfAttrCopyAllItems | HostThunk::MfSampleSetSampleFlags | HostThunk::MfSampleGetSampleFlags | HostThunk::MfSampleGetTotalLength | HostThunk::MfSampleCopyToBuffer | HostThunk::MfSampleConvertToContiguousBuffer | HostThunk::MfMediaTypeIsEqual | HostThunk::MfMediaTypeGetRepresentation | HostThunk::MfMediaTypeFreeRepresentation | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType | HostThunk::MfActivateGetCount | HostThunk::MfActivateGetItem | HostThunk::MfActivateGetGuid | HostThunk::MfActivateGetString | HostThunk::MfActivateActivateObject | HostThunk::MfActivateShutdownObject | HostThunk::MfTransformGetStreamLimits | HostThunk::MfTransformGetStreamCounts | HostThunk::MfTransformGetStreamIds | HostThunk::MfTransformGetStreamInfo | HostThunk::MfTransformGetAttributes | HostThunk::MfTransformGetInputAvailableType | HostThunk::MfTransformGetOutputAvailableType | HostThunk::MfTransformSetInputType | HostThunk::MfTransformSetOutputType | HostThunk::MfTransformGetInputCurrentType | HostThunk::MfTransformGetOutputCurrentType | HostThunk::MfTransformGetInputStatus | HostThunk::MfTransformGetOutputStatus | HostThunk::MfTransformProcessInput | HostThunk::MfTransformProcessOutput | HostThunk::MfTransformProcessMessage | HostThunk::MfRateControlSetRate | HostThunk::MfRateControlGetRate | HostThunk::MfRateSupportGetSlowestRate | HostThunk::MfRateSupportGetFastestRate | HostThunk::MfRateSupportIsRateSupported | HostThunk::MftTransformUnsupported) => {
 
                 self.dispatch_mf_or_com(thunk, state, memory)?;
             }
@@ -44810,6 +44832,9 @@ impl PeHostRuntime {
                 state.set(Register::Rax, u64::from(ok));
                 self.last_error = if ok { 0 } else { ERROR_INVALID_PARAMETER };
             }
+            HostThunk::DriverIslandShim { function } => {
+                crate::driver_island::dispatch_shim(self, state, memory, function)?;
+            }
             HostThunk::UnsupportedMethod { name } => {
                 self.telemetry.record_unsupported_method(&name);
                 return Err(AppError::new(
@@ -56065,6 +56090,26 @@ impl PeHostRuntime {
             HostThunk::NtCreateFile => {
                 self.dispatch_nt_create_file(state, memory)?;
             }
+            HostThunk::NtLoadDriver => {
+                let service_path = guest_call_arg(state, memory, 0)?;
+                let status = crate::driver_island::DriverIsland::nt_load_driver(
+                    self,
+                    memory,
+                    service_path,
+                );
+                state.set(Register::Rax, u64::from(status as u32));
+                self.last_error = 0;
+            }
+            HostThunk::NtUnloadDriver => {
+                let service_path = guest_call_arg(state, memory, 0)?;
+                let status = crate::driver_island::DriverIsland::nt_unload_driver(
+                    self,
+                    memory,
+                    service_path,
+                );
+                state.set(Register::Rax, u64::from(status as u32));
+                self.last_error = 0;
+            }
             HostThunk::NtDeviceIoControlFile => {
                 self.dispatch_nt_device_io_control_file(state, memory)?;
             }
@@ -67118,6 +67163,7 @@ impl PeHostRuntime {
             | GuestObjectKind::ImfPresentationDescriptor
             | GuestObjectKind::ImfStreamDescriptor
             | GuestObjectKind::ImfMediaTypeHandler
+            | GuestObjectKind::ImfMetadata
             | GuestObjectKind::ImfMediaSource
             | GuestObjectKind::ImfSourceReader
             | GuestObjectKind::ImfMediaEvent => self.destroy_mf_object_state(address)?,
@@ -81831,6 +81877,9 @@ impl HostThunk {
             ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateFile" => {
                 Self::MfCreateFile
             }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateTempFile" => {
+                Self::MfCreateTempFile
+            }
             ("mfplat.dll", ImportSymbol::ByName { name, .. })
                 if name == "MFCreateMediaBufferFromMediaType" =>
             {
@@ -85333,6 +85382,12 @@ impl HostThunk {
             }
             ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateFile" => {
                 Self::NtCreateFile
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtLoadDriver" => {
+                Self::NtLoadDriver
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtUnloadDriver" => {
+                Self::NtUnloadDriver
             }
             ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtDeviceIoControlFile" => {
                 Self::NtDeviceIoControlFile
@@ -91038,6 +91093,7 @@ impl HostThunk {
             Self::NtCreateSection | Self::NtDuplicateObject | Self::NtCreateKey => 28,
             Self::NtCreateThreadEx | Self::NtDeviceIoControlFile | Self::NtMapViewOfSection => 40,
             Self::NtCreateFile => 44,
+            Self::NtLoadDriver | Self::NtUnloadDriver => 4,
             // ── kernel32 core surface (x86 stdcall byte counts) ────────────
             Self::DisableThreadLibraryCalls => 4,
             Self::ExpandEnvironmentStringsW => 12,
@@ -150848,6 +150904,11 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             target: ExportTarget::Rva(0x24130),
         },
         ExportSymbol {
+            ordinal: 21,
+            name: Some("MFCreateTempFile".to_string()),
+            target: ExportTarget::Rva(0x24140),
+        },
+        ExportSymbol {
             ordinal: 90,
             name: Some("IMFAsyncResult".to_string()),
             target: ExportTarget::Rva(0x24200),
@@ -151931,6 +151992,16 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                     ordinal: 67,
                     name: Some("LdrRemoveRefDll".to_string()),
                     target: ExportTarget::Rva(0x2720),
+                },
+                ExportSymbol {
+                    ordinal: 68,
+                    name: Some("NtLoadDriver".to_string()),
+                    target: ExportTarget::Rva(0x2730),
+                },
+                ExportSymbol {
+                    ordinal: 69,
+                    name: Some("NtUnloadDriver".to_string()),
+                    target: ExportTarget::Rva(0x2740),
                 },
                 ExportSymbol {
                     ordinal: 99,

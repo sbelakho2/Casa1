@@ -11,7 +11,7 @@
 use super::super::*;
 use super::unknown_preamble;
 use crate::media::{Guid, ImfMediaBuffer, ImfMediaType, ImfSample, MfEventQueue};
-use crate::runtime::state::{ComStreamState, ImfByteStreamState};
+use crate::runtime::state::{ComStreamState, ImfByteStreamState, ImfMetadataState};
 
 /// MFT_CATEGORY_VIDEO_DECODER {d6c02d4b-6833-45b4-971a-05a4b04bab91}
 /// (the guest little-endian byte form).
@@ -141,12 +141,18 @@ const SERVICE_MF_MEDIASOURCE: [u8; 16] = [
     0xf7, 0x92, 0x99, 0xf0, 0xba, 0x9f, 0x4a, 0x4c, 0xa3, 0x7f, 0x8c, 0x47, 0xb4, 0xe1, 0xdf, 0xe7,
 ];
 /// MF_METADATA_PROVIDER_SERVICE {db214084-58a4-4d2e-b84f-6f755b2f7a0d}
-/// (mfidl.h).  No real metadata/tag parser exists in the runtime, so no
-/// provider is registered: the service stays genuinely unsupported.
-#[allow(dead_code)] // referenced by the MF service-resolution tests
+/// (mfidl.h).  Real media sources answer it with an IMFMetadata provider
+/// over the container tag map parsed from the file.
 const SERVICE_MF_METADATA_PROVIDER: [u8; 16] = [
     0x84, 0x40, 0x21, 0xdb, 0xa4, 0x58, 0x2e, 0x4d, 0xb8, 0x4f, 0x6f, 0x75, 0x5b, 0x2f, 0x7a, 0x0d,
 ];
+/// IID_IMFMetadata {f88cfb8c-ef16-4991-b450-cb8c69e51704} (mfidl.h).
+const IID_IMF_METADATA: [u8; 16] = [
+    0x8c, 0xfb, 0x8c, 0xf8, 0x16, 0xef, 0x91, 0x49, 0xb4, 0x50, 0xcb, 0x8c, 0x69, 0xe5, 0x17, 0x04,
+];
+/// MF_OPENMODE_DELETE_IF_EXIST (mfobjects.h): replace the file like
+/// RESET_IF_EXIST and delete it when the byte stream closes.
+const MF_OPENMODE_DELETE_IF_EXIST: u32 = 4;
 /// MF_BYTESTREAM_ORIGIN_NAME {fc358288-3cb6-460c-a424-b6681260375a}.
 const SERVICE_MF_BYTESTREAM_ORIGIN_NAME: [u8; 16] = [
     0x88, 0x82, 0x35, 0xfc, 0xb6, 0x3c, 0x0c, 0x46, 0xa4, 0x24, 0xb6, 0x68, 0x12, 0x60, 0x37, 0x5a,
@@ -396,9 +402,9 @@ impl PeHostRuntime {
     /// The media source's real provider table.  `MF_MEDIASOURCE_SERVICE` is
     /// the documented Windows 8.1+ source service: it returns the source
     /// object itself for `IID_IMFMediaSource`, `IID_IMFMediaSourceEx` and
-    /// `IID_IUnknown`.  `MF_METADATA_PROVIDER_SERVICE` is NOT registered:
-    /// the runtime has no real container tag/metadata parser, so no provider
-    /// is fabricated.
+    /// `IID_IUnknown`.  `MF_METADATA_PROVIDER_SERVICE` returns a real
+    /// `IMFMetadata` object over the MP4 tag map parsed from the source's
+    /// file (an empty provider when the container carries no `ilst` tags).
     fn dispatch_mf_media_source_get_service(
         &mut self,
         state: &mut CpuState,
@@ -415,6 +421,30 @@ impl PeHostRuntime {
         {
             write_guest_pointer(memory, out, source, self.guest_arch).ok();
             self.add_ref_guest_object(source)?;
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        if service == &SERVICE_MF_METADATA_PROVIDER {
+            if iid != &IID_IMF_METADATA && iid != &IID_IUNKNOWN {
+                state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+                return Ok(());
+            }
+            let tags = self
+                .mf_media_sources
+                .get(&source)
+                .map(|source| source.metadata().clone())
+                .unwrap_or_default();
+            let vtable = self.alloc_guest_vtable(memory, mf_metadata_methods())?;
+            let object = self
+                .alloc_guest_object(memory, GuestObjectKind::ImfMetadata, vtable)
+                .unwrap_or(0);
+            if object == 0 {
+                state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+                return Ok(());
+            }
+            self.mf_metadata
+                .insert(object, ImfMetadataState::from_tags(tags));
+            write_guest_pointer(memory, out, object, self.guest_arch).ok();
             state.set(Register::Rax, u64::from(S_OK));
             return Ok(());
         }
@@ -471,6 +501,274 @@ impl PeHostRuntime {
         store.set_string(key, value);
         self.mf_media_types.insert(object, store);
         write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// Allocate a guest UTF-16 string and write a VT_LPWSTR PROPVARIANT at
+    /// `out`.
+    fn write_mf_propvariant_string(
+        &mut self,
+        memory: &mut MemoryImage,
+        out: u64,
+        text: &str,
+    ) -> AppResult<()> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let address = self.alloc_zeroed(memory, units.len() * 2 + 2, 2)?;
+        for (index, unit) in units.iter().enumerate() {
+            write_guest_u16(memory, address + index as u64 * 2, *unit).ok();
+        }
+        write_u32(memory, out, 31); // VT_LPWSTR
+        write_guest_pointer(memory, out + 8, address, self.guest_arch).ok();
+        Ok(())
+    }
+
+    /// Allocate a VT_VECTOR|VT_LPWSTR PROPVARIANT (a CALPWSTR) at `out`.
+    fn write_mf_propvariant_string_vector(
+        &mut self,
+        memory: &mut MemoryImage,
+        out: u64,
+        values: &[String],
+    ) -> AppResult<()> {
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let array = self.alloc_zeroed(
+            memory,
+            (values.len() as u64 * pointer_bytes).max(1) as usize,
+            pointer_bytes.max(4),
+        )?;
+        for (index, value) in values.iter().enumerate() {
+            let units: Vec<u16> = value.encode_utf16().collect();
+            let text = self.alloc_zeroed(memory, units.len() * 2 + 2, 2)?;
+            for (unit_index, unit) in units.iter().enumerate() {
+                write_guest_u16(memory, text + unit_index as u64 * 2, *unit).ok();
+            }
+            write_guest_pointer(
+                memory,
+                array + index as u64 * pointer_bytes,
+                text,
+                self.guest_arch,
+            )
+            .ok();
+        }
+        write_u32(memory, out, 0x101f); // VT_VECTOR | VT_LPWSTR
+        write_u32(memory, out + 8, values.len() as u32);
+        write_guest_pointer(memory, out + 8 + pointer_bytes, array, self.guest_arch).ok();
+        Ok(())
+    }
+
+    /// `IMFMetadata::SetLanguage(pwszRFC1766)`.
+    pub(crate) fn dispatch_mf_metadata_set_language(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let language_ptr = guest_call_arg(state, memory, 1)?;
+        let Some(language) = read_utf16_string(memory, language_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if language.is_empty() {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(metadata) = self.mf_metadata.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if !metadata.languages.contains(&language) {
+            metadata.languages.push(language.clone());
+        }
+        metadata.language = Some(language);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMetadata::GetLanguage(ppwszRFC1766)`.
+    pub(crate) fn dispatch_mf_metadata_get_language(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(metadata) = self.mf_metadata.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let language = metadata.language.clone();
+        let Some(language) = language else {
+            if out != 0 {
+                write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        };
+        if out != 0 {
+            let units: Vec<u16> = language.encode_utf16().collect();
+            let address = self.alloc_zeroed(memory, units.len() * 2 + 2, 2)?;
+            for (index, unit) in units.iter().enumerate() {
+                write_guest_u16(memory, address + index as u64 * 2, *unit).ok();
+            }
+            write_guest_pointer(memory, out, address, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMetadata::GetAllLanguages(ppvLanguages)`.
+    pub(crate) fn dispatch_mf_metadata_get_all_languages(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(metadata) = self.mf_metadata.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let languages = metadata.languages.clone();
+        if out != 0 {
+            self.write_mf_propvariant_string_vector(memory, out, &languages)?;
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMetadata::DeleteLanguage(pwszRFC1766)`.
+    pub(crate) fn dispatch_mf_metadata_delete_language(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let language_ptr = guest_call_arg(state, memory, 1)?;
+        let Some(language) = read_utf16_string(memory, language_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(metadata) = self.mf_metadata.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        metadata.languages.retain(|entry| entry != &language);
+        if metadata.language.as_deref() == Some(language.as_str()) {
+            metadata.language = metadata.languages.first().cloned();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMetadata::SetProperty(pwszName, ppvValue)`.
+    pub(crate) fn dispatch_mf_metadata_set_property(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let value_ptr = guest_call_arg(state, memory, 2)?;
+        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if name.is_empty() || value_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let vt = read_guest_u32(memory, value_ptr).unwrap_or(0);
+        let payload = read_guest_pointer(memory, value_ptr + 8, self.guest_arch).unwrap_or(0);
+        let value = match vt {
+            0 => None, // VT_EMPTY deletes the property
+            31 => Some(read_utf16_string(memory, payload).unwrap_or_default()),
+            8 => Some(read_utf16_string(memory, payload + 4).unwrap_or_default()),
+            _ => {
+                state.set(Register::Rax, u64::from(MF_E_INVALIDMEDIATYPE));
+                return Ok(());
+            }
+        };
+        let Some(metadata) = self.mf_metadata.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        match value {
+            Some(value) => {
+                metadata.properties.insert(name, value);
+            }
+            None => {
+                metadata.properties.remove(&name);
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMetadata::GetProperty(pwszName, ppvValue)`.
+    pub(crate) fn dispatch_mf_metadata_get_property(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(metadata) = self.mf_metadata.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let Some(value) = metadata.properties.get(&name).cloned() else {
+            state.set(Register::Rax, u64::from(MF_E_ATTRIBUTENOTFOUND));
+            return Ok(());
+        };
+        if out != 0 {
+            self.write_mf_propvariant_string(memory, out, &value)?;
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMetadata::DeleteProperty(pwszName)`.
+    pub(crate) fn dispatch_mf_metadata_delete_property(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(metadata) = self.mf_metadata.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        metadata.properties.remove(&name);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMetadata::GetAllPropertyNames(ppvNames)`.
+    pub(crate) fn dispatch_mf_metadata_get_all_property_names(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(metadata) = self.mf_metadata.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let names: Vec<String> = metadata.properties.keys().cloned().collect();
+        if out != 0 {
+            self.write_mf_propvariant_string_vector(memory, out, &names)?;
+        }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -1112,9 +1410,13 @@ impl PeHostRuntime {
                 Err(_) => return Ok(Err(MF_E_UNSUPPORTED_BYTESTREAM_TYPE)),
             };
             let presentation = reader.presentation(0, None);
+            let metadata = reader.metadata().clone();
             let source = self.mf_alloc_media_source_object(memory, presentation, stream_object)?;
             if source == 0 {
                 return Ok(Err(E_OUTOFMEMORY));
+            }
+            if let Some(source_state) = self.mf_media_sources.get_mut(&source) {
+                source_state.set_metadata(metadata);
             }
             let reader_object = self.mf_alloc_source_reader_object(memory, reader, source)?;
             if reader_object == 0 {
@@ -1178,9 +1480,13 @@ impl PeHostRuntime {
             stream.content_type = content_type.clone();
         }
         let presentation = reader.presentation(length, content_type.as_deref());
+        let metadata = reader.metadata().clone();
         let source = self.mf_alloc_media_source_object(memory, presentation, byte_stream)?;
         if source == 0 {
             return Ok(Err(E_OUTOFMEMORY));
+        }
+        if let Some(source_state) = self.mf_media_sources.get_mut(&source) {
+            source_state.set_metadata(metadata);
         }
         let reader_object = self.mf_alloc_source_reader_object(memory, reader, source)?;
         if reader_object == 0 {
@@ -1412,15 +1718,19 @@ impl PeHostRuntime {
                 return Ok(());
             }
         };
+        let mut delete_on_close = false;
         let creation = match open_mode {
             0 => crate::win32::CreationDisposition::OpenExisting, // FAIL_IF_NOT_EXIST
             1 => crate::win32::CreationDisposition::CreateNew,    // FAIL_IF_EXIST
             2 => crate::win32::CreationDisposition::CreateAlways, // RESET_IF_EXIST
             3 => crate::win32::CreationDisposition::OpenAlways,   // APPEND_IF_EXIST
+            MF_OPENMODE_DELETE_IF_EXIST => {
+                // DELETE_IF_EXIST replaces existing contents (delete-on-open
+                // semantics) and removes the file when the stream closes.
+                delete_on_close = true;
+                crate::win32::CreationDisposition::CreateAlways
+            }
             _ => {
-                // MF_OPENMODE_DELETE_IF_EXIST has no runtime file-table
-                // disposition; it is answered as an argument error instead
-                // of silently opening a non-deleting stream.
                 state.set(Register::Rax, u64::from(E_INVALIDARG));
                 return Ok(());
             }
@@ -1450,10 +1760,10 @@ impl PeHostRuntime {
             0
         };
         let content_type = crate::media::mime_type_for_path(&path).map(str::to_string);
-        let object = self.mf_alloc_byte_stream_object(
-            memory,
-            ImfByteStreamState::from_file(handle, length, write, Some(path.clone())),
-        )?;
+        let mut stream_state =
+            ImfByteStreamState::from_file(handle, length, write, Some(path.clone()));
+        stream_state.delete_on_close = delete_on_close;
+        let object = self.mf_alloc_byte_stream_object(memory, stream_state)?;
         if object == 0 {
             self.win32.close_handle(handle).ok();
             state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
@@ -1461,6 +1771,87 @@ impl PeHostRuntime {
         }
         if let Some(stream) = self.mf_byte_streams.get_mut(&object) {
             stream.content_type = content_type;
+        }
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `MFCreateTempFile(AccessMode, OpenMode, fFileFlags, ppIByteStream)`
+    /// — create a unique temp file through the runtime's
+    /// `GetTempPathW`/`GetTempFileNameW`, open it with `CreateFileW`
+    /// semantics, and wrap the real handle in an IMFByteStream that deletes
+    /// the file when it closes or is released.
+    pub(crate) fn dispatch_mf_create_temp_file(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let access_mode = guest_call_arg_u32(state, memory, 0)?;
+        let _open_mode = guest_call_arg_u32(state, memory, 1)?;
+        let _flags = guest_call_arg_u32(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let (read, write) = match access_mode {
+            1 => (true, false), // MF_ACCESSMODE_READ
+            2 => (false, true), // MF_ACCESSMODE_WRITE
+            3 => (true, true),  // MF_ACCESSMODE_READWRITE
+            _ => {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+        };
+        let temp_path = match self.win32.get_temp_path_w() {
+            Ok(path) => path,
+            Err(error) => {
+                state.set(Register::Rax, u64::from(win32_error_to_hresult(&error)));
+                return Ok(());
+            }
+        };
+        let path = match self.win32.get_temp_file_name_w(&temp_path, "mft") {
+            Ok(path) => path,
+            Err(error) => {
+                state.set(Register::Rax, u64::from(win32_error_to_hresult(&error)));
+                return Ok(());
+            }
+        };
+        let handle = match self.win32.create_file_w(
+            &path,
+            crate::ge::FileAccess {
+                read,
+                write,
+                delete: true,
+            },
+            crate::ge::ShareMode::all(),
+            crate::win32::CreationDisposition::CreateAlways,
+            false,
+            false,
+            false,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.win32.delete_file_w(&path).ok();
+                state.set(Register::Rax, u64::from(win32_error_to_hresult(&error)));
+                return Ok(());
+            }
+        };
+        let length = if read {
+            self.win32.get_file_size_ex(handle).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut stream_state =
+            ImfByteStreamState::from_file(handle, length, write, Some(path.clone()));
+        stream_state.delete_on_close = true;
+        let object = self.mf_alloc_byte_stream_object(memory, stream_state)?;
+        if object == 0 {
+            self.win32.close_handle(handle).ok();
+            self.win32.delete_file_w(&path).ok();
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
         }
         write_guest_pointer(memory, out, object, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
@@ -5856,6 +6247,11 @@ impl PeHostRuntime {
             self.win32.close_handle(handle).ok();
             stream.file_handle = 0;
         }
+        if stream.delete_on_close
+            && let Some(path) = stream.origin_name.as_deref()
+        {
+            self.win32.delete_file_w(path).ok();
+        }
         stream.closed = true;
         stream.data.clear();
         stream.length = 0;
@@ -6061,10 +6457,16 @@ impl PeHostRuntime {
             if stream.file_handle != 0 {
                 self.win32.close_handle(stream.file_handle).ok();
             }
+            if stream.delete_on_close
+                && let Some(path) = stream.origin_name.as_deref()
+            {
+                self.win32.delete_file_w(path).ok();
+            }
         }
         self.mf_presentation_descriptors.remove(&address);
         self.mf_stream_descriptors.remove(&address);
         self.mf_media_type_handlers.remove(&address);
+        self.mf_metadata.remove(&address);
         self.mf_media_events.remove(&address);
         self.mf_media_types.remove(&address);
         self.mf_source_d3d_managers.remove(&address);
@@ -6917,6 +7319,17 @@ impl PeHostRuntime {
                 self.dispatch_mf_media_source_set_d3d_manager(state, memory)
             }
             MfCreateFile => self.dispatch_mf_create_file(state, memory),
+            MfCreateTempFile => self.dispatch_mf_create_temp_file(state, memory),
+            MfMetadataSetLanguage => self.dispatch_mf_metadata_set_language(state, memory),
+            MfMetadataGetLanguage => self.dispatch_mf_metadata_get_language(state, memory),
+            MfMetadataGetAllLanguages => self.dispatch_mf_metadata_get_all_languages(state, memory),
+            MfMetadataDeleteLanguage => self.dispatch_mf_metadata_delete_language(state, memory),
+            MfMetadataSetProperty => self.dispatch_mf_metadata_set_property(state, memory),
+            MfMetadataGetProperty => self.dispatch_mf_metadata_get_property(state, memory),
+            MfMetadataDeleteProperty => self.dispatch_mf_metadata_delete_property(state, memory),
+            MfMetadataGetAllPropertyNames => {
+                self.dispatch_mf_metadata_get_all_property_names(state, memory)
+            }
             MfSourceResolverBegin => self.dispatch_mf_source_resolver_begin(state, memory),
             MftStreamAttributes => self.dispatch_mft_stream_attributes(state, memory),
             MftFixedStreams => self.dispatch_mft_fixed_streams(state, memory),
@@ -7256,6 +7669,22 @@ fn mf_sink_writer_methods() -> Vec<HostThunk> {
     methods.push(HostThunk::MfSinkWriterEndWriting);
     methods.push(HostThunk::MfSinkWriterGetServiceForStream);
     methods.push(HostThunk::MfSinkWriterGetStatistics);
+    methods
+}
+
+/// The IMFMetadata vtable (IUnknown preamble + the true Windows order:
+/// SetLanguage, GetLanguage, GetAllLanguages, DeleteLanguage, SetProperty,
+/// GetProperty, DeleteProperty, GetAllPropertyNames).
+fn mf_metadata_methods() -> Vec<HostThunk> {
+    let mut methods = unknown_preamble();
+    methods.push(HostThunk::MfMetadataSetLanguage);
+    methods.push(HostThunk::MfMetadataGetLanguage);
+    methods.push(HostThunk::MfMetadataGetAllLanguages);
+    methods.push(HostThunk::MfMetadataDeleteLanguage);
+    methods.push(HostThunk::MfMetadataSetProperty);
+    methods.push(HostThunk::MfMetadataGetProperty);
+    methods.push(HostThunk::MfMetadataDeleteProperty);
+    methods.push(HostThunk::MfMetadataGetAllPropertyNames);
     methods
 }
 
@@ -8211,6 +8640,50 @@ mod tests {
         file
     }
 
+    /// A real, valid MP4 carrying `moov.udta.meta.ilst` tag atoms on top of
+    /// the minimal sample tables.
+    fn mp4_with_metadata(tags: &[(&[u8; 4], &str)]) -> Vec<u8> {
+        fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut items = Vec::new();
+        for (kind, text) in tags {
+            let mut payload = vec![0_u8, 0, 0, 1, 0, 0, 0, 0]; // UTF-8, locale 0
+            payload.extend_from_slice(text.as_bytes());
+            items.extend_from_slice(&boxed(kind, &boxed(b"data", &payload)));
+        }
+        let ilst = boxed(b"ilst", &items);
+        let meta = boxed(b"meta", &[&[0_u8; 4][..], &ilst].concat());
+        let udta = boxed(b"udta", &meta);
+
+        let mut file = minimal_mp4_file();
+        let mut offset = 0;
+        while offset + 8 <= file.len() {
+            let size = u32::from_be_bytes([
+                file[offset],
+                file[offset + 1],
+                file[offset + 2],
+                file[offset + 3],
+            ]) as usize;
+            if size < 8 || offset + size > file.len() {
+                break;
+            }
+            if file[offset + 4..offset + 8] == *b"moov" {
+                let moov_end = offset + size;
+                let new_size = (size + udta.len()) as u32;
+                file[offset..offset + 4].copy_from_slice(&new_size.to_be_bytes());
+                file.splice(moov_end..moov_end, udta);
+                break;
+            }
+            offset += size;
+        }
+        file
+    }
+
     /// Write bytes into the sandbox at a guest-visible Windows path.
     fn write_sandbox_file(runtime: &PeHostRuntime, guest_path: &str, bytes: &[u8]) {
         let host_path = runtime
@@ -8451,8 +8924,8 @@ mod tests {
                 MF_E_UNSUPPORTED_SERVICE as u64
             );
 
-            // The metadata provider stays genuinely unsupported (no real tag
-            // parser exists).
+            // The metadata provider is real but only answers IID_IMFMetadata
+            // (or IUnknown); other interfaces stay unsupported.
             write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_METADATA_PROVIDER);
             write_guest_guid_bytes(&mut memory, iid, &IID_IMF_ATTRIBUTES);
             assert_eq!(
@@ -9218,6 +9691,576 @@ mod tests {
                     &[1, 1, 0, writable_path as u32, stream_out as u32]
                 ),
                 0x8007_00B7
+            );
+        })
+    }
+
+    #[test]
+    fn mf_create_temp_file_creates_delete_on_close_streams() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-create-temp-file");
+            let mut memory = MemoryImage::default();
+            let create: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateTempFile);
+            let write: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamWrite);
+            let read: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamRead);
+            let set_position: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfByteStreamSetCurrentPosition);
+            let close: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamClose);
+            let stream_out = 0x41_500;
+
+            // MF_ACCESSMODE_READWRITE=3; the open mode is documented ignored.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[3, 2, 0, stream_out as u32]
+                ),
+                0
+            );
+            let stream = read_guest_pointer(&memory, stream_out, GuestArch::X86).unwrap();
+            let path = runtime
+                .mf_byte_streams
+                .get(&stream)
+                .unwrap()
+                .origin_name
+                .clone()
+                .expect("temp file origin");
+            assert!(path.to_ascii_lowercase().contains("temp"), "{path}");
+            let host_path = runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path(&path)
+                .expect("temp host path");
+            assert!(host_path.exists(), "the temp file is really created");
+
+            let buffer = 0x43_400;
+            let count = 0x43_410;
+            memory.map_bytes(buffer, b"HELLO");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    write,
+                    &[stream as u32, buffer as u32, 5, count as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, count).unwrap(), 5);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_position, &[stream as u32, 0]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    read,
+                    &[stream as u32, buffer as u32, 5, count as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, count).unwrap(), 5);
+            assert_eq!(memory.read_bytes(buffer, 5).unwrap(), b"HELLO".to_vec());
+
+            // Close deletes the temp file; a second close answers E_FAIL.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[stream as u32]),
+                0
+            );
+            assert!(!host_path.exists(), "close removes the temp file");
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[stream as u32]),
+                E_FAIL as u64
+            );
+
+            // Invalid access mode and a null out-pointer are argument errors.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[0, 2, 0, stream_out as u32]
+                ),
+                E_INVALIDARG as u64
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, create, &[3, 2, 0, 0]),
+                E_INVALIDARG as u64
+            );
+
+            // Read-only access really denies Write, and still deletes on close.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[1, 2, 0, stream_out as u32]
+                ),
+                0
+            );
+            let read_only = read_guest_pointer(&memory, stream_out, GuestArch::X86).unwrap();
+            let read_only_path = runtime
+                .mf_byte_streams
+                .get(&read_only)
+                .unwrap()
+                .origin_name
+                .clone()
+                .unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    write,
+                    &[read_only as u32, buffer as u32, 1, count as u32]
+                ),
+                E_ACCESSDENIED as u64
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[read_only as u32]),
+                0
+            );
+            assert!(
+                !runtime
+                    .win32
+                    .ge()
+                    .host_path_for_windows_path(&read_only_path)
+                    .unwrap()
+                    .exists()
+            );
+
+            // Consecutive creations get unique paths.
+            let first_out = 0x41_510;
+            let second_out = 0x41_520;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[3, 0, 0, first_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[3, 0, 0, second_out as u32]
+                ),
+                0
+            );
+            let first = read_guest_pointer(&memory, first_out, GuestArch::X86).unwrap();
+            let second = read_guest_pointer(&memory, second_out, GuestArch::X86).unwrap();
+            let first_path = runtime
+                .mf_byte_streams
+                .get(&first)
+                .unwrap()
+                .origin_name
+                .clone()
+                .unwrap();
+            let second_path = runtime
+                .mf_byte_streams
+                .get(&second)
+                .unwrap()
+                .origin_name
+                .clone()
+                .unwrap();
+            assert_ne!(first_path, second_path);
+            dispatch_x86_thunk(&mut runtime, &mut memory, close, &[first as u32]);
+            dispatch_x86_thunk(&mut runtime, &mut memory, close, &[second as u32]);
+
+            // A missing temp directory is reported as a temp-path failure.
+            let temp_path = runtime.win32.get_temp_path_w().unwrap();
+            let temp_host = runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path(temp_path.trim_end_matches(['\\', '/']))
+                .unwrap();
+            std::fs::remove_dir_all(&temp_host).unwrap();
+            assert_ne!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[3, 0, 0, stream_out as u32]
+                ),
+                0,
+                "a missing temp path must fail MFCreateTempFile"
+            );
+            std::fs::create_dir_all(&temp_host).ok();
+        })
+    }
+
+    #[test]
+    fn mf_create_file_delete_if_exist_replaces_and_deletes_on_close() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-delete-if-exist");
+            let mut memory = MemoryImage::default();
+            write_sandbox_file(&runtime, "C:\\media\\replace.bin", b"OLD!");
+            let create: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateFile);
+            let write: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamWrite);
+            let length: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamGetLength);
+            let close: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamClose);
+            let url = 0x42_000;
+            write_utf16(&mut memory, url, "C:\\media\\replace.bin");
+            let stream_out = 0x41_500;
+            let value = 0x41_510;
+
+            // MF_ACCESSMODE_READWRITE=3, MF_OPENMODE_DELETE_IF_EXIST=4.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[3, 4, 0, url as u32, stream_out as u32]
+                ),
+                0
+            );
+            let stream = read_guest_pointer(&memory, stream_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    length,
+                    &[stream as u32, value as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u64(&memory, value).unwrap(),
+                0,
+                "DELETE_IF_EXIST replaces the pre-existing contents"
+            );
+            let buffer = 0x43_400;
+            let written = 0x43_410;
+            memory.map_bytes(buffer, b"NEW!");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    write,
+                    &[stream as u32, buffer as u32, 4, written as u32]
+                ),
+                0
+            );
+            let host_path = runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path("C:\\media\\replace.bin")
+                .unwrap();
+            assert_eq!(std::fs::read(&host_path).unwrap(), b"NEW!".to_vec());
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[stream as u32]),
+                0
+            );
+            assert!(!host_path.exists(), "closing the stream deletes the file");
+
+            // DELETE_IF_EXIST also creates a previously missing file, then
+            // deletes it on close.
+            let missing = 0x42_100;
+            write_utf16(&mut memory, missing, "C:\\media\\missing-delete.bin");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[1, 4, 0, missing as u32, stream_out as u32]
+                ),
+                0
+            );
+            let missing_stream = read_guest_pointer(&memory, stream_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[missing_stream as u32]),
+                0
+            );
+            assert!(
+                !runtime
+                    .win32
+                    .ge()
+                    .host_path_for_windows_path("C:\\media\\missing-delete.bin")
+                    .unwrap()
+                    .exists()
+            );
+        })
+    }
+
+    #[test]
+    fn mf_metadata_provider_reads_and_writes_real_mp4_tags() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-metadata-tags");
+            let mut memory = MemoryImage::default();
+            let mp4 = mp4_with_metadata(&[
+                (b"\xa9nam", "Song Title"),
+                (b"\xa9ART", "The Artist"),
+                (b"\xa9alb", "The Album"),
+                (b"\xa9day", "2024"),
+            ]);
+            write_sandbox_file(&runtime, "C:\\media\\tagged.mp4", &mp4);
+
+            let create_reader: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfCreateSourceReaderFromUrl);
+            let url = 0x42_000;
+            write_utf16(&mut memory, url, "C:\\media\\tagged.mp4");
+            let reader_out = 0x41_000;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_reader,
+                    &[url as u32, 0, reader_out as u32]
+                ),
+                0
+            );
+            let reader = read_guest_pointer(&memory, reader_out, GuestArch::X86).unwrap();
+            let source = runtime.mf_source_readers.get(&reader).unwrap().source();
+            assert_eq!(
+                runtime
+                    .mf_media_sources
+                    .get(&source)
+                    .unwrap()
+                    .metadata()
+                    .properties
+                    .get("©nam"),
+                Some(&"Song Title".to_string())
+            );
+
+            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
+            let guid = 0x44_000;
+            let iid = 0x44_100;
+            let out = 0x44_200;
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_METADATA_PROVIDER);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_METADATA);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[source as u32, guid as u32, iid as u32, out as u32]
+                ),
+                0
+            );
+            let metadata = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            assert!(runtime.mf_metadata.contains_key(&metadata));
+
+            // GetAllPropertyNames reports the real parsed ilst keys.
+            let get_names: u64 = runtime.alloc_host_thunk(HostThunk::MfMetadataGetAllPropertyNames);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_names,
+                    &[metadata as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0x101f);
+            assert_eq!(read_guest_u32(&memory, out + 8).unwrap(), 4);
+            let array = read_guest_pointer(&memory, out + 12, GuestArch::X86).unwrap();
+            let mut names = Vec::new();
+            for index in 0..4 {
+                let entry = read_guest_pointer(&memory, array + index * 4, GuestArch::X86).unwrap();
+                names.push(read_utf16_string(&memory, entry).unwrap());
+            }
+            names.sort();
+            assert_eq!(names, vec!["©ART", "©alb", "©day", "©nam"]);
+
+            // GetProperty returns the real UTF-8 data-atom payload.
+            let get_property: u64 = runtime.alloc_host_thunk(HostThunk::MfMetadataGetProperty);
+            let name_ptr = 0x45_000;
+            write_utf16(&mut memory, name_ptr, "©nam");
+            let value = 0x45_100;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_property,
+                    &[metadata as u32, name_ptr as u32, value as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, value).unwrap(), 31);
+            let text = read_guest_pointer(&memory, value + 8, GuestArch::X86).unwrap();
+            assert_eq!(read_utf16_string(&memory, text).unwrap(), "Song Title");
+
+            // A missing property answers MF_E_ATTRIBUTENOTFOUND.
+            let missing = 0x45_200;
+            write_utf16(&mut memory, missing, "©cmt");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_property,
+                    &[metadata as u32, missing as u32, value as u32]
+                ),
+                MF_E_ATTRIBUTENOTFOUND as u64
+            );
+
+            // SetProperty adds a real guest-visible tag.
+            let set_property: u64 = runtime.alloc_host_thunk(HostThunk::MfMetadataSetProperty);
+            let comment = 0x45_300;
+            write_utf16(&mut memory, comment, "A comment");
+            let propvariant = 0x45_400;
+            write_u32(&mut memory, propvariant, 31);
+            write_u32(&mut memory, propvariant + 8, comment as u32);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_property,
+                    &[metadata as u32, missing as u32, propvariant as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_property,
+                    &[metadata as u32, missing as u32, value as u32]
+                ),
+                0
+            );
+            let text = read_guest_pointer(&memory, value + 8, GuestArch::X86).unwrap();
+            assert_eq!(read_utf16_string(&memory, text).unwrap(), "A comment");
+            assert_eq!(
+                runtime
+                    .mf_metadata
+                    .get(&metadata)
+                    .unwrap()
+                    .properties
+                    .get("©cmt"),
+                Some(&"A comment".to_string())
+            );
+
+            // Language state: the parsed MP4 tags are en-US; SetLanguage adds
+            // a second language to GetAllLanguages.
+            let get_language: u64 = runtime.alloc_host_thunk(HostThunk::MfMetadataGetLanguage);
+            let language_out = 0x45_500;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_language,
+                    &[metadata as u32, language_out as u32]
+                ),
+                0
+            );
+            let language = read_guest_pointer(&memory, language_out, GuestArch::X86).unwrap();
+            assert_eq!(read_utf16_string(&memory, language).unwrap(), "en-US");
+            let set_language: u64 = runtime.alloc_host_thunk(HostThunk::MfMetadataSetLanguage);
+            let french = 0x45_600;
+            write_utf16(&mut memory, french, "fr-FR");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_language,
+                    &[metadata as u32, french as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_language,
+                    &[metadata as u32, language_out as u32]
+                ),
+                0
+            );
+            let language = read_guest_pointer(&memory, language_out, GuestArch::X86).unwrap();
+            assert_eq!(read_utf16_string(&memory, language).unwrap(), "fr-FR");
+            let get_languages: u64 = runtime.alloc_host_thunk(HostThunk::MfMetadataGetAllLanguages);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_languages,
+                    &[metadata as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0x101f);
+            assert_eq!(read_guest_u32(&memory, out + 8).unwrap(), 2);
+
+            // The metadata service answers only IID_IMFMetadata/IUnknown.
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_ATTRIBUTES);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[source as u32, guid as u32, iid as u32, out as u32]
+                ),
+                MF_E_UNSUPPORTED_SERVICE as u64
+            );
+        })
+    }
+
+    #[test]
+    fn mf_metadata_provider_on_untagged_source_is_empty_not_unsupported() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-metadata-empty");
+            let mut memory = MemoryImage::default();
+            write_sandbox_file(&runtime, "C:\\media\\plain.mp4", &minimal_mp4_file());
+            let create_reader: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfCreateSourceReaderFromUrl);
+            let url = 0x42_000;
+            write_utf16(&mut memory, url, "C:\\media\\plain.mp4");
+            let reader_out = 0x41_000;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_reader,
+                    &[url as u32, 0, reader_out as u32]
+                ),
+                0
+            );
+            let reader = read_guest_pointer(&memory, reader_out, GuestArch::X86).unwrap();
+            let source = runtime.mf_source_readers.get(&reader).unwrap().source();
+
+            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
+            let guid = 0x44_000;
+            let iid = 0x44_100;
+            let out = 0x44_200;
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_METADATA_PROVIDER);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_METADATA);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[source as u32, guid as u32, iid as u32, out as u32]
+                ),
+                0,
+                "a real media source always provides IMFMetadata"
+            );
+            let metadata = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            let get_names: u64 = runtime.alloc_host_thunk(HostThunk::MfMetadataGetAllPropertyNames);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_names,
+                    &[metadata as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out + 8).unwrap(), 0);
+            let get_property: u64 = runtime.alloc_host_thunk(HostThunk::MfMetadataGetProperty);
+            let name_ptr = 0x45_000;
+            write_utf16(&mut memory, name_ptr, "©nam");
+            let value = 0x45_100;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_property,
+                    &[metadata as u32, name_ptr as u32, value as u32]
+                ),
+                MF_E_ATTRIBUTENOTFOUND as u64
             );
         })
     }
