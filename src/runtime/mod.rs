@@ -5167,6 +5167,8 @@ pub enum HostThunk {
     MsiCloseAllHandles,
     MsiCloseHandle,
     MsiConfigureProductW,
+    MsiCreateRecord,
+    MsiDatabaseCommit,
     MsiDatabaseOpenViewW,
     MsiEnumProductsW,
     MsiGetProductInfoW,
@@ -5176,13 +5178,18 @@ pub enum HostThunk {
     MsiOpenPackageW,
     MsiQueryProductInfoW,
     MsiRecordDataSize,
+    MsiRecordGetInteger,
     MsiRecordGetStringW,
+    MsiRecordReadStream,
+    MsiRecordSetInteger,
     MsiRecordSetStringW,
     MsiReinstallProductW,
     MsiSetPropertyW,
     MsiViewClose,
     MsiViewExecute,
     MsiViewFetch,
+    MsiViewGetColumnInfo,
+    MsiViewModify,
     OleIidMoniker,
     OleIidStream,
     OleIidStorage,
@@ -29266,7 +29273,7 @@ impl PeHostRuntime {
             ref thunk @ (HostThunk::AcmDriverClose | HostThunk::AcmDriverEnum | HostThunk::AcmDriverMessage | HostThunk::AcmDriverOpen | HostThunk::AcmFormatDetails | HostThunk::AcmFormatDetailsW | HostThunk::AcmFormatEnum | HostThunk::AcmFormatEnumW | HostThunk::AcmFormatSuggest | HostThunk::AcmMetrics | HostThunk::AcmStreamClose | HostThunk::AcmStreamConvert | HostThunk::AcmStreamOpen | HostThunk::AcmStreamSize) => {
                 self.dispatch_acm(thunk, state, memory)?;
             }
-            ref thunk @ (HostThunk::MsiCloseAllHandles | HostThunk::MsiCloseHandle | HostThunk::MsiConfigureProductW | HostThunk::MsiDatabaseOpenViewW | HostThunk::MsiEnumProductsW | HostThunk::MsiGetProductInfoW | HostThunk::MsiGetPropertyW | HostThunk::MsiInstallProductW | HostThunk::MsiOpenDatabaseW | HostThunk::MsiOpenPackageW | HostThunk::MsiQueryProductInfoW | HostThunk::MsiRecordDataSize | HostThunk::MsiRecordGetStringW | HostThunk::MsiRecordSetStringW | HostThunk::MsiReinstallProductW | HostThunk::MsiSetPropertyW | HostThunk::MsiViewClose | HostThunk::MsiViewExecute | HostThunk::MsiViewFetch) => {
+            ref thunk @ (HostThunk::MsiCloseAllHandles | HostThunk::MsiCloseHandle | HostThunk::MsiConfigureProductW | HostThunk::MsiCreateRecord | HostThunk::MsiDatabaseCommit | HostThunk::MsiDatabaseOpenViewW | HostThunk::MsiEnumProductsW | HostThunk::MsiGetProductInfoW | HostThunk::MsiGetPropertyW | HostThunk::MsiInstallProductW | HostThunk::MsiOpenDatabaseW | HostThunk::MsiOpenPackageW | HostThunk::MsiQueryProductInfoW | HostThunk::MsiRecordDataSize | HostThunk::MsiRecordGetInteger | HostThunk::MsiRecordGetStringW | HostThunk::MsiRecordReadStream | HostThunk::MsiRecordSetInteger | HostThunk::MsiRecordSetStringW | HostThunk::MsiReinstallProductW | HostThunk::MsiSetPropertyW | HostThunk::MsiViewClose | HostThunk::MsiViewExecute | HostThunk::MsiViewFetch | HostThunk::MsiViewGetColumnInfo | HostThunk::MsiViewModify) => {
                 self.dispatch_msi(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::OleIidMoniker | HostThunk::OleIidStream | HostThunk::OleIidStorage | HostThunk::OleIidMalloc | HostThunk::OleIidPersist | HostThunk::OleIidDropTarget | HostThunk::OleIidDataObject | HostThunk::OleIidOleObject | HostThunk::OleIidInPlaceObject | HostThunk::OleIidObjectWithSite | HostThunk::OleIidServiceProvider | HostThunk::OleIidEnumVariant | HostThunk::OleIidConnectionPoint | HostThunk::OleDispGetParam | HostThunk::OleDispGetIdsOfNames | HostThunk::OleDispInvoke | HostThunk::OleCreateDispTypeInfo | HostThunk::OleCreateStdDispatch | HostThunk::OleLoadTypeLib | HostThunk::OleLoadRegTypeLib | HostThunk::OleQueryPathOfRegTypeLib | HostThunk::OleRegisterTypeLib | HostThunk::OleUnRegisterTypeLib) => {
@@ -64174,6 +64181,10 @@ impl PeHostRuntime {
         // delivered from the same servicing point: the parked guest callback
         // fires after the Begin call returned.
         let _ = self.drain_pending_mf_async_completions(state, memory)?;
+        // DirectPlay8 engine events (datagrams, connect/send completions,
+        // player create/destroy, session lost) are delivered to the guest
+        // message handler from this servicing point, never inline.
+        let _ = self.drain_pending_dplay_events(state, memory)?;
         // Event-driven WASAPI clients are driven from the same servicing
         // point: a running client whose buffer has free space raises its
         // ready event so a guest blocked in WaitForSingleObject wakes.
@@ -64257,6 +64268,7 @@ impl PeHostRuntime {
         // delivered from the same servicing point: the parked guest callback
         // fires after the Begin call returned.
         let _ = self.drain_pending_mf_async_completions(state, memory)?;
+        let _ = self.drain_pending_dplay_events(state, memory)?;
         self.tick_audio_client_events();
         self.win32.sleep_ex(16, false, None)?;
         // Always yield the CPU between GetMessageW polls to prevent
@@ -67140,7 +67152,8 @@ impl PeHostRuntime {
             | GuestObjectKind::D3dBlob
             | GuestObjectKind::Theme
             | GuestObjectKind::MsiDatabase
-            | GuestObjectKind::MsiView) => {
+            | GuestObjectKind::MsiView
+            | GuestObjectKind::MsiRecord) => {
                 self.guest_objects.remove(&address);
                 let _ = kind;
             }
@@ -79519,6 +79532,7 @@ impl Drop for PeHostRuntime {
         // runtime must not be clobbered).
         crate::runtime_events::clear_current_observers(&self.observers);
         crate::cef_bridge::set_event_observers(None);
+        crate::media::clear_mf_async_state(self.guest_pid);
     }
 }
 
@@ -87361,6 +87375,12 @@ impl HostThunk {
             ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiConfigureProductW" => {
                 Self::MsiConfigureProductW
             }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiCreateRecord" => {
+                Self::MsiCreateRecord
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiDatabaseCommit" => {
+                Self::MsiDatabaseCommit
+            }
             ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiDatabaseOpenViewW" => {
                 Self::MsiDatabaseOpenViewW
             }
@@ -87388,8 +87408,17 @@ impl HostThunk {
             ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiRecordDataSize" => {
                 Self::MsiRecordDataSize
             }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiRecordGetInteger" => {
+                Self::MsiRecordGetInteger
+            }
             ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiRecordGetStringW" => {
                 Self::MsiRecordGetStringW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiRecordReadStream" => {
+                Self::MsiRecordReadStream
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiRecordSetInteger" => {
+                Self::MsiRecordSetInteger
             }
             ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiRecordSetStringW" => {
                 Self::MsiRecordSetStringW
@@ -87408,6 +87437,12 @@ impl HostThunk {
             }
             ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiViewFetch" => {
                 Self::MsiViewFetch
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiViewGetColumnInfo" => {
+                Self::MsiViewGetColumnInfo
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiViewModify" => {
+                Self::MsiViewModify
             }
             ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IMoniker" => {
                 Self::OleIidMoniker
@@ -153338,6 +153373,41 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                     ordinal: 19,
                     name: Some("MsiCloseAllHandles".to_string()),
                     target: ExportTarget::Rva(0x47120),
+                },
+                ExportSymbol {
+                    ordinal: 20,
+                    name: Some("MsiCreateRecord".to_string()),
+                    target: ExportTarget::Rva(0x47130),
+                },
+                ExportSymbol {
+                    ordinal: 21,
+                    name: Some("MsiDatabaseCommit".to_string()),
+                    target: ExportTarget::Rva(0x47140),
+                },
+                ExportSymbol {
+                    ordinal: 22,
+                    name: Some("MsiRecordGetInteger".to_string()),
+                    target: ExportTarget::Rva(0x47150),
+                },
+                ExportSymbol {
+                    ordinal: 23,
+                    name: Some("MsiRecordReadStream".to_string()),
+                    target: ExportTarget::Rva(0x47160),
+                },
+                ExportSymbol {
+                    ordinal: 24,
+                    name: Some("MsiRecordSetInteger".to_string()),
+                    target: ExportTarget::Rva(0x47170),
+                },
+                ExportSymbol {
+                    ordinal: 25,
+                    name: Some("MsiViewGetColumnInfo".to_string()),
+                    target: ExportTarget::Rva(0x47180),
+                },
+                ExportSymbol {
+                    ordinal: 26,
+                    name: Some("MsiViewModify".to_string()),
+                    target: ExportTarget::Rva(0x47190),
                 },
             ],
         ),

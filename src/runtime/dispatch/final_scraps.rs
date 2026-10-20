@@ -8178,9 +8178,39 @@ impl PeHostRuntime {
                     _ => crate::dplay::DPNERR_INVALIDPARAM,
                 }
             }
-            // BuildFromDirectPlay4Address: the legacy DPADDRESS blob format
-            // is not modeled; this is a documented gap.
-            21 => crate::dplay::DPNERR_UNSUPPORTED,
+            21 => {
+                // BuildFromDirectPlay4Address(pDP, flags): a real conversion
+                // from the legacy peer's bound TCP/IP endpoint.
+                if arg_u32!(2) != 0 {
+                    return crate::dplay::DPNERR_INVALIDFLAGS;
+                }
+                let legacy_object = arg!(1);
+                let addr = match runtime.objects.get(&legacy_object) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Legacy(legacy),
+                        ..
+                    }) => legacy.player_address(legacy.local_player),
+                    _ => return crate::dplay::DPNERR_INVALIDPARAM,
+                };
+                let Some(addr) = addr else {
+                    return crate::dplay::DPNERR_NOCONNECTION;
+                };
+                let hostname = addr.ip().to_string();
+                let port = addr.port();
+                match runtime.objects.get_mut(&this) {
+                    Some(crate::dplay::DplayObjectEntry {
+                        object: crate::dplay::DplayObject::Address(address),
+                        ..
+                    }) => {
+                        address.clear();
+                        let _ = address.set_sp(&crate::dplay::CLSID_DP8SP_TCPIP);
+                        let _ = address.set_hostname(&hostname);
+                        let _ = address.set_port(port);
+                        crate::dplay::S_OK
+                    }
+                    _ => crate::dplay::DPNERR_INVALIDPARAM,
+                }
+            }
             _ => crate::dplay::DPNERR_INVALIDPARAM,
         }
     }
@@ -8261,7 +8291,21 @@ impl PeHostRuntime {
                     write_guest_pointer(memory, buffer + tail + pointer_size, 0, self.guest_arch);
                 dplay::S_OK
             }
-            5 => dplay::DPNERR_INVALIDHANDLE,
+            5 => {
+                // CancelAsyncOperation(hAsyncOp).
+                let handle = arg_u32!(1);
+                let result = match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.cancel_async_operation(handle),
+                    _ => dplay::DPNERR_INVALIDPARAM,
+                };
+                if result == dplay::S_OK {
+                    runtime.cancel_pending_async(handle);
+                }
+                result
+            }
             6 => {
                 // Connect(app, host, device, security, creds, data, size,
                 //         playerContext, asyncContext, phAsync, flags).
@@ -8293,36 +8337,49 @@ impl PeHostRuntime {
                 } else {
                     name
                 };
-                match runtime.objects.get_mut(&this) {
+                let asynchronous = flags & dplay::DPNOP_SYNC == 0;
+                let (async_handle, dpnid) = match runtime.objects.get_mut(&this) {
                     Some(dplay::DplayObjectEntry {
                         object: dplay::DplayObject::Peer(peer),
                         ..
                     }) => {
+                        let handle = if asynchronous {
+                            peer.begin_async_operation(dplay::AsyncOperationKind::Connect)
+                        } else {
+                            0
+                        };
                         let result = peer.connect(target, &name, &[]);
                         if result != dplay::S_OK {
+                            if handle != 0 {
+                                let _ = peer.cancel_async_operation(handle);
+                            }
                             return result;
                         }
                         peer.set_local_context(player_context);
+                        (handle, peer.local_dpnid())
                     }
                     _ => return dplay::DPNERR_INVALIDPARAM,
-                }
-                if flags & dplay::DPNOP_SYNC != 0 {
+                };
+                if !asynchronous {
                     dplay::S_OK
                 } else {
-                    runtime
-                        .pending
-                        .push_back(dplay::DplayEvent::ConnectComplete {
-                            async_op: 1,
+                    if arg!(10) != 0 {
+                        let _ = write_guest_pointer(
+                            memory,
+                            arg!(10),
+                            u64::from(async_handle),
+                            self.guest_arch,
+                        );
+                    }
+                    runtime.push_event(
+                        this,
+                        dplay::DplayEvent::ConnectComplete {
+                            async_op: async_handle,
                             context: player_context,
                             result: dplay::S_OK,
-                            dpnid: match runtime.objects.get(&this) {
-                                Some(dplay::DplayObjectEntry {
-                                    object: dplay::DplayObject::Peer(peer),
-                                    ..
-                                }) => peer.local_dpnid(),
-                                _ => 0,
-                            },
-                        });
+                            dpnid,
+                        },
+                    );
                     dplay::DPNERR_PENDING
                 }
             }
@@ -8350,24 +8407,47 @@ impl PeHostRuntime {
                         return dplay::DPNERR_DATATOOLARGE;
                     }
                 }
-                let result = match runtime.objects.get_mut(&this) {
+                let asynchronous = flags & dplay::DPNOP_SYNC == 0;
+                let async_handle = match runtime.objects.get_mut(&this) {
                     Some(dplay::DplayObjectEntry {
                         object: dplay::DplayObject::Peer(peer),
                         ..
-                    }) => peer.send_to(dpnid, &payload),
+                    }) => {
+                        let handle = if asynchronous {
+                            peer.begin_async_operation(dplay::AsyncOperationKind::SendTo)
+                        } else {
+                            0
+                        };
+                        let result = peer.send_to(dpnid, &payload);
+                        if result != dplay::S_OK {
+                            if handle != 0 {
+                                let _ = peer.cancel_async_operation(handle);
+                            }
+                            return result;
+                        }
+                        handle
+                    }
                     _ => return dplay::DPNERR_INVALIDPARAM,
                 };
-                if result != dplay::S_OK {
-                    return result;
-                }
-                if flags & dplay::DPNOP_SYNC != 0 {
+                if !asynchronous {
                     dplay::S_OK
                 } else {
-                    runtime.pending.push_back(dplay::DplayEvent::SendComplete {
-                        async_op: 1,
-                        context: arg!(5),
-                        result: dplay::S_OK,
-                    });
+                    if arg!(6) != 0 {
+                        let _ = write_guest_pointer(
+                            memory,
+                            arg!(6),
+                            u64::from(async_handle),
+                            self.guest_arch,
+                        );
+                    }
+                    runtime.push_event(
+                        this,
+                        dplay::DplayEvent::SendComplete {
+                            async_op: async_handle,
+                            context: arg!(5),
+                            result: dplay::S_OK,
+                        },
+                    );
                     dplay::DPNERR_PENDING
                 }
             }
@@ -8422,10 +8502,13 @@ impl PeHostRuntime {
                     }
                     _ => return dplay::DPNERR_INVALIDPARAM,
                 }
-                runtime.pending.push_back(dplay::DplayEvent::CreatePlayer {
-                    dpnid: dplay::HOST_PLAYER_ID,
-                    context: local_context,
-                });
+                runtime.push_event(
+                    this,
+                    dplay::DplayEvent::CreatePlayer {
+                        dpnid: dplay::HOST_PLAYER_ID,
+                        context: local_context,
+                    },
+                );
                 dplay::S_OK
             }
             10 => {
@@ -8502,9 +8585,8 @@ impl PeHostRuntime {
                     }) => match peer.create_group(&name, owner, &data) {
                         Ok(group_id) => {
                             if arg!(4) != 0 {
-                                write_u32(memory, arg!(4), 1);
+                                write_u32(memory, arg!(4), group_id);
                             }
-                            let _ = group_id;
                             dplay::S_OK
                         }
                         Err(error) => error,
@@ -8545,18 +8627,12 @@ impl PeHostRuntime {
                 let data =
                     read_guest_bytes(memory, data_ptr, data_size as usize).unwrap_or_default();
                 let group_id = arg_u32!(1);
-                match runtime
-                    .objects
-                    .get_mut(&this)
-                    .and_then(|entry| match &mut entry.object {
-                        dplay::DplayObject::Peer(peer) => peer.group(group_id).cloned(),
-                        _ => None,
-                    }) {
-                    Some(group) => {
-                        let _ = (group, name, data);
-                        dplay::DPNERR_UNSUPPORTED
-                    }
-                    None => dplay::DPNERR_INVALIDGROUP,
+                match runtime.objects.get_mut(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.set_group_info(group_id, &name, &data),
+                    _ => dplay::DPNERR_INVALIDPARAM,
                 }
             }
             17 => {
@@ -8565,7 +8641,7 @@ impl PeHostRuntime {
                     Some(dplay::DplayObjectEntry {
                         object: dplay::DplayObject::Peer(peer),
                         ..
-                    }) => peer.group(group_id).cloned(),
+                    }) => peer.group(group_id),
                     _ => return dplay::DPNERR_INVALIDPARAM,
                 };
                 let Some(group) = group else {
@@ -8574,7 +8650,9 @@ impl PeHostRuntime {
                 let base = arg!(2);
                 let size_ptr = arg!(3);
                 let name = group.name.clone();
-                let required = (8 + 4 * pointer_size) as u32 + (name.len() as u32 + 1) * 2;
+                let data = group.data.clone();
+                let base_size = (8 + 4 * pointer_size) as u32;
+                let required = base_size + (name.len() as u32 + 1) * 2 + data.len() as u32;
                 if size_ptr != 0 {
                     write_u32(memory, size_ptr, required);
                 }
@@ -8591,15 +8669,23 @@ impl PeHostRuntime {
                 }
                 let _ = write_guest_bytes_checked(memory, base, &vec![0u8; required as usize]);
                 write_u32(memory, base, required);
-                write_u32(memory, base + 4, dplay::DPNINFO_NAME);
-                let name_memory = base + 8 + 4 * pointer_size;
+                write_u32(memory, base + 4, dplay::DPNINFO_NAME | dplay::DPNINFO_DATA);
+                let name_memory = base + base_size as u64;
                 let _ = write_guest_bytes_checked(
                     memory,
                     name_memory,
                     &dplay::encode_utf16_bytes(&name),
                 );
                 let _ = write_guest_pointer(memory, base + 8, name_memory, self.guest_arch);
-                write_u32(memory, base + 8 + 2 * pointer_size, 0);
+                let data_memory = name_memory + (name.len() as u64 + 1) * 2;
+                let _ = write_guest_bytes_checked(memory, data_memory, &data);
+                let _ = write_guest_pointer(
+                    memory,
+                    base + 8 + pointer_size,
+                    data_memory,
+                    self.guest_arch,
+                );
+                write_u32(memory, base + 8 + 2 * pointer_size, data.len() as u32);
                 dplay::S_OK
             }
             18 => {
@@ -8613,7 +8699,7 @@ impl PeHostRuntime {
                         ids.extend(peer.players().iter().map(|player| player.dpnid));
                     }
                     if arg_u32!(3) & 0x0010 != 0 {
-                        ids.extend(peer.groups().map(|group| group.group_id));
+                        ids.extend(peer.groups().iter().map(|group| group.group_id));
                     }
                 }
                 let buffer = arg!(1);
@@ -8640,7 +8726,7 @@ impl PeHostRuntime {
                     Some(dplay::DplayObjectEntry {
                         object: dplay::DplayObject::Peer(peer),
                         ..
-                    }) => peer.group(arg_u32!(1)).cloned(),
+                    }) => peer.group(arg_u32!(1)),
                     _ => return dplay::DPNERR_INVALIDPARAM,
                 };
                 let Some(group) = group else {
@@ -8864,9 +8950,10 @@ impl PeHostRuntime {
                     _ => return dplay::DPNERR_INVALIDPARAM,
                 };
                 for session in results {
-                    runtime
-                        .pending
-                        .push_back(dplay::DplayEvent::EnumHostsResponse { context, session });
+                    runtime.push_event(
+                        this,
+                        dplay::DplayEvent::EnumHostsResponse { context, session },
+                    );
                 }
                 dplay::S_OK
             }
@@ -8901,7 +8988,44 @@ impl PeHostRuntime {
                 }
                 dplay::S_OK
             }
-            29 => dplay::DPNERR_UNSUPPORTED,
+            29 => {
+                // GetGroupContext(dpnidGroup, pvGroupContext, flags): the
+                // group context is the real byte storage set by
+                // CreateGroup/SetGroupInfo, materialised in guest memory.
+                if arg_u32!(3) != 0 {
+                    return dplay::DPNERR_INVALIDFLAGS;
+                }
+                let out = arg!(2);
+                if out == 0 {
+                    return dplay::DPNERR_INVALIDPOINTER;
+                }
+                let group_id = arg_u32!(1);
+                let data = match runtime.objects.get(&this) {
+                    Some(dplay::DplayObjectEntry {
+                        object: dplay::DplayObject::Peer(peer),
+                        ..
+                    }) => peer.group_context(group_id),
+                    _ => return dplay::DPNERR_INVALIDPARAM,
+                };
+                match data {
+                    Ok(bytes) => {
+                        let pointer = if bytes.is_empty() {
+                            0
+                        } else {
+                            match self.alloc_zeroed(memory, bytes.len(), 4) {
+                                Ok(pointer) => {
+                                    let _ = write_guest_bytes_checked(memory, pointer, &bytes);
+                                    pointer
+                                }
+                                Err(_) => return dplay::DPNERR_OUTOFMEMORY,
+                            }
+                        };
+                        let _ = write_guest_pointer(memory, out, pointer, self.guest_arch);
+                        dplay::S_OK
+                    }
+                    Err(error) => error,
+                }
+            }
             30 => {
                 let caps = match runtime.objects.get(&this) {
                     Some(dplay::DplayObjectEntry {
@@ -9030,6 +9154,9 @@ impl PeHostRuntime {
                 );
                 dplay::S_OK
             }
+            // RegisterLobby: this runtime has no DirectPlay lobby service or
+            // lobby client connection to register with, so the real result
+            // is DPNERR_UNSUPPORTED.
             35 => dplay::DPNERR_UNSUPPORTED,
             36 => match runtime.objects.get_mut(&this) {
                 Some(dplay::DplayObjectEntry {
@@ -9037,12 +9164,13 @@ impl PeHostRuntime {
                     ..
                 }) => {
                     let reason = peer.close();
-                    runtime
-                        .pending
-                        .push_back(dplay::DplayEvent::TerminateSession {
+                    runtime.push_event(
+                        this,
+                        dplay::DplayEvent::TerminateSession {
                             result: reason,
                             data: Vec::new(),
-                        });
+                        },
+                    );
                     dplay::S_OK
                 }
                 _ => dplay::DPNERR_INVALIDPARAM,
@@ -9069,6 +9197,270 @@ impl PeHostRuntime {
             crate::dplay::IFACE_ADDRESS,
             crate::dplay::DplayObject::Address(address),
         )
+    }
+
+    /// Deliver the queued DirectPlay8 engine events (received datagrams,
+    /// connect/send completions, player create/destroy, session lost) to the
+    /// registered guest message handler.  This runs from the runtime
+    /// servicing points (block-dispatch safepoint and message-loop idle
+    /// drain) so callbacks never run inside the peer method that queued the
+    /// event.
+    pub(crate) fn drain_pending_dplay_events(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::dplay::DplayObject;
+        let pid = self.guest_pid;
+        let mut deliveries: Vec<(u64, u64, u32, crate::dplay::DplayEvent)> = Vec::new();
+        {
+            let mut store = crate::dplay::lock_dplay_runtimes();
+            let Some(runtime) = store.get_mut(&pid) else {
+                return Ok(());
+            };
+            let owners: Vec<u64> = runtime
+                .objects
+                .iter()
+                .filter(|(_, entry)| matches!(entry.object, DplayObject::Peer(_)))
+                .map(|(owner, _)| *owner)
+                .collect();
+            for owner in owners {
+                let Some(crate::dplay::DplayObjectEntry {
+                    object: DplayObject::Peer(peer),
+                    ..
+                }) = runtime.objects.get_mut(&owner)
+                else {
+                    continue;
+                };
+                let handler = peer.message_handler();
+                if handler == 0 {
+                    let _ = peer.poll_engine_events();
+                    continue;
+                }
+                let user_context = peer.user_context();
+                let local_dpnid = peer.local_dpnid();
+                for event in peer.poll_engine_events() {
+                    deliveries.push((handler, user_context, local_dpnid, event));
+                }
+            }
+            let pending: Vec<crate::dplay::PendingDplayEvent> = runtime.pending.drain(..).collect();
+            for pending in pending {
+                let Some(crate::dplay::DplayObjectEntry {
+                    object: DplayObject::Peer(peer),
+                    ..
+                }) = runtime.objects.get_mut(&pending.owner)
+                else {
+                    continue;
+                };
+                if let Some(handle) = pending.event.async_operation() {
+                    if !peer.complete_async_operation(handle) {
+                        // Cancelled while queued: the completion must not run.
+                        continue;
+                    }
+                }
+                let handler = peer.message_handler();
+                if handler == 0 {
+                    continue;
+                }
+                deliveries.push((
+                    handler,
+                    peer.user_context(),
+                    peer.local_dpnid(),
+                    pending.event,
+                ));
+            }
+        }
+        for (handler, user_context, local_dpnid, event) in deliveries {
+            let (message_id, message_ptr) =
+                self.dplay_materialize_message(memory, &event, local_dpnid)?;
+            let _ = self.execute_guest_callback(
+                state,
+                memory,
+                handler,
+                &[user_context, u64::from(message_id), message_ptr],
+                "IDirectPlay8Peer message handler",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Materialise one `DPN_MSGID_*` message structure in guest memory using
+    /// the guest architecture's pointer size and natural alignment.
+    fn dplay_materialize_message(
+        &mut self,
+        memory: &mut MemoryImage,
+        event: &crate::dplay::DplayEvent,
+        local_dpnid: u32,
+    ) -> AppResult<(u32, u64)> {
+        use crate::dplay::DplayEvent;
+        let is64 = self.guest_arch == GuestArch::X64;
+        let pointer_size: usize = if is64 { 8 } else { 4 };
+        match event {
+            DplayEvent::Receive { sender, data, .. } => {
+                let data_ptr = if data.is_empty() {
+                    0
+                } else {
+                    let pointer = self.alloc_zeroed(memory, data.len(), 1)?;
+                    let _ = write_guest_bytes_checked(memory, pointer, data);
+                    pointer
+                };
+                let (size, source_at, destination_at, group_at) = if is64 {
+                    (64, 32, 40, 48)
+                } else {
+                    (32, 16, 20, 24)
+                };
+                let base = self.alloc_zeroed(memory, size, pointer_size as u64)?;
+                write_u32(memory, base, size as u32);
+                let pointer_at = if is64 { 16 } else { 8 };
+                let length_at = if is64 { 24 } else { 12 };
+                if is64 {
+                    write_u64(memory, base + pointer_at, data_ptr);
+                } else {
+                    write_u32(memory, base + pointer_at, data_ptr as u32);
+                }
+                write_u32(memory, base + length_at, data.len() as u32);
+                if is64 {
+                    write_u64(memory, base + source_at, u64::from(*sender));
+                    write_u64(memory, base + destination_at, u64::from(local_dpnid));
+                    write_u64(memory, base + group_at, 0);
+                } else {
+                    write_u32(memory, base + source_at, *sender);
+                    write_u32(memory, base + destination_at, local_dpnid);
+                    write_u32(memory, base + group_at, 0);
+                }
+                Ok((1, base))
+            }
+            DplayEvent::CreatePlayer { dpnid, context } => {
+                let (size, dpnid_at, context_at) = if is64 { (24, 8, 16) } else { (12, 4, 8) };
+                let base = self.alloc_zeroed(memory, size, pointer_size as u64)?;
+                write_u32(memory, base, size as u32);
+                if is64 {
+                    write_u64(memory, base + dpnid_at, u64::from(*dpnid));
+                    write_u64(memory, base + context_at, *context);
+                } else {
+                    write_u32(memory, base + dpnid_at, *dpnid);
+                    write_u32(memory, base + context_at, *context as u32);
+                }
+                Ok((3, base))
+            }
+            DplayEvent::DestroyPlayer {
+                dpnid,
+                reason,
+                context,
+            } => {
+                let (size, dpnid_at, reason_at, context_at) = if is64 {
+                    (32, 8, 16, 24)
+                } else {
+                    (16, 4, 8, 12)
+                };
+                let base = self.alloc_zeroed(memory, size, pointer_size as u64)?;
+                write_u32(memory, base, size as u32);
+                if is64 {
+                    write_u64(memory, base + dpnid_at, u64::from(*dpnid));
+                    write_u32(memory, base + reason_at, *reason);
+                    write_u64(memory, base + context_at, *context);
+                } else {
+                    write_u32(memory, base + dpnid_at, *dpnid);
+                    write_u32(memory, base + reason_at, *reason);
+                    write_u32(memory, base + context_at, *context as u32);
+                }
+                Ok((4, base))
+            }
+            DplayEvent::ConnectComplete {
+                async_op,
+                context,
+                result,
+                dpnid,
+            } => {
+                let (size, op_at, context_at, result_at, player_at) = if is64 {
+                    (56, 8, 16, 24, 48)
+                } else {
+                    (28, 4, 8, 12, 24)
+                };
+                let base = self.alloc_zeroed(memory, size, pointer_size as u64)?;
+                write_u32(memory, base, size as u32);
+                if is64 {
+                    write_u64(memory, base + op_at, u64::from(*async_op));
+                    write_u64(memory, base + context_at, *context);
+                    write_u32(memory, base + result_at, *result);
+                    write_u64(memory, base + player_at, u64::from(*dpnid));
+                } else {
+                    write_u32(memory, base + op_at, *async_op);
+                    write_u32(memory, base + context_at, *context as u32);
+                    write_u32(memory, base + result_at, *result);
+                    write_u32(memory, base + player_at, *dpnid);
+                }
+                Ok((7, base))
+            }
+            DplayEvent::SendComplete {
+                async_op,
+                context,
+                result,
+            } => {
+                let (size, op_at, context_at, result_at) = if is64 {
+                    (32, 8, 16, 24)
+                } else {
+                    (16, 4, 8, 12)
+                };
+                let base = self.alloc_zeroed(memory, size, pointer_size as u64)?;
+                write_u32(memory, base, size as u32);
+                if is64 {
+                    write_u64(memory, base + op_at, u64::from(*async_op));
+                    write_u64(memory, base + context_at, *context);
+                    write_u32(memory, base + result_at, *result);
+                } else {
+                    write_u32(memory, base + op_at, *async_op);
+                    write_u32(memory, base + context_at, *context as u32);
+                    write_u32(memory, base + result_at, *result);
+                }
+                Ok((2, base))
+            }
+            DplayEvent::SessionLost { result } => {
+                let base = self.alloc_zeroed(memory, 8, 4)?;
+                write_u32(memory, base, 8);
+                write_u32(memory, base + 4, *result);
+                Ok((10, base))
+            }
+            DplayEvent::TerminateSession { result, data } => {
+                let data_ptr = if data.is_empty() {
+                    0
+                } else {
+                    let pointer = self.alloc_zeroed(memory, data.len(), 1)?;
+                    let _ = write_guest_bytes_checked(memory, pointer, data);
+                    pointer
+                };
+                let (size, result_at, data_at, size_at) = if is64 {
+                    (32, 8, 16, 24)
+                } else {
+                    (16, 4, 8, 12)
+                };
+                let base = self.alloc_zeroed(memory, size, pointer_size as u64)?;
+                write_u32(memory, base, size as u32);
+                if is64 {
+                    write_u32(memory, base + result_at, *result);
+                    write_u64(memory, base + data_at, data_ptr);
+                    write_u32(memory, base + size_at, data.len() as u32);
+                } else {
+                    write_u32(memory, base + result_at, *result);
+                    write_u32(memory, base + data_at, data_ptr as u32);
+                    write_u32(memory, base + size_at, data.len() as u32);
+                }
+                Ok((11, base))
+            }
+            DplayEvent::EnumHostsResponse { context, session } => {
+                let (size, context_at, latency_at) = if is64 { (40, 8, 32) } else { (20, 4, 16) };
+                let base = self.alloc_zeroed(memory, size, pointer_size as u64)?;
+                write_u32(memory, base, size as u32);
+                if is64 {
+                    write_u64(memory, base + context_at, *context);
+                    write_u32(memory, base + latency_at, session.latency_ms);
+                } else {
+                    write_u32(memory, base + context_at, *context as u32);
+                    write_u32(memory, base + latency_at, session.latency_ms);
+                }
+                Ok((13, base))
+            }
+        }
     }
 }
 

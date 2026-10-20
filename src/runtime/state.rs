@@ -234,6 +234,7 @@ pub(crate) enum GuestObjectKind {
     Theme,
     MsiDatabase,
     MsiView,
+    MsiRecord,
     NcryptProvider,
     NcryptKey,
     RpcBinding,
@@ -1874,9 +1875,11 @@ pub(crate) struct PeHostRuntime {
     /// The HID preparsed-data objects (the report descriptors).
     pub(crate) hid_preparsed: HashMap<u64, Vec<u8>>,
     /// The MSI database handles.
-    pub(crate) msi_databases: HashMap<u64, u32>,
+    pub(crate) msi_databases: HashMap<u64, crate::runtime::dispatch::msi::MsiDatabaseState>,
     /// The MSI view handles.
-    pub(crate) msi_views: HashMap<u64, String>,
+    pub(crate) msi_views: HashMap<u64, crate::runtime::dispatch::msi::MsiViewState>,
+    /// The MSI record handles.
+    pub(crate) msi_records: HashMap<u64, crate::runtime::dispatch::msi::MsiRecord>,
     /// The Media Foundation transform objects.
     pub(crate) mf_transforms: HashMap<u64, MftTransformState>,
     /// The MFT activation objects (MFTEnumEx).
@@ -2540,6 +2543,7 @@ impl PeHostRuntime {
             hid_preparsed: HashMap::new(),
             msi_databases: HashMap::new(),
             msi_views: HashMap::new(),
+            msi_records: HashMap::new(),
             mf_transforms: HashMap::new(),
             mf_activates: HashMap::new(),
             ncrypt_providers: HashMap::new(),

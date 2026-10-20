@@ -2855,13 +2855,10 @@ impl PeHostRuntime {
                 self.alloc_mf_event_object(memory, event.mf_type, event.status as u32, value)?;
             let result = self.alloc_mf_async_result(memory, request.state_object, S_OK)?;
             let mut completion = crate::media::MfAsyncCompletion {
-                owner: this,
                 op: crate::media::MfAsyncOp::GetEvent,
                 result,
-                status: S_OK,
                 callback_object: request.callback_object,
                 callback_method: request.callback_method,
-                state_object: request.state_object,
                 event_object,
                 bytes: 0,
             };
@@ -5919,13 +5916,10 @@ impl PeHostRuntime {
             crate::media::complete_mf_request(
                 self.guest_pid,
                 crate::media::MfAsyncCompletion {
-                    owner: this,
                     op: crate::media::MfAsyncOp::Read,
                     result,
-                    status: S_OK,
                     callback_object: callback,
                     callback_method,
-                    state_object,
                     event_object: 0,
                     bytes: read,
                 },
@@ -6181,13 +6175,10 @@ impl PeHostRuntime {
             crate::media::complete_mf_request(
                 self.guest_pid,
                 crate::media::MfAsyncCompletion {
-                    owner: this,
                     op: crate::media::MfAsyncOp::Write,
                     result,
-                    status: S_OK,
                     callback_object: callback,
                     callback_method,
-                    state_object,
                     event_object: 0,
                     bytes: written,
                 },

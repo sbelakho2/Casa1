@@ -1277,9 +1277,12 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         SubsystemCapability::Partial,
         "Creates a real legacy IDirectPlay4 object over the software DirectPlay8 \
          peer engine: real UDP host/connect, session and player state, enumeration, \
-         send/receive with real datagrams and the documented DirectPlay error codes.  \
-         Group replication, lobby registration and async handler callbacks are not \
-         wired yet.",
+         send/receive with real datagrams, guest message-handler delivery of the real \
+         engine events (receive/connect/destroy/session-lost with datagram bytes), \
+         and best-effort wire group replication (create/join/leave/destroy, member-\
+         only SendToGroup, group context) with the documented DirectPlay error codes.  \
+         No lobby service exists, so RegisterLobby stays DPNERR_UNSUPPORTED; group \
+         replication has no retransmit/resync after UDP loss.",
     ),
     semantic_override(
         "dplay.dll",

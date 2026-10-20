@@ -1089,20 +1089,14 @@ pub(crate) struct MfParkedRequest {
 /// retrieves.
 #[derive(Debug, Clone)]
 pub(crate) struct MfAsyncCompletion {
-    /// The object the request was made on.
-    pub(crate) owner: u64,
     /// The operation.
     pub(crate) op: MfAsyncOp,
     /// The guest `IMFAsyncResult` object.
     pub(crate) result: u64,
-    /// The result's `GetStatus` value.
-    pub(crate) status: u32,
     /// The callback object to invoke (0 = no callback; poll via EndX).
     pub(crate) callback_object: u64,
     /// The callback's `Invoke` entry point (0 = no callback).
     pub(crate) callback_method: u64,
-    /// The result's state object (`GetState`).
-    pub(crate) state_object: u64,
     /// The guest `IMFMediaEvent` object a `GetEvent` completion produced.
     pub(crate) event_object: u64,
     /// Bytes read/written by a byte-stream completion.

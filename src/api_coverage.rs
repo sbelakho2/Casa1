@@ -7817,6 +7817,41 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:mf_create_file_byte_stream_reads_writes_and_seeks_real_files",
     ),
     conformance(
+        "msi.dll",
+        "MsiCreateRecord",
+        "casa1-conformance:msi_modify_and_commit_round_trip",
+    ),
+    conformance(
+        "msi.dll",
+        "MsiDatabaseCommit",
+        "casa1-conformance:msi_modify_and_commit_round_trip",
+    ),
+    conformance(
+        "msi.dll",
+        "MsiViewModify",
+        "casa1-conformance:msi_modify_and_commit_round_trip",
+    ),
+    conformance(
+        "msi.dll",
+        "MsiRecordSetInteger",
+        "casa1-conformance:msi_modify_and_commit_round_trip",
+    ),
+    conformance(
+        "msi.dll",
+        "MsiRecordGetInteger",
+        "casa1-conformance:msi_reads_real_compound_database",
+    ),
+    conformance(
+        "msi.dll",
+        "MsiRecordReadStream",
+        "casa1-conformance:msi_reads_real_compound_database",
+    ),
+    conformance(
+        "msi.dll",
+        "MsiViewGetColumnInfo",
+        "casa1-conformance:msi_reads_real_compound_database",
+    ),
+    conformance(
         "x3daudio1_7.dll",
         "X3DAudioInitialize",
         "casa1-conformance:evidence_final_scraps_surfaces",

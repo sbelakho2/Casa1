@@ -42,7 +42,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### dplay.dll
 
-- `DirectPlayCreate` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Creates a real legacy IDirectPlay4 object over the software DirectPlay8 peer engine: real UDP host/connect, session and player state, enumeration, send/receive with real datagrams and the documented DirectPlay error codes.  Group replication, lobby registration and async handler callbacks are not wired yet.
+- `DirectPlayCreate` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Creates a real legacy IDirectPlay4 object over the software DirectPlay8 peer engine: real UDP host/connect, session and player state, enumeration, send/receive with real datagrams, guest message-handler delivery of the real engine events (receive/connect/destroy/session-lost with datagram bytes), and best-effort wire group replication (create/join/leave/destroy, member-only SendToGroup, group context) with the documented DirectPlay error codes.  No lobby service exists, so RegisterLobby stays DPNERR_UNSUPPORTED; group replication has no retransmit/resync after UDP loss.
 - `DirectPlayEnumerateW` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Enumerates the real TCP/IP service provider plus every session actually hosted by the runtime by invoking the guest's DPENUMSESSIONS callback with real provider and session records.
 
 ### dpnet.dll

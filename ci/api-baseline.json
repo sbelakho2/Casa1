@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-11T01:21:21Z",
+  "generated_at": "2026-10-20T12:34:05Z",
   "per_dll": {
     "activeds.dll": {
       "total": 3,
@@ -1892,20 +1892,20 @@
       "capability_absent": 0
     },
     "msi.dll": {
-      "total": 19,
-      "implemented": 19,
+      "total": 26,
+      "implemented": 26,
       "partial": 0,
       "stub": 0,
       "unsupported": 0,
-      "differential_tested": 19,
-      "conformance_tested": 19,
+      "differential_tested": 26,
+      "conformance_tested": 26,
       "transitional_partial": 0,
-      "exact": 19,
+      "exact": 26,
       "restricted": 0,
       "approximate": 0,
       "synthetic_environment": 0,
       "canned_failure": 0,
-      "capability_full": 19,
+      "capability_full": 26,
       "capability_partial": 0,
       "capability_absent": 0
     },
@@ -10909,7 +10909,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Creates a real legacy IDirectPlay4 object over the software DirectPlay8 peer engine: real UDP host/connect, session and player state, enumeration, send/receive with real datagrams and the documented DirectPlay error codes.  Group replication, lobby registration and async handler callbacks are not wired yet."
+      "detail": "Creates a real legacy IDirectPlay4 object over the software DirectPlay8 peer engine: real UDP host/connect, session and player state, enumeration, send/receive with real datagrams, guest message-handler delivery of the real engine events (receive/connect/destroy/session-lost with datagram bytes), and best-effort wire group replication (create/join/leave/destroy, member-only SendToGroup, group context) with the documented DirectPlay error codes.  No lobby service exists, so RegisterLobby stays DPNERR_UNSUPPORTED; group replication has no retransmit/resync after UDP loss."
     },
     {
       "dll": "dplay.dll",
@@ -16344,6 +16344,76 @@
     {
       "dll": "msi.dll",
       "export": "MsiViewFetch",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
+      "support_policy": "OptionalFeature",
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
+    },
+    {
+      "dll": "msi.dll",
+      "export": "MsiCreateRecord",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
+      "support_policy": "OptionalFeature",
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
+    },
+    {
+      "dll": "msi.dll",
+      "export": "MsiDatabaseCommit",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
+      "support_policy": "OptionalFeature",
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
+    },
+    {
+      "dll": "msi.dll",
+      "export": "MsiRecordGetInteger",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
+      "support_policy": "OptionalFeature",
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
+    },
+    {
+      "dll": "msi.dll",
+      "export": "MsiRecordReadStream",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
+      "support_policy": "OptionalFeature",
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
+    },
+    {
+      "dll": "msi.dll",
+      "export": "MsiRecordSetInteger",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
+      "support_policy": "OptionalFeature",
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
+    },
+    {
+      "dll": "msi.dll",
+      "export": "MsiViewGetColumnInfo",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
+      "support_policy": "OptionalFeature",
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
+    },
+    {
+      "dll": "msi.dll",
+      "export": "MsiViewModify",
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",

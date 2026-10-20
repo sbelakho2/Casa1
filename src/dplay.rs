@@ -80,7 +80,25 @@
 //!                              nB  terminate data
 //!
 //! DP8P  keepalive               4s  magic "DP8P" (the service echoes it)
-//! ```
+//!
+//! DP8G  group operation         4s  magic "DP8G"
+//!                              1B  op (1 = create, 2 = destroy,
+//!                                  3 = add member, 4 = remove member,
+//!                                  5 = info/context)
+//!                              4B  group id
+//!   create:                    4B  owner dpnid
+//!                              2B  name length, nB name (UTF-8)
+//!                              2B  data length, mB data
+//!   destroy:                   (no payload)
+//!   add/remove:                4B  member dpnid
+//!   info:                      2B  name length, nB name (UTF-8)
+//!                              2B  data length, mB data
+//!
+//! Group create/destroy/member/info operations are sent by the owning peer
+//! to the host, which applies them to the session group table and relays
+//! them to every other connected player.  `DP8D` datagrams whose destination
+//! is a group id are relayed to each real group member (and looped back to
+//! the host when the host is a member).
 //!
 //! A host runs one service thread on its session socket: it answers `DP8Q`
 //! with `DP8R`, accepts `DP8C` with `DP8A` (or rejects with `DP8F` when the
@@ -889,6 +907,12 @@ const MAGIC_LEAVE: &[u8; 4] = b"DP8X";
 const MAGIC_DATA: &[u8; 4] = b"DP8D";
 const MAGIC_TERMINATE: &[u8; 4] = b"DP8S";
 const MAGIC_KEEPALIVE: &[u8; 4] = b"DP8P";
+const MAGIC_GROUP: &[u8; 4] = b"DP8G";
+const GROUP_OP_CREATE: u8 = 1;
+const GROUP_OP_DESTROY: u8 = 2;
+const GROUP_OP_ADD_MEMBER: u8 = 3;
+const GROUP_OP_REMOVE_MEMBER: u8 = 4;
+const GROUP_OP_INFO: u8 = 5;
 const WIRE_PROTOCOL_VERSION: u8 = 1;
 
 fn put_u16(out: &mut Vec<u8>, value: u16) {
@@ -1142,6 +1166,119 @@ fn parse_terminate(data: &[u8]) -> Option<(u32, &[u8])> {
     Some((get_u32(data, 4)?, &data[8..]))
 }
 
+/// A decoded `DP8G` group operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GroupWire {
+    Create {
+        group_id: u32,
+        owner: u32,
+        name: String,
+        data: Vec<u8>,
+    },
+    Destroy {
+        group_id: u32,
+    },
+    AddMember {
+        group_id: u32,
+        dpnid: u32,
+    },
+    RemoveMember {
+        group_id: u32,
+        dpnid: u32,
+    },
+    Info {
+        group_id: u32,
+        name: String,
+        data: Vec<u8>,
+    },
+}
+
+/// `DP8G` create encoder.
+fn wire_group_create(group_id: u32, owner: u32, name: &str, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(15 + name.len() + data.len());
+    out.extend_from_slice(MAGIC_GROUP);
+    out.push(GROUP_OP_CREATE);
+    put_u32(&mut out, group_id);
+    put_u32(&mut out, owner);
+    put_bytes(&mut out, name.as_bytes());
+    put_bytes(&mut out, data);
+    out
+}
+
+/// `DP8G` destroy encoder.
+fn wire_group_destroy(group_id: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    out.extend_from_slice(MAGIC_GROUP);
+    out.push(GROUP_OP_DESTROY);
+    put_u32(&mut out, group_id);
+    out
+}
+
+/// `DP8G` add/remove member encoder.
+fn wire_group_member(op: u8, group_id: u32, dpnid: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(13);
+    out.extend_from_slice(MAGIC_GROUP);
+    out.push(op);
+    put_u32(&mut out, group_id);
+    put_u32(&mut out, dpnid);
+    out
+}
+
+/// `DP8G` info/context encoder.
+fn wire_group_info(group_id: u32, name: &str, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(11 + name.len() + data.len());
+    out.extend_from_slice(MAGIC_GROUP);
+    out.push(GROUP_OP_INFO);
+    put_u32(&mut out, group_id);
+    put_bytes(&mut out, name.as_bytes());
+    put_bytes(&mut out, data);
+    out
+}
+
+fn parse_group(data: &[u8]) -> Option<GroupWire> {
+    if !starts_with_magic(data, MAGIC_GROUP) || data.len() < 9 {
+        return None;
+    }
+    let op = data[4];
+    let group_id = get_u32(data, 5)?;
+    match op {
+        GROUP_OP_CREATE => {
+            let owner = get_u32(data, 9)?;
+            let name_len = get_u16(data, 13)? as usize;
+            let name = data.get(15..15 + name_len)?;
+            let data_len = get_u16(data, 15 + name_len)? as usize;
+            let payload = data.get(17 + name_len..17 + name_len + data_len)?;
+            Some(GroupWire::Create {
+                group_id,
+                owner,
+                name: String::from_utf8_lossy(name).into_owned(),
+                data: payload.to_vec(),
+            })
+        }
+        GROUP_OP_DESTROY => Some(GroupWire::Destroy { group_id }),
+        GROUP_OP_ADD_MEMBER | GROUP_OP_REMOVE_MEMBER => {
+            let dpnid = get_u32(data, 9)?;
+            if op == GROUP_OP_ADD_MEMBER {
+                Some(GroupWire::AddMember { group_id, dpnid })
+            } else {
+                Some(GroupWire::RemoveMember { group_id, dpnid })
+            }
+        }
+        GROUP_OP_INFO => {
+            let name_len = get_u16(data, 9)? as usize;
+            let name = data.get(11..11 + name_len)?;
+            let data_len = get_u16(data, 11 + name_len)? as usize;
+            let payload = data.get(13 + name_len..13 + name_len + data_len)?;
+            Some(GroupWire::Info {
+                group_id,
+                name: String::from_utf8_lossy(name).into_owned(),
+                data: payload.to_vec(),
+            })
+        }
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared runtime pieces
 // ---------------------------------------------------------------------------
@@ -1254,6 +1391,7 @@ struct SessionShared {
     socket: Arc<UdpSocket>,
     players: Mutex<BTreeMap<u32, PlayerRecord>>,
     next_dpnid: AtomicU32,
+    groups: Mutex<BTreeMap<u32, GroupRecord>>,
     inbound: Arc<InboundQueue>,
     events: Arc<EventQueue>,
     closing: AtomicBool,
@@ -1283,6 +1421,46 @@ impl SessionShared {
             .values()
             .cloned()
             .collect()
+    }
+
+    fn player_by_addr(&self, addr: SocketAddr) -> Option<u32> {
+        self.players
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .find(|player| player.addr == addr)
+            .map(|player| player.dpnid)
+    }
+
+    fn group(&self, group_id: u32) -> Option<GroupRecord> {
+        self.groups
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&group_id)
+            .cloned()
+    }
+
+    fn group_snapshot(&self) -> Vec<GroupRecord> {
+        self.groups
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn broadcast_group(&self, message: &[u8]) {
+        for player in self.snapshot_players() {
+            let _ = self.socket.send_to(message, player.addr);
+        }
+    }
+
+    fn relay_group(&self, message: &[u8], except: u32) {
+        for player in self.snapshot_players() {
+            if player.dpnid != except {
+                let _ = self.socket.send_to(message, player.addr);
+            }
+        }
     }
 }
 
@@ -1445,7 +1623,16 @@ fn session_service_loop(session: Arc<SessionShared>) {
                             .send_to(&wire_reject(request_id, DPNERR_SESSIONFULL), from);
                         continue;
                     }
-                    let dpnid = session.next_dpnid.fetch_add(1, Ordering::SeqCst);
+                    let dpnid = loop {
+                        let candidate = session.next_dpnid.fetch_add(1, Ordering::SeqCst);
+                        let groups = session
+                            .groups
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        if !groups.contains_key(&candidate) {
+                            break candidate;
+                        }
+                    };
                     let existing: Vec<(u32, String)> = session
                         .snapshot_players()
                         .into_iter()
@@ -1501,6 +1688,133 @@ fn session_service_loop(session: Arc<SessionShared>) {
                     } else if let Some(addr) = session.player_addr(destination) {
                         let relay = wire_data(source, destination, payload);
                         let _ = session.socket.send_to(&relay, addr);
+                    } else if let Some(group) = session.group(destination) {
+                        let relay = wire_data(source, destination, payload);
+                        for member in &group.members {
+                            if *member == HOST_PLAYER_ID {
+                                session.inbound.push(received.clone());
+                            } else if let Some(addr) = session.player_addr(*member) {
+                                let _ = session.socket.send_to(&relay, addr);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if let Some(operation) = parse_group(datagram) {
+                    let Some(sender) = session.player_by_addr(from) else {
+                        continue;
+                    };
+                    match operation {
+                        GroupWire::Create {
+                            group_id,
+                            owner,
+                            name,
+                            data,
+                        } => {
+                            if group_id < 2 || data.len() > MAX_MESSAGE_PAYLOAD {
+                                continue;
+                            }
+                            let owner_exists =
+                                owner == HOST_PLAYER_ID || session.player_addr(owner).is_some();
+                            if !owner_exists {
+                                continue;
+                            }
+                            let mut groups = session
+                                .groups
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner());
+                            if groups.contains_key(&group_id)
+                                || session.player_addr(group_id).is_some()
+                            {
+                                continue;
+                            }
+                            groups.insert(
+                                group_id,
+                                GroupRecord {
+                                    group_id,
+                                    owner,
+                                    name: name.clone(),
+                                    data: data.clone(),
+                                    members: BTreeSet::new(),
+                                },
+                            );
+                            drop(groups);
+                            let message = wire_group_create(group_id, owner, &name, &data);
+                            session.relay_group(&message, sender);
+                        }
+                        GroupWire::Destroy { group_id } => {
+                            let removed = session
+                                .groups
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .remove(&group_id)
+                                .is_some();
+                            if removed {
+                                session.relay_group(&wire_group_destroy(group_id), sender);
+                            }
+                        }
+                        GroupWire::AddMember { group_id, dpnid } => {
+                            let player_exists =
+                                dpnid == HOST_PLAYER_ID || session.player_addr(dpnid).is_some();
+                            let changed = match session
+                                .groups
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .get_mut(&group_id)
+                            {
+                                Some(group) if player_exists => group.members.insert(dpnid),
+                                _ => false,
+                            };
+                            if changed {
+                                session.relay_group(
+                                    &wire_group_member(GROUP_OP_ADD_MEMBER, group_id, dpnid),
+                                    sender,
+                                );
+                            }
+                        }
+                        GroupWire::RemoveMember { group_id, dpnid } => {
+                            let changed = match session
+                                .groups
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .get_mut(&group_id)
+                            {
+                                Some(group) => group.members.remove(&dpnid),
+                                None => false,
+                            };
+                            if changed {
+                                session.relay_group(
+                                    &wire_group_member(GROUP_OP_REMOVE_MEMBER, group_id, dpnid),
+                                    sender,
+                                );
+                            }
+                        }
+                        GroupWire::Info {
+                            group_id,
+                            name,
+                            data,
+                        } => {
+                            if data.len() > MAX_MESSAGE_PAYLOAD {
+                                continue;
+                            }
+                            let changed = match session
+                                .groups
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .get_mut(&group_id)
+                            {
+                                Some(group) => {
+                                    group.name = name.clone();
+                                    group.data = data.clone();
+                                    true
+                                }
+                                None => false,
+                            };
+                            if changed {
+                                session
+                                    .relay_group(&wire_group_info(group_id, &name, &data), sender);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1554,6 +1868,16 @@ struct ClientTransport {
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     host: SocketAddr,
+    /// Group state replicated by the host over `DP8G`.
+    groups: Arc<Mutex<BTreeMap<u32, GroupRecord>>>,
+}
+
+/// The asynchronous peer operations the engine can queue and cancel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AsyncOperationKind {
+    Connect,
+    SendTo,
+    EnumHosts,
 }
 
 /// The engine behind `IDirectPlay8Peer`.
@@ -1578,8 +1902,14 @@ pub(crate) struct Dplay8Peer {
     /// The player cache on the client side (host + peers announced by DP8J).
     player_cache: BTreeMap<u32, PlayerInfo>,
     /// The local group model (`CreateGroup`/`AddPlayerToGroup`/...).
+    /// On a client this is the host-replicated copy (the same map the
+    /// receiver thread updates from `DP8G`).
     groups: BTreeMap<u32, GroupRecord>,
     next_group_id: u32,
+    /// Pending asynchronous operations that `CancelAsyncOperation` can abort.
+    pending_operations: BTreeMap<u32, AsyncOperationKind>,
+    completed_operations: BTreeSet<u32>,
+    next_async_operation: u32,
     /// The local player name/data set with `SetPeerInfo`.
     local_player_name: String,
     local_player_data: Vec<u8>,
@@ -1624,6 +1954,9 @@ impl Dplay8Peer {
             player_cache: BTreeMap::new(),
             groups: BTreeMap::new(),
             next_group_id: 1,
+            pending_operations: BTreeMap::new(),
+            completed_operations: BTreeSet::new(),
+            next_async_operation: 1,
             local_player_name: String::new(),
             local_player_data: Vec::new(),
             local_context: 0,
@@ -1661,6 +1994,30 @@ impl Dplay8Peer {
 
     pub(crate) fn message_handler(&self) -> u64 {
         self.message_handler
+    }
+
+    /// Register the guest message handler before initialization.
+    pub(crate) fn set_message_handler(&mut self, handler: u64) -> u32 {
+        if self.initialized {
+            return DPNERR_ALREADYINITIALIZED;
+        }
+        if handler == 0 {
+            return DPNERR_INVALIDPOINTER;
+        }
+        self.message_handler = handler;
+        S_OK
+    }
+
+    /// Replace the registered handler on a live peer.
+    pub(crate) fn update_message_handler(&mut self, handler: u64) -> u32 {
+        if !self.initialized {
+            return DPNERR_UNINITIALIZED;
+        }
+        if handler == 0 {
+            return DPNERR_INVALIDPOINTER;
+        }
+        self.message_handler = handler;
+        S_OK
     }
 
     pub(crate) fn app_desc(&self) -> &DplayAppDesc {
@@ -1779,6 +2136,7 @@ impl Dplay8Peer {
             socket,
             players: Mutex::new(BTreeMap::new()),
             next_dpnid: AtomicU32::new(HOST_PLAYER_ID + 1),
+            groups: Mutex::new(BTreeMap::new()),
             inbound: Arc::clone(&self.inbound),
             events: Arc::clone(&self.events),
             closing: AtomicBool::new(false),
@@ -1855,6 +2213,9 @@ impl Dplay8Peer {
         let thread_lost = Arc::clone(&self.connection_lost);
         let thread_terminated = Arc::clone(&self.terminated);
         let thread_counters = Arc::clone(&self.counters);
+        let client_groups: Arc<Mutex<BTreeMap<u32, GroupRecord>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let thread_groups = Arc::clone(&client_groups);
         let handle = thread::Builder::new()
             .name(format!("casa1-dplay8-client-{request_id}"))
             .spawn(move || {
@@ -1867,6 +2228,7 @@ impl Dplay8Peer {
                     thread_terminated,
                     thread_shutdown,
                     thread_counters,
+                    thread_groups,
                 );
             });
         let handle = match handle {
@@ -1892,6 +2254,7 @@ impl Dplay8Peer {
                     shutdown,
                     thread: Some(handle),
                     host,
+                    groups: client_groups,
                 });
                 S_OK
             }
@@ -1980,6 +2343,25 @@ impl Dplay8Peer {
                 self.counters.packets_sent.fetch_add(1, Ordering::SeqCst);
                 return S_OK;
             }
+            if let Some(group) = session.group(dpnid) {
+                let message = wire_data(HOST_PLAYER_ID, dpnid, payload);
+                for member in &group.members {
+                    if *member == HOST_PLAYER_ID {
+                        self.inbound.push(ReceivedDatagram {
+                            from_dpnid: HOST_PLAYER_ID,
+                            from_addr: session.addr,
+                            data: payload.to_vec(),
+                        });
+                    } else if let Some(addr) = session.player_addr(*member) {
+                        let _ = session.socket.send_to(&message, addr);
+                    }
+                }
+                self.counters
+                    .bytes_sent
+                    .fetch_add(payload.len() as u64, Ordering::SeqCst);
+                self.counters.packets_sent.fetch_add(1, Ordering::SeqCst);
+                return S_OK;
+            }
             let Some(addr) = session.player_addr(dpnid) else {
                 return DPNERR_INVALIDPLAYER;
             };
@@ -1997,6 +2379,7 @@ impl Dplay8Peer {
             if dpnid != DPNID_ALL_PLAYERS_GROUP
                 && dpnid != self.host_dpnid
                 && !self.player_cache.contains_key(&dpnid)
+                && self.group(dpnid).is_none()
             {
                 return DPNERR_INVALIDPLAYER;
             }
@@ -2258,6 +2641,76 @@ impl Dplay8Peer {
         }
     }
 
+    /// Register a pending asynchronous operation and return its real handle.
+    pub(crate) fn begin_async_operation(&mut self, kind: AsyncOperationKind) -> u32 {
+        let handle = self.next_async_operation.max(1);
+        self.next_async_operation = handle.wrapping_add(1).max(1);
+        self.pending_operations.insert(handle, kind);
+        handle
+    }
+
+    /// Mark an asynchronous operation complete.  Returns `false` when the
+    /// handle was cancelled or never existed (its completion must not run).
+    pub(crate) fn complete_async_operation(&mut self, handle: u32) -> bool {
+        if self.pending_operations.remove(&handle).is_none() {
+            return false;
+        }
+        self.completed_operations.insert(handle);
+        true
+    }
+
+    /// `CancelAsyncOperation` — a pending operation really stops being
+    /// pending.  Unknown handles are `DPNERR_INVALIDHANDLE`; operations
+    /// already completed are `DPNERR_CANNOTCANCEL`.
+    pub(crate) fn cancel_async_operation(&mut self, handle: u32) -> u32 {
+        if handle == 0 {
+            return DPNERR_INVALIDHANDLE;
+        }
+        if self.pending_operations.remove(&handle).is_some() {
+            return S_OK;
+        }
+        if self.completed_operations.contains(&handle) {
+            return DPNERR_CANNOTCANCEL;
+        }
+        DPNERR_INVALIDHANDLE
+    }
+
+    pub(crate) fn async_operation_pending(&self, handle: u32) -> bool {
+        self.pending_operations.contains_key(&handle)
+    }
+
+    /// Pull the real queued engine events — received datagrams, player
+    /// create/destroy changes and session termination — into the
+    /// guest-visible [`DplayEvent`] stream.
+    pub(crate) fn poll_engine_events(&mut self) -> Vec<DplayEvent> {
+        let mut events = Vec::new();
+        for event in self.drain_events() {
+            match event {
+                SessionEvent::PlayerJoined { dpnid, .. } => {
+                    events.push(DplayEvent::CreatePlayer { dpnid, context: 0 });
+                }
+                SessionEvent::PlayerLeft { dpnid, reason } => {
+                    events.push(DplayEvent::DestroyPlayer {
+                        dpnid,
+                        reason,
+                        context: 0,
+                    });
+                }
+                SessionEvent::Terminated { reason } => {
+                    events.push(DplayEvent::SessionLost { result: reason });
+                }
+            }
+        }
+        while let Some(message) = self.poll_receive() {
+            events.push(DplayEvent::Receive {
+                sender: message.from_dpnid,
+                context: 0,
+                data: message.data,
+            });
+        }
+        events
+    }
+
     /// Drain the transport-thread events (joins/leaves/termination).
     pub(crate) fn drain_events(&mut self) -> Vec<SessionEvent> {
         let events = self.events.drain();
@@ -2286,49 +2739,256 @@ impl Dplay8Peer {
         if owner != 0 && !self.player_exists(owner) {
             return Err(DPNERR_INVALIDPLAYER);
         }
-        let group_id = self.next_group_id.max(2);
-        self.next_group_id = group_id + 1;
-        self.groups.insert(
-            group_id,
-            GroupRecord {
-                group_id,
-                owner,
-                name: name.to_string(),
-                data: data.to_vec(),
-                members: BTreeSet::new(),
-            },
-        );
-        Ok(group_id)
+        if data.len() > MAX_MESSAGE_PAYLOAD {
+            return Err(DPNERR_DATATOOLARGE);
+        }
+        if let Some(session) = &self.session {
+            // Group ids share the DPNID namespace: draw from the same real
+            // allocation sequence as players so a group id can never be
+            // mistaken for a player id by the data path.
+            let group_id = session.next_dpnid.fetch_add(1, Ordering::SeqCst).max(2);
+            session
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(
+                    group_id,
+                    GroupRecord {
+                        group_id,
+                        owner,
+                        name: name.to_string(),
+                        data: data.to_vec(),
+                        members: BTreeSet::new(),
+                    },
+                );
+            let message = wire_group_create(group_id, owner, name, data);
+            session.broadcast_group(&message);
+            return Ok(group_id);
+        }
+        if self.client.is_some() {
+            // Refresh the player cache from the real transport events before
+            // picking an id from the shared DPNID namespace.
+            let _ = self.drain_events();
+        }
+        if let Some(client) = &self.client {
+            // Never collide with a known player id (the host's data relay
+            // resolves players before groups).
+            let highest_player = self
+                .player_cache
+                .keys()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(self.local_dpnid)
+                .max(self.host_dpnid);
+            let highest_group = client
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .keys()
+                .copied()
+                .max()
+                .unwrap_or(0);
+            let group_id = self
+                .next_group_id
+                .max(2)
+                .max(highest_player + 1)
+                .max(highest_group + 1);
+            self.next_group_id = group_id + 1;
+            client
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(
+                    group_id,
+                    GroupRecord {
+                        group_id,
+                        owner,
+                        name: name.to_string(),
+                        data: data.to_vec(),
+                        members: BTreeSet::new(),
+                    },
+                );
+            let message = wire_group_create(group_id, owner, name, data);
+            if client.socket.send(&message).is_err() {
+                return Err(DPNERR_CONNECTIONLOST);
+            }
+            return Ok(group_id);
+        }
+        Err(DPNERR_NOCONNECTION)
     }
 
     pub(crate) fn destroy_group(&mut self, group_id: u32) -> u32 {
-        if self.groups.remove(&group_id).is_none() {
-            return DPNERR_INVALIDGROUP;
+        if let Some(session) = &self.session {
+            if session
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&group_id)
+                .is_none()
+            {
+                return DPNERR_INVALIDGROUP;
+            }
+            session.broadcast_group(&wire_group_destroy(group_id));
+            return S_OK;
         }
-        S_OK
+        if let Some(client) = &self.client {
+            if client
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&group_id)
+                .is_none()
+            {
+                return DPNERR_INVALIDGROUP;
+            }
+            let _ = client.socket.send(&wire_group_destroy(group_id));
+            return S_OK;
+        }
+        DPNERR_NOCONNECTION
     }
 
     pub(crate) fn add_player_to_group(&mut self, group_id: u32, dpnid: u32) -> u32 {
         if !self.player_exists(dpnid) {
             return DPNERR_INVALIDPLAYER;
         }
-        let Some(group) = self.groups.get_mut(&group_id) else {
-            return DPNERR_INVALIDGROUP;
-        };
-        if !group.members.insert(dpnid) {
-            return DPNERR_DUPLICATECOMMAND;
+        if let Some(session) = &self.session {
+            let inserted = match session
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get_mut(&group_id)
+            {
+                Some(group) => group.members.insert(dpnid),
+                None => return DPNERR_INVALIDGROUP,
+            };
+            if !inserted {
+                return DPNERR_DUPLICATECOMMAND;
+            }
+            session.broadcast_group(&wire_group_member(GROUP_OP_ADD_MEMBER, group_id, dpnid));
+            return S_OK;
         }
-        S_OK
+        if let Some(client) = &self.client {
+            let inserted = match client
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get_mut(&group_id)
+            {
+                Some(group) => group.members.insert(dpnid),
+                None => return DPNERR_INVALIDGROUP,
+            };
+            if !inserted {
+                return DPNERR_DUPLICATECOMMAND;
+            }
+            let _ = client
+                .socket
+                .send(&wire_group_member(GROUP_OP_ADD_MEMBER, group_id, dpnid));
+            return S_OK;
+        }
+        DPNERR_NOCONNECTION
     }
 
     pub(crate) fn remove_player_from_group(&mut self, group_id: u32, dpnid: u32) -> u32 {
-        let Some(group) = self.groups.get_mut(&group_id) else {
-            return DPNERR_INVALIDGROUP;
-        };
-        if !group.members.remove(&dpnid) {
-            return DPNERR_INVALIDPLAYER;
+        if let Some(session) = &self.session {
+            let removed = match session
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get_mut(&group_id)
+            {
+                Some(group) => group.members.remove(&dpnid),
+                None => return DPNERR_INVALIDGROUP,
+            };
+            if !removed {
+                return DPNERR_INVALIDPLAYER;
+            }
+            session.broadcast_group(&wire_group_member(GROUP_OP_REMOVE_MEMBER, group_id, dpnid));
+            return S_OK;
         }
-        S_OK
+        if let Some(client) = &self.client {
+            let removed = match client
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get_mut(&group_id)
+            {
+                Some(group) => group.members.remove(&dpnid),
+                None => return DPNERR_INVALIDGROUP,
+            };
+            if !removed {
+                return DPNERR_INVALIDPLAYER;
+            }
+            let _ = client
+                .socket
+                .send(&wire_group_member(GROUP_OP_REMOVE_MEMBER, group_id, dpnid));
+            return S_OK;
+        }
+        DPNERR_NOCONNECTION
+    }
+
+    /// `SetGroupInfo` — real name/data update, replicated to every peer.
+    pub(crate) fn set_group_info(&mut self, group_id: u32, name: &str, data: &[u8]) -> u32 {
+        if data.len() > MAX_MESSAGE_PAYLOAD {
+            return DPNERR_DATATOOLARGE;
+        }
+        if let Some(session) = &self.session {
+            let updated = match session
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get_mut(&group_id)
+            {
+                Some(group) => {
+                    group.name = name.to_string();
+                    group.data = data.to_vec();
+                    true
+                }
+                None => false,
+            };
+            if !updated {
+                return DPNERR_INVALIDGROUP;
+            }
+            session.broadcast_group(&wire_group_info(group_id, name, data));
+            return S_OK;
+        }
+        if let Some(client) = &self.client {
+            let updated = match client
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get_mut(&group_id)
+            {
+                Some(group) => {
+                    group.name = name.to_string();
+                    group.data = data.to_vec();
+                    true
+                }
+                None => false,
+            };
+            if !updated {
+                return DPNERR_INVALIDGROUP;
+            }
+            let _ = client.socket.send(&wire_group_info(group_id, name, data));
+            return S_OK;
+        }
+        DPNERR_NOCONNECTION
+    }
+
+    /// The group context bytes as stored by `CreateGroup`/`SetGroupInfo`.
+    pub(crate) fn group_context(&self, group_id: u32) -> Result<Vec<u8>, u32> {
+        self.group(group_id)
+            .map(|group| group.data)
+            .ok_or(DPNERR_INVALIDGROUP)
+    }
+
+    /// Update only the group context bytes, keeping the name.
+    pub(crate) fn set_group_context(&mut self, group_id: u32, data: &[u8]) -> u32 {
+        let name = match self.group(group_id) {
+            Some(group) => group.name,
+            None => return DPNERR_INVALIDGROUP,
+        };
+        self.set_group_info(group_id, &name, data)
     }
 
     /// Host-side `DestroyPeer`/`DestroyClient`: remove the player, announce
@@ -2356,12 +3016,35 @@ impl Dplay8Peer {
         S_OK
     }
 
-    pub(crate) fn groups(&self) -> impl Iterator<Item = &GroupRecord> {
-        self.groups.values()
+    pub(crate) fn groups(&self) -> Vec<GroupRecord> {
+        if let Some(session) = &self.session {
+            return session.group_snapshot();
+        }
+        if let Some(client) = &self.client {
+            return client
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .values()
+                .cloned()
+                .collect();
+        }
+        self.groups.values().cloned().collect()
     }
 
-    pub(crate) fn group(&self, group_id: u32) -> Option<&GroupRecord> {
-        self.groups.get(&group_id)
+    pub(crate) fn group(&self, group_id: u32) -> Option<GroupRecord> {
+        if let Some(session) = &self.session {
+            return session.group(group_id);
+        }
+        if let Some(client) = &self.client {
+            return client
+                .groups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(&group_id)
+                .cloned();
+        }
+        self.groups.get(&group_id).cloned()
     }
 
     pub(crate) fn player_exists(&self, dpnid: u32) -> bool {
@@ -2393,6 +3076,7 @@ fn client_receive_loop(
     terminated: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     counters: Arc<Counters>,
+    groups: Arc<Mutex<BTreeMap<u32, GroupRecord>>>,
 ) {
     let _ = &counters;
     let mut buffer = vec![0u8; RECEIVE_BUFFER];
@@ -2423,6 +3107,63 @@ fn client_receive_loop(
                         }),
                         data: payload.to_vec(),
                     });
+                    continue;
+                }
+                if let Some(operation) = parse_group(datagram) {
+                    let mut groups = groups.lock().unwrap_or_else(|poison| poison.into_inner());
+                    match operation {
+                        GroupWire::Create {
+                            group_id,
+                            owner,
+                            name,
+                            data,
+                        } => {
+                            let group = groups.entry(group_id).or_insert_with(|| GroupRecord {
+                                group_id,
+                                owner,
+                                name: String::new(),
+                                data: Vec::new(),
+                                members: BTreeSet::new(),
+                            });
+                            group.owner = owner;
+                            group.name = name;
+                            group.data = data;
+                        }
+                        GroupWire::Destroy { group_id } => {
+                            groups.remove(&group_id);
+                        }
+                        GroupWire::AddMember { group_id, dpnid } => {
+                            // UDP may deliver the membership announcement
+                            // before the create; keep it in a placeholder that
+                            // the later create fills in.
+                            groups
+                                .entry(group_id)
+                                .or_insert_with(|| GroupRecord {
+                                    group_id,
+                                    owner: 0,
+                                    name: String::new(),
+                                    data: Vec::new(),
+                                    members: BTreeSet::new(),
+                                })
+                                .members
+                                .insert(dpnid);
+                        }
+                        GroupWire::RemoveMember { group_id, dpnid } => {
+                            if let Some(group) = groups.get_mut(&group_id) {
+                                group.members.remove(&dpnid);
+                            }
+                        }
+                        GroupWire::Info {
+                            group_id,
+                            name,
+                            data,
+                        } => {
+                            if let Some(group) = groups.get_mut(&group_id) {
+                                group.name = name;
+                                group.data = data;
+                            }
+                        }
+                    }
                     continue;
                 }
                 if let Some((dpnid, name)) = parse_join(datagram) {
@@ -2478,7 +3219,28 @@ fn client_receive_loop(
 pub(crate) struct DplayRuntime {
     pub(crate) objects: BTreeMap<u64, DplayObjectEntry>,
     pub(crate) vtables: BTreeMap<u8, u64>,
-    pub(crate) pending: VecDeque<DplayEvent>,
+    pub(crate) pending: VecDeque<PendingDplayEvent>,
+}
+
+/// A queued guest-visible event together with the peer object that owns the
+/// registered message handler.
+pub(crate) struct PendingDplayEvent {
+    pub(crate) owner: u64,
+    pub(crate) event: DplayEvent,
+}
+
+impl DplayRuntime {
+    pub(crate) fn push_event(&mut self, owner: u64, event: DplayEvent) {
+        self.pending.push_back(PendingDplayEvent { owner, event });
+    }
+
+    /// Drop a queued completion whose async operation was cancelled.
+    pub(crate) fn cancel_pending_async(&mut self, handle: u32) -> bool {
+        let before = self.pending.len();
+        self.pending
+            .retain(|pending| pending.event.async_operation() != Some(handle));
+        self.pending.len() != before
+    }
 }
 
 /// One reference-counted guest object.
@@ -3022,10 +3784,24 @@ pub(crate) enum DplayEvent {
         result: u32,
         data: Vec<u8>,
     },
+    SessionLost {
+        result: u32,
+    },
     EnumHostsResponse {
         context: u64,
         session: SessionInfo,
     },
+}
+
+impl DplayEvent {
+    /// The async-operation handle this event completes, if any.
+    pub(crate) fn async_operation(&self) -> Option<u32> {
+        match self {
+            DplayEvent::ConnectComplete { async_op, .. }
+            | DplayEvent::SendComplete { async_op, .. } => Some(*async_op),
+            _ => None,
+        }
+    }
 }
 
 // ===========================================================================
@@ -3920,6 +4696,774 @@ mod tests {
                 "the real service provider and the hosted session are enumerated"
             );
             host.close();
+        })
+    }
+
+    // ── group replication, handler delivery and cancellation ───────────────
+
+    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if condition() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn wire_group_messages_round_trip() {
+        let create = wire_group_create(7, 3, "Team", b"ctx");
+        assert_eq!(
+            parse_group(&create),
+            Some(GroupWire::Create {
+                group_id: 7,
+                owner: 3,
+                name: "Team".to_string(),
+                data: b"ctx".to_vec(),
+            })
+        );
+        assert_eq!(
+            parse_group(&wire_group_destroy(7)),
+            Some(GroupWire::Destroy { group_id: 7 })
+        );
+        assert_eq!(
+            parse_group(&wire_group_member(GROUP_OP_ADD_MEMBER, 7, 9)),
+            Some(GroupWire::AddMember {
+                group_id: 7,
+                dpnid: 9
+            })
+        );
+        assert_eq!(
+            parse_group(&wire_group_member(GROUP_OP_REMOVE_MEMBER, 7, 9)),
+            Some(GroupWire::RemoveMember {
+                group_id: 7,
+                dpnid: 9
+            })
+        );
+        assert_eq!(
+            parse_group(&wire_group_info(7, "Renamed", b"data")),
+            Some(GroupWire::Info {
+                group_id: 7,
+                name: "Renamed".to_string(),
+                data: b"data".to_vec(),
+            })
+        );
+        assert_eq!(parse_group(b"DP8G"), None);
+        assert_eq!(parse_group(&create[..11]), None);
+    }
+
+    #[test]
+    fn group_create_join_leave_context_and_send_to_members() {
+        let mut host = started_peer();
+        assert_eq!(
+            host.host(&DplayAppDesc::new("Group Wire", 8), localhost()),
+            S_OK
+        );
+        let host_addr = host.local_address().expect("host address");
+        let mut first = started_peer();
+        first.set_connect_timeout(Duration::from_secs(3));
+        assert_eq!(first.connect(host_addr, "First", &[]), S_OK);
+        let mut second = started_peer();
+        second.set_connect_timeout(Duration::from_secs(3));
+        assert_eq!(second.connect(host_addr, "Second", &[]), S_OK);
+        let first_id = first.local_dpnid();
+        let second_id = second.local_dpnid();
+
+        let group = host
+            .create_group("Team", HOST_PLAYER_ID, b"context")
+            .expect("host group");
+        assert_eq!(host.add_player_to_group(group, HOST_PLAYER_ID), S_OK);
+        assert_eq!(host.add_player_to_group(group, first_id), S_OK);
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                first.group(group).is_some_and(|group| {
+                    group.name == "Team"
+                        && group.members.contains(&HOST_PLAYER_ID)
+                        && group.members.contains(&first_id)
+                })
+            }),
+            "client replicates group name and real members"
+        );
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                second.group(group).is_some_and(|group| {
+                    group.members.contains(&HOST_PLAYER_ID) && group.members.contains(&first_id)
+                })
+            }),
+            "every peer enumerates the real group membership"
+        );
+        assert_eq!(first.group_context(group).expect("context"), b"context");
+
+        // Host send: only members receive.
+        assert_eq!(host.send_to(group, b"host-ping"), S_OK);
+        assert_eq!(
+            first
+                .receive_from(Duration::from_secs(3))
+                .expect("member receives host group datagram")
+                .data,
+            b"host-ping"
+        );
+        assert_eq!(
+            host.receive_from(Duration::from_secs(3))
+                .expect("host member gets its own group loopback")
+                .data,
+            b"host-ping"
+        );
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            second.poll_receive().is_none(),
+            "non-member must not receive a group send"
+        );
+
+        // Client send: host and the sending member receive, the non-member does not.
+        assert_eq!(first.send_to(group, b"member-ping"), S_OK);
+        assert_eq!(
+            host.receive_from(Duration::from_secs(3))
+                .expect("host member receives client group datagram")
+                .data,
+            b"member-ping"
+        );
+        assert_eq!(
+            first
+                .receive_from(Duration::from_secs(3))
+                .expect("sender that is a member gets the group loopback")
+                .data,
+            b"member-ping"
+        );
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            second.poll_receive().is_none(),
+            "non-member must not receive a client group send"
+        );
+
+        // Context and info changes replicate.
+        assert_eq!(first.set_group_context(group, b"new-context"), S_OK);
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                host.group(group)
+                    .is_some_and(|group| group.data == b"new-context")
+                    && second
+                        .group(group)
+                        .is_some_and(|group| group.data == b"new-context")
+            }),
+            "group context round-trips over DP8G"
+        );
+        assert_eq!(first.set_group_info(group, "Renamed", b"info-data"), S_OK);
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                host.group(group)
+                    .is_some_and(|group| group.name == "Renamed" && group.data == b"info-data")
+            }),
+            "group info round-trips over DP8G"
+        );
+
+        // Client-created group is shared with the host and other peers.
+        let client_group = first
+            .create_group("Client Team", first_id, b"client-data")
+            .expect("client group");
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                host.group(client_group).is_some() && second.group(client_group).is_some()
+            }),
+            "client-created group reaches host and peers"
+        );
+        assert_eq!(first.destroy_group(client_group), S_OK);
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                host.group(client_group).is_none() && second.group(client_group).is_none()
+            }),
+            "client group destroy replicates"
+        );
+
+        // Leaving the group stops delivery.
+        assert_eq!(host.remove_player_from_group(group, first_id), S_OK);
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                first
+                    .group(group)
+                    .is_some_and(|group| !group.members.contains(&first_id))
+            }),
+            "leave replicates to the member"
+        );
+        assert_eq!(host.send_to(group, b"after-leave"), S_OK);
+        assert_eq!(
+            host.receive_from(Duration::from_secs(3))
+                .expect("host is still a member")
+                .data,
+            b"after-leave"
+        );
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            first.poll_receive().is_none(),
+            "a removed member no longer receives group traffic"
+        );
+
+        assert_eq!(host.destroy_group(group), S_OK);
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                first.group(group).is_none() && second.group(group).is_none()
+            }),
+            "group destroy replicates"
+        );
+
+        assert_eq!(host.send_to(4242, b"not a group"), DPNERR_INVALIDPLAYER);
+        first.close();
+        second.close();
+        host.close();
+        assert_ne!(first_id, 0);
+        assert_ne!(second_id, 0);
+    }
+
+    #[test]
+    fn async_operation_cancel_is_real() {
+        let mut peer = started_peer();
+        let pending = peer.begin_async_operation(AsyncOperationKind::Connect);
+        assert!(peer.async_operation_pending(pending));
+        assert_eq!(peer.cancel_async_operation(pending), S_OK);
+        assert!(!peer.async_operation_pending(pending));
+        assert_eq!(
+            peer.cancel_async_operation(pending),
+            DPNERR_INVALIDHANDLE,
+            "an already cancelled handle is gone"
+        );
+        let completed = peer.begin_async_operation(AsyncOperationKind::SendTo);
+        assert!(peer.complete_async_operation(completed));
+        assert_eq!(
+            peer.cancel_async_operation(completed),
+            DPNERR_CANNOTCANCEL,
+            "a completed operation cannot be cancelled"
+        );
+        assert!(!peer.complete_async_operation(completed));
+        assert_eq!(peer.cancel_async_operation(0), DPNERR_INVALIDHANDLE);
+    }
+
+    #[test]
+    fn message_handler_registration_error_semantics() {
+        let mut peer = Dplay8Peer::new();
+        assert_eq!(peer.set_message_handler(0x1234), S_OK);
+        assert_eq!(peer.message_handler(), 0x1234);
+        assert_eq!(peer.update_message_handler(0x5678), DPNERR_UNINITIALIZED);
+        assert_eq!(peer.set_message_handler(0), DPNERR_INVALIDPOINTER);
+        assert_eq!(peer.initialize(7, 0, 0), S_OK);
+        assert_eq!(peer.set_message_handler(0x9999), DPNERR_ALREADYINITIALIZED);
+        assert_eq!(peer.update_message_handler(0x5678), S_OK);
+        assert_eq!(peer.message_handler(), 0x5678);
+        assert_eq!(peer.update_message_handler(0), DPNERR_INVALIDPOINTER);
+    }
+
+    #[test]
+    fn guest_message_handler_receives_real_events() {
+        use crate::cpu::{CpuState, GuestArch, Register};
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("dplay-message-handler");
+            let msgid_out = 0x45_100_u64;
+            let data_out = 0x45_200_u64;
+            guest_put_u32(&mut fixture.memory, msgid_out, 0);
+            guest_put_u32(&mut fixture.memory, data_out, 0);
+            // Handler: record dwMessageType; for DPN_MSGID_RECEIVE record the
+            // first four datagram bytes through pReceiveData.
+            let handler = 0x46_000_u64;
+            let mut code = vec![
+                0x8B, 0x44, 0x24, 0x08, // mov eax,[esp+8]
+                0xA3, // mov [msgid_out],eax
+            ];
+            code.extend_from_slice(&(msgid_out as u32).to_le_bytes());
+            code.extend_from_slice(&[
+                0x83, 0xF8, 0x01, // cmp eax, DPN_MSGID_RECEIVE
+                0x75, 0x13, // jne done
+                0x8B, 0x44, 0x24, 0x0C, // mov eax,[esp+12]
+                0x8B, 0x40, 0x08, // mov eax,[eax+8] (pReceiveData)
+                0x85, 0xC0, // test eax,eax
+                0x74, 0x08, // jz done
+                0x8B, 0x10, // mov edx,[eax]
+                0x89, 0x15, // mov [data_out],edx
+            ]);
+            code.extend_from_slice(&(data_out as u32).to_le_bytes());
+            code.extend_from_slice(&[0x33, 0xC0, 0xC3]); // xor eax,eax; ret
+            guest_put(&mut fixture.memory, handler, &code);
+
+            let mut host_peer = Dplay8Peer::new();
+            assert_eq!(host_peer.initialize(0x55, handler, 0), S_OK);
+            assert_eq!(
+                host_peer.host(&DplayAppDesc::new("Handler", 4), localhost()),
+                S_OK
+            );
+            let host_addr = host_peer.local_address().expect("host address");
+            let pid = fixture.runtime.guest_pid;
+            {
+                let mut store = lock_dplay_runtimes();
+                let runtime = store.entry(pid).or_default();
+                runtime.objects.insert(
+                    0x2000,
+                    DplayObjectEntry {
+                        refcount: 1,
+                        object: DplayObject::Peer(host_peer),
+                    },
+                );
+            }
+
+            let mut client = started_peer();
+            client.set_connect_timeout(Duration::from_secs(3));
+            assert_eq!(client.connect(host_addr, "Sender", &[]), S_OK);
+            assert_eq!(client.send_to(HOST_PLAYER_ID, b"ping"), S_OK);
+
+            let mut state = CpuState::new(GuestArch::X86);
+            fixture.memory.map_bytes(0x4F_000, &vec![0u8; 0x2000]);
+            state.set(Register::Rsp, 0x50_000);
+            let mut delivered = false;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                fixture
+                    .runtime
+                    .drain_pending_dplay_events(&mut state, &mut fixture.memory)
+                    .expect("drain dplay events");
+                if guest_read_u32(&fixture.memory, msgid_out) == 1 {
+                    delivered = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(delivered, "DPN_MSGID_RECEIVE delivered to the handler");
+            assert_eq!(guest_read_u32(&fixture.memory, data_out), 0x676E_6970);
+
+            // Connect-complete and destroy/session-lost events, queued the
+            // same way the dispatch layer queues them.
+            let handle = {
+                let mut store = lock_dplay_runtimes();
+                let runtime = store.get_mut(&pid).expect("runtime");
+                let handle = match &mut runtime.objects.get_mut(&0x2000).expect("peer").object {
+                    DplayObject::Peer(peer) => {
+                        peer.begin_async_operation(AsyncOperationKind::Connect)
+                    }
+                    _ => unreachable!(),
+                };
+                runtime.push_event(
+                    0x2000,
+                    DplayEvent::ConnectComplete {
+                        async_op: handle,
+                        context: 0,
+                        result: S_OK,
+                        dpnid: 2,
+                    },
+                );
+                handle
+            };
+            guest_put_u32(&mut fixture.memory, msgid_out, 0);
+            fixture
+                .runtime
+                .drain_pending_dplay_events(&mut state, &mut fixture.memory)
+                .expect("drain connect complete");
+            assert_eq!(
+                guest_read_u32(&fixture.memory, msgid_out),
+                7,
+                "DPN_MSGID_CONNECT_COMPLETE delivered"
+            );
+            {
+                let mut store = lock_dplay_runtimes();
+                let runtime = store.get_mut(&pid).expect("runtime");
+                runtime.push_event(
+                    0x2000,
+                    DplayEvent::DestroyPlayer {
+                        dpnid: 2,
+                        reason: DPNDESTROYPLAYERREASON_NORMAL,
+                        context: 0,
+                    },
+                );
+            }
+            fixture
+                .runtime
+                .drain_pending_dplay_events(&mut state, &mut fixture.memory)
+                .expect("drain destroy player");
+            assert_eq!(
+                guest_read_u32(&fixture.memory, msgid_out),
+                4,
+                "DPN_MSGID_DESTROY_PLAYER delivered"
+            );
+            {
+                let mut store = lock_dplay_runtimes();
+                let runtime = store.get_mut(&pid).expect("runtime");
+                runtime.push_event(0x2000, DplayEvent::SessionLost { result: 0 });
+            }
+            fixture
+                .runtime
+                .drain_pending_dplay_events(&mut state, &mut fixture.memory)
+                .expect("drain session lost");
+            assert_eq!(
+                guest_read_u32(&fixture.memory, msgid_out),
+                10,
+                "DPN_MSGID_SESSION_LOST delivered"
+            );
+            {
+                let mut store = lock_dplay_runtimes();
+                let runtime = store.get_mut(&pid).expect("runtime");
+                assert!(runtime.pending.is_empty(), "all queued events delivered");
+                let peer = match &mut runtime.objects.get_mut(&0x2000).expect("peer").object {
+                    DplayObject::Peer(peer) => peer,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    peer.cancel_async_operation(handle),
+                    DPNERR_CANNOTCANCEL,
+                    "delivery completed the async operation"
+                );
+            }
+            client.close();
+            lock_dplay_runtimes().remove(&pid);
+        })
+    }
+
+    #[test]
+    fn guest_cancel_async_operation_cancels_queued_completion() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("dplay-cancel-async");
+            let pid = fixture.runtime.guest_pid;
+            let handle = {
+                let mut store = lock_dplay_runtimes();
+                let runtime = store.entry(pid).or_default();
+                let mut peer = Dplay8Peer::new();
+                assert_eq!(peer.initialize(0, 0, 0), S_OK);
+                let handle = peer.begin_async_operation(AsyncOperationKind::Connect);
+                runtime.objects.insert(
+                    0x2000,
+                    DplayObjectEntry {
+                        refcount: 1,
+                        object: DplayObject::Peer(peer),
+                    },
+                );
+                runtime.push_event(
+                    0x2000,
+                    DplayEvent::ConnectComplete {
+                        async_op: handle,
+                        context: 0,
+                        result: S_OK,
+                        dpnid: 2,
+                    },
+                );
+                handle
+            };
+            assert_eq!(
+                guest_call(&mut fixture, 0x2000, IFACE_PEER, 5, &[handle],),
+                u64::from(S_OK),
+                "CancelAsyncOperation"
+            );
+            {
+                let store = lock_dplay_runtimes();
+                let runtime = store.get(&pid).expect("runtime");
+                assert!(
+                    runtime.pending.is_empty(),
+                    "the queued completion was really removed"
+                );
+            }
+            assert_eq!(
+                guest_call(&mut fixture, 0x2000, IFACE_PEER, 5, &[handle]),
+                u64::from(DPNERR_INVALIDHANDLE)
+            );
+            lock_dplay_runtimes().remove(&pid);
+        })
+    }
+
+    #[test]
+    fn guest_build_address_from_direct_play4_address() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("dplay-build-from-dp4");
+            let out = 0x40_200_u64;
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::DirectPlayCreate,
+                    &[0, out as u32, 0]
+                ),
+                u64::from(S_OK)
+            );
+            let legacy = guest_read_u32(&fixture.memory, out) as u64;
+            assert_ne!(legacy, 0);
+            assert_eq!(
+                guest_call(&mut fixture, legacy, IFACE_LEGACY, 23, &[0]),
+                u64::from(S_OK)
+            );
+            let desc = 0x41_000_u64;
+            let ascii_name = 0x42_400_u64;
+            guest_put(&mut fixture.memory, ascii_name, b"DP4 Address\0");
+            guest_put(&mut fixture.memory, desc, &[0u8; 80]);
+            guest_put_u32(&mut fixture.memory, desc, 80);
+            guest_put_u32(&mut fixture.memory, desc + 4, 1);
+            guest_put_u32(&mut fixture.memory, desc + 40, 4);
+            guest_put_u32(&mut fixture.memory, desc + 48, ascii_name as u32);
+            assert_eq!(
+                guest_call(&mut fixture, legacy, IFACE_LEGACY, 24, &[desc as u32, 1]),
+                u64::from(S_OK)
+            );
+
+            let address_iid = 0x43_000_u64;
+            let address_out = 0x43_100_u64;
+            guest_put(&mut fixture.memory, address_iid, &IID_IDIRECTPLAY8_ADDRESS);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::DirectPlay8AddressCreate,
+                    &[address_iid as u32, address_out as u32, 0],
+                ),
+                u64::from(S_OK)
+            );
+            let address = guest_read_u32(&fixture.memory, address_out) as u64;
+            assert_ne!(address, 0);
+
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    address,
+                    IFACE_ADDRESS,
+                    21,
+                    &[legacy as u32, 0]
+                ),
+                u64::from(S_OK),
+                "BuildFromDirectPlay4Address converts the live endpoint"
+            );
+            let chars = 0x44_000_u64;
+            let buffer = 0x44_100_u64;
+            guest_put(&mut fixture.memory, buffer, &[0u8; 1024]);
+            guest_put_u32(&mut fixture.memory, chars, 0);
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    address,
+                    IFACE_ADDRESS,
+                    9,
+                    &[buffer as u32, chars as u32]
+                ),
+                u64::from(DPNERR_BUFFERTOOSMALL)
+            );
+            let required = guest_read_u32(&fixture.memory, chars);
+            assert!(required > 1);
+            guest_put_u32(&mut fixture.memory, chars, required);
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    address,
+                    IFACE_ADDRESS,
+                    9,
+                    &[buffer as u32, chars as u32]
+                ),
+                u64::from(S_OK)
+            );
+            let url_bytes = fixture
+                .memory
+                .read_bytes(buffer, ((required as usize) - 1) * 2)
+                .unwrap();
+            let url = String::from_utf16_lossy(
+                &url_bytes
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect::<Vec<_>>(),
+            );
+            assert!(url.starts_with("x-directplay:/provider=IP;hostname="));
+            assert!(!url.ends_with("port=0"), "real bound port: {url}");
+
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    address,
+                    IFACE_ADDRESS,
+                    21,
+                    &[legacy as u32, 1]
+                ),
+                u64::from(DPNERR_INVALIDFLAGS)
+            );
+            assert_eq!(
+                guest_call(&mut fixture, address, IFACE_ADDRESS, 21, &[0xDEAD, 0]),
+                u64::from(DPNERR_INVALIDPARAM)
+            );
+            assert_eq!(
+                guest_call(&mut fixture, legacy, IFACE_LEGACY, 4, &[]),
+                u64::from(S_OK)
+            );
+        })
+    }
+
+    #[test]
+    fn guest_group_info_members_and_context_are_real() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("dplay-guest-group");
+            let pid = fixture.runtime.guest_pid;
+            let mut peer = Dplay8Peer::new();
+            assert_eq!(peer.initialize(0, 0, 0), S_OK);
+            assert_eq!(
+                peer.host(&DplayAppDesc::new("Guest Groups", 4), localhost()),
+                S_OK
+            );
+            {
+                let mut store = lock_dplay_runtimes();
+                store.entry(pid).or_default().objects.insert(
+                    0x2000,
+                    DplayObjectEntry {
+                        refcount: 1,
+                        object: DplayObject::Peer(peer),
+                    },
+                );
+            }
+
+            // DPN_GROUP_INFO (x86): name + context bytes.
+            let info = 0x41_000_u64;
+            let name = 0x42_000_u64;
+            let data = 0x42_200_u64;
+            guest_put_utf16(&mut fixture.memory, name, "Blue Team");
+            guest_put(&mut fixture.memory, data, b"ctx!");
+            guest_put(&mut fixture.memory, info, &[0u8; 32]);
+            guest_put_u32(&mut fixture.memory, info, 32);
+            guest_put_u32(&mut fixture.memory, info + 4, DPNINFO_NAME | DPNINFO_DATA);
+            guest_put_u32(&mut fixture.memory, info + 8, name as u32);
+            guest_put_u32(&mut fixture.memory, info + 12, data as u32);
+            guest_put_u32(&mut fixture.memory, info + 16, 4);
+            let group_out = 0x43_000_u64;
+            guest_put_u32(&mut fixture.memory, group_out, 0);
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    0x2000,
+                    IFACE_PEER,
+                    12,
+                    &[info as u32, 0, 0, group_out as u32, 0]
+                ),
+                u64::from(S_OK)
+            );
+            let group = guest_read_u32(&mut fixture.memory, group_out);
+            assert_ne!(group, 0);
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    0x2000,
+                    IFACE_PEER,
+                    14,
+                    &[group, HOST_PLAYER_ID]
+                ),
+                u64::from(S_OK)
+            );
+
+            // EnumGroupMembers returns the real member list.
+            let members = 0x44_000_u64;
+            let count = 0x44_100_u64;
+            guest_put_u32(&mut fixture.memory, count, 8);
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    0x2000,
+                    IFACE_PEER,
+                    19,
+                    &[group, members as u32, count as u32]
+                ),
+                u64::from(S_OK)
+            );
+            assert_eq!(guest_read_u32(&mut fixture.memory, count), 1);
+            assert_eq!(guest_read_u32(&mut fixture.memory, members), HOST_PLAYER_ID);
+
+            // GetGroupInfo reports the real name/data pair.
+            let size = 0x45_000_u64;
+            let base = 0x45_100_u64;
+            guest_put_u32(&mut fixture.memory, size, 0);
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    0x2000,
+                    IFACE_PEER,
+                    17,
+                    &[group, 0, size as u32]
+                ),
+                u64::from(DPNERR_BUFFERTOOSMALL)
+            );
+            let required = guest_read_u32(&mut fixture.memory, size);
+            assert!(required > 24);
+            guest_put(&mut fixture.memory, base, &vec![0u8; required as usize]);
+            guest_put_u32(&mut fixture.memory, size, required);
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    0x2000,
+                    IFACE_PEER,
+                    17,
+                    &[group, base as u32, size as u32]
+                ),
+                u64::from(S_OK)
+            );
+            assert_eq!(
+                guest_read_u32(&mut fixture.memory, base + 4),
+                DPNINFO_NAME | DPNINFO_DATA
+            );
+            let group_name_ptr = guest_read_u32(&mut fixture.memory, base + 8) as u64;
+            let group_data_ptr = guest_read_u32(&mut fixture.memory, base + 12) as u64;
+            assert_eq!(
+                guest_read_u32(&mut fixture.memory, base + 16),
+                4,
+                "real context size"
+            );
+            let group_name = fixture
+                .memory
+                .read_bytes(group_name_ptr, 18)
+                .expect("group name bytes");
+            assert_eq!(
+                String::from_utf16_lossy(
+                    &group_name
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect::<Vec<_>>()
+                ),
+                "Blue Team"
+            );
+            assert_eq!(
+                fixture.memory.read_bytes(group_data_ptr, 4).unwrap(),
+                b"ctx!"
+            );
+
+            // GetGroupContext returns the stored bytes.
+            let context_out = 0x46_000_u64;
+            guest_put_u32(&mut fixture.memory, context_out, 0);
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    0x2000,
+                    IFACE_PEER,
+                    29,
+                    &[group, context_out as u32, 0]
+                ),
+                u64::from(S_OK)
+            );
+            let context_ptr = guest_read_u32(&mut fixture.memory, context_out) as u64;
+            assert_ne!(context_ptr, 0);
+            assert_eq!(fixture.memory.read_bytes(context_ptr, 4).unwrap(), b"ctx!");
+
+            // SetGroupInfo replaces the real name/context.
+            let new_name = 0x47_000_u64;
+            guest_put_utf16(&mut fixture.memory, new_name, "Red Team");
+            guest_put(&mut fixture.memory, info, &[0u8; 32]);
+            guest_put_u32(&mut fixture.memory, info, 32);
+            guest_put_u32(&mut fixture.memory, info + 4, DPNINFO_NAME | DPNINFO_DATA);
+            guest_put_u32(&mut fixture.memory, info + 8, new_name as u32);
+            guest_put_u32(&mut fixture.memory, info + 12, data as u32);
+            guest_put_u32(&mut fixture.memory, info + 16, 4);
+            assert_eq!(
+                guest_call(&mut fixture, 0x2000, IFACE_PEER, 16, &[group, info as u32]),
+                u64::from(S_OK)
+            );
+            {
+                let store = lock_dplay_runtimes();
+                let runtime = store.get(&pid).expect("runtime");
+                let peer = match &runtime.objects.get(&0x2000).expect("peer").object {
+                    DplayObject::Peer(peer) => peer,
+                    _ => unreachable!(),
+                };
+                let stored = peer.group(group).expect("group");
+                assert_eq!(stored.name, "Red Team");
+                assert_eq!(stored.data, b"ctx!");
+            }
+
+            assert_eq!(
+                guest_call(&mut fixture, 0x2000, IFACE_PEER, 13, &[group]),
+                u64::from(S_OK)
+            );
+            lock_dplay_runtimes().remove(&pid);
         })
     }
 }
