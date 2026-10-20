@@ -26,8 +26,10 @@ const MFT_CASA1_VIDEO_DECODER_CLSID: [u8; 16] = [
 // ── Media Foundation HRESULT codes (the documented MF_E_* family) ─────────
 
 const S_OK: u32 = 0x0000_0000;
+const S_FALSE: u32 = 0x0000_0001;
 const E_INVALIDARG: u32 = 0x8007_0057;
 const E_NOTIMPL: u32 = 0x8000_4001;
+const E_PENDING: u32 = 0x8000_000A;
 #[allow(dead_code)] // reserved for the MF error surface
 const E_NOINTERFACE: u32 = 0x8000_4002;
 #[allow(dead_code)] // reserved for the interface error surface
@@ -2580,6 +2582,10 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(MF_E_INVALIDREQUEST));
             return Ok(());
         }
+        // Real state change: complete parked BeginGetEvent requests with the
+        // queued MESourceStarted/MENewStream/MEStreamStarted (or Seeked)
+        // events.
+        self.mf_source_pump_events(this, memory, false)?;
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -2596,7 +2602,10 @@ impl PeHostRuntime {
             return Ok(());
         };
         match source.stop() {
-            Ok(()) => state.set(Register::Rax, u64::from(S_OK)),
+            Ok(()) => {
+                self.mf_source_pump_events(this, memory, false)?;
+                state.set(Register::Rax, u64::from(S_OK))
+            }
             Err(_) => state.set(Register::Rax, u64::from(MF_E_SHUTDOWN)),
         }
         Ok(())
@@ -2614,7 +2623,10 @@ impl PeHostRuntime {
             return Ok(());
         };
         match source.pause() {
-            Ok(()) => state.set(Register::Rax, u64::from(S_OK)),
+            Ok(()) => {
+                self.mf_source_pump_events(this, memory, false)?;
+                state.set(Register::Rax, u64::from(S_OK))
+            }
             Err(_) => state.set(Register::Rax, u64::from(MF_E_INVALIDREQUEST)),
         }
         Ok(())
@@ -2675,31 +2687,219 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `IMFMediaEventGenerator::BeginGetEvent` / `EndGetEvent` — the
-    /// runtime has no MF async callback pump; synchronous `GetEvent` is the
-    /// backed path and these answer E_NOTIMPL honestly.
+    /// `IMFMediaEventGenerator::BeginGetEvent` — parks the guest request on
+    /// the MF async callback pump.  When a real event is already queued the
+    /// call completes synchronously (`S_OK`, no callback — Windows contract);
+    /// otherwise it returns `E_PENDING` and the callback's `Invoke` fires
+    /// from the runtime servicing point
+    /// ([`Self::drain_pending_mf_async_completions`]) once a real source
+    /// state change (Start/Stop/Pause/seek) or the real end of file queues
+    /// an event.
     pub(crate) fn dispatch_mf_media_source_begin_get_event(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
-        state.set(Register::Rax, u64::from(E_NOTIMPL));
+        let this = guest_call_arg(state, memory, 0)?;
+        let callback = guest_call_arg(state, memory, 1)?;
+        let state_object = guest_call_arg(state, memory, 2)?;
+        let Some(source) = self.mf_media_sources.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if source.state() == crate::media::MfSourceState::Shutdown {
+            state.set(Register::Rax, u64::from(MF_E_SHUTDOWN));
+            return Ok(());
+        }
+        if crate::media::has_mf_parked_request(
+            self.guest_pid,
+            this,
+            crate::media::MfAsyncOp::GetEvent,
+        ) {
+            // A Begin is already parked for this source (the guest must
+            // consume it with EndGetEvent/CancelGetEvent first).
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let callback_method = if callback != 0 {
+            let Some(method) = self.mf_async_callback_method(memory, callback) else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            };
+            method
+        } else {
+            0
+        };
+        crate::media::park_mf_request(
+            self.guest_pid,
+            crate::media::MfParkedRequest {
+                owner: this,
+                op: crate::media::MfAsyncOp::GetEvent,
+                callback_object: callback,
+                callback_method,
+                state_object,
+            },
+        );
+        // Events already on the real queue complete synchronously; the
+        // completion is recorded for EndGetEvent but the callback is not
+        // invoked (Windows S_OK contract).
+        if self.mf_source_pump_events(this, memory, true)? {
+            state.set(Register::Rax, u64::from(S_OK));
+        } else {
+            state.set(Register::Rax, u64::from(E_PENDING));
+        }
         Ok(())
     }
 
-    /// `IMFMediaEventGenerator::EndGetEvent`.
+    /// `IMFMediaEventGenerator::EndGetEvent` — retrieves the real event a
+    /// completed `BeginGetEvent` produced (the event object was materialised
+    /// when the event was queued, so this never allocates new state).
     pub(crate) fn dispatch_mf_media_source_end_get_event(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
+        let this = guest_call_arg(state, memory, 0)?;
+        let result = guest_call_arg(state, memory, 1)?;
         let out = guest_call_arg(state, memory, 2)?;
-        if out != 0 {
-            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        if !self.mf_media_sources.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
         }
-        state.set(Register::Rax, u64::from(E_NOTIMPL));
+        let Some(completion) = crate::media::take_mf_result(self.guest_pid, result) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if completion.op != crate::media::MfAsyncOp::GetEvent || completion.event_object == 0 {
+            // Not a GetEvent result: re-record it so its own EndX still
+            // retrieves it, and reject the wrong completion.
+            crate::media::record_mf_result(self.guest_pid, completion);
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, completion.event_object, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `CancelGetEvent` — drops the parked `BeginGetEvent` request so its
+    /// callback never fires.  `S_OK` when a request was pending, `S_FALSE`
+    /// when there was nothing to cancel.
+    pub(crate) fn dispatch_mf_media_source_cancel_get_event(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if !self.mf_media_sources.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let cancelled = crate::media::take_mf_parked_request(
+            self.guest_pid,
+            this,
+            crate::media::MfAsyncOp::GetEvent,
+        )
+        .is_some();
+        state.set(
+            Register::Rax,
+            u64::from(if cancelled { S_OK } else { S_FALSE }),
+        );
+        Ok(())
+    }
+
+    /// Resolve an `IMFAsyncCallback` object's `Invoke` entry point (vtable
+    /// slot 4: QueryInterface, AddRef, Release, GetParameters, Invoke).
+    fn mf_async_callback_method(&self, memory: &MemoryImage, callback: u64) -> Option<u64> {
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let vtable = read_guest_pointer(memory, callback, self.guest_arch).ok()?;
+        let method =
+            read_guest_pointer(memory, vtable + 4 * pointer_bytes, self.guest_arch).ok()?;
+        (method != 0).then_some(method)
+    }
+
+    /// Complete parked `BeginGetEvent` requests from the source's real event
+    /// queue: while a request is parked and the source has a real event, the
+    /// event becomes a guest `IMFMediaEvent` object and a real
+    /// `IMFAsyncResult` is recorded.  `synchronous` marks a completion that
+    /// happened inside `BeginGetEvent` itself (`S_OK`): the callback is not
+    /// queued, only the result for `EndGetEvent`.
+    fn mf_source_pump_events(
+        &mut self,
+        this: u64,
+        memory: &mut MemoryImage,
+        synchronous: bool,
+    ) -> AppResult<bool> {
+        let pid = self.guest_pid;
+        let mut completed = false;
+        loop {
+            if !crate::media::has_mf_parked_request(pid, this, crate::media::MfAsyncOp::GetEvent) {
+                break;
+            }
+            let Some(event) = self
+                .mf_media_sources
+                .get_mut(&this)
+                .and_then(crate::media::MfMediaSource::get_event)
+            else {
+                break;
+            };
+            let Some(request) =
+                crate::media::take_mf_parked_request(pid, this, crate::media::MfAsyncOp::GetEvent)
+            else {
+                break;
+            };
+            let value = event.pts.unwrap_or(0);
+            let event_object =
+                self.alloc_mf_event_object(memory, event.mf_type, event.status as u32, value)?;
+            let result = self.alloc_mf_async_result(memory, request.state_object, S_OK)?;
+            let mut completion = crate::media::MfAsyncCompletion {
+                owner: this,
+                op: crate::media::MfAsyncOp::GetEvent,
+                result,
+                status: S_OK,
+                callback_object: request.callback_object,
+                callback_method: request.callback_method,
+                state_object: request.state_object,
+                event_object,
+                bytes: 0,
+            };
+            if synchronous {
+                completion.callback_object = 0;
+                completion.callback_method = 0;
+                crate::media::record_mf_result(pid, completion);
+            } else {
+                crate::media::complete_mf_request(pid, completion);
+            }
+            completed = true;
+        }
+        Ok(completed)
+    }
+
+    /// Deliver the queued MF asynchronous completions of this process: each
+    /// completion's `IMFAsyncCallback::Invoke` is invoked in guest context
+    /// with the real `IMFAsyncResult`.  Runs only from the runtime servicing
+    /// points (the block-dispatch safepoint and the message-loop idle drain)
+    /// and from tests that poll for completion — never inline inside the
+    /// Begin call that parked the request.
+    pub(crate) fn drain_pending_mf_async_completions(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        while let Some(completion) = crate::media::pop_mf_completion(self.guest_pid) {
+            if completion.callback_method == 0 {
+                continue;
+            }
+            self.execute_guest_callback(
+                state,
+                memory,
+                completion.callback_method,
+                &[completion.callback_object, completion.result],
+                "MFAsyncCallback::Invoke",
+            )?;
+        }
         Ok(())
     }
 
@@ -2721,6 +2921,7 @@ impl PeHostRuntime {
             return Ok(());
         };
         source.queue_event_number(mf_type);
+        self.mf_source_pump_events(this, memory, false)?;
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -5256,6 +5457,9 @@ impl PeHostRuntime {
                 if let Some(source_state) = self.mf_media_sources.get_mut(&source) {
                     source_state.end_presentation();
                 }
+                // Real EOF is a real state change: deliver the queued
+                // MEEndOf* events to a parked BeginGetEvent.
+                self.mf_source_pump_events(source, memory, false)?;
             }
         }
         state.set(Register::Rax, u64::from(S_OK));
@@ -5663,9 +5867,13 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// IMFByteStream::BeginRead — the runtime has no MF async callback pump,
-    /// so the read completes synchronously: the bytes are read, an
-    /// IMFAsyncResult records the completion, and EndRead retrieves it.
+    /// IMFByteStream::BeginRead — performs the real read and completes it
+    /// through the MF async callback pump: a real IMFAsyncResult is created
+    /// and the guest callback's `Invoke` is queued for the servicing point
+    /// ([`Self::drain_pending_mf_async_completions`]); `EndRead` then
+    /// retrieves the real byte count.  Windows returns `E_PENDING` when the
+    /// callback is used; a null callback keeps the synchronous completion
+    /// (`S_OK`, bytes recorded for `EndRead`).
     pub(crate) fn dispatch_mf_byte_stream_begin_read(
         &mut self,
         state: &mut CpuState,
@@ -5674,8 +5882,8 @@ impl PeHostRuntime {
         let this = guest_call_arg(state, memory, 0)?;
         let buffer = guest_call_arg(state, memory, 1)?;
         let length = guest_call_arg_u32(state, memory, 2)?;
-        let _callback = guest_call_arg(state, memory, 3)?;
-        let _state_object = guest_call_arg(state, memory, 4)?;
+        let callback = guest_call_arg(state, memory, 3)?;
+        let state_object = guest_call_arg(state, memory, 4)?;
         let Some(stream) = self.mf_byte_streams.get(&this) else {
             state.set(Register::Rax, u64::from(E_NOINTERFACE));
             return Ok(());
@@ -5688,17 +5896,44 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         }
+        let callback_method = if callback != 0 {
+            let Some(method) = self.mf_async_callback_method(memory, callback) else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            };
+            method
+        } else {
+            0
+        };
         let (read, access_denied) = self.mf_byte_stream_read_bytes(this, buffer, length, memory)?;
         if access_denied {
             state.set(Register::Rax, u64::from(E_ACCESSDENIED));
             return Ok(());
         }
-        let result = self.alloc_mf_async_result(memory, 0, S_OK)?;
+        let result = self.alloc_mf_async_result(memory, state_object, S_OK)?;
         if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
             stream.last_async_result = result;
             stream.last_async_read = read;
         }
-        state.set(Register::Rax, u64::from(S_OK));
+        if callback != 0 {
+            crate::media::complete_mf_request(
+                self.guest_pid,
+                crate::media::MfAsyncCompletion {
+                    owner: this,
+                    op: crate::media::MfAsyncOp::Read,
+                    result,
+                    status: S_OK,
+                    callback_object: callback,
+                    callback_method,
+                    state_object,
+                    event_object: 0,
+                    bytes: read,
+                },
+            );
+            state.set(Register::Rax, u64::from(E_PENDING));
+        } else {
+            state.set(Register::Rax, u64::from(S_OK));
+        }
         Ok(())
     }
 
@@ -5845,8 +6080,9 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// IMFByteStream::EndRead — completes a synchronous BeginRead by writing
-    /// the recorded byte count out.
+    /// IMFByteStream::EndRead — retrieves the real byte count of the
+    /// `BeginRead` result (whether it completed through the callback pump or
+    /// synchronously with a null callback).
     pub(crate) fn dispatch_mf_byte_stream_end_read(
         &mut self,
         state: &mut CpuState,
@@ -5863,14 +6099,29 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_FAIL));
             return Ok(());
         }
-        if result == 0 || result != stream.last_async_result {
-            state.set(Register::Rax, u64::from(E_INVALIDARG));
-            return Ok(());
-        }
-        let read = stream.last_async_read;
-        if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
-            stream.last_async_result = 0;
-        }
+        let read = if let Some(completion) = crate::media::take_mf_result(self.guest_pid, result) {
+            if completion.op != crate::media::MfAsyncOp::Read {
+                crate::media::record_mf_result(self.guest_pid, completion);
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+            if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
+                if stream.last_async_result == result {
+                    stream.last_async_result = 0;
+                }
+            }
+            completion.bytes
+        } else {
+            if result == 0 || result != stream.last_async_result {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+            let read = stream.last_async_read;
+            if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
+                stream.last_async_result = 0;
+            }
+            read
+        };
         if read_out != 0 {
             write_u32(memory, read_out, read);
         }
@@ -5878,8 +6129,11 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// IMFByteStream::BeginWrite — synchronous write completion (see
-    /// BeginRead).
+    /// IMFByteStream::BeginWrite — performs the real write and completes it
+    /// through the MF async callback pump (see BeginRead): the guest
+    /// callback's `Invoke` is queued with a real IMFAsyncResult and
+    /// `EndWrite` retrieves the real byte count; a null callback keeps the
+    /// synchronous `S_OK` completion.
     pub(crate) fn dispatch_mf_byte_stream_begin_write(
         &mut self,
         state: &mut CpuState,
@@ -5888,8 +6142,8 @@ impl PeHostRuntime {
         let this = guest_call_arg(state, memory, 0)?;
         let buffer = guest_call_arg(state, memory, 1)?;
         let length = guest_call_arg_u32(state, memory, 2)?;
-        let _callback = guest_call_arg(state, memory, 3)?;
-        let _state_object = guest_call_arg(state, memory, 4)?;
+        let callback = guest_call_arg(state, memory, 3)?;
+        let state_object = guest_call_arg(state, memory, 4)?;
         let Some(stream) = self.mf_byte_streams.get(&this) else {
             state.set(Register::Rax, u64::from(E_NOINTERFACE));
             return Ok(());
@@ -5902,19 +6156,46 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_ACCESSDENIED));
             return Ok(());
         }
-        // Drive the synchronous Write implementation, then capture the
-        // completion in an IMFAsyncResult for EndWrite.
+        let callback_method = if callback != 0 {
+            let Some(method) = self.mf_async_callback_method(memory, callback) else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            };
+            method
+        } else {
+            0
+        };
+        // Drive the real write implementation, then capture the completion
+        // in an IMFAsyncResult for EndWrite.
         let (written, denied) = self.mf_byte_stream_write_bytes(this, buffer, length, memory)?;
         if denied {
             state.set(Register::Rax, u64::from(E_ACCESSDENIED));
             return Ok(());
         }
-        let result = self.alloc_mf_async_result(memory, 0, S_OK)?;
+        let result = self.alloc_mf_async_result(memory, state_object, S_OK)?;
         if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
             stream.last_async_result = result;
             stream.last_async_written = written;
         }
-        state.set(Register::Rax, u64::from(S_OK));
+        if callback != 0 {
+            crate::media::complete_mf_request(
+                self.guest_pid,
+                crate::media::MfAsyncCompletion {
+                    owner: this,
+                    op: crate::media::MfAsyncOp::Write,
+                    result,
+                    status: S_OK,
+                    callback_object: callback,
+                    callback_method,
+                    state_object,
+                    event_object: 0,
+                    bytes: written,
+                },
+            );
+            state.set(Register::Rax, u64::from(E_PENDING));
+        } else {
+            state.set(Register::Rax, u64::from(S_OK));
+        }
         Ok(())
     }
 
@@ -5935,14 +6216,30 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_FAIL));
             return Ok(());
         }
-        if result == 0 || result != stream.last_async_result {
-            state.set(Register::Rax, u64::from(E_INVALIDARG));
-            return Ok(());
-        }
-        let written = stream.last_async_written;
-        if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
-            stream.last_async_result = 0;
-        }
+        let written = if let Some(completion) = crate::media::take_mf_result(self.guest_pid, result)
+        {
+            if completion.op != crate::media::MfAsyncOp::Write {
+                crate::media::record_mf_result(self.guest_pid, completion);
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+            if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
+                if stream.last_async_result == result {
+                    stream.last_async_result = 0;
+                }
+            }
+            completion.bytes
+        } else {
+            if result == 0 || result != stream.last_async_result {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+            let written = stream.last_async_written;
+            if let Some(stream) = self.mf_byte_streams.get_mut(&this) {
+                stream.last_async_result = 0;
+            }
+            written
+        };
         if written_out != 0 {
             write_u32(memory, written_out, written);
         }
@@ -6341,8 +6638,8 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// IMFAsyncResult::GetObject(ppObject) — the runtime's completion
-    /// results carry no object.
+    /// IMFAsyncResult::GetObject(ppObject) — the event a completed
+    /// `BeginGetEvent` produced (0 for the byte-stream completions).
     pub(crate) fn dispatch_mf_async_result_get_object(
         &mut self,
         state: &mut CpuState,
@@ -6355,14 +6652,16 @@ impl PeHostRuntime {
             return Ok(());
         }
         if out != 0 {
-            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            let event_object =
+                crate::media::mf_result_event_object(self.guest_pid, this).unwrap_or(0);
+            write_guest_pointer(memory, out, event_object, self.guest_arch).ok();
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
-    /// IMFAsyncResult::GetCallback(ppCallback) — the runtime's synchronous
-    /// completions carry no callback object.
+    /// IMFAsyncResult::GetCallback(ppCallback) — the callback the completion
+    /// was parked with (0 for the synchronous completions).
     pub(crate) fn dispatch_mf_async_result_get_callback(
         &mut self,
         state: &mut CpuState,
@@ -6375,7 +6674,9 @@ impl PeHostRuntime {
             return Ok(());
         }
         if out != 0 {
-            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            let callback =
+                crate::media::mf_result_callback_object(self.guest_pid, this).unwrap_or(0);
+            write_guest_pointer(memory, out, callback, self.guest_arch).ok();
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -6612,6 +6913,9 @@ impl PeHostRuntime {
             }
             MfMediaSourceEndGetEvent => self.dispatch_mf_media_source_end_get_event(state, memory),
             MfMediaSourceQueueEvent => self.dispatch_mf_media_source_queue_event(state, memory),
+            MfMediaSourceCancelGetEvent => {
+                self.dispatch_mf_media_source_cancel_get_event(state, memory)
+            }
             MfMediaSourceGetSourceAttributes => {
                 self.dispatch_mf_media_source_get_source_attributes(state, memory)
             }
@@ -7073,7 +7377,10 @@ fn mf_media_type_handler_methods() -> Vec<HostThunk> {
 
 /// The IMFMediaSource vtable: the IMFMediaEventGenerator base (GetEvent,
 /// BeginGetEvent, EndGetEvent, QueueEvent) followed by GetCharacteristics,
-/// CreatePresentationDescriptor, Start, Stop, Pause, Shutdown.
+/// CreatePresentationDescriptor, Start, Stop, Pause, Shutdown.  The
+/// runtime-extension CancelGetEvent slot is appended after the documented
+/// surface (the Windows IMFMediaEventGenerator publishes no cancel method;
+/// this runtime models the request lifetime explicitly).
 fn mf_media_source_methods() -> Vec<HostThunk> {
     let mut methods = unknown_preamble();
     methods.push(HostThunk::MfMediaSourceGetEvent);
@@ -7086,6 +7393,7 @@ fn mf_media_source_methods() -> Vec<HostThunk> {
     methods.push(HostThunk::MfMediaSourceStop);
     methods.push(HostThunk::MfMediaSourcePause);
     methods.push(HostThunk::MfMediaSourceShutdown);
+    methods.push(HostThunk::MfMediaSourceCancelGetEvent);
     methods
 }
 
@@ -9119,6 +9427,362 @@ mod tests {
             assert_eq!(
                 runtime.mf_media_sources.get(&graph.source).unwrap().state(),
                 crate::media::MfSourceState::Stopped
+            );
+        })
+    }
+
+    // ---- Adversarial async-pump coverage ---------------------------------
+
+    const MF_CB_OBJECT: u64 = 0x62_000;
+    const MF_CB_VTABLE: u64 = 0x62_100;
+    const MF_CB_STUB: u64 = 0x62_200;
+    const MF_CB_COUNT: u64 = 0x62_300;
+    const MF_CB_RESULT: u64 = 0x62_304;
+    const MF_CB_STACK: u64 = 0x52_000;
+
+    /// Install a real x86 IMFAsyncCallback stub: it records the result
+    /// pointer argument and increments an invocation counter, returning S_OK.
+    fn install_mf_async_callback(memory: &mut MemoryImage) {
+        memory.map_bytes(MF_CB_OBJECT, &[0_u8; 8]);
+        memory.map_bytes(MF_CB_VTABLE, &[0_u8; 32]);
+        memory.map_bytes(MF_CB_COUNT, &[0_u8; 8]);
+        memory.map_bytes(MF_CB_STACK, &[0_u8; 0x400]);
+        let mut code = Vec::new();
+        // mov eax, [esp+8] (pAsyncResult)
+        code.extend_from_slice(&[0x8B, 0x44, 0x24, 0x08]);
+        // mov [MF_CB_RESULT], eax
+        code.push(0xA3);
+        code.extend_from_slice(&(MF_CB_RESULT as u32).to_le_bytes());
+        // mov eax, [MF_CB_COUNT]
+        code.push(0xA1);
+        code.extend_from_slice(&(MF_CB_COUNT as u32).to_le_bytes());
+        // add eax, 1
+        code.extend_from_slice(&[0x05, 0x01, 0x00, 0x00, 0x00]);
+        // mov [MF_CB_COUNT], eax
+        code.push(0xA3);
+        code.extend_from_slice(&(MF_CB_COUNT as u32).to_le_bytes());
+        code.extend_from_slice(&[0x31, 0xC0, 0xC3]); // xor eax,eax; ret
+        let mut stub = vec![0x90_u8; 0x40];
+        stub[..code.len()].copy_from_slice(&code);
+        memory.map_bytes(MF_CB_STUB, &stub);
+        write_u32(memory, MF_CB_OBJECT, MF_CB_VTABLE as u32);
+        // IMFAsyncCallback: QI(0) AddRef(1) Release(2) GetParameters(3)
+        // Invoke(4).
+        write_u32(memory, MF_CB_VTABLE + 16, MF_CB_STUB as u32);
+    }
+
+    fn mf_callback_count(memory: &MemoryImage) -> u32 {
+        read_guest_u32(memory, MF_CB_COUNT).unwrap_or(0)
+    }
+
+    fn mf_callback_result(memory: &MemoryImage) -> u64 {
+        u64::from(read_guest_u32(memory, MF_CB_RESULT).unwrap_or(0))
+    }
+
+    fn drain_mf(runtime: &mut PeHostRuntime, state: &mut CpuState, memory: &mut MemoryImage) {
+        runtime
+            .drain_pending_mf_async_completions(state, memory)
+            .expect("drain MF completions");
+    }
+
+    fn begin_get_event(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        source: u64,
+        callback: u64,
+    ) -> u64 {
+        let thunk: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceBeginGetEvent);
+        dispatch_x86_thunk(
+            runtime,
+            memory,
+            thunk,
+            &[source as u32, callback as u32, 0x7000],
+        )
+    }
+
+    fn start_source(runtime: &mut PeHostRuntime, memory: &mut MemoryImage, source: u64) -> u64 {
+        let thunk: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceStart);
+        dispatch_x86_thunk(runtime, memory, thunk, &[source as u32, 0, 0, 0])
+    }
+
+    #[test]
+    fn mf_begin_get_event_parks_cancels_and_delivers_exactly_once() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-async-events");
+            let mut memory = MemoryImage::default();
+            let mp4 = minimal_mp4_file();
+            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &mp4);
+            let graph = create_source_graph(&mut runtime, &mut memory, "C:\\media\\clip.mp4");
+            install_mf_async_callback(&mut memory);
+
+            let mut state = CpuState::new(GuestArch::X86);
+            state.set(Register::Rsp, MF_CB_STACK);
+
+            // No event is queued yet: the request parks with E_PENDING and no
+            // callback may fire before a servicing point runs.
+            assert_eq!(
+                begin_get_event(&mut runtime, &mut memory, graph.source, MF_CB_OBJECT),
+                u64::from(0x8000_000A_u32),
+                "E_PENDING"
+            );
+            assert_eq!(mf_callback_count(&memory), 0);
+            // A second Begin while one is parked is rejected.
+            assert_eq!(
+                begin_get_event(&mut runtime, &mut memory, graph.source, MF_CB_OBJECT),
+                u64::from(E_INVALIDARG)
+            );
+            // Cancel drops the park; a second cancel reports S_FALSE.
+            let cancel: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceCancelGetEvent);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, cancel, &[graph.source as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, cancel, &[graph.source as u32]),
+                1,
+                "S_FALSE"
+            );
+
+            // Park again, then a real state change (Start) completes it.
+            assert_eq!(
+                begin_get_event(&mut runtime, &mut memory, graph.source, MF_CB_OBJECT),
+                u64::from(0x8000_000A_u32)
+            );
+            assert_eq!(start_source(&mut runtime, &mut memory, graph.source), 0);
+            assert_eq!(
+                mf_callback_count(&memory),
+                0,
+                "callback fires at servicing only"
+            );
+            drain_mf(&mut runtime, &mut state, &mut memory);
+            assert_eq!(mf_callback_count(&memory), 1);
+            let result = mf_callback_result(&memory);
+            assert_ne!(result, 0, "the callback received a real IMFAsyncResult");
+            // Draining again must not re-invoke the callback.
+            drain_mf(&mut runtime, &mut state, &mut memory);
+            assert_eq!(mf_callback_count(&memory), 1);
+
+            // EndGetEvent returns the real event for that result, exactly once.
+            let end: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceEndGetEvent);
+            let event_out = 0x47_000;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end,
+                    &[graph.source as u32, result as u32, event_out as u32]
+                ),
+                0
+            );
+            let event = read_guest_pointer(&memory, event_out, GuestArch::X86).unwrap();
+            assert_ne!(event, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end,
+                    &[graph.source as u32, result as u32, event_out as u32]
+                ),
+                u64::from(E_INVALIDARG),
+                "a completion is consumed exactly once"
+            );
+            // Junk result pointers are rejected without disturbing state.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end,
+                    &[graph.source as u32, 0xDEAD_0000_u32, event_out as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            // A callback object whose vtable has a null Invoke slot is rejected.
+            let broken = 0x63_000;
+            let broken_vtable = 0x63_100;
+            memory.map_bytes(broken, &[0_u8; 8]);
+            memory.map_bytes(broken_vtable, &[0_u8; 32]);
+            write_u32(&mut memory, broken, broken_vtable as u32);
+            assert_eq!(
+                begin_get_event(&mut runtime, &mut memory, graph.source, broken),
+                u64::from(E_INVALIDARG)
+            );
+            // An unknown source object fails cleanly.
+            assert_eq!(
+                begin_get_event(&mut runtime, &mut memory, 0xDEAD_0000, MF_CB_OBJECT),
+                u64::from(E_NOINTERFACE)
+            );
+        })
+    }
+
+    #[test]
+    fn mf_begin_get_event_cancel_prevents_callback() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-async-cancel");
+            let mut memory = MemoryImage::default();
+            let mp4 = minimal_mp4_file();
+            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &mp4);
+            let graph = create_source_graph(&mut runtime, &mut memory, "C:\\media\\clip.mp4");
+            install_mf_async_callback(&mut memory);
+            let mut state = CpuState::new(GuestArch::X86);
+            state.set(Register::Rsp, MF_CB_STACK);
+
+            assert_eq!(
+                begin_get_event(&mut runtime, &mut memory, graph.source, MF_CB_OBJECT),
+                u64::from(0x8000_000A_u32)
+            );
+            let cancel: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceCancelGetEvent);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, cancel, &[graph.source as u32]),
+                0
+            );
+            assert_eq!(start_source(&mut runtime, &mut memory, graph.source), 0);
+            drain_mf(&mut runtime, &mut state, &mut memory);
+            assert_eq!(
+                mf_callback_count(&memory),
+                0,
+                "a cancelled request never invokes the callback"
+            );
+            assert_eq!(mf_callback_result(&memory), 0);
+        })
+    }
+
+    #[test]
+    fn mf_byte_stream_begin_read_is_async_and_exactly_once() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-async-read");
+            let mut memory = MemoryImage::default();
+            let mp4 = minimal_mp4_file();
+            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &mp4);
+            let graph = create_source_graph(&mut runtime, &mut memory, "C:\\media\\clip.mp4");
+            install_mf_async_callback(&mut memory);
+            let mut state = CpuState::new(GuestArch::X86);
+            state.set(Register::Rsp, MF_CB_STACK);
+
+            let begin: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamBeginRead);
+            let end: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamEndRead);
+            let buffer = 0x48_000;
+            memory.map_bytes(buffer, &[0_u8; 32]);
+
+            // Invalid argument shapes are rejected before anything is queued.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    begin,
+                    &[graph.byte_stream as u32, 0, 8, MF_CB_OBJECT as u32, 0]
+                ),
+                u64::from(E_INVALIDARG),
+                "a null buffer with a length is invalid"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    begin,
+                    &[
+                        graph.byte_stream as u32,
+                        buffer as u32,
+                        8,
+                        0xDEAD_0000_u32,
+                        0
+                    ]
+                ),
+                u64::from(E_INVALIDARG),
+                "an unmapped callback object is invalid"
+            );
+            assert_eq!(mf_callback_count(&memory), 0);
+
+            // A null callback keeps the synchronous contract.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    begin,
+                    &[graph.byte_stream as u32, buffer as u32, 8, 0, 0]
+                ),
+                0,
+                "S_OK without a callback"
+            );
+
+            // With a callback the read completes asynchronously through the
+            // pump: E_PENDING, callback only at the servicing point.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    begin,
+                    &[
+                        graph.byte_stream as u32,
+                        buffer as u32,
+                        16,
+                        MF_CB_OBJECT as u32,
+                        0x99
+                    ]
+                ),
+                u64::from(0x8000_000A_u32)
+            );
+            assert_eq!(mf_callback_count(&memory), 0);
+            drain_mf(&mut runtime, &mut state, &mut memory);
+            assert_eq!(mf_callback_count(&memory), 1);
+            let result = mf_callback_result(&memory);
+            assert_ne!(result, 0);
+
+            // EndRead returns the real byte count exactly once.
+            let read_out = 0x47_100;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end,
+                    &[graph.byte_stream as u32, result as u32, read_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, read_out).unwrap(), 16);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end,
+                    &[graph.byte_stream as u32, result as u32, read_out as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+
+            // Closing the stream makes both halves fail with the real status.
+            let close: u64 = runtime.alloc_host_thunk(HostThunk::MfByteStreamClose);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    close,
+                    &[graph.byte_stream as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    begin,
+                    &[
+                        graph.byte_stream as u32,
+                        buffer as u32,
+                        8,
+                        MF_CB_OBJECT as u32,
+                        0
+                    ]
+                ),
+                u64::from(E_FAIL)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end,
+                    &[graph.byte_stream as u32, result as u32, read_out as u32]
+                ),
+                u64::from(E_FAIL)
             );
         })
     }

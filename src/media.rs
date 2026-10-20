@@ -1043,6 +1043,193 @@ impl Default for MfEventQueue {
 }
 
 // ===========================================================================
+// MF asynchronous callback pump
+// ===========================================================================
+//
+// The MF asynchronous surface (`IMFMediaEventGenerator::BeginGetEvent` and
+// `IMFByteStream::BeginRead`/`BeginWrite`) parks the guest request here and
+// completes it when the backing real state changes.  The runtime servicing
+// points drain the queued completions and invoke the guest
+// `IMFAsyncCallback::Invoke` — the same shape the audio-activation
+// completions use (`crate::audio_activation` + the block-dispatch
+// safepoint).  The registry is process-keyed because a `PeHostRuntime`
+// services exactly one guest process.
+
+/// The asynchronous MF operation a parked request or completion belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MfAsyncOp {
+    /// `IMFMediaEventGenerator::BeginGetEvent`.
+    GetEvent,
+    /// `IMFByteStream::BeginRead`.
+    Read,
+    /// `IMFByteStream::BeginWrite`.
+    Write,
+}
+
+/// A parked MF asynchronous request: the guest `IMFAsyncCallback` whose
+/// `Invoke` fires when the operation completes, plus the state object that
+/// becomes the result's `GetState`.
+#[derive(Debug, Clone)]
+pub(crate) struct MfParkedRequest {
+    /// The object the request was made on (media source / byte stream).
+    pub(crate) owner: u64,
+    /// The operation.
+    pub(crate) op: MfAsyncOp,
+    /// The `IMFAsyncCallback` object passed to the Begin call.
+    pub(crate) callback_object: u64,
+    /// The callback's `Invoke` entry point (vtable slot 4, resolved at Begin
+    /// time so delivery never has to re-read guest memory).
+    pub(crate) callback_method: u64,
+    /// The `punkState` passed to the Begin call.
+    pub(crate) state_object: u64,
+}
+
+/// A completed MF asynchronous operation: the real `IMFAsyncResult` handed
+/// to the callback, and the payload `EndGetEvent`/`EndRead`/`EndWrite`
+/// retrieves.
+#[derive(Debug, Clone)]
+pub(crate) struct MfAsyncCompletion {
+    /// The object the request was made on.
+    pub(crate) owner: u64,
+    /// The operation.
+    pub(crate) op: MfAsyncOp,
+    /// The guest `IMFAsyncResult` object.
+    pub(crate) result: u64,
+    /// The result's `GetStatus` value.
+    pub(crate) status: u32,
+    /// The callback object to invoke (0 = no callback; poll via EndX).
+    pub(crate) callback_object: u64,
+    /// The callback's `Invoke` entry point (0 = no callback).
+    pub(crate) callback_method: u64,
+    /// The result's state object (`GetState`).
+    pub(crate) state_object: u64,
+    /// The guest `IMFMediaEvent` object a `GetEvent` completion produced.
+    pub(crate) event_object: u64,
+    /// Bytes read/written by a byte-stream completion.
+    pub(crate) bytes: u32,
+}
+
+type MfParkedMap = std::collections::HashMap<u32, Vec<MfParkedRequest>>;
+type MfCompletionQueue =
+    std::collections::HashMap<u32, std::collections::VecDeque<MfAsyncCompletion>>;
+type MfResultMap =
+    std::collections::HashMap<u32, std::collections::HashMap<u64, MfAsyncCompletion>>;
+
+static MF_PARKED_REQUESTS: std::sync::OnceLock<std::sync::Mutex<MfParkedMap>> =
+    std::sync::OnceLock::new();
+static MF_COMPLETION_QUEUE: std::sync::OnceLock<std::sync::Mutex<MfCompletionQueue>> =
+    std::sync::OnceLock::new();
+static MF_ASYNC_RESULTS: std::sync::OnceLock<std::sync::Mutex<MfResultMap>> =
+    std::sync::OnceLock::new();
+
+fn mf_registry<T: Default>(
+    cell: &std::sync::OnceLock<std::sync::Mutex<T>>,
+) -> std::sync::MutexGuard<'_, T> {
+    cell.get_or_init(|| std::sync::Mutex::new(T::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Park a Begin request until the operation completes.
+pub(crate) fn park_mf_request(pid: u32, request: MfParkedRequest) {
+    mf_registry(&MF_PARKED_REQUESTS)
+        .entry(pid)
+        .or_default()
+        .push(request);
+}
+
+/// Whether a request for `owner`/`op` is still parked (not yet completed).
+pub(crate) fn has_mf_parked_request(pid: u32, owner: u64, op: MfAsyncOp) -> bool {
+    mf_registry(&MF_PARKED_REQUESTS)
+        .get(&pid)
+        .is_some_and(|requests| {
+            requests
+                .iter()
+                .any(|request| request.owner == owner && request.op == op)
+        })
+}
+
+/// Take (and remove) the parked request for `owner`/`op`, if any.  Used by
+/// completion (the request is consumed when its result is produced) and by
+/// cancellation (the request is dropped).
+pub(crate) fn take_mf_parked_request(
+    pid: u32,
+    owner: u64,
+    op: MfAsyncOp,
+) -> Option<MfParkedRequest> {
+    let mut parked = mf_registry(&MF_PARKED_REQUESTS);
+    let requests = parked.get_mut(&pid)?;
+    let index = requests
+        .iter()
+        .position(|request| request.owner == owner && request.op == op)?;
+    Some(requests.remove(index))
+}
+
+/// Record a completed operation: the real result becomes retrievable by
+/// `EndGetEvent`/`EndRead`/`EndWrite`, and the callback is queued for the
+/// runtime servicing point that drains the pump.
+pub(crate) fn complete_mf_request(pid: u32, completion: MfAsyncCompletion) {
+    mf_registry(&MF_ASYNC_RESULTS)
+        .entry(pid)
+        .or_default()
+        .insert(completion.result, completion.clone());
+    mf_registry(&MF_COMPLETION_QUEUE)
+        .entry(pid)
+        .or_default()
+        .push_back(completion);
+}
+
+/// Record a completed operation without queueing its callback: used for a
+/// `BeginGetEvent` that completed synchronously (`S_OK`) inside the Begin
+/// call, where Windows does not invoke the callback.
+pub(crate) fn record_mf_result(pid: u32, completion: MfAsyncCompletion) {
+    mf_registry(&MF_ASYNC_RESULTS)
+        .entry(pid)
+        .or_default()
+        .insert(completion.result, completion);
+}
+
+/// Pop the next completion awaiting callback delivery, if any.
+pub(crate) fn pop_mf_completion(pid: u32) -> Option<MfAsyncCompletion> {
+    mf_registry(&MF_COMPLETION_QUEUE)
+        .get_mut(&pid)
+        .and_then(std::collections::VecDeque::pop_front)
+}
+
+/// Take the completed operation recorded for `result` (one-shot: EndX
+/// consumes it).
+pub(crate) fn take_mf_result(pid: u32, result: u64) -> Option<MfAsyncCompletion> {
+    mf_registry(&MF_ASYNC_RESULTS)
+        .get_mut(&pid)?
+        .remove(&result)
+}
+
+/// The guest `IMFMediaEvent` object a completed `GetEvent` result carries
+/// (used by `IMFAsyncResult::GetObject`).
+pub(crate) fn mf_result_event_object(pid: u32, result: u64) -> Option<u64> {
+    mf_registry(&MF_ASYNC_RESULTS)
+        .get(&pid)?
+        .get(&result)
+        .map(|completion| completion.event_object)
+}
+
+/// The `IMFAsyncCallback` object a completed result carries (used by
+/// `IMFAsyncResult::GetCallback`).
+pub(crate) fn mf_result_callback_object(pid: u32, result: u64) -> Option<u64> {
+    mf_registry(&MF_ASYNC_RESULTS)
+        .get(&pid)?
+        .get(&result)
+        .map(|completion| completion.callback_object)
+}
+
+/// Forget every parked request and pending completion of `pid`.
+pub(crate) fn clear_mf_async_state(pid: u32) {
+    mf_registry(&MF_PARKED_REQUESTS).remove(&pid);
+    mf_registry(&MF_COMPLETION_QUEUE).remove(&pid);
+    mf_registry(&MF_ASYNC_RESULTS).remove(&pid);
+}
+
+// ===========================================================================
 // MFT (Media Foundation Transform) trait
 // ===========================================================================
 
