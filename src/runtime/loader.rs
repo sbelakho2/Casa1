@@ -1047,7 +1047,10 @@ impl PeHostRuntime {
     /// (e.g. `DLL_PROCESS_ATTACH = 1`). Callbacks fire from
     /// [`get_or_create_module_handle`] when a synthetic module is first created.
     #[allow(dead_code)] // synthetic-DLL init callback registration; used by tests
-    pub fn register_synthetic_dll_init_callback(&mut self, cb: Box<dyn FnMut(u64, u32)>) {
+    pub fn register_synthetic_dll_init_callback(
+        &mut self,
+        cb: Box<dyn FnMut(u64, u32) + Send + Sync>,
+    ) {
         self.synthetic_dll_init_callbacks.push(cb);
     }
 }
@@ -1541,5 +1544,48 @@ impl PeHostRuntime {
             Some(_) => false,
             None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ge::GeArch;
+
+    #[test]
+    fn synthetic_dll_init_callback_failure_race_fires_exactly_once() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "loader-synthetic-callback",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("game environment");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_callback = std::sync::Arc::clone(&seen);
+        runtime.register_synthetic_dll_init_callback(Box::new(move |handle, reason| {
+            seen_callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((handle, reason));
+        }));
+        let handle = runtime.get_or_create_module_handle("casa1_callback_probe.dll");
+        assert_ne!(handle, 0, "a synthetic module must receive a real handle");
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![(handle, DLL_PROCESS_ATTACH)],
+            "the callback must observe the created handle and the attach reason"
+        );
+        let again = runtime.get_or_create_module_handle("casa1_callback_probe.dll");
+        assert_eq!(again, handle, "the repeat load must reuse the handle");
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "a repeated load must not fire a second synthetic init callback"
+        );
     }
 }

@@ -10,7 +10,7 @@ pub(crate) use self::thread::*;
 pub mod handle_table;
 pub mod object_manager;
 pub(crate) mod process;
-mod scheduler;
+pub(crate) mod scheduler;
 pub(crate) use self::scheduler::*;
 mod callback;
 pub(crate) use self::callback::*;
@@ -5361,24 +5361,46 @@ pub enum HostThunk {
     DllFunc,
     DllMain,
     DllProc,
+    D3DKMTAcquireKeyedMutex,
+    D3DKMTAcquireKeyedMutex2,
     D3DKMTCloseAdapter,
     D3DKMTCreateAllocation,
     D3DKMTCreateContext,
     D3DKMTCreateDevice,
+    D3DKMTCreateSwapChain,
     D3DKMTCreateSynchronizationObject,
+    D3DKMTDestroyAllocation,
     D3DKMTDestroyContext,
     D3DKMTDestroyDevice,
+    D3DKMTDestroySwapchain,
+    D3DKMTDestroySynchronizationObject,
     D3DKMTEnumAdapters,
+    D3DKMTEvict,
     D3DKMTGetDisplayModeList,
+    D3DKMTMakeResident,
+    D3DKMTOpenAdapterFromDeviceName,
+    D3DKMTOpenAdapterFromGdiDisplayName,
     D3DKMTOpenAdapterFromHdc,
+    D3DKMTOpenAdapterFromLuid,
+    D3DKMTOpenDevice,
     D3DKMTOpenKeyedMutex,
+    D3DKMTOpenKeyedMutex2,
     D3DKMTOpenResource,
+    D3DKMTOpenResource2,
     D3DKMTPresent,
     D3DKMTQueryAdapterInfo,
+    D3DKMTReleaseKeyedMutex,
+    D3DKMTReleaseKeyedMutex2,
     D3DKMTQueryAllocationResidency,
+    D3DKMTQueryStatistics,
+    D3DKMTQuerySwapChainInfo,
     D3DKMTRender,
     D3DKMTSetAllocationPriority,
     D3DKMTSetDisplayPrivateDriverFormat,
+    D3DKMTSignalSynchronizationObject,
+    D3DKMTSignalSynchronizationObject2,
+    D3DKMTWaitForSynchronizationObject,
+    D3DKMTWaitForSynchronizationObject2,
     JetAttachDatabase,
     JetBeginTransaction,
     JetCloseDatabase,
@@ -19012,7 +19034,11 @@ impl PeHostRuntime {
                     let out_ptr = state.get(Register::Rdx);
                     if out_ptr != 0
                         && let Some(instance_id) = self.xapo_effect_instances.get(&object).copied()
-                            && let Some(props) = self.xapo_manager.instance_registration(instance_id) {
+                            && let Some(props) = self
+                                .xapo_manager
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .instance_registration(instance_id) {
                                 // Write the XAPO_REGISTRATION_PROPERTIES structure to guest memory.
                                 // Layout (COM repr(C)):
                                 //   0:  clsid (16 bytes)
@@ -19106,7 +19132,11 @@ impl PeHostRuntime {
 
                             // Determine actual channel count from the effect instance.
                             let channels = if let Some(instance_id) = self.xapo_effect_instances.get(&object).copied() {
-                                self.xapo_manager.instance_channels(instance_id).unwrap_or(2) as usize
+                                self.xapo_manager
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .instance_channels(instance_id)
+                                    .unwrap_or(2) as usize
                             } else {
                                 2
                             };
@@ -19121,11 +19151,10 @@ impl PeHostRuntime {
                             let mut output_buf = vec![0.0f32; out_samples.max(4)];
 
                             if let Some(instance_id) = self.xapo_effect_instances.get(&object).copied() {
-                                self.xapo_manager.process_instance(
-                                    instance_id,
-                                    &input_buf,
-                                    &mut output_buf,
-                                );
+                                self.xapo_manager
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .process_instance(instance_id, &input_buf, &mut output_buf);
                             }
 
                             // Write output samples back to guest memory
@@ -29374,7 +29403,7 @@ impl PeHostRuntime {
             ref thunk @ (HostThunk::BasicClassAddRef | HostThunk::BasicClassGetIDsOfNames | HostThunk::BasicClassInvoke | HostThunk::BasicClassQueryInterface | HostThunk::BasicClassRelease | HostThunk::BasicDispatchInvoke | HostThunk::DllCall | HostThunk::DllFunc | HostThunk::DllMain | HostThunk::DllProc) => {
                 self.dispatch_msvbvm(thunk, state, memory)?;
             }
-            ref thunk @ (HostThunk::D3DKMTCloseAdapter | HostThunk::D3DKMTCreateAllocation | HostThunk::D3DKMTCreateContext | HostThunk::D3DKMTCreateDevice | HostThunk::D3DKMTCreateSynchronizationObject | HostThunk::D3DKMTDestroyContext | HostThunk::D3DKMTDestroyDevice | HostThunk::D3DKMTEnumAdapters | HostThunk::D3DKMTGetDisplayModeList | HostThunk::D3DKMTOpenAdapterFromHdc | HostThunk::D3DKMTOpenKeyedMutex | HostThunk::D3DKMTOpenResource | HostThunk::D3DKMTPresent | HostThunk::D3DKMTQueryAdapterInfo | HostThunk::D3DKMTQueryAllocationResidency | HostThunk::D3DKMTRender | HostThunk::D3DKMTSetAllocationPriority | HostThunk::D3DKMTSetDisplayPrivateDriverFormat) => {
+            ref thunk @ (HostThunk::D3DKMTAcquireKeyedMutex | HostThunk::D3DKMTAcquireKeyedMutex2 | HostThunk::D3DKMTCloseAdapter | HostThunk::D3DKMTCreateAllocation | HostThunk::D3DKMTCreateContext | HostThunk::D3DKMTCreateDevice | HostThunk::D3DKMTCreateSwapChain | HostThunk::D3DKMTCreateSynchronizationObject | HostThunk::D3DKMTDestroyAllocation | HostThunk::D3DKMTDestroyContext | HostThunk::D3DKMTDestroyDevice | HostThunk::D3DKMTDestroySwapchain | HostThunk::D3DKMTDestroySynchronizationObject | HostThunk::D3DKMTEnumAdapters | HostThunk::D3DKMTEvict | HostThunk::D3DKMTGetDisplayModeList | HostThunk::D3DKMTMakeResident | HostThunk::D3DKMTOpenAdapterFromDeviceName | HostThunk::D3DKMTOpenAdapterFromGdiDisplayName | HostThunk::D3DKMTOpenAdapterFromHdc | HostThunk::D3DKMTOpenAdapterFromLuid | HostThunk::D3DKMTOpenDevice | HostThunk::D3DKMTOpenKeyedMutex | HostThunk::D3DKMTOpenKeyedMutex2 | HostThunk::D3DKMTOpenResource | HostThunk::D3DKMTOpenResource2 | HostThunk::D3DKMTPresent | HostThunk::D3DKMTQueryAdapterInfo | HostThunk::D3DKMTQueryAllocationResidency | HostThunk::D3DKMTQueryStatistics | HostThunk::D3DKMTQuerySwapChainInfo | HostThunk::D3DKMTReleaseKeyedMutex | HostThunk::D3DKMTReleaseKeyedMutex2 | HostThunk::D3DKMTRender | HostThunk::D3DKMTSetAllocationPriority | HostThunk::D3DKMTSetDisplayPrivateDriverFormat | HostThunk::D3DKMTSignalSynchronizationObject | HostThunk::D3DKMTSignalSynchronizationObject2 | HostThunk::D3DKMTWaitForSynchronizationObject | HostThunk::D3DKMTWaitForSynchronizationObject2) => {
                 self.dispatch_d3d8thk(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::JetAttachDatabase | HostThunk::JetBeginTransaction | HostThunk::JetCloseDatabase | HostThunk::JetCloseTable | HostThunk::JetCommitTransaction | HostThunk::JetCreateDatabase | HostThunk::JetDetachDatabase | HostThunk::JetGetTableColumnInfo | HostThunk::JetInit | HostThunk::JetOpenDatabase | HostThunk::JetOpenTable | HostThunk::JetRollback | HostThunk::JetTerm) => {
@@ -57895,6 +57924,7 @@ impl PeHostRuntime {
                                 .entry(thread_id as u64)
                                 .or_default()
                                 .queue_user_apc(pfn_apc, dw_data);
+                            self.notify_parked_apc(thread_id);
                             state.set(Register::Rax, 1);
                             self.last_error = 0;
                             self.push_trace(
@@ -68384,7 +68414,12 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
         clsid: &[u8; 16],
     ) -> AppResult<Option<u64>> {
-        let instance_id = match self.xapo_manager.create_instance(clsid) {
+        let instance_id = match self
+            .xapo_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .create_instance(clsid)
+        {
             Some(id) => id,
             None => return Ok(None),
         };
@@ -68407,7 +68442,10 @@ impl PeHostRuntime {
 
     fn destroy_xapo_effect_object(&mut self, address: u64) -> AppResult<()> {
         if let Some(instance_id) = self.xapo_effect_instances.remove(&address) {
-            self.xapo_manager.destroy_instance(instance_id);
+            self.xapo_manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .destroy_instance(instance_id);
         }
         self.guest_objects.remove(&address);
         Ok(())
@@ -88913,8 +88951,97 @@ impl HostThunk {
             {
                 Self::Dxva2GetVideoProcessorCaps
             }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTAcquireKeyedMutex" =>
+            {
+                Self::D3DKMTAcquireKeyedMutex
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTAcquireKeyedMutex2" =>
+            {
+                Self::D3DKMTAcquireKeyedMutex2
+            }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTCloseAdapter" => {
                 Self::D3DKMTCloseAdapter
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTReleaseKeyedMutex" =>
+            {
+                Self::D3DKMTReleaseKeyedMutex
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTReleaseKeyedMutex2" =>
+            {
+                Self::D3DKMTReleaseKeyedMutex2
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTCreateSwapChain" =>
+            {
+                Self::D3DKMTCreateSwapChain
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTDestroyAllocation" =>
+            {
+                Self::D3DKMTDestroyAllocation
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTDestroySwapchain" =>
+            {
+                Self::D3DKMTDestroySwapchain
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTEvict" => {
+                Self::D3DKMTEvict
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTMakeResident" => {
+                Self::D3DKMTMakeResident
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTOpenAdapterFromLuid" =>
+            {
+                Self::D3DKMTOpenAdapterFromLuid
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTOpenAdapterFromGdiDisplayName" =>
+            {
+                Self::D3DKMTOpenAdapterFromGdiDisplayName
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTOpenAdapterFromDeviceName" =>
+            {
+                Self::D3DKMTOpenAdapterFromDeviceName
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTOpenDevice" => {
+                Self::D3DKMTOpenDevice
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTQueryStatistics" =>
+            {
+                Self::D3DKMTQueryStatistics
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTQuerySwapChainInfo" =>
+            {
+                Self::D3DKMTQuerySwapChainInfo
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTSignalSynchronizationObject" =>
+            {
+                Self::D3DKMTSignalSynchronizationObject
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTSignalSynchronizationObject2" =>
+            {
+                Self::D3DKMTSignalSynchronizationObject2
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTWaitForSynchronizationObject" =>
+            {
+                Self::D3DKMTWaitForSynchronizationObject
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTWaitForSynchronizationObject2" =>
+            {
+                Self::D3DKMTWaitForSynchronizationObject2
             }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
                 if name == "D3DKMTCreateAllocation" =>
@@ -88937,6 +89064,11 @@ impl HostThunk {
             {
                 Self::D3DKMTDestroyContext
             }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTDestroySynchronizationObject" =>
+            {
+                Self::D3DKMTDestroySynchronizationObject
+            }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTDestroyDevice" => {
                 Self::D3DKMTDestroyDevice
             }
@@ -88958,8 +89090,16 @@ impl HostThunk {
             {
                 Self::D3DKMTOpenKeyedMutex
             }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTOpenKeyedMutex2" =>
+            {
+                Self::D3DKMTOpenKeyedMutex2
+            }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTOpenResource" => {
                 Self::D3DKMTOpenResource
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTOpenResource2" => {
+                Self::D3DKMTOpenResource2
             }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTPresent" => {
                 Self::D3DKMTPresent
@@ -117221,13 +117361,20 @@ mod tests {
             let (mut runtime, _tmp) = test_runtime("evidence-mixed");
             let mut memory = MemoryImage::default();
 
-            // ── d3d8thk: the adapter/device/context lifecycle ──
+            // ── d3d8thk: the adapter/device/swapchain lifecycle ──
             let enum_adapters: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTEnumAdapters);
-            let open_adapter: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTOpenAdapterFromHdc);
+            let open_adapter: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTOpenAdapterFromLuid);
             let create_device: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTCreateDevice);
+            let create_swapchain: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTCreateSwapChain);
             let present: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTPresent);
+            let destroy_swapchain: u64 =
+                runtime.alloc_host_thunk(HostThunk::D3DKMTDestroySwapchain);
+            let destroy_device: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTDestroyDevice);
             let close_adapter: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTCloseAdapter);
             let enum_info = 0x41_000_u64;
+            let adapter_list = 0x41_008_u64;
+            write_guest_u32(&mut memory, enum_info, 0).ok();
+            write_guest_u32(&mut memory, enum_info + 4, 0).ok();
             assert_eq!(
                 dispatch_x86_thunk(
                     &mut runtime,
@@ -117242,15 +117389,34 @@ mod tests {
                 1,
                 "one adapter"
             );
-            let open_info = 0x41_010_u64;
+            write_guest_u32(&mut memory, enum_info, 1).ok();
+            write_guest_pointer(&mut memory, enum_info + 4, adapter_list, GuestArch::X86).ok();
+            memory.map_bytes(adapter_list, &[0_u8; 20]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enum_adapters,
+                    &[enum_info as u32]
+                ),
+                0
+            );
+            let open_info = 0x41_020_u64;
+            memory.map_bytes(open_info, &[0_u8; 12]);
+            let adapter_luid_low = read_guest_u32(&memory, adapter_list + 4).unwrap();
+            let adapter_luid_high = read_guest_u32(&memory, adapter_list + 8).unwrap();
+            write_guest_u32(&mut memory, open_info, adapter_luid_low).ok();
+            write_guest_u32(&mut memory, open_info + 4, adapter_luid_high).ok();
             assert_eq!(
                 dispatch_x86_thunk(&mut runtime, &mut memory, open_adapter, &[open_info as u32]),
                 0
             );
-            let adapter = read_guest_pointer(&memory, open_info + 8, GuestArch::X86).unwrap();
+            let adapter = read_guest_u32(&memory, open_info + 8).unwrap();
             assert_ne!(adapter, 0);
-            let device_info = 0x41_020_u64;
-            write_guest_pointer(&mut memory, device_info, adapter, GuestArch::X86).ok();
+            let device_info = 0x41_030_u64;
+            memory.map_bytes(device_info, &[0_u8; 12]);
+            write_guest_u32(&mut memory, device_info, adapter).ok();
+            write_guest_u32(&mut memory, device_info + 4, 0).ok();
             assert_eq!(
                 dispatch_x86_thunk(
                     &mut runtime,
@@ -117260,16 +117426,71 @@ mod tests {
                 ),
                 0
             );
-            assert_ne!(
-                read_guest_pointer(&memory, device_info + 8, GuestArch::X86).unwrap(),
+            let device = read_guest_u32(&memory, device_info + 8).unwrap();
+            assert_ne!(device, 0);
+            let swap_info = 0x41_040_u64;
+            memory.map_bytes(swap_info, &[0_u8; 28]);
+            write_guest_u32(&mut memory, swap_info, device).ok();
+            write_guest_u32(&mut memory, swap_info + 4, 8).ok();
+            write_guest_u32(&mut memory, swap_info + 8, 8).ok();
+            write_guest_u32(&mut memory, swap_info + 12, 87).ok();
+            write_guest_u32(&mut memory, swap_info + 16, 2).ok();
+            write_guest_u32(&mut memory, swap_info + 20, 0).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_swapchain,
+                    &[swap_info as u32]
+                ),
+                0
+            );
+            let swapchain = read_guest_u32(&memory, swap_info + 24).unwrap();
+            assert_ne!(swapchain, 0);
+            let present_info = 0x41_060_u64;
+            memory.map_bytes(present_info, &[0_u8; 56]);
+            write_guest_u32(&mut memory, present_info, device).ok();
+            write_guest_u32(&mut memory, present_info + 4, swapchain).ok();
+            write_guest_u32(&mut memory, present_info + 8, 1).ok();
+            write_guest_u32(&mut memory, present_info + 12, 0).ok();
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, present, &[present_info as u32]),
                 0
             );
             assert_eq!(
-                dispatch_x86_thunk(&mut runtime, &mut memory, present, &[0]),
+                read_guest_u64(&memory, present_info + 16).unwrap(),
+                1,
+                "one present"
+            );
+            assert_eq!(
+                read_guest_u64(&memory, present_info + 24).unwrap(),
+                1,
+                "one refresh"
+            );
+            let swap_close = 0x41_0A0_u64;
+            write_guest_u32(&mut memory, swap_close, swapchain).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    destroy_swapchain,
+                    &[swap_close as u32]
+                ),
                 0
             );
-            let close_info = 0x41_030_u64;
-            write_guest_pointer(&mut memory, close_info, adapter, GuestArch::X86).ok();
+            let device_close = 0x41_0A8_u64;
+            write_guest_u32(&mut memory, device_close, device).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    destroy_device,
+                    &[device_close as u32]
+                ),
+                0
+            );
+            let close_info = 0x41_0B0_u64;
+            write_guest_u32(&mut memory, close_info, adapter).ok();
             assert_eq!(
                 dispatch_x86_thunk(
                     &mut runtime,

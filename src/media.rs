@@ -3870,7 +3870,10 @@ impl Mp4Demuxer {
 pub struct SourceReader {
     demuxer: Mp4Demuxer,
     selected_streams: Vec<u32>,
-    decoder: Option<Box<dyn MftTransform>>,
+    /// Wrapped in a `Mutex` so the reader is `Sync` even though the transform
+    /// trait is only `Send` (raw platform handles inside the decoder are used
+    /// through `&mut self`).
+    decoder: Option<std::sync::Mutex<Box<dyn MftTransform>>>,
     /// The guest IMFMediaSource object this reader pulls from (0 when the
     /// reader was created without a source).
     source: u64,

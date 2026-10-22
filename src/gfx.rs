@@ -1642,7 +1642,10 @@ pub struct GraphicsBackend {
     /// Optional callback invoked on every `present()` with the presented frame.
     /// Enables connecting D3D swapchain presents to the live display pipeline.
     /// The callback receives the current backbuffer bytes, width, height, and format.
-    frame_published_callback: Option<Box<dyn FnMut(PresentedFrame) + Send>>,
+    /// Mutex-wrapped because the callback is `FnMut` (not `Sync`) while
+    /// `GraphicsBackend` must be `Sync`; presentation stays serialized on the
+    /// owner thread.
+    frame_published_callback: Option<std::sync::Mutex<Box<dyn FnMut(PresentedFrame) + Send>>>,
     /// API that presents through this backend; labels every `PresentedFrame`
     /// produced by [`presented_frame`](Self::presented_frame).
     frame_source: FrameSource,
@@ -1667,9 +1670,12 @@ pub struct GraphicsBackend {
     /// `presentDrawable:` was committed).
     layer_presents: u64,
     /// Per-instance observability counters for translation optimisations.
-    translation_stats: std::cell::RefCell<TranslationStats>,
+    /// Mutex (not RefCell) because `GraphicsBackend` is shared through
+    /// `PeHostRuntime`, which is `Send + Sync`; translation can run from a
+    /// producer thread while another thread observes the counters.
+    translation_stats: std::sync::Mutex<TranslationStats>,
     /// Cache of translated descriptor tables (revision-validated).
-    descriptor_translation_cache: std::cell::RefCell<DescriptorTranslationCache>,
+    descriptor_translation_cache: std::sync::Mutex<DescriptorTranslationCache>,
 }
 
 impl std::fmt::Debug for GraphicsBackend {
@@ -1741,9 +1747,17 @@ impl Clone for GraphicsBackend {
             present_layer: self.present_layer.clone(),
             layer_present_attempts: self.layer_present_attempts,
             layer_presents: self.layer_presents,
-            translation_stats: std::cell::RefCell::new(*self.translation_stats.borrow()),
-            descriptor_translation_cache: std::cell::RefCell::new(
-                self.descriptor_translation_cache.borrow().clone(),
+            translation_stats: std::sync::Mutex::new(
+                *self
+                    .translation_stats
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ),
+            descriptor_translation_cache: std::sync::Mutex::new(
+                self.descriptor_translation_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
             ),
         }
     }
@@ -2410,8 +2424,8 @@ impl GraphicsBackend {
             timestamps: 1,
             subresource_states: BTreeMap::new(),
             pending_split_barriers: Vec::new(),
-            translation_stats: std::cell::RefCell::new(TranslationStats::default()),
-            descriptor_translation_cache: std::cell::RefCell::new(
+            translation_stats: std::sync::Mutex::new(TranslationStats::default()),
+            descriptor_translation_cache: std::sync::Mutex::new(
                 DescriptorTranslationCache::default(),
             ),
         }
@@ -2635,10 +2649,13 @@ impl GraphicsBackend {
                 None
             }
         };
-        if let (Some(ref mut cb), Some(presented)) =
-            (self.frame_published_callback.as_mut(), presented_frame)
+        if let (Some(callback), Some(presented)) =
+            (self.frame_published_callback.as_ref(), presented_frame)
         {
-            cb(presented);
+            let mut callback = callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            callback(presented);
         }
 
         // Read final queued_frames count after any callback side-effects
@@ -2931,7 +2948,7 @@ impl GraphicsBackend {
         &mut self,
         callback: Option<Box<dyn FnMut(PresentedFrame) + Send>>,
     ) {
-        self.frame_published_callback = callback;
+        self.frame_published_callback = callback.map(std::sync::Mutex::new);
     }
 
     /// Declare which API presents through this backend.  Every
@@ -2987,7 +3004,8 @@ impl GraphicsBackend {
             AppError::new(ReasonCode::RcD3dInvalidState, "unknown descriptor heap")
         })?;
         self.descriptor_translation_cache
-            .get_mut()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entries
             .remove(&heap);
         Ok(())
@@ -3193,14 +3211,18 @@ impl GraphicsBackend {
         let revision = heap_record.revision;
         let cached = self
             .descriptor_translation_cache
-            .borrow()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entries
             .get(&heap)
             .cloned();
         if let Some((cached_revision, bindings)) = cached
             && cached_revision == revision
         {
-            self.translation_stats.borrow_mut().descriptor_table_reuses += 1;
+            self.translation_stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .descriptor_table_reuses += 1;
             return Ok(bindings);
         }
         let bindings = heap_record
@@ -3214,10 +3236,14 @@ impl GraphicsBackend {
             })
             .collect::<Vec<_>>();
         self.descriptor_translation_cache
-            .borrow_mut()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entries
             .insert(heap, (revision, bindings.clone()));
-        self.translation_stats.borrow_mut().descriptor_table_uploads += 1;
+        self.translation_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .descriptor_table_uploads += 1;
         Ok(bindings)
     }
 
@@ -3229,7 +3255,10 @@ impl GraphicsBackend {
         &self,
         heaps: &[DescriptorHeapId],
     ) -> AppResult<Vec<Vec<MetalBinding>>> {
-        self.translation_stats.borrow_mut().descriptor_table_batches += 1;
+        self.translation_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .descriptor_table_batches += 1;
         heaps
             .iter()
             .map(|&heap| self.translate_descriptor_heap(heap))
@@ -3238,12 +3267,18 @@ impl GraphicsBackend {
 
     /// Snapshot of this backend's translation counters.
     pub fn translation_stats(&self) -> TranslationStats {
-        *self.translation_stats.borrow()
+        *self
+            .translation_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Reset the translation counters (useful for per-frame measurements).
     pub fn reset_translation_stats(&mut self) {
-        *self.translation_stats.get_mut() = TranslationStats::default();
+        *self
+            .translation_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = TranslationStats::default();
     }
 
     pub fn create_root_signature(&mut self, desc: RootSignatureDesc) -> RootSignatureId {
@@ -4123,7 +4158,12 @@ impl GraphicsBackend {
             plan.render_passes.push(pass);
         }
         let analysis = plan.hazards.analysis;
-        analysis.merge_into(self.translation_stats.get_mut());
+        analysis.merge_into(
+            &mut *self
+                .translation_stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
 
         let mut signaled_fences = Vec::new();
         if let Some((fence, value)) = signal_fence {
@@ -4244,7 +4284,10 @@ impl GraphicsBackend {
 
         let mut streams = Vec::with_capacity(lists.len());
         {
-            let mut stats = self.translation_stats.borrow_mut();
+            let mut stats = self
+                .translation_stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             stats.parallel_translation_batches +=
                 batches.iter().filter(|batch| batch.len() > 1).count() as u64;
             for (index, stream) in lists.iter().enumerate() {
@@ -4304,8 +4347,10 @@ impl GraphicsBackend {
             let pipeline = snapshot.pipeline_for_stream(stream.id)?;
             for command in &stream.commands {
                 let translated = snapshot.translate_command(command, &pipeline)?;
-                self.translation_stats.get_mut().commands_translated +=
-                    translated.source_command_count();
+                self.translation_stats
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .commands_translated += translated.source_command_count();
                 self.apply_translated_command(&translated, &mut plan)?;
             }
         }
@@ -4507,7 +4552,10 @@ impl GraphicsBackend {
     }
 
     fn record_update_path(&mut self, path: ResourceUpdatePath) {
-        let stats = self.translation_stats.get_mut();
+        let mut stats = self
+            .translation_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match path {
             ResourceUpdatePath::HostVisibleInPlace => stats.zero_copy_updates += 1,
             ResourceUpdatePath::StagedUpload => stats.staged_copies += 1,
@@ -6093,5 +6141,255 @@ mod tests {
             .present(swapchain, 1, false)
             .expect("missing backbuffer bytes must fall through");
         backend.resources.insert(backbuffer, resource);
+    }
+
+    #[test]
+    fn present_poisoned_frame_callback_panic_is_recovered_exactly_once() {
+        let mut backend = GraphicsBackend::new();
+        let swapchain = backend
+            .create_swapchain(SwapchainDesc {
+                width: 8,
+                height: 8,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("swapchain");
+        let delivered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&delivered);
+        backend.set_frame_published_callback(Some(Box::new(move |frame| {
+            assert_eq!(frame.width, 8);
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .frame_published_callback
+                .as_ref()
+                .expect("callback installed")
+                .lock()
+                .expect("unpoisoned callback");
+            panic!("poison the frame-published callback");
+        }));
+        assert_eq!(poisoned.is_err(), true);
+        assert_eq!(
+            backend
+                .frame_published_callback
+                .as_ref()
+                .expect("callback installed")
+                .is_poisoned(),
+            true
+        );
+
+        let result = backend
+            .present(swapchain, 1, false)
+            .expect("a poisoned callback lock must not block present");
+        assert_eq!(result.displayed_frame_index, 1);
+        assert_eq!(
+            delivered.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the recovered callback must run exactly once"
+        );
+    }
+
+    #[test]
+    fn destroy_descriptor_heap_recovers_from_panicked_cache_lock() {
+        let mut backend = GraphicsBackend::new();
+        let resource =
+            parallel_test_resource(&mut backend, "destroy-poison", ResourceState::Common);
+        let heap = backend.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        backend
+            .write_descriptor(
+                heap,
+                0,
+                ViewDescriptor::Rtv {
+                    resource,
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                },
+            )
+            .expect("write descriptor");
+        assert_eq!(
+            backend
+                .translate_descriptor_heap(heap)
+                .expect("translate before destroy")
+                .len(),
+            1
+        );
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .descriptor_translation_cache
+                .lock()
+                .expect("unpoisoned descriptor cache");
+            panic!("poison the descriptor translation cache");
+        }));
+        assert_eq!(poisoned.is_err(), true);
+        assert_eq!(backend.descriptor_translation_cache.is_poisoned(), true);
+
+        backend
+            .destroy_descriptor_heap(heap)
+            .expect("a poisoned cache lock must not block heap destruction");
+        assert_eq!(
+            backend
+                .descriptor_translation_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entries
+                .contains_key(&heap),
+            false
+        );
+        let error = backend
+            .destroy_descriptor_heap(heap)
+            .expect_err("a destroyed heap must not be destroyed twice");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "unknown descriptor heap");
+    }
+
+    #[test]
+    fn translate_descriptor_heap_panicked_cache_and_stats_reuse_exactly() {
+        let mut backend = GraphicsBackend::new();
+        let resource = parallel_test_resource(&mut backend, "reuse-poison", ResourceState::Common);
+        let heap = backend.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        backend
+            .write_descriptor(
+                heap,
+                0,
+                ViewDescriptor::Rtv {
+                    resource,
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                },
+            )
+            .expect("write descriptor");
+        let first = backend
+            .translate_descriptor_heap(heap)
+            .expect("first translation must upload");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].slot, 0);
+        assert_eq!(backend.translation_stats().descriptor_table_uploads, 1);
+
+        let cache_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .descriptor_translation_cache
+                .lock()
+                .expect("unpoisoned descriptor cache");
+            panic!("poison the descriptor translation cache");
+        }));
+        assert_eq!(cache_poison.is_err(), true);
+        let stats_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .translation_stats
+                .lock()
+                .expect("unpoisoned translation stats");
+            panic!("poison the translation stats");
+        }));
+        assert_eq!(stats_poison.is_err(), true);
+        assert_eq!(backend.descriptor_translation_cache.is_poisoned(), true);
+        assert_eq!(backend.translation_stats.is_poisoned(), true);
+
+        let second = backend
+            .translate_descriptor_heap(heap)
+            .expect("poisoned locks must still serve the revision cache");
+        assert_eq!(second, first);
+        let stats = backend.translation_stats();
+        assert_eq!(stats.descriptor_table_uploads, 1);
+        assert_eq!(stats.descriptor_table_reuses, 1);
+    }
+
+    #[test]
+    fn translate_descriptor_heap_panicked_cache_insert_and_upload_exactly() {
+        let mut backend = GraphicsBackend::new();
+        let resource = parallel_test_resource(&mut backend, "insert-poison", ResourceState::Common);
+        let heap = backend.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        backend
+            .write_descriptor(
+                heap,
+                0,
+                ViewDescriptor::Rtv {
+                    resource,
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                },
+            )
+            .expect("write descriptor");
+
+        let cache_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .descriptor_translation_cache
+                .lock()
+                .expect("unpoisoned descriptor cache");
+            panic!("poison the descriptor translation cache");
+        }));
+        assert_eq!(cache_poison.is_err(), true);
+        let stats_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .translation_stats
+                .lock()
+                .expect("unpoisoned translation stats");
+            panic!("poison the translation stats");
+        }));
+        assert_eq!(stats_poison.is_err(), true);
+
+        let bindings = backend
+            .translate_descriptor_heap(heap)
+            .expect("poisoned locks must not drop an uncached translation");
+        assert_eq!(bindings.len(), 1);
+        let stats = backend.translation_stats();
+        assert_eq!(stats.descriptor_table_uploads, 1);
+        assert_eq!(stats.descriptor_table_reuses, 0);
+        assert_eq!(
+            backend
+                .descriptor_translation_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entries
+                .get(&heap)
+                .cloned(),
+            Some((1, bindings))
+        );
+    }
+
+    #[test]
+    fn translate_descriptor_tables_panicked_stats_batch_is_counted() {
+        let mut backend = GraphicsBackend::new();
+        let heap = backend.create_descriptor_heap(DescriptorHeapType::Sampler, 0);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .translation_stats
+                .lock()
+                .expect("unpoisoned translation stats");
+            panic!("poison the translation stats");
+        }));
+        assert_eq!(poisoned.is_err(), true);
+        assert_eq!(backend.translation_stats.is_poisoned(), true);
+
+        let tables = backend
+            .translate_descriptor_tables(&[heap])
+            .expect("a poisoned stats lock must not block batch translation");
+        assert_eq!(tables, vec![Vec::<MetalBinding>::new()]);
+        let stats = backend.translation_stats();
+        assert_eq!(stats.descriptor_table_batches, 1);
+        assert_eq!(stats.descriptor_table_uploads, 1);
+    }
+
+    #[test]
+    fn overwrite_resource_host_visible_recovers_panicked_stats_lock() {
+        let mut backend = GraphicsBackend::new();
+        let resource = parallel_test_resource(&mut backend, "update-poison", ResourceState::Common);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .translation_stats
+                .lock()
+                .expect("unpoisoned translation stats");
+            panic!("poison the translation stats");
+        }));
+        assert_eq!(poisoned.is_err(), true);
+
+        let path = backend
+            .overwrite_resource_host_visible(resource, &[0x5A; 64])
+            .expect("a poisoned stats lock must not drop the resource update");
+        assert_eq!(path, ResourceUpdatePath::StagedUpload);
+        assert_eq!(
+            backend.resource_bytes(resource).expect("resource bytes"),
+            &[0x5A; 64]
+        );
+        let stats = backend.translation_stats();
+        assert_eq!(stats.staged_copies, 1);
+        assert_eq!(stats.zero_copy_updates, 0);
     }
 }

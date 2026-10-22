@@ -44,6 +44,9 @@ pub struct WasapiExclusiveState {
     pub period_ms: u32,
     /// The audio format negotiated with the hardware.
     pub format: WaveFormat,
+    /// Whether CoreAudio hog mode backs this exclusive client (and, when not,
+    /// why the client-side contract is in force).
+    pub hog_mode: HogModeOutcome,
 }
 
 /// A real audio output device discovered via `cpal`.
@@ -80,6 +83,433 @@ pub struct DevicePeriodInfo {
     pub minimum_period_hns: u64,
     /// Stream latency of a buffer-sized period on this device.
     pub stream_latency_hns: u64,
+}
+
+// ---------------------------------------------------------------------------
+// System-wide loopback capture (CoreAudio process taps / ScreenCaptureKit)
+// ---------------------------------------------------------------------------
+
+/// Seconds of real system-output history retained for loopback clients.
+pub const SYSTEM_LOOPBACK_HISTORY_SECONDS: u32 = 4;
+
+/// Which real system-output capture backend the host can provide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemLoopbackBackend {
+    /// CoreAudio process tap (`AudioHardwareCreateProcessTap` +
+    /// `CATapDescription`, macOS 14.2+).
+    CoreAudioProcessTap,
+    /// ScreenCaptureKit audio capture (`SCStream.capturesAudio`).
+    ScreenCaptureKit,
+    /// No host system-output capture API is available.
+    Unavailable,
+}
+
+/// A pinned reason a system-loopback capture could not start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemLoopbackFailure {
+    /// No host backend is available (non-macOS, old macOS, or forced off).
+    Unavailable,
+    /// The tap description object could not be created.
+    ObjectUnavailable,
+    /// `AudioHardwareCreateProcessTap` failed with this `OSStatus`.
+    TapCreation(i32),
+    /// `AudioHardwareCreateAggregateDevice` failed with this `OSStatus`.
+    AggregateCreation(i32),
+    /// `AudioDeviceStart` failed with this `OSStatus`.
+    StreamStart(i32),
+    /// The tap's stream format is not the backed 32-bit float shape.
+    FormatUnavailable,
+}
+
+/// Pure capability classification (testable without touching the host).
+pub fn classify_system_loopback_probe(
+    process_tap_available: bool,
+    screen_capture_kit_available: bool,
+    forced_off: bool,
+) -> SystemLoopbackBackend {
+    if forced_off {
+        SystemLoopbackBackend::Unavailable
+    } else if process_tap_available {
+        SystemLoopbackBackend::CoreAudioProcessTap
+    } else if screen_capture_kit_available {
+        SystemLoopbackBackend::ScreenCaptureKit
+    } else {
+        SystemLoopbackBackend::Unavailable
+    }
+}
+
+/// Map a failure at `stage` (with its `OSStatus`) to a pinned reason.
+pub fn classify_system_loopback_failure(
+    stage: SystemLoopbackFailure,
+    status: i32,
+) -> SystemLoopbackFailure {
+    match stage {
+        SystemLoopbackFailure::TapCreation(_) => SystemLoopbackFailure::TapCreation(status),
+        SystemLoopbackFailure::AggregateCreation(_) => {
+            SystemLoopbackFailure::AggregateCreation(status)
+        }
+        SystemLoopbackFailure::StreamStart(_) => SystemLoopbackFailure::StreamStart(status),
+        other => other,
+    }
+}
+
+/// Probe the host for a real system-output capture backend.
+///
+/// `CASA1_SYSTEM_LOOPBACK=off` (or `0`) forces the internal render-history
+/// fallback; unset (or `auto`) probes the host.
+pub fn system_loopback_capability() -> SystemLoopbackBackend {
+    #[cfg(test)]
+    {
+        // Tests never touch the developer's real system audio unless a test
+        // explicitly overrides this.  The real probe is still available
+        // through `probe_system_loopback_capability_for_test`.
+        test_system_loopback_capability_override().unwrap_or(SystemLoopbackBackend::Unavailable)
+    }
+    #[cfg(not(test))]
+    {
+        probe_system_loopback_capability()
+    }
+}
+
+/// The real host probe (bypasses the test override).
+pub(crate) fn probe_system_loopback_capability() -> SystemLoopbackBackend {
+    let forced_off = std::env::var("CASA1_SYSTEM_LOOPBACK")
+        .map(|value| {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("off") || value == "0"
+        })
+        .unwrap_or(false);
+    classify_system_loopback_probe(
+        process_tap_available(),
+        screen_capture_kit_available(),
+        forced_off,
+    )
+}
+
+/// Real host probe for capability-gated tests.
+#[cfg(test)]
+pub(crate) fn probe_system_loopback_capability_for_test() -> SystemLoopbackBackend {
+    probe_system_loopback_capability()
+}
+
+#[cfg(target_os = "macos")]
+fn process_tap_available() -> bool {
+    platform::process_tap_symbols_available()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_tap_available() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn screen_capture_kit_available() -> bool {
+    platform::screen_capture_kit_available()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn screen_capture_kit_available() -> bool {
+    false
+}
+
+/// The real captured samples and counters shared with the host callback.
+///
+/// The callback runs on the host audio thread, so ingestion never blocks it:
+/// a contended lock drops that callback's frames instead of stalling audio.
+#[derive(Debug)]
+struct SystemLoopbackSink {
+    /// The generation this sink belongs to (the session's generation).
+    generation: u64,
+    /// The generation currently allowed to publish frames.  Teardown bumps
+    /// this before stopping the host stream, so late callbacks from a stale
+    /// tap/stream are dropped instead of leaking into a replacement session.
+    live_generation: u64,
+    channels: u16,
+    sample_rate: u32,
+    samples: VecDeque<f32>,
+    frames_delivered: u64,
+    dropped_frames: u64,
+}
+
+impl SystemLoopbackSink {
+    fn new(generation: u64, channels: u16, sample_rate: u32) -> Self {
+        Self {
+            generation,
+            live_generation: generation,
+            channels: channels.max(1),
+            sample_rate: sample_rate.max(1),
+            samples: VecDeque::new(),
+            frames_delivered: 0,
+            dropped_frames: 0,
+        }
+    }
+
+    fn max_samples(&self) -> usize {
+        (self.sample_rate.max(1) as usize)
+            .saturating_mul(self.channels.max(1) as usize)
+            .saturating_mul(SYSTEM_LOOPBACK_HISTORY_SECONDS as usize)
+    }
+
+    fn live(&self, generation: u64) -> bool {
+        generation == self.live_generation && generation == self.generation
+    }
+
+    /// Invalidate `generation` and discard its buffered frames.
+    fn stop(&mut self, generation: u64) {
+        if self.generation == generation {
+            self.live_generation = generation.wrapping_add(1);
+            self.samples.clear();
+        }
+    }
+
+    /// Append interleaved f32 system frames for `generation`.
+    ///
+    /// Returns `true` when the frames were accepted.  A stale generation (an
+    /// old tap callback racing teardown) is rejected without touching the
+    /// buffer.  If the callback's real format differs from the negotiated tap
+    /// format, the session adopts the callback's format and restarts its
+    /// history (the real stream renegotiated, so old frames are not
+    /// compatible).
+    fn ingest(
+        &mut self,
+        generation: u64,
+        channels: u16,
+        sample_rate: u32,
+        interleaved: &[f32],
+    ) -> bool {
+        if !self.live(generation) {
+            return false;
+        }
+        let channels = channels.max(1);
+        let sample_rate = sample_rate.max(1);
+        if channels != self.channels || sample_rate != self.sample_rate {
+            self.channels = channels;
+            self.sample_rate = sample_rate;
+            self.samples.clear();
+        }
+        if interleaved.is_empty() {
+            return true;
+        }
+        let max_samples = self.max_samples();
+        let drop = self
+            .samples
+            .len()
+            .saturating_add(interleaved.len())
+            .saturating_sub(max_samples);
+        let drop = drop.min(self.samples.len());
+        for _ in 0..drop {
+            self.samples.pop_front();
+        }
+        self.dropped_frames = self
+            .dropped_frames
+            .saturating_add((drop / self.channels.max(1) as usize) as u64);
+        let room = max_samples.saturating_sub(self.samples.len());
+        let take = interleaved.len().min(room);
+        if take < interleaved.len() {
+            self.dropped_frames = self.dropped_frames.saturating_add(
+                ((interleaved.len() - take) / self.channels.max(1) as usize) as u64,
+            );
+        }
+        self.samples.extend(
+            interleaved[interleaved.len().saturating_sub(take)..]
+                .iter()
+                .copied(),
+        );
+        self.frames_delivered = self
+            .frames_delivered
+            .saturating_add((take / self.channels.max(1) as usize) as u64);
+        true
+    }
+}
+
+/// One live system-loopback capture session.
+struct SystemLoopbackSession {
+    backend: SystemLoopbackBackend,
+    generation: u64,
+    shared: Arc<Mutex<SystemLoopbackSink>>,
+    /// Host teardown; dropped exactly once by [`RealAudioBackend::stop_system_loopback`].
+    stop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl SystemLoopbackSession {
+    fn stop(&mut self) {
+        {
+            let mut sink = self
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sink.stop(self.generation);
+        }
+        if let Some(stop) = self.stop.take() {
+            stop();
+        }
+        // Host teardown synchronizes its callback; clear once more so a
+        // callback that passed the generation check before teardown cannot
+        // leave frames behind.
+        let mut sink = self
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sink.samples.clear();
+    }
+}
+
+/// Observable system-loopback state (tests / diagnostics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemLoopbackSnapshot {
+    pub capability: SystemLoopbackBackend,
+    pub running: bool,
+    pub backend: Option<SystemLoopbackBackend>,
+    pub generation: u64,
+    pub channels: u16,
+    pub sample_rate: u32,
+    pub buffered_frames: u64,
+    pub frames_delivered: u64,
+    pub dropped_frames: u64,
+}
+
+#[cfg(test)]
+static TEST_SYSTEM_LOOPBACK_CAPABILITY: Mutex<Option<SystemLoopbackBackend>> = Mutex::new(None);
+
+/// Serializes every test that drives the process-global system-loopback seam
+/// (the capability override, the fault injector and the live test session).
+#[cfg(test)]
+static TEST_NEXT_EXCLUSIVE_STREAM_OPEN: Mutex<Option<Result<usize, i32>>> = Mutex::new(None);
+
+/// Force the next exclusive-mode stream open to succeed with `frames` or fail
+/// with `status` (test seam: the real open needs a live output device).
+#[cfg(test)]
+pub(crate) fn force_next_exclusive_stream_open(result: Option<Result<usize, i32>>) {
+    *TEST_NEXT_EXCLUSIVE_STREAM_OPEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = result;
+}
+
+#[cfg(test)]
+static SYSTEM_LOOPBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_system_loopback_tests() -> std::sync::MutexGuard<'static, ()> {
+    SYSTEM_LOOPBACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Force the probed system-loopback capability for a test (serialized by the
+/// caller against other loopback tests).
+#[cfg(test)]
+pub(crate) fn set_test_system_loopback_capability(backend: Option<SystemLoopbackBackend>) {
+    *TEST_SYSTEM_LOOPBACK_CAPABILITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = backend;
+}
+
+#[cfg(test)]
+fn test_system_loopback_capability_override() -> Option<SystemLoopbackBackend> {
+    *TEST_SYSTEM_LOOPBACK_CAPABILITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+static TEST_NEXT_SYSTEM_LOOPBACK_FAILURE: Mutex<Option<SystemLoopbackFailure>> = Mutex::new(None);
+
+/// Force the next [`RealAudioBackend::start_system_loopback`] to fail with
+/// `reason` (test seam used by the loopback fallback tests).
+#[cfg(test)]
+pub(crate) fn force_next_system_loopback_failure(reason: Option<SystemLoopbackFailure>) {
+    *TEST_NEXT_SYSTEM_LOOPBACK_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = reason;
+}
+
+#[cfg(test)]
+fn take_forced_system_loopback_failure() -> Option<SystemLoopbackFailure> {
+    TEST_NEXT_SYSTEM_LOOPBACK_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+// ---------------------------------------------------------------------------
+// CoreAudio hog mode (true hardware-exclusive access)
+// ---------------------------------------------------------------------------
+
+/// The real outcome of a CoreAudio hog-mode request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HogModeOutcome {
+    /// This process now owns hog mode on the device.
+    Acquired,
+    /// This process already owned hog mode on the device.
+    AlreadyHeld,
+    /// Another process owns hog mode; the client-side contract is used.
+    Denied { owner_pid: i32 },
+    /// The host/device cannot provide hog mode; the client-side contract is
+    /// used.
+    Unavailable,
+}
+
+impl HogModeOutcome {
+    /// Whether the device is genuinely hogged by this process.
+    pub fn is_exclusive(self) -> bool {
+        matches!(self, HogModeOutcome::Acquired | HogModeOutcome::AlreadyHeld)
+    }
+}
+
+/// The host operations an exclusive-mode open needs for true hog mode.
+///
+/// Split behind a trait so the acquisition/denial/rate-failure transitions are
+/// adversarially testable without grabbing the developer's real output device.
+pub(crate) trait HogModeDriver {
+    fn hog_owner(&mut self) -> Result<i32, i32>;
+    fn set_hog(&mut self) -> Result<i32, i32>;
+    fn release_hog(&mut self) -> Result<(), i32>;
+    fn set_nominal_sample_rate(&mut self, sample_rate: f64) -> Result<(), i32>;
+    fn set_buffer_frame_size(&mut self, frames: u32) -> Result<(), i32>;
+}
+
+/// Acquire hog mode and pin the device's nominal sample rate to the exact
+/// exclusive-mode rate.
+///
+/// If the rate cannot be pinned, hog mode is released again and the caller
+/// falls back to the client-side exclusive contract (the host cannot provide
+/// true exclusive mode at that rate).
+pub(crate) fn acquire_exclusive_hog_with(
+    driver: &mut dyn HogModeDriver,
+    our_pid: i32,
+    sample_rate: u32,
+) -> HogModeOutcome {
+    fn after_set(owner: i32, our_pid: i32) -> HogModeOutcome {
+        if owner == our_pid {
+            HogModeOutcome::Acquired
+        } else if owner == -1 {
+            // The host refused the set and left the device free: hog mode is
+            // genuinely unavailable, not denied by another owner.
+            HogModeOutcome::Unavailable
+        } else {
+            HogModeOutcome::Denied { owner_pid: owner }
+        }
+    }
+    let outcome = match driver.hog_owner() {
+        Ok(owner) if owner == our_pid => HogModeOutcome::AlreadyHeld,
+        Ok(_) => match driver.set_hog() {
+            Ok(owner) => after_set(owner, our_pid),
+            Err(_) => match driver.hog_owner() {
+                Ok(owner) => after_set(owner, our_pid),
+                Err(_) => HogModeOutcome::Unavailable,
+            },
+        },
+        Err(_) => HogModeOutcome::Unavailable,
+    };
+    if outcome.is_exclusive()
+        && driver
+            .set_nominal_sample_rate(sample_rate.max(1) as f64)
+            .is_err()
+    {
+        let _ = driver.release_hog();
+        return HogModeOutcome::Unavailable;
+    }
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +655,13 @@ pub struct RealAudioBackend {
     input_stream: Option<cpal::Stream>,
     /// Shared buffer for captured audio data from the input stream callback.
     capture_buffer: Arc<Mutex<VecDeque<f32>>>,
+    /// The live real system-output capture (process tap / ScreenCaptureKit).
+    system_loopback: Option<SystemLoopbackSession>,
+    /// Generation counter for system-loopback sessions (stale callbacks are
+    /// rejected by generation).
+    next_system_loopback_generation: u64,
+    /// Devices on which this process currently owns CoreAudio hog mode.
+    hog_devices: HashMap<DeviceId, i32>,
 }
 
 impl RealAudioBackend {
@@ -288,6 +725,9 @@ impl RealAudioBackend {
             next_audio_client_id: 1,
             input_stream: None,
             capture_buffer: Arc::new(Mutex::new(VecDeque::new())),
+            system_loopback: None,
+            next_system_loopback_generation: 1,
+            hog_devices: HashMap::new(),
         })
     }
 
@@ -522,6 +962,13 @@ impl RealAudioBackend {
     /// possible buffer size (target ≤10 ms latency). This provides lower latency
     /// at the cost of exclusive hardware access.
     ///
+    /// On macOS the default output device is additionally put into CoreAudio
+    /// hog mode (`kAudioDevicePropertyHogMode`) and pinned to the exact
+    /// nominal sample rate and fixed buffer frame size.  When another process
+    /// owns hog mode (or the host/device cannot provide it), the real outcome
+    /// is recorded in [`WasapiExclusiveState::hog_mode`] and the documented
+    /// client-side exclusive contract is enforced unchanged.
+    ///
     /// Returns an `AudioClientId` that identifies this exclusive-mode client.
     /// Use `push_wasapi_frames_exclusive()` to submit audio data.
     ///
@@ -537,8 +984,20 @@ impl RealAudioBackend {
         // Validate device
         self.device_info(device_id)?;
 
+        // True hardware exclusivity where the host supports it: hog mode plus
+        // the exact nominal rate before the fixed-buffer stream is built.
+        // Denial is not an error: the client-side contract stays in force.
+        let hog_mode = self.acquire_hog_mode(device_id, format.sample_rate);
+
         // Create an exclusive-mode cpal stream (exact sample rate, no resampling)
-        let buffer_frames = self.ensure_stream_exclusive(device_id, &format)?;
+        let buffer_frames = match self.ensure_stream_exclusive(device_id, &format) {
+            Ok(frames) => frames,
+            Err(error) => {
+                self.release_hog_if_unused(device_id);
+                return Err(error);
+            }
+        };
+        self.pin_exclusive_buffer_frames(device_id, buffer_frames.min(u32::MAX as usize) as u32);
 
         // Calculate the period in milliseconds
         let period_ms = if format.sample_rate > 0 {
@@ -559,6 +1018,7 @@ impl RealAudioBackend {
                 buffer_frames,
                 period_ms,
                 format: format.clone(),
+                hog_mode,
             },
         );
 
@@ -756,6 +1216,7 @@ impl RealAudioBackend {
             self.streams.remove(id);
             self.stream_queues.remove(id);
             self.exclusive_streams.remove(id);
+            self.release_hog(*id);
         }
 
         Ok((added, to_remove))
@@ -855,6 +1316,7 @@ impl RealAudioBackend {
         self.exclusive_clients
             .retain(|_, state| state.device_id != device_id);
         self.exclusive_streams.remove(&device_id);
+        self.release_hog(device_id);
     }
 
     /// Close all output streams and exclusive-mode clients.
@@ -863,6 +1325,10 @@ impl RealAudioBackend {
         self.stream_queues.clear();
         self.exclusive_clients.clear();
         self.exclusive_streams.clear();
+        let devices: Vec<DeviceId> = self.hog_devices.keys().copied().collect();
+        for device_id in devices {
+            self.release_hog(device_id);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -995,6 +1461,19 @@ impl RealAudioBackend {
         device_id: DeviceId,
         format: &WaveFormat,
     ) -> AppResult<usize> {
+        #[cfg(test)]
+        if let Some(result) = TEST_NEXT_EXCLUSIVE_STREAM_OPEN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            return result.map_err(|status| {
+                AppError::new(
+                    ReasonCode::RcAudioUnsupported,
+                    format!("forced exclusive stream open failure ({status})"),
+                )
+            });
+        }
         if let Some((stored_format, buffer_frames)) = self.exclusive_streams.get(&device_id) {
             if stored_format == format {
                 // Same format as the existing exclusive stream: reuse it and
@@ -1299,6 +1778,268 @@ impl RealAudioBackend {
         } else {
             Vec::new()
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Real system-output loopback capture
+    // -----------------------------------------------------------------------
+
+    /// Which real system-output capture backend the host offers.
+    pub fn system_loopback_capability(&self) -> SystemLoopbackBackend {
+        system_loopback_capability()
+    }
+
+    /// Start real system-output capture (beyond this runtime's render
+    /// history) and return the backend actually used.
+    ///
+    /// The capture is independent of any runtime render stream: it taps the
+    /// system output mix, so audio produced by other processes is captured
+    /// too.  Idempotent while a session is live.
+    pub fn start_system_loopback(
+        &mut self,
+    ) -> Result<SystemLoopbackBackend, SystemLoopbackFailure> {
+        if let Some(session) = self.system_loopback.as_ref() {
+            return Ok(session.backend);
+        }
+        #[cfg(test)]
+        if let Some(reason) = take_forced_system_loopback_failure() {
+            return Err(reason);
+        }
+        let backend = system_loopback_capability();
+        if backend == SystemLoopbackBackend::Unavailable {
+            return Err(SystemLoopbackFailure::Unavailable);
+        }
+        let generation = self.next_system_loopback_generation.max(1);
+        self.next_system_loopback_generation = generation.wrapping_add(1).max(1);
+        let shared = Arc::new(Mutex::new(SystemLoopbackSink::new(generation, 2, 48_000)));
+        let session = match backend {
+            #[cfg(target_os = "macos")]
+            SystemLoopbackBackend::CoreAudioProcessTap => {
+                platform::start_process_tap(Arc::clone(&shared), generation)?
+            }
+            #[cfg(target_os = "macos")]
+            SystemLoopbackBackend::ScreenCaptureKit => {
+                platform::start_screen_capture_kit(Arc::clone(&shared), generation)?
+            }
+            _ => return Err(SystemLoopbackFailure::Unavailable),
+        };
+        self.system_loopback = Some(session);
+        Ok(backend)
+    }
+
+    /// Stop real system-output capture and invalidate any in-flight callback.
+    ///
+    /// Safe to call at any point (including while the host stream is still
+    /// delivering frames): the generation is bumped before teardown and the
+    /// host stop synchronizes the callback, so no stale frame is ever handed
+    /// to a later capture client.
+    pub fn stop_system_loopback(&mut self) {
+        if let Some(mut session) = self.system_loopback.take() {
+            session.stop();
+        }
+    }
+
+    /// Whether real system-output capture is currently running.
+    pub fn system_loopback_running(&self) -> bool {
+        self.system_loopback.is_some()
+    }
+
+    /// The real capture format `(channels, sample_rate)` of the live system
+    /// loopback, when running.
+    pub fn system_loopback_format(&self) -> Option<(u16, u32)> {
+        let session = self.system_loopback.as_ref()?;
+        let sink = session
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some((sink.channels, sink.sample_rate))
+    }
+
+    /// Frames currently buffered by the real system-output capture.
+    pub fn system_loopback_available_frames(&self) -> u32 {
+        let Some(session) = self.system_loopback.as_ref() else {
+            return 0;
+        };
+        let sink = session
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (sink.samples.len() / sink.channels.max(1) as usize).min(u32::MAX as usize) as u32
+    }
+
+    /// Drain the real captured system frames (interleaved f32 in the capture
+    /// format reported by [`Self::system_loopback_format`]).
+    pub fn read_system_loopback_data(&mut self) -> Vec<f32> {
+        let Some(session) = self.system_loopback.as_ref() else {
+            return Vec::new();
+        };
+        let mut sink = session
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sink.samples.drain(..).collect()
+    }
+
+    /// Observable system-loopback state.
+    pub fn system_loopback_status(&self) -> SystemLoopbackSnapshot {
+        let capability = system_loopback_capability();
+        let Some(session) = self.system_loopback.as_ref() else {
+            return SystemLoopbackSnapshot {
+                capability,
+                running: false,
+                backend: None,
+                generation: 0,
+                channels: 0,
+                sample_rate: 0,
+                buffered_frames: 0,
+                frames_delivered: 0,
+                dropped_frames: 0,
+            };
+        };
+        let sink = session
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SystemLoopbackSnapshot {
+            capability,
+            running: true,
+            backend: Some(session.backend),
+            generation: session.generation,
+            channels: sink.channels,
+            sample_rate: sink.sample_rate,
+            buffered_frames: (sink.samples.len() / sink.channels.max(1) as usize) as u64,
+            frames_delivered: sink.frames_delivered,
+            dropped_frames: sink.dropped_frames,
+        }
+    }
+
+    /// Install a deterministic in-process system-loopback session (test seam:
+    /// exercises the real loopback delivery path without TCC/hardware).
+    #[cfg(test)]
+    pub(crate) fn install_test_system_loopback(&mut self, channels: u16, sample_rate: u32) -> u64 {
+        self.stop_system_loopback();
+        let generation = self.next_system_loopback_generation.max(1);
+        self.next_system_loopback_generation = generation.wrapping_add(1).max(1);
+        let shared = Arc::new(Mutex::new(SystemLoopbackSink::new(
+            generation,
+            channels,
+            sample_rate,
+        )));
+        self.system_loopback = Some(SystemLoopbackSession {
+            backend: SystemLoopbackBackend::CoreAudioProcessTap,
+            generation,
+            shared,
+            stop: Some(Box::new(|| {})),
+        });
+        generation
+    }
+
+    /// Publish interleaved frames through the live test/system sink.
+    #[cfg(test)]
+    pub(crate) fn push_test_system_loopback_frames(
+        &mut self,
+        generation: u64,
+        channels: u16,
+        sample_rate: u32,
+        interleaved: &[f32],
+    ) -> bool {
+        let Some(session) = self.system_loopback.as_ref() else {
+            return false;
+        };
+        let mut sink = session
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sink.ingest(generation, channels, sample_rate, interleaved)
+    }
+
+    // -----------------------------------------------------------------------
+    // CoreAudio hog mode (true exclusive access)
+    // -----------------------------------------------------------------------
+
+    /// Acquire hog mode for an exclusive-mode open on the default output
+    /// device, pinning the exact client sample rate.  Non-default devices (and
+    /// non-macOS hosts) report `Unavailable` and keep the client-side
+    /// exclusive contract.
+    fn acquire_hog_mode(&mut self, device_id: DeviceId, sample_rate: u32) -> HogModeOutcome {
+        let is_default = self
+            .devices
+            .get(&device_id)
+            .map(|device| device.is_default)
+            .unwrap_or(false);
+        if !is_default {
+            return HogModeOutcome::Unavailable;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let our_pid = std::process::id() as i32;
+            let Some(mut driver) = platform::CoreAudioHogDriver::open_default_output() else {
+                return HogModeOutcome::Unavailable;
+            };
+            let outcome = acquire_exclusive_hog_with(&mut driver, our_pid, sample_rate);
+            if outcome.is_exclusive() {
+                self.hog_devices.insert(device_id, our_pid);
+            }
+            outcome
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = sample_rate;
+            HogModeOutcome::Unavailable
+        }
+    }
+
+    /// Pin the device buffer frame size to the exact fixed exclusive buffer.
+    fn pin_exclusive_buffer_frames(&self, device_id: DeviceId, frames: u32) {
+        if !self.hog_devices.contains_key(&device_id) {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(mut driver) = platform::CoreAudioHogDriver::open_default_output()
+            && let Err(status) = driver.set_buffer_frame_size(frames.max(1))
+        {
+            eprintln!("[RealAudio] exclusive buffer-size pin failed: OSStatus {status}");
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (device_id, frames);
+    }
+
+    /// Release hog mode for `device_id` if no other exclusive client uses it.
+    fn release_hog_if_unused(&mut self, device_id: DeviceId) {
+        let in_use = self
+            .exclusive_clients
+            .values()
+            .any(|state| state.device_id == device_id);
+        if in_use {
+            return;
+        }
+        self.release_hog(device_id);
+    }
+
+    fn release_hog(&mut self, device_id: DeviceId) {
+        if self.hog_devices.remove(&device_id).is_none() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(mut driver) = platform::CoreAudioHogDriver::open_default_output()
+            && let Err(status) = driver.release_hog()
+        {
+            eprintln!("[RealAudio] hog-mode release failed: OSStatus {status}");
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = device_id;
+    }
+
+    /// Whether this process currently owns CoreAudio hog mode on `device_id`.
+    pub fn hog_mode_held(&self, device_id: DeviceId) -> bool {
+        self.hog_devices.contains_key(&device_id)
+    }
+
+    /// The real hog-mode outcome recorded for an exclusive-mode client.
+    pub fn exclusive_client_hog_mode(&self, client: AudioClientId) -> Option<HogModeOutcome> {
+        self.exclusive_clients
+            .get(&client)
+            .map(|state| state.hog_mode)
     }
 
     /// Append samples to a device's output queue, keeping at most `max_samples`
@@ -4327,6 +5068,1433 @@ fn hns_from_frames(frames: u64, rate: u32) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// macOS host capture: CoreAudio process taps + ScreenCaptureKit
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::*;
+    use core_foundation::array::CFArray;
+    use core_foundation::base::{CFRelease, CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::{CFString, CFStringRef};
+    use objc::declare::ClassDecl;
+    use objc::runtime::{Class, Object, Sel};
+    use objc::{msg_send, sel, sel_impl};
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+    use std::ptr;
+    use std::sync::mpsc;
+    use std::sync::{OnceLock, atomic::Ordering};
+    use std::time::Duration;
+
+    const SCOPE_GLOBAL: u32 = 0x676c_6f62; // 'glob'
+    const SYSTEM_OBJECT: u32 = 1;
+    const HW_DEFAULT_OUTPUT_DEVICE: u32 = 0x644f_7574; // 'dOut'
+    const HW_TRANSLATE_PID_TO_PROCESS_OBJECT: u32 = 0x6964_3270; // 'id2p'
+    const DEVICE_HOG_MODE: u32 = 0x6f69_6e6b; // 'oink'
+    const DEVICE_NOMINAL_SAMPLE_RATE: u32 = 0x6e73_7274; // 'nsrt'
+    const DEVICE_BUFFER_FRAME_SIZE: u32 = 0x6673_697a; // 'fsiz'
+    const TAP_FORMAT: u32 = 0x7466_6d74; // 'tfmt'
+    const TAP_UID: u32 = 0x7475_6964; // 'tuid'
+    const FORMAT_LINEAR_PCM: u32 = 0x6c70_636d; // 'lpcm'
+    const FORMAT_FLAG_IS_FLOAT: u32 = 1 << 0;
+    const AGGREGATE_DEVICE_UID_KEY: &str = "uid";
+    const AGGREGATE_DEVICE_PRIVATE_KEY: &str = "private";
+    const AGGREGATE_DEVICE_TAP_LIST_KEY: &str = "taps";
+    const SUB_TAP_UID_KEY: &str = "uid";
+
+    #[repr(C)]
+    struct AudioObjectPropertyAddress {
+        selector: u32,
+        scope: u32,
+        element: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct AudioStreamBasicDescription {
+        sample_rate: f64,
+        format_id: u32,
+        format_flags: u32,
+        bytes_per_packet: u32,
+        frames_per_packet: u32,
+        bytes_per_frame: u32,
+        channels_per_frame: u32,
+        bits_per_channel: u32,
+        reserved: u32,
+    }
+
+    #[repr(C)]
+    struct AudioBuffer {
+        number_channels: u32,
+        data_byte_size: u32,
+        data: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct AudioBufferList {
+        number_buffers: u32,
+        buffers: [AudioBuffer; 1],
+    }
+
+    type OsStatus = i32;
+    type AudioObjectId = u32;
+    type AudioDeviceIoProcId = *mut c_void;
+
+    type GetPropertyDataFn = unsafe extern "C" fn(
+        AudioObjectId,
+        *const AudioObjectPropertyAddress,
+        u32,
+        *const c_void,
+        *mut u32,
+        *mut c_void,
+    ) -> OsStatus;
+    type SetPropertyDataFn = unsafe extern "C" fn(
+        AudioObjectId,
+        *const AudioObjectPropertyAddress,
+        u32,
+        *const c_void,
+        u32,
+        *const c_void,
+    ) -> OsStatus;
+    type CreateAggregateFn = unsafe extern "C" fn(*const c_void, *mut AudioObjectId) -> OsStatus;
+    type DestroyAggregateFn = unsafe extern "C" fn(AudioObjectId) -> OsStatus;
+    type CreateIoProcWithBlockFn = unsafe extern "C" fn(
+        *mut AudioDeviceIoProcId,
+        AudioObjectId,
+        *mut c_void,
+        *const c_void,
+    ) -> OsStatus;
+    type DestroyIoProcFn = unsafe extern "C" fn(AudioObjectId, AudioDeviceIoProcId) -> OsStatus;
+    type StartDeviceFn = unsafe extern "C" fn(AudioObjectId, AudioDeviceIoProcId) -> OsStatus;
+    type CreateProcessTapFn = unsafe extern "C" fn(*mut Object, *mut AudioObjectId) -> OsStatus;
+    type DestroyProcessTapFn = unsafe extern "C" fn(AudioObjectId) -> OsStatus;
+
+    struct CoreAudioApi {
+        get_property_data: GetPropertyDataFn,
+        set_property_data: SetPropertyDataFn,
+        create_aggregate: CreateAggregateFn,
+        destroy_aggregate: DestroyAggregateFn,
+        create_ioproc: CreateIoProcWithBlockFn,
+        destroy_ioproc: DestroyIoProcFn,
+        device_start: StartDeviceFn,
+        device_stop: StartDeviceFn,
+        create_process_tap: Option<CreateProcessTapFn>,
+        destroy_process_tap: Option<DestroyProcessTapFn>,
+    }
+
+    fn coreaudio_handle() -> Option<*mut c_void> {
+        static HANDLE: OnceLock<usize> = OnceLock::new();
+        let handle = *HANDLE.get_or_init(|| unsafe {
+            libc::dlopen(
+                c"/System/Library/Frameworks/CoreAudio.framework/CoreAudio".as_ptr(),
+                libc::RTLD_LAZY | libc::RTLD_LOCAL,
+            ) as usize
+        });
+        (handle != 0).then_some(handle as *mut c_void)
+    }
+
+    fn symbol(handle: *mut c_void, name: &[u8]) -> Option<*mut c_void> {
+        let symbol = unsafe { libc::dlsym(handle, name.as_ptr() as *const c_char) };
+        (!symbol.is_null()).then_some(symbol)
+    }
+
+    #[cfg(test)]
+    static TEST_CORE_AUDIO_API: Mutex<Option<&'static CoreAudioApi>> = Mutex::new(None);
+
+    fn coreaudio_api() -> Option<&'static CoreAudioApi> {
+        #[cfg(test)]
+        if let Some(api) = *TEST_CORE_AUDIO_API
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return Some(api);
+        }
+        static API: OnceLock<Option<CoreAudioApi>> = OnceLock::new();
+        API.get_or_init(|| {
+            let handle = coreaudio_handle()?;
+            unsafe {
+                let get_property_data: GetPropertyDataFn =
+                    std::mem::transmute(symbol(handle, b"AudioObjectGetPropertyData\0")?);
+                let set_property_data: SetPropertyDataFn =
+                    std::mem::transmute(symbol(handle, b"AudioObjectSetPropertyData\0")?);
+                let create_aggregate: CreateAggregateFn =
+                    std::mem::transmute(symbol(handle, b"AudioHardwareCreateAggregateDevice\0")?);
+                let destroy_aggregate: DestroyAggregateFn =
+                    std::mem::transmute(symbol(handle, b"AudioHardwareDestroyAggregateDevice\0")?);
+                let create_ioproc: CreateIoProcWithBlockFn =
+                    std::mem::transmute(symbol(handle, b"AudioDeviceCreateIOProcIDWithBlock\0")?);
+                let destroy_ioproc: DestroyIoProcFn =
+                    std::mem::transmute(symbol(handle, b"AudioDeviceDestroyIOProcID\0")?);
+                let device_start: StartDeviceFn =
+                    std::mem::transmute(symbol(handle, b"AudioDeviceStart\0")?);
+                let device_stop: StartDeviceFn =
+                    std::mem::transmute(symbol(handle, b"AudioDeviceStop\0")?);
+                let create_process_tap: Option<CreateProcessTapFn> =
+                    symbol(handle, b"AudioHardwareCreateProcessTap\0")
+                        .map(|symbol| std::mem::transmute(symbol));
+                let destroy_process_tap: Option<DestroyProcessTapFn> =
+                    symbol(handle, b"AudioHardwareDestroyProcessTap\0")
+                        .map(|symbol| std::mem::transmute(symbol));
+                Some(CoreAudioApi {
+                    get_property_data,
+                    set_property_data,
+                    create_aggregate,
+                    destroy_aggregate,
+                    create_ioproc,
+                    destroy_ioproc,
+                    device_start,
+                    device_stop,
+                    create_process_tap,
+                    destroy_process_tap,
+                })
+            }
+        })
+        .as_ref()
+    }
+
+    pub(super) fn process_tap_symbols_available() -> bool {
+        coreaudio_api().is_some_and(|api| {
+            api.create_process_tap.is_some() && api.destroy_process_tap.is_some()
+        })
+    }
+
+    pub(super) fn screen_capture_kit_available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| unsafe {
+            let handle = libc::dlopen(
+                c"/System/Library/Frameworks/ScreenCaptureKit.framework/ScreenCaptureKit".as_ptr(),
+                libc::RTLD_LAZY | libc::RTLD_LOCAL,
+            );
+            !handle.is_null() && Class::get("SCStream").is_some()
+        })
+    }
+
+    fn property_address(selector: u32) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress {
+            selector,
+            scope: SCOPE_GLOBAL,
+            element: 0,
+        }
+    }
+
+    unsafe fn get_property<T>(
+        api: &CoreAudioApi,
+        object: AudioObjectId,
+        selector: u32,
+    ) -> Result<T, OsStatus> {
+        let address = property_address(selector);
+        let mut value: T = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<T>() as u32;
+        let status = unsafe {
+            (api.get_property_data)(
+                object,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut value as *mut T as *mut c_void,
+            )
+        };
+        if status == 0 && size as usize >= std::mem::size_of::<T>() {
+            Ok(value)
+        } else {
+            Err(status)
+        }
+    }
+
+    unsafe fn set_property<T>(
+        api: &CoreAudioApi,
+        object: AudioObjectId,
+        selector: u32,
+        value: &mut T,
+    ) -> OsStatus {
+        let address = property_address(selector);
+        unsafe {
+            (api.set_property_data)(
+                object,
+                &address,
+                0,
+                ptr::null(),
+                std::mem::size_of::<T>() as u32,
+                value as *mut T as *mut c_void,
+            )
+        }
+    }
+
+    unsafe fn translate_pid(api: &CoreAudioApi, pid: i32) -> Option<AudioObjectId> {
+        let address = property_address(HW_TRANSLATE_PID_TO_PROCESS_OBJECT);
+        let mut object: AudioObjectId = 0;
+        let mut size = std::mem::size_of::<AudioObjectId>() as u32;
+        let mut pid = pid;
+        let status = unsafe {
+            (api.get_property_data)(
+                SYSTEM_OBJECT,
+                &address,
+                std::mem::size_of::<i32>() as u32,
+                &mut pid as *mut i32 as *const c_void,
+                &mut size,
+                &mut object as *mut AudioObjectId as *mut c_void,
+            )
+        };
+        (status == 0 && object != 0).then_some(object)
+    }
+
+    unsafe fn query_tap_format(api: &CoreAudioApi, tap: AudioObjectId) -> Option<(u16, u32)> {
+        let format: AudioStreamBasicDescription =
+            unsafe { get_property(api, tap, TAP_FORMAT) }.ok()?;
+        let is_float = format.format_flags & FORMAT_FLAG_IS_FLOAT != 0;
+        if format.format_id != FORMAT_LINEAR_PCM
+            || !is_float
+            || format.bits_per_channel != 32
+            || format.channels_per_frame == 0
+            || format.sample_rate <= 0.0
+        {
+            return None;
+        }
+        Some((
+            format.channels_per_frame.min(u16::MAX as u32) as u16,
+            format.sample_rate.round() as u32,
+        ))
+    }
+
+    unsafe fn query_tap_uid(api: &CoreAudioApi, tap: AudioObjectId) -> Option<CFString> {
+        let address = property_address(TAP_UID);
+        let mut value: CFStringRef = ptr::null();
+        let mut size = std::mem::size_of::<CFStringRef>() as u32;
+        let status = unsafe {
+            (api.get_property_data)(
+                tap,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut value as *mut CFStringRef as *mut c_void,
+            )
+        };
+        (status == 0 && !value.is_null()).then(|| unsafe { CFString::wrap_under_get_rule(value) })
+    }
+
+    unsafe fn exclude_own_process(processes: *mut Object, own_process: AudioObjectId) {
+        if own_process == 0 {
+            return;
+        }
+        let Some(number_class) = Class::get("NSNumber") else {
+            return; // coverage: unreachable — Foundation always provides NSNumber
+        };
+        let number: *mut Object =
+            unsafe { msg_send![number_class, numberWithUnsignedInt: own_process] };
+        if number.is_null() {
+            return; // coverage: unreachable — numberWithUnsignedInt: never returns nil
+        }
+        let _: () = unsafe { msg_send![processes, addObject: number] };
+    }
+
+    unsafe fn create_tap_description(own_process: AudioObjectId) -> Option<*mut Object> {
+        let class = Class::get("CATapDescription")?;
+        let alloc: *mut Object = unsafe { msg_send![class, alloc] };
+        if alloc.is_null() {
+            return None; // coverage: unreachable — NSObject's alloc always returns an instance
+        }
+        let array_class = Class::get("NSMutableArray")?;
+        let processes: *mut Object = unsafe { msg_send![array_class, array] };
+        unsafe { exclude_own_process(processes, own_process) };
+        let description: *mut Object =
+            unsafe { msg_send![alloc, initStereoGlobalTapButExcludeProcesses: processes] };
+        if description.is_null() {
+            return None; // coverage: unreachable — CATapDescription's designated init is total
+        }
+        let _: () = unsafe { msg_send![description, setPrivate: 1i8] };
+        // CATapDescription always implements setMuteBehavior: (macOS 12+;
+        // process taps themselves need 14.2+), so this is unconditional.
+        let _: () = unsafe { msg_send![description, setMuteBehavior: 0i64] };
+        Some(description)
+    }
+
+    fn aggregate_composition(tap_uid: &CFString) -> CFDictionary<CFString, CFType> {
+        let tap_entry = CFDictionary::<CFString, CFType>::from_CFType_pairs(&[(
+            CFString::new(SUB_TAP_UID_KEY),
+            tap_uid.as_CFType(),
+        )]);
+        let tap_list = CFArray::<CFType>::from_CFTypes(&[tap_entry.as_CFType()]);
+        static AGGREGATE_SERIAL: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let serial = AGGREGATE_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let aggregate_uid = CFString::new(&format!(
+            "Casa1-System-Loopback-{}-{serial}",
+            std::process::id()
+        ));
+        CFDictionary::from_CFType_pairs(&[
+            (
+                CFString::new(AGGREGATE_DEVICE_UID_KEY),
+                aggregate_uid.as_CFType(),
+            ),
+            (
+                CFString::new(AGGREGATE_DEVICE_PRIVATE_KEY),
+                CFBoolean::true_value().as_CFType(),
+            ),
+            (
+                CFString::new(AGGREGATE_DEVICE_TAP_LIST_KEY),
+                tap_list.as_CFType(),
+            ),
+        ])
+    }
+
+    /// Interleave one host `AudioBufferList` of 32-bit floats.
+    ///
+    /// Returns the interleaved samples and the actual channel count.  A
+    /// single buffer is interleaved; multiple buffers are one channel each
+    /// (the CoreAudio non-interleaved layout).
+    unsafe fn audio_buffer_list_to_interleaved(list: *const AudioBufferList) -> (Vec<f32>, u16) {
+        if list.is_null() {
+            return (Vec::new(), 0);
+        }
+        let number_buffers = unsafe { (*list).number_buffers as usize };
+        if number_buffers == 0 || number_buffers > 64 {
+            return (Vec::new(), 0);
+        }
+        let buffers = unsafe { ptr::addr_of!((*list).buffers) as *const AudioBuffer };
+        let first = unsafe { &*buffers };
+        if first.data.is_null() || first.number_channels == 0 {
+            return (Vec::new(), 0);
+        }
+        if number_buffers == 1 {
+            let channels = first.number_channels as usize;
+            let frames = first.data_byte_size as usize / (4 * channels);
+            if frames == 0 {
+                return (Vec::new(), 0);
+            }
+            let samples =
+                unsafe { std::slice::from_raw_parts(first.data as *const f32, frames * channels) };
+            return (samples.to_vec(), channels.min(u16::MAX as usize) as u16);
+        }
+        let frames = (0..number_buffers)
+            .map(|index| {
+                let buffer = unsafe { &*buffers.add(index) };
+                if buffer.data.is_null() {
+                    0
+                } else {
+                    buffer.data_byte_size as usize / 4
+                }
+            })
+            .min()
+            .unwrap_or(0);
+        if frames == 0 {
+            return (Vec::new(), 0);
+        }
+        let channels = number_buffers.min(u16::MAX as usize) as u16;
+        let mut output = vec![0.0f32; frames * number_buffers];
+        for (channel, index) in (0..number_buffers).enumerate() {
+            let buffer = unsafe { &*buffers.add(index) };
+            if buffer.data.is_null() {
+                // coverage: unreachable — frames is the minimum over every
+                // buffer, so a null buffer already forced frames == 0 above.
+                continue; // coverage: unreachable — see the frames == 0 return above
+            }
+            let samples = unsafe { std::slice::from_raw_parts(buffer.data as *const f32, frames) };
+            for (frame, sample) in samples.iter().enumerate() {
+                output[frame * number_buffers + channel] = *sample;
+            }
+        }
+        (output, channels)
+    }
+
+    pub(super) fn start_process_tap(
+        shared: Arc<Mutex<SystemLoopbackSink>>,
+        generation: u64,
+    ) -> Result<SystemLoopbackSession, SystemLoopbackFailure> {
+        let api = coreaudio_api().ok_or(SystemLoopbackFailure::Unavailable)?;
+        let create_tap = api
+            .create_process_tap
+            .ok_or(SystemLoopbackFailure::Unavailable)?;
+        let destroy_tap = api
+            .destroy_process_tap
+            .ok_or(SystemLoopbackFailure::Unavailable)?;
+        let own_process = unsafe { translate_pid(api, std::process::id() as i32) }.unwrap_or(0);
+        let description =
+            objc::rc::autoreleasepool(|| unsafe { create_tap_description(own_process) })
+                .ok_or(SystemLoopbackFailure::ObjectUnavailable)?;
+        let mut tap: AudioObjectId = 0;
+        let status = unsafe { create_tap(description, &mut tap) };
+        unsafe {
+            let _: () = msg_send![description, release];
+        }
+        if status != 0 || tap == 0 {
+            return Err(SystemLoopbackFailure::TapCreation(status));
+        }
+
+        let Some((channels, sample_rate)) = (unsafe { query_tap_format(api, tap) }) else {
+            unsafe {
+                let _ = destroy_tap(tap);
+            }
+            return Err(SystemLoopbackFailure::FormatUnavailable);
+        };
+        let Some(tap_uid) = (unsafe { query_tap_uid(api, tap) }) else {
+            unsafe {
+                let _ = destroy_tap(tap);
+            }
+            return Err(SystemLoopbackFailure::ObjectUnavailable);
+        };
+        let composition = aggregate_composition(&tap_uid);
+        let mut aggregate: AudioObjectId = 0;
+        let status = unsafe {
+            (api.create_aggregate)(
+                composition.as_concrete_TypeRef() as *const c_void,
+                &mut aggregate,
+            )
+        };
+        if status != 0 || aggregate == 0 {
+            unsafe {
+                let _ = destroy_tap(tap);
+            }
+            return Err(SystemLoopbackFailure::AggregateCreation(status));
+        }
+
+        let sink = Arc::clone(&shared);
+        let block = block::ConcreteBlock::new(
+            move |_now: *const c_void,
+                  input: *const AudioBufferList,
+                  _input_time: *const c_void,
+                  _output: *mut AudioBufferList,
+                  _output_time: *const c_void| {
+                let (samples, actual_channels) = unsafe { audio_buffer_list_to_interleaved(input) };
+                if samples.is_empty() {
+                    return;
+                }
+                if let Ok(mut sink) = sink.try_lock() {
+                    let _ = sink.ingest(generation, actual_channels, sample_rate, &samples);
+                }
+            },
+        );
+        let block = block.copy();
+        let mut ioproc: AudioDeviceIoProcId = ptr::null_mut();
+        let block_ptr = &*block as *const _ as *const c_void;
+        let status =
+            unsafe { (api.create_ioproc)(&mut ioproc, aggregate, ptr::null_mut(), block_ptr) };
+        if status != 0 || ioproc.is_null() {
+            unsafe {
+                let _ = (api.destroy_aggregate)(aggregate);
+                let _ = destroy_tap(tap);
+            }
+            return Err(SystemLoopbackFailure::StreamStart(status));
+        }
+        let status = unsafe { (api.device_start)(aggregate, ioproc) };
+        if status != 0 {
+            unsafe {
+                let _ = (api.destroy_ioproc)(aggregate, ioproc);
+                let _ = (api.destroy_aggregate)(aggregate);
+                let _ = destroy_tap(tap);
+            }
+            return Err(SystemLoopbackFailure::StreamStart(status));
+        }
+
+        {
+            let mut sink = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sink.channels = channels;
+            sink.sample_rate = sample_rate;
+        }
+        let ioproc = ioproc as usize;
+        let stop = Box::new(move || unsafe {
+            let ioproc = ioproc as AudioDeviceIoProcId;
+            let _ = (api.device_stop)(aggregate, ioproc);
+            let _ = (api.destroy_ioproc)(aggregate, ioproc);
+            let _ = (api.destroy_aggregate)(aggregate);
+            let _ = destroy_tap(tap);
+        });
+        Ok(SystemLoopbackSession {
+            backend: SystemLoopbackBackend::CoreAudioProcessTap,
+            generation,
+            shared,
+            stop: Some(stop),
+        })
+    }
+
+    pub(super) fn start_screen_capture_kit(
+        shared: Arc<Mutex<SystemLoopbackSink>>,
+        generation: u64,
+    ) -> Result<SystemLoopbackSession, SystemLoopbackFailure> {
+        sck::start(shared, generation)
+    }
+
+    /// CoreAudio hog-mode driver for the default output device.
+    pub(crate) struct CoreAudioHogDriver {
+        api: &'static CoreAudioApi,
+        device: AudioObjectId,
+        pid: i32,
+    }
+
+    impl CoreAudioHogDriver {
+        pub(crate) fn open_default_output() -> Option<Self> {
+            let api = coreaudio_api()?;
+            let device: AudioObjectId =
+                unsafe { get_property(api, SYSTEM_OBJECT, HW_DEFAULT_OUTPUT_DEVICE) }.ok()?;
+            (device != 0).then_some(Self {
+                api,
+                device,
+                pid: std::process::id() as i32,
+            })
+        }
+    }
+
+    impl HogModeDriver for CoreAudioHogDriver {
+        fn hog_owner(&mut self) -> Result<i32, i32> {
+            unsafe { get_property(self.api, self.device, DEVICE_HOG_MODE) }
+        }
+
+        fn set_hog(&mut self) -> Result<i32, i32> {
+            let mut owner = self.pid;
+            let status =
+                unsafe { set_property(self.api, self.device, DEVICE_HOG_MODE, &mut owner) };
+            if status != 0 { Err(status) } else { Ok(owner) }
+        }
+
+        fn release_hog(&mut self) -> Result<(), i32> {
+            let owner = self.hog_owner()?;
+            if owner != self.pid {
+                return Ok(());
+            }
+            let mut value = self.pid;
+            let status =
+                unsafe { set_property(self.api, self.device, DEVICE_HOG_MODE, &mut value) };
+            if status == 0 { Ok(()) } else { Err(status) }
+        }
+
+        fn set_nominal_sample_rate(&mut self, sample_rate: f64) -> Result<(), i32> {
+            let mut value = sample_rate;
+            let status = unsafe {
+                set_property(
+                    self.api,
+                    self.device,
+                    DEVICE_NOMINAL_SAMPLE_RATE,
+                    &mut value,
+                )
+            };
+            if status == 0 { Ok(()) } else { Err(status) }
+        }
+
+        fn set_buffer_frame_size(&mut self, frames: u32) -> Result<(), i32> {
+            let mut value = frames;
+            let status = unsafe {
+                set_property(self.api, self.device, DEVICE_BUFFER_FRAME_SIZE, &mut value)
+            };
+            if status == 0 { Ok(()) } else { Err(status) }
+        }
+    }
+
+    /// ScreenCaptureKit audio capture (`SCStream.capturesAudio`).
+    #[cfg(not(test))]
+    mod sck {
+        use super::*;
+
+        const OUTPUT_TYPE_AUDIO: i64 = 1;
+        const CONTENT_TIMEOUT: Duration = Duration::from_secs(4);
+        const START_TIMEOUT: Duration = Duration::from_secs(4);
+        const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+        const FLAG_AUDIO_BUFFER_LIST_ASSURE_16_BYTE_ALIGNMENT: u32 = 1 << 0;
+
+        struct SckContext {
+            shared: Arc<Mutex<SystemLoopbackSink>>,
+            generation: u64,
+            sample_rate: u32,
+        }
+
+        type SampleBufferAudioBufferListFn = unsafe extern "C" fn(
+            *mut c_void,
+            *mut usize,
+            *mut AudioBufferList,
+            usize,
+            *const c_void,
+            *const c_void,
+            u32,
+            *mut *mut c_void,
+        ) -> OsStatus;
+
+        fn sample_buffer_api() -> Option<SampleBufferAudioBufferListFn> {
+            static API: OnceLock<usize> = OnceLock::new();
+            let pointer = *API.get_or_init(|| unsafe {
+                let handle = libc::dlopen(
+                    c"/System/Library/Frameworks/CoreMedia.framework/CoreMedia".as_ptr(),
+                    libc::RTLD_LAZY | libc::RTLD_LOCAL,
+                );
+                if handle.is_null() {
+                    return 0;
+                }
+                symbol(
+                    handle,
+                    b"CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer\0",
+                )
+                .map(|symbol| symbol as usize)
+                .unwrap_or(0)
+            });
+            (pointer != 0).then(|| unsafe {
+                std::mem::transmute::<usize, SampleBufferAudioBufferListFn>(pointer)
+            })
+        }
+
+        unsafe fn empty_array() -> Option<*mut Object> {
+            let class = Class::get("NSArray")?;
+            let array: *mut Object = unsafe { msg_send![class, array] };
+            (!array.is_null()).then_some(array)
+        }
+
+        unsafe fn shareable_content() -> Option<*mut Object> {
+            let class = Class::get("SCShareableContent")?;
+            let (sender, receiver) = mpsc::channel::<(usize, usize)>();
+            let block =
+                block::ConcreteBlock::new(move |content: *mut Object, error: *mut Object| {
+                    let _ = sender.send((content as usize, error as usize));
+                });
+            let block = block.copy();
+            let block_ptr = &*block as *const _ as *const c_void;
+            let _: () =
+                unsafe { msg_send![class, getShareableContentWithCompletionHandler: block_ptr] };
+            match receiver.recv_timeout(CONTENT_TIMEOUT) {
+                Ok((content, error)) if content != 0 && error == 0 => {
+                    let retained: *mut Object =
+                        unsafe { msg_send![content as *mut Object, retain] };
+                    (!retained.is_null()).then_some(retained)
+                }
+                _ => None,
+            }
+        }
+
+        unsafe fn first_display(content: *mut Object) -> Option<*mut Object> {
+            let displays: *mut Object = unsafe { msg_send![content, displays] };
+            if displays.is_null() {
+                return None;
+            }
+            let count: usize = unsafe { msg_send![displays, count] };
+            if count == 0 {
+                return None;
+            }
+            let display: *mut Object = unsafe { msg_send![displays, objectAtIndex: 0] };
+            (!display.is_null()).then_some(display)
+        }
+
+        unsafe fn create_filter(display: *mut Object) -> Option<*mut Object> {
+            let class = Class::get("SCContentFilter")?;
+            let excluded = unsafe { empty_array() }?;
+            let alloc: *mut Object = unsafe { msg_send![class, alloc] };
+            if alloc.is_null() {
+                return None;
+            }
+            let filter: *mut Object =
+                unsafe { msg_send![alloc, initWithDisplay: display excludingWindows: excluded] };
+            (!filter.is_null()).then_some(filter)
+        }
+
+        unsafe fn create_configuration(sample_rate: u32, channels: u16) -> Option<*mut Object> {
+            let class = Class::get("SCStreamConfiguration")?;
+            let config: *mut Object = unsafe { msg_send![class, new] };
+            if config.is_null() {
+                return None;
+            }
+            let _: () = unsafe { msg_send![config, setCapturesAudio: 1i8] };
+            let _: () = unsafe { msg_send![config, setExcludesCurrentProcessAudio: 1i8] };
+            let _: () = unsafe { msg_send![config, setSampleRate: sample_rate.max(1) as i64] };
+            let _: () = unsafe { msg_send![config, setChannelCount: channels.max(1) as i64] };
+            let _: () = unsafe { msg_send![config, setWidth: 2usize] };
+            let _: () = unsafe { msg_send![config, setHeight: 2usize] };
+            Some(config)
+        }
+
+        extern "C" fn did_output(
+            this: &mut Object,
+            _cmd: Sel,
+            _stream: *mut Object,
+            sample_buffer: *mut c_void,
+            output_type: i64,
+        ) {
+            if output_type != OUTPUT_TYPE_AUDIO || sample_buffer.is_null() {
+                return;
+            }
+            let context_pointer = unsafe { *this.get_ivar::<usize>("casa_context") };
+            if context_pointer == 0 {
+                return;
+            }
+            let context = unsafe { &*(context_pointer as *const SckContext) };
+            let (samples, channels) = unsafe { sample_buffer_to_interleaved(sample_buffer) };
+            if samples.is_empty() {
+                return;
+            }
+            if let Ok(mut sink) = context.shared.try_lock() {
+                let _ = sink.ingest(context.generation, channels, context.sample_rate, &samples);
+            }
+        }
+
+        extern "C" fn dealloc(this: &mut Object, _cmd: Sel) {
+            unsafe {
+                let pointer = *this.get_ivar::<usize>("casa_context");
+                if pointer != 0 {
+                    drop(Box::from_raw(pointer as *mut SckContext));
+                    this.set_ivar("casa_context", 0usize);
+                }
+                let _: () = msg_send![super(this, class!(NSObject)), dealloc];
+            }
+        }
+
+        fn output_class() -> Option<&'static Class> {
+            static CLASS: OnceLock<usize> = OnceLock::new();
+            let pointer = *CLASS.get_or_init(|| {
+                let Some(superclass) = Class::get("NSObject") else {
+                    return 0;
+                };
+                let Some(mut declaration) = ClassDecl::new("Casa1SCStreamOutput", superclass)
+                else {
+                    return 0;
+                };
+                declaration.add_ivar::<usize>("casa_context");
+                unsafe {
+                    declaration.add_method(
+                        sel!(stream:didOutputSampleBuffer:ofType:),
+                        did_output
+                            as extern "C" fn(&mut Object, Sel, *mut Object, *mut c_void, i64),
+                    );
+                    declaration
+                        .add_method(sel!(dealloc), dealloc as extern "C" fn(&mut Object, Sel));
+                }
+                declaration.register() as *const Class as usize
+            });
+            (pointer != 0).then(|| unsafe { &*(pointer as *const Class) })
+        }
+
+        unsafe fn sample_buffer_to_interleaved(sample_buffer: *mut c_void) -> (Vec<f32>, u16) {
+            let Some(get_buffers) = sample_buffer_api() else {
+                return (Vec::new(), 0);
+            };
+            let mut needed = 0usize;
+            let _status = unsafe {
+                get_buffers(
+                    sample_buffer,
+                    &mut needed,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                )
+            };
+            if needed == 0 {
+                return (Vec::new(), 0);
+            }
+            let words = needed.div_ceil(std::mem::size_of::<u128>());
+            let mut storage = vec![0u128; words];
+            let list = storage.as_mut_ptr() as *mut AudioBufferList;
+            let mut block_buffer: *mut c_void = ptr::null_mut();
+            let status = unsafe {
+                get_buffers(
+                    sample_buffer,
+                    &mut needed,
+                    list,
+                    words * std::mem::size_of::<u128>(),
+                    ptr::null(),
+                    ptr::null(),
+                    FLAG_AUDIO_BUFFER_LIST_ASSURE_16_BYTE_ALIGNMENT,
+                    &mut block_buffer,
+                )
+            };
+            if status != 0 {
+                return (Vec::new(), 0);
+            }
+            let result = unsafe { audio_buffer_list_to_interleaved(list) };
+            if !block_buffer.is_null() {
+                unsafe {
+                    CFRelease(block_buffer);
+                }
+            }
+            result
+        }
+
+        pub(super) fn start(
+            shared: Arc<Mutex<SystemLoopbackSink>>,
+            generation: u64,
+        ) -> Result<SystemLoopbackSession, SystemLoopbackFailure> {
+            unsafe {
+                let content = shareable_content().ok_or(SystemLoopbackFailure::Unavailable)?;
+                let display =
+                    first_display(content).ok_or(SystemLoopbackFailure::ObjectUnavailable)?;
+                let filter =
+                    create_filter(display).ok_or(SystemLoopbackFailure::ObjectUnavailable)?;
+                let channels = 2u16;
+                let sample_rate = 48_000u32;
+                let configuration = create_configuration(sample_rate, channels)
+                    .ok_or(SystemLoopbackFailure::ObjectUnavailable)?;
+                let stream_class =
+                    Class::get("SCStream").ok_or(SystemLoopbackFailure::Unavailable)?;
+                let alloc: *mut Object = msg_send![stream_class, alloc];
+                let stream: *mut Object = msg_send![alloc, initWithFilter: filter configuration: configuration delegate: ptr::null::<Object>()];
+                let _: () = msg_send![filter, release];
+                let _: () = msg_send![configuration, release];
+                if stream.is_null() {
+                    let _: () = msg_send![content, release];
+                    return Err(SystemLoopbackFailure::ObjectUnavailable);
+                }
+
+                let Some(output_class) = output_class() else {
+                    let _: () = msg_send![stream, release];
+                    let _: () = msg_send![content, release];
+                    return Err(SystemLoopbackFailure::Unavailable);
+                };
+                let output: *mut Object = msg_send![output_class, alloc];
+                let context = Box::into_raw(Box::new(SckContext {
+                    shared: Arc::clone(&shared),
+                    generation,
+                    sample_rate,
+                }));
+                (&mut *output).set_ivar("casa_context", context as usize);
+                let output: *mut Object = msg_send![output, init];
+                let mut error: *mut Object = ptr::null_mut();
+                let added: bool = msg_send![stream, addStreamOutput: output type: OUTPUT_TYPE_AUDIO sampleHandlerQueue: ptr::null::<c_void>() error: &mut error];
+                if !added {
+                    let _: () = msg_send![output, release];
+                    let _: () = msg_send![stream, release];
+                    let _: () = msg_send![content, release];
+                    return Err(SystemLoopbackFailure::StreamStart(-1));
+                }
+
+                let (sender, receiver) = mpsc::channel::<usize>();
+                let block = block::ConcreteBlock::new(move |error: *mut Object| {
+                    let _ = sender.send(error as usize);
+                });
+                let block = block.copy();
+                let block_ptr = &*block as *const _ as *const c_void;
+                let _: () = msg_send![stream, startCaptureWithCompletionHandler: block_ptr];
+                match receiver.recv_timeout(START_TIMEOUT) {
+                    Ok(0) => {}
+                    _ => {
+                        let _: () = msg_send![stream, removeStreamOutput: output type: OUTPUT_TYPE_AUDIO error: ptr::null_mut::<*mut Object>()];
+                        let _: () = msg_send![output, release];
+                        let _: () = msg_send![stream, release];
+                        let _: () = msg_send![content, release];
+                        return Err(SystemLoopbackFailure::StreamStart(-1));
+                    }
+                }
+
+                let stream_address = stream as usize;
+                let output_address = output as usize;
+                let content_address = content as usize;
+                let stop = Box::new(move || {
+                    let stream = stream_address as *mut Object;
+                    let output = output_address as *mut Object;
+                    let content = content_address as *mut Object;
+                    let (sender, receiver) = mpsc::channel::<usize>();
+                    let block = block::ConcreteBlock::new(move |error: *mut Object| {
+                        let _ = sender.send(error as usize);
+                    });
+                    let block = block.copy();
+                    let block_ptr = &*block as *const _ as *const c_void;
+                    let _: () = msg_send![stream, stopCaptureWithCompletionHandler: block_ptr];
+                    let _ = receiver.recv_timeout(STOP_TIMEOUT);
+                    let _: () = msg_send![stream, removeStreamOutput: output type: OUTPUT_TYPE_AUDIO error: ptr::null_mut::<*mut Object>()];
+                    let _: () = msg_send![output, release];
+                    let _: () = msg_send![stream, release];
+                    let _: () = msg_send![content, release];
+                });
+                Ok(SystemLoopbackSession {
+                    backend: SystemLoopbackBackend::ScreenCaptureKit,
+                    generation,
+                    shared,
+                    stop: Some(stop),
+                })
+            }
+        }
+    }
+
+    /// Deterministic fake CoreAudio host used by the adversarial system
+    /// loopback/hog tests.  It implements the same function-pointer API as the
+    /// real framework, including invoking the installed IOProc block with a
+    /// synthetic AudioBufferList, so the entire capture pipeline runs without
+    /// TCC or touching the developer's audio devices.
+    #[cfg(test)]
+    pub(crate) mod fake {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
+
+        static TAP_STATUS: AtomicI32 = AtomicI32::new(0);
+        static AGGREGATE_STATUS: AtomicI32 = AtomicI32::new(0);
+        static IOPROC_STATUS: AtomicI32 = AtomicI32::new(0);
+        static START_STATUS: AtomicI32 = AtomicI32::new(0);
+        static FORMAT_VALID: AtomicBool = AtomicBool::new(true);
+        static HOG_OWNER: AtomicI32 = AtomicI32::new(-1);
+        static SET_HOG_STATUS: AtomicI32 = AtomicI32::new(0);
+        static SET_RATE_STATUS: AtomicI32 = AtomicI32::new(0);
+        static SET_BUFFER_STATUS: AtomicI32 = AtomicI32::new(0);
+        static DEFAULT_DEVICE: AtomicU32 = AtomicU32::new(3);
+        static FAIL_SELECTOR: AtomicU32 = AtomicU32::new(0);
+        static NULL_TAP_UID: AtomicBool = AtomicBool::new(false);
+        static SAMPLES: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+        static SAMPLE_CHANNELS: AtomicU32 = AtomicU32::new(2);
+        static DESTROYED_TAP: AtomicU32 = AtomicU32::new(0);
+        static DESTROYED_AGGREGATE: AtomicU32 = AtomicU32::new(0);
+        static DESTROYED_IOPROC: AtomicU32 = AtomicU32::new(0);
+        static FAKE_UID: OnceLock<usize> = OnceLock::new();
+
+        fn lock<T>(mutex: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+            mutex
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        unsafe fn write_out<T: Copy>(out: *mut c_void, size: *mut u32, value: T) {
+            if !size.is_null() {
+                unsafe {
+                    *size = std::mem::size_of::<T>() as u32;
+                }
+            }
+            if !out.is_null() {
+                unsafe {
+                    *(out as *mut T) = value;
+                }
+            }
+        }
+
+        fn fake_uid() -> CFStringRef {
+            let pointer = *FAKE_UID.get_or_init(|| {
+                let uid = CFString::new("Casa1-Fake-Tap");
+                let pointer = uid.as_concrete_TypeRef() as usize;
+                std::mem::forget(uid);
+                pointer
+            });
+            pointer as CFStringRef
+        }
+
+        unsafe extern "C" fn fake_get(
+            object: AudioObjectId,
+            address: *const AudioObjectPropertyAddress,
+            _qualifier_size: u32,
+            _qualifier: *const c_void,
+            size: *mut u32,
+            out: *mut c_void,
+        ) -> OsStatus {
+            if address.is_null() {
+                return -50;
+            }
+            let selector = unsafe { (*address).selector };
+            if FAIL_SELECTOR.load(Ordering::SeqCst) == selector {
+                return -4;
+            }
+            match selector {
+                HW_DEFAULT_OUTPUT_DEVICE => {
+                    unsafe { write_out(out, size, DEFAULT_DEVICE.load(Ordering::SeqCst)) };
+                    0
+                }
+                HW_TRANSLATE_PID_TO_PROCESS_OBJECT => {
+                    unsafe { write_out(out, size, 5u32) };
+                    0
+                }
+                TAP_FORMAT if object == 7 => {
+                    let valid = FORMAT_VALID.load(Ordering::SeqCst);
+                    let format = AudioStreamBasicDescription {
+                        sample_rate: 48_000.0,
+                        format_id: if valid { FORMAT_LINEAR_PCM } else { 0 },
+                        format_flags: if valid { FORMAT_FLAG_IS_FLOAT } else { 0 },
+                        bytes_per_packet: 8,
+                        frames_per_packet: 1,
+                        bytes_per_frame: 8,
+                        channels_per_frame: if valid { 2 } else { 0 },
+                        bits_per_channel: 32,
+                        reserved: 0,
+                    };
+                    unsafe { write_out(out, size, format) };
+                    0
+                }
+                TAP_UID if object == 7 => {
+                    let uid = if NULL_TAP_UID.load(Ordering::SeqCst) {
+                        ptr::null()
+                    } else {
+                        fake_uid()
+                    };
+                    unsafe { write_out(out, size, uid) };
+                    0
+                }
+                DEVICE_HOG_MODE if object == 3 => {
+                    unsafe { write_out(out, size, HOG_OWNER.load(Ordering::SeqCst)) };
+                    0
+                }
+                DEVICE_NOMINAL_SAMPLE_RATE if object == 3 => {
+                    unsafe { write_out(out, size, 48_000.0f64) };
+                    0
+                }
+                DEVICE_BUFFER_FRAME_SIZE if object == 3 => {
+                    unsafe { write_out(out, size, 128u32) };
+                    0
+                }
+                _ => -4,
+            }
+        }
+
+        unsafe extern "C" fn fake_set(
+            object: AudioObjectId,
+            address: *const AudioObjectPropertyAddress,
+            _qualifier_size: u32,
+            _qualifier: *const c_void,
+            _size: u32,
+            data: *const c_void,
+        ) -> OsStatus {
+            if address.is_null() || data.is_null() {
+                return -50;
+            }
+            let selector = unsafe { (*address).selector };
+            match selector {
+                DEVICE_HOG_MODE if object == 3 => {
+                    let status = SET_HOG_STATUS.load(Ordering::SeqCst);
+                    if status == 0 {
+                        let requested = unsafe { *(data as *const i32) };
+                        let owner = HOG_OWNER.load(Ordering::SeqCst);
+                        // CoreAudio treats setting hog mode to the current
+                        // owner as a release, and to a free device as an
+                        // acquire.
+                        HOG_OWNER.store(
+                            if owner == requested { -1 } else { requested },
+                            Ordering::SeqCst,
+                        );
+                    }
+                    status
+                }
+                DEVICE_NOMINAL_SAMPLE_RATE if object == 3 => SET_RATE_STATUS.load(Ordering::SeqCst),
+                DEVICE_BUFFER_FRAME_SIZE if object == 3 => SET_BUFFER_STATUS.load(Ordering::SeqCst),
+                _ => -4,
+            }
+        }
+
+        unsafe extern "C" fn fake_create_tap(
+            _description: *mut Object,
+            tap: *mut AudioObjectId,
+        ) -> OsStatus {
+            let status = TAP_STATUS.load(Ordering::SeqCst);
+            if status == 0 && !tap.is_null() {
+                unsafe {
+                    *tap = 7;
+                }
+            }
+            status
+        }
+
+        unsafe extern "C" fn fake_destroy_tap(_tap: AudioObjectId) -> OsStatus {
+            DESTROYED_TAP.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+
+        unsafe extern "C" fn fake_create_aggregate(
+            _composition: *const c_void,
+            aggregate: *mut AudioObjectId,
+        ) -> OsStatus {
+            let status = AGGREGATE_STATUS.load(Ordering::SeqCst);
+            if status == 0 && !aggregate.is_null() {
+                unsafe {
+                    *aggregate = 8;
+                }
+            }
+            status
+        }
+
+        unsafe extern "C" fn fake_destroy_aggregate(_aggregate: AudioObjectId) -> OsStatus {
+            DESTROYED_AGGREGATE.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+
+        type IoArgs = (
+            *const c_void,
+            *const AudioBufferList,
+            *const c_void,
+            *mut AudioBufferList,
+            *const c_void,
+        );
+
+        unsafe extern "C" fn fake_create_ioproc(
+            ioproc: *mut AudioDeviceIoProcId,
+            _device: AudioObjectId,
+            _queue: *mut c_void,
+            block: *const c_void,
+        ) -> OsStatus {
+            let status = IOPROC_STATUS.load(Ordering::SeqCst);
+            if status != 0 {
+                return status;
+            }
+            if ioproc.is_null() || block.is_null() {
+                return -50;
+            }
+            unsafe {
+                *ioproc = 0x1 as AudioDeviceIoProcId;
+            }
+            let samples = lock(&SAMPLES).clone();
+            if samples.is_empty() {
+                let block = unsafe { &*(block as *const block::Block<IoArgs, ()>) };
+                unsafe {
+                    block.call((
+                        ptr::null(),
+                        ptr::null(),
+                        ptr::null(),
+                        ptr::null_mut(),
+                        ptr::null(),
+                    ));
+                }
+            } else {
+                let channels = SAMPLE_CHANNELS.load(Ordering::SeqCst).max(1);
+                let mut data = samples;
+                let buffer = AudioBuffer {
+                    number_channels: channels,
+                    data_byte_size: (data.len() * std::mem::size_of::<f32>()) as u32,
+                    data: data.as_mut_ptr() as *mut c_void,
+                };
+                let list = AudioBufferList {
+                    number_buffers: 1,
+                    buffers: [buffer],
+                };
+                let block = unsafe { &*(block as *const block::Block<IoArgs, ()>) };
+                unsafe {
+                    block.call((
+                        ptr::null(),
+                        &list,
+                        ptr::null(),
+                        ptr::null_mut(),
+                        ptr::null(),
+                    ));
+                }
+            }
+            0
+        }
+
+        unsafe extern "C" fn fake_destroy_ioproc(
+            _device: AudioObjectId,
+            _ioproc: AudioDeviceIoProcId,
+        ) -> OsStatus {
+            DESTROYED_IOPROC.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+
+        unsafe extern "C" fn fake_start(
+            _device: AudioObjectId,
+            _ioproc: AudioDeviceIoProcId,
+        ) -> OsStatus {
+            START_STATUS.load(Ordering::SeqCst)
+        }
+
+        unsafe extern "C" fn fake_stop(
+            _device: AudioObjectId,
+            _ioproc: AudioDeviceIoProcId,
+        ) -> OsStatus {
+            0
+        }
+
+        pub(crate) fn install() {
+            TAP_STATUS.store(0, Ordering::SeqCst);
+            AGGREGATE_STATUS.store(0, Ordering::SeqCst);
+            IOPROC_STATUS.store(0, Ordering::SeqCst);
+            START_STATUS.store(0, Ordering::SeqCst);
+            FORMAT_VALID.store(true, Ordering::SeqCst);
+            HOG_OWNER.store(-1, Ordering::SeqCst);
+            SET_HOG_STATUS.store(0, Ordering::SeqCst);
+            SET_RATE_STATUS.store(0, Ordering::SeqCst);
+            SET_BUFFER_STATUS.store(0, Ordering::SeqCst);
+            DEFAULT_DEVICE.store(3, Ordering::SeqCst);
+            FAIL_SELECTOR.store(0, Ordering::SeqCst);
+            NULL_TAP_UID.store(false, Ordering::SeqCst);
+            SAMPLE_CHANNELS.store(2, Ordering::SeqCst);
+            DESTROYED_TAP.store(0, Ordering::SeqCst);
+            DESTROYED_AGGREGATE.store(0, Ordering::SeqCst);
+            DESTROYED_IOPROC.store(0, Ordering::SeqCst);
+            lock(&SAMPLES).clear();
+            let api = CoreAudioApi {
+                get_property_data: fake_get,
+                set_property_data: fake_set,
+                create_aggregate: fake_create_aggregate,
+                destroy_aggregate: fake_destroy_aggregate,
+                create_ioproc: fake_create_ioproc,
+                destroy_ioproc: fake_destroy_ioproc,
+                device_start: fake_start,
+                device_stop: fake_stop,
+                create_process_tap: Some(fake_create_tap),
+                destroy_process_tap: Some(fake_destroy_tap),
+            };
+            *TEST_CORE_AUDIO_API
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::leak(Box::new(api)));
+        }
+
+        pub(crate) fn clear() {
+            *TEST_CORE_AUDIO_API
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+
+        pub(crate) fn set_tap_status(status: i32) {
+            TAP_STATUS.store(status, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_aggregate_status(status: i32) {
+            AGGREGATE_STATUS.store(status, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_ioproc_status(status: i32) {
+            IOPROC_STATUS.store(status, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_start_status(status: i32) {
+            START_STATUS.store(status, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_format_valid(valid: bool) {
+            FORMAT_VALID.store(valid, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_samples(samples: Vec<f32>, channels: u16) {
+            SAMPLE_CHANNELS.store(channels.max(1) as u32, Ordering::SeqCst);
+            *lock(&SAMPLES) = samples;
+        }
+
+        pub(crate) fn set_hog(
+            owner: i32,
+            set_hog_status: i32,
+            set_rate_status: i32,
+            set_buffer_status: i32,
+        ) {
+            HOG_OWNER.store(owner, Ordering::SeqCst);
+            SET_HOG_STATUS.store(set_hog_status, Ordering::SeqCst);
+            SET_RATE_STATUS.store(set_rate_status, Ordering::SeqCst);
+            SET_BUFFER_STATUS.store(set_buffer_status, Ordering::SeqCst);
+        }
+
+        pub(crate) fn hog_owner() -> i32 {
+            HOG_OWNER.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn set_default_device(device: u32) {
+            DEFAULT_DEVICE.store(device, Ordering::SeqCst);
+        }
+
+        pub(crate) fn null_tap_uid() {
+            NULL_TAP_UID.store(true, Ordering::SeqCst);
+        }
+
+        pub(crate) fn fail_hog_mode_query() {
+            FAIL_SELECTOR.store(DEVICE_HOG_MODE, Ordering::SeqCst);
+        }
+
+        pub(crate) fn destroy_counts() -> (u32, u32, u32) {
+            (
+                DESTROYED_TAP.load(Ordering::SeqCst),
+                DESTROYED_AGGREGATE.load(Ordering::SeqCst),
+                DESTROYED_IOPROC.load(Ordering::SeqCst),
+            )
+        }
+
+        #[test]
+        fn system_loopback_tap_exclusion_invalid_zero_process_is_a_noop() {
+            unsafe {
+                // own_process == 0 means "could not translate our PID"; the
+                // helper must return before touching the process array.
+                assert_eq!(exclude_own_process(ptr::null_mut(), 0), ());
+            }
+        }
+
+        #[test]
+        fn system_loopback_buffer_list_edge_shapes_are_pinned() {
+            unsafe {
+                assert_eq!(
+                    audio_buffer_list_to_interleaved(ptr::null()),
+                    (Vec::new(), 0)
+                );
+                let mut zero = AudioBufferList {
+                    number_buffers: 0,
+                    buffers: [AudioBuffer {
+                        number_channels: 2,
+                        data_byte_size: 8,
+                        data: ptr::null_mut(),
+                    }],
+                };
+                assert_eq!(
+                    audio_buffer_list_to_interleaved(&zero as *const _),
+                    (Vec::new(), 0)
+                );
+                let mut missing = AudioBufferList {
+                    number_buffers: 1,
+                    buffers: [AudioBuffer {
+                        number_channels: 2,
+                        data_byte_size: 8,
+                        data: ptr::null_mut(),
+                    }],
+                };
+                assert_eq!(
+                    audio_buffer_list_to_interleaved(&missing as *const _),
+                    (Vec::new(), 0)
+                );
+                let mut dummy = [0.0f32; 2];
+                let empty_frames = AudioBufferList {
+                    number_buffers: 1,
+                    buffers: [AudioBuffer {
+                        number_channels: 2,
+                        data_byte_size: 0,
+                        data: dummy.as_mut_ptr() as *mut c_void,
+                    }],
+                };
+                assert_eq!(
+                    audio_buffer_list_to_interleaved(&empty_frames as *const _),
+                    (Vec::new(), 0)
+                );
+                let _ = &mut zero;
+                let _ = &mut missing;
+
+                let mut left = [0.1f32, 0.2];
+                let mut right = [0.3f32, 0.4];
+                let mut storage = vec![0u64; 8];
+                let list = storage.as_mut_ptr() as *mut AudioBufferList;
+                (*list).number_buffers = 2;
+                let buffers = ptr::addr_of_mut!((*list).buffers) as *mut AudioBuffer;
+                *buffers = AudioBuffer {
+                    number_channels: 1,
+                    data_byte_size: 8,
+                    data: left.as_mut_ptr() as *mut c_void,
+                };
+                *buffers.add(1) = AudioBuffer {
+                    number_channels: 1,
+                    data_byte_size: 8,
+                    data: right.as_mut_ptr() as *mut c_void,
+                };
+                assert_eq!(
+                    audio_buffer_list_to_interleaved(list),
+                    (vec![0.1, 0.3, 0.2, 0.4], 2)
+                );
+                *buffers.add(1) = AudioBuffer {
+                    number_channels: 1,
+                    data_byte_size: 8,
+                    data: ptr::null_mut(),
+                };
+                // A null channel buffer makes the minimum frame count zero,
+                // so the whole callback is rejected rather than half-read.
+                assert_eq!(audio_buffer_list_to_interleaved(list), (Vec::new(), 0));
+                *buffers = AudioBuffer {
+                    number_channels: 1,
+                    data_byte_size: 8,
+                    data: ptr::null_mut(),
+                };
+                assert_eq!(audio_buffer_list_to_interleaved(list), (Vec::new(), 0));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod sck {
+        use super::*;
+
+        /// The production ScreenCaptureKit path is compiled out of the test
+        /// binary (it needs Screen Recording TCC and a live display); the tap
+        /// pipeline is exercised against the fake CoreAudio host instead.
+        pub(super) fn start(
+            _shared: Arc<Mutex<SystemLoopbackSink>>,
+            _generation: u64,
+        ) -> Result<SystemLoopbackSession, SystemLoopbackFailure> {
+            Err(SystemLoopbackFailure::Unavailable)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4904,5 +7072,770 @@ mod tests {
         };
         // An unknown device has no latency record.
         assert_eq!(backend.last_latency_ms(999_999), None);
+    }
+
+    // ── System-output loopback (tap / ScreenCaptureKit) ─────────────────
+
+    /// Serializes fake-host tests and restores the real probe on drop.
+    struct FakeHostGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FakeHostGuard {
+        fn new() -> Self {
+            let lock = lock_system_loopback_tests();
+            platform::fake::install();
+            set_test_system_loopback_capability(Some(SystemLoopbackBackend::CoreAudioProcessTap));
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for FakeHostGuard {
+        fn drop(&mut self) {
+            set_test_system_loopback_capability(None);
+            platform::fake::clear();
+        }
+    }
+
+    fn fake_device(backend: &mut RealAudioBackend, id: DeviceId, is_default: bool) {
+        backend.devices.insert(
+            id,
+            RealAudioDevice {
+                id,
+                key: format!("fake-device-{id}"),
+                name: format!("Fake Device {id}"),
+                channels: 2,
+                sample_rate: 48_000,
+                is_default,
+            },
+        );
+    }
+
+    fn exclusive_test_format() -> WaveFormat {
+        WaveFormat {
+            channels: 2,
+            sample_rate: 48_000,
+            sample_format: SampleFormat::Float32,
+        }
+    }
+
+    #[test]
+    fn system_loopback_process_tap_pipeline_captures_and_tears_down() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_samples(vec![0.25, 0.75, 0.5, 0.5], 2);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::CoreAudioProcessTap)
+        );
+        assert_eq!(backend.system_loopback_format(), Some((2, 48_000)));
+        assert_eq!(backend.system_loopback_available_frames(), 2);
+        assert_eq!(
+            backend.read_system_loopback_data(),
+            vec![0.25, 0.75, 0.5, 0.5]
+        );
+        let status = backend.system_loopback_status();
+        assert_eq!(status.frames_delivered, 2);
+        assert_eq!(status.buffered_frames, 0);
+        backend.stop_system_loopback();
+        assert!(!backend.system_loopback_running());
+        assert_eq!(
+            platform::fake::destroy_counts(),
+            (1, 1, 1),
+            "tap, aggregate and IOProc are all released exactly once"
+        );
+    }
+
+    #[test]
+    fn system_loopback_tap_creation_failure_is_pinned() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_tap_status(-50);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::TapCreation(-50))
+        );
+        assert!(!backend.system_loopback_running());
+        assert_eq!(platform::fake::destroy_counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn system_loopback_aggregate_creation_failure_is_pinned() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_aggregate_status(-4);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::AggregateCreation(-4))
+        );
+        assert_eq!(
+            platform::fake::destroy_counts(),
+            (1, 0, 0),
+            "a failed aggregate creation still destroys the tap"
+        );
+    }
+
+    #[test]
+    fn system_loopback_stream_start_failure_is_pinned() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_start_status(-1);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::StreamStart(-1))
+        );
+        assert_eq!(
+            platform::fake::destroy_counts(),
+            (1, 1, 1),
+            "a failed device start unwinds the IOProc, aggregate and tap"
+        );
+    }
+
+    #[test]
+    fn system_loopback_tap_format_unavailable_is_pinned() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_format_valid(false);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::FormatUnavailable)
+        );
+        assert_eq!(platform::fake::destroy_counts(), (1, 0, 0));
+    }
+
+    #[test]
+    fn system_loopback_ioproc_failure_unwinds_aggregate_and_tap() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_ioproc_status(-1);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::StreamStart(-1))
+        );
+        assert_eq!(platform::fake::destroy_counts(), (1, 1, 0));
+    }
+
+    #[test]
+    fn system_loopback_empty_callback_is_dropped_without_frames() {
+        let _host = FakeHostGuard::new();
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::CoreAudioProcessTap)
+        );
+        assert_eq!(backend.system_loopback_available_frames(), 0);
+        assert_eq!(backend.system_loopback_status().frames_delivered, 0);
+        backend.stop_system_loopback();
+        assert_eq!(platform::fake::destroy_counts(), (1, 1, 1));
+    }
+
+    #[test]
+    fn system_loopback_null_tap_uid_is_a_failure() {
+        let _host = FakeHostGuard::new();
+        platform::fake::null_tap_uid();
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::ObjectUnavailable)
+        );
+        assert_eq!(platform::fake::destroy_counts(), (1, 0, 0));
+    }
+
+    #[test]
+    fn system_loopback_sck_fallback_is_unavailable() {
+        let shared = Arc::new(Mutex::new(SystemLoopbackSink::new(1, 2, 48_000)));
+        assert_eq!(
+            platform::start_screen_capture_kit(shared, 1).err(),
+            Some(SystemLoopbackFailure::Unavailable)
+        );
+    }
+
+    #[test]
+    fn exclusive_mode_hog_acquire_and_release_are_pinned() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_hog(-1, 0, 0, 0);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 11, true);
+        force_next_exclusive_stream_open(Some(Ok(128)));
+        let client = backend
+            .open_wasapi_client_exclusive(11, exclusive_test_format())
+            .expect("fake exclusive open");
+        assert_eq!(
+            backend.exclusive_client_hog_mode(client),
+            Some(HogModeOutcome::Acquired)
+        );
+        assert!(backend.hog_mode_held(11));
+        assert_eq!(
+            platform::fake::hog_owner(),
+            std::process::id() as i32,
+            "hog mode is owned by this process"
+        );
+        backend.close_stream(11);
+        assert!(!backend.hog_mode_held(11));
+        assert_eq!(platform::fake::hog_owner(), -1, "hog mode is released");
+        assert_eq!(backend.exclusive_client_hog_mode(client), None);
+    }
+
+    #[test]
+    fn exclusive_mode_hog_denial_keeps_the_client_contract() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_hog(1_234, -50, 0, 0);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 12, true);
+        force_next_exclusive_stream_open(Some(Ok(64)));
+        let client = backend
+            .open_wasapi_client_exclusive(12, exclusive_test_format())
+            .expect("client-side exclusive open still succeeds");
+        assert_eq!(
+            backend.exclusive_client_hog_mode(client),
+            Some(HogModeOutcome::Denied { owner_pid: 1_234 })
+        );
+        assert!(!backend.hog_mode_held(12));
+        assert_eq!(
+            backend
+                .exclusive_clients
+                .get(&client)
+                .expect("exclusive state")
+                .buffer_frames,
+            64
+        );
+        backend.hog_devices.insert(12, std::process::id() as i32);
+        backend.close_all_streams();
+        assert!(!backend.hog_mode_held(12));
+    }
+
+    #[test]
+    fn exclusive_mode_hog_rate_failure_releases_and_falls_back() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_hog(-1, 0, -50, 0);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 13, true);
+        force_next_exclusive_stream_open(Some(Ok(64)));
+        let client = backend
+            .open_wasapi_client_exclusive(13, exclusive_test_format())
+            .expect("client-side exclusive open still succeeds");
+        assert_eq!(
+            backend.exclusive_client_hog_mode(client),
+            Some(HogModeOutcome::Unavailable)
+        );
+        assert!(!backend.hog_mode_held(13));
+        assert_eq!(
+            platform::fake::hog_owner(),
+            -1,
+            "the failed rate pin released hog mode"
+        );
+        backend.close_stream(13);
+    }
+
+    #[test]
+    fn exclusive_mode_stream_open_failure_releases_hog() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_hog(-1, 0, 0, 0);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 14, true);
+        force_next_exclusive_stream_open(Some(Err(-50)));
+        let error = backend
+            .open_wasapi_client_exclusive(14, exclusive_test_format())
+            .expect_err("forced exclusive stream failure");
+        assert_eq!(error.code, ReasonCode::RcAudioUnsupported);
+        assert!(!backend.hog_mode_held(14));
+        assert_eq!(
+            platform::fake::hog_owner(),
+            -1,
+            "a failed stream open releases the already-acquired hog"
+        );
+    }
+
+    #[test]
+    fn exclusive_mode_non_default_device_reports_hog_unavailable() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_hog(-1, 0, 0, 0);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 18, false);
+        force_next_exclusive_stream_open(Some(Ok(64)));
+        let client = backend
+            .open_wasapi_client_exclusive(18, exclusive_test_format())
+            .expect("client-side exclusive open");
+        assert_eq!(
+            backend.exclusive_client_hog_mode(client),
+            Some(HogModeOutcome::Unavailable),
+            "hog mode is only attempted on the default output device"
+        );
+        assert!(!backend.hog_mode_held(18));
+        backend.close_stream(18);
+    }
+
+    #[test]
+    fn exclusive_mode_missing_default_output_reports_hog_unavailable() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_hog(-1, 0, 0, 0);
+        platform::fake::set_default_device(0);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 19, true);
+        force_next_exclusive_stream_open(Some(Ok(64)));
+        let client = backend
+            .open_wasapi_client_exclusive(19, exclusive_test_format())
+            .expect("client-side exclusive open");
+        assert_eq!(
+            backend.exclusive_client_hog_mode(client),
+            Some(HogModeOutcome::Unavailable),
+            "a host with no default output cannot provide hog mode"
+        );
+        assert!(!backend.hog_mode_held(19));
+        backend.close_stream(19);
+    }
+
+    #[test]
+    fn exclusive_mode_second_client_failure_keeps_the_first_hog() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_hog(-1, 0, 0, 0);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 20, true);
+        force_next_exclusive_stream_open(Some(Ok(128)));
+        let first = backend
+            .open_wasapi_client_exclusive(20, exclusive_test_format())
+            .expect("first exclusive client");
+        assert!(backend.hog_mode_held(20));
+        force_next_exclusive_stream_open(Some(Err(-50)));
+        backend
+            .open_wasapi_client_exclusive(20, exclusive_test_format())
+            .expect_err("second exclusive open fails");
+        assert_eq!(
+            backend.hog_mode_held(20),
+            true,
+            "a failed second client must not release the first client's hog"
+        );
+        assert_eq!(backend.exclusive_client_hog_mode(first).is_some(), true);
+        backend.close_stream(20);
+        assert!(!backend.hog_mode_held(20));
+    }
+
+    #[test]
+    fn exclusive_mode_hog_release_failure_is_reported_but_drops_the_lease() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_hog(-1, 0, 0, 0);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 21, true);
+        force_next_exclusive_stream_open(Some(Ok(64)));
+        backend
+            .open_wasapi_client_exclusive(21, exclusive_test_format())
+            .expect("exclusive open");
+        let our_pid = std::process::id() as i32;
+        platform::fake::set_hog(our_pid, -50, 0, 0);
+        backend.close_stream(21);
+        assert!(
+            !backend.hog_mode_held(21),
+            "the emulator lease is dropped even when the host release fails"
+        );
+        assert_eq!(platform::fake::hog_owner(), our_pid);
+        platform::fake::set_hog(-1, 0, 0, 0);
+    }
+
+    #[test]
+    fn hog_mode_property_query_failure_is_reported() {
+        let _host = FakeHostGuard::new();
+        platform::fake::fail_hog_mode_query();
+        let mut driver =
+            platform::CoreAudioHogDriver::open_default_output().expect("fake default device");
+        assert_eq!(driver.hog_owner(), Err(-4));
+        assert_eq!(
+            acquire_exclusive_hog_with(&mut driver, std::process::id() as i32, 48_000),
+            HogModeOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn device_hotplug_stale_removal_releases_hog() {
+        let _host = FakeHostGuard::new();
+        let mut backend = RealAudioBackend::new().expect("backend");
+        let stale = 999_999;
+        fake_device(&mut backend, stale, false);
+        backend.hog_devices.insert(stale, std::process::id() as i32);
+        if backend.detect_device_changes().is_err() {
+            return;
+        }
+        assert_eq!(
+            backend.hog_mode_held(stale),
+            false,
+            "a device removed by hotplug loses its hog lease"
+        );
+    }
+
+    #[test]
+    fn exclusive_mode_buffer_pin_failure_is_reported_but_keeps_hog() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_hog(-1, 0, 0, -50);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 15, true);
+        force_next_exclusive_stream_open(Some(Ok(64)));
+        let client = backend
+            .open_wasapi_client_exclusive(15, exclusive_test_format())
+            .expect("fake exclusive open");
+        assert_eq!(
+            backend.exclusive_client_hog_mode(client),
+            Some(HogModeOutcome::Acquired)
+        );
+        assert!(
+            backend.hog_mode_held(15),
+            "a buffer-size pin failure does not drop the hog lease"
+        );
+        backend.close_stream(15);
+    }
+
+    #[test]
+    fn system_loopback_probe_fallback_classification_is_pinned() {
+        assert_eq!(
+            classify_system_loopback_probe(true, true, false),
+            SystemLoopbackBackend::CoreAudioProcessTap
+        );
+        assert_eq!(
+            classify_system_loopback_probe(false, true, false),
+            SystemLoopbackBackend::ScreenCaptureKit
+        );
+        assert_eq!(
+            classify_system_loopback_probe(false, false, false),
+            SystemLoopbackBackend::Unavailable
+        );
+        assert_eq!(
+            classify_system_loopback_probe(true, true, true),
+            SystemLoopbackBackend::Unavailable,
+            "CASA1_SYSTEM_LOOPBACK=off always forces the fallback"
+        );
+        let _lock = lock_system_loopback_tests();
+        platform::fake::clear();
+        let real = probe_system_loopback_capability_for_test();
+        assert!(
+            matches!(
+                real,
+                SystemLoopbackBackend::CoreAudioProcessTap
+                    | SystemLoopbackBackend::ScreenCaptureKit
+                    | SystemLoopbackBackend::Unavailable
+            ),
+            "the real probe loads the host frameworks without panicking"
+        );
+    }
+
+    #[test]
+    fn system_loopback_failure_stage_mapping_is_pinned() {
+        assert_eq!(
+            classify_system_loopback_failure(SystemLoopbackFailure::TapCreation(0), -50),
+            SystemLoopbackFailure::TapCreation(-50)
+        );
+        assert_eq!(
+            classify_system_loopback_failure(SystemLoopbackFailure::AggregateCreation(0), -4),
+            SystemLoopbackFailure::AggregateCreation(-4)
+        );
+        assert_eq!(
+            classify_system_loopback_failure(SystemLoopbackFailure::StreamStart(0), -1),
+            SystemLoopbackFailure::StreamStart(-1)
+        );
+        assert_eq!(
+            classify_system_loopback_failure(SystemLoopbackFailure::FormatUnavailable, -1),
+            SystemLoopbackFailure::FormatUnavailable
+        );
+    }
+
+    #[test]
+    fn system_loopback_stale_generation_is_rejected_after_test_session_teardown() {
+        let mut backend = RealAudioBackend::new().expect("backend");
+        let generation = backend.install_test_system_loopback(2, 8_000);
+        assert!(backend.system_loopback_running());
+        assert_eq!(backend.system_loopback_format(), Some((2, 8_000)));
+        assert!(backend.push_test_system_loopback_frames(generation, 2, 8_000, &[0.25; 8]));
+        assert_eq!(backend.system_loopback_available_frames(), 4);
+        let status = backend.system_loopback_status();
+        assert!(status.running);
+        assert_eq!(status.generation, generation);
+        assert_eq!(
+            status.backend,
+            Some(SystemLoopbackBackend::CoreAudioProcessTap)
+        );
+        assert_eq!(status.channels, 2);
+        assert_eq!(status.sample_rate, 8_000);
+        assert_eq!(status.buffered_frames, 4);
+        assert_eq!(status.frames_delivered, 4);
+        assert_eq!(status.dropped_frames, 0);
+
+        backend.stop_system_loopback();
+        assert!(!backend.system_loopback_running());
+        assert!(
+            !backend.push_test_system_loopback_frames(generation, 2, 8_000, &[0.5; 8]),
+            "a callback from the torn-down session must be rejected"
+        );
+        assert_eq!(backend.system_loopback_available_frames(), 0);
+        assert_eq!(backend.read_system_loopback_data(), Vec::<f32>::new());
+        let status = backend.system_loopback_status();
+        assert!(!status.running);
+        assert_eq!(status.backend, None);
+        assert_eq!(status.generation, 0);
+    }
+
+    #[test]
+    fn system_loopback_sink_history_boundary_drops_oldest_frames() {
+        let mut sink = SystemLoopbackSink::new(3, 1, 1_000);
+        assert_eq!(sink.max_samples(), 4_000);
+        assert!(
+            sink.ingest(3, 1, 1_000, &[]),
+            "an empty callback is accepted without touching history"
+        );
+        let input: Vec<f32> = (0..5_000).map(|value| value as f32).collect();
+        assert!(sink.ingest(3, 1, 1_000, &input[..3_000]));
+        assert!(sink.ingest(3, 1, 1_000, &input[3_000..]));
+        assert_eq!(sink.samples.len(), 4_000);
+        assert_eq!(sink.samples.front().copied(), Some(1_000.0));
+        assert_eq!(sink.samples.back().copied(), Some(4_999.0));
+        assert_eq!(sink.dropped_frames, 1_000);
+        // A callback larger than the whole history exercises the
+        // after-drop truncation path as well as the oldest-frame eviction.
+        assert!(sink.ingest(3, 1, 1_000, &input));
+        assert_eq!(sink.samples.len(), 4_000);
+        assert_eq!(sink.samples.front().copied(), Some(1_000.0));
+        assert_eq!(sink.samples.back().copied(), Some(4_999.0));
+        assert_eq!(sink.dropped_frames, 6_000);
+        assert!(
+            !sink.ingest(2, 1, 1_000, &[1.0]),
+            "an old generation cannot grow the replacement history"
+        );
+    }
+
+    #[test]
+    fn system_loopback_sink_format_change_discards_incompatible_history() {
+        let mut sink = SystemLoopbackSink::new(4, 2, 48_000);
+        assert!(sink.ingest(4, 2, 48_000, &[0.1; 4]));
+        assert_eq!(sink.samples.len(), 4);
+        assert!(sink.ingest(4, 2, 44_100, &[0.2; 2]));
+        assert_eq!(sink.sample_rate, 44_100);
+        assert_eq!(sink.samples, VecDeque::from(vec![0.2, 0.2]));
+        sink.stop(4);
+        assert!(sink.samples.is_empty());
+        assert!(!sink.ingest(4, 2, 44_100, &[0.3; 2]));
+    }
+
+    #[test]
+    fn system_loopback_capability_unavailable_never_starts() {
+        let _lock = lock_system_loopback_tests();
+        set_test_system_loopback_capability(Some(SystemLoopbackBackend::Unavailable));
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.system_loopback_capability(),
+            SystemLoopbackBackend::Unavailable
+        );
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::Unavailable)
+        );
+        assert!(!backend.system_loopback_running());
+        set_test_system_loopback_capability(None);
+    }
+
+    #[test]
+    fn system_loopback_duplicate_start_is_idempotent() {
+        let _lock = lock_system_loopback_tests();
+        set_test_system_loopback_capability(Some(SystemLoopbackBackend::CoreAudioProcessTap));
+        let mut backend = RealAudioBackend::new().expect("backend");
+        let generation = backend.install_test_system_loopback(2, 48_000);
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::CoreAudioProcessTap)
+        );
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::CoreAudioProcessTap),
+            "a second Start reuses the live session"
+        );
+        assert_eq!(backend.system_loopback_status().generation, generation);
+        backend.stop_system_loopback();
+        set_test_system_loopback_capability(None);
+    }
+
+    #[test]
+    fn system_loopback_real_start_or_creation_failure_is_reported() {
+        if std::env::var("CASA1_TEST_REAL_SYSTEM_LOOPBACK").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping system_loopback_real_start_or_creation_failure_is_reported: set CASA1_TEST_REAL_SYSTEM_LOOPBACK=1"
+            );
+            return;
+        }
+        let mut backend = RealAudioBackend::new().expect("backend");
+        let capability = probe_system_loopback_capability_for_test();
+        match backend.start_system_loopback() {
+            Ok(used) => {
+                assert_eq!(used, capability, "the probed backend is the one used");
+                assert!(backend.system_loopback_running());
+                backend.stop_system_loopback();
+                assert!(!backend.system_loopback_running());
+            }
+            Err(failure) => {
+                assert_ne!(
+                    failure,
+                    SystemLoopbackFailure::Unavailable,
+                    "a probed backend fails for a real creation reason"
+                );
+                assert!(!backend.system_loopback_running());
+            }
+        }
+    }
+
+    // ── CoreAudio hog mode ───────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct FakeHogDriver {
+        owner: i32,
+        owner_error: Option<i32>,
+        set_result: Option<i32>,
+        set_calls: u32,
+        release_called: bool,
+        rate_result: Option<i32>,
+        rates: Vec<f64>,
+    }
+
+    impl HogModeDriver for FakeHogDriver {
+        fn hog_owner(&mut self) -> Result<i32, i32> {
+            match self.owner_error {
+                Some(status) => Err(status),
+                None => Ok(self.owner),
+            }
+        }
+
+        fn set_hog(&mut self) -> Result<i32, i32> {
+            self.set_calls += 1;
+            match self.set_result {
+                Some(owner) => {
+                    self.owner = owner;
+                    Ok(owner)
+                }
+                None => Err(-50),
+            }
+        }
+
+        fn release_hog(&mut self) -> Result<(), i32> {
+            self.release_called = true;
+            if self.owner != -1 {
+                self.owner = -1;
+            }
+            Ok(())
+        }
+
+        fn set_nominal_sample_rate(&mut self, sample_rate: f64) -> Result<(), i32> {
+            self.rates.push(sample_rate);
+            match self.rate_result {
+                Some(status) => Err(status),
+                None => Ok(()),
+            }
+        }
+
+        fn set_buffer_frame_size(&mut self, _frames: u32) -> Result<(), i32> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hog_mode_deny_and_unavailable_pin_the_client_contract() {
+        let mut denied = FakeHogDriver {
+            owner: 1_234,
+            set_result: Some(1_234),
+            ..FakeHogDriver::default()
+        };
+        let outcome = acquire_exclusive_hog_with(&mut denied, 42, 48_000);
+        assert_eq!(outcome, HogModeOutcome::Denied { owner_pid: 1_234 });
+        assert!(!outcome.is_exclusive());
+        assert_eq!(denied.set_calls, 1);
+
+        let mut unavailable = FakeHogDriver {
+            owner: -1,
+            set_result: None,
+            ..FakeHogDriver::default()
+        };
+        assert_eq!(
+            acquire_exclusive_hog_with(&mut unavailable, 42, 48_000),
+            HogModeOutcome::Unavailable,
+            "a refused set with a still-free device is unavailable, not denied"
+        );
+        assert!(!unavailable.release_called);
+    }
+
+    #[test]
+    fn hog_mode_owner_query_failure_is_reported_as_unavailable() {
+        let mut driver = FakeHogDriver {
+            owner_error: Some(-4),
+            ..FakeHogDriver::default()
+        };
+        assert_eq!(
+            acquire_exclusive_hog_with(&mut driver, 42, 48_000),
+            HogModeOutcome::Unavailable
+        );
+        assert_eq!(driver.set_calls, 0, "no hog set on an unqueryable device");
+    }
+
+    struct SecondQueryFailsDriver {
+        calls: u32,
+    }
+
+    impl HogModeDriver for SecondQueryFailsDriver {
+        fn hog_owner(&mut self) -> Result<i32, i32> {
+            self.calls += 1;
+            if self.calls == 1 { Ok(-1) } else { Err(-4) }
+        }
+
+        fn set_hog(&mut self) -> Result<i32, i32> {
+            Err(-50)
+        }
+
+        fn release_hog(&mut self) -> Result<(), i32> {
+            Ok(())
+        }
+
+        fn set_nominal_sample_rate(&mut self, _sample_rate: f64) -> Result<(), i32> {
+            Ok(())
+        }
+
+        fn set_buffer_frame_size(&mut self, _frames: u32) -> Result<(), i32> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hog_mode_set_failure_then_query_failure_is_unavailable() {
+        let mut driver = SecondQueryFailsDriver { calls: 0 };
+        assert_eq!(
+            acquire_exclusive_hog_with(&mut driver, 42, 48_000),
+            HogModeOutcome::Unavailable
+        );
+        assert_eq!(
+            driver.calls, 2,
+            "the owner is re-queried after a failed set"
+        );
+    }
+
+    #[test]
+    fn hog_mode_rate_pin_failure_releases_and_falls_back() {
+        let mut driver = FakeHogDriver {
+            owner: -1,
+            set_result: Some(42),
+            rate_result: Some(-50),
+            ..FakeHogDriver::default()
+        };
+        let outcome = acquire_exclusive_hog_with(&mut driver, 42, 44_100);
+        assert_eq!(outcome, HogModeOutcome::Unavailable);
+        assert!(
+            driver.release_called,
+            "a failed exact-rate pin releases hog"
+        );
+        assert_eq!(driver.rates, vec![44_100.0]);
+        assert_eq!(driver.owner, -1);
+    }
+
+    #[test]
+    fn hog_mode_already_held_reacquire_is_rejected_and_pins_the_rate() {
+        let mut driver = FakeHogDriver {
+            owner: 42,
+            set_result: Some(0),
+            ..FakeHogDriver::default()
+        };
+        let outcome = acquire_exclusive_hog_with(&mut driver, 42, 96_000);
+        assert_eq!(outcome, HogModeOutcome::AlreadyHeld);
+        assert!(outcome.is_exclusive());
+        assert_eq!(driver.set_calls, 0, "hog is not re-taken");
+        assert_eq!(driver.rates, vec![96_000.0]);
     }
 }

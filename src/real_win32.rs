@@ -27,7 +27,7 @@ pub struct ComApartmentState {
     next_iid: u64,
     com_objects: BTreeMap<u64, ComObjectRecord>,
     /// CLSID string → factory function mapping.
-    class_factories: HashMap<String, Box<dyn Fn() -> Box<dyn ComObject> + Send>>,
+    class_factories: HashMap<String, Box<dyn Fn() -> Box<dyn ComObject> + Send + Sync>>,
     /// Per-thread apartment state tracking.
     thread_apartments: HashMap<u32, ComApartmentModel>,
     /// Registered class factories with their tokens (for CoRegisterClassObject).
@@ -3918,7 +3918,7 @@ impl ComApartmentState {
     pub fn register_class_object(
         &mut self,
         clsid: &[u8; 16],
-        factory: Box<dyn Fn() -> Box<dyn ComObject> + Send>,
+        factory: Box<dyn Fn() -> Box<dyn ComObject> + Send + Sync>,
     ) {
         let guid_str = guid_to_string(clsid);
         self.class_factories.insert(guid_str, factory);
@@ -4346,7 +4346,7 @@ impl ComApartmentState {
     pub fn register_class_object_with_token(
         &mut self,
         clsid: &[u8; 16],
-        factory: Box<dyn Fn() -> Box<dyn ComObject> + Send>,
+        factory: Box<dyn Fn() -> Box<dyn ComObject> + Send + Sync>,
     ) -> u32 {
         let guid_str = guid_to_string(clsid);
         let token = self.next_token;
@@ -10003,6 +10003,78 @@ mod tests {
                 .unwrap()
         );
         assert!(com.com_query_interface(handle, ComIid::IXAUDIO2).unwrap());
+    }
+
+    #[test]
+    fn real_win32_revoke_unknown_class_object_is_rejected() {
+        let mut com = ComApartmentState::new();
+        com.co_initialize_ex(1, ComApartmentModel::MultiThreaded)
+            .expect("CoInitializeEx");
+        let clsid = [0x11; 16];
+        let other = [0x22; 16];
+        com.register_class_object(
+            &clsid,
+            Box::new(move || Box::new(SimpleComObject::new(clsid, ComIid::IUNKNOWN, "Edge"))),
+        );
+
+        assert_eq!(
+            com.revoke_class_object(&other),
+            false,
+            "revoking an unregistered CLSID must return false"
+        );
+        assert_eq!(
+            com.revoke_class_object(&clsid),
+            true,
+            "revoking the registered CLSID must return true"
+        );
+    }
+
+    #[test]
+    fn real_win32_class_object_token_overflow_wraps_to_zero() {
+        let mut com = ComApartmentState::new();
+        com.next_token = u32::MAX;
+        let first_clsid = [0x33; 16];
+        let second_clsid = [0x44; 16];
+        let first = com.register_class_object_with_token(
+            &first_clsid,
+            Box::new(move || {
+                Box::new(SimpleComObject::new(
+                    first_clsid,
+                    ComIid::IUNKNOWN,
+                    "OverflowFirst",
+                ))
+            }),
+        );
+        let second = com.register_class_object_with_token(
+            &second_clsid,
+            Box::new(move || {
+                Box::new(SimpleComObject::new(
+                    second_clsid,
+                    ComIid::IUNKNOWN,
+                    "OverflowSecond",
+                ))
+            }),
+        );
+
+        assert_eq!(
+            first,
+            u32::MAX,
+            "the first token must be the boundary value"
+        );
+        assert_eq!(second, 0, "the token counter must wrap to zero");
+        assert_eq!(
+            com.clsid_for_token(0),
+            Some(second_clsid),
+            "token zero must resolve to the wrapped registration"
+        );
+        assert!(
+            com.revoke_class_object_by_token(0),
+            "the wrapped token must revoke its registration"
+        );
+        assert!(
+            !com.revoke_class_object_by_token(0),
+            "revoking the same wrapped token twice must return false"
+        );
     }
 
     // --- CRT Tests ---

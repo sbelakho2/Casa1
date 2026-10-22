@@ -34,13 +34,33 @@
   "(marker_count(&memory), 0, \"handler must never be invoked\")",
   "(marker_count(&memory), 0)"
  ],
+ "activation_operation_cancel_vtable_slot_is_absent": [
+  "(methods.len(), ACTIVATION_OPERATION_METHOD_COUNT)",
+  "(ACTIVATION_OPERATION_METHOD_COUNT, 4)",
+  "(methods.len(), 5, \"Windows defines no CancelActivation slot\")"
+ ],
+ "activation_operation_concurrent_completion_and_release_races_keep_the_operation": [
+  "( completion.interface_object, operation, \"the completion delivers the operation object under the race\" )",
+  "( operation_get_activate_result(pid, operation), Err(E_ILLEGAL_METHOD_CALL), \"release-before-read removes the result exactly once\" )",
+  "(pop_activation_completion(pid), None)",
+  "( commit_initialize(pid, object, &plan, &format, 0x6_000, 3200), AUDCLNT_S_OK )"
+ ],
  "activation_operation_failure_result_is_still_a_completion": [
   "( operation_get_activate_result(pid, operation), Ok((ACTIVATION_E_NOINTERFACE, 0)), \"GetActivateResult succeeds and carries the activation HRESULT\" )",
   "( operation_get_activate_result(pid, operation), Err(E_ILLEGAL_METHOD_CALL) )"
  ],
  "activation_operation_query_interface_ids": [
-  "( commit_initialize(pid, object, &plan, &format, 0x6_000, 3200), AUDCLNT_S_OK )",
   "assert!(activation_operation_supports_riid( &IID_IACTIVATE_AUDIO_INTERFACE_ASYNC_OPERATION )"
+ ],
+ "activation_operation_release_after_completion_race_keeps_one_result": [
+  "( operation_get_activate_result(pid, operation), Ok((ACTIVATION_S_OK, interface)) )",
+  "( operation_get_activate_result(pid, operation), Err(E_ILLEGAL_METHOD_CALL) )",
+  "(activation_operation_interface(pid, operation), None)"
+ ],
+ "activation_operation_release_before_completion_race_keeps_the_operation_object": [
+  "( completion.interface_object, operation, \"the handler must receive the operation object, never the endpoint\" )",
+  "( operation_get_activate_result(pid, operation), Err(E_ILLEGAL_METHOD_CALL), \"a released operation no longer reports a result\" )",
+  "(pop_activation_completion(pid), None)"
  ],
  "activation_operation_reports_result_once_after_completion": [
   "( activation_operation_interface(pid, operation), Some(0x9_601) )",
@@ -87,6 +107,14 @@
  ],
  "adapt_audio_chunk_zero_input_rate_does_not_panic": [
   "(out.len() % 2, 0)"
+ ],
+ "adapter_names_modes_and_private_format_reject_unknown_targets": [
+  "( subsystem .d3dkmt_open_adapter_from_display_name(\"\") .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_open_adapter_from_device_name(\" \") .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_open_adapter_from_display_name(\"\\\\\\\\.\\\\DISPLAY9\") .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
+  "( subsystem .d3dkmt_open_adapter_from_device_name(\"metal#zz\") .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_open_adapter_from_device_name(\"metal#ffffffffffffffff\") .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
+  "( subsystem .d3dkmt_open_adapter_from_device_name(\"not a gpu\") .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )"
  ],
  "add_ref_pins_and_remove_ref_unpins": [
   "( runtime.dll_info_table.get(&handle).unwrap().load_count, u32::MAX )",
@@ -158,6 +186,22 @@
   "( nt_allocate_virtual_memory( &mut vm, base, 0, 0x1000, MEM_RESERVE, crate::ntdll::PAGE_READWRITE, ), Err(STATUS_CONFLICTING_ADDRESSES) )",
   "( nt_allocate_virtual_memory( &mut vm, base + 0x10_000, 0, 0x1000, MEM_COMMIT, crate::ntdll::PAGE_READWRITE, ), Err(STATUS_INVALID_PARAMETER) )"
  ],
+ "allocation_arrays_reject_invalid_bounds_segments_and_duplicate_identities": [
+  "( subsystem .d3dkmt_create_allocations(request(Vec::new(), 0)) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_create_allocations(request( vec![ AllocationDesc { size: 1, segment: SEGMENT_LOCAL, }; MAX_KMT_ARRAY + 1 ], 0 )) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_create_allocations(request( vec![ AllocationDesc { size: 0, segment: SEGMENT_LOCAL, }, AllocationDesc { size: 1, segment: SEGMENT_LOCAL, }, ], 1 )) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_create_allocations(request( vec![AllocationDesc { size: 1, segment: SegmentId(9), }], 1 )) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_create_allocations(request( vec![ AllocationDesc { size: 1, segment: SEGMENT_LOCAL, }; 2 ], u64::MAX )) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "(subsystem.d3dkmt_query_statistics().allocation_count, 0)"
+ ],
+ "allocation_priority_boundaries_and_cross_device_lists_are_rejected": [
+  "( subsystem .d3dkmt_set_allocation_priority(device, &[allocation], 0) .expect(\"minimum priority\"), () )",
+  "(subsystem.allocation_priority(allocation), Ok(0))",
+  "( subsystem .d3dkmt_set_allocation_priority(device, &[allocation], MAX_SCHEDULING_PRIORITY,) .expect(\"maximum priority\"), () )",
+  "( subsystem.allocation_priority(allocation), Ok(MAX_SCHEDULING_PRIORITY) )",
+  "( subsystem .d3dkmt_set_allocation_priority(device, &[allocation], MAX_SCHEDULING_PRIORITY + 1,) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_set_allocation_priority(device, &[], 1) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )"
+ ],
  "anti_debug_state": [
   "(state.debug_port, 0)",
   "(state.nt_global_flag, 0)",
@@ -176,6 +220,29 @@
   "(status, WaitStatus::Timeout)",
   "(win32.apc_counters().delivered, 0)",
   "(status, WaitStatus::Object0)"
+ ],
+ "apng_composes_disposal_blend_and_delays_exactly": [
+  "(wic_image_frame_count(&apng), 4)",
+  "(frame0.pixels, [0_u8, 0, 255, 255].repeat(4))",
+  "( &frame1.pixels[..], &[0, 0, 0, 0, 0, 255, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0] )",
+  "( &frame2.pixels[..], &[255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0] )",
+  "( &frame3.pixels[..], &[0, 0, 0, 0, 0, 255, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0] )",
+  "( wic_decode_png_frame(&apng, 4).unwrap_err(), WINCODEC_ERR_FRAMEMISSING, \"frame selection past the animation end is rejected\" )"
+ ],
+ "apng_default_image_precedes_animation_frames_and_truncated_frames_rejected": [
+  "(wic_image_frame_count(&apng), 2)",
+  "(default.pixels, [255_u8, 0, 0, 255].repeat(4))",
+  "( &animated.pixels[..], &[ 0, 0, 255, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255 ], \"the default image is the canvas and the animation frame replaces its first pixel\" )",
+  "( wic_decode_png_frame(&apng, 2).unwrap_err(), WINCODEC_ERR_FRAMEMISSING, \"default image plus one animation frame is the whole stream\" )",
+  "( wic_decode_png_frame(&truncated, 1).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a truncated fdAT zlib stream is rejected\" )"
+ ],
+ "apng_malformed_chunks_sequences_and_frame_bounds_rejected": [
+  "( bad(&[(b\"IDAT\", raw.clone()), (b\"acTL\", apng_actl(1, 0)),]), WINCODEC_ERR_BADIMAGE, \"acTL after IDAT is invalid\" )",
+  "( bad(&[(b\"acTL\", apng_actl(0, 0)), (b\"IDAT\", raw.clone())]), WINCODEC_ERR_BADIMAGE, \"an animation with zero frames is invalid\" )",
+  "( bad(&[(b\"acTL\", vec![0, 0, 0]), (b\"IDAT\", raw.clone())]), WINCODEC_ERR_BADIMAGE, \"a short acTL is invalid\" )",
+  "( bad(&[ (b\"fcTL\", apng_fctl(0, 1, 1, 0, 0, 1, 10, 0, 0)), (b\"IDAT\", raw.clone()), ]), WINCODEC_ERR_BADIMAGE, \"fcTL without acTL is invalid\" )",
+  "( bad(&[ (b\"acTL\", apng_actl(1, 0)), (b\"fcTL\", apng_fctl(1, 1, 1, 0, 0, 1, 10, 0, 0)), (b\"IDAT\", raw.clone()), ]), WINCODEC_ERR_BADIMAGE, \"a sequence gap is rejected\" )",
+  "( bad(&[ (b\"acTL\", apng_actl(1, 0)), (b\"fcTL\", apng_fctl(0, 2, 2, 1, 1, 1, 10, 0, 0)), (b\"IDAT\", raw.clone()), ]), WINCODEC_ERR_BADIMAGE, \"a frame rectangle outside the canvas is rejected\" )"
  ],
  "apple_m_series_profiles_map_to_expected_metal_families": [
   "(m1.adapter.name, \"Apple M1 Max\")",
@@ -606,11 +673,6 @@
   "(second, first, \"closed values are recycled FIFO\")",
   "( table.handle_generation(second), Some(1), \"reuse gets a fresh generation\" )"
  ],
- "cmyk_ycck_and_malformed_streams_rejected": [
-  "( wic_decode_jpeg(&cmyk).unwrap_err(), WINCODEC_ERR_UNSUPPORTEDOPERATION )",
-  "( wic_decode_jpeg(&ycck).unwrap_err(), WINCODEC_ERR_UNSUPPORTEDOPERATION )",
-  "( wic_decode_jpeg(truncated).unwrap_err(), WINCODEC_ERR_BADIMAGE )"
- ],
  "cng_audit_log_appends_real_records": [
   "(ret, u64::from(ERROR_SUCCESS))",
   "(runtime.last_error, 0)",
@@ -765,6 +827,29 @@
   "( call_slot( &mut fixture, item_moniker, 16, &[item_moniker as u32, OUT as u32] ), 0 )",
   "(fixture.memory.read_u32(OUT).unwrap(), 4)"
  ],
+ "concurrent_flat_and_image_atomic_views_never_observe_stale_or_torn_values": [
+  "(memory.read_u32(address).unwrap(), iterations)",
+  "(store.materialisation_count(), 1)"
+ ],
+ "concurrent_multi_page_stress_keeps_views_coherent_without_rematerialising": [
+  "(reader.join().unwrap(), ITERATIONS)",
+  "(memory.read_u64(address).unwrap(), ITERATIONS)",
+  "( memory.page(address).expect(\"committed page\").bytes.as_ptr() as usize, views[page as usize].0 )",
+  "(store.materialised_page_count(), PAGES)",
+  "(store.materialisation_count(), PAGES)"
+ ],
+ "concurrent_signal_wait_races_wake_each_waiter_exactly_once": [
+  "( subsystem.d3dkmt_signal_synchronization_object(sync, 1), Ok(()) )",
+  "(waiter.join().expect(\"waiter thread\"), Ok(()))",
+  "(wakes.load(Ordering::SeqCst), WAITERS)",
+  "(statistics.wait_count, WAITERS as u64)",
+  "(statistics.timeout_count, 0)"
+ ],
+ "concurrent_wait_timeouts_are_per_waiter_and_exact": [
+  "(error.status(), STATUS_TIMEOUT)",
+  "(statistics.wait_count, WAITERS as u64)",
+  "(statistics.timeout_count, WAITERS as u64)"
+ ],
  "condition_variable_quiet_wait_does_not_poll": [
   "(cv.wake_count(), 0)"
  ],
@@ -792,6 +877,10 @@
  "connect_without_answer_times_out_with_noresponse": [
   "(peer.connect(addr, \"Nobody\", &[]), DPNERR_NORESPONSE)"
  ],
+ "constant_fold_drops_overwritten_mov_imm_but_keeps_read_values": [
+  "( folded, vec![IrInstruction::MovImm { dst: Register::Rax, value: 128 }], \"an unread MOV chain must collapse to its final write\" )",
+  "( folded, vec![ IrInstruction::MovImm { dst: Register::Rax, value: 7 }, IrInstruction::MovImm { dst: Register::Rcx, value: 7 }, IrInstruction::MovImm { dst: Register::Rax, value: 9 }, ], \"a read value must be preserved even when the register is overwritten\" )"
+ ],
  "consume_wait_implements_event_mutex_semaphore_timer_semantics": [
   "(manager.consume_wait(event_id, 7, 0), WaitStatus::Object0)",
   "(manager.consume_wait(event_id, 7, 0), WaitStatus::Timeout)",
@@ -799,6 +888,14 @@
   "( manager.consume_wait(mutex_id, 7, 0), WaitStatus::Object0, \"recursive acquisition\" )",
   "( manager.consume_wait(mutex_id, 8, 0), WaitStatus::Timeout, \"another thread cannot acquire\" )",
   "( manager.wait_satisfaction(mutex_id, 9, 0), WaitSatisfaction::Signaled )"
+ ],
+ "context_and_render_reject_stale_handles_invalid_lists_and_priority_bounds": [
+  "( subsystem .d3dkmt_create_context(invalid) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_create_context(CreateContextRequest { device, node_ordinal: 0, priority: MAX_SCHEDULING_PRIORITY + 1, }) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_create_context(CreateContextRequest { device: DeviceHandle(0xFFFF_FFFF), node_ordinal: 0, priority: 0, }) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "(info.node_ordinal, RENDER_NODE_ORDINAL)",
+  "(info.priority, MAX_SCHEDULING_PRIORITY)",
+  "(info.submit_count, 0)"
  ],
  "convert_and_resample_partial_frame_does_not_panic": [
   "(result.len(), 2)"
@@ -813,6 +910,26 @@
  ],
  "cookie_alt_svc_handles_missing_alpn": [
   "(entries[0].alpn, Some(\"h3\".to_string()))"
+ ],
+ "cooperative_and_production_guest_loops_no_races_byte_identical": [
+  "( read_u32_guest(&cooperative, SLICE_COUNTER_A), iterations, \"cooperative loop did not finish in {rounds} rounds\" )",
+  "(reports.len(), 1)",
+  "( reports[0].state.rip, SLICE_CODE + 21, \"loop must fall through to ret after {iterations} iterations (exit {:?})\", reports[0].exit )",
+  "( session_pending_rips(&production), Vec::<u64>::new(), \"production thread did not exit after {rounds} rounds\" )",
+  "( read_u32_guest(&cooperative, SLICE_COUNTER_A), iterations, \"cooperative result\" )",
+  "( read_u32_guest(&production, SLICE_COUNTER_A), iterations, \"production result\" )"
+ ],
+ "cooperative_pump_driven_idle_poll_race_remains_bounded": [
+  "(session.runtime.scheduler_mode(), SchedulerMode::Cooperative)",
+  "(exit_code, 0)",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(read_u32_guest(&session, BYTES_PTR), 5)"
+ ],
+ "cooperative_pumped_slice_yield_race_requeues_exactly_once": [
+  "(pump_once(&mut session), true, \"the yielding slice ran\")",
+  "( session.runtime.pending_guest_threads.len(), 2, \"a yielded pumped thread must be requeued exactly once\" )",
+  "( session .runtime .pending_guest_threads .iter() .filter(|thread| thread.state_machine == GuestThreadState::Waiting) .count(), 1, \"only the yielding thread is parked in the wait queue\" )",
+  "( SCHEDULER_COUNTERS.snapshot().guest_thread_switches, before.guest_thread_switches, \"the yield must count as one guest-thread switch\" )"
  ],
  "copy_page_to_raw_copies_fully_mapped_page_and_rejects_partial": [
   "(dst[0], 0xCD)",
@@ -1122,9 +1239,9 @@
  ],
  "d2d_vertex_pool_boundary_binds_pooled_buffer_and_pins_cursor": [
   "(renderer.encoder.is_some(), true)",
-  "(renderer.pool_cursor.get(), 0)",
-  "( renderer.pool_cursor.get(), 4 * std::mem::size_of::<D2DVertex>(), \"fill_rect must bind four pooled vertices\" )",
-  "( renderer.pool_cursor.get(), 10 * std::mem::size_of::<D2DVertex>(), \"draw_line must append six pooled vertices\" )",
+  "(renderer.pool_cursor.load(Ordering::Relaxed), 0)",
+  "( renderer.pool_cursor.load(Ordering::Relaxed), 4 * std::mem::size_of::<D2DVertex>(), \"fill_rect must bind four pooled vertices\" )",
+  "( renderer.pool_cursor.load(Ordering::Relaxed), 10 * std::mem::size_of::<D2DVertex>(), \"draw_line must append six pooled vertices\" )",
   "(renderer.upload_vertex_data(&[1u64]).is_none(), true)"
  ],
  "d3d12_build_bottom_level_acceleration_structure": [
@@ -1145,6 +1262,109 @@
   "(runtime.iosurface_present_count(), 0)",
   "(runtime.surface_writes(), 0)",
   "(&frame.bytes[..pixels.len()], &pixels)"
+ ],
+ "d3d8thk_allocation_residency_rejects_budget_overrun_and_double_destroy": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTQueryAdapterInfo, &[query] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTMakeResident, &[resident] ), STATUS_GRAPHICS_NO_VIDEO_MEMORY )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateAllocation, &[duplicate] ), STATUS_OBJECT_NAME_COLLISION )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateAllocation, &[zero_size] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateAllocation, &[bad_segment] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateAllocation, &[no_allocations] ), STATUS_INVALID_PARAMETER )"
+ ],
+ "d3d8thk_context_render_modes_priority_and_statistics_errors_are_exact": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenAdapterFromGdiDisplayName, &[gdi] ), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenAdapterFromGdiDisplayName, &[gdi] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenAdapterFromDeviceName, &[device_name] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenAdapterFromGdiDisplayName, &[empty_name] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenAdapterFromDeviceName, &[unterminated] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateAllocation, &[array] ), 0 )"
+ ],
+ "d3d8thk_descriptor_write_failures_cleanup_and_reject_exactly": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenAdapterFromGdiDisplayName, &[name_descriptor] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateContext, &[context] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenResource, &[open] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenResource, &[open] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenResource2, &[open2] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenResource2, &[open2] ), 0 )"
+ ],
+ "d3d8thk_descriptors_reject_null_and_unmapped_guest_pointers": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenAdapterFromLuid, &[0] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenAdapterFromHdc, &[0] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTEnumAdapters, &[0] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateDevice, &[0] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateAllocation, &[0] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTDestroyAllocation, &[0] ), STATUS_INVALID_PARAMETER )"
+ ],
+ "d3d8thk_device_open_rejects_private_and_stale_handles": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateDevice, &[create] ), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenDevice, &[open] ), STATUS_ACCESS_DENIED )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenDevice, &[open] ), STATUS_INVALID_HANDLE )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenDevice, &[open] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTDestroyDevice, &[destroy] ), 0 )"
+ ],
+ "d3d8thk_enum_adapters_rejects_null_and_short_buffers": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTEnumAdapters, &[info] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTEnumAdapters, &[info] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTEnumAdapters, &[info] ), STATUS_BUFFER_TOO_SMALL )",
+  "(load_u32(&memory, info), count, \"required count written\")"
+ ],
+ "d3d8thk_luid_open_rejects_unknown_and_closed_adapter_handles": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenAdapterFromLuid, &[open] ), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTQueryAdapterInfo, &[query] ), 0 )",
+  "(load_u32(&memory, data), 0, \"bus number\")",
+  "(load_u32(&memory, data), snapshot.luid.LowPart)",
+  "(load_u32(&memory, data + 4), snapshot.luid.HighPart as u32)"
+ ],
+ "d3d8thk_present_rejects_invalid_and_closed_swapchains_and_advances_flip": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateSwapChain, &[invalid_device] ), STATUS_INVALID_HANDLE )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateSwapChain, &[zero_width] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateSwapChain, &[short_chain] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateSwapChain, &[bad_format] ), STATUS_GRAPHICS_INVALID_PIXELFORMAT )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTPresent, &[present] ), STATUS_INVALID_HANDLE )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTPresent, &[present] ), STATUS_GRAPHICS_PRESENT_INVALID_WINDOW )"
+ ],
+ "d3d8thk_resource_mutex_and_sync_arrays_reject_collisions_and_timeouts": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenResource, &[open] ), STATUS_ACCESS_DENIED )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenResource, &[open] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenResource, &[open] ), STATUS_OBJECT_NAME_COLLISION )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenResource2, &[open2] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenResource2, &[open2] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenKeyedMutex, &[mutex] ), 0 )"
+ ],
+ "d3d8thk_signal_array_context_errors_reject_before_signal": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTSignalSynchronizationObject2, &[signal] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTWaitForSynchronizationObject, &[wait] ), STATUS_TIMEOUT )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTSignalSynchronizationObject2, &[signal] ), STATUS_INVALID_HANDLE )"
+ ],
+ "d3d8thk_sync_wait_rejects_backwards_signal_and_times_out_exactly_once": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateSynchronizationObject, &[descriptor] ), STATUS_INVALID_HANDLE )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateSynchronizationObject, &[descriptor] ), STATUS_NOT_SUPPORTED )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTSignalSynchronizationObject, &[signal] ), STATUS_INVALID_HANDLE )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTWaitForSynchronizationObject, &[wait] ), STATUS_TIMEOUT )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTWaitForSynchronizationObject, &[wait_short] ), STATUS_TIMEOUT )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTSignalSynchronizationObject, &[signal] ), 0 )"
+ ],
+ "d3d8thk_unknown_kmt_types_and_unimplemented_thunks_return_exact_status": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTQueryAdapterInfo, &[query] ), STATUS_NOT_SUPPORTED )",
+  "( call_status(&mut runtime, &mut memory, thunk, &[0]), STATUS_INVALID_PARAMETER )",
+  "(error.code, ReasonCode::RcUnimplInsn)",
+  "(error.message, \"unrouted D3D8-kernel thunk CreateFileW\")"
+ ],
+ "d3d8thk_x64_descriptors_reject_bad_luid_and_round_trip_handles": [
+  "(ps, 8)",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTEnumAdapters, &[info] ), 0 )",
+  "(load_u32(&memory, info), 1)",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenAdapterFromLuid, &[open] ), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenDevice, &[open_device] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTQueryAdapterInfo, &[query] ), 0 )"
+ ],
+ "d3d8thk_x64_new_descriptors_render_modes_and_arrays_round_trip": [
+  "(ps, 8)",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateContext, &[context] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTRender, &[render] ), 0 )",
+  "(load_u64(&memory, render + 40), 8192)",
+  "(load_u64(&memory, render + 48), 0)",
+  "(load_u32(&memory, render + 56), 7)"
  ],
  "d3d9_direct3d_create9_and_create9_ex_dispatch": [
   "( runtime.guest_object_kind(factory).expect(\"factory kind\"), GuestObjectKind::D3d9Factory )",
@@ -1438,12 +1658,28 @@
   "(error.code, ReasonCode::RcInvalidState)",
   "( error.message, \"set_depth_bounds: emulated depth bounds testing requires patching \\ the fragment shader entry point and recompiling the pipeline, which \\ this API cannot do; the depth bounds are not applied\" )"
  ],
+ "destroy_descriptor_heap_recovers_from_panicked_cache_lock": [
+  "( backend .translate_descriptor_heap(heap) .expect(\"translate before destroy\") .len(), 1 )",
+  "(poisoned.is_err(), true)",
+  "(backend.descriptor_translation_cache.is_poisoned(), true)",
+  "( backend .descriptor_translation_cache .lock() .unwrap_or_else(|poisoned| poisoned.into_inner()) .entries .contains_key(&heap), false )",
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "(error.message, \"unknown descriptor heap\")"
+ ],
  "destroy_texture_rejects_stale_heap_and_breaks_at_owning_heap": [
   "( backend.heap_usage(second).expect(\"second usage\").0 > 0, true )",
   "(backend.heap_usage(first).expect(\"first usage\").0, 0)",
   "(backend.get_texture(texture).is_none(), true)",
   "( backend .heap_usage(first) .expect(\"first usage after destroy\") .0, 0 )",
   "( backend .heap_usage(second) .expect(\"second usage after destroy\") .0, 0, \"the owning heap must release the byte range\" )"
+ ],
+ "deterministic_mode_stays_identical_without_stale_production_wakeups": [
+  "( session.runtime.scheduler_mode(), SchedulerMode::Cooperative, \"deterministic cooperative scheduling is the default\" )",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(after.wakeups, before.wakeups)",
+  "(after.migrations, before.migrations)",
+  "(after.worker_overlaps, before.worker_overlaps)",
+  "(after.poll_iterations, before.poll_iterations)"
  ],
  "device_creation_accepts_level11_0_request_on_mesh_backend": [
   "(apple11.feature_level(), FeatureLevel::Level11_0)",
@@ -1456,6 +1692,25 @@
   "(manager.top_of_stack(lower).unwrap(), lower)",
   "( manager.allocate_irp(upper, IrpParameterBlock::new(IrpMajorFunction::Read, 0, 1)), Err(STATUS_DELETE_PENDING) )",
   "(manager.delete_device(upper), Err(STATUS_DELETE_PENDING))"
+ ],
+ "device_destroy_reaps_contexts_keyed_mutexes_and_shared_handles": [
+  "(subsystem.d3dkmt_destroy_context_on(device, context), Ok(()))",
+  "(subsystem.d3dkmt_destroy_device(device), Ok(()))",
+  "( subsystem.context_info(reaped_context).unwrap_err().status(), STATUS_INVALID_HANDLE )",
+  "( subsystem .d3dkmt_acquire_keyed_mutex(mutex, 0x22, 0, 7) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem.allocation_info(allocation).unwrap_err().status(), STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE )",
+  "( subsystem .allocation_info(survivor) .expect(\"shared alias survives\") .size, 16 )"
+ ],
+ "device_hotplug_stale_removal_releases_hog": [
+  "( backend.hog_mode_held(stale), false, \"a device removed by hotplug loses its hog lease\" )"
+ ],
+ "device_open_duplicate_destroy_and_lifetime_boundaries_are_exact": [
+  "( subsystem .d3dkmt_create_device(CreateDeviceRequest { adapter: AdapterHandle(0xDEAD), shareable: true, owner_process: 7, }) .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
+  "( subsystem.device_info(private).expect(\"device info\"), DeviceInfo { shareable: false, owner_process: 7, } )",
+  "( subsystem .device_info(DeviceHandle(0xFFFF_FFFF)) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem.d3dkmt_open_device(private).unwrap_err().status(), STATUS_ACCESS_DENIED )",
+  "( subsystem .d3dkmt_open_device(DeviceHandle(0xFFFF_FFFF)) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem .d3dkmt_close_adapter(adapter) .unwrap_err() .status(), STATUS_GRAPHICS_ALLOCATION_BUSY )"
  ],
  "device_period_info_falls_back_to_the_device_sample_rate": [
   "(info.sample_rate, 48_000)",
@@ -1826,7 +2081,7 @@
  ],
  "draw_bitmap_rejects_exhausted_vertex_pool_without_overwriting_cursor": [
   "( renderer.encoder.is_some(), true, \"the bitmap fallback needs a live render encoder\" )",
-  "( renderer.pool_cursor.get(), POOL_BUFFER_BYTES, \"an exhausted pool must never be overwritten or rewound\" )",
+  "( renderer.pool_cursor.load(Ordering::Relaxed), POOL_BUFFER_BYTES, \"an exhausted pool must never be overwritten or rewound\" )",
   "( renderer.upload_vertex_data(&[0u8; 4]).is_none(), true, \"the pool must stay exhausted after the dedicated-buffer fallback\" )"
  ],
  "draw_rect_repeated_create_destroy_no_leak": [
@@ -1862,6 +2117,14 @@
   "(island.status(), STATUS_SUCCESS)",
   "(island.device_count(), 1)",
   "(island.casak_device_names(), vec![\"CasaTest\"])"
+ ],
+ "duplicate_allocation_and_invalid_allocation_handles_are_rejected": [
+  "( subsystem .d3dkmt_create_allocation(CreateAllocationRequest { device: DeviceHandle(0xFFFF_FFFF), size: 1, segment: SEGMENT_LOCAL, resource_id: 1, shareable: false, owner_process: 7, }) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem .d3dkmt_create_allocation(CreateAllocationRequest { device, size: 0, segment: SEGMENT_LOCAL, resource_id: 1, shareable: false, owner_process: 7, }) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_create_allocation(CreateAllocationRequest { device, size: 1, segment: SegmentId(9), resource_id: 1, shareable: false, owner_process: 7, }) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_create_allocation(CreateAllocationRequest { device, size: 1, segment: SEGMENT_NON_LOCAL, resource_id: 42, shareable: false, owner_process: 8, }) .unwrap_err() .status(), STATUS_OBJECT_NAME_COLLISION )",
+  "(info.size, 4096)",
+  "(info.owner_process, 7)"
  ],
  "duplicate_and_late_acks_complete_an_async_send_once": [
   "( reliability.acknowledge(1, None), vec![ReliableCompletion::Async { async_op: 7, context: 0xAA, result: S_OK, }] )"
@@ -1972,7 +2235,17 @@
   "( wic_encoder_frames(b\"short\"), Vec::new(), \"a profile shorter than the magic is empty\" )",
   "( wic_encoder_frames(b\"NOT-THE-MAGIC-0123456789\"), Vec::new(), \"a profile without the magic is empty\" )",
   "( wic_encoder_frames(&count_only), Vec::new(), \"a missing frame header ends the frame list\" )",
-  "( wic_encoder_frames(&short_pixels), Vec::new(), \"a frame whose pixels run past the profile is dropped\" )"
+  "( wic_encoder_frames(&short_pixels), Vec::new(), \"a frame whose pixels run past the profile is dropped\" )",
+  "( wic_encoder_frames(&truncated_metadata), Vec::new(), \"a frame whose metadata trailer is truncated is dropped\" )",
+  "(frames.len(), 1)"
+ ],
+ "encoder_metadata_writer_round_trips_orientation_and_basic_tags": [
+  "( writer_for_frame(&mut fixture, frame), writer, \"the frame reuses its metadata writer\" )",
+  "( dispatch_x86( &mut fixture, HostThunk::WicFrameEncodeUnsupported, &[frame as u32, 0] ), u64::from(E_INVALIDARG), \"a null metadata writer output is rejected\" )",
+  "( writer_set(&mut fixture, writer, \"Orientation\", &prop_u16(6)), 0 )",
+  "(writer_set(&mut fixture, writer, \"Make\", &make), 0)",
+  "( dispatch_x86( &mut fixture, HostThunk::WicFrameEncodeCommit, &[frame as u32] ), 0 )",
+  "( dispatch_x86(&mut fixture, HostThunk::WicEncoderCommit, &[encoder as u32]), 0 )"
  ],
  "encoder_single_frame_containers_and_wrong_state_rejected": [
   "(wic_image_frame_count(&encoded), 1)",
@@ -1993,7 +2266,7 @@
   "(renderer.command_buffer.is_none(), true)",
   "(renderer.encoder.is_none(), true)",
   "(renderer.frame_index, frame_index + 1)",
-  "( renderer.pool_buffer.get(), (frame_index + 1) % POOL_BUFFER_COUNT, \"a frameless end_frame must rotate the pool exactly once\" )"
+  "( renderer.pool_buffer.load(Ordering::Relaxed), (frame_index + 1) % POOL_BUFFER_COUNT, \"a frameless end_frame must rotate the pool exactly once\" )"
  ],
  "engine_categories_follow_parent_chains": [
   "(engine.category_gain(2), 0.25)",
@@ -2208,8 +2481,7 @@
   "( read_guest_u32(&memory, enum_info).unwrap(), 1, \"one adapter\" )",
   "( dispatch_x86_thunk(&mut runtime, &mut memory, open_adapter, &[open_info as u32]), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create_device, &[device_info as u32] ), 0 )",
-  "( dispatch_x86_thunk(&mut runtime, &mut memory, present, &[0]), 0 )",
-  "( dispatch_x86_thunk( &mut runtime, &mut memory, close_adapter, &[close_info as u32] ), 0 )"
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create_swapchain, &[swap_info as u32] ), 0 )"
  ],
  "evidence_dialogs_profiles_netprov_tsf_vb_surfaces": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, open_file, &[open_struct as u32]), 0, \"no dialog host\" )",
@@ -2444,6 +2716,9 @@
   "( dispatch_x86_thunk( &mut runtime, &mut memory, enum_device, &[dev_info_set as u32, 1, dev_data as u32] ), 1, \"SetupDiEnumDeviceInfo enumerates device 1\" )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, enum_device, &[dev_info_set as u32, 2, dev_data as u32] ), 0, \"SetupDiEnumDeviceInfo past the end fails\" )"
  ],
+ "exclusive_mode_buffer_pin_failure_is_reported_but_keeps_hog": [
+  "( backend.exclusive_client_hog_mode(client), Some(HogModeOutcome::Acquired) )"
+ ],
  "exclusive_mode_enforces_buffer_and_period_constraints": [
   "(plan.buffer_frames, 480)",
   "( plan_initialize(pid, object, AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 10_000, 0, &mix,), Err(AUDCLNT_E_BUFFER_SIZE_ERROR), \"below the real minimum device period\" )",
@@ -2451,6 +2726,37 @@
   "( plan_initialize( pid, object, AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 100_000, 200_000, &mix, ), Err(AUDCLNT_E_INVALID_DEVICE_PERIOD), \"periodicity larger than the buffer\" )",
   "( plan_initialize( pid, object, AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 30_000_000, 0, &mix, ), Err(AUDCLNT_E_BUFFER_TOO_LARGE), \"the engine caps buffers at two seconds\" )",
   "( plan_initialize( pid, object, AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 100_000, 0, &pcm, ), Err(AUDCLNT_E_UNSUPPORTED_FORMAT), \"exclusive mode requires the exact device format\" )"
+ ],
+ "exclusive_mode_hog_acquire_and_release_are_pinned": [
+  "( backend.exclusive_client_hog_mode(client), Some(HogModeOutcome::Acquired) )",
+  "( platform::fake::hog_owner(), std::process::id() as i32, \"hog mode is owned by this process\" )",
+  "(platform::fake::hog_owner(), -1, \"hog mode is released\")",
+  "(backend.exclusive_client_hog_mode(client), None)"
+ ],
+ "exclusive_mode_hog_denial_keeps_the_client_contract": [
+  "( backend.exclusive_client_hog_mode(client), Some(HogModeOutcome::Denied { owner_pid: 1_234 }) )",
+  "( backend .exclusive_clients .get(&client) .expect(\"exclusive state\") .buffer_frames, 64 )"
+ ],
+ "exclusive_mode_hog_rate_failure_releases_and_falls_back": [
+  "( backend.exclusive_client_hog_mode(client), Some(HogModeOutcome::Unavailable) )",
+  "( platform::fake::hog_owner(), -1, \"the failed rate pin released hog mode\" )"
+ ],
+ "exclusive_mode_hog_release_failure_is_reported_but_drops_the_lease": [
+  "(platform::fake::hog_owner(), our_pid)"
+ ],
+ "exclusive_mode_missing_default_output_reports_hog_unavailable": [
+  "( backend.exclusive_client_hog_mode(client), Some(HogModeOutcome::Unavailable), \"a host with no default output cannot provide hog mode\" )"
+ ],
+ "exclusive_mode_non_default_device_reports_hog_unavailable": [
+  "( backend.exclusive_client_hog_mode(client), Some(HogModeOutcome::Unavailable), \"hog mode is only attempted on the default output device\" )"
+ ],
+ "exclusive_mode_second_client_failure_keeps_the_first_hog": [
+  "( backend.hog_mode_held(20), true, \"a failed second client must not release the first client's hog\" )",
+  "(backend.exclusive_client_hog_mode(first).is_some(), true)"
+ ],
+ "exclusive_mode_stream_open_failure_releases_hog": [
+  "(error.code, ReasonCode::RcAudioUnsupported)",
+  "( platform::fake::hog_owner(), -1, \"a failed stream open releases the already-acquired hog\" )"
  ],
  "execute_decimal_format_loop_body_reduces_ecx_and_emits_digits": [
   "(state.get(Register::Rcx), 3)",
@@ -2462,6 +2768,14 @@
  ],
  "execute_lea_with_negative_displacement_wraps_instead_of_faulting": [
   "(state.get(Register::R8), 0x0000_0000_ffff_ffed)"
+ ],
+ "execute_slice_block_stale_null_entry_falls_back_to_safepoint": [
+  "(block.published_entry().is_null(), false)",
+  "(block.published_entry().is_null(), true)",
+  "(program.block(0x7000).is_some(), true)",
+  "(program.block(0x7001).is_none(), true)",
+  "(outcome.reason, JitExitReason::Safepoint)",
+  "(outcome.final_block, 0x7000)"
  ],
  "executes_driver_entry_for_real": [
   "(island.status(), STATUS_SUCCESS)",
@@ -3032,6 +3346,22 @@
   "(fault.address, 0x3004, \"precise first-unmapped byte\")",
   "(fault.address, 0x9_0000)"
  ],
+ "guest_slice_memory_boundary_overflow_and_empty_range_faults_are_exact": [
+  "(view.range_available(0x1000, 0), false)",
+  "(view.load(0x1000, 8).expect(\"one mapped page\"), 0)",
+  "(view.load(0x1004, 4).expect(\"unaligned mapped load\"), 0)",
+  "(view.load(0x1002, 4).expect(\"word-crossing mapped load\"), 0)",
+  "( view.load(0x1000, 0) .expect_err(\"zero-length load must fault\"), GuestMemoryFault { address: 0x1000, write: false, read_len: 0, } )",
+  "( view.store(0x1000, &[]) .expect_err(\"zero-length store must fault\"), GuestMemoryFault { address: 0x1000, write: true, read_len: 0, } )"
+ ],
+ "guest_slice_memory_false_sharing_race_merges_and_publishes": [
+  "( word.to_le_bytes(), [1, 0xF0, 2, 0xF1, 3, 0xF2, 4, 0xF3], \"coincident sub-word stores must preserve every neighbour\" )",
+  "( view.load(base + 8, 8).expect(\"mapped\"), 0xA5A5_5A5A_DEAD_BEEF, \"a published store must be visible to another worker\" )",
+  "( view.load(0x9000, 8) .expect_err(\"an unmapped page must fault\") .address, 0x9000 )",
+  "((store_fault.address, store_fault.write), (0x9000, true))",
+  "(code_view.store(base, &[0x33]).expect(\"mapped\"), true)",
+  "(code_view.take_code_writes(), vec![(base, 1)])"
+ ],
  "guest_synchronous_send_rejects_invalid_dpnid_without_async_handle": [
   "( guest_call( &mut fixture, 0x2000, IFACE_PEER, 7, &[4242, 0, 0, 0, 0, ph_async as u32, DPNOP_SYNC], ), u64::from(DPNERR_INVALIDPLAYER), \"a synchronous SendTo returns the real player error\" )",
   "( guest_read_u32(&fixture.memory, ph_async), 0xDEAD_BEEF, \"a synchronous send must not write an async handle\" )",
@@ -3075,6 +3405,40 @@
   "(error.code, ReasonCode::RcIo)",
   "( error.message.starts_with(&format!( \"heap {heap_id} out of memory: a 4096x4096 texture needs\" )), true )",
   "(backend.heap_usage(heap_id).expect(\"heap usage\").0, 0)"
+ ],
+ "high_address_edge_page_outside_flat_window_is_never_flat_resident": [
+  "(store.materialised_page_count(), 1)",
+  "(store.materialisation_count(), 1)",
+  "( store.resident_flat_page_count(), 0, \"a page above the flat window must not consume flat residency\" )",
+  "(memory.read_u8(address).unwrap(), 0x7E)",
+  "(memory.read_u8(address + 4095).unwrap(), 0x42)"
+ ],
+ "hog_mode_already_held_reacquire_is_rejected_and_pins_the_rate": [
+  "(outcome, HogModeOutcome::AlreadyHeld)",
+  "(driver.set_calls, 0, \"hog is not re-taken\")",
+  "(driver.rates, vec![96_000.0])"
+ ],
+ "hog_mode_deny_and_unavailable_pin_the_client_contract": [
+  "(outcome, HogModeOutcome::Denied { owner_pid: 1_234 })",
+  "(denied.set_calls, 1)",
+  "( acquire_exclusive_hog_with(&mut unavailable, 42, 48_000), HogModeOutcome::Unavailable, \"a refused set with a still-free device is unavailable, not denied\" )"
+ ],
+ "hog_mode_owner_query_failure_is_reported_as_unavailable": [
+  "( acquire_exclusive_hog_with(&mut driver, 42, 48_000), HogModeOutcome::Unavailable )",
+  "(driver.set_calls, 0, \"no hog set on an unqueryable device\")"
+ ],
+ "hog_mode_property_query_failure_is_reported": [
+  "(driver.hog_owner(), Err(-4))",
+  "( acquire_exclusive_hog_with(&mut driver, std::process::id() as i32, 48_000), HogModeOutcome::Unavailable )"
+ ],
+ "hog_mode_rate_pin_failure_releases_and_falls_back": [
+  "(outcome, HogModeOutcome::Unavailable)",
+  "(driver.rates, vec![44_100.0])",
+  "(driver.owner, -1)"
+ ],
+ "hog_mode_set_failure_then_query_failure_is_unavailable": [
+  "( acquire_exclusive_hog_with(&mut driver, 42, 48_000), HogModeOutcome::Unavailable )",
+  "( driver.calls, 2, \"the owner is re-queried after a failed set\" )"
  ],
  "host_busy_port_reports_addressing": [
   "( peer.host(&DplayAppDesc::new(\"Busy\", 4), addr), DPNERR_ADDRESSING, \"a busy port is a real addressing failure\" )"
@@ -3215,6 +3579,20 @@
  "invalid_block_installation_falls_back_to_interpreter": [
   "( run_invalid_block_installation_case(false), None, \"an unavailable probe must skip the native fault fallback\" )",
   "( run_invalid_block_installation_case(jit_execution_available()).is_some(), jit_execution_available() )"
+ ],
+ "invalid_flat_view_rejects_reads_syncs_and_materialisation": [
+  "(flat.base(), 0)",
+  "(buf, [0xAA; 8], \"an invalid view must not write the buffer\")",
+  "(stats.pages_materialised, 0)",
+  "(stats.bytes_copied, 0)"
+ ],
+ "invalid_luid_and_adapter_handles_are_rejected_with_graphics_status": [
+  "(empty.d3dkmt_enum_adapters(), Vec::new())",
+  "(missing.status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER)",
+  "(missing.detail(), \"no adapter has this LUID\")",
+  "( info.luid, luid_from_metal_identity(info.registry_id, &info.name) )",
+  "( info.luid.to_u64() >> 32, u64::from(info.luid.HighPart as u32) )",
+  "(info.segments.len(), 2)"
  ],
  "invalid_param_constructor_sets_correct_code": [
   "(err.code, ReasonCode::RcInvalidParameter)",
@@ -3360,6 +3738,14 @@
   "(runtime.chain_links_formed, 0)",
   "( runtime .block_cache .get(&0x6000) .expect(\"source cached\") .link_target .load(Ordering::Acquire), 0, \"a rejected chain must not publish a target\" )"
  ],
+ "jit_block_and_interpreter_store_never_observe_a_stale_canonical_page": [
+  "( runtime.flat_memory.base(), memory.canonical_store().flat_base(), \"both views must share the same 4 GiB mapping\" )",
+  "(memory.canonical_store().materialisation_count(), 1)",
+  "(memory.read_u64(address).unwrap(), 0x1111_2222_3333_4444)",
+  "(flat_value, 0x5555_6666_7777_8888)",
+  "( state.get(Register::Rax), 0x5555_6666_7777_8888, \"the compiled block must see the interpreter's store immediately\" )",
+  "(state.get(Register::Rax), 0x9999_AAAA_BBBB_CCCC)"
+ ],
  "jit_capability_gate_reports_unavailable_host_without_running_native_code": [
   "(skip_without_capability_for(\"fixture\", true), false)",
   "(skip_without_capability_for(\"fixture\", false), true)",
@@ -3390,6 +3776,10 @@
  "jit_chain_blocks_rejects_unpublished_target_entry": [
   "(error.code, ReasonCode::RcJitCodeAllocFailed)",
   "(error.message, \"block 0x5000 has no published entry\")"
+ ],
+ "jit_compare_jump_stale_flag_race_is_exact_for_slice_loops": [
+  "(taken, vec![true, true, false, true])",
+  "(state.get(Register::Rcx), 0xFFFF_FFFF)"
  ],
  "jit_compile_block_rejects_unavailable_executable_memory": [
   "(error.code, ReasonCode::RcJitCodeAllocFailed)",
@@ -3692,6 +4082,14 @@
   "(error.code, ReasonCode::RcJitCompilationError)",
   "( error.message, \"JIT self-test: direct thunk call failed: reason=Normal { new_rip: 24576 } rax=0x98\" )"
  ],
+ "jit_slice_block_cache_clear_drops_worker_blocks": [
+  "(block.worker_safe, true)",
+  "(runtime.slice_block(0x7100).is_some(), true)",
+  "(runtime.slice_block(0x7100).is_none(), true)",
+  "(runtime.slice_block_cache.is_empty(), true)",
+  "(program.flat_base, program.memory.flat_base())",
+  "(program.flat_base == 0, false)"
+ ],
  "jit_thunk_registration_rejects_unknown_indices_and_pins_guest_addrs": [
   "( runtime.register_host_thunk_for_guest( jit_self_test_host_thunk as *const () as usize, guest ), Some(0) )",
   "( runtime.guest_thunk_addrs(), HashSet::from([guest]), \"guest_addrs must include registered guest targets\" )",
@@ -3716,6 +4114,27 @@
  "jit_unavailable_capability_returns_null_allocation": [
   "(manager.mechanism(), JitExecMechanism::Unavailable)"
  ],
+ "jit_worker_slice_load_success_and_fault_are_exact": [
+  "(value, 0)",
+  "(state.jit_pending_fault, None)",
+  "(faulted, 0)",
+  "(state.jit_pending_fault, Some(0x9000))",
+  "(state.jit_pending_fault_write, false)",
+  "(guard.code_written(), false)"
+ ],
+ "jit_worker_slice_null_memory_store_without_guard_is_dropped": [
+  "(worker_slice_memory().is_none(), true)",
+  "(state.jit_pending_fault, None)",
+  "(state.jit_pending_fault_write, false)"
+ ],
+ "jit_worker_slice_store_flag_and_unmapped_fault_are_exact": [
+  "(guard.code_written(), false)",
+  "(guard.code_written(), true)",
+  "(state.jit_pending_fault, None)",
+  "(view.take_code_writes(), vec![(0x1000, 1)])",
+  "(state.jit_pending_fault, Some(0x9000))",
+  "(state.jit_pending_fault_write, true)"
+ ],
  "join_of_active_pumped_thread_returns_timeout_without_hang": [
   "(runtime.pending_guest_threads.len(), 1)",
   "( result, crate::win32::WAIT_TIMEOUT as u64, \"joining the active pumped thread must return WAIT_TIMEOUT immediately (documented divergence)\" )",
@@ -3723,14 +4142,24 @@
   "(result, crate::win32::WAIT_TIMEOUT as u64)",
   "(worker_handle, 0)"
  ],
+ "jpeg_12bit_cmyk_fixture_pins_exact_samples_and_rejects_truncated_stream": [
+  "(image.pixels, [0_u8, 0, 255, 255].repeat(64))",
+  "(image.pixels, [96_u8, 32, 64, 255].repeat(64))",
+  "( wic_decode_jpeg(&truncated[..truncated.len() - 5]).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a truncated 12-bit CMYK scan is rejected\" )"
+ ],
+ "jpeg_12bit_precision_downscales_exactly_and_invalid_precision_rejected": [
+  "( image.pixels, [expected, expected, expected, 255].repeat(64), \"12-bit sample {sample} downsamples to {expected}\" )",
+  "( image.pixels, [9_u8, 9, 9, 255].repeat(64), \"8-bit samples pass through unchanged\" )",
+  "( wic_decode_jpeg(&bad).unwrap_err(), WINCODEC_ERR_UNSUPPORTEDOPERATION, \"precision {precision} is unsupported\" )"
+ ],
  "jpeg_422_and_444_sampling_and_truncated_scan_rejected": [
   "( wic_decode_jpeg(&jpeg[..jpeg.len() / 2]).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a scan truncated mid-entropy is rejected\" )",
   "( wic_encode_jpeg_sampled(8, 8, &solid[..solid.len() - 1], None, (1, 1)).unwrap_err(), E_INVALIDARG, \"short pixel input is invalid\" )"
  ],
- "jpeg_app_markers_reject_ycck_and_keep_jfif_dpi": [
+ "jpeg_app_markers_ycck_edge_and_keep_jfif_dpi": [
   "(image.dpi_x, 96.0)",
   "(image.dpi_y, 96.0)",
-  "( wic_decode_jpeg(&ycck).unwrap_err(), WINCODEC_ERR_UNSUPPORTEDOPERATION, \"Adobe transform 2 (YCCK) is rejected\" )",
+  "(ycck.pixels, [0_u8, 0, 254, 255].repeat(64))",
   "( wic_decode_jpeg(&adobe).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a non-YCCK Adobe marker without a scan is rejected\" )"
  ],
  "jpeg_bit_reader_rejects_non_restart_markers_without_pending_restart": [
@@ -3791,6 +4220,14 @@
   "( wic_jpeg_decode_block(&mut component, 0, &mut bits, &dc, &ac, scan, &mut eob) .unwrap_err(), WINCODEC_ERR_BADIMAGE, \"an unmatched progressive AC code is rejected\" )",
   "( wic_jpeg_decode_block(&mut component, 0, &mut bits, &dc, &ac, refine, &mut eob) .unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a refinement bit past the stream is rejected\" )"
  ],
+ "jpeg_cmyk_ycck_invalid_transform_and_truncated_stream_rejected": [
+  "( image.pixels, [0_u8, 0, 255, 255].repeat(64), \"Adobe transform {transform:?} decodes inverted CMYK\" )",
+  "( ycck.pixels, [0_u8, 0, 254, 255].repeat(64), \"Adobe YCCK transform 2 decodes to BGRA\" )",
+  "( wic_decode_jpeg(&build_jpeg_cmyk(Some(1), false)).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"Adobe transform 1 is invalid for four components\" )",
+  "( wic_decode_jpeg(&build_jpeg_cmyk(Some(3), false)).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"an unknown Adobe CMYK transform is invalid\" )",
+  "( wic_decode_jpeg(&truncated[..truncated.len() - 5]).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a truncated CMYK scan is rejected\" )",
+  "( wic_decode_jpeg(&progressive_jpeg_fixture()[..40]).unwrap_err(), WINCODEC_ERR_BADIMAGE )"
+ ],
  "jpeg_decoder_baseline_scan_and_truncated_scan_rejected": [
   "(hr, 0, \"CreateDecoderFromStream(JPEG)\")",
   "( dispatch_x86( &mut fixture, HostThunk::WicDecoderGetContainerFormat, &[decoder as u32, CONTAINER_OUT as u32] ), 0 )",
@@ -3824,6 +4261,14 @@
   "( jpeg_psnr(&bgra, &bgra, 0).is_nan(), true, \"zero-pixel input produces the NaN MSE boundary\" )",
   "( wic_decode_jpeg(&jpeg[..jpeg.len() / 2]).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a truncated baseline JPEG is rejected\" )",
   "( dispatch_x86( &mut fixture, HostThunk::WicFactoryCreateStream, &[factory as u32, STREAM_OUT as u32] ), 0 )"
+ ],
+ "jpeg_exif_orientation_edge_applies_all_eight_values_in_copy_pixels": [
+  "(hr, 0, \"orientation {orientation} decoder\")",
+  "( dispatch_x86( &mut fixture, HostThunk::WicSourceGetSize, &[ frame as u32, LOCK_SIZE_OUT as u32, (LOCK_SIZE_OUT + 4) as u32 ] ), 0 )",
+  "( read_guest_u32(&fixture.memory, LOCK_SIZE_OUT).unwrap(), 16, \"orientation {orientation} width\" )",
+  "( read_guest_u32(&fixture.memory, LOCK_SIZE_OUT + 4).unwrap(), 16, \"orientation {orientation} height\" )",
+  "( &pixels[index..index + 4], &color, \"orientation {orientation} pixel {column},{row}\" )",
+  "(hr, 0)"
  ],
  "jpeg_exif_scanner_rejects_malformed_segments": [
   "( wic_jpeg_exif(b\"NOTJPEG\"), None, \"a non-JPEG stream has no EXIF\" )",
@@ -3900,6 +4345,14 @@
   "( image.dpi_y, WIC_DEFAULT_DPI, \"a non-JFIF APP0 must not claim the JFIF density\" )",
   "( image.dpi_x, WIC_DEFAULT_DPI, \"a truncated APP0 must not claim a density\" )",
   "( image.dpi_y, WIC_DEFAULT_DPI, \"a truncated APP0 must not claim a density\" )"
+ ],
+ "keyed_mutex_timeout_release_errors_and_exactly_once_wake_are_exact": [
+  "( subsystem .d3dkmt_open_keyed_mutex(device, private, 0x55) .unwrap_err() .status(), STATUS_ACCESS_DENIED )",
+  "( subsystem .d3dkmt_open_keyed_mutex(device, allocation, 0) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_open_keyed_mutex(device, allocation, 0x1234) .unwrap_err() .status(), STATUS_OBJECT_NAME_COLLISION )",
+  "( subsystem .d3dkmt_open_keyed_mutex2(device, allocation, 0x9999) .unwrap_err() .status(), STATUS_OBJECT_NAME_COLLISION )",
+  "( subsystem .d3dkmt_open_keyed_mutex(other_device, alias, 0x9999) .unwrap_err() .status(), STATUS_ACCESS_DENIED )",
+  "( subsystem .d3dkmt_acquire_keyed_mutex(mutex, 0x9999, 0, 7) .unwrap_err() .status(), STATUS_ACCESS_DENIED )"
  ],
  "kmdf_bad_device_add_callback_is_rejected": [
   "(island.status(), STATUS_INVALID_PARAMETER)",
@@ -4232,6 +4685,13 @@
   "( session.detached_real_dll_count(), 1, \"the host-backed state is parked in the detach-only list\" )",
   "( session.pending_dll_main_calls(), vec![(handle, 0x1000, 1), (handle, 0x1000, 0)], \"the load queued ATTACH; the last unload appends DllMain(DLL_PROCESS_DETACH)\" )"
  ],
+ "legacy_sync_entry_points_never_leave_stale_or_duplicate_state": [
+  "(runtime.synced_page_count(), 2)",
+  "(runtime.synced_page_count(), 3)",
+  "( memory.canonical_store().materialisation_count(), 3, \"incremental sync must not rematerialise existing pages\" )",
+  "(memory.read_u8(0x1000).unwrap(), 0x11)",
+  "(memory.read_u8(0x2000).unwrap(), 0x22)"
+ ],
  "live_pipeline_reports_zero_real_frames_before_guest_paint": [
   "(runtime.real_guest_frames, 0)",
   "((w, h), (2, 1))",
@@ -4476,6 +4936,14 @@
   "( metadata_query(&mut fixture, reader, \"/tEXt/{str=Comment}\"), (0, Some(\"wave-eight\".to_string())) )",
   "( metadata_query(&mut fixture, reader, \"Missing\"), (u64::from(WINCODEC_ERR_PROPERTYNOTFOUND), None) )",
   "( metadata_query(&mut fixture, reader, \"Make\"), (0, Some(\"CasaCam\".to_string())) )"
+ ],
+ "metadata_writer_rejects_malformed_values_and_copies_readers": [
+  "( dispatch_x86( &mut fixture, HostThunk::WicFactoryCreateQueryWriter, &[factory as u32, FORMAT as u32, 0, META_WRITER_OUT as u32] ), u64::from(WIC_E_CODECNOTHANDLED), \"an unknown metadata format is not handled\" )",
+  "(read_ptr(&fixture, META_WRITER_OUT), 0)",
+  "( dispatch_x86( &mut fixture, HostThunk::WicFactoryCreateQueryWriter, &[factory as u32, FORMAT as u32, 0, 0] ), u64::from(E_INVALIDARG) )",
+  "( dispatch_x86( &mut fixture, HostThunk::WicFactoryCreateQueryWriter, &[factory as u32, FORMAT as u32, 0, META_WRITER_OUT as u32] ), 0 )",
+  "( dispatch_x86( &mut fixture, HostThunk::WicGetMetadataContentSize, &[writer as u32, 0, META_PROP as u32] ), u64::from(E_INVALIDARG), \"a null metadata name is rejected\" )",
+  "( dispatch_x86( &mut fixture, HostThunk::WicGetMetadataContentSize, &[writer as u32, META_NAME as u32, 0] ), u64::from(E_INVALIDARG), \"a null PROPVARIANT is rejected\" )"
  ],
  "metal_backend_accessors_and_destroy_caches_reject_stale_handles": [
   "(backend.device().name().is_empty(), false)",
@@ -5218,6 +5686,12 @@
   "(amd.adapter.vendor_id, 0x1002)",
   "(amd.adapter.device_id, 0x7008)"
  ],
+ "object_manager_concurrent_duplicate_load_unload_race_is_exact": [
+  "(manager.lock().unwrap().handle_count(id), 2)",
+  "( drops.load(std::sync::atomic::Ordering::SeqCst), 1, \"exactly one close observes the last reference\" )",
+  "(manager.handle_count(id), 0)",
+  "( manager.resolve(\"RaceEvent\"), None, \"last close forgets the namespace entry\" )"
+ ],
  "object_manager_names_events_and_mutexes": [
   "( win32 .describe_handle(opened_event) .expect(\"descriptor\") .object_type, casa1::win32::ObjectType::Event )",
   "( win32 .describe_handle(event) .expect(\"descriptor\") .object_type, casa1::win32::ObjectType::Event )",
@@ -5302,6 +5776,21 @@
  "override_profile_has_dll_overrides": [
   "(override_profile.id, \"steam-optimal\")"
  ],
+ "overwrite_mapped_page_never_corrupts_neighbour_pages_or_snapshot": [
+  "(memory.read_u8(0x2FFF).unwrap(), 0x11)",
+  "(memory.read_u8(0x3000).unwrap(), 0x44)",
+  "(memory.read_u8(0x3FFF).unwrap(), 0x44)",
+  "(memory.read_u8(0x4000).unwrap(), 0x33)",
+  "( snapshot.read_u8(0x3000).unwrap(), 0x22, \"a clone must remain an independent snapshot\" )",
+  "(snapshot.read_u8(0x2FFF).unwrap(), 0x11)"
+ ],
+ "overwrite_resource_host_visible_recovers_panicked_stats_lock": [
+  "(poisoned.is_err(), true)",
+  "(path, ResourceUpdatePath::StagedUpload)",
+  "( backend.resource_bytes(resource).expect(\"resource bytes\"), &[0x5A; 64] )",
+  "(stats.staged_copies, 1)",
+  "(stats.zero_copy_updates, 0)"
+ ],
  "package_writability_probe_gate": [
   "( written as usize, payload.len(), \"full payload must be written\" )",
   "( read_back, payload, \"probe payload must survive close/reopen\" )",
@@ -5382,9 +5871,16 @@
  "parse_version_resource_default_when_missing": [
   "(result, VersionInfo::default())"
  ],
+ "partial_page_boundary_probes_never_report_unmapped_bytes_or_absent_pages": [
+  "(memory.canonical_store().materialisation_count(), 1)"
+ ],
  "partially_mapped_page_is_not_materialised": [
+  "(detached.pages_materialised, 0)",
+  "(detached.bytes_copied, 0)",
   "(telemetry.pages_materialised, 0)",
-  "(telemetry.bytes_copied, 0)"
+  "(telemetry.bytes_copied, 0)",
+  "(empty.pages_materialised, 0)",
+  "(outside.pages_materialised, 0)"
  ],
  "path_normalize_vectors_parse_typed_input": [
   "( result.output[\"normalized\"], serde_json::json!(\"C:\\\\Alpha\\\\Beta\\\\.\\\\Gamma\\\\..\\\\File.txt\"), \"the normalized output must correspond to the vector's path\" )",
@@ -5421,6 +5917,10 @@
   "(memory.read_u32(driver + 0x34).unwrap(), 0)",
   "(memory.read_u16(header).unwrap(), 4)",
   "(memory.read_u16(header + 2).unwrap(), 6)"
+ ],
+ "pe_host_runtime_is_send_and_sync": [
+  "(std::mem::size_of::<super::PeHostRuntime>() > 0, true)",
+  "(std::mem::needs_drop::<super::PeHostRuntime>(), true)"
  ],
  "pe_parser_mutation_corpus_is_deterministic_and_bounds_checked": [
   "( first, second, \"mutation case {index} produced nondeterministic parse results\" )"
@@ -5576,6 +6076,14 @@
   "( wic_png_text_entries(&png), Vec::<(String, String)>::new(), \"an iTXt without a language terminator yields no entries\" )",
   "( wic_jpeg_exif(&[0xff, 0xd8, 0, 0, 0, 0]), None, \"a JPEG with a non-marker byte before APP1 yields no EXIF\" )"
  ],
+ "png_and_tiff_exif_orientation_edge_values_swap_dimensions": [
+  "( wic_decode_png(&png).expect(\"oriented PNG\").orientation, orientation as u8 )",
+  "(hr, 0)",
+  "( dispatch_x86( &mut fixture, HostThunk::WicSourceGetSize, &[ frame as u32, LOCK_SIZE_OUT as u32, (LOCK_SIZE_OUT + 4) as u32 ] ), 0 )",
+  "( read_guest_u32(&fixture.memory, LOCK_SIZE_OUT).unwrap(), width, \"PNG orientation {orientation} width\" )",
+  "( read_guest_u32(&fixture.memory, LOCK_SIZE_OUT + 4).unwrap(), height, \"PNG orientation {orientation} height\" )",
+  "( &pixels[..], &arrangements[(orientation - 1) as usize], \"PNG orientation {orientation}\" )"
+ ],
  "png_chunk_scanner_rejects_truncated_and_overflowing_chunks": [
   "( wic_png_chunks(b\"not a png\", |_, _| panic!(\"must not visit\")), (), \"a non-PNG signature returns without visiting\" )",
   "( wic_png_text_entries(&huge).is_empty(), true, \"a chunk length past the buffer stops the scan\" )",
@@ -5622,8 +6130,30 @@
   "( dispatch_x86( &mut fixture, HostThunk::WicEncoderCreateNewFrame, &[encoder as u32, FRAME_OUT as u32, 0] ), 0 )"
  ],
  "png_encoder_rejects_invalid_dimensions_and_short_pixels": [
-  "(wic_encode_png(0, 1, &[], None).unwrap_err(), E_INVALIDARG)",
-  "( wic_encode_png(1, 1, &[0, 0, 0], None).unwrap_err(), E_INVALIDARG, \"a short pixel buffer is rejected\" )"
+  "( wic_encode_png(0, 1, &[], None, &[]).unwrap_err(), E_INVALIDARG )",
+  "( wic_encode_png(1, 1, &[0, 0, 0], None, &[]).unwrap_err(), E_INVALIDARG, \"a short pixel buffer is rejected\" )"
+ ],
+ "png_gama_srgb_edge_values_transform_with_exact_rounding": [
+  "( image .pixels .chunks_exact(4) .map(|pixel| pixel[0]) .collect::<Vec<_>>(), vec![0, 1, 128, 255] )",
+  "( image .pixels .chunks_exact(4) .map(|pixel| pixel[0]) .collect::<Vec<_>>(), vec![0, 13, 188, 255], \"gamma 1.0 samples are linear and encode through sRGB\" )",
+  "( image .pixels .chunks_exact(4) .map(|pixel| pixel[0]) .collect::<Vec<_>>(), vec![0, 80, 222, 255] )",
+  "( image .pixels .chunks_exact(4) .map(|pixel| pixel[0]) .collect::<Vec<_>>(), vec![0, 1, 128, 255], \"an sRGB chunk keeps the already-encoded samples\" )",
+  "( image .pixels .chunks_exact(4) .map(|pixel| pixel[0]) .collect::<Vec<_>>(), vec![0, 13, 188, 255], \"an invalid sRGB intent falls back to gAMA\" )",
+  "( wic_decode_png(&palette).expect(\"gamma palette\").pixels, vec![0, 0, 188, 255] )"
+ ],
+ "png_gama_srgb_metadata_exposed_and_malformed_chunk_ignored": [
+  "( wic_png_text_entries(&png), vec![ (\"gAMA\".to_string(), \"45455\".to_string()), (\"sRGB\".to_string(), \"0\".to_string()) ] )",
+  "( metadata_query(&mut fixture, reader, \"/gAMA\"), (0, Some(\"45455\".to_string())) )",
+  "( metadata_query(&mut fixture, reader, \"/sRGB\"), (0, Some(\"0\".to_string())) )",
+  "( wic_png_text_entries(&malformed), Vec::<(String, String)>::new(), \"a malformed gAMA chunk is not exposed\" )",
+  "( metadata_query(&mut fixture, reader, \"/gAMA\"), (u64::from(WINCODEC_ERR_PROPERTYNOTFOUND), None) )"
+ ],
+ "png_indexed_16bit_palette_edges_and_apng_rejected": [
+  "( wic_decode_png(&indexed_16).unwrap_err(), WINCODEC_ERR_UNSUPPORTEDOPERATION, \"indexed color cannot use 16-bit samples\" )",
+  "( wic_decode_png(&too_many).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a 257-entry palette exceeds the PNG limit\" )",
+  "( wic_decode_png(&ragged).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a PLTE chunk that is not a multiple of three is invalid\" )",
+  "( wic_decode_png(&long_trns).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"tRNS cannot have more entries than PLTE\" )",
+  "( wic_decode_png(&apng).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"an acTL without a matching frame control is invalid\" )"
  ],
  "png_paeth_predictor_boundary_ties": [
   "(wic_png_paeth(1, 2, 3), 1)",
@@ -5705,9 +6235,24 @@
   "(backend.nv12_present_count(), 0)",
   "(debug.contains(\"present_layer: true\"), true)"
  ],
+ "present_on_invalid_and_closed_swapchains_is_rejected": [
+  "( subsystem .d3dkmt_create_swapchain(CreateSwapChainRequest { device: DeviceHandle(0xFFFF_FFFF), width: 8, height: 8, format: DxgiFormat::B8G8R8A8Unorm, buffer_count: 2, }) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem .d3dkmt_create_swapchain(CreateSwapChainRequest { device, width: 0, height: 8, format: DxgiFormat::B8G8R8A8Unorm, buffer_count: 2, }) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_create_swapchain(CreateSwapChainRequest { device, width: 8, height: 8, format: DxgiFormat::B8G8R8A8Unorm, buffer_count: 1, }) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_create_swapchain(CreateSwapChainRequest { device, width: 8, height: 8, format: DxgiFormat::Unknown, buffer_count: 2, }) .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_PIXELFORMAT )",
+  "( subsystem .d3dkmt_query_swapchain_info(SwapChainHandle(0xFFFF_FFFF)) .unwrap_err() .status(), STATUS_GRAPHICS_PRESENT_INVALID_WINDOW )",
+  "( subsystem .d3dkmt_present(PresentRequest { swapchain: SwapChainHandle(0xFFFF_FFFF), sync_interval: 0, allow_tearing: false, }) .unwrap_err() .status(), STATUS_GRAPHICS_PRESENT_INVALID_WINDOW )"
+ ],
  "present_plane_readback_rejects_pixel_swapchain_without_nv12_channel": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
   "( error.message, format!(\"swapchain {swapchain} has no NV12 present channel\") )"
+ ],
+ "present_poisoned_frame_callback_panic_is_recovered_exactly_once": [
+  "(frame.width, 8)",
+  "(poisoned.is_err(), true)",
+  "( backend .frame_published_callback .as_ref() .expect(\"callback installed\") .is_poisoned(), true )",
+  "(result.displayed_frame_index, 1)",
+  "( delivered.load(std::sync::atomic::Ordering::SeqCst), 1, \"the recovered callback must run exactly once\" )"
  ],
  "present_rejects_pixel_channel_count_and_dimension_mismatches": [
   "( device.iosurface_channels.len(), 2, \"host must expose IOSurfaces\" )",
@@ -5743,6 +6288,251 @@
   "( win32 .get_exit_code_process(result.process_handle) .expect(\"exit code\"), None )",
   "(err.code, ReasonCode::RcHelperPermissionDenied)",
   "( win32 .get_exit_code_process(result.process_handle) .expect(\"exit code after terminate\"), Some(1) )"
+ ],
+ "production_alertable_apc_race_resumes_with_io_completion": [
+  "( read_u32_guest(&session, APC_FLAG_PTR), 1, \"the APC callback ran before the wait reported\" )",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(after.poll_iterations, before.poll_iterations)",
+  "(after.apc_wakeups, before.apc_wakeups)"
+ ],
+ "production_blocking_wait_and_shutdown_races_never_lose_a_worker": [
+  "(completions.len(), 1)",
+  "(completions[0].job_id, job_id)"
+ ],
+ "production_completion_port_alertable_apc_race_wakes_the_waiter": [
+  "(read_u32_guest(&session, APC_FLAG_PTR), 1)",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(after.apc_wakeups, before.apc_wakeups)",
+  "(after.port_rechecks, before.port_rechecks)"
+ ],
+ "production_completion_port_ex_race_writes_every_entry": [
+  "(port_state.queued_packet_count(), 1)",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(read_u32_guest(&session, ENTRIES_PTR), 0xAAA)",
+  "(read_u32_guest(&session, ENTRIES_PTR + 4), 0xBBB)",
+  "(read_u32_guest(&session, ENTRIES_PTR + 12), 11)",
+  "(read_u32_guest(&session, REMOVED_PTR), 1)"
+ ],
+ "production_completion_port_invalid_pointer_race_propagates_error": [
+  "(error.code, crate::reason::ReasonCode::RcUnimplInsn)",
+  "(resume.code, 1)",
+  "(resume.bytes, Some(1))"
+ ],
+ "production_completion_port_late_signal_race_repolls_without_busy_wait": [
+  "( completion.reason, WaitWakeReason::ObjectSignaled, \"the late signal must be observed on the next slice recheck\" )",
+  "( completion.packets.len(), 0, \"the signal wake must not fabricate a packet\" )",
+  "( started.elapsed() < std::time::Duration::from_secs(2), true, \"the recheck must be bounded by the port slice, not a busy poll\" )",
+  "( SCHEDULER_COUNTERS.snapshot().port_rechecks, before.port_rechecks, \"an empty port slice must re-enter the port condition variable\" )"
+ ],
+ "production_completion_port_shutdown_race_reports_signal_reason": [
+  "( completion.reason, WaitWakeReason::Shutdown, \"a shutdown notification must win after the port slice expires\" )",
+  "( completion.packets.len(), 0, \"a shutdown wake must not fabricate a packet\" )",
+  "( started.elapsed() < std::time::Duration::from_secs(2), true, \"the worker must observe shutdown within one port slice\" )",
+  "( SCHEDULER_COUNTERS.snapshot().port_rechecks, before.port_rechecks, \"the blocked port wait must recheck exactly once per slice\" )"
+ ],
+ "production_completion_port_timeout_race_reports_wait_timeout": [
+  "(session.runtime.last_error, crate::win32::WAIT_TIMEOUT)",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(session.runtime.production_waits.len(), 0)",
+  "(after.poll_iterations, before.poll_iterations)",
+  "(run_wait_job(job).reason, WaitWakeReason::PortTimedOut)",
+  "(after.deadline_wakeups, before.deadline_wakeups)"
+ ],
+ "production_contention_stress_has_exact_completion_invariants": [
+  "(job_ids.len(), JOBS)",
+  "( completion.reason, WaitWakeReason::ObjectSignaled, \"every job must observe its real wake, not a timeout\" )",
+  "(completed, job_ids)",
+  "(scheduler.active_job_count(), 0)"
+ ],
+ "production_deadline_wake_race_advances_guest_clock_exactly": [
+  "( read_u32_guest(&session, RESUME_CODE_PTR), crate::win32::WAIT_TIMEOUT )",
+  "(session.runtime.production_waits.len(), 0)",
+  "(after.poll_iterations, before.poll_iterations)",
+  "(after.deadline_wakeups, before.deadline_wakeups)"
+ ],
+ "production_event_wait_wakes_with_latency_bound_and_zero_idle_polls_no_busy_wait": [
+  "( session.runtime.production_waits.len(), 1, \"the wait is owned by a native production job\" )",
+  "(session.runtime.production_waits.len(), 0)",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(after.wakeups, SCHEDULER_COUNTERS.snapshot().wakeups)",
+  "(SchedulerMode::Cooperative.worker_count(), 0)",
+  "( after.poll_iterations, before.poll_iterations, \"a production event wait must not enter the 1 ms idle poll\" )"
+ ],
+ "production_migration_counter_race_is_exact": [
+  "(ids, BTreeSet::from([first_id, second_id]))",
+  "( SCHEDULER_COUNTERS.snapshot().migrations, before.migrations, \"the same guest thread ran on two different host workers\" )"
+ ],
+ "production_mode_switch_race_refuses_while_wait_parked": [
+  "(session.runtime.scheduler_mode(), SchedulerMode::Cooperative)"
+ ],
+ "production_mutex_release_wake_race_is_exact_without_busy_wait": [
+  "( session .runtime .win32 .wait_for_single_object_instant(mutex, crate::win32::ObjectType::Mutex, owner_tid) .expect(\"acquire\"), crate::win32::WaitStatus::Object0 )",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "( session .runtime .win32 .wait_for_single_object_instant(mutex, crate::win32::ObjectType::Mutex, owner_tid) .expect(\"mutex probe\"), crate::win32::WaitStatus::Abandoned )",
+  "( after.poll_iterations, before.poll_iterations, \"mutex wake is event-driven\" )",
+  "(after.object_wakeups, before.object_wakeups)"
+ ],
+ "production_object_wait_rejects_unsupported_iocp_handle": [
+  "( session .runtime .production_wait_supported(&object_wait(port)), false, \"an IOCP handle is not a supported object-wait source\" )"
+ ],
+ "production_packet_failure_race_propagates_through_completion_apply": [
+  "(error.code, crate::reason::ReasonCode::RcUnimplInsn)",
+  "( session.runtime.production_waits.len(), 0, \"the failed apply consumed the parked wait\" )",
+  "( session.runtime.pending_guest_threads.len(), 0, \"the failed apply must not requeue a thread with no resume result\" )",
+  "( SCHEDULER_COUNTERS.snapshot().completion_port_wakeups, before.completion_port_wakeups, \"a failed out-parameter write is not a packet handoff\" )"
+ ],
+ "production_port_close_race_wakes_with_abandoned_error_not_a_packet": [
+  "( session.runtime.last_error, crate::win32::ERROR_ABANDONED_WAIT_0 )",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(session.runtime.production_waits.len(), 0)",
+  "( after.completion_port_wakeups, before.completion_port_wakeups, \"a closed port is not a packet handoff\" )",
+  "( after.poll_iterations, before.poll_iterations, \"close wakeup is event-driven\" )"
+ ],
+ "production_pump_driven_completion_port_wake_is_event_driven_without_busy_wait": [
+  "(exit_code, 0)",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(read_u32_guest(&session, BYTES_PTR), 7)",
+  "(read_u32_guest(&session, KEY_PTR), 0x5151)",
+  "(read_u32_guest(&session, OVERLAPPED_PTR), 0x6161)",
+  "(port_state.queued_packet_count(), 0)"
+ ],
+ "production_pump_race_dispatches_two_guest_loops_to_two_workers": [
+  "(pump_once(&mut session), true)",
+  "(read_u32_guest(&session, SLICE_COUNTER_A), 512)",
+  "(read_u32_guest(&session, SLICE_COUNTER_B), 512)"
+ ],
+ "production_pump_slice_duplicate_completion_race_applies_once": [
+  "( outcome .expect(\"duplicate reports still count as work\") .did_work, true )",
+  "( session.runtime.pending_guest_threads.len(), 2, \"neither duplicate record may be lost\" )",
+  "( session .runtime .pending_guest_threads .iter() .filter(|thread| thread.state.rip == SLICE_JUMP_CODE + 2) .count(), 1, \"a duplicate completion must update exactly one thread record\" )"
+ ],
+ "production_pump_slice_shutdown_race_reports_no_work": [
+  "( outcome.is_none(), true, \"a slice round that reports nothing must fall back to the owner pump\" )",
+  "( session.runtime.pending_guest_threads.len(), 1, \"the runnable thread must stay queued for the owner\" )"
+ ],
+ "production_pump_slice_stale_completion_race_skips_unknown_thread": [
+  "( outcome .expect(\"a stale report is still worker work\") .did_work, true )",
+  "( session.runtime.pending_guest_threads.len(), 1, \"a stale completion must not consume an unrelated thread\" )",
+  "( session.runtime.pending_guest_threads[0].thread_id, 0x80, \"the live thread stays parked in the queue\" )"
+ ],
+ "production_pumped_thread_dispatch_race_is_exact": [
+  "(session.runtime.production_waits.len(), 1)",
+  "(session.runtime.pending_guest_threads.len(), 1)",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(session.runtime.production_waits.len(), 0)"
+ ],
+ "production_semaphore_release_wake_race_is_exact_without_busy_wait": [
+  "( session .runtime .win32 .release_semaphore(semaphore, 1) .expect(\"release semaphore\"), 0, \"the permit count was exhausted before release\" )",
+  "( read_u32_guest(&session, FLAG_PTR), 1, \"the semaphore waiter resumed\" )",
+  "( session .runtime .win32 .release_semaphore(semaphore, 1) .expect(\"post-acquire count\"), 0, \"the resumed waiter consumed the released permit\" )",
+  "( after.poll_iterations, before.poll_iterations, \"semaphore wake is event-driven\" )",
+  "(after.object_wakeups, before.object_wakeups)"
+ ],
+ "production_sleep_wait_race_uses_native_deadline_worker": [
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(session.runtime.production_waits.len(), 0)",
+  "(after.poll_iterations, before.poll_iterations)",
+  "(run_wait_job(job).reason, WaitWakeReason::Deadline)",
+  "(after.deadline_wakeups, before.deadline_wakeups)"
+ ],
+ "production_slice_close_race_shutdown_joins_active_guest_loop": [
+  "( start.elapsed() < std::time::Duration::from_secs(5), true, \"dropping the pool must join an active guest slice\" )",
+  "(session.runtime.production_scheduler.is_none(), true)",
+  "assert!( session .runtime .ensure_slice_block(&mut session.memory, SLICE_CODE)"
+ ],
+ "production_slice_code_write_race_clears_stale_blocks": [
+  "(reports.len(), 1)",
+  "( reports[0].exit, GuestSliceExit::CodeWrite, \"a guest store to a compiled-code page must yield to the owner\" )",
+  "( reports[0].code_writes, vec![(SLICE_CODE_WRITE_CODE, 4)], \"the exact code write must be reported for invalidation\" )",
+  "( session .runtime .jit_runtime .as_ref() .expect(\"jit runtime\") .slice_block(SLICE_CODE_WRITE_CODE) .is_none(), true, \"a code write must clear stale worker slice blocks\" )"
+ ],
+ "production_slice_dispatch_rejects_empty_or_missing_pool": [
+  "( empty.len(), 0, \"an empty request set must dispatch no slices\" )",
+  "( no_pool.len(), 0, \"cooperative mode has no production pool to dispatch to\" )",
+  "( session.runtime.production_scheduler.is_none(), true, \"the dispatch must not create a pool implicitly\" )"
+ ],
+ "production_slice_jump_exit_race_updates_rip_exactly_once": [
+  "(reports.len(), 1)",
+  "( reports[0].state.rip, SLICE_JUMP_CODE, \"a jump exit must land on the jump target\" )",
+  "( reports[0].blocks_executed, 1, \"the budget must stop the slice after the jump\" )",
+  "( reports[0].exit, GuestSliceExit::Budget, \"the jump target re-enters the same worker-safe loop\" )"
+ ],
+ "production_slice_missing_exit_metadata_is_host_barrier": [
+  "( completion.exit, GuestSliceExit::HostBarrier { rip: SLICE_JUMPIF_CODE }, \"conditional exit metadata loss must never fabricate a RIP\" )",
+  "( completion.state.rip, SLICE_JUMPIF_CODE, \"the owner re-dispatches the original block address\" )"
+ ],
+ "production_slice_race_two_guest_loops_overlap_with_exact_counters": [
+  "( requests .iter() .map(|request| request.state.rip) .collect::<Vec<_>>(), vec![SLICE_CODE, SLICE_CODE_2] )",
+  "(reports.len(), 2, \"both guest threads must produce a report\")",
+  "( reports .iter() .map(|report| report.blocks_executed) .sum::<u64>(), 4_096, \"each thread's slice must execute exactly its budget\" )",
+  "(read_u32_guest(&session, SLICE_COUNTER_A), 2_048)",
+  "(read_u32_guest(&session, SLICE_COUNTER_B), 2_048)",
+  "assert!( session .runtime .jit_runtime .as_ref() .expect(\"jit\") .slice_block(SLICE_CODE)",
+  "assert!( session .runtime .jit_runtime .as_ref() .expect(\"jit\") .slice_block(SLICE_CODE_2)"
+ ],
+ "production_slice_round_shutdown_race_drains_completion_before_stop": [
+  "( reports.len(), 0, \"shutdown must stop the round even when a wait completion woke it\" )",
+  "( scheduler.take_completions().len(), 1, \"slice rounds must leave wait completions for the owner\" )"
+ ],
+ "production_slice_round_shutdown_race_skips_all_worker_reports": [
+  "( reports.len(), 0, \"a shutdown round must never report a slice as executed\" )"
+ ],
+ "production_slice_safepoint_exit_race_consumes_request": [
+  "(reports.len(), 1)",
+  "( reports[0].exit, GuestSliceExit::Safepoint, \"the worker must stop at the safepoint, not run guest code\" )",
+  "( reports[0].blocks_executed, 1, \"the safepoint is observed after the block prologue ran\" )"
+ ],
+ "production_slice_start_gate_over_arrival_race_returns_without_deadlock": [
+  "( *gate .remaining .lock() .unwrap_or_else(|poisoned| poisoned.into_inner()), 0, \"an over-arrival must observe the already-emptied gate\" )",
+  "( shutdown.load(std::sync::atomic::Ordering::Acquire), false, \"the over-arrival must not fake a shutdown\" )"
+ ],
+ "production_slice_straight_line_fallback_is_host_barrier": [
+  "( completion.exit, GuestSliceExit::HostBarrier { rip: SLICE_STRAIGHT_CODE }, \"a straight-line exit must return to the runtime owner\" )",
+  "( completion.blocks_executed, 1, \"the straight-line block executed exactly once\" )",
+  "( completion.state.get(Register::Rax), 0x1234, \"the worker applied the block result before the barrier\" )"
+ ],
+ "production_terminate_race_prunes_parked_wait_and_never_resumes": [
+  "(session.runtime.production_waits.len(), 1)",
+  "(session.runtime.production_waits.len(), 0)",
+  "(read_u32_guest(&session, FLAG_PTR), 0)"
+ ],
+ "production_thread_exit_race_wakes_join_without_polling": [
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "( session .runtime .win32 .wait_for_single_object_instant( target, crate::win32::ObjectType::Thread, session.runtime.win32.current_thread_id() ) .expect(\"thread probe\"), crate::win32::WaitStatus::Object0 )",
+  "(after.poll_iterations, before.poll_iterations)"
+ ],
+ "production_thunk_serialization_stress_is_exactly_once_under_two_threads": [
+  "( trace_calls(&session, \"time\", \"GetTickCount64\"), before + 2 * iterations as usize, \"every guest call must dispatch its thunk exactly once\" )",
+  "(session.runtime.pending_guest_threads.len(), 0)"
+ ],
+ "production_wait_all_repark_race_is_exact": [
+  "( session.runtime.production_waits.len(), 1, \"a partial wait-all wake must re-park, never resume\" )",
+  "(read_u32_guest(&session, FLAG_PTR), 0)",
+  "(read_u32_guest(&session, FLAG_PTR), 1)",
+  "(session.runtime.production_waits.len(), 0)",
+  "( SCHEDULER_COUNTERS.snapshot().repark_events, before.repark_events )"
+ ],
+ "production_worker_barrier_never_double_dispatches_host_thunk": [
+  "(reports.len(), 1)",
+  "( reports[0].exit, GuestSliceExit::HostBarrier { rip: SLICE_CODE_2 } )",
+  "(reports[0].blocks_executed, 0)",
+  "( trace_calls(&session, \"time\", \"GetTickCount64\"), before, \"a production worker must never run the host thunk\" )",
+  "( trace_calls(&session, \"time\", \"GetTickCount64\"), before + 1, \"the runtime owner executes the thunk exactly once\" )",
+  "(session.runtime.pending_guest_threads.len(), 0)"
+ ],
+ "production_worker_guest_fault_boundary_is_reported_to_the_owner": [
+  "(reports.len(), 1)",
+  "( reports[0].exit, GuestSliceExit::GuestFault { address: 0x9000, write: false } )",
+  "(reports[0].blocks_executed, 1)",
+  "( session .runtime .ensure_slice_block(&mut session.memory, rip) .expect(\"compile slice block\"), true, \"the test block must be worker-safe\" )"
+ ],
+ "production_worker_overlap_race_is_exact_on_two_host_workers": [
+  "( scheduler.active_job_count(), 2, \"overlap proof: two guest waits active on two host workers\" )",
+  "(completions.len(), 2)",
+  "(ids.len(), 2, \"each wait job completes exactly once\")",
+  "(ids, BTreeSet::from([first_id, second_id]))",
+  "(scheduler.active_job_count(), 0)",
+  "( after.worker_overlaps, before.worker_overlaps, \"overlap accounting must observe concurrency\" )"
  ],
  "profiles_are_internally_consistent": [
   "(desktop.windows_version, WindowsVersion::Win11)",
@@ -5890,6 +6680,15 @@
  "real_external_windows_xaudio2_imports_trace_through_pe_runtime": [
   "(canonical_output.exit_code, 0)"
  ],
+ "real_win32_class_object_token_overflow_wraps_to_zero": [
+  "( first, u32::MAX, \"the first token must be the boundary value\" )",
+  "(second, 0, \"the token counter must wrap to zero\")",
+  "( com.clsid_for_token(0), Some(second_clsid), \"token zero must resolve to the wrapped registration\" )"
+ ],
+ "real_win32_revoke_unknown_class_object_is_rejected": [
+  "( com.revoke_class_object(&other), false, \"revoking an unregistered CLSID must return false\" )",
+  "( com.revoke_class_object(&clsid), true, \"revoking the registered CLSID must return true\" )"
+ ],
  "record_workload_dedups_and_reports_found": [
   "(entry.workloads_reaching, vec![\"fixture-a\", \"fixture-b\"])"
  ],
@@ -5969,6 +6768,14 @@
   "(host.add_player_to_group(group, member_id), S_OK)",
   "(origin.send_to(group, b\"relay-me\"), S_OK)"
  ],
+ "release_curves_pin_exact_gain_and_reject_malformed_payload": [
+  "(release_at(ReleaseCurve::Linear, 50, 100), 0.5)",
+  "(release_at(ReleaseCurve::Squared, 50, 100), 0.25)",
+  "(release_at(ReleaseCurve::Squared, 0, 100), 0.0)",
+  "( release_at(ReleaseCurve::EqualPower, 0, 0), 0.0, \"invalid zero-length release is silent\" )",
+  "(settings.categories[0].release_curve, curve)",
+  "( GlobalSettings::parse(&build_xgs_curve(4)), Err(XACTENGINE_E_INVALIDDATA), \"unknown curve byte is malformed content\" )"
+ ],
  "release_frees_the_whole_reservation_regardless_of_size": [
   "(vm.region_size(base), Some(0x3000))",
   "(vm.query(base).state, VmState::Free)",
@@ -6037,6 +6844,13 @@
   "( vm.reserve(Some(0x7400_2000), 0x1000), 0x7400_2000, \"adjacent OK\" )",
   "( vm.region_size(0x7300_0000), Some(0x3000), \"register grows the region\" )",
   "(query.kind, VmRegionKind::Image, \"innermost region wins\")"
+ ],
+ "residency_accounting_over_budget_and_evict_boundaries_are_exact": [
+  "(subsystem.d3dkmt_make_resident(allocation, 7), Ok(1))",
+  "(subsystem.d3dkmt_make_resident(allocation, 7), Ok(2))",
+  "( subsystem .d3dkmt_query_adapter_info(adapter) .expect(\"adapter info\") .segments[0] .used, 4096 )",
+  "( subsystem .d3dkmt_make_resident(over_budget, 7) .unwrap_err() .status(), STATUS_GRAPHICS_NO_VIDEO_MEMORY )",
+  "(subsystem.d3dkmt_evict(allocation, 7), Ok(1))"
  ],
  "residency_set_backend_integration_and_destroy_purges": [
   "( backend .residency_set_allocation_count(set_id) .expect(\"count\"), 4 )",
@@ -6381,6 +7195,14 @@
   "(error.code, ReasonCode::RcCliInvalid)",
   "(error.message, \"invalid shading rate value: 255\")"
  ],
+ "shared_resource_open_rejects_collisions_cross_adapter_and_private_data_errors": [
+  "(info.len(), 2)",
+  "( subsystem .d3dkmt_open_resource(same_adapter, private) .unwrap_err() .status(), STATUS_ACCESS_DENIED )",
+  "( subsystem .d3dkmt_open_resource(device, shared) .unwrap_err() .status(), STATUS_OBJECT_NAME_COLLISION )",
+  "( subsystem .d3dkmt_open_resource(other_adapter, shared) .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
+  "( subsystem .d3dkmt_open_resource(DeviceHandle(0xFFFF_FFFF), shared) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem .d3dkmt_open_resource(same_adapter, AllocationHandle(0xFFFF_FFFF)) .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE )"
+ ],
  "sharing_modes_and_byte_range_locks_reject_conflicts": [
   "(sharing_violation.code, ReasonCode::RcFsSharingViolation)",
   "(lock_violation.code, ReasonCode::RcFsLockViolation)"
@@ -6426,6 +7248,31 @@
  "shim_x86_arg_bytes_abi_mismatch_or_zero_width_rejects": [
   "( shim.x86_arg_bytes(), want, \"{shim:?} must pop its exact stdcall byte count\" )"
  ],
+ "sigbus_fallback_never_corrupts_committed_bytes_and_handles_partial_and_absent_pages": [
+  "(first, 0xAB, \"servicing must never zero committed bytes\")",
+  "(memory.read_u8(0x1000).unwrap(), 0xAB)",
+  "(partial_head, 0x11)",
+  "(partial_tail, 0x22)",
+  "(absent_tail, 0)",
+  "(memory.canonical_store().materialisation_count(), 3)"
+ ],
+ "sigbus_fallback_touches_mapped_tail_without_zeroing_or_marking_it": [
+  "(tail, 0x33, \"a mapped tail byte must never be zeroed\")",
+  "(head, 0)",
+  "(memory.read_u8(0x4FFF).unwrap(), 0x33)"
+ ],
+ "sigbus_handler_services_flat_fault_without_copying_or_corrupting": [
+  "( memory.read_u8(0x7000).unwrap(), 0x5A, \"the fallback must preserve committed bytes\" )",
+  "(SIGBUS_HANDLER_DEPTH.load(Ordering::Relaxed), 0)"
+ ],
+ "sigbus_partial_page_tail_mapping_fallback_is_exact": [
+  "(tail.page_is_fully_mapped(0x1000), false)",
+  "(tail.page_exists(0x1000), true)",
+  "(tail.page_byte_is_mapped(0x1000, 0), false)",
+  "(tail.page_byte_is_mapped(0x1000, 4095), true)",
+  "(interior.page_exists(0x1000), true)",
+  "(interior.page_byte_is_mapped(0x1000, 0), false)"
+ ],
  "signal_and_reset_event_update_wait_state": [
   "(manager.header(id).wait_state, WaitableState::Signaled)",
   "( manager.wait_satisfaction(id, 0, 0), WaitSatisfaction::Signaled )",
@@ -6440,6 +7287,11 @@
   "( user32 .get_pointer_frame_info() .unwrap() .current_pointer_count, 1 )",
   "(frame_info.current_pointer_count, 0)",
   "(frame_info.pointers_in_frame, 0)"
+ ],
+ "slice_ensure_block_rejects_missing_jit_thunk_and_unmapped_rip": [
+  "( session .runtime .ensure_slice_block(&mut session.memory, SLICE_JUMP_CODE) .expect(\"missing jit\"), false, \"a runtime without a JIT cannot produce worker slices\" )",
+  "( session .runtime .ensure_slice_block(&mut session.memory, thunk) .expect(\"host thunk\"), false, \"a host thunk address is never worker guest code\" )",
+  "( error.code, crate::reason::ReasonCode::RcUnimplInsn, \"the decode failure must propagate to the caller\" )"
  ],
  "smc_dirty_overflow_marks_overflow_and_keeps_bounded_ring": [
   "(pages.len(), SMC_DIRTY_SLOTS)",
@@ -6501,11 +7353,18 @@
  ],
  "sparse_guest_memory_materialises_only_committed_pages": [
   "(memory.committed_page_addresses().len(), 16)",
+  "( memory.canonical_store().materialisation_count(), 16, \"each committed page is materialised exactly once by the store\" )",
   "( telemetry.pages_materialised, 16, \"only the 16 committed pages may be materialised\" )",
   "( telemetry.sync_operations, 16, \"16 isolated pages form 16 runs\" )",
   "(telemetry.bytes_copied, 16 * 4096)",
-  "(runtime.flat_memory.materialised_page_count(), 16)",
-  "( runtime.flat_memory.total_page_count(), 1_048_576, \"the flat region is still the full 4 GiB\" )"
+  "( memory.canonical_store().materialisation_count(), 16, \"the sync pass must not re-materialise canonical pages\" )"
+ ],
+ "sparse_two_gib_commit_materialises_pages_once_and_only_touched_pages_resident": [
+  "(store.materialised_page_count(), 2)",
+  "(store.materialisation_count(), 2)",
+  "( store.resident_flat_page_count(), 2, \"only the two touched pages may be resident in a 4 GiB window\" )",
+  "(memory.read_u64(low).unwrap(), value)",
+  "(memory.read_u64(two_gib).unwrap(), value)"
  ],
  "spirv_header_parsing": [
   "(translator.entry_points.len(), 1)",
@@ -6530,6 +7389,14 @@
  ],
  "static_sampler_rejects_undefined_address_modes": [
   "(error.code, ReasonCode::RcD3dInvalidState)"
+ ],
+ "statistics_track_gpu_and_memory_counters_across_destroy_boundaries": [
+  "(empty.d3dkmt_query_statistics(), WddmStatistics::default())",
+  "( empty .d3dkmt_make_resident(AllocationHandle(1), 0) .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE )",
+  "(subsystem.d3dkmt_make_resident(allocation, 7), Ok(1))",
+  "( subsystem.d3dkmt_signal_synchronization_object(sync, 1), Ok(()) )",
+  "( subsystem.d3dkmt_wait_for_synchronization_object(sync, 1, 0), Ok(()) )",
+  "(statistics.present_count, 2)"
  ],
  "status_conversion_boundary_agrees_with_the_canonical_map": [
   "( rtl_nt_status_to_dos_error(crate::ntdll::STATUS_INVALID_HANDLE), crate::error::ntstatus_to_dos_error(0xC000_0008) )"
@@ -6668,6 +7535,28 @@
   "(runtime.iosurface_channels[0].height(), 4)",
   "(resized.pixel[0].width(), 16)"
  ],
+ "synchronization_invalid_handles_timeouts_and_backwards_signals_are_rejected": [
+  "( subsystem .d3dkmt_create_synchronization_object(DeviceHandle(0xFFFF_FFFF), 0) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem .d3dkmt_signal_synchronization_object(SyncObjectHandle(0xFFFF_FFFF), 1) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem .d3dkmt_wait_for_synchronization_object(SyncObjectHandle(0xFFFF_FFFF), 1, 0) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem.d3dkmt_wait_for_synchronization_object(sync, 2, 0), Ok(()) )",
+  "( subsystem .d3dkmt_signal_synchronization_object(sync, 1) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_signal_synchronization_object(sync, 2) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )"
+ ],
+ "synchronization_object_arrays_reject_bad_handles_and_timeout_atomically": [
+  "( subsystem .d3dkmt_signal_synchronization_objects(device, &[], &[], 1) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_signal_synchronization_objects(device, &[first; MAX_KMT_ARRAY + 1], &[], 1,) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_signal_synchronization_objects( device, &[SyncObjectHandle(0xFFFF_FFFF)], &[], 1, ) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem .d3dkmt_signal_synchronization_objects(device, &[foreign], &[], 1) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem .d3dkmt_signal_synchronization_objects( device, &[first], &[ContextHandle(0xFFFF_FFFF)], 1, ) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
+  "( subsystem .d3dkmt_signal_synchronization_objects(device, &[first], &[foreign_context], 1,) .unwrap_err() .status(), STATUS_INVALID_HANDLE )"
+ ],
+ "synthetic_dll_init_callback_failure_race_fires_exactly_once": [
+  "( *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()), vec![(handle, DLL_PROCESS_ATTACH)], \"the callback must observe the created handle and the attach reason\" )",
+  "(again, handle, \"the repeat load must reuse the handle\")",
+  "( seen.lock() .unwrap_or_else(|poisoned| poisoned.into_inner()) .len(), 1, \"a repeated load must not fire a second synthetic init callback\" )",
+  "(handle, 0, \"a synthetic module must receive a real handle\")"
+ ],
  "system_info_classes_validate_and_counter_layout_is_canonical": [
   "( validate_system_information_class(99), Err(crate::ntdll::STATUS_INVALID_INFO_CLASS) )",
   "(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 12345)",
@@ -6680,6 +7569,166 @@
   "( read_u32(&basic, 8), win32_nprocs, \"the Nt serializer reports the same processor count as GetSystemInfo\" )",
   "(read_u32(&basic, 24), win32_nprocs)",
   "(read_u32(&basic, 60), win32_nprocs)"
+ ],
+ "system_loopback_aggregate_creation_failure_is_pinned": [
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::AggregateCreation(-4)) )",
+  "( platform::fake::destroy_counts(), (1, 0, 0), \"a failed aggregate creation still destroys the tap\" )"
+ ],
+ "system_loopback_backend_init_failure_keeps_the_fallback_contract": [
+  "(result.is_none(), true)",
+  "( guard.is_none(), true, \"a failed init never installs a backend\" )"
+ ],
+ "system_loopback_buffer_list_edge_shapes_are_pinned": [
+  "( audio_buffer_list_to_interleaved(ptr::null()), (Vec::new(), 0) )",
+  "( audio_buffer_list_to_interleaved(&zero as *const _), (Vec::new(), 0) )",
+  "( audio_buffer_list_to_interleaved(&missing as *const _), (Vec::new(), 0) )",
+  "( audio_buffer_list_to_interleaved(&empty_frames as *const _), (Vec::new(), 0) )",
+  "( audio_buffer_list_to_interleaved(list), (vec![0.1, 0.3, 0.2, 0.4], 2) )",
+  "(audio_buffer_list_to_interleaved(list), (Vec::new(), 0))"
+ ],
+ "system_loopback_capability_unavailable_never_starts": [
+  "( backend.system_loopback_capability(), SystemLoopbackBackend::Unavailable )",
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::Unavailable) )"
+ ],
+ "system_loopback_capture_stop_start_during_teardown_has_no_stale_frames": [
+  "(set_event_handle(pid, object, 0xE9), AUDCLNT_S_OK)",
+  "(start(pid, object), AUDCLNT_S_OK)",
+  "(capture_next_packet_size(pid, service), Ok(5))",
+  "(stop(pid, object), AUDCLNT_S_OK)",
+  "(capture_next_packet_size(pid, service), Ok(3))"
+ ],
+ "system_loopback_duplicate_start_is_idempotent": [
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::CoreAudioProcessTap) )",
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::CoreAudioProcessTap), \"a second Start reuses the live session\" )",
+  "(backend.system_loopback_status().generation, generation)"
+ ],
+ "system_loopback_empty_callback_is_dropped_without_frames": [
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::CoreAudioProcessTap) )",
+  "(backend.system_loopback_available_frames(), 0)",
+  "(backend.system_loopback_status().frames_delivered, 0)",
+  "(platform::fake::destroy_counts(), (1, 1, 1))"
+ ],
+ "system_loopback_failure_stage_mapping_is_pinned": [
+  "( classify_system_loopback_failure(SystemLoopbackFailure::TapCreation(0), -50), SystemLoopbackFailure::TapCreation(-50) )",
+  "( classify_system_loopback_failure(SystemLoopbackFailure::AggregateCreation(0), -4), SystemLoopbackFailure::AggregateCreation(-4) )",
+  "( classify_system_loopback_failure(SystemLoopbackFailure::StreamStart(0), -1), SystemLoopbackFailure::StreamStart(-1) )",
+  "( classify_system_loopback_failure(SystemLoopbackFailure::FormatUnavailable, -1), SystemLoopbackFailure::FormatUnavailable )"
+ ],
+ "system_loopback_format_mismatch_capture_is_converted_to_the_client_format": [
+  "( commit_initialize(pid, object, &plan, &format, 0x7_000, 4410), AUDCLNT_S_OK )",
+  "(start(pid, object), AUDCLNT_S_OK)",
+  "(capture_next_packet_size(pid, service), Ok(88))",
+  "(packet.frames, 88)",
+  "(packet.flags, 0, \"captured system audio is not silent\")",
+  "(packet.samples.len(), 88)"
+ ],
+ "system_loopback_format_mismatch_conversion_edges_are_pinned": [
+  "(real, 0)",
+  "(samples, vec![0.0; 10])",
+  "(samples, vec![0.0; 4])",
+  "(real, 2)",
+  "(samples, vec![0.5, 0.5])"
+ ],
+ "system_loopback_ioproc_failure_unwinds_aggregate_and_tap": [
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::StreamStart(-1)) )",
+  "(platform::fake::destroy_counts(), (1, 1, 0))"
+ ],
+ "system_loopback_missing_audio_flow_yields_pinned_silent_packets": [
+  "(set_event_handle(pid, object, 0xE8), AUDCLNT_S_OK)",
+  "(start(pid, object), AUDCLNT_S_OK)",
+  "(packet.flags, AUDCLNT_BUFFERFLAGS_SILENT)",
+  "(packet.frames, frames)",
+  "(packet.channels, format.channels)",
+  "(stop(pid, object), AUDCLNT_S_OK)"
+ ],
+ "system_loopback_null_tap_uid_is_a_failure": [
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::ObjectUnavailable) )",
+  "(platform::fake::destroy_counts(), (1, 0, 0))"
+ ],
+ "system_loopback_probe_fallback_classification_is_pinned": [
+  "( classify_system_loopback_probe(true, true, false), SystemLoopbackBackend::CoreAudioProcessTap )",
+  "( classify_system_loopback_probe(false, true, false), SystemLoopbackBackend::ScreenCaptureKit )",
+  "( classify_system_loopback_probe(false, false, false), SystemLoopbackBackend::Unavailable )",
+  "( classify_system_loopback_probe(true, true, true), SystemLoopbackBackend::Unavailable, \"CASA1_SYSTEM_LOOPBACK=off always forces the fallback\" )"
+ ],
+ "system_loopback_process_tap_pipeline_captures_and_tears_down": [
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::CoreAudioProcessTap) )",
+  "(backend.system_loopback_format(), Some((2, 48_000)))",
+  "(backend.system_loopback_available_frames(), 2)",
+  "( backend.read_system_loopback_data(), vec![0.25, 0.75, 0.5, 0.5] )",
+  "(status.frames_delivered, 2)",
+  "(status.buffered_frames, 0)"
+ ],
+ "system_loopback_real_start_or_creation_failure_is_reported": [
+  "(used, capability, \"the probed backend is the one used\")",
+  "( failure, SystemLoopbackFailure::Unavailable, \"a probed backend fails for a real creation reason\" )"
+ ],
+ "system_loopback_release_while_running_stops_the_capture": [
+  "(set_event_handle(pid, object, 0xEA), AUDCLNT_S_OK)",
+  "(start(pid, object), AUDCLNT_S_OK)",
+  "(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 1)",
+  "(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 0)"
+ ],
+ "system_loopback_sck_fallback_is_unavailable": [
+  "( platform::start_screen_capture_kit(shared, 1).err(), Some(SystemLoopbackFailure::Unavailable) )"
+ ],
+ "system_loopback_shared_users_release_only_on_the_last_stop": [
+  "(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 2)",
+  "(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 1)",
+  "(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 0)"
+ ],
+ "system_loopback_sink_format_change_discards_incompatible_history": [
+  "(sink.samples.len(), 4)",
+  "(sink.sample_rate, 44_100)",
+  "(sink.samples, VecDeque::from(vec![0.2, 0.2]))"
+ ],
+ "system_loopback_sink_history_boundary_drops_oldest_frames": [
+  "(sink.max_samples(), 4_000)",
+  "(sink.samples.len(), 4_000)",
+  "(sink.samples.front().copied(), Some(1_000.0))",
+  "(sink.samples.back().copied(), Some(4_999.0))",
+  "(sink.dropped_frames, 1_000)"
+ ],
+ "system_loopback_stale_generation_frames_are_rejected_across_teardown": [
+  "(backend.system_loopback_available_frames(), 4)",
+  "(backend.read_system_loopback_data(), vec![0.5; 8])",
+  "(second_generation, first_generation)"
+ ],
+ "system_loopback_stale_generation_is_rejected_after_test_session_teardown": [
+  "(backend.system_loopback_format(), Some((2, 8_000)))",
+  "(backend.system_loopback_available_frames(), 4)",
+  "(status.generation, generation)",
+  "( status.backend, Some(SystemLoopbackBackend::CoreAudioProcessTap) )",
+  "(status.channels, 2)",
+  "(status.sample_rate, 8_000)"
+ ],
+ "system_loopback_stopped_user_and_missing_backend_report_zero": [
+  "( system_loopback_available_for(state, false), 0, \"an unused capture reports no frames without touching the backend\" )",
+  "(get_current_padding(pid, object), Ok(0))",
+  "( get_current_padding(pid, object), Ok(0), \"a missing backend is a zero-frame capture, never a panic\" )"
+ ],
+ "system_loopback_stream_start_failure_is_pinned": [
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::StreamStart(-1)) )",
+  "( platform::fake::destroy_counts(), (1, 1, 1), \"a failed device start unwinds the IOProc, aggregate and tap\" )"
+ ],
+ "system_loopback_tap_creation_failure_falls_back_to_render_history": [
+  "(set_event_handle(pid, object, 0xE7), AUDCLNT_S_OK)",
+  "(start(pid, object), AUDCLNT_S_OK)",
+  "(capture_next_packet_size(pid, service), Ok(32))",
+  "(packet.flags, 0, \"render-history frames are real frames\")",
+  "(packet.samples, rendered)",
+  "(stop(pid, object), AUDCLNT_S_OK)"
+ ],
+ "system_loopback_tap_creation_failure_is_pinned": [
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::TapCreation(-50)) )",
+  "(platform::fake::destroy_counts(), (0, 0, 0))"
+ ],
+ "system_loopback_tap_exclusion_invalid_zero_process_is_a_noop": [
+  "(exclude_own_process(ptr::null_mut(), 0), ())"
+ ],
+ "system_loopback_tap_format_unavailable_is_pinned": [
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::FormatUnavailable) )",
+  "(platform::fake::destroy_counts(), (1, 0, 0))"
  ],
  "system_time_and_timer_resolution_domains_are_consistent": [
   "( read_u64(&session.read_guest(ft_ptr, 8), 0), read_u64(&session.read_guest(win32_ft_ptr, 8), 0) )",
@@ -7974,13 +9023,15 @@
   "(page1.pixels, second)",
   "(&data[..11], b\"second page\")",
   "( wic_encode_tiff_pages(&[]).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"the empty page list is rejected\" )",
-  "( wic_encode_tiff_pages(&[WicTiffPage { width: 2, height: 1, bgra: &first[..7], dpi: None, description: None, make: None, model: None, datetime: None, }]) .unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a page with short pixels is rejected\" )"
+  "( wic_encode_tiff_pages(&[WicTiffPage { width: 2, height: 1, bgra: &first[..7], dpi: None, description: None, make: None, model: None, datetime: None, metadata: &[], }]) .unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a page with short pixels is rejected\" )"
  ],
  "tiff_encoder_rejects_bad_dpi_and_short_pages_after_odd_padding": [
   "(&image.pixels, &one)",
   "(image.dpi_x, 96.0)",
   "(image.dpi_y, 96.0)",
-  "( wic_encode_tiff_pages(&[WicTiffPage { width: 2, height: 2, bgra: &one, dpi: None, description: None, make: None, model: None, datetime: None, }]) .unwrap_err(), WINCODEC_ERR_BADIMAGE, \"short page pixels are rejected\" )"
+  "( wic_encode_tiff_pages(&[WicTiffPage { width: 2, height: 2, bgra: &one, dpi: None, description: None, make: None, model: None, datetime: None, metadata: &[], }]) .unwrap_err(), WINCODEC_ERR_BADIMAGE, \"short page pixels are rejected\" )",
+  "( dispatch_x86( fixture, HostThunk::WicFrameEncodeUnsupported, &[frame as u32, META_WRITER_OUT as u32] ), 0, \"GetMetadataQueryWriter\" )",
+  "( dispatch_x86( fixture, HostThunk::WicFactoryCreateStream, &[factory as u32, STREAM_OUT as u32] ), 0 )"
  ],
  "tiff_ifd_and_entry_helpers_reject_truncated_metadata": [
   "( wic_tiff_header(&[0_u8; 7]), None, \"a TIFF shorter than its header is rejected\" )",
@@ -7989,6 +9040,12 @@
   "( wic_tiff_ifd(&[0x01, 0x10], 0, true).is_none(), true, \"an IFD with more than 4096 entries is rejected\" )",
   "( wic_tiff_ifd(&[0x01, 0x00, 0x00, 0x00], 0, true).is_none(), true, \"an IFD whose entries run past the buffer is rejected\" )",
   "( wic_tiff_frame_offsets(b\"NOTATIFF\").is_empty(), true, \"a malformed TIFF has no frames\" )"
+ ],
+ "tiff_jpeg_cmyk_strip_edges_and_truncated_cmyk_rejected": [
+  "(image.pixels, [0_u8, 0, 255, 255].repeat(64))",
+  "(image.pixels, [0_u8, 0, 254, 255].repeat(64))",
+  "( image.pixels, [255_u8, 255, 255, 255].repeat(1), \"zero ink decodes to white\" )",
+  "( wic_decode_tiff_frame(&short_cmyk, 0).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a truncated CMYK JPEG strip is rejected\" )"
  ],
  "tiff_jpeg_compressed_strip_and_truncated_payload_rejected": [
   "((image.width, image.height), (width as u32, height as u32))",
@@ -8033,10 +9090,10 @@
  "tiff_new_paths_reject_malformed_and_unsupported_streams": [
   "( wic_decode_tiff_frame(&compression6, 0).unwrap_err(), WINCODEC_ERR_COMPRESSIONNOTSUPPORTED )",
   "( wic_decode_tiff_frame(&predictor3, 0).unwrap_err(), WINCODEC_ERR_UNSUPPORTEDOPERATION )",
+  "( wic_decode_tiff_frame(&deflate_predictor3, 0).unwrap_err(), WINCODEC_ERR_UNSUPPORTEDOPERATION, \"Deflate floating-point predictor 3 is unsupported\" )",
   "( wic_decode_tiff_frame(&planar3, 0).unwrap_err(), WINCODEC_ERR_UNSUPPORTEDOPERATION )",
   "( wic_decode_tiff_frame(&corrupt_deflate, 0).unwrap_err(), WINCODEC_ERR_BADIMAGE )",
-  "( wic_decode_tiff_frame(&truncated_ccitt, 0).unwrap_err(), WINCODEC_ERR_BADIMAGE )",
-  "( wic_decode_tiff_frame(&garbage_jpeg, 0).unwrap_err(), WINCODEC_ERR_UNKNOWNIMAGEFORMAT )"
+  "( wic_decode_tiff_frame(&truncated_ccitt, 0).unwrap_err(), WINCODEC_ERR_BADIMAGE )"
  ],
  "tiff_packbits_rejects_and_clips_malformed_runs": [
   "(wic_tiff_packbits_decode(&[0x00, 0xaa], 1), Some(vec![0xaa]))",
@@ -8054,13 +9111,29 @@
   "(data, [0x80])",
   "(wic_tiff_set_bit(&mut data, 0, false), true)"
  ],
+ "tiff_predictor3_float_edges_and_invalid_layouts_rejected": [
+  "( image.pixels, vec![255, 128, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255], \"float32 edge samples map with exact clamping and rounding\" )",
+  "(image.pixels, vec![0, 191, 64, 255])",
+  "( image.pixels, vec![255, 128, 0, 255, 0, 128, 255, 255], \"planar predictor 3 reverses each plane independently\" )",
+  "( invalid(build_tiff_strips( 1, 1, 1, &[8], 2, 1, 3, 1, 1, &[vec![0]], &[], true )), WINCODEC_ERR_UNSUPPORTEDOPERATION, \"predictor 3 requires floating-point samples\" )",
+  "( invalid(build_tiff_float_strips( 1, 1, 3, 32, 2, 3, 1, 1, &[vec![0; 12]], true )), WINCODEC_ERR_UNSUPPORTEDOPERATION, \"predictor 3 requires SampleFormat IEEE\" )",
+  "( invalid(build_tiff_float_strips( 1, 1, 3, 32, 2, 4, 1, 3, &[vec![0; 12]], true )), WINCODEC_ERR_UNSUPPORTEDOPERATION, \"an unknown predictor is rejected\" )"
+ ],
  "tiff_predictor_rejects_unsupported_widths_and_endianness": [
-  "( wic_tiff_apply_predictor(&mut data, 4, 2, 2, 8, false, true), true )",
+  "( wic_tiff_apply_predictor(&mut data, 4, 2, 2, 8, false, true, 2), true )",
   "(data, [1, 2, 4, 6])",
-  "( wic_tiff_apply_predictor(&mut data, 2, 2, 3, 8, true, true), true )",
+  "( wic_tiff_apply_predictor(&mut data, 2, 2, 3, 8, true, true, 2), true )",
   "(data, [1, 3])",
-  "( wic_tiff_apply_predictor(&mut data, 4, 2, 1, 16, true, true), true )",
+  "( wic_tiff_apply_predictor(&mut data, 4, 2, 1, 16, true, true, 2), true )",
   "(data, [0, 1, 0, 3])"
+ ],
+ "tiff_raw_cmyk_edges_and_invalid_cmyk_layouts_rejected": [
+  "( image.pixels, vec![ 255, 255, 255, 255, 255, 255, 0, 255, 0, 0, 0, 255, 209, 179, 119, 255 ], \"uncompressed CMYK maps exactly to BGRA\" )",
+  "(image.pixels, vec![127, 127, 127, 255])",
+  "( image.pixels, vec![255, 255, 255, 255, 255, 255, 0, 255], \"planar CMYK reads each sample plane\" )",
+  "( invalid(build_tiff_strips( 1, 1, 3, &[8, 8, 8], 5, 1, 1, 1, 1, &[vec![0; 3]], &[], true )), WINCODEC_ERR_UNSUPPORTEDOPERATION, \"CMYK requires four samples\" )",
+  "( invalid(build_tiff_strips( 1, 1, 4, &[1, 1, 1, 1], 5, 1, 1, 1, 1, &[vec![0]], &[], true )), WINCODEC_ERR_UNSUPPORTEDOPERATION, \"raw CMYK requires 8- or 16-bit samples\" )",
+  "( invalid(build_tiff_strips( 1, 1, 4, &[16, 16, 16, 16], 5, 7, 1, 1, 1, &[vec![0; 8]], &[], true )), WINCODEC_ERR_UNSUPPORTEDOPERATION, \"JPEG CMYK requires 8-bit samples\" )"
  ],
  "tiff_resolution_units_and_invalid_rationals": [
   "((image.dpi_x * 100.0).round() as u32, 25_400)",
@@ -8070,12 +9143,12 @@
   "(image.dpi_y, WIC_DEFAULT_DPI)"
  ],
  "tiff_sample_conversion_rejects_unsupported_layouts": [
-  "( wic_tiff_to_bgra(&planar, 2, 1, 2, 8, 3, 2, &[], true, true), Ok(vec![50, 30, 10, 255, 60, 40, 20, 255]), \"planar RGB samples convert to BGRA\" )",
-  "( wic_tiff_to_bgra(&planar, 2, 1, 2, 8, 1, 2, &[], true, true), Err(WINCODEC_ERR_BADIMAGE), \"RGB with fewer than three samples is rejected\" )",
-  "( wic_tiff_to_bgra(&[vec![0x56]], 2, 1, 1, 4, 1, 1, &[], true, false), Ok(vec![85, 85, 85, 255, 102, 102, 102, 255]), \"4-bit grayscale scales to 8 bits\" )",
-  "( wic_tiff_to_bgra(&[vec![5, 6]], 2, 1, 2, 8, 1, 0, &[], true, false), Ok(vec![250, 250, 250, 255, 249, 249, 249, 255]), \"photometric 0 inverts grayscale\" )",
-  "( wic_tiff_to_bgra(&[vec![0]], 1, 1, 1, 8, 2, 1, &[], true, false), Err(WINCODEC_ERR_BADIMAGE), \"grayscale with two samples is rejected\" )",
-  "( wic_tiff_to_bgra(&[vec![0]], 1, 1, 1, 8, 2, 3, &[], true, false), Err(WINCODEC_ERR_BADIMAGE), \"a palette with two samples is rejected\" )"
+  "( wic_tiff_to_bgra(&planar, 2, 1, 2, 8, 3, 2, &[], true, true, false), Ok(vec![50, 30, 10, 255, 60, 40, 20, 255]), \"planar RGB samples convert to BGRA\" )",
+  "( wic_tiff_to_bgra(&planar, 2, 1, 2, 8, 1, 2, &[], true, true, false), Err(WINCODEC_ERR_BADIMAGE), \"RGB with fewer than three samples is rejected\" )",
+  "( wic_tiff_to_bgra(&[vec![0x56]], 2, 1, 1, 4, 1, 1, &[], true, false, false), Ok(vec![85, 85, 85, 255, 102, 102, 102, 255]), \"4-bit grayscale scales to 8 bits\" )",
+  "( wic_tiff_to_bgra(&[vec![5, 6]], 2, 1, 2, 8, 1, 0, &[], true, false, false), Ok(vec![250, 250, 250, 255, 249, 249, 249, 255]), \"photometric 0 inverts grayscale\" )",
+  "( wic_tiff_to_bgra(&[vec![0]], 1, 1, 1, 8, 2, 1, &[], true, false, false), Err(WINCODEC_ERR_BADIMAGE), \"grayscale with two samples is rejected\" )",
+  "( wic_tiff_to_bgra(&[vec![0]], 1, 1, 1, 8, 2, 3, &[], true, false, false), Err(WINCODEC_ERR_BADIMAGE), \"a palette with two samples is rejected\" )"
  ],
  "tiff_sub_byte_tiled_grayscale_and_zero_tiles_rejected": [
   "((image.width, image.height), (width, height))",
@@ -8136,6 +9209,29 @@
   "(device.iosurface_channels.len(), 2)",
   "(bytes, vec![0u8; 32])"
  ],
+ "translate_descriptor_heap_panicked_cache_and_stats_reuse_exactly": [
+  "(first.len(), 1)",
+  "(first[0].slot, 0)",
+  "(backend.translation_stats().descriptor_table_uploads, 1)",
+  "(cache_poison.is_err(), true)",
+  "(stats_poison.is_err(), true)",
+  "(backend.descriptor_translation_cache.is_poisoned(), true)"
+ ],
+ "translate_descriptor_heap_panicked_cache_insert_and_upload_exactly": [
+  "(cache_poison.is_err(), true)",
+  "(stats_poison.is_err(), true)",
+  "(bindings.len(), 1)",
+  "(stats.descriptor_table_uploads, 1)",
+  "(stats.descriptor_table_reuses, 0)",
+  "( backend .descriptor_translation_cache .lock() .unwrap_or_else(|poisoned| poisoned.into_inner()) .entries .get(&heap) .cloned(), Some((1, bindings)) )"
+ ],
+ "translate_descriptor_tables_panicked_stats_batch_is_counted": [
+  "(poisoned.is_err(), true)",
+  "(backend.translation_stats.is_poisoned(), true)",
+  "(tables, vec![Vec::<MetalBinding>::new()])",
+  "(stats.descriptor_table_batches, 1)",
+  "(stats.descriptor_table_uploads, 1)"
+ ],
  "translation_cache_invalidate_code_write_no_overlap": [
   "(cache.blocks.len(), 1, \"block should remain\")"
  ],
@@ -8181,6 +9277,14 @@
   "( call_slot( &mut fixture, dispatch_info, 3, &[dispatch_info as u32, OUT as u32] ), 0 )",
   "( fixture.memory.read_bytes(dispatch_attrs, 16).unwrap(), COM_IID_IDISPATCH.to_vec(), \"referenced ITypeInfo is IDispatch\" )",
   "(fixture.memory.read_u32(dispatch_attrs + 40).unwrap(), 3)"
+ ],
+ "typed_statistics_reject_unknown_unsupported_types_and_node_bounds": [
+  "( subsystem .d3dkmt_query_statistics_for(adapter, 1, 0) .unwrap_err() .status(), STATUS_NOT_SUPPORTED )",
+  "( subsystem .d3dkmt_query_statistics_for(adapter, 99, 0) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_query_statistics_for(adapter, D3DKMT_QUERYSTATISTICS_NODE, 1) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "( subsystem .d3dkmt_query_statistics_for( AdapterHandle(0xFFFF_FFFF), D3DKMT_QUERYSTATISTICS_ADAPTER, 0, ) .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
+  "( subsystem .d3dkmt_query_node_statistics(adapter, 1) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
+  "(adapter_stats.allocation_count, 1)"
  ],
  "typelib_documentation_findname_isname_and_typeinfo_type_are_real": [
   "( call_slot( &mut fixture, typelib, 0, &[typelib as u32, IID_PTR as u32, OUT as u32] ), 0, \"ITypeLib QI\" )",
@@ -8271,6 +9375,25 @@
   "(result, 0x8007_0057)",
   "(runtime.last_error, ERROR_INVALID_PARAMETER)",
   "( read_utf16_string(&memory, bind_ctx).expect(\"bind ctx tag\"), \"AsyncBindCtx\" )"
+ ],
+ "user32_dialog_item_rejects_invalid_parent_and_id": [
+  "( user32 .get_dlg_item(0xDEAD_BEEF, 1) .expect(\"unknown parent is not an error\"), None, \"an unknown parent must not materialize a dialog item\" )",
+  "( user32.get_dlg_item(parent, 0).expect(\"zero id\"), None, \"control id zero is invalid\" )",
+  "( user32.get_dlg_item(parent, -1).expect(\"negative id\"), None, \"negative control ids are invalid\" )",
+  "( user32.get_dlg_item(parent, 42).expect(\"cached item\"), Some(item), \"a dialog item handle must be stable across lookups\" )",
+  "(preview.parent, Some(parent))",
+  "(preview.control_id, 42)"
+ ],
+ "user32_nonzero_ns_window_pointer_owner_thread_edge_reaches_appkit_calls": [
+  "( user32.show_window(hwnd, 1).expect(\"show window\"), false, \"the window was hidden before the show\" )",
+  "( user32.show_window(hwnd, 0).expect(\"hide window\"), true, \"the window was visible before the hide\" )",
+  "( user32.get_window_text_w(hwnd).as_deref(), Some(\"stub-title\") )",
+  "( user32 .move_window(hwnd, 10, 20, 300, 200, false) .expect(\"move window\"), true )",
+  "(user32.window_origin(hwnd), (10, 20))",
+  "( user32 .set_window_pos(hwnd, 0, 15, 25, 320, 240, 0x0040) .expect(\"show and resize\"), true )"
+ ],
+ "user32_track_popup_menu_invalid_hwnd_and_zero_target_edges": [
+  "( kinds .iter() .filter(|kind| **kind == MessageKind::Paint) .count(), 0, \"a null owner window must not queue a paint\" )"
  ],
  "variable_rate_shading": [
   "(rate_map.width, 16)",
@@ -8410,6 +9533,54 @@
   "( parse_wave_format(&bad_align), Err(AUDCLNT_E_UNSUPPORTED_FORMAT) )",
   "( parse_wave_format(&extensible), Err(AUDCLNT_E_UNSUPPORTED_FORMAT) )"
  ],
+ "wddm_adapter_name_edges_reject_unknown_and_non_display_names": [
+  "( subsystem .d3dkmt_query_adapter_info(by_display_name) .expect(\"opened adapter info\") .luid, snapshot.luid )",
+  "(unknown.status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER)",
+  "(unknown.detail(), \"no adapter answers to this display name\")",
+  "(delegated.status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER)",
+  "( delegated.detail(), \"no adapter answers to this display name\" )"
+ ],
+ "wddm_concurrent_render_fence_overtake_race_is_rejected_exactly": [
+  "(successes, 1)",
+  "(errors.len(), 1)",
+  "(errors[0].status(), STATUS_INVALID_PARAMETER)",
+  "( errors[0].detail(), \"render fence value was overtaken during submission\" )"
+ ],
+ "wddm_keyed_mutex_infinite_wait_race_acquires_after_release": [
+  "( subsystem .d3dkmt_acquire_keyed_mutex(mutex, 0x4321, 0, 7) .expect(\"owner acquire\"), () )",
+  "( subsystem.d3dkmt_release_keyed_mutex(mutex, 0x4321, 7), Ok(()) )",
+  "(waiter.join().expect(\"keyed mutex waiter\"), Ok(()))",
+  "( subsystem.d3dkmt_release_keyed_mutex(mutex, 0x4321, 8), Ok(()) )",
+  "(statistics.keyed_mutex_acquire_count, 2)",
+  "(statistics.keyed_mutex_timeout_count, 0)"
+ ],
+ "wddm_keyed_mutex_shared_reopen_and_destroy_reap_invalidates_handles": [
+  "( subsystem .d3dkmt_open_keyed_mutex(other_device, allocation, 0x1234) .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE )",
+  "( subsystem .d3dkmt_open_keyed_mutex(other_device, alias, 0x2222) .unwrap_err() .status(), STATUS_ACCESS_DENIED )",
+  "( subsystem .d3dkmt_acquire_keyed_mutex(mutex, 0x1234, 0, 7) .expect(\"acquire through the first handle\"), () )",
+  "( subsystem .d3dkmt_release_keyed_mutex(shared, 0x1234, 7) .expect(\"release through the shared handle\"), () )",
+  "(subsystem.d3dkmt_destroy_allocation(alias), Ok(()))",
+  "(subsystem.d3dkmt_destroy_allocation(allocation), Ok(()))"
+ ],
+ "wddm_render_submit_failure_returns_gpu_exception_status": [
+  "( completion_status(metal::MTLCommandBufferStatus::Error), Err(WddmError::new( STATUS_GRAPHICS_GPU_EXCEPTION_ON_DEVICE, \"Metal blit command buffer did not complete\", )) )"
+ ],
+ "wddm_statistics_node_error_and_valid_node_arm_are_exact": [
+  "(error.status(), STATUS_INVALID_PARAMETER)",
+  "(error.detail(), \"statistics node ordinal does not exist\")",
+  "(node.allocation_count, 1)",
+  "(node.allocated_bytes, 256)",
+  "(node.render_count, 1)",
+  "(node.render_bytes, 256)"
+ ],
+ "wddm_sync_array_wait_timeout_and_infinite_race_are_exact": [
+  "( subsystem.d3dkmt_signal_synchronization_object(sync, 1), Ok(()) )",
+  "(waiter.join().expect(\"array waiter thread\"), Ok(()))",
+  "(error.status(), STATUS_TIMEOUT)",
+  "(error.detail(), \"fence array value not reached\")",
+  "(statistics.wait_count, 2)",
+  "(statistics.timeout_count, 1)"
+ ],
  "wdf_config_edges_reject_stale_parents_and_invalid_dispatch_type": [
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::RtlInitUnicodeString, &[0xFFFF_FFFF, text], ) .expect(\"invalid destination\"), STATUS_INVALID_PARAMETER )",
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::RtlInitUnicodeString, &[text, text], ) .expect(\"overlapping source and destination\"), STATUS_SUCCESS )",
@@ -8534,6 +9705,21 @@
   "(second.pixels, blue)",
   "( wic_decode_tiff_frame(&encoded[..8], 1).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a truncated multi-page TIFF has no second page\" )"
  ],
+ "win32_directory_handle_rejects_invalid_backup_semantics": [
+  "( err.code, ReasonCode::RcIo, \"missing FILE_FLAG_BACKUP_SEMANTICS must be a directory-handle error\" )",
+  "( err.code, ReasonCode::RcIo, \"CreateNew on an existing directory must be a directory-handle error\" )",
+  "(info.normalized_path, \"C:\\\\dir-handle\")"
+ ],
+ "win32_read_file_overlapped_full_missing_host_file_is_io_error": [
+  "( err.code, ReasonCode::RcIo, \"a removed backing file must surface as an I/O error\" )"
+ ],
+ "win32_set_file_time_stale_handle_reports_missing_file": [
+  "( err.code, ReasonCode::RcFsNotFound, \"a missing backing file must be ERROR_FILE_NOT_FOUND\" )"
+ ],
+ "win32_write_file_overlapped_overflow_offset_is_rejected": [
+  "( err.code, ReasonCode::RcMemoryAccessViolation, \"an offset above isize::MAX must be a memory-access violation\" )",
+  "( err.message, \"file write offset is too large\", \"the overflow rejection must name the offending offset\" )"
+ ],
  "win_verify_trust_rejects_invalid_signature_on_disk": [
   "(result, 0x8009_6010)"
  ],
@@ -8598,6 +9784,14 @@
   "( parse_group(&wire_group_member(GROUP_OP_REMOVE_MEMBER, 5, 9, 7, 8)), Some(GroupWire::RemoveMember { sender: 5, sequence: 9, group_id: 7, members: vec![8], }) )",
   "(parse_group(&datagram), None)"
  ],
+ "worker_safe_classification_rejects_host_barriers_and_helper_fallback": [
+  "(block_is_worker_safe(&[IrInstruction::Nop], true), false)",
+  "(block_is_worker_safe(&[IrInstruction::Cpuid], false), false)",
+  "( block_is_worker_safe( &[IrInstruction::Call { target: 0x1000, return_address: 0x1005, }], false, ), false )",
+  "( block_is_worker_safe( &[IrInstruction::CallRegister { src: Register::Rax, return_address: 0x1005, }], false, ), false )",
+  "( block_is_worker_safe(&[IrInstruction::Return { stack_adjust: 0 }], false), false )",
+  "( block_is_worker_safe( &[ IrInstruction::MovImm { dst: Register::Rax, value: 1, }, IrInstruction::Nop, ], false, ), true )"
+ ],
  "write_file_denied_on_read_only_handle": [
   "(runtime.last_error, 0)",
   "(result, 0, \"WriteFile must fail on a read-only handle\")",
@@ -8654,12 +9848,71 @@
   "(eax, u64::from(crate::xact::S_OK))",
   "(read_u16(&memory, OUT_A).expect(\"cue count\"), 2)"
  ],
+ "xact_cue_readonly_scoped_variable_rejects_set_but_reads_initial": [
+  "( xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, sb, crate::xact::IFACE_SOUNDBANK, 6, &[0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 9, &[0, xact_f32(800.0)], ), u64::from(crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 10, &[0, OUT_A], ), u64::from(crate::xact::S_OK) )",
+  "( f32::from_bits(read_u32(&memory, OUT_A).expect(\"read-only value\")), 343.0 )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 22, &[0, xact_f32(1.0)], ), u64::from(crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX) )"
+ ],
+ "xact_cue_scoped_variable_uses_local_value_and_rejects_global_io": [
+  "( xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, sb, crate::xact::IFACE_SOUNDBANK, 6, &[0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 8, &[STRING_BUF], ), 0, \"binding-name fallback resolves the cue-local slot\" )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 8, &[STRING_BUF], ), 0 )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 23, &[0, OUT_A], ), u64::from(crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX) )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 22, &[0, xact_f32(100.0)], ), u64::from(crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX) )"
+ ],
+ "xact_cue_scoped_variable_without_variation_binding_gets_local_slot": [
+  "( xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, sb, crate::xact::IFACE_SOUNDBANK, 6, &[0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 8, &[STRING_BUF], ), 0, \"a cue-scoped variable is registered even without a variation binding\" )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 9, &[0, xact_f32(800.0)], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 10, &[0, OUT_A], ), u64::from(crate::xact::S_OK) )",
+  "( f32::from_bits(read_u32(&memory, OUT_A).expect(\"local value\")), 800.0 )"
+ ],
+ "xact_cue_variable_empty_local_name_falls_back_and_rejects_unknown": [
+  "( xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, sb, crate::xact::IFACE_SOUNDBANK, 6, &[0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 8, &[STRING_BUF], ), 0, \"empty local names are skipped, binding name wins\" )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 9, &[0, xact_f32(100.0)], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 23, &[0, OUT_A], ), u64::from(crate::xact::S_OK) )",
+  "( f32::from_bits(read_u32(&memory, OUT_A).expect(\"global initial\")), 343.0, \"the empty-name cue override did not touch the global\" )"
+ ],
+ "xact_cue_variable_out_of_range_binding_is_rejected": [
+  "( xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, sb, crate::xact::IFACE_SOUNDBANK, 6, &[0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 8, &[STRING_BUF], ), 0, \"a missing local binding falls back to the global name\" )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 9, &[0, xact_f32(800.0)], ), u64::from(crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 10, &[0, OUT_A], ), u64::from(crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 10, &[1, OUT_A], ), u64::from(crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX) )"
+ ],
+ "xact_cue_variable_unbound_binding_edges_are_exact": [
+  "( xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, sb, crate::xact::IFACE_SOUNDBANK, 6, &[0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 8, &[STRING_BUF], ), u64::from(crate::xact::XACTVARIABLEINDEX_INVALID), \"an unbound cue has no local name table\" )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 8, &[STRING_BUF], ), 0 )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 9, &[0, xact_f32(800.0)], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 23, &[0, OUT_A], ), u64::from(crate::xact::S_OK) )"
+ ],
+ "xact_destroy_objects_tear_down_live_voices_and_reject_stale_handles": [
+  "( xact_initialize(&mut runtime, &mut memory, engine, 0), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, wb, crate::xact::IFACE_WAVEBANK, 8, &[0, 0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, sb, crate::xact::IFACE_SOUNDBANK, 6, &[0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 3, &[], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, wave, crate::xact::IFACE_WAVE, 3, &[], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, wave, crate::xact::IFACE_WAVE, 4, &[u64::from(crate::xact::XACT_FLAG_STOP_IMMEDIATE)], ), u64::from(crate::xact::E_INVALIDARG) )"
+ ],
  "xact_engine_create_validates_flags_and_releases_cleanly": [
   "(eax, u64::from(crate::xact::E_INVALIDARG))",
   "(read_u32(&memory, OUT_A).expect(\"out\"), 0)",
   "( u64::from(read_u32(&memory, engine).expect(\"vtable pointer\")), vtable )",
   "(eax, u64::from(crate::xact::S_OK))",
   "(u64::from(read_u32(&memory, OUT_C).expect(\"QI out\")), engine)"
+ ],
+ "xact_malformed_release_curve_byte_is_rejected": [
+  "( xact_initialize_with_settings(&mut runtime, &mut memory, engine, &settings), u64::from(crate::xact::XACTENGINE_E_INVALIDDATA), \"unknown curve byte is malformed content\" )"
  ],
  "xact_notification_callback_receives_cue_play": [
   "( xact_initialize(&mut runtime, &mut memory, engine, CALLBACK_STUB), u64::from(crate::xact::S_OK) )",
@@ -8669,21 +9922,58 @@
   "(read_u32(&memory, MARKERS).expect(\"notify type\"), 2)",
   "( read_u32(&memory, MARKERS + 4).expect(\"notify context\"), 0x0000_ABCD )"
  ],
- "xact_streaming_wavebank_accepts_drive_and_systemroot_relative_paths": [
+ "xact_prepare_bank_entry_rejects_unknown_codecs_and_invalid_objects": [
   "( xact_initialize(&mut runtime, &mut memory, engine, 0), u64::from(crate::xact::S_OK) )",
-  "( create(&mut runtime, &mut memory, r\"C:stream-drive.xwb\"), u64::from(crate::xact::S_OK) )",
-  "( xact_call( &mut runtime, &mut memory, drive_bank, crate::xact::IFACE_WAVEBANK, 7, &[0, 0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
-  "(cached, pcm)",
-  "(result, u64::from(crate::xact::S_OK), \"{path}\")",
-  "( create(&mut runtime, &mut memory, path), u64::from(crate::xact::E_FAIL), \"{path}\" )"
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 10, &[buffer, xwb.len() as u64, 0, 0, OUT_B], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, wb, crate::xact::IFACE_WAVEBANK, 7, &[0, 0, 0, 0, OUT_C], ), u64::from(crate::xact::XACTENGINE_E_INVALIDDATA) )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_WAVEBANK, 7, &[0, 0, 0, 0, OUT_C], ), u64::from(crate::xact::E_INVALIDARG) )",
+  "( xact_call( &mut runtime, &mut memory, pcm_bank, crate::xact::IFACE_WAVEBANK, 7, &[0, 0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )"
  ],
- "xact_streaming_wavebank_loads_prepares_and_plays_from_a_real_file": [
+ "xact_prepare_wave_accepts_drive_and_systemroot_relative_paths": [
   "( xact_initialize(&mut runtime, &mut memory, engine, 0), u64::from(crate::xact::S_OK) )",
-  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 11, &[STRING_BUF, OUT_B], ), u64::from(crate::xact::S_OK) )",
-  "(entries_len, 2)",
-  "( xact_call( &mut runtime, &mut memory, wb, crate::xact::IFACE_WAVEBANK, 8, &[0, 0, 0, 0, OUT_C], ), u64::from(crate::xact::XACTENGINE_E_WAVEBANKNOTPREPARED) )",
-  "( xact_call( &mut runtime, &mut memory, wb, crate::xact::IFACE_WAVEBANK, 7, &[9, 0, 0, 0, OUT_C], ), u64::from(crate::xact::XACTENGINE_E_INVALIDWAVEINDEX) )",
-  "( xact_call( &mut runtime, &mut memory, wb, crate::xact::IFACE_WAVEBANK, 7, &[1, 0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )"
+  "( prepare(&mut runtime, &mut memory, r\"C:stream-drive.xwb\"), u64::from(crate::xact::S_OK) )",
+  "(cached.expect(\"streamed payload\"), pcm)",
+  "(result, u64::from(crate::xact::S_OK), \"{path}\")",
+  "( prepare(&mut runtime, &mut memory, r\"C:empty-stream.xwb\"), u64::from(crate::xact::XACTENGINE_E_INVALIDDATA) )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 14, &[0, entry_address, params_address, 4, 0, 0, 0, OUT_B], ), u64::from(crate::xact::E_FAIL) )"
+ ],
+ "xact_release_curve_variants_pin_exact_gain_steps": [
+  "( xact_initialize_with_settings(&mut runtime, &mut memory, engine, &settings), u64::from(crate::xact::S_OK), \"{name} settings\" )",
+  "( xact_call( &mut runtime, &mut memory, sb, crate::xact::IFACE_SOUNDBANK, 6, &[0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 3, &[], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 4, &[0], ), u64::from(crate::xact::S_OK) )",
+  "( xact_cue_state(&runtime, cue), Some(crate::xact::XACT_STATE_STOPPING), \"{name} release starts\" )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 8, &[512], ), u64::from(crate::xact::S_OK) )"
+ ],
+ "xact_release_volume_and_malformed_curve_are_exact": [
+  "( xact_initialize_with_settings(&mut runtime, &mut memory, engine, &settings), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, sb, crate::xact::IFACE_SOUNDBANK, 6, &[0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 3, &[], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 4, &[0], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 8, &[512], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 19, &[0, xact_f32(2.0)], ), u64::from(crate::xact::S_OK) )"
+ ],
+ "xact_set_output_voices_reroutes_live_cue_exactly": [
+  "( xact_initialize(&mut runtime, &mut memory, engine, 0), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, sb, crate::xact::IFACE_SOUNDBANK, 6, &[0, 0, 0, OUT_C], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 13, &[PARAMS], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 14, &[voice_a, 1, 2, PARAMS + 64], ), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, cue, crate::xact::IFACE_CUE, 3, &[], ), u64::from(crate::xact::S_OK) )",
+  "(voices_a.len(), 1)"
+ ],
+ "xact_streaming_guest_callback_failures_and_short_reads_are_exact": [
+  "( xact_initialize(&mut runtime, &mut memory, engine, 0), u64::from(crate::xact::S_OK) )",
+  "(create(&mut runtime, &mut memory), 0x8007_0005)",
+  "(create(&mut runtime, &mut memory), 0x8000_4005)",
+  "( create(&mut runtime, &mut memory), u64::from(crate::xact::E_FAIL) )"
+ ],
+ "xact_streaming_guest_callbacks_load_prepare_play_and_close": [
+  "( xact_initialize(&mut runtime, &mut memory, engine, 0), u64::from(crate::xact::S_OK) )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 11, &[STREAM_PARAMS, OUT_B], ), u64::from(crate::xact::E_INVALIDARG), \"zero file handle\" )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 11, &[STREAM_PARAMS, OUT_B], ), u64::from(crate::xact::E_INVALIDARG), \"null read callback\" )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 11, &[STREAM_PARAMS, OUT_B], ), u64::from(crate::xact::E_INVALIDARG), \"null seek callback\" )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 11, &[STREAM_PARAMS, OUT_B], ), u64::from(crate::xact::E_INVALIDARG), \"null close callback\" )",
+  "( xact_call( &mut runtime, &mut memory, engine, crate::xact::IFACE_ENGINE, 11, &[0, OUT_B], ), u64::from(crate::xact::E_INVALIDARG), \"null streaming parameters\" )"
  ],
  "xact_two_output_voices_apply_per_voice_matrix_gains": [
   "( xact_initialize(&mut runtime, &mut memory, engine, 0), u64::from(crate::xact::S_OK) )",

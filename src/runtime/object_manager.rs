@@ -23,11 +23,9 @@
 
 use crate::real_win32::SecurityDescriptor;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Global object-id counter: every object in every subsystem gets its id
 /// from ONE counter (a guest-visible identity, never a host pointer).
@@ -162,7 +160,21 @@ pub(crate) struct FileObject {
     pub(crate) delete_on_close: bool,
 }
 
-pub(crate) type FileHandleObject = Rc<RefCell<FileObject>>;
+/// Poison-recovering payload lock.  Kernel-object payloads are shared across
+/// host threads once production scheduling is enabled, so every payload cell
+/// is a `Mutex`; a panicking holder must not brick the object for the rest of
+/// the process (the payload is plain state, not an invariant the lock guards).
+pub(crate) trait PayloadLock<T> {
+    fn lock_payload(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> PayloadLock<T> for Mutex<T> {
+    fn lock_payload(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+pub(crate) type FileHandleObject = Arc<Mutex<FileObject>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EventObject {
@@ -170,7 +182,7 @@ pub(crate) struct EventObject {
     pub(crate) signaled: bool,
 }
 
-pub(crate) type EventHandle = Rc<RefCell<EventObject>>;
+pub(crate) type EventHandle = Arc<Mutex<EventObject>>;
 
 /// Minimal pipe object stored directly in the kernel-object enum.
 /// Used by the older `create_named_pipe` / `create_named_pipe_w` code paths;
@@ -548,6 +560,7 @@ impl ObjectManager {
         self.objects.remove(&id);
         self.headers.remove(&id);
         self.handle_counts.remove(&id);
+        super::scheduler::notify_object_waiters(id, true);
         true
     }
 
@@ -565,7 +578,7 @@ impl ObjectManager {
     ) -> WaitSatisfaction {
         match self.objects.get(&id) {
             Some(KernelObject::Event(event)) => {
-                if event.borrow().signaled {
+                if event.lock_payload().signaled {
                     WaitSatisfaction::Signaled
                 } else {
                     WaitSatisfaction::NotSignaled
@@ -612,7 +625,7 @@ impl ObjectManager {
         now: u64,
     ) -> bool {
         match self.objects.get(&id) {
-            Some(KernelObject::Event(event)) => event.borrow().signaled,
+            Some(KernelObject::Event(event)) => event.lock_payload().signaled,
             Some(KernelObject::Mutex(mutex)) => {
                 mutex.abandoned
                     || mutex.owner_thread_id.is_none()
@@ -636,7 +649,7 @@ impl ObjectManager {
     ) -> WaitStatus {
         let status = match self.objects.get_mut(&id) {
             Some(KernelObject::Event(event)) => {
-                let mut event = event.borrow_mut();
+                let mut event = event.lock_payload();
                 if event.signaled {
                     if !event.manual_reset {
                         event.signaled = false;
@@ -706,10 +719,11 @@ impl ObjectManager {
         let Some(KernelObject::Event(event)) = self.objects.get_mut(&id) else {
             return false;
         };
-        event.borrow_mut().signaled = true;
+        event.lock_payload().signaled = true;
         if let Some(header) = self.headers.get_mut(&id) {
             header.wait_state = WaitableState::Signaled;
         }
+        super::scheduler::notify_object_waiters(id, false);
         true
     }
 
@@ -719,7 +733,7 @@ impl ObjectManager {
         let Some(KernelObject::Event(event)) = self.objects.get_mut(&id) else {
             return false;
         };
-        event.borrow_mut().signaled = false;
+        event.lock_payload().signaled = false;
         if let Some(header) = self.headers.get_mut(&id) {
             header.wait_state = WaitableState::NotSignaled;
         }
@@ -746,6 +760,7 @@ impl ObjectManager {
         if let Some(header) = self.headers.get_mut(&id) {
             header.wait_state = WaitableState::Signaled;
         }
+        super::scheduler::notify_object_waiters(id, false);
         true
     }
 
@@ -761,6 +776,9 @@ impl ObjectManager {
             .count
             .saturating_add(release_count)
             .min(semaphore.maximum);
+        if semaphore.count != previous {
+            super::scheduler::notify_object_waiters(id, false);
+        }
         Some(previous)
     }
 
@@ -782,6 +800,7 @@ impl ObjectManager {
             if let Some(header) = self.headers.get_mut(&id) {
                 header.wait_state = WaitableState::Abandoned;
             }
+            super::scheduler::notify_object_waiters(id, false);
         }
     }
 }
@@ -789,12 +808,79 @@ impl ObjectManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::handle_table::HandleTable;
+    use std::sync::Barrier;
 
     fn event_object(signaled: bool) -> KernelObject {
-        KernelObject::Event(Rc::new(RefCell::new(EventObject {
+        KernelObject::Event(Arc::new(Mutex::new(EventObject {
             manual_reset: false,
             signaled,
         })))
+    }
+
+    /// Compile-time contract: the kernel-object graph is shared with native
+    /// host workers, so every payload and both canonical tables must be
+    /// `Send + Sync`.
+    #[test]
+    fn object_manager_concurrent_duplicate_load_unload_race_is_exact() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ObjectManager>();
+        assert_send_sync::<KernelObject>();
+        assert_send_sync::<FileHandleObject>();
+        assert_send_sync::<EventHandle>();
+        assert_send_sync::<HandleTable>();
+        assert_send_sync::<ObjectHeader>();
+
+        let manager = Arc::new(Mutex::new(ObjectManager::new()));
+        let id = manager.lock().unwrap().insert(
+            ObjectType::Event,
+            Some("RaceEvent".to_string()),
+            None,
+            event_object(false),
+        );
+        {
+            let mut manager = manager.lock().unwrap();
+            assert!(!manager.object_is_signaled(id, 0, 0));
+            assert!(manager.signal_event(id));
+            assert!(manager.object_is_signaled(id, 0, 0));
+        }
+        // Two live handles (one per racing closer).
+        manager.lock().unwrap().handle_added(id);
+        manager.lock().unwrap().handle_added(id);
+        assert_eq!(manager.lock().unwrap().handle_count(id), 2);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut closers = Vec::new();
+        for _ in 0..2 {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            let drops = Arc::clone(&drops);
+            closers.push(std::thread::spawn(move || {
+                barrier.wait();
+                if manager.lock().unwrap().handle_removed(id) {
+                    drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        barrier.wait();
+        for closer in closers {
+            closer.join().expect("closer");
+        }
+
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one close observes the last reference"
+        );
+        let manager = manager.lock().unwrap();
+        assert_eq!(manager.handle_count(id), 0);
+        assert!(!manager.is_live(id), "last close drops the object");
+        assert_eq!(
+            manager.resolve("RaceEvent"),
+            None,
+            "last close forgets the namespace entry"
+        );
     }
 
     #[test]

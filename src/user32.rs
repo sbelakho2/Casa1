@@ -1190,8 +1190,11 @@ struct WindowRecord {
     region_handle: u32,
     /// Window placement cached for GetWindowPlacement/SetWindowPlacement
     placement: WindowPlacement,
-    /// Raw pointer to the real NSWindow on macOS (null if not yet created / headless).
-    ns_window: *mut std::ffi::c_void,
+    /// Address of the real NSWindow on macOS (0 if not yet created /
+    /// headless).  Stored as `usize`, not a raw pointer, so the record is
+    /// genuinely `Send + Sync`; NSWindow is still only created, used and
+    /// closed on the runtime owner thread (never a production JIT worker).
+    ns_window: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1960,7 +1963,7 @@ impl User32Subsystem {
                         bottom: height as i32,
                     },
                 },
-                ns_window,
+                ns_window: ns_window as usize,
             },
         );
         // Add to z-order: topmost layered windows go at the front
@@ -2126,9 +2129,9 @@ impl User32Subsystem {
 
         // Real macOS window: show or hide the NSWindow
         if let Ok(window) = self.window(hwnd).map(|w| w.ns_window)
-            && !window.is_null()
+            && window != 0
         {
-            mac_window::show_nswindow(window, should_show);
+            mac_window::show_nswindow(window as *mut std::ffi::c_void, should_show);
         }
 
         Ok(was_visible)
@@ -2180,8 +2183,8 @@ impl User32Subsystem {
         };
         window.title = title.to_string();
         // Update the real NSWindow title if it exists
-        if !window.ns_window.is_null() {
-            mac_window::set_nswindow_title(window.ns_window, title);
+        if window.ns_window != 0 {
+            mac_window::set_nswindow_title(window.ns_window as *mut std::ffi::c_void, title);
         }
         true
     }
@@ -2254,10 +2257,10 @@ impl User32Subsystem {
             // Close the real NSWindow exactly once and null the pointer so
             // no later path (e.g. the queued WM_NCDESTROY dispatch) closes
             // or updates it again (double-close / use-after-free).
-            if !window.ns_window.is_null() {
-                mac_window::close_nswindow(window.ns_window);
+            if window.ns_window != 0 {
+                mac_window::close_nswindow(window.ns_window as *mut std::ffi::c_void);
                 mac_window::remove_hwnd_nswindow(hwnd);
-                window.ns_window = std::ptr::null_mut();
+                window.ns_window = 0;
             }
         }
 
@@ -2304,8 +2307,14 @@ impl User32Subsystem {
         window.y = y;
         window.width = width;
         window.height = height;
-        if !window.ns_window.is_null() {
-            mac_window::set_nswindow_frame(window.ns_window, x, y, width, height);
+        if window.ns_window != 0 {
+            mac_window::set_nswindow_frame(
+                window.ns_window as *mut std::ffi::c_void,
+                x,
+                y,
+                width,
+                height,
+            );
         }
         self.queue_resize(hwnd, width, height)?;
         Ok(true)
@@ -2354,7 +2363,7 @@ impl User32Subsystem {
         }
 
         // Update real NSWindow frame
-        if !window.ns_window.is_null() {
+        if window.ns_window != 0 {
             let new_x = if flags & SWP_NOMOVE == 0 { x } else { window.x };
             let new_y = if flags & SWP_NOMOVE == 0 { y } else { window.y };
             // Guard the size exactly like the record fields above: a guest
@@ -2370,13 +2379,19 @@ impl User32Subsystem {
             } else {
                 window.height
             };
-            mac_window::set_nswindow_frame(window.ns_window, new_x, new_y, new_w, new_h);
+            mac_window::set_nswindow_frame(
+                window.ns_window as *mut std::ffi::c_void,
+                new_x,
+                new_y,
+                new_w,
+                new_h,
+            );
 
             if flags & SWP_SHOWWINDOW != 0 {
-                mac_window::show_nswindow(window.ns_window, true);
+                mac_window::show_nswindow(window.ns_window as *mut std::ffi::c_void, true);
             }
             if flags & SWP_HIDEWINDOW != 0 {
-                mac_window::show_nswindow(window.ns_window, false);
+                mac_window::show_nswindow(window.ns_window as *mut std::ffi::c_void, false);
             }
         }
 
@@ -2436,8 +2451,8 @@ impl User32Subsystem {
             return Ok(false);
         }
         let ns_window = window.ns_window;
-        if !ns_window.is_null() {
-            mac_window::update_nswindow(ns_window);
+        if ns_window != 0 {
+            mac_window::update_nswindow(ns_window as *mut std::ffi::c_void);
         }
         // UpdateWindow should trigger WM_PAINT dispatch for an existing window
         // even in headless/hidden test setups.
@@ -2869,7 +2884,7 @@ impl User32Subsystem {
                 alpha: 255,
                 layered_flags: 0,
                 region_handle: 0,
-                ns_window: std::ptr::null_mut(),
+                ns_window: 0,
                 placement: WindowPlacement {
                     show_cmd: 1,
                     pt_min_position: (-1, -1),
@@ -3341,9 +3356,9 @@ impl User32Subsystem {
             if let Some(window) = self
                 .windows
                 .get(&hwnd)
-                .filter(|window| !window.ns_window.is_null())
+                .filter(|window| window.ns_window != 0)
             {
-                mac_window::close_nswindow(window.ns_window);
+                mac_window::close_nswindow(window.ns_window as *mut std::ffi::c_void);
                 mac_window::remove_hwnd_nswindow(hwnd);
             }
             self.windows.remove(&hwnd);
@@ -3931,10 +3946,10 @@ impl User32Subsystem {
                 _ => return false,
             }
         } else {
-            std::ptr::null_mut()
+            0
         };
-        if !ns_window.is_null() {
-            mac_window::update_nswindow(ns_window);
+        if ns_window != 0 {
+            mac_window::update_nswindow(ns_window as *mut std::ffi::c_void);
         }
         if hwnd != 0 && self.queue_paint(hwnd).is_err() {
             return false;
@@ -3969,8 +3984,8 @@ impl User32Subsystem {
         if menu_handle != 0 && !self.menu_items.contains_key(&menu_handle) {
             return false;
         }
-        if !ns_window.is_null() {
-            mac_window::update_nswindow(ns_window);
+        if ns_window != 0 {
+            mac_window::update_nswindow(ns_window as *mut std::ffi::c_void);
         }
         if self.queue_paint(hwnd).is_err() {
             return false;
@@ -4676,20 +4691,20 @@ impl User32Subsystem {
                 let size_changed = window.width != target_width || window.height != target_height;
                 let ns_window = window.ns_window;
                 let visible = window.visible;
-                if visible && !ns_window.is_null() {
+                if visible && ns_window != 0 {
                     let source_width =
                         (rect_from.right as i64 - rect_from.left as i64).max(0) as u32;
                     let source_height =
                         (rect_from.bottom as i64 - rect_from.top as i64).max(0) as u32;
                     if source_width > 0 && source_height > 0 {
                         mac_window::set_nswindow_frame(
-                            ns_window,
+                            ns_window as *mut std::ffi::c_void,
                             rect_from.left,
                             rect_from.top,
                             source_width,
                             source_height,
                         );
-                        mac_window::update_nswindow(ns_window);
+                        mac_window::update_nswindow(ns_window as *mut std::ffi::c_void);
                     }
                 }
                 window.x = rect_to.left;
@@ -4702,15 +4717,15 @@ impl User32Subsystem {
             Err(_) => return false,
         };
 
-        if visible && !ns_window.is_null() {
+        if visible && ns_window != 0 {
             mac_window::set_nswindow_frame(
-                ns_window,
+                ns_window as *mut std::ffi::c_void,
                 rect_to.left,
                 rect_to.top,
                 target_width,
                 target_height,
             );
-            mac_window::update_nswindow(ns_window);
+            mac_window::update_nswindow(ns_window as *mut std::ffi::c_void);
         }
         if size_changed
             && self
@@ -6531,6 +6546,115 @@ fn normalize_axis(raw: i32, calibration: AxisCalibration) -> i32 {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    mod appkit_stub {
+        use super::*;
+        use objc::runtime::{
+            Class, Imp, Object, Sel, class_addMethod, class_createInstance, objc_allocateClassPair,
+            objc_registerClassPair,
+        };
+        use std::cell::Cell;
+        use std::ffi::{CStr, c_char, c_void};
+        use std::sync::OnceLock;
+
+        thread_local! {
+            static FORCE_DIRECT: Cell<bool> = const { Cell::new(false) };
+        }
+
+        unsafe extern "C" {
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        }
+
+        #[unsafe(export_name = "pthread_main_np")]
+        pub extern "C" fn test_pthread_main_np() -> i32 {
+            if FORCE_DIRECT.with(Cell::get) {
+                return 1;
+            }
+            unsafe {
+                let previous = dlsym(-1isize as *mut c_void, c"pthread_main_np".as_ptr());
+                if previous.is_null()
+                    || previous as usize == test_pthread_main_np as *const () as usize
+                {
+                    return 0;
+                }
+                let real: extern "C" fn() -> i32 = std::mem::transmute(previous);
+                real()
+            }
+        }
+
+        pub struct DirectAppKit;
+
+        impl Drop for DirectAppKit {
+            fn drop(&mut self) {
+                FORCE_DIRECT.with(|flag| flag.set(false));
+            }
+        }
+
+        pub fn force_direct() -> DirectAppKit {
+            FORCE_DIRECT.with(|flag| {
+                assert!(!flag.replace(true), "direct AppKit guard must not nest");
+            });
+            DirectAppKit
+        }
+
+        unsafe extern "C" fn noop(_: *mut Object, _: Sel) {}
+
+        unsafe extern "C" fn noop_arg(_: *mut Object, _: Sel, _: *mut Object) {}
+
+        unsafe extern "C" fn noop_frame(
+            _: *mut Object,
+            _: Sel,
+            _: crate::mac_window::NSRect,
+            _: i8,
+            _: i8,
+        ) {
+        }
+
+        fn add_method(cls: *mut Class, selector: &str, imp: *const (), types: &CStr) {
+            let imp: Imp = unsafe { std::mem::transmute(imp) };
+            let added =
+                unsafe { class_addMethod(cls, Sel::register(selector), imp, types.as_ptr()) };
+            assert_eq!(added as i32, 1, "stub selector {selector} must be accepted");
+        }
+
+        pub fn stub_window() -> usize {
+            static STUB: OnceLock<usize> = OnceLock::new();
+            *STUB.get_or_init(|| unsafe {
+                let superclass = Class::get("NSObject").expect("NSObject class");
+                let cls = objc_allocateClassPair(superclass, c"Casa1User32StubWindow".as_ptr(), 0);
+                assert!(!cls.is_null(), "stub window class allocation failed");
+                add_method(cls, "close", noop as *const (), c"v@:");
+                add_method(cls, "display", noop as *const (), c"v@:");
+                add_method(cls, "makeKeyAndOrderFront:", noop_arg as *const (), c"v@:@");
+                add_method(cls, "orderOut:", noop_arg as *const (), c"v@:@");
+                add_method(cls, "setTitle:", noop_arg as *const (), c"v@:@");
+                add_method(
+                    cls,
+                    "setFrame:display:animate:",
+                    noop_frame as *const (),
+                    c"v@:{CGRect={CGPoint=dd}{CGSize=dd}}cc",
+                );
+                objc_registerClassPair(cls);
+                let window = class_createInstance(cls, 0);
+                assert!(!window.is_null(), "stub window allocation failed");
+                window as usize
+            })
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    mod appkit_stub {
+        pub struct DirectAppKit;
+
+        pub fn force_direct() -> DirectAppKit {
+            DirectAppKit
+        }
+
+        pub fn stub_window() -> usize {
+            1
+        }
+    }
+
     #[test]
     fn invalidate_window_queues_paint_once() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
@@ -7286,6 +7410,240 @@ mod tests {
         let infinite_intersection = infinite.intersect(&a);
         assert!(!infinite_intersection.inverted);
         assert_eq!(infinite_intersection.as_rect(), Some((0.0, 0.0, 4.0, 4.0)));
+    }
+
+    #[test]
+    fn user32_dialog_item_rejects_invalid_parent_and_id() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("user32-dialog");
+        let parent = user32
+            .create_window_ex_w("user32-dialog", "parent", 320, 200, true, false, None, 1)
+            .expect("create dialog parent");
+
+        assert_eq!(
+            user32
+                .get_dlg_item(0xDEAD_BEEF, 1)
+                .expect("unknown parent is not an error"),
+            None,
+            "an unknown parent must not materialize a dialog item"
+        );
+        assert_eq!(
+            user32.get_dlg_item(parent, 0).expect("zero id"),
+            None,
+            "control id zero is invalid"
+        );
+        assert_eq!(
+            user32.get_dlg_item(parent, -1).expect("negative id"),
+            None,
+            "negative control ids are invalid"
+        );
+
+        let item = user32
+            .get_dlg_item(parent, 42)
+            .expect("create dialog item")
+            .expect("dialog item handle");
+        assert_eq!(
+            user32.get_dlg_item(parent, 42).expect("cached item"),
+            Some(item),
+            "a dialog item handle must be stable across lookups"
+        );
+        let preview = user32
+            .window_previews()
+            .into_iter()
+            .find(|window| window.hwnd == item)
+            .expect("dialog item preview");
+        assert_eq!(preview.parent, Some(parent));
+        assert_eq!(preview.control_id, 42);
+        assert_eq!(preview.title, "dlg-item-42");
+    }
+
+    #[test]
+    fn user32_track_popup_menu_invalid_hwnd_and_zero_target_edges() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("user32-menu");
+        let hwnd = user32
+            .create_window_ex_w("user32-menu", "menu", 320, 200, true, false, None, 1)
+            .expect("create menu window");
+        let menu = user32.create_popup_menu();
+        let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
+
+        assert!(
+            !user32.track_popup_menu(0xDEAD_BEEF, 0, 0, 0, hwnd),
+            "an unknown menu handle must be rejected"
+        );
+        assert!(
+            !user32.track_popup_menu(menu, 0, 0, 0, 0xDEAD_BEEF),
+            "an unknown owner window must be rejected"
+        );
+        assert!(
+            user32.track_popup_menu(menu, 0, 0, 0, 0),
+            "a null owner window tracks without touching a window"
+        );
+        let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == MessageKind::Paint)
+                .count(),
+            0,
+            "a null owner window must not queue a paint"
+        );
+    }
+
+    #[test]
+    fn user32_nonzero_ns_window_pointer_owner_thread_edge_reaches_appkit_calls() {
+        let _direct = appkit_stub::force_direct();
+        let stub_window = appkit_stub::stub_window();
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("user32-appkit");
+        let hwnd = user32
+            .create_window_ex_w("user32-appkit", "appkit", 320, 200, false, false, None, 1)
+            .expect("create appkit window");
+        user32
+            .windows
+            .get_mut(&hwnd)
+            .expect("window record")
+            .ns_window = stub_window;
+
+        assert_eq!(
+            user32.show_window(hwnd, 1).expect("show window"),
+            false,
+            "the window was hidden before the show"
+        );
+        assert_eq!(
+            user32.show_window(hwnd, 0).expect("hide window"),
+            true,
+            "the window was visible before the hide"
+        );
+        assert!(user32.set_window_text_w(hwnd, "stub-title"));
+        assert_eq!(
+            user32.get_window_text_w(hwnd).as_deref(),
+            Some("stub-title")
+        );
+
+        assert_eq!(
+            user32
+                .move_window(hwnd, 10, 20, 300, 200, false)
+                .expect("move window"),
+            true
+        );
+        assert_eq!(user32.window_origin(hwnd), (10, 20));
+
+        assert_eq!(
+            user32
+                .set_window_pos(hwnd, 0, 15, 25, 320, 240, 0x0040)
+                .expect("show and resize"),
+            true
+        );
+        assert_eq!(user32.window_origin(hwnd), (15, 25));
+        assert_eq!(
+            user32.window_state(hwnd).expect("window state").width,
+            320,
+            "the visible resize must update the logical width"
+        );
+        assert_eq!(
+            user32
+                .set_window_pos(hwnd, 0, 0, 0, 0, 0, 0x0080)
+                .expect("hide window position"),
+            true
+        );
+        assert!(
+            !user32.window_state(hwnd).expect("window state").visible,
+            "SWP_HIDEWINDOW must hide the logical window"
+        );
+
+        assert_eq!(
+            user32.show_window(hwnd, 1).expect("reshow window"),
+            false,
+            "the window was hidden before the reshow"
+        );
+        assert_eq!(user32.update_window(hwnd).expect("update window"), true);
+
+        let from = Rect {
+            left: 10,
+            top: 20,
+            right: 330,
+            bottom: 220,
+        };
+        let to = Rect {
+            left: 40,
+            top: 50,
+            right: 520,
+            bottom: 390,
+        };
+        assert!(
+            user32.draw_animated_rects(hwnd, &from, &to),
+            "visible window animation must succeed"
+        );
+        let state = user32.window_state(hwnd).expect("animated state");
+        assert_eq!((state.width, state.height), (480, 340));
+
+        let menu = user32.create_popup_menu();
+        assert!(user32.set_menu(hwnd, menu));
+        assert!(user32.track_popup_menu(menu, 0, 0, 0, hwnd));
+        assert!(user32.draw_menu_bar(hwnd));
+
+        let doomed = user32
+            .create_window_ex_w("user32-appkit", "doomed", 64, 64, true, false, None, 1)
+            .expect("create doomed window");
+        user32
+            .windows
+            .get_mut(&doomed)
+            .expect("doomed record")
+            .ns_window = stub_window;
+        assert_eq!(
+            user32.destroy_window(doomed).expect("destroy window"),
+            true,
+            "an existing window must be destroyed"
+        );
+        assert!(!user32.has_window(doomed));
+        assert_eq!(
+            user32.destroy_window(doomed).expect("destroy again"),
+            false,
+            "a destroyed window must not be destroyed twice"
+        );
+
+        let dying = user32
+            .create_window_ex_w("user32-appkit", "dying", 64, 64, true, false, None, 1)
+            .expect("create dying window");
+        user32
+            .windows
+            .get_mut(&dying)
+            .expect("dying record")
+            .ns_window = stub_window;
+        let nc_destroy = Message {
+            hwnd: Some(dying),
+            kind: MessageKind::NcDestroy,
+            wparam: 0,
+            lparam: 0,
+            translated: false,
+            device_id: None,
+        };
+        assert_eq!(
+            user32
+                .dispatch_message_w(&nc_destroy)
+                .expect("dispatch WM_NCDESTROY"),
+            0,
+            "WM_NCDESTROY has no special return value"
+        );
+        assert!(!user32.has_window(dying));
+
+        let cleanup = Message {
+            hwnd: Some(hwnd),
+            kind: MessageKind::NcDestroy,
+            wparam: 0,
+            lparam: 0,
+            translated: false,
+            device_id: None,
+        };
+        assert_eq!(
+            user32
+                .dispatch_message_w(&cleanup)
+                .expect("cleanup WM_NCDESTROY"),
+            0
+        );
+        assert!(!user32.has_window(hwnd));
     }
 }
 

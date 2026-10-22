@@ -4,7 +4,10 @@
 //! directly on the host CPU. Uses MAP_JIT for W^X-compliant executable memory
 //! allocation on Apple Silicon.
 
-use crate::cpu::{ConditionCode, CpuState, GuestArch, IrInstruction, MemoryImage, Register};
+use crate::cpu::{
+    ConditionCode, CpuState, GuestArch, GuestMemoryFault, GuestMemoryStore, IrInstruction,
+    MemoryImage, Register,
+};
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
@@ -32,6 +35,64 @@ use std::sync::{Arc, LazyLock, Mutex};
 //
 // ABI: helper(state: *mut CpuState, memory: *mut MemoryImage, address: u64,
 // width: u64) -> u64
+//
+// Production worker slices execute the same compiled blocks but have no
+// `MemoryImage` (the worker must not touch the runtime's page table).  They
+// install a `GuestSliceMemory` view over the canonical store in a
+// thread-local; when present, these helpers ignore the (null) `MemoryImage`
+// pointer and access the shared canonical bytes through that view.  The
+// view's aligned-word atomics provide cross-worker coherence, and unmapped
+// accesses are reported through the normal `jit_pending_fault` channel.
+
+thread_local! {
+    static WORKER_SLICE_MEMORY: std::cell::Cell<*const GuestSliceMemory> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+    static WORKER_SLICE_CODE_WRITTEN: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Install the worker-slice memory view for the duration of a slice.  The
+/// guard clears the thread-local on drop so a stale pointer can never leak
+/// into a later host-thread execution on the same native worker.
+pub(crate) struct WorkerSliceGuard {
+    previous: *const GuestSliceMemory,
+}
+
+impl WorkerSliceGuard {
+    pub(crate) fn install(memory: &GuestSliceMemory) -> Self {
+        WORKER_SLICE_CODE_WRITTEN.with(|flag| flag.set(false));
+        let previous = WORKER_SLICE_MEMORY.with(|slot| {
+            let previous = slot.get();
+            slot.set(memory as *const GuestSliceMemory);
+            previous
+        });
+        Self { previous }
+    }
+
+    pub(crate) fn code_written(&self) -> bool {
+        WORKER_SLICE_CODE_WRITTEN.with(|flag| flag.get())
+    }
+}
+
+impl Drop for WorkerSliceGuard {
+    fn drop(&mut self) {
+        WORKER_SLICE_MEMORY.with(|slot| slot.set(self.previous));
+    }
+}
+
+fn worker_slice_memory() -> Option<&'static GuestSliceMemory> {
+    WORKER_SLICE_MEMORY.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            None
+        } else {
+            // SAFETY: `WorkerSliceGuard::install` publishes a valid view for
+            // the whole duration of the worker's slice, and the guard clears
+            // it before the view can be dropped (the job owns the Arc).
+            Some(unsafe { &*pointer })
+        }
+    })
+}
 
 /// Read 1/2/4/8 bytes from guest memory.  Returns the zero-extended value.
 /// On an unmapped address, records the fault in `state.jit_pending_fault` and
@@ -51,6 +112,20 @@ pub unsafe extern "C" fn jit_helper_load(
     address: u64,
     width: u64,
 ) -> u64 {
+    if let Some(slice_memory) = worker_slice_memory() {
+        return match slice_memory.load(address, width as usize) {
+            Ok(value) => value,
+            Err(fault) => {
+                if !state.is_null() {
+                    unsafe {
+                        (*state).jit_pending_fault = Some(fault.address);
+                        (*state).jit_pending_fault_write = false;
+                    };
+                }
+                0
+            }
+        };
+    }
     if memory.is_null() {
         return 0;
     }
@@ -99,15 +174,33 @@ pub unsafe extern "C" fn jit_helper_store(
     value: u64,
     width: u64,
 ) {
-    if memory.is_null() {
-        return;
-    }
-    let mem = unsafe { &mut *memory };
     let bytes: [u8; 8] = value.to_le_bytes();
     let write_len = match width {
         1 | 2 | 4 | 8 => width as usize,
         _ => 8,
     };
+    if let Some(slice_memory) = worker_slice_memory() {
+        match slice_memory.store(address, &bytes[..write_len]) {
+            Ok(code_write) => {
+                if code_write {
+                    WORKER_SLICE_CODE_WRITTEN.with(|flag| flag.set(true));
+                }
+            }
+            Err(fault) => {
+                if !state.is_null() {
+                    unsafe {
+                        (*state).jit_pending_fault = Some(fault.address);
+                        (*state).jit_pending_fault_write = true;
+                    };
+                }
+            }
+        }
+        return;
+    }
+    if memory.is_null() {
+        return;
+    }
+    let mem = unsafe { &mut *memory };
     let result = mem.guest_write_checked(address, &bytes[..write_len]);
     match result {
         Ok(()) => {
@@ -1839,17 +1932,6 @@ static SIGBUS_CONSECUTIVE_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 const MAX_CONSECUTIVE_FAULTS: usize = 32;
 
-/// Number of surrounding pages to batch-sync on each SIGBUS. Amortizes the
-/// signal delivery cost by pre-syncing neighbouring pages that are likely
-/// to be accessed soon (sequential access patterns).
-///
-/// Increased from 8 to 256 to drastically reduce SIGBUS frequency. With
-/// batch radius 8 (17 pages per SIGBUS), ~3811/4084 samples were in
-/// _sigtramp (93% CPU in signal delivery). With radius 256 (513 pages per
-/// SIGBUS), each signal handles 30× more pages, reducing signal delivery
-/// overhead proportionally.
-const SIGBUS_BATCH_SYNC_RADIUS: u64 = 256;
-
 /// Total SIGBUS events for diagnostics (monotonic counter).
 pub static SIGBUS_TOTAL_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2213,27 +2295,25 @@ pub fn write_diag_file(msg: &str) {
 ///   are visible before another invocation can proceed.
 static SIGBUS_IN_HANDLER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Signal-safe SIGBUS handler that syncs the faulting guest page — and a
-/// batch of surrounding pages — to the flat memory region on demand.
+/// Signal-safe SIGBUS fallback for a page the guest has not materialised.
 ///
-/// # Improvements over the original single-page handler
-/// - **Batch sync**: syncs `SIGBUS_BATCH_SYNC_RADIUS` pages on each side of
-///   the faulting page, reducing total SIGBUS count by up to 16×.
+/// # Behavior
+/// - **Shared pages**: committed bytes already live in the mapping both views
+///   alias; touching one byte forces the kernel to back the page, and the
+///   retried instruction proceeds without any copy.
+/// - **Uncommitted pages**: a single lossless zero write backs the page.
 /// - **Loop detection**: if the same page faults more than
 ///   `MAX_CONSECUTIVE_FAULTS` times, the handler disables itself (stores
 ///   null pointers) to break an infinite SIGBUS loop.
-/// - **Pre-fault**: after syncing, touches the first byte of each synced
-///   page to ensure the OS commits the physical page, preventing a second
-///   fault on the same address.
 ///
 /// # Safety
 /// - Must be async-signal-safe: no heap allocation, no locks, no non-reentrant
 ///   libc functions. Only async-signal-safe operations are used: atomic loads/
-///   stores, `write_volatile`, and `ptr::copy_nonoverlapping` on pre-allocated
-///   stack buffers.
-/// - The handler reads the fault address from `siginfo_t`, aligns to page
-///   boundary, and calls `sync_from_memory_image` to copy the page from
-///   MemoryImage into the flat mmap'd region.
+///   stores and volatile loads/stores.
+/// - The handler reads the fault address from `siginfo_t`, aligns it to a page
+///   boundary, and backs that page in place: committed pages are already in
+///   the shared canonical mapping (one volatile read forces residency), and
+///   uncommitted pages get a lossless zero write.
 /// - After the handler returns, the kernel retries the faulting instruction.
 ///
 /// # Acquire/Release Protocol for `SIGBUS_JIT_RUNTIME` and `SIGBUS_JIT_MEMORY`
@@ -2397,79 +2477,82 @@ extern "C" fn sigbus_sa_handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut
         std::process::abort();
     }
 
-    // ── Batch sync: materialise the faulting page + surrounding pages ──
+    // ── Faulting-page fallback ─────────────────────────────────────────
     //
-    // The previous handler copied every page through a stack buffer that was
-    // then zeroed (three 4 KiB memory touches per page) and additionally wrote
-    // a zero byte to the LAST byte of every page *after* copying it —
-    // corrupting the last byte of every guest page that held data.  The
-    // handler now copies each MemoryImage page directly into the flat mirror
-    // (one 4 KiB copy, no intermediate buffer, no buffer zeroing) and groups
-    // contiguous mapped pages into one sync operation for accounting.  Pages
-    // absent from the MemoryImage are only physically backed (they hold no
-    // guest data yet, so the zero write is lossless).
-    let batch_start = page.saturating_sub(SIGBUS_BATCH_SYNC_RADIUS * 4096) & !0xfff;
-    let batch_end = page
-        .saturating_add(SIGBUS_BATCH_SYNC_RADIUS * 4096)
-        .saturating_add(4096)
-        .min(flat_size);
+    // The flat view and the interpreter now share the same canonical pages,
+    // so a committed page needs no copy: reading one byte forces the kernel
+    // to back the page that the canonical store already owns.  A page with no
+    // committed bytes is backed with a lossless zero write so the retried
+    // instruction can proceed.  This path is a safety net for pages the guest
+    // has not committed yet, never routine synchronisation.
     let flat_base_ptr = runtime.flat_memory.base() as *mut u8;
-
-    let mut cursor = batch_start;
-    let mut copied_pages = 0u64;
-    let mut sync_operations = 0u64;
-    let mut copied_bytes = 0u64;
-    let mut in_run = false;
-    while cursor < batch_end {
-        // SAFETY: cursor < batch_end <= flat_size, so writing one 4 KiB page
-        // at the mirror offset stays inside the mmap'd region.
-        // `copy_page_to_raw` is async-signal-safe: it performs a page-table
-        // lookup and one `copy_nonoverlapping` with no allocation.
-        let copied = unsafe { memory.copy_page_to_raw(cursor, flat_base_ptr.add(cursor as usize)) };
-        if copied {
-            runtime
-                .flat_memory
-                .mark_page_materialised_signal_safe(cursor);
-            SIGBUS_PAGE_FOUND.fetch_add(1, Ordering::Relaxed);
-            copied_pages += 1;
-            copied_bytes += 4096;
-            if !in_run {
-                sync_operations += 1;
-                in_run = true;
-            }
-        } else {
-            SIGBUS_PAGE_NOT_FOUND.fetch_add(1, Ordering::Relaxed);
-            in_run = false;
-            // ── ALWAYS pre-fault pages with no MemoryImage data ───────────
-            // On macOS with MAP_NORESERVE, a page of the flat mmap exists in
-            // the virtual address space but has no physical backing until the
-            // first write; a subsequent JIT write would SIGBUS.  A single
-            // write to the last byte forces the kernel to back the page.  The
-            // page has no guest data yet, so writing zero is lossless.
-            let offset = cursor as usize;
-            if let Some(end_offset) = offset.checked_add(4095)
-                && end_offset < flat_size as usize
-            {
-                // SAFETY: end_offset < flat_size guarantees the pointer is
-                // within the mmap'd region.
-                unsafe {
-                    std::ptr::write_volatile(flat_base_ptr.add(end_offset), 0u8);
-                }
-                runtime
-                    .flat_memory
-                    .mark_page_materialised_signal_safe(cursor);
-            }
-        }
-        cursor += 4096;
-    }
-    GUEST_PAGES_MATERIALISED.fetch_add(copied_pages, Ordering::Relaxed);
-    GUEST_SYNC_OPERATIONS.fetch_add(sync_operations, Ordering::Relaxed);
-    GUEST_SYNC_BYTES_COPIED.fetch_add(copied_bytes, Ordering::Relaxed);
+    service_faulting_page(runtime, memory, page, flat_base_ptr, flat_size as usize);
     SIGBUS_HANDLER_DEPTH.fetch_sub(1, Ordering::Relaxed);
     // Clear re-entrancy guard with Release ordering to ensure all writes
     // made during the handler are visible before another invocation proceeds.
     SIGBUS_IN_HANDLER.store(false, Ordering::Release);
     _ = sig; // suppress unused variable warning
+}
+
+/// Back a faulting flat page without copying canonical data.
+///
+/// Split out of the signal handler so the three fallback cases (fully mapped,
+/// partially mapped, uncommitted) are unit-testable and every accounting
+/// branch is covered by adversarial tests.
+fn service_faulting_page(
+    runtime: &JitRuntime,
+    memory: &MemoryImage,
+    page: u64,
+    flat_base_ptr: *mut u8,
+    flat_size: usize,
+) {
+    let mut materialised_pages = 0u64;
+    let mut sync_operations = 0u64;
+    let mut copied_bytes = 0u64;
+    if memory.page_is_fully_mapped(page) {
+        // SAFETY: `page` is in the flat window (validated by the caller) and
+        // the byte belongs to the canonical store shared by both views.
+        unsafe {
+            let _ = std::ptr::read_volatile(flat_base_ptr.add(page as usize));
+        }
+        runtime.flat_memory.mark_page_materialised_signal_safe(page);
+        SIGBUS_PAGE_FOUND.fetch_add(1, Ordering::Relaxed);
+        materialised_pages = 1;
+        sync_operations = 1;
+        copied_bytes = 4096;
+    } else if memory.page_exists(page) {
+        // Partially mapped page: touch a mapped byte if one exists.  A fully
+        // unmapped tail is left alone; writing zero there is lossless but is
+        // not needed for a page the kernel has already backed.
+        SIGBUS_PAGE_NOT_FOUND.fetch_add(1, Ordering::Relaxed);
+        if memory.page_byte_is_mapped(page, 0) {
+            // SAFETY: byte 0 is inside the mapped, shared page.
+            unsafe {
+                let _ = std::ptr::read_volatile(flat_base_ptr.add(page as usize));
+            }
+        } else if memory.page_byte_is_mapped(page, 4095) {
+            // SAFETY: the last byte is inside the mapped, shared page.
+            unsafe {
+                let _ = std::ptr::read_volatile(flat_base_ptr.add(page as usize + 4095));
+            }
+        }
+    } else {
+        SIGBUS_PAGE_NOT_FOUND.fetch_add(1, Ordering::Relaxed);
+        let offset = page as usize;
+        if let Some(end_offset) = offset.checked_add(4095)
+            && end_offset < flat_size
+        {
+            // SAFETY: end_offset < flat_size keeps the write inside the flat
+            // window.  The page holds no guest bytes, so zero is lossless.
+            unsafe {
+                std::ptr::write_volatile(flat_base_ptr.add(end_offset), 0u8);
+            }
+            runtime.flat_memory.mark_page_materialised_signal_safe(page);
+        }
+    }
+    GUEST_PAGES_MATERIALISED.fetch_add(materialised_pages, Ordering::Relaxed);
+    GUEST_SYNC_OPERATIONS.fetch_add(sync_operations, Ordering::Relaxed);
+    GUEST_SYNC_BYTES_COPIED.fetch_add(copied_bytes, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -3340,12 +3423,22 @@ impl JitMemoryManager {
     /// Safe to call on any thread; it only toggles the thread-local JIT
     /// write-protection state.
     pub unsafe fn prepare_execution(&self) {
+        Self::prepare_execution_for_mechanism(self.mechanism);
+    }
+
+    /// Switch the CALLING THREAD into execute mode for the selected
+    /// executable-memory mechanism.  Production workers call this directly
+    /// (they do not own the runtime's `JitMemoryManager`); the toggle is
+    /// per-thread, so every worker must do it for itself.
+    pub(crate) fn prepare_execution_for_mechanism(mechanism: JitExecMechanism) {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if matches!(self.mechanism, JitExecMechanism::MapJitWx) {
+        if matches!(mechanism, JitExecMechanism::MapJitWx) {
             unsafe {
                 libc::pthread_jit_write_protect_np(1);
             }
         }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = mechanism;
     }
 
     /// # Safety
@@ -3404,104 +3497,88 @@ impl Drop for JitMemoryManager {
 // Flat guest memory for direct JIT access
 // ---------------------------------------------------------------------------
 
-/// A flat mmap'd region mirroring the guest address space.
-/// JIT-compiled code uses this for direct load/store access.
+/// The JIT's flat view of the canonical guest address space.
 ///
-/// The mirror is populated **on demand**: a guest page is copied in only when
-/// it is committed in the `MemoryImage` (or when the SIGBUS handler services a
-/// fault on it).  `materialised` is a one-bit-per-4-KiB-page record of exactly
-/// which pages have ever been copied, so instrumentation and tests can prove
-/// that untouched guest pages are never materialised.
+/// This is **not** a mirror: it aliases the very same 4 GiB `mmap` owned by
+/// [`crate::cpu::GuestMemoryStore`].  A guest store executed by JIT-compiled
+/// code and a store performed through the interpreter's [`MemoryImage`] touch
+/// the same bytes, so no post-execution copy-back exists.
+///
+/// `materialised` is a one-bit-per-4-KiB-page record of which pages this view
+/// has been told about (fully mapped pages seen by a sync/materialisation
+/// pass).  It is diagnostic only: even a page not marked here is already
+/// coherent, because the bytes live in the shared store.
 pub struct FlatGuestMemory {
-    base: *mut u8,
-    size: usize,
-    valid: bool,
-    /// One bit per 4 KiB page of `size`: set once the page has been copied
-    /// from `MemoryImage` (or otherwise physically backed).  Atomics keep the
-    /// SIGBUS fast path async-signal-safe.
+    store: Arc<GuestMemoryStore>,
+    /// One bit per 4 KiB page of the flat window.  Atomics keep the SIGBUS
+    /// fast path async-signal-safe.
     materialised: Box<[AtomicU64]>,
 }
 
-/// Maximum bytes read into the scratch buffer for a single batched sync
-/// operation.  A contiguous run longer than this is split into bounded
-/// chunks so one sync can never allocate a multi-gigabyte scratch buffer.
-const MAX_BATCH_BYTES: usize = 1024 * 1024;
-
-// SAFETY: FlatGuestMemory contains a raw mmap'd pointer. It is safe to
-// send across threads because mmap'd memory is thread-safe (kernel manages
-// page tables). All methods use bounds checking before pointer arithmetic.
+// SAFETY: FlatGuestMemory contains only an Arc to the canonical store (which
+// is Send+Sync) and an atomic bitmap.
 unsafe impl Send for FlatGuestMemory {}
-// SAFETY: All methods take &self and use bounds-checked pointer arithmetic.
-// The base pointer and size are immutable after construction.
+// SAFETY: all shared state is atomic or behind the store's own synchronisation.
 unsafe impl Sync for FlatGuestMemory {}
 
 impl FlatGuestMemory {
     pub fn new(_arch: GuestArch) -> Self {
-        let size = 4 * 1024 * 1024 * 1024; // 4GB
-        // SAFETY: mmap allocates a 4GB anonymous private mapping with
-        // read+write permissions. null_mut() lets the kernel choose the
-        // address. fd=-1 is valid for MAP_ANONYMOUS. This creates the
-        // flat guest memory mirror used by JIT-compiled code for direct
-        // load/store access.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        let valid = base != libc::MAP_FAILED;
-        let base_ptr = if valid {
-            base as *mut u8
-        } else {
-            std::ptr::null_mut()
-        };
-        if !valid {
-            eprintln!(
-                "[JIT] FlatGuestMemory::new: mmap 4GB FAILED, errno={}",
-                // SAFETY: __error() returns a thread-local pointer to errno,
-                // which is always valid on macOS. The read is safe in a
-                // single-threaded context (during initialization).
-                unsafe { *libc::__error() },
-            );
-        }
+        let store = Arc::new(GuestMemoryStore::new());
         // 4 GiB / 4 KiB = 1,048,576 pages → 16,384 u64 words (128 KiB).
-        let bitmap_words = size.div_ceil(4096 * 64);
+        let bitmap_words = store.flat_size().div_ceil(4096 * 64);
         let materialised = (0..bitmap_words)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
-            base: base_ptr,
-            size,
-            valid,
+            store,
             materialised,
         }
     }
 
-    pub fn base(&self) -> u64 {
-        self.base as u64
-    }
-    pub fn is_valid(&self) -> bool {
-        self.valid
+    /// Point this view at `store` (the store owned by the live MemoryImage).
+    ///
+    /// This is the only "sync" the hot path performs: an `Arc` identity check.
+    /// When the store changes (first attachment, or a different image), the
+    /// diagnostic bitmap is reset because the pages refer to different bytes.
+    pub(crate) fn attach_store(&mut self, store: &Arc<GuestMemoryStore>) {
+        if Arc::ptr_eq(&self.store, store) {
+            return;
+        }
+        self.store = Arc::clone(store);
+        for word in &self.materialised {
+            word.store(0, Ordering::Relaxed);
+        }
     }
 
-    /// Number of 4 KiB pages in the flat mirror (the whole guest range).
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> &Arc<GuestMemoryStore> {
+        &self.store
+    }
+
+    #[inline]
+    pub fn base(&self) -> u64 {
+        self.store.flat_base()
+    }
+
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.store.is_valid()
+    }
+
+    /// Number of 4 KiB pages in the flat window (the whole 4 GiB range).
     pub fn total_page_count(&self) -> u64 {
-        (self.size / 4096) as u64
+        (self.store.flat_size() / 4096) as u64
     }
 
     /// Bitmap index/bit for a page base address, or `None` when the page is
     /// outside the flat region.
     fn materialised_bit(&self, page_addr: u64) -> Option<(usize, u64)> {
-        if !self.valid {
+        if !self.is_valid() {
             return None;
         }
         let offset = page_addr as usize;
-        if offset % 4096 != 0 || offset >= self.size {
+        if offset % 4096 != 0 || offset >= self.size() {
             return None;
         }
         let page = offset / 4096;
@@ -3510,8 +3587,8 @@ impl FlatGuestMemory {
         Some((word, bit))
     }
 
-    /// Record that `page_addr` has been materialised.  Async-signal-safe:
-    /// a single lock-free atomic OR with no allocation.
+    /// Record that `page_addr` has been made visible to this view.
+    /// Async-signal-safe: a single lock-free atomic OR with no allocation.
     #[inline]
     pub fn mark_page_materialised_signal_safe(&self, page_addr: u64) {
         if let Some((word, bit)) = self.materialised_bit(page_addr) {
@@ -3519,7 +3596,7 @@ impl FlatGuestMemory {
         }
     }
 
-    /// Returns `true` when `page_addr` has ever been copied into the mirror.
+    /// Returns `true` when `page_addr` has been materialised into this view.
     pub fn is_page_materialised(&self, page_addr: u64) -> bool {
         match self.materialised_bit(page_addr) {
             Some((word, bit)) => self.materialised[word].load(Ordering::Relaxed) & bit != 0,
@@ -3527,7 +3604,7 @@ impl FlatGuestMemory {
         }
     }
 
-    /// Number of guest pages materialised in the mirror so far.
+    /// Number of guest pages materialised in this view so far.
     pub fn materialised_page_count(&self) -> u64 {
         self.materialised
             .iter()
@@ -3535,53 +3612,64 @@ impl FlatGuestMemory {
             .sum()
     }
 
-    /// Sync data from MemoryImage into the flat region at a guest address.
+    /// Copy `data` into the canonical store at a flat guest address.
+    ///
+    /// Kept for explicit producer paths; routine JIT execution never calls
+    /// this because both views already alias the same bytes.
     pub fn sync_from_memory_image(&self, guest_addr: u64, data: &[u8]) {
-        if !self.valid {
+        if !self.is_valid() {
             return;
         }
         let offset = guest_addr as usize;
-        if offset.saturating_add(data.len()) <= self.size {
-            // SAFETY: offset + data.len() <= self.size (checked above),
-            // so self.base.add(offset) is within the mmap'd region.
-            // data.as_ptr() is valid for data.len() bytes. The regions
-            // are non-overlapping (data is a stack/heap buffer, base is mmap).
+        if offset.saturating_add(data.len()) <= self.size() {
+            // SAFETY: offset + data.len() <= size (checked above), so the
+            // destination is inside the shared flat window. `data` is a
+            // separate host buffer.
             unsafe {
-                ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(offset), data.len());
+                ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    (self.base() as *mut u8).add(offset),
+                    data.len(),
+                );
             }
         }
     }
 
-    /// Read bytes from the flat region.
+    /// Read bytes from the canonical flat window.
     pub fn read(&self, guest_addr: u64, buf: &mut [u8]) {
-        if !self.valid {
+        if !self.is_valid() {
             return;
         }
         let offset = guest_addr as usize;
-        if offset.saturating_add(buf.len()) <= self.size {
-            // SAFETY: offset + buf.len() <= self.size (checked above),
-            // so self.base.add(offset) is within the mmap'd region.
-            // buf.as_mut_ptr() is valid for buf.len() bytes. Regions are
-            // non-overlapping.
+        if offset.saturating_add(buf.len()) <= self.size() {
+            // SAFETY: the source is inside the shared flat window and `buf`
+            // is a distinct host allocation.
             unsafe {
-                ptr::copy_nonoverlapping(self.base.add(offset), buf.as_mut_ptr(), buf.len());
+                ptr::copy_nonoverlapping(
+                    (self.base() as *const u8).add(offset),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
             }
         }
     }
 
-    /// Materialise the given guest pages from `memory` into the flat mirror.
+    /// Materialise the given guest pages into this view.
     ///
-    /// **On demand**: only the supplied pages are ever copied.  Contiguous
-    /// page runs are read from `MemoryImage` and copied into the mirror in a
-    /// single operations, so a dense block of N pages costs one sync
-    /// operation instead of N.  A partially/unmapped page is skipped exactly
-    /// like the previous per-page code did.
-    ///
-    /// Updates [`GUEST_PAGES_MATERIALISED`], [`GUEST_SYNC_OPERATIONS`] and
-    /// [`GUEST_SYNC_BYTES_COPIED`].
+    /// Because the view aliases the canonical store, **no bytes are copied**:
+    /// a page is marked materialised only after confirming that the
+    /// `MemoryImage` has it fully mapped.  The per-page telemetry is retained
+    /// for the sync-path benchmark and diagnostics; `bytes_copied` counts the
+    /// bytes whose transfer this design eliminated.
     pub fn materialise_pages(&self, memory: &MemoryImage, pages: &[u64]) -> GuestMemoryTelemetry {
         let mut stats = GuestMemoryTelemetry::default();
-        if !self.valid || pages.is_empty() {
+        if !self.is_valid() || pages.is_empty() {
+            return stats;
+        }
+        if !Arc::ptr_eq(&self.store, memory.canonical_store()) {
+            // The view must be attached before it can describe the image.
+            // Callers attach first; refusing here keeps byte identity a hard
+            // invariant rather than silently reporting another store's pages.
             return stats;
         }
 
@@ -3590,7 +3678,7 @@ impl FlatGuestMemory {
             .iter()
             .filter_map(|&page| {
                 let aligned = page & !0xfff;
-                ((aligned as usize) < self.size).then_some(aligned)
+                ((aligned as usize) < self.size()).then_some(aligned)
             })
             .collect();
         if sorted.is_empty() {
@@ -3599,57 +3687,27 @@ impl FlatGuestMemory {
         sorted.sort_unstable();
         sorted.dedup();
 
-        let mut scratch: Vec<u8> = Vec::new();
         let mut index = 0usize;
         while index < sorted.len() {
-            // Coalesce the maximal contiguous run starting at sorted[index].
-            let run_start = sorted[index];
-            let mut run_end = run_start + 4096;
-            let mut run_end_index = index + 1;
-            while run_end_index < sorted.len() && sorted[run_end_index] == run_end {
-                run_end += 4096;
-                run_end_index += 1;
-            }
-            let run_len = (run_end - run_start) as usize;
-            // Bound the scratch buffer: a single sync never allocates more
-            // than MAX_BATCH_BYTES even for a multi-gigabyte contiguous run.
-            let mut offset = 0usize;
-            while offset < run_len {
-                let chunk_len = (run_len - offset).min(MAX_BATCH_BYTES);
-                let chunk_start = run_start + offset as u64;
-                scratch.resize(chunk_len, 0);
-                match memory.read_into(chunk_start, &mut scratch[..chunk_len]) {
-                    Ok(()) => {
-                        // One batched operation per contiguous chunk.
-                        self.sync_from_memory_image(chunk_start, &scratch[..chunk_len]);
-                        let chunk_pages = (chunk_len / 4096) as u64;
-                        for page_index in 0..chunk_pages {
-                            self.mark_page_materialised_signal_safe(
-                                chunk_start + page_index * 4096,
-                            );
-                        }
-                        stats.pages_materialised += chunk_pages;
-                        stats.sync_operations += 1;
-                        stats.bytes_copied += chunk_len as u64;
-                    }
-                    Err(_) => {
-                        // A gap inside the chunk (partially mapped pages):
-                        // fall back to per-page sync, preserving the previous
-                        // semantics of skipping any page that is not fully
-                        // readable.
-                        for page_index in 0..(chunk_len / 4096) {
-                            let page = chunk_start + (page_index as u64) * 4096;
-                            if memory.read_into(page, &mut scratch[..4096]).is_ok() {
-                                self.sync_from_memory_image(page, &scratch[..4096]);
-                                self.mark_page_materialised_signal_safe(page);
-                                stats.pages_materialised += 1;
-                                stats.sync_operations += 1;
-                                stats.bytes_copied += 4096;
-                            }
-                        }
-                    }
+            let mut run_end_index = index;
+            while run_end_index < sorted.len() {
+                let page = sorted[run_end_index];
+                if !memory.page_is_fully_mapped(page) {
+                    break;
                 }
-                offset += chunk_len;
+                self.mark_page_materialised_signal_safe(page);
+                stats.pages_materialised += 1;
+                stats.bytes_copied += 4096;
+                run_end_index += 1;
+                if run_end_index < sorted.len() && sorted[run_end_index] != page + 4096 {
+                    break;
+                }
+            }
+            if run_end_index > index {
+                stats.sync_operations += 1;
+            } else {
+                // Partially mapped page: not visible to JIT direct access.
+                run_end_index = index + 1;
             }
             index = run_end_index;
         }
@@ -3660,21 +3718,265 @@ impl FlatGuestMemory {
         stats
     }
 
+    #[inline]
     pub fn size(&self) -> usize {
-        self.size
+        self.store.flat_size()
     }
 }
 
-impl Drop for FlatGuestMemory {
-    fn drop(&mut self) {
-        if self.valid && !self.base.is_null() {
-            // SAFETY: base was returned by a successful mmap in new(),
-            // and size matches the original allocation. munmap releases
-            // the 4GB mapping. No other code accesses this memory after Drop.
-            unsafe {
-                libc::munmap(self.base as *mut libc::c_void, self.size);
-            }
+// ---------------------------------------------------------------------------
+// Production worker-slice memory and program
+// ---------------------------------------------------------------------------
+
+/// A worker-safe view of the canonical guest memory.
+///
+/// Workers must not touch the runtime's `MemoryImage` (its page table is
+/// mutable and owned by the runtime thread), but they must run against the
+/// *same* canonical bytes.  This view aliases the canonical store's flat
+/// window and snapshots which pages are fully mapped.  Accesses to any other
+/// page fail (and are reported as a guest fault) so the runtime owner can
+/// service them with the full page table/VM.
+///
+/// Aligned word accesses use `AtomicU64` operations so two workers touching
+/// neighbouring bytes in the same word can never tear or lose each other's
+/// writes; unaligned accesses are merged with the same atomic RMW, giving
+/// x86-style byte-preserving semantics.
+pub(crate) struct GuestSliceMemory {
+    store: Arc<GuestMemoryStore>,
+    fully_mapped: BTreeSet<u64>,
+    code_pages: BTreeSet<u64>,
+    /// Guest code-page writes observed by workers, drained by the runtime
+    /// owner to invalidate stale compiled blocks before the next dispatch.
+    code_writes: Mutex<Vec<(u64, usize)>>,
+}
+
+impl GuestSliceMemory {
+    fn new(memory: &MemoryImage, code_pages: BTreeSet<u64>) -> Self {
+        let fully_mapped = memory
+            .committed_page_addresses()
+            .into_iter()
+            .filter(|page| memory.page_is_fully_mapped(*page))
+            .collect();
+        Self {
+            store: Arc::clone(memory.canonical_store()),
+            fully_mapped,
+            code_pages,
+            code_writes: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn flat_base(&self) -> u64 {
+        self.store.flat_base()
+    }
+
+    pub(crate) fn flat_size(&self) -> u64 {
+        self.store.flat_size() as u64
+    }
+
+    fn range_available(&self, address: u64, len: usize) -> bool {
+        if len == 0 || self.store.flat_base() == 0 {
+            return false;
+        }
+        let Some(end) = address.checked_add(len as u64) else {
+            return false;
+        };
+        if end > self.flat_size() {
+            return false;
+        }
+        let mut page = address & !0xfff;
+        let last = (end - 1) & !0xfff;
+        loop {
+            if !self.fully_mapped.contains(&page) {
+                return false;
+            }
+            if page == last {
+                return true;
+            }
+            page = page.saturating_add(0x1000);
+        }
+    }
+
+    fn first_fault(&self, address: u64, len: usize, write: bool) -> GuestMemoryFault {
+        let mut current = address;
+        let end = address.saturating_add(len as u64);
+        while current < end {
+            let page = current & !0xfff;
+            if !self.fully_mapped.contains(&page) || current >= self.flat_size() {
+                return GuestMemoryFault {
+                    address: current,
+                    write,
+                    read_len: len,
+                };
+            }
+            current = page.saturating_add(0x1000);
+        }
+        GuestMemoryFault {
+            address,
+            write,
+            read_len: len,
+        }
+    }
+
+    #[inline]
+    fn atomic_word(&self, word_base: u64) -> &AtomicU64 {
+        // SAFETY: `range_available` validated that the word lies inside the
+        // canonical flat mapping; the mapping is stable for the store's
+        // lifetime and word_base is 8-byte aligned.
+        unsafe { &*((self.store.flat_base() + word_base) as *const AtomicU64) }
+    }
+
+    /// Read 1..=8 guest bytes through the shared canonical store.
+    pub(crate) fn load(&self, address: u64, len: usize) -> Result<u64, GuestMemoryFault> {
+        if len == 0 || len > 8 || !self.range_available(address, len) {
+            return Err(self.first_fault(address, len, false));
+        }
+        let mut value = 0_u64;
+        let mut done = 0_usize;
+        while done < len {
+            let current = address + done as u64;
+            let word_base = current & !7;
+            let word = self.atomic_word(word_base).load(Ordering::SeqCst);
+            let offset = (current - word_base) as usize;
+            let take = (8 - offset).min(len - done);
+            let mask = if take == 8 {
+                u64::MAX
+            } else {
+                (1_u64 << (take * 8)) - 1
+            };
+            value |= ((word >> (offset * 8)) & mask) << (done * 8);
+            done += take;
+        }
+        Ok(value)
+    }
+
+    /// Write 1..=8 guest bytes through the shared canonical store.  Returns
+    /// `true` when the write touched a compiled-code page (the runtime owner
+    /// must invalidate stale blocks before the next slice).
+    pub(crate) fn store(&self, address: u64, bytes: &[u8]) -> Result<bool, GuestMemoryFault> {
+        let len = bytes.len();
+        if len == 0 || len > 8 || !self.range_available(address, len) {
+            return Err(self.first_fault(address, len, true));
+        }
+        let mut value = 0_u64;
+        for (index, byte) in bytes.iter().enumerate() {
+            value |= u64::from(*byte) << (index * 8);
+        }
+        let mut done = 0_usize;
+        while done < len {
+            let current = address + done as u64;
+            let word_base = current & !7;
+            let offset = (current - word_base) as usize;
+            let take = (8 - offset).min(len - done);
+            let mask = if take == 8 {
+                u64::MAX
+            } else {
+                (1_u64 << (take * 8)) - 1
+            };
+            let bits = ((value >> (done * 8)) & mask) << (offset * 8);
+            let field_mask = mask << (offset * 8);
+            self.atomic_word(word_base)
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+                    Some((old & !field_mask) | bits)
+                })
+                .expect("atomic guest-word update never fails");
+            done += take;
+        }
+        let touches_code = self
+            .code_pages
+            .range((address & !0xfff)..=((address + len as u64 - 1) & !0xfff))
+            .next()
+            .is_some();
+        if touches_code {
+            self.code_writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((address, len));
+        }
+        Ok(touches_code)
+    }
+
+    pub(crate) fn take_code_writes(&self) -> Vec<(u64, usize)> {
+        std::mem::take(
+            &mut *self
+                .code_writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
+/// Immutable execution plan handed to a production worker.
+///
+/// The blocks are compiled into a dedicated, deliberately unlinked cache
+/// (worker dispatches one block at a time, so a slice budget is exact and no
+/// chained loop can bypass the thunk barrier).  The program is `Send + Sync`
+/// because every field is immutable shared state; `JitCompiledBlock` stores
+/// its entry as an address and the code pages are immutable after
+/// `finalize_code`.
+pub(crate) struct GuestSliceProgram {
+    pub(crate) blocks: HashMap<u64, JitCompiledBlock>,
+    pub(crate) memory: Arc<GuestSliceMemory>,
+    pub(crate) flat_base: u64,
+    pub(crate) mechanism: JitExecMechanism,
+}
+
+impl GuestSliceProgram {
+    pub(crate) fn block(&self, rip: u64) -> Option<&JitCompiledBlock> {
+        self.blocks.get(&rip)
+    }
+}
+
+/// Result of one worker block execution: the dispatcher-visible exit plus the
+/// address of the block that actually produced it (a chain can end in a
+/// different block than the one entered).
+pub(crate) struct SliceBlockOutcome {
+    pub(crate) reason: JitExitReason,
+    pub(crate) final_block: u64,
+}
+
+/// Execute one compiled block on a production worker.
+///
+/// # Safety
+/// `block` must have been produced by this runtime's compiler and finalized,
+/// `program.flat_base` must address the canonical guest store, and the
+/// worker must not share guest state with the runtime owner (each slice owns
+/// its `CpuState`).
+pub(crate) unsafe fn execute_slice_block(
+    program: &GuestSliceProgram,
+    block: &JitCompiledBlock,
+    state: &mut CpuState,
+    exit_slot: &mut [u64; 2],
+) -> SliceBlockOutcome {
+    JitMemoryManager::prepare_execution_for_mechanism(program.mechanism);
+    let entry = block.published_entry();
+    if entry.is_null() {
+        return SliceBlockOutcome {
+            reason: JitExitReason::Safepoint,
+            final_block: block.guest_address,
+        };
+    }
+    // SAFETY: the caller guarantees the entry points at finalized immutable
+    // code.  The ABI is the block entry ABI (state, flat base, unused
+    // MemoryImage pointer, per-thread exit cell).
+    let entry_fn: unsafe extern "C" fn(*mut CpuState, u64, *mut MemoryImage, *mut u64) -> u64 =
+        unsafe { std::mem::transmute(entry) };
+    let result = unsafe {
+        entry_fn(
+            state as *mut CpuState,
+            program.flat_base,
+            ptr::null_mut(),
+            exit_slot.as_mut_ptr(),
+        )
+    };
+    let final_block = exit_slot[0];
+    let exit_info = program
+        .blocks
+        .get(&final_block)
+        .map(|final_block| final_block.last_exit_info)
+        .unwrap_or(block.last_exit_info);
+    SliceBlockOutcome {
+        reason: map_exit_reason(result, state, result, exit_info),
+        final_block,
     }
 }
 
@@ -3683,13 +3985,20 @@ impl Drop for FlatGuestMemory {
 // ---------------------------------------------------------------------------
 
 /// Result of JIT-compiling a block of IR instructions.
+///
+/// The compiled-code descriptor is immutable after construction and contains
+/// no raw pointers: the executable entry is stored as a `usize` address (plus
+/// the `entry_atomic` publication slot).  That makes the descriptor genuinely
+/// `Send + Sync`; the safety invariant is that the underlying code page is
+/// immutable and executable after `finalize_code`, and every executor obtains
+/// the entry through [`Self::published_entry`] (acquire).
 pub struct JitCompiledBlock {
-    /// Pointer to the compiled ARM64 code entry point.  Callers that publish a
+    /// Address of the compiled ARM64 code entry point.  Callers that publish a
     /// block to another thread must use [`Self::published_entry`] (acquire) so
     /// the code bytes written before publication are visible.
-    pub entry: *const u8,
-    /// Atomic publication of `entry`.  Installers store with Release after
-    /// `finalize_code` (icache flush); executors load with Acquire.
+    entry_addr: usize,
+    /// Atomic publication of the entry address.  Installers store with Release
+    /// after `finalize_code` (icache flush); executors load with Acquire.
     entry_atomic: AtomicPtr<u8>,
     /// Size of compiled code in bytes.
     pub code_size: usize,
@@ -3718,12 +4027,17 @@ pub struct JitCompiledBlock {
     /// never patches code — it publishes a pointer with Release, so no other
     /// thread can observe a torn instruction sequence.
     pub link_target: Arc<AtomicU64>,
+    /// True when a production worker may execute this block without touching
+    /// runtime-owned host state: no interpreter fallback, no host call/return
+    /// terminator, and no unresolved jump target.  Worker slices execute only
+    /// these blocks; everything else is a thunk/host barrier.
+    pub worker_safe: bool,
 }
 
 impl Clone for JitCompiledBlock {
     fn clone(&self) -> Self {
         Self {
-            entry: self.entry,
+            entry_addr: self.entry_addr,
             entry_atomic: AtomicPtr::new(self.entry_atomic.load(Ordering::Acquire)),
             code_size: self.code_size,
             guest_address: self.guest_address,
@@ -3733,6 +4047,7 @@ impl Clone for JitCompiledBlock {
             compile_tier: self.compile_tier,
             ends_in_control_flow: self.ends_in_control_flow,
             link_target: Arc::clone(&self.link_target),
+            worker_safe: self.worker_safe,
         }
     }
 }
@@ -3741,6 +4056,11 @@ impl JitCompiledBlock {
     /// Acquire-load the published executable entry point.
     pub fn published_entry(&self) -> *const u8 {
         self.entry_atomic.load(Ordering::Acquire)
+    }
+
+    /// The immutable entry address captured at compilation time.
+    pub fn entry(&self) -> *const u8 {
+        self.entry_addr as *const u8
     }
 }
 
@@ -3762,6 +4082,31 @@ fn instruction_controls_rip(insn: &IrInstruction) -> bool {
 
 fn block_ends_in_control_flow(ir: &[IrInstruction]) -> bool {
     ir.last().is_some_and(instruction_controls_rip)
+}
+
+/// A production worker slice may execute a block only when it is fully
+/// self-contained: no interpreter-helper fallback (which needs a live
+/// `MemoryImage`), and no host-call / return / indirect-jump terminator.
+/// Any other block is a barrier that yields to the runtime owner.
+fn block_is_worker_safe(ir: &[IrInstruction], used_interpreter_helper: bool) -> bool {
+    if used_interpreter_helper {
+        return false;
+    }
+    !ir.iter().any(|insn| {
+        matches!(
+            insn,
+            IrInstruction::Call { .. }
+                | IrInstruction::CallRegister { .. }
+                | IrInstruction::CallMemory { .. }
+                | IrInstruction::Return { .. }
+                | IrInstruction::JumpRegister { .. }
+                | IrInstruction::JumpMemory { .. }
+                | IrInstruction::Cpuid
+                | IrInstruction::Xgetbv
+                | IrInstruction::Fxsave { .. }
+                | IrInstruction::Fxrstor { .. }
+        )
+    })
 }
 
 /// Result of executing a JIT-compiled block.
@@ -3923,6 +4268,11 @@ pub struct JitCompiler {
     /// unconditional-jump arm embeds its address and reads it at run time;
     /// `chain_blocks` publishes a target entry into it with Release ordering.
     link_slot: Option<Arc<AtomicU64>>,
+    /// True when the block currently being compiled used the universal
+    /// single-instruction interpreter helper, which needs a live
+    /// `MemoryImage` pointer and therefore may not run on a production
+    /// worker.
+    used_interpreter_helper: bool,
 }
 
 impl Default for JitCompiler {
@@ -3940,6 +4290,7 @@ impl JitCompiler {
             safepoint_cbnz_patch: None,
             fault_cbnz_patches: Vec::new(),
             link_slot: None,
+            used_interpreter_helper: false,
         }
     }
 
@@ -4016,6 +4367,7 @@ impl JitCompiler {
         fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
+        self.used_interpreter_helper = false;
         let link_target = Arc::new(AtomicU64::new(0));
         self.link_slot = Some(Arc::clone(&link_target));
 
@@ -4073,11 +4425,12 @@ impl JitCompiler {
         // Uses FNV-1a style hashing of the instruction discriminants and guest_address.
         let source_hash = compute_ir_hash(ir, guest_address);
         let last_exit_info = block_exit_info(ir);
+        let worker_safe = block_is_worker_safe(ir, self.used_interpreter_helper);
         self.link_slot = None;
 
         Ok(JitCompiledBlock {
-            entry: code_ptr,
-            entry_atomic: AtomicPtr::new(code_ptr as *mut u8),
+            entry_addr: code_ptr as usize,
+            entry_atomic: AtomicPtr::new(code_ptr),
             code_size,
             guest_address,
             instruction_count: ir.len(),
@@ -4086,6 +4439,7 @@ impl JitCompiler {
             compile_tier: CompilationTier::Tier0,
             ends_in_control_flow: block_ends_in_control_flow(ir),
             link_target,
+            worker_safe,
         })
     }
 
@@ -4426,21 +4780,20 @@ impl JitCompiler {
         self.emitter.mov_reg(1, result_reg); // x1 = result
         self.emitter.mov_reg(2, lhs_reg); // x2 = lhs
         self.emitter.mov_reg(3, rhs_reg); // x3 = rhs
-        // x4 = op, x5 = width — but x4 is a guest reg (RAX). Use movz into
-        // a temp after the BL clobberable setup. Actually we can't use x4.
-        // Pack op and width: use movz into x3 high bits? No — just use
-        // separate approach: load op/width into x27/x28 (callee-saved).
-        self.emitter.movz(27, op as u16, 0);
-        self.emitter.movz(28, width as u16, 0);
-        // Re-set x0-x3 (they may have been clobbered by movz — no, movz
-        // targets x27/x28).
+        // x4 = op, x5 = width — but x4 is a guest reg (RAX).  Use x21/x22
+        // for op/width: they are scratch temps in this ABI and, crucially,
+        // are NOT among result/lhs/rhs (x27/x25/x26 here, or the guest
+        // destination in the logic arm).  Using x27/x28 would clobber the
+        // result/lhs values before they are passed, which made every JIT
+        // compare see stale flags (ZF := (op==0)).
+        self.emitter.movz(21, op as u16, 0);
+        self.emitter.movz(22, width as u16, 0);
         self.emitter.mov_reg(0, 24); // x0 = CpuState
         self.emitter.mov_reg(1, result_reg);
         self.emitter.mov_reg(2, lhs_reg);
         self.emitter.mov_reg(3, rhs_reg);
-        self.emitter.mov_reg(4, 27); // x4 = op (x4 is caller-saved, but
-        // we reload guest regs after)
-        self.emitter.mov_reg(5, 28); // x5 = width
+        self.emitter.mov_reg(4, 21); // x4 = op
+        self.emitter.mov_reg(5, 22); // x5 = width
         self.emit_bl_to(jit_helper_set_flags as *const () as usize);
         self.emitter.mov_reg(0, 24); // restore CpuState
         self.emit_load_guest_registers(arch);
@@ -5130,6 +5483,7 @@ impl JitCompiler {
         insn: &IrInstruction,
         arch: GuestArch,
     ) -> AppResult<()> {
+        self.used_interpreter_helper = true;
         // Store a boxed copy so the address is stable across Vec growth.
         let boxed = Box::new(insn.clone());
         let insn_ptr = &*boxed as *const IrInstruction as u64;
@@ -5185,6 +5539,10 @@ pub struct JitRuntime {
     pub flat_memory: FlatGuestMemory,
     /// Cache of compiled blocks keyed by guest address.
     pub block_cache: HashMap<u64, JitCompiledBlock>,
+    /// Deliberately unlinked blocks compiled for production worker slices.
+    /// Kept separate from `block_cache` so worker execution never inherits a
+    /// published chain that could bypass the per-slice budget/thunk barrier.
+    pub(crate) slice_block_cache: HashMap<u64, JitCompiledBlock>,
     /// FIFO access-order queue for LRU eviction of compiled blocks.
     /// Front = least recently used (next to evict), back = most recently used.
     pub block_access_order: VecDeque<u64>,
@@ -5248,6 +5606,7 @@ impl JitRuntime {
             compiler: JitCompiler::new(),
             flat_memory: FlatGuestMemory::new(arch),
             block_cache: HashMap::new(),
+            slice_block_cache: HashMap::new(),
             block_access_order: VecDeque::new(),
             max_blocks: 8192,
             blocks_compiled: 0,
@@ -5471,6 +5830,46 @@ impl JitRuntime {
         Ok(self.block_cache.get(&guest_address).unwrap())
     }
 
+    /// Compile (or fetch) a deliberately unlinked block for production worker
+    /// slices.  Worker blocks never use resolved fast-thunk trampolines and
+    /// never publish chain links, so each worker dispatch executes exactly one
+    /// block and the slice budget/thunk barrier stays exact.
+    pub(crate) fn get_or_compile_slice_block(
+        &mut self,
+        ir: &[IrInstruction],
+        guest_address: u64,
+        arch: GuestArch,
+    ) -> AppResult<&JitCompiledBlock> {
+        if !self.slice_block_cache.contains_key(&guest_address) {
+            let block = self.compiler.compile_block(ir, guest_address, arch, None)?;
+            self.slice_block_cache.insert(guest_address, block);
+        }
+        Ok(self
+            .slice_block_cache
+            .get(&guest_address)
+            .expect("slice block inserted above"))
+    }
+
+    pub(crate) fn slice_block(&self, guest_address: u64) -> Option<&JitCompiledBlock> {
+        self.slice_block_cache.get(&guest_address)
+    }
+
+    pub(crate) fn clear_slice_blocks(&mut self) {
+        self.slice_block_cache.clear();
+    }
+
+    /// Build the immutable program a production worker executes.  The
+    /// memory view aliases the canonical store; no bytes are copied.
+    pub(crate) fn build_slice_program(&self, memory: &MemoryImage) -> GuestSliceProgram {
+        let view = Arc::new(GuestSliceMemory::new(memory, self.code_pages.clone()));
+        GuestSliceProgram {
+            blocks: self.slice_block_cache.clone(),
+            flat_base: view.flat_base(),
+            memory: view,
+            mechanism: self.compiler.memory_manager.mechanism(),
+        }
+    }
+
     /// Drain self-modifying-code dirty pages and invalidate every cached
     /// block that overlaps them.  Returns the invalidated guest addresses.
     pub fn drain_smc_invalidations(&mut self) -> Vec<u64> {
@@ -5534,6 +5933,7 @@ impl JitRuntime {
     /// The caller is responsible for syncing the updated unwind table to the
     /// SEH subsystem via [`JitUnwindTable::register_with_seh`].
     pub fn invalidate_block(&mut self, guest_address: u64) {
+        self.slice_block_cache.remove(&guest_address);
         if let Some(block) = self.block_cache.remove(&guest_address) {
             // Remove from the access-order queue so stale entries don't
             // accumulate and cause incorrect evictions.
@@ -5719,6 +6119,9 @@ impl JitRuntime {
         if !any_overlap {
             return Vec::new();
         }
+        // Worker slice blocks compile from the same source pages; a code
+        // write invalidates them just like dispatcher blocks.
+        self.slice_block_cache.clear();
 
         let affected: Vec<u64> = self
             .block_cache
@@ -5860,7 +6263,7 @@ impl JitRuntime {
     ///
     /// # Safety
     /// The caller must ensure the block was correctly compiled and memory is valid.
-    /// `block.entry` must point to valid ARM64 machine code, `state` must be a
+    /// `block.entry()` must point to valid ARM64 machine code, `state` must be a
     /// valid CpuState, and `memory` must be a valid MemoryImage.
     pub unsafe fn execute_block(
         &mut self,
@@ -5914,8 +6317,9 @@ impl JitRuntime {
             return JitExitReason::Safepoint;
         }
 
-        // Sync relevant memory pages to flat region
-        // (In a full implementation, this would be done lazily)
+        // Both views must alias the same canonical pages before any native
+        // load/store executes.  This is O(1) (Arc identity), not a page copy.
+        self.attach_guest_memory(memory);
 
         // The JIT entry point expects:
         // x0 = pointer to CpuState
@@ -5938,7 +6342,7 @@ impl JitRuntime {
         let mem_image_ptr = memory as *mut MemoryImage;
         let exit_ptr = exec_slot.as_mut_ptr();
 
-        // SAFETY: block.entry points to JIT-compiled ARM64 code that was
+        // SAFETY: block.entry() points to JIT-compiled ARM64 code that was
         // written by this compiler and finalized (icache flushed, executable
         // permissions set). The JIT code respects the ARM64 ABI and only
         // accesses memory through the provided base pointer and validated
@@ -5948,7 +6352,7 @@ impl JitRuntime {
         // pointer with the JIT block ABI:
         //   (cpu_state_ptr, mem_base_u64, memory_image_ptr, exit_reason_ptr) -> u64
         // This is valid because:
-        // 1. block.entry was produced by JitMemoryManager during compilation
+        // 1. block.entry() was produced by JitMemoryManager during compilation
         //    of this specific IR block. The manager allocates MAP_JIT pages
         //    and sets executable permissions after writing.
         // 2. The JIT compiler emits ARM64 machine code conforming to this
@@ -6003,36 +6407,41 @@ impl JitRuntime {
         reason
     }
 
-    /// Sync a page from MemoryImage to the flat guest memory region.
+    /// Attach the flat view to the live image's canonical store.
     ///
-    /// On-demand: this materialises exactly the requested page (batched
-    /// through [`FlatGuestMemory::materialise_pages`]) and records it in
-    /// `synced_pages`.
+    /// O(1): an `Arc` identity check.  Both views then address the same
+    /// 4 GiB mapping, so no page copy is needed before or after execution.
+    pub(crate) fn attach_guest_memory(&mut self, memory: &MemoryImage) {
+        self.flat_memory.attach_store(memory.canonical_store());
+    }
+
+    /// Mark a committed page as visible to the flat view.
+    ///
+    /// The bytes are already shared (the page lives in the canonical store);
+    /// this only updates the diagnostic bitmap and `synced_pages`.
     pub fn sync_page_to_flat(&mut self, memory: &MemoryImage, page_addr: u64) {
         let aligned = page_addr & !0xfff;
+        self.attach_guest_memory(memory);
         self.flat_memory.materialise_pages(memory, &[aligned]);
         self.synced_pages.insert(aligned);
     }
 
-    /// Materialise **all committed (guest-touched) pages** from `MemoryImage`
-    /// into the flat guest mirror.  Called before native execution to
-    /// establish the baseline copy.
+    /// Establish the baseline flat view for all committed guest pages.
     ///
-    /// This is O(committed pages, batched) and never touches guest pages that
-    /// were never committed: the former whole-4-GiB `prefault_all` pass (one
-    /// write per 1,048,576 pages on **every** call) is gone.  Contiguous
-    /// committed runs are copied in a single read+sync operation; only
-    /// genuinely touched pages are materialised.
+    /// No bytes are copied: committed pages already live in the canonical
+    /// store the flat view aliases.  This pass only records which fully
+    /// mapped pages are visible to direct JIT addressing and updates the
+    /// compatibility telemetry consumed by the sync-path benchmark.
     pub fn sync_all_pages_to_flat(&mut self, memory: &MemoryImage) {
+        self.attach_guest_memory(memory);
         let pages = memory.committed_page_addresses();
         self.flat_memory.materialise_pages(memory, &pages);
         self.synced_pages = pages.into_iter().collect();
     }
 
-    /// Incremental sync: only materialise pages that are new since the last
-    /// sync (`synced_pages` set difference), batched over contiguous runs.
-    /// This is O(new pages) instead of O(all committed pages).
+    /// Incremental bookkeeping: only new pages are noted since the last pass.
     pub fn sync_new_pages_to_flat(&mut self, memory: &MemoryImage) {
+        self.attach_guest_memory(memory);
         let current_pages: BTreeSet<u64> = memory.committed_page_addresses().into_iter().collect();
         let new_pages: Vec<u64> = current_pages
             .difference(&self.synced_pages)
@@ -6044,50 +6453,16 @@ impl JitRuntime {
         self.synced_pages = current_pages;
     }
 
-    /// Sync modified state from flat memory back to MemoryImage.
-    pub fn sync_flat_to_memory(&self, guest_addr: u64, memory: &mut MemoryImage, size: usize) {
-        let mut buf = vec![0u8; size];
-        self.flat_memory.read(guest_addr, &mut buf);
-        memory.map_bytes(guest_addr, &buf);
-    }
+    /// Coherence is immediate through the shared canonical store, so there is
+    /// nothing to copy back.  Retained for source compatibility.
+    pub fn sync_flat_to_memory(&self, _guest_addr: u64, _memory: &mut MemoryImage, _size: usize) {}
 
-    /// Sync **all** committed pages from the flat memory region back into
-    /// `MemoryImage`. Called after JIT execution so that any guest-memory
-    /// writes performed by the JIT-compiled ARM64 code (stack pushes, heap
-    /// stores, global variable updates, etc.) are visible to the host-side
-    /// interpreter and thunk dispatch.
-    ///
-    /// Only pages that were actually materialised are read back — a page the
-    /// flat mirror never received must not overwrite its `MemoryImage`
-    /// contents with the mirror's zeros.
-    pub fn sync_all_flat_to_memory(&self, memory: &mut MemoryImage) {
-        let mut page_data = [0u8; 4096];
-        for page_addr in memory.committed_page_addresses() {
-            if !self.flat_memory.is_page_materialised(page_addr) {
-                continue;
-            }
-            self.flat_memory.read(page_addr, &mut page_data);
-            // Use the internal page write which only touches mapped ranges
-            // and avoids re-allocating pages that already exist.
-            memory.map_bytes(page_addr, &page_data);
-        }
-    }
+    /// No-op: JIT stores already land in the canonical pages the interpreter
+    /// reads.  Retained for source compatibility.
+    pub fn sync_all_flat_to_memory(&self, _memory: &mut MemoryImage) {}
 
-    /// Incremental write-back: only sync pages that are in the `synced_pages`
-    /// set (and were actually materialised) back to MemoryImage. This is
-    /// O(synced pages) but typically much less than O(committed pages)
-    /// because many pages are read-only (code, resources) and don't need
-    /// write-back every block.
-    pub fn sync_synced_flat_to_memory(&self, memory: &mut MemoryImage) {
-        let mut page_data = [0u8; 4096];
-        for page_addr in &self.synced_pages {
-            if !self.flat_memory.is_page_materialised(*page_addr) {
-                continue;
-            }
-            self.flat_memory.read(*page_addr, &mut page_data);
-            memory.map_bytes(*page_addr, &page_data);
-        }
-    }
+    /// No-op: see [`Self::sync_all_flat_to_memory`].
+    pub fn sync_synced_flat_to_memory(&self, _memory: &mut MemoryImage) {}
 
     /// Install the SIGBUS handler that syncs guest pages on demand during JIT
     /// execution. Stores `self` and `memory` as raw pointers for the signal
@@ -6131,6 +6506,9 @@ impl JitRuntime {
     /// eliminating the per-block sigaction syscall overhead.
     /// Only updates the memory pointer (in case it changed).
     pub fn ensure_sigbus_handler(&mut self, memory: &MemoryImage) {
+        // The fallback services faulting pages of the store the flat view
+        // addresses, so pin the view to this image before publishing pointers.
+        self.attach_guest_memory(memory);
         if !self.sigbus_installed {
             self.install_sigbus_handler(memory);
             self.sigbus_installed = true;
@@ -6645,6 +7023,7 @@ impl JitCompiler {
         fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
+        self.used_interpreter_helper = false;
         let link_target = Arc::new(AtomicU64::new(0));
         self.link_slot = Some(Arc::clone(&link_target));
 
@@ -6685,11 +7064,12 @@ impl JitCompiler {
 
         let source_hash = compute_ir_hash(ir, guest_address);
         let last_exit_info = block_exit_info(ir);
+        let worker_safe = block_is_worker_safe(&folded_ir, self.used_interpreter_helper);
         self.link_slot = None;
 
         Ok(JitCompiledBlock {
-            entry: code_ptr,
-            entry_atomic: AtomicPtr::new(code_ptr as *mut u8),
+            entry_addr: code_ptr as usize,
+            entry_atomic: AtomicPtr::new(code_ptr),
             code_size,
             guest_address,
             instruction_count: ir.len(),
@@ -6698,6 +7078,7 @@ impl JitCompiler {
             compile_tier: CompilationTier::Tier1,
             ends_in_control_flow: block_ends_in_control_flow(ir),
             link_target,
+            worker_safe,
         })
     }
 
@@ -6715,6 +7096,7 @@ impl JitCompiler {
         fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
+        self.used_interpreter_helper = false;
         let link_target = Arc::new(AtomicU64::new(0));
         self.link_slot = Some(Arc::clone(&link_target));
 
@@ -6756,11 +7138,12 @@ impl JitCompiler {
 
         let source_hash = compute_ir_hash(ir, guest_address);
         let last_exit_info = block_exit_info(&optimized_ir);
+        let worker_safe = block_is_worker_safe(&optimized_ir, self.used_interpreter_helper);
         self.link_slot = None;
 
         Ok(JitCompiledBlock {
-            entry: code_ptr,
-            entry_atomic: AtomicPtr::new(code_ptr as *mut u8),
+            entry_addr: code_ptr as usize,
+            entry_atomic: AtomicPtr::new(code_ptr),
             code_size,
             guest_address,
             instruction_count: ir.len(),
@@ -6769,6 +7152,7 @@ impl JitCompiler {
             compile_tier: CompilationTier::Tier2,
             ends_in_control_flow: block_ends_in_control_flow(ir),
             link_target,
+            worker_safe,
         })
     }
 
@@ -6804,10 +7188,12 @@ impl JitCompiler {
 
         for insn in ir {
             match insn {
-                // MovImm: record the immediate value
+                // MovImm: record the immediate value and coalesce with a
+                // directly preceding write to the same register (the whole
+                // chain collapses to the last write).
                 IrInstruction::MovImm { dst, value } => {
                     known.insert(*dst, KnownValue::Immediate(*value));
-                    result.push(insn.clone());
+                    Self::push_folded_immediate(&mut result, *dst, *value);
                 }
 
                 // MovReg: propagate known value or record copy
@@ -8790,7 +9176,7 @@ pub fn run_jit_self_test_child() -> AppResult<JitSelfTestReport> {
                     format!("JIT self-test: compile_block failed: {}", error.message),
                 )
             })?;
-        (block.entry, block.code_size, runtime.blocks_compiled)
+        (block.entry(), block.code_size, runtime.blocks_compiled)
     };
     let code_words: Vec<u32> = unsafe {
         std::slice::from_raw_parts(block_entry as *const u32, block_code_size / 4).to_vec()
@@ -9558,7 +9944,7 @@ mod tests {
         assert_eq!(block.guest_address, 0x1000);
         assert_eq!(block.instruction_count, 1);
         assert!(block.code_size > 0);
-        assert!(!block.entry.is_null());
+        assert!(!block.entry().is_null());
     }
 
     #[test]
@@ -10655,6 +11041,9 @@ mod tests {
 
     #[test]
     fn sigbus_reentrancy_guard_prevents_recursive_entry() {
+        let _guard = SIGBUS_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Ensure guard starts clear
         SIGBUS_IN_HANDLER.store(false, Ordering::Release);
         assert!(!SIGBUS_IN_HANDLER.load(Ordering::Acquire));
@@ -10678,6 +11067,9 @@ mod tests {
 
     #[test]
     fn sigbus_out_of_range_fault_diagnostic_counters() {
+        let _guard = SIGBUS_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let rt = JitRuntime::new(GuestArch::X64);
         let flat_base = rt.flat_memory.base();
         let flat_size = rt.flat_memory.size() as u64;
@@ -10830,6 +11222,9 @@ mod tests {
     // =====================================================================
 
     static GUEST_MEMORY_TELEMETRY_LOCK: Mutex<()> = Mutex::new(());
+    /// Serializes tests that install/remove the SIGBUS handler or mutate its
+    /// process-wide state.
+    static SIGBUS_STATE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn sparse_guest_memory_materialises_only_committed_pages() {
@@ -10842,6 +11237,11 @@ mod tests {
             memory.map_bytes(i * 0x0800_0000, &[0xABu8; 4096]);
         }
         assert_eq!(memory.committed_page_addresses().len(), 16);
+        assert_eq!(
+            memory.canonical_store().materialisation_count(),
+            16,
+            "each committed page is materialised exactly once by the store"
+        );
 
         let mut runtime = JitRuntime::new(GuestArch::X64);
         reset_guest_memory_telemetry();
@@ -10857,6 +11257,17 @@ mod tests {
             "16 isolated pages form 16 runs"
         );
         assert_eq!(telemetry.bytes_copied, 16 * 4096);
+        assert_eq!(
+            memory.canonical_store().materialisation_count(),
+            16,
+            "the sync pass must not re-materialise canonical pages"
+        );
+        runtime.sync_all_pages_to_flat(&memory);
+        assert_eq!(
+            memory.canonical_store().materialisation_count(),
+            16,
+            "repeated sync passes must leave canonical materialisation unchanged"
+        );
         assert_eq!(runtime.flat_memory.materialised_page_count(), 16);
         assert_eq!(
             runtime.flat_memory.total_page_count(),
@@ -10879,6 +11290,54 @@ mod tests {
         let mut buf = [0u8; 8];
         runtime.flat_memory.read(0, &mut buf);
         assert_eq!(buf, [0xAB; 8]);
+        runtime.flat_memory.sync_from_memory_image(0, &[0xCD; 8]);
+        assert_eq!(
+            memory.read_u8(0).unwrap(),
+            0xCD,
+            "an explicit flat write must land in the shared canonical page"
+        );
+        runtime.flat_memory.read(0, &mut buf);
+        assert_eq!(buf, [0xCD; 8]);
+        // Out-of-window syncs/reads/diagnostic probes must be refused without
+        // touching the mapping.
+        runtime
+            .flat_memory
+            .sync_from_memory_image(u64::MAX - 3, &[0xEE; 8]);
+        runtime.flat_memory.read(u64::MAX - 3, &mut buf);
+        assert_eq!(buf, [0xCD; 8]);
+        assert!(!runtime.flat_memory.is_page_materialised(0x1001));
+        assert!(
+            !runtime
+                .flat_memory
+                .is_page_materialised(4 * 1024 * 1024 * 1024)
+        );
+        let debug = format!("{memory:?}");
+        assert!(debug.contains("GuestMemoryStore"));
+        assert!(!debug.contains("materialised: ["));
+    }
+
+    #[test]
+    fn invalid_flat_view_rejects_reads_syncs_and_materialisation() {
+        let memory = MemoryImage::default();
+        let store = Arc::new(GuestMemoryStore::invalid_for_test());
+        let bitmap_words = (4 * 1024 * 1024 * 1024_usize).div_ceil(4096 * 64);
+        let flat = FlatGuestMemory {
+            store,
+            materialised: (0..bitmap_words)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        };
+        assert!(!flat.is_valid());
+        assert_eq!(flat.base(), 0);
+        let mut buf = [0xAA; 8];
+        flat.read(0, &mut buf);
+        assert_eq!(buf, [0xAA; 8], "an invalid view must not write the buffer");
+        flat.sync_from_memory_image(0, &[0x11; 8]);
+        let stats = flat.materialise_pages(&memory, &[0]);
+        assert_eq!(stats.pages_materialised, 0);
+        assert_eq!(stats.bytes_copied, 0);
+        assert!(!flat.is_page_materialised(0));
     }
 
     #[test]
@@ -10892,6 +11351,13 @@ mod tests {
         memory.map_bytes(0x3000_0000, &[0x11u8; 16]);
 
         let mut runtime = JitRuntime::new(GuestArch::X64);
+        let detached = runtime
+            .flat_memory
+            .materialise_pages(&memory, &[0x3000_0000]);
+        assert_eq!(detached.pages_materialised, 0);
+        assert_eq!(detached.bytes_copied, 0);
+        assert!(!runtime.flat_memory.is_page_materialised(0x3000_0000));
+
         reset_guest_memory_telemetry();
         runtime.sync_all_pages_to_flat(&memory);
 
@@ -10899,6 +11365,147 @@ mod tests {
         assert_eq!(telemetry.pages_materialised, 0);
         assert_eq!(telemetry.bytes_copied, 0);
         assert!(!runtime.flat_memory.is_page_materialised(0x3000_0000));
+
+        let empty = runtime.flat_memory.materialise_pages(&memory, &[]);
+        assert_eq!(empty.pages_materialised, 0);
+        let outside = runtime
+            .flat_memory
+            .materialise_pages(&memory, &[4 * 1024 * 1024 * 1024]);
+        assert_eq!(outside.pages_materialised, 0);
+        assert_eq!(outside.sync_operations, 0);
+    }
+
+    #[test]
+    fn sigbus_fallback_never_corrupts_committed_bytes_and_handles_partial_and_absent_pages() {
+        let _guard = GUEST_MEMORY_TELEMETRY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &[0xAB; 4096]);
+        memory.map_bytes(0x2000, &[0x11; 16]);
+        memory.map_bytes(0x4000 + 4080, &[0x22; 16]);
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        runtime.sync_all_pages_to_flat(&memory);
+        let base = runtime.flat_memory.base() as *mut u8;
+        let size = runtime.flat_memory.size();
+
+        service_faulting_page(&runtime, &memory, 0x1000, base, size);
+        // SAFETY: page 0x1000 is inside the shared flat window.
+        let first = unsafe { std::ptr::read_volatile(base.add(0x1000)) };
+        assert_eq!(first, 0xAB, "servicing must never zero committed bytes");
+        assert_eq!(memory.read_u8(0x1000).unwrap(), 0xAB);
+
+        service_faulting_page(&runtime, &memory, 0x2000, base, size);
+        // SAFETY: page 0x2000 is inside the shared flat window.
+        let partial_head = unsafe { std::ptr::read_volatile(base.add(0x2000)) };
+        assert_eq!(partial_head, 0x11);
+        assert!(!runtime.flat_memory.is_page_materialised(0x2000));
+
+        service_faulting_page(&runtime, &memory, 0x4000, base, size);
+        // SAFETY: page 0x4000 is inside the shared flat window.
+        let partial_tail = unsafe { std::ptr::read_volatile(base.add(0x4000 + 4095)) };
+        assert_eq!(partial_tail, 0x22);
+        assert!(!runtime.flat_memory.is_page_materialised(0x4000));
+
+        service_faulting_page(&runtime, &memory, 0x6000, base, size);
+        // SAFETY: page 0x6000 is inside the shared flat window.
+        let absent_tail = unsafe { std::ptr::read_volatile(base.add(0x6000 + 4095)) };
+        assert_eq!(absent_tail, 0);
+        assert!(runtime.flat_memory.is_page_materialised(0x6000));
+        assert!(
+            memory.read_u8(0x6000).is_err(),
+            "an uncommitted page must stay unmapped for the interpreter"
+        );
+        assert_eq!(memory.canonical_store().materialisation_count(), 3);
+    }
+
+    #[test]
+    fn sigbus_fallback_touches_mapped_tail_without_zeroing_or_marking_it() {
+        let mut memory = MemoryImage::default();
+        // Only the last 16 bytes of the page are mapped.
+        memory.map_bytes(0x4FF0, &[0x33; 16]);
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        runtime.sync_all_pages_to_flat(&memory);
+        let base = runtime.flat_memory.base() as *mut u8;
+        let size = runtime.flat_memory.size();
+
+        service_faulting_page(&runtime, &memory, 0x4000, base, size);
+        // SAFETY: page 0x4000 is inside the shared flat window.
+        let tail = unsafe { std::ptr::read_volatile(base.add(0x4FFF)) };
+        assert_eq!(tail, 0x33, "a mapped tail byte must never be zeroed");
+        // SAFETY: byte 0 of the same page is inside the flat window.
+        let head = unsafe { std::ptr::read_volatile(base.add(0x4000)) };
+        assert_eq!(head, 0);
+        assert!(!runtime.flat_memory.is_page_materialised(0x4000));
+        assert_eq!(memory.read_u8(0x4FFF).unwrap(), 0x33);
+    }
+
+    #[test]
+    fn legacy_sync_entry_points_never_leave_stale_or_duplicate_state() {
+        let _guard = GUEST_MEMORY_TELEMETRY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &[0x11; 4096]);
+        memory.map_bytes(0x2000, &[0x22; 4096]);
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        runtime.sync_all_pages_to_flat(&memory);
+        assert_eq!(runtime.synced_page_count(), 2);
+
+        runtime.sync_page_to_flat(&memory, 0x1000);
+        assert_eq!(runtime.synced_page_count(), 2);
+        memory.map_bytes(0x3000, &[0x33; 4096]);
+        runtime.sync_new_pages_to_flat(&memory);
+        assert_eq!(runtime.synced_page_count(), 3);
+        assert_eq!(
+            memory.canonical_store().materialisation_count(),
+            3,
+            "incremental sync must not rematerialise existing pages"
+        );
+
+        // These back-compatibility entry points are deliberate no-ops: a
+        // write through either view is already visible through the other.
+        runtime.sync_flat_to_memory(0x1000, &mut memory, 8);
+        runtime.sync_all_flat_to_memory(&mut memory);
+        runtime.sync_synced_flat_to_memory(&mut memory);
+        assert_eq!(memory.read_u8(0x1000).unwrap(), 0x11);
+        assert_eq!(memory.read_u8(0x2000).unwrap(), 0x22);
+        assert_eq!(memory.read_u8(0x3000).unwrap(), 0x33);
+        assert_eq!(memory.canonical_store().materialisation_count(), 3);
+    }
+
+    #[test]
+    fn sigbus_handler_services_flat_fault_without_copying_or_corrupting() {
+        let _guard = SIGBUS_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x7000, &[0x5A; 4096]);
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        runtime.sync_all_pages_to_flat(&memory);
+        runtime.install_sigbus_handler(&memory);
+
+        // SAFETY: `siginfo_t` is zero-initialised and only public fields are
+        // set.  The handler is called directly (not from a real signal) with a
+        // flat-window address that is fully committed.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            info.si_signo = libc::SIGBUS;
+            info.si_addr = (runtime.flat_memory.base() + 0x7000) as *mut c_void;
+            sigbus_sa_handler(libc::SIGBUS, &mut info, std::ptr::null_mut());
+        }
+
+        assert_eq!(
+            memory.read_u8(0x7000).unwrap(),
+            0x5A,
+            "the fallback must preserve committed bytes"
+        );
+        assert!(runtime.flat_memory.is_page_materialised(0x7000));
+        assert_eq!(SIGBUS_HANDLER_DEPTH.load(Ordering::Relaxed), 0);
+        assert!(!SIGBUS_IN_HANDLER.load(Ordering::Acquire));
+        runtime.remove_sigbus_handler();
+        assert!(SIGBUS_JIT_RUNTIME.load(Ordering::Acquire).is_null());
+        assert!(SIGBUS_JIT_MEMORY.load(Ordering::Acquire).is_null());
     }
 }
 
@@ -11295,6 +11902,113 @@ mod production_safety_tests {
             jit_execution_available()
         );
     }
+
+    #[test]
+    fn jit_block_and_interpreter_store_never_observe_a_stale_canonical_page() {
+        if skip_without_capability(
+            "jit_block_and_interpreter_store_never_observe_a_stale_canonical_page",
+        ) {
+            return;
+        }
+        let address = 0x2_0000_u64;
+        let load_site = 0x3_0000_u64;
+        let store_site = 0x4_0000_u64;
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(address, &[0_u8; 16]);
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        runtime.sync_all_pages_to_flat(&memory);
+
+        assert!(
+            Arc::ptr_eq(runtime.flat_memory.store(), memory.canonical_store()),
+            "the JIT flat view must alias the image's canonical store"
+        );
+        assert_eq!(
+            runtime.flat_memory.base(),
+            memory.canonical_store().flat_base(),
+            "both views must share the same 4 GiB mapping"
+        );
+        assert_eq!(memory.canonical_store().materialisation_count(), 1);
+
+        // Direct JIT-view store → interpreter read, with no sync call.
+        // SAFETY: the page is committed, aligned and inside the shared map.
+        unsafe {
+            ptr::write_volatile(
+                (runtime.flat_memory.base() as *mut u64).add((address / 8) as usize),
+                0x1111_2222_3333_4444,
+            );
+        }
+        assert_eq!(memory.read_u64(address).unwrap(), 0x1111_2222_3333_4444);
+
+        // Interpreter store → direct JIT-view read, with no sync call.
+        memory.write_u64(address, 0x5555_6666_7777_8888);
+        // SAFETY: same canonical page as above.
+        let flat_value = unsafe {
+            ptr::read_volatile(
+                (runtime.flat_memory.base() as *const u64).add((address / 8) as usize),
+            )
+        };
+        assert_eq!(flat_value, 0x5555_6666_7777_8888);
+
+        let operand = crate::cpu::MemoryOperand {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0,
+            rip_relative: false,
+            rip_base: 0,
+            segment: None,
+            address_size_32: false,
+            absolute_address: Some(address),
+        };
+        let load_ir = vec![IrInstruction::LoadMemory {
+            dst: Register::Rax,
+            address: operand.clone(),
+            width: 8,
+        }];
+        runtime
+            .get_or_compile(&load_ir, load_site, GuestArch::X64, None)
+            .expect("compile canonical load block");
+        let mut state = CpuState::new(GuestArch::X64);
+        let reason = execute_cached(&mut runtime, load_site, &mut state, &mut memory);
+        assert!(matches!(reason, JitExitReason::Normal { .. }));
+        assert_eq!(
+            state.get(Register::Rax),
+            0x5555_6666_7777_8888,
+            "the compiled block must see the interpreter's store immediately"
+        );
+
+        // A later interpreter store is visible to the next block execution
+        // without an explicit sync.
+        memory.write_u64(address, 0x9999_AAAA_BBBB_CCCC);
+        state.set(Register::Rax, 0);
+        let reason = execute_cached(&mut runtime, load_site, &mut state, &mut memory);
+        assert!(matches!(reason, JitExitReason::Normal { .. }));
+        assert_eq!(state.get(Register::Rax), 0x9999_AAAA_BBBB_CCCC);
+
+        // Compiled store → interpreter read, with no write-back pass.
+        let store_ir = vec![IrInstruction::StoreMemory {
+            src: Register::Rcx,
+            address: operand,
+            width: 8,
+        }];
+        runtime
+            .get_or_compile(&store_ir, store_site, GuestArch::X64, None)
+            .expect("compile canonical store block");
+        state.set(Register::Rcx, 0xDDDD_EEEE_FFFF_0001);
+        let reason = execute_cached(&mut runtime, store_site, &mut state, &mut memory);
+        assert!(matches!(reason, JitExitReason::Normal { .. }));
+        assert_eq!(
+            memory.read_u64(address).unwrap(),
+            0xDDDD_EEEE_FFFF_0001,
+            "the interpreter must see the compiled block's store immediately"
+        );
+
+        assert_eq!(
+            memory.canonical_store().materialisation_count(),
+            1,
+            "JIT execution must never materialise an already-committed page"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11658,7 +12372,7 @@ mod coverage_adversarial_tests {
         assert_eq!(tier1.guest_address, 0x1000);
         assert_eq!(tier1.instruction_count, 3);
         assert_ne!(tier1.source_hash, 0);
-        assert_ne!(tier1.entry as usize, 0);
+        assert_ne!(tier1.entry() as usize, 0);
         let tier2 = compiler
             .compile_tier2(&ir, 0x2000, GuestArch::X64, None)
             .expect("tier2 compile");
@@ -12596,5 +13310,441 @@ mod coverage_adversarial_tests {
         write_diag_file("fault-chain: second");
         let after = std::fs::read_to_string(path).expect("diagnostic file must be readable");
         assert_eq!(after, "torn faultfault-chain: first\nfault-chain: second\n");
+    }
+
+    #[test]
+    fn constant_fold_drops_overwritten_mov_imm_but_keeps_read_values() {
+        use crate::cpu::{IrInstruction, Register};
+        // A long chain of overwritten MOV immediates collapses to the last
+        // write: every earlier value is unread and must be dropped.
+        let chain: Vec<IrInstruction> = (1..=128u64)
+            .map(|value| IrInstruction::MovImm {
+                dst: Register::Rax,
+                value,
+            })
+            .collect();
+        let folded = JitCompiler::constant_fold(&chain);
+        assert_eq!(
+            folded,
+            vec![IrInstruction::MovImm {
+                dst: Register::Rax,
+                value: 128
+            }],
+            "an unread MOV chain must collapse to its final write"
+        );
+        // A value read between writes is not dropped: the first write folds
+        // into the reader, and the later overwrite remains.
+        let interleaved = vec![
+            IrInstruction::MovImm {
+                dst: Register::Rax,
+                value: 7,
+            },
+            IrInstruction::MovReg {
+                dst: Register::Rcx,
+                src: Register::Rax,
+                width: 8,
+            },
+            IrInstruction::MovImm {
+                dst: Register::Rax,
+                value: 9,
+            },
+        ];
+        let folded = JitCompiler::constant_fold(&interleaved);
+        assert_eq!(
+            folded,
+            vec![
+                IrInstruction::MovImm {
+                    dst: Register::Rax,
+                    value: 7
+                },
+                IrInstruction::MovImm {
+                    dst: Register::Rcx,
+                    value: 7
+                },
+                IrInstruction::MovImm {
+                    dst: Register::Rax,
+                    value: 9
+                },
+            ],
+            "a read value must be preserved even when the register is overwritten"
+        );
+    }
+    #[test]
+    fn guest_slice_memory_false_sharing_race_merges_and_publishes() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &[0_u8; 0x1000]);
+        let view = GuestSliceMemory::new(&memory, BTreeSet::new());
+        let base = 0x1000_u64;
+        std::thread::scope(|scope| {
+            for index in 0..4_u8 {
+                let view = &view;
+                scope.spawn(move || {
+                    let pattern = [index.wrapping_add(1), 0xF0_u8.wrapping_add(index)];
+                    for _ in 0..1_000 {
+                        view.store(base + u64::from(index) * 2, &pattern)
+                            .expect("the page is fully mapped");
+                    }
+                });
+            }
+        });
+        let word = view.load(base, 8).expect("mapped");
+        assert_eq!(
+            word.to_le_bytes(),
+            [1, 0xF0, 2, 0xF1, 3, 0xF2, 4, 0xF3],
+            "coincident sub-word stores must preserve every neighbour"
+        );
+
+        let published = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let view = &view;
+            let published = &published;
+            scope.spawn(move || {
+                view.store(base + 8, &0xA5A5_5A5A_DEAD_BEEF_u64.to_le_bytes())
+                    .expect("mapped");
+                published.store(true, std::sync::atomic::Ordering::Release);
+            });
+            while !published.load(std::sync::atomic::Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            assert_eq!(
+                view.load(base + 8, 8).expect("mapped"),
+                0xA5A5_5A5A_DEAD_BEEF,
+                "a published store must be visible to another worker"
+            );
+        });
+
+        assert_eq!(
+            view.load(0x9000, 8)
+                .expect_err("an unmapped page must fault")
+                .address,
+            0x9000
+        );
+        let store_fault = view
+            .store(0x9000, &[0x11, 0x22])
+            .expect_err("an unmapped store must fault");
+        assert_eq!((store_fault.address, store_fault.write), (0x9000, true));
+
+        let code_view = GuestSliceMemory::new(&memory, BTreeSet::from([0x1000]));
+        assert_eq!(code_view.store(base, &[0x33]).expect("mapped"), true);
+        assert_eq!(code_view.take_code_writes(), vec![(base, 1)]);
+    }
+
+    #[test]
+    fn jit_compare_jump_stale_flag_race_is_exact_for_slice_loops() {
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        let mut runtime = JitRuntime::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        runtime.attach_guest_memory(&mut memory);
+        let ir = vec![
+            IrInstruction::SubImm {
+                dst: Register::Rcx,
+                value: 1,
+                width: 4,
+            },
+            IrInstruction::Compare {
+                lhs: crate::cpu::CompareOperand::Register(Register::Rcx),
+                rhs: crate::cpu::CompareOperand::ImmediateU64(0),
+                width: 4,
+            },
+            IrInstruction::JumpIf {
+                condition: ConditionCode::NotEqual,
+                target: 0x1000,
+                fallthrough: 0x1006,
+            },
+        ];
+        let block = runtime
+            .get_or_compile_slice_block(&ir, 0x1000, GuestArch::X86)
+            .expect("compile slice loop")
+            .clone();
+        let view = Arc::new(GuestSliceMemory::new(&memory, BTreeSet::new()));
+        let program = GuestSliceProgram {
+            blocks: HashMap::from([(0x1000, block)]),
+            flat_base: view.flat_base(),
+            memory: view,
+            mechanism: runtime.compiler.memory_manager.mechanism(),
+        };
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rcx, 3);
+        let mut taken = Vec::new();
+        for _ in 0..4 {
+            let mut exit_slot = [u64::MAX, program.flat_base];
+            let outcome = unsafe {
+                execute_slice_block(
+                    &program,
+                    &program.blocks[&0x1000],
+                    &mut state,
+                    &mut exit_slot,
+                )
+            };
+            match outcome.reason {
+                JitExitReason::ConditionalBranch {
+                    taken: branch_taken,
+                    ..
+                } => taken.push(branch_taken),
+                other => panic!("expected conditional branch, got {other:?}"),
+            }
+        }
+        assert_eq!(taken, vec![true, true, false, true]);
+        assert_eq!(state.get(Register::Rcx), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn jit_worker_slice_store_flag_and_unmapped_fault_are_exact() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &[0u8; 0x1000]);
+        memory.map_bytes(0x2000, &[0u8; 0x1000]);
+        let view = GuestSliceMemory::new(&memory, BTreeSet::from([0x1000]));
+        let mut state = CpuState::new(GuestArch::X64);
+
+        {
+            let guard = WorkerSliceGuard::install(&view);
+            // SAFETY: `state` and `view` outlive the call; the canonical store
+            // is alive for the guard's lifetime and the address is mapped.
+            unsafe {
+                jit_helper_store(&mut state, ptr::null_mut(), 0x2000, 0x11, 1);
+            }
+            assert_eq!(guard.code_written(), false);
+            unsafe {
+                jit_helper_store(&mut state, ptr::null_mut(), 0x1000, 0xAB, 1);
+            }
+            assert_eq!(guard.code_written(), true);
+            assert_eq!(state.jit_pending_fault, None);
+        }
+        assert_eq!(view.take_code_writes(), vec![(0x1000, 1)]);
+
+        {
+            let guard = WorkerSliceGuard::install(&view);
+            // SAFETY: same contract as above; 0x9000 is deliberately unmapped
+            // so the helper must report the exact write fault through state.
+            unsafe {
+                jit_helper_store(&mut state, ptr::null_mut(), 0x9000, 0xCD, 2);
+            }
+            assert_eq!(state.jit_pending_fault, Some(0x9000));
+            assert_eq!(state.jit_pending_fault_write, true);
+            assert_eq!(guard.code_written(), false);
+        }
+    }
+
+    #[test]
+    fn jit_worker_slice_load_success_and_fault_are_exact() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &[0u8; 0x1000]);
+        let view = GuestSliceMemory::new(&memory, BTreeSet::new());
+        let mut state = CpuState::new(GuestArch::X64);
+        {
+            let guard = WorkerSliceGuard::install(&view);
+            // SAFETY: `state` and `view` outlive the call and the address is
+            // mapped in the canonical store.
+            let value = unsafe { jit_helper_load(&mut state, ptr::null_mut(), 0x1000, 8) };
+            assert_eq!(value, 0);
+            assert_eq!(state.jit_pending_fault, None);
+            // SAFETY: same contract; 0x9000 is unmapped so the helper must
+            // report a read fault instead of fabricating a zero.
+            let faulted = unsafe { jit_helper_load(&mut state, ptr::null_mut(), 0x9000, 4) };
+            assert_eq!(faulted, 0);
+            assert_eq!(state.jit_pending_fault, Some(0x9000));
+            assert_eq!(state.jit_pending_fault_write, false);
+            assert_eq!(guard.code_written(), false);
+        }
+    }
+
+    #[test]
+    fn jit_worker_slice_null_memory_store_without_guard_is_dropped() {
+        let mut state = CpuState::new(GuestArch::X64);
+        assert_eq!(worker_slice_memory().is_none(), true);
+        // SAFETY: both pointers are null and no worker slice is installed; the
+        // helper must return without dereferencing either pointer.
+        unsafe {
+            jit_helper_store(&mut state, ptr::null_mut(), 0x1000, 0x55, 8);
+        }
+        assert_eq!(state.jit_pending_fault, None);
+        assert_eq!(state.jit_pending_fault_write, false);
+    }
+
+    #[test]
+    fn guest_slice_memory_boundary_overflow_and_empty_range_faults_are_exact() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &[0u8; 0x1000]);
+        let view = GuestSliceMemory::new(&memory, BTreeSet::new());
+
+        assert_eq!(view.range_available(0x1000, 0), false);
+        assert_eq!(view.load(0x1000, 8).expect("one mapped page"), 0);
+        assert_eq!(view.load(0x1004, 4).expect("unaligned mapped load"), 0);
+        assert_eq!(view.load(0x1002, 4).expect("word-crossing mapped load"), 0);
+        assert_eq!(
+            view.load(0x1000, 0)
+                .expect_err("zero-length load must fault"),
+            GuestMemoryFault {
+                address: 0x1000,
+                write: false,
+                read_len: 0,
+            }
+        );
+        assert_eq!(
+            view.store(0x1000, &[])
+                .expect_err("zero-length store must fault"),
+            GuestMemoryFault {
+                address: 0x1000,
+                write: true,
+                read_len: 0,
+            }
+        );
+        assert_eq!(
+            view.load(u64::MAX - 3, 8)
+                .expect_err("overflowing address range must fault"),
+            GuestMemoryFault {
+                address: u64::MAX - 3,
+                write: false,
+                read_len: 8,
+            }
+        );
+        assert_eq!(
+            view.load(0x1_0000_0000, 8)
+                .expect_err("range beyond the flat window must fault"),
+            GuestMemoryFault {
+                address: 0x1_0000_0000,
+                write: false,
+                read_len: 8,
+            }
+        );
+        assert_eq!(
+            view.load(0x1FFC, 8)
+                .expect_err("range crossing into an unmapped page must fault"),
+            GuestMemoryFault {
+                address: 0x2000,
+                write: false,
+                read_len: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn sigbus_partial_page_tail_mapping_fallback_is_exact() {
+        let runtime = JitRuntime::new(GuestArch::X64);
+        let mut tail = MemoryImage::default();
+        tail.map_bytes(0x1FFF, &[0x5A]);
+        assert_eq!(tail.page_is_fully_mapped(0x1000), false);
+        assert_eq!(tail.page_exists(0x1000), true);
+        assert_eq!(tail.page_byte_is_mapped(0x1000, 0), false);
+        assert_eq!(tail.page_byte_is_mapped(0x1000, 4095), true);
+        let mut interior = MemoryImage::default();
+        interior.map_bytes(0x1001, &[0x00]);
+        assert_eq!(interior.page_exists(0x1000), true);
+        assert_eq!(interior.page_byte_is_mapped(0x1000, 0), false);
+        assert_eq!(interior.page_byte_is_mapped(0x1000, 4095), false);
+        let mut flat = vec![0u8; 0x2000];
+        let before = SIGBUS_PAGE_NOT_FOUND.load(Ordering::Relaxed);
+        service_faulting_page(&runtime, &tail, 0x1000, flat.as_mut_ptr(), flat.len());
+        service_faulting_page(&runtime, &interior, 0x1000, flat.as_mut_ptr(), flat.len());
+        assert_eq!(SIGBUS_PAGE_NOT_FOUND.load(Ordering::Relaxed), before + 2);
+    }
+
+    #[test]
+    fn execute_slice_block_stale_null_entry_falls_back_to_safepoint() {
+        let mut runtime = capable_runtime();
+        let mut block = runtime
+            .get_or_compile_slice_block(&[IrInstruction::Nop], 0x7000, GuestArch::X64)
+            .expect("compile slice block")
+            .clone();
+        assert_eq!(block.published_entry().is_null(), false);
+        block.entry_atomic.store(ptr::null_mut(), Ordering::Release);
+        assert_eq!(block.published_entry().is_null(), true);
+
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x7000, &[0u8; 0x1000]);
+        let view = Arc::new(GuestSliceMemory::new(&memory, BTreeSet::new()));
+        let program = GuestSliceProgram {
+            blocks: HashMap::from([(0x7000, block)]),
+            flat_base: view.flat_base(),
+            memory: view,
+            mechanism: runtime.compiler.memory_manager.mechanism(),
+        };
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut exit_slot = [u64::MAX, program.flat_base];
+        assert_eq!(program.block(0x7000).is_some(), true);
+        assert_eq!(program.block(0x7001).is_none(), true);
+        let outcome = unsafe {
+            execute_slice_block(
+                &program,
+                &program.blocks[&0x7000],
+                &mut state,
+                &mut exit_slot,
+            )
+        };
+        assert_eq!(outcome.reason, JitExitReason::Safepoint);
+        assert_eq!(outcome.final_block, 0x7000);
+        assert_eq!(state.jit_pending_fault, None);
+    }
+
+    #[test]
+    fn jit_slice_block_cache_clear_drops_worker_blocks() {
+        let mut runtime = capable_runtime();
+        let block = runtime
+            .get_or_compile_slice_block(&[IrInstruction::Nop], 0x7100, GuestArch::X64)
+            .expect("compile slice block");
+        assert_eq!(block.worker_safe, true);
+        assert_eq!(runtime.slice_block(0x7100).is_some(), true);
+        runtime.clear_slice_blocks();
+        assert_eq!(runtime.slice_block(0x7100).is_none(), true);
+        assert_eq!(runtime.slice_block_cache.is_empty(), true);
+        let memory = MemoryImage::default();
+        let program = runtime.build_slice_program(&memory);
+        assert_eq!(program.flat_base, program.memory.flat_base());
+        assert_eq!(program.flat_base == 0, false);
+        assert_eq!(program.blocks.is_empty(), true);
+    }
+
+    #[test]
+    fn worker_safe_classification_rejects_host_barriers_and_helper_fallback() {
+        assert_eq!(block_is_worker_safe(&[IrInstruction::Nop], true), false);
+        assert_eq!(block_is_worker_safe(&[IrInstruction::Cpuid], false), false);
+        assert_eq!(
+            block_is_worker_safe(
+                &[IrInstruction::Call {
+                    target: 0x1000,
+                    return_address: 0x1005,
+                }],
+                false,
+            ),
+            false
+        );
+        assert_eq!(
+            block_is_worker_safe(
+                &[IrInstruction::CallRegister {
+                    src: Register::Rax,
+                    return_address: 0x1005,
+                }],
+                false,
+            ),
+            false
+        );
+        assert_eq!(
+            block_is_worker_safe(&[IrInstruction::Return { stack_adjust: 0 }], false),
+            false
+        );
+        assert_eq!(
+            block_is_worker_safe(
+                &[
+                    IrInstruction::MovImm {
+                        dst: Register::Rax,
+                        value: 1,
+                    },
+                    IrInstruction::Nop,
+                ],
+                false,
+            ),
+            true
+        );
+        assert_eq!(
+            block_is_worker_safe(
+                &[IrInstruction::JumpIf {
+                    condition: ConditionCode::Equal,
+                    target: 0x1000,
+                    fallthrough: 0x1006,
+                }],
+                false,
+            ),
+            true
+        );
     }
 }

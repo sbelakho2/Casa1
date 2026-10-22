@@ -6,19 +6,18 @@ use crate::reason::ReasonCode;
 pub use crate::runtime::object_manager::ObjectType;
 use crate::runtime::object_manager::{
     DirectorySearchObject, EventObject, FileHandleObject, FileObject, IoCompletionPortObject,
-    KernelObject, KeyObject, MutexObject, NamedPipeState, ObjectId, ObjectManager, PipeObject,
-    ProcessObject, SectionObject, SemaphoreObject, ThreadObject, TimerObject, WindowStationObject,
+    KernelObject, KeyObject, MutexObject, NamedPipeState, ObjectId, ObjectManager, PayloadLock,
+    PipeObject, ProcessObject, SectionObject, SemaphoreObject, ThreadObject, TimerObject,
+    WindowStationObject,
 };
 use crate::runtime::process::{GuestProcess, allocate_guest_pid};
 use crate::vm::{VmProtection, VmRegionKind, VmState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1642,7 +1641,7 @@ impl Win32Subsystem {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::File(file) => {
-                let file = file.borrow();
+                let file = file.lock_payload();
                 Ok(FileHandleState {
                     normalized_path: file.normalized_path.clone(),
                     position: file.position,
@@ -1711,7 +1710,7 @@ impl Win32Subsystem {
             return (handle, true);
         }
 
-        let event = Rc::new(RefCell::new(EventObject {
+        let event = Arc::new(Mutex::new(EventObject {
             manual_reset,
             signaled: initial_state,
         }));
@@ -2027,7 +2026,7 @@ impl Win32Subsystem {
             _ => return invalid_handle("handle is not an event"),
         }
         match &entry.object {
-            KernelObject::Event(event) => Ok(event.borrow().signaled),
+            KernelObject::Event(event) => Ok(event.lock_payload().signaled),
             _ => invalid_handle("handle is not an event"),
         }
     }
@@ -2963,7 +2962,7 @@ impl Win32Subsystem {
                 ObjectType::File,
                 granted_access,
                 inheritable,
-                KernelObject::File(Rc::new(RefCell::new(FileObject {
+                KernelObject::File(Arc::new(Mutex::new(FileObject {
                     normalized_path,
                     host_path,
                     ge_handle,
@@ -3145,7 +3144,7 @@ impl Win32Subsystem {
             ObjectType::File,
             granted_access,
             inheritable,
-            KernelObject::File(Rc::new(RefCell::new(FileObject {
+            KernelObject::File(Arc::new(Mutex::new(FileObject {
                 normalized_path,
                 host_path,
                 ge_handle,
@@ -3190,7 +3189,7 @@ impl Win32Subsystem {
         // entry so the manager refcount can be decremented).
         if let KernelObject::File(file) = &object {
             let ge_handle = if last_handle {
-                file.borrow().ge_handle.clone()
+                file.lock_payload().ge_handle.clone()
             } else {
                 None
             };
@@ -3198,7 +3197,7 @@ impl Win32Subsystem {
                 self.ge.close_file_handle(&ge_handle)?;
             }
             let (delete_on_close, normalized_path, host_path) = {
-                let file = file.borrow();
+                let file = file.lock_payload();
                 (
                     file.delete_on_close,
                     file.normalized_path.clone(),
@@ -3444,7 +3443,7 @@ impl Win32Subsystem {
                 let (data, read_path) = (|| -> AppResult<(Vec<u8>, String)> {
                     let mut entry = self.handle_entry_mut(handle)?;
                     if let KernelObject::File(file) = &mut entry.object {
-                        let mut file = file.borrow_mut();
+                        let mut file = file.lock_payload();
                         let path_display = file.host_path.display().to_string();
                         let position = file.position;
                         if let Some(host_file) = file.host_file.as_mut() {
@@ -3556,7 +3555,7 @@ impl Win32Subsystem {
                 let (normalized_path, host_path) = {
                     let mut entry = self.handle_entry_mut(handle)?;
                     if let KernelObject::File(file) = &mut entry.object {
-                        let mut file = file.borrow_mut();
+                        let mut file = file.lock_payload();
                         let path_display = file.host_path.display().to_string();
                         let pos = file.position;
                         if let Some(host_file) = file.host_file.as_mut() {
@@ -3715,7 +3714,7 @@ impl Win32Subsystem {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::File(file) => {
-                let file = file.borrow();
+                let file = file.lock_payload();
                 if file.host_path.is_dir() {
                     return invalid_handle("handle is not a file");
                 }
@@ -3752,7 +3751,7 @@ impl Win32Subsystem {
         Self::require_access(&entry, FILE_READ_ATTRIBUTES)?;
         match &entry.object {
             KernelObject::File(file) => {
-                let file = file.borrow();
+                let file = file.lock_payload();
                 fs::metadata(&file.host_path)
                     .map(|metadata| metadata.len())
                     .map_err(|error| {
@@ -3790,7 +3789,7 @@ impl Win32Subsystem {
         let mut entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::File(file) => {
-                let mut file = file.borrow_mut();
+                let mut file = file.lock_payload();
                 let next = match origin {
                     SeekOrigin::Begin => distance as i128,
                     // i128 intermediate so a position near u64::MAX cannot
@@ -3833,7 +3832,7 @@ impl Win32Subsystem {
             let mut entry = self.handle_entry_mut(handle)?;
             match &mut entry.object {
                 KernelObject::File(file) => {
-                    let mut file = file.borrow_mut();
+                    let mut file = file.lock_payload();
                     let position = file.position;
                     if let Some(host_file) = file.host_file.as_mut() {
                         host_file.set_len(position).map_err(|error| {
@@ -3973,7 +3972,7 @@ impl Win32Subsystem {
             let entry = self.handle_entry(handle)?;
             match &entry.object {
                 KernelObject::File(file) => {
-                    let file = file.borrow();
+                    let file = file.lock_payload();
                     (file.normalized_path.clone(), file.host_path.clone())
                 }
                 _ => return invalid_handle("handle is not a file"),
@@ -4051,7 +4050,7 @@ impl Win32Subsystem {
         let normalized_path = {
             let entry = self.handle_entry(handle)?;
             match &entry.object {
-                KernelObject::File(file) => file.borrow().normalized_path.clone(),
+                KernelObject::File(file) => file.lock_payload().normalized_path.clone(),
                 _ => return invalid_handle("handle is not a file"),
             }
         };
@@ -4221,7 +4220,7 @@ impl Win32Subsystem {
         // removal) does not double-delete.
         for (_, object) in self.objects.objects_iter_mut() {
             if let KernelObject::File(file) = object {
-                let mut file = file.borrow_mut();
+                let mut file = file.lock_payload();
                 if file.normalized_path == normalized_path {
                     file.delete_pending = true;
                 }
@@ -4439,7 +4438,7 @@ impl Win32Subsystem {
         event_handle: Option<Handle>,
     ) -> AppResult<OverlappedResult> {
         let file = self.file_object(handle)?;
-        let file = file.borrow();
+        let file = file.lock_payload();
         let bytes = fs::read(&file.host_path).map_err(|error| {
             AppError::from_io(
                 ReasonCode::RcIo,
@@ -4476,7 +4475,7 @@ impl Win32Subsystem {
         event_handle: Option<Handle>,
     ) -> AppResult<(OverlappedResult, Vec<u8>)> {
         let file = self.file_object(handle)?;
-        let file = file.borrow();
+        let file = file.lock_payload();
         let bytes = fs::read(&file.host_path).map_err(|error| {
             AppError::from_io(
                 ReasonCode::RcIo,
@@ -4516,7 +4515,7 @@ impl Win32Subsystem {
     ) -> AppResult<OverlappedResult> {
         let (normalized_path, host_path) = {
             let file = self.file_object(handle)?;
-            let file = file.borrow();
+            let file = file.lock_payload();
             let mut contents = if file.host_path.exists() {
                 fs::read(&file.host_path).map_err(|error| {
                     AppError::from_io(
@@ -6443,6 +6442,10 @@ impl Win32Subsystem {
     pub fn set_thread_exit_code_by_id(&mut self, thread_id: u32, exit_code: u32) -> AppResult<()> {
         self.ensure_thread_state(thread_id);
         self.thread_state_mut(thread_id)?.exit_code = Some(exit_code);
+        // Wake production-scheduled waits on this thread's kernel object (a
+        // join parked on a native worker learns about every exit source,
+        // including TerminateThread).
+        crate::runtime::scheduler::notify_thread_exit(thread_id);
         // Windows mutex semantics: a thread that terminates while owning a
         // mutex abandons it — the next successful waiter receives
         // WAIT_ABANDONED and takes ownership.
@@ -7405,7 +7408,7 @@ impl Win32Subsystem {
     fn file_object(&self, handle: Handle) -> AppResult<FileHandleObject> {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
-            KernelObject::File(file) => Ok(Rc::clone(file)),
+            KernelObject::File(file) => Ok(Arc::clone(file)),
             _ => invalid_handle("handle is not a file"),
         }
     }
@@ -10274,5 +10277,189 @@ mod tests {
             "SetEndOfFile on a non-file handle must be ERROR_INVALID_HANDLE"
         );
         win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn win32_directory_handle_rejects_invalid_backup_semantics() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "win32-dir-hnd", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        win32
+            .create_directory_w("C:\\dir-handle")
+            .expect("create directory");
+
+        let err = win32
+            .create_file_w(
+                "C:\\dir-handle",
+                FileAccess::read_only(),
+                ShareMode::all(),
+                CreationDisposition::OpenExisting,
+                false,
+                false,
+                false,
+            )
+            .expect_err("a directory handle without backup semantics must fail");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcIo,
+            "missing FILE_FLAG_BACKUP_SEMANTICS must be a directory-handle error"
+        );
+
+        let err = win32
+            .create_file_w(
+                "C:\\dir-handle",
+                FileAccess::read_only(),
+                ShareMode::all(),
+                CreationDisposition::CreateNew,
+                false,
+                false,
+                true,
+            )
+            .expect_err("creating an existing directory must fail");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcIo,
+            "CreateNew on an existing directory must be a directory-handle error"
+        );
+
+        let handle = win32
+            .create_file_w(
+                "C:\\dir-handle",
+                FileAccess::read_only(),
+                ShareMode::all(),
+                CreationDisposition::OpenExisting,
+                false,
+                false,
+                true,
+            )
+            .expect("directory handle with backup semantics");
+        let info = win32
+            .get_file_information_by_handle_ex(handle)
+            .expect("directory handle information");
+        assert_eq!(info.normalized_path, "C:\\dir-handle");
+        assert!(
+            info.is_directory,
+            "the handle state must report a directory"
+        );
+        win32.close_handle(handle).expect("close directory handle");
+    }
+
+    #[test]
+    fn win32_set_file_time_stale_handle_reports_missing_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "win32-stale-time",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let path = "C:\\stale-time.txt";
+        let handle = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        let host_path = win32
+            .guest_path_to_host_path(path)
+            .expect("resolve host path");
+        fs::remove_file(&host_path).expect("remove backing file");
+
+        let err = win32
+            .set_file_time(handle, Some(0), None, None)
+            .expect_err("a stale file handle must not update times");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcFsNotFound,
+            "a missing backing file must be ERROR_FILE_NOT_FOUND"
+        );
+        let _ = win32.close_handle(handle);
+    }
+
+    #[test]
+    fn win32_read_file_overlapped_full_missing_host_file_is_io_error() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "win32-stale-read",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let path = "C:\\stale-read.bin";
+        let handle = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                true,
+                false,
+            )
+            .expect("create file");
+        win32.write_file(handle, b"body").expect("seed file");
+        let host_path = win32
+            .guest_path_to_host_path(path)
+            .expect("resolve host path");
+        fs::remove_file(&host_path).expect("remove backing file");
+
+        let err = win32
+            .read_file_overlapped_full(handle, 4, 0, None)
+            .expect_err("a missing backing file must fail the overlapped read");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcIo,
+            "a removed backing file must surface as an I/O error"
+        );
+        let _ = win32.close_handle(handle);
+    }
+
+    #[test]
+    fn win32_write_file_overlapped_overflow_offset_is_rejected() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "win32-write-offset",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let handle = win32
+            .create_file_w(
+                "C:\\write-offset.bin",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                true,
+                false,
+            )
+            .expect("create file");
+
+        let err = win32
+            .write_file_overlapped(handle, b"x", u64::MAX, None)
+            .expect_err("an overflowing write offset must be rejected");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcMemoryAccessViolation,
+            "an offset above isize::MAX must be a memory-access violation"
+        );
+        assert_eq!(
+            err.message, "file write offset is too large",
+            "the overflow rejection must name the offending offset"
+        );
+        let _ = win32.close_handle(handle);
     }
 }

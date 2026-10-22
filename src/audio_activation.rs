@@ -35,18 +35,40 @@
 //!   activated interface (after AddRef).  Before the completion is delivered
 //!   `GetActivateResult` returns `E_ILLEGAL_METHOD_CALL`; a second call after
 //!   a successful read is rejected the same way.
+//! - `IActivateAudioInterfaceAsyncOperation` has exactly the four Windows
+//!   slots: `QueryInterface`, `AddRef`, `Release`, `GetActivateResult`.
+//!   There is deliberately **no `CancelActivation` method** — the Windows
+//!   contract never exposed cancellation on this interface (unlike
+//!   `IAsyncAction`), so the vtable has no fifth slot and no thunk.  A guest
+//!   that calls through slot 4 calls whatever follows the object's vtable in
+//!   guest memory, never an emulator cancellation path; a `QueryInterface`
+//!   for a cancellation IID returns `E_NOINTERFACE`.  The pending completion
+//!   reference keeps the operation alive until the handler returns, and
+//!   `Release` before completion (guest reference drop) does not invalidate
+//!   the completion: the completion still delivers the operation object and
+//!   `GetActivateResult` reports the real result exactly once.  Concurrent
+//!   completion/Release is serialized by the operation lifecycle lock, so a
+//!   late release is a no-op instead of a use-after-free or double drop.
 //! - `Initialize` with `AUDCLNT_STREAMFLAGS_LOOPBACK` on a RENDER endpoint
 //!   turns the client into a loopback capture client: `GetService(
-//!   IID_IAudioCaptureClient)` then hands out the render stream's recently
-//!   played frames (the same f32 frames released through the real render
-//!   client, converted to the capture format) from a per-device history.
-//!   With no render stream active the capture clock paces real silent
-//!   packets flagged `AUDCLNT_BUFFERFLAGS_SILENT`.  Loopback requested on a
-//!   genuine capture endpoint is `AUDCLNT_E_WRONG_ENDPOINT_TYPE`; loopback +
-//!   exclusive mode is `AUDCLNT_E_INVALID_STREAM_FLAG` (loopback is a
-//!   shared-mode path).  Capture endpoints from the
-//!   `DEVINTERFACE_AUDIO_CAPTURE` activation path are real input endpoints
-//!   (`AudioDirection::Capture`).
+//!   IID_IAudioCaptureClient)` then hands out real system-output frames when
+//!   the host provides system capture (macOS CoreAudio process taps on
+//!   14.2+, ScreenCaptureKit as the probed alternative; see
+//!   [`crate::real_audio::system_loopback_capability`]).  The captured frames
+//!   are converted from the tap's real channel count/sample rate to the
+//!   client's initialized format, so a client at 44.1 kHz mono reads the
+//!   48 kHz stereo system mix correctly.  When the system capture is
+//!   unavailable, cannot start, or has no frames flowing, the existing
+//!   internal render history remains the fallback: frames released through
+//!   the runtime's own render clients are still captured; with no render
+//!   stream active the capture clock paces real silent packets flagged
+//!   `AUDCLNT_BUFFERFLAGS_SILENT`.  A running system tap with no audio
+//!   flowing also produces clock-paced silent packets, never stale frames
+//!   from a torn-down tap.  Loopback requested on a genuine capture endpoint
+//!   is `AUDCLNT_E_WRONG_ENDPOINT_TYPE`; loopback + exclusive mode is
+//!   `AUDCLNT_E_INVALID_STREAM_FLAG` (loopback is a shared-mode path).
+//!   Capture endpoints from the `DEVINTERFACE_AUDIO_CAPTURE` activation path
+//!   are real input endpoints (`AudioDirection::Capture`).
 //! - Exclusive mode is enforced client-side with the real device values:
 //!   the buffer duration is mandatory, at least the device minimum period
 //!   (cpal's supported buffer-size minimum) and at most the engine's
@@ -55,11 +77,16 @@
 //!   device format (channel count, sample rate, 32-bit float), because
 //!   exclusive mode forbids the shared-mode conversion path.  The cpal host
 //!   path additionally opens a private fixed-buffer stream at that exact
-//!   format.  What the host cannot provide is documented honestly: cpal does
-//!   not expose a portable "hardware exclusive" flag (on backends without
-//!   WASAPI exclusive support the stream is a private shared stream), the
-//!   negotiated hardware period may be coarser than the requested
-//!   `hnsPeriodicity`, and offload/bitstream exclusivity is not backed.
+//!   format.  On macOS the default output device is also put into CoreAudio
+//!   hog mode (`kAudioDevicePropertyHogMode`) and pinned to the exact nominal
+//!   sample rate and fixed buffer frame size; when another process owns hog
+//!   mode, the device cannot be hogged, or the rate cannot be pinned, the
+//!   real outcome is reported by the backend and the client-side contract is
+//!   enforced exactly as before.  What the host cannot provide is documented
+//!   honestly: non-default devices use the client-side contract (hog mode is
+//!   applied to the default output device), the negotiated hardware period
+//!   may be coarser than the requested `hnsPeriodicity`, and
+//!   offload/bitstream exclusivity is not backed.
 //! - Every activation outcome carries a real HRESULT: `S_OK` with the
 //!   activated endpoint object, `AUDCLNT_E_DEVICE_INVALIDATED` when the real
 //!   device list is genuinely empty or the requested endpoint does not exist,
@@ -75,6 +102,7 @@ use crate::audio::{SampleFormat, WaveFormat};
 use crate::real_audio::{RealAudioBackend, RealAudioDevice};
 use crate::runtime::HostThunk;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -363,6 +391,7 @@ pub(crate) fn push_activation_completion(pid: u32, completion: PendingActivation
 /// `IActivateAudioInterfaceAsyncOperation` object rather than the activated
 /// interface.
 pub(crate) fn pop_activation_completion(pid: u32) -> Option<PendingActivationCompletion> {
+    let _lifecycle = activation_lifecycle();
     let mut completion = {
         let mut pending = pending_locks();
         let queue = pending.get_mut(&pid)?;
@@ -373,7 +402,7 @@ pub(crate) fn pop_activation_completion(pid: u32) -> Option<PendingActivationCom
         completion
     }?;
     if let Some(operation) = pop_pending_operation(pid) {
-        complete_activation_operation(
+        complete_activation_operation_locked(
             pid,
             operation,
             completion.result_hr,
@@ -425,6 +454,16 @@ static ACTIVATION_OPERATIONS: LazyLock<
 static PENDING_OPERATIONS: LazyLock<Mutex<HashMap<u32, VecDeque<u64>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Serializes activation-operation completion against Release/GetActivateResult
+/// so a concurrent release can never tear the operation state mid-completion.
+static ACTIVATION_LIFECYCLE: Mutex<()> = Mutex::new(());
+
+fn activation_lifecycle() -> MutexGuard<'static, ()> {
+    ACTIVATION_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn operation_locks() -> MutexGuard<'static, HashMap<u32, BTreeMap<u64, ActivationOperationState>>> {
     ACTIVATION_OPERATIONS
         .lock()
@@ -469,7 +508,18 @@ fn pop_pending_operation(pid: u32) -> Option<u64> {
 }
 
 /// Mark an operation as completed with the real activation outcome.
+#[cfg(test)]
 pub(crate) fn complete_activation_operation(
+    pid: u32,
+    operation: u64,
+    result_hr: u32,
+    interface_object: u64,
+) {
+    let _lifecycle = activation_lifecycle();
+    complete_activation_operation_locked(pid, operation, result_hr, interface_object);
+}
+
+fn complete_activation_operation_locked(
     pid: u32,
     operation: u64,
     result_hr: u32,
@@ -491,6 +541,7 @@ pub(crate) fn complete_activation_operation(
 /// Before completion, and on every call after the first completed read, the
 /// documented `E_ILLEGAL_METHOD_CALL` is returned.
 pub(crate) fn operation_get_activate_result(pid: u32, operation: u64) -> Result<(u32, u64), u32> {
+    let _lifecycle = activation_lifecycle();
     let mut operations = operation_locks();
     let Some(state) = operations
         .get_mut(&pid)
@@ -530,20 +581,19 @@ pub(crate) fn activation_operation_interface(pid: u32, operation: u64) -> Option
 
 /// Drop the operation state of `operation` (called when the guest object's
 /// last reference is released).
+///
+/// The operation id stays in the activation-order queue as a tombstone until
+/// the matching completion is drained: a Release racing completion can never
+/// make the handler receive the activated endpoint instead of the operation
+/// object.  If the state is already gone, `GetActivateResult` on the
+/// delivered object reports `E_ILLEGAL_METHOD_CALL`; if the completion wins
+/// the race, the result is readable exactly once and a later Release is a
+/// no-op.
 pub(crate) fn release_activation_operation(pid: u32, operation: u64) {
-    let removed = operation_locks()
+    let _lifecycle = activation_lifecycle();
+    operation_locks()
         .get_mut(&pid)
-        .and_then(|operations| operations.remove(&operation))
-        .is_some();
-    if removed {
-        let mut pending = pending_operation_locks();
-        if let Some(queue) = pending.get_mut(&pid) {
-            queue.retain(|candidate| *candidate != operation);
-            if queue.is_empty() {
-                pending.remove(&pid);
-            }
-        }
-    }
+        .and_then(|operations| operations.remove(&operation));
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +885,162 @@ fn loopback_reset_cursor(pid: u32, key: &str) -> u64 {
     loopback_ring_info(pid, key)
         .map(|(_, end, _, _)| end)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// System-wide loopback — real host output capture with render-history fallback
+// ---------------------------------------------------------------------------
+//
+// A loopback capture client first tries the host's real system-output capture
+// (CoreAudio process tap / ScreenCaptureKit, capability-probed in
+// `real_audio`).  That source is global: it sees output from every process,
+// not just this runtime's render clients.  The internal render history above
+// remains the fallback when the host has no usable capture API, capture
+// creation/start fails (e.g. TCC denial), or the user forced it off with
+// `CASA1_SYSTEM_LOOPBACK=off`.
+//
+// Users are counted globally (one host capture session serves every loopback
+// client).  Teardown is generation-guarded in `real_audio`: the counter drops
+// to zero before the host stream is stopped, and stale callback frames from a
+// torn-down tap are rejected.
+
+/// Loopback clients currently holding the real system-output capture open.
+static SYSTEM_LOOPBACK_USERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the real system-output capture is currently in use.
+fn system_loopback_in_use() -> bool {
+    SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst) > 0
+}
+
+/// Take a reference on the real system-output capture, starting it for the
+/// first user.  Returns `false` when the host cannot provide it; the caller
+/// then keeps the internal render-history fallback.
+fn acquire_system_loopback() -> bool {
+    if SYSTEM_LOOPBACK_USERS.fetch_add(1, Ordering::SeqCst) > 0 {
+        return true;
+    }
+    let started = (|| {
+        let mut guard = audio_client_backend();
+        let backend = ensure_audio_client_backend(&mut guard)?;
+        match backend.start_system_loopback() {
+            Ok(_) => Some(()),
+            Err(error) => {
+                eprintln!(
+                    "[RealAudio] system loopback unavailable, using render history: {error:?}"
+                );
+                None
+            }
+        }
+    })();
+    if started.is_some() {
+        true
+    } else {
+        SYSTEM_LOOPBACK_USERS.fetch_sub(1, Ordering::SeqCst);
+        false
+    }
+}
+
+/// Drop a reference on the real system-output capture, stopping it when the
+/// last loopback client releases it.
+fn release_system_loopback_reference() {
+    if SYSTEM_LOOPBACK_USERS.fetch_sub(1, Ordering::SeqCst) == 1 {
+        let mut guard = audio_client_backend();
+        if let Some(backend) = guard.as_mut() {
+            backend.stop_system_loopback();
+        }
+    }
+}
+
+/// Real captured system frames available to a capture client, expressed in
+/// the client's own frame rate.
+fn system_loopback_available_for(state: &AudioClientState, capture_in_use: bool) -> u32 {
+    if !capture_in_use {
+        return 0;
+    }
+    let mut guard = audio_client_backend();
+    let Some(backend) = guard.as_mut() else {
+        return 0;
+    };
+    if !backend.system_loopback_running() {
+        return 0;
+    }
+    let (_, source_rate) = backend.system_loopback_format().unwrap_or((
+        state.device.channels.max(1),
+        state.device.sample_rate.max(1),
+    ));
+    let source_frames = backend.system_loopback_available_frames() as u64;
+    let capture_rate = state
+        .format
+        .as_ref()
+        .map(|format| format.sample_rate)
+        .unwrap_or(state.device.sample_rate)
+        .max(1);
+    let converted = source_frames.saturating_mul(capture_rate as u64) / source_rate.max(1) as u64;
+    converted.min(u32::MAX as u64) as u32
+}
+
+/// Convert interleaved f32 frames from the real system capture format to the
+/// capture client's initialized channel count and sample rate.
+///
+/// Channel mapping matches the render-history loopback path: identical counts
+/// copy through, mono capture averages the source channels, mono source fans
+/// out, and an unusual channel count copies the common prefix / zero-fills.
+/// Returns the output samples and the number of output frames that carried
+/// real source samples (0 means the packet is silent).
+fn convert_loopback_frames(
+    source: &[f32],
+    source_channels: u16,
+    source_rate: u32,
+    capture_channels: u16,
+    capture_rate: u32,
+    frames: u32,
+) -> (Vec<f32>, u32) {
+    let capture_channels = capture_channels.max(1) as usize;
+    let mut output = vec![0.0f32; frames as usize * capture_channels];
+    let source_channels = source_channels.max(1) as usize;
+    let source_frames = source.len() / source_channels;
+    if source_frames == 0 || frames == 0 {
+        return (output, 0);
+    }
+    let ratio = source_rate.max(1) as f64 / capture_rate.max(1) as f64;
+    let mut real_frames = 0_u32;
+    for frame in 0..frames as u64 {
+        let source_frame = (frame as f64 * ratio).floor() as usize;
+        if source_frame >= source_frames {
+            break;
+        }
+        let offset = source_frame * source_channels;
+        // coverage: unreachable — source_frame < source_frames bounds the
+        // slice to the complete frames counted above.
+        if offset + source_channels > source.len() {
+            break; // coverage: unreachable — source_frame < source_frames bounds the slice
+        }
+        let frame_start = frame as usize * capture_channels;
+        let source_slice = &source[offset..offset + source_channels];
+        match (capture_channels, source_channels) {
+            (dst, src) if dst == src => {
+                output[frame_start..frame_start + dst].copy_from_slice(source_slice);
+            }
+            (1, src) => {
+                let sum: f32 = source_slice.iter().take(src).sum();
+                output[frame_start] = sum / src as f32;
+            }
+            (dst, 1) => {
+                for channel in 0..dst {
+                    output[frame_start + channel] = source_slice[0];
+                }
+            }
+            (dst, src) => {
+                for channel in 0..dst {
+                    output[frame_start + channel] =
+                        source_slice.get(channel).copied().unwrap_or(0.0);
+                }
+                let _ = src;
+            }
+        }
+        real_frames += 1;
+    }
+    (output, real_frames)
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,8 +1341,21 @@ pub(crate) fn audio_client_methods() -> Vec<HostThunk> {
     ]
 }
 
+/// Number of methods on `IActivateAudioInterfaceAsyncOperation`: the IUnknown
+/// preamble plus `GetActivateResult`.
+///
+/// Windows never defines cancellation on this interface, so there is no fifth
+/// (`CancelActivation`) slot and no thunk for one.  The constant is the
+/// compile-time contract the vtable builder and the adversarial test pin.
+pub const ACTIVATION_OPERATION_METHOD_COUNT: usize = 4;
+
 /// The `IActivateAudioInterfaceAsyncOperation` vtable method sequence:
 /// IUnknown preamble plus `GetActivateResult` at slot 3.
+///
+/// `CancelActivation` is intentionally absent: the Windows contract has no
+/// such method on this interface (cancellation exists only on `IAsyncAction`
+/// / `IAsyncOperation`, not on the audio activation operation).  Adding a
+/// slot here would shift `GetActivateResult` and break every guest.
 pub(crate) fn audio_activation_operation_methods() -> Vec<HostThunk> {
     vec![
         HostThunk::AudioActivationOperationQueryInterface, // [0]
@@ -1480,6 +1699,8 @@ pub struct AudioClientState {
     pub loopback_cursor: u64,
     /// Whether the real cpal input stream opened for this client.
     pub capture_input_active: bool,
+    /// Whether this loopback client holds the real system-output capture.
+    pub system_loopback_held: bool,
     /// Client epoch used for `IAudioClock::GetPosition`'s QPC value.
     pub clock_epoch: Instant,
 }
@@ -1535,6 +1756,19 @@ impl AudioClientState {
     /// as silence (`AUDCLNT_BUFFERFLAGS_SILENT`).
     fn capture_next_packet_frames(&self, pid: u32, now: Instant) -> u32 {
         if self.loopback {
+            if system_loopback_in_use() {
+                // Real system-output frames take priority.  With a running
+                // tap and no audio flowing, the capture clock paces silent
+                // packets instead of waiting for this runtime's render side.
+                let system = system_loopback_available_for(self, true);
+                if system > 0 {
+                    return system.min(self.buffer_frames.max(1));
+                }
+                let available = self
+                    .capture_arrived_frames(now)
+                    .saturating_sub(self.capture_consumed_frames);
+                return available.min(self.buffer_frames.max(1) as u64) as u32;
+            }
             let rate = self
                 .format
                 .as_ref()
@@ -1697,8 +1931,17 @@ fn audio_client_backend() -> MutexGuard<'static, Option<RealAudioBackend>> {
 fn ensure_audio_client_backend(
     guard: &mut Option<RealAudioBackend>,
 ) -> Option<&mut RealAudioBackend> {
+    ensure_audio_client_backend_with(guard, RealAudioBackend::new)
+}
+
+/// Backend initialization with an injectable creator so the real failure path
+/// is adversarially reachable without breaking the host audio services.
+fn ensure_audio_client_backend_with(
+    guard: &mut Option<RealAudioBackend>,
+    create: impl FnOnce() -> crate::error::AppResult<RealAudioBackend>,
+) -> Option<&mut RealAudioBackend> {
     if guard.is_none() {
-        match RealAudioBackend::new() {
+        match create() {
             Ok(backend) => *guard = Some(backend),
             Err(error) => {
                 eprintln!("[RealAudio] audio-client backend init failed: {error}");
@@ -1801,6 +2044,7 @@ pub(crate) fn register_audio_client_direction(
             capture_queue: VecDeque::new(),
             loopback_cursor: 0,
             capture_input_active: false,
+            system_loopback_held: false,
             clock_epoch: Instant::now(),
         });
 }
@@ -1809,7 +2053,7 @@ pub(crate) fn register_audio_client_direction(
 /// runtime releases the guest object).  When the released endpoint was the
 /// last audio client using a real stream, the backend stream is closed.
 pub(crate) fn release_audio_object(pid: u32, object: u64) {
-    let (removed, close_device, stop_capture) = {
+    let (removed, close_device, stop_capture, stop_system_loopback) = {
         let mut registry = audio_clients();
         let removed = registry
             .clients
@@ -1841,6 +2085,9 @@ pub(crate) fn release_audio_object(pid: u32, object: u64) {
                 .values()
                 .flat_map(|clients| clients.values())
                 .any(|state| state.capture_input_active);
+        let stop_system_loopback = removed
+            .as_ref()
+            .is_some_and(|state| state.loopback && state.system_loopback_held);
         if registry
             .services
             .get(&pid)
@@ -1855,7 +2102,7 @@ pub(crate) fn release_audio_object(pid: u32, object: u64) {
         {
             registry.clients.remove(&pid);
         }
-        (removed, close_device, stop_capture)
+        (removed, close_device, stop_capture, stop_system_loopback)
     };
     if let Some(state) = removed.as_ref()
         && state.running
@@ -1876,6 +2123,9 @@ pub(crate) fn release_audio_object(pid: u32, object: u64) {
         if let Some(backend) = guard.as_mut() {
             backend.stop_input_stream();
         }
+    }
+    if stop_system_loopback {
+        release_system_loopback_reference();
     }
 }
 
@@ -1945,6 +2195,7 @@ pub(crate) struct AudioClientTestSnapshot {
     pub capture_frames_carry: u64,
     pub capture_outstanding_frames: u32,
     pub capture_input_active: bool,
+    pub system_loopback_held: bool,
     pub loopback: bool,
     pub loopback_cursor: u64,
 }
@@ -1976,6 +2227,7 @@ pub(crate) fn test_client_snapshot(pid: u32, object: u64) -> Option<AudioClientT
             capture_frames_carry: state.capture_frames_carry,
             capture_outstanding_frames: state.capture_outstanding_frames,
             capture_input_active: state.capture_input_active,
+            system_loopback_held: state.system_loopback_held,
             loopback: state.loopback,
             loopback_cursor: state.loopback_cursor,
         })
@@ -2464,6 +2716,9 @@ pub(crate) fn start(pid: u32, object: u64) -> u32 {
             // Windows: starting an already-running stream returns S_FALSE.
             return Ok(AUDCLNT_S_FALSE);
         }
+        if state.loopback {
+            state.system_loopback_held = acquire_system_loopback();
+        }
         state.running = true;
         state.run_started = Some(Instant::now());
         state.event_ready_signaled = false;
@@ -2494,6 +2749,10 @@ pub(crate) fn stop(pid: u32, object: u64) -> u32 {
         state.capture_frames_carry = state.capture_arrived_frames(now);
         if state.direction == AudioDirection::Render && !state.loopback {
             mark_render_stream_stopped(pid, &state.device.key);
+        }
+        if state.system_loopback_held {
+            state.system_loopback_held = false;
+            release_system_loopback_reference();
         }
         state.run_started = None;
         state.running = false;
@@ -3694,7 +3953,30 @@ pub(crate) fn capture_get_buffer(pid: u32, service_object: u64) -> Result<Captur
         .ok_or(AUDCLNT_E_NOT_INITIALIZED)?;
     let channels = format.channels.max(1) as usize;
     let sample_count = frames as usize * channels;
-    let (samples, real_frames) = if state.loopback {
+    let (samples, real_frames) = if state.loopback && system_loopback_in_use() {
+        let mut source = Vec::new();
+        let mut source_channels = format.channels;
+        let mut source_rate = format.sample_rate;
+        {
+            let mut backend_guard = audio_client_backend();
+            if let Some(backend) = backend_guard.as_mut()
+                && let Some((channels, rate)) = backend.system_loopback_format()
+            {
+                source_channels = channels;
+                source_rate = rate;
+                source = backend.read_system_loopback_data();
+            }
+        }
+        let (samples, real_frames) = convert_loopback_frames(
+            &source,
+            source_channels,
+            source_rate,
+            format.channels,
+            format.sample_rate,
+            frames,
+        );
+        (samples, real_frames as usize)
+    } else if state.loopback {
         let mut cursor = state.loopback_cursor;
         let (samples, real_frames) = loopback_take_frames(
             pid,
@@ -3831,6 +4113,7 @@ pub(crate) fn capture_next_packet_size(pid: u32, service_object: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::real_audio::{SystemLoopbackBackend, SystemLoopbackFailure};
 
     #[test]
     fn unsupported_riids_rejected() {
@@ -4170,9 +4453,185 @@ mod tests {
         assert!(!activation_operation_supports_riid(&[0xAA; 16]));
     }
 
+    #[test]
+    fn activation_operation_cancel_vtable_slot_is_absent() {
+        let methods = audio_activation_operation_methods();
+        assert_eq!(methods.len(), ACTIVATION_OPERATION_METHOD_COUNT);
+        assert_eq!(ACTIVATION_OPERATION_METHOD_COUNT, 4);
+        assert_ne!(methods.len(), 5, "Windows defines no CancelActivation slot");
+        assert!(
+            matches!(
+                methods.get(3),
+                Some(HostThunk::AudioActivationOperationGetActivateResult)
+            ),
+            "slot 3 stays GetActivateResult"
+        );
+        // A cancellation-shaped IID is not exposed by the operation object.
+        assert!(!activation_operation_supports_riid(&[0x43; 16]));
+    }
+
+    #[test]
+    fn activation_operation_release_after_completion_race_keeps_one_result() {
+        let pid = 0x7d03;
+        let operation = 0x9_503;
+        let interface = 0x9_603;
+        register_activation_operation(pid, operation, interface);
+        complete_activation_operation(pid, operation, ACTIVATION_S_OK, interface);
+        assert_eq!(
+            operation_get_activate_result(pid, operation),
+            Ok((ACTIVATION_S_OK, interface))
+        );
+        release_activation_operation(pid, operation);
+        assert_eq!(
+            operation_get_activate_result(pid, operation),
+            Err(E_ILLEGAL_METHOD_CALL)
+        );
+        // A late/repeated Release is a no-op, not a double drop.
+        release_activation_operation(pid, operation);
+        assert_eq!(activation_operation_interface(pid, operation), None);
+    }
+
+    #[test]
+    fn activation_operation_release_before_completion_race_keeps_the_operation_object() {
+        let pid = 0x7d04;
+        let operation = 0x9_504;
+        let interface = 0x9_604;
+        register_activation_operation(pid, operation, interface);
+        push_activation_completion(
+            pid,
+            PendingActivationCompletion {
+                handler_object: 0x11,
+                handler_method: 0x22,
+                result_hr: ACTIVATION_S_OK,
+                interface_object: interface,
+            },
+        );
+        release_activation_operation(pid, operation);
+        let completion = pop_activation_completion(pid).expect("queued completion");
+        assert_eq!(
+            completion.interface_object, operation,
+            "the handler must receive the operation object, never the endpoint"
+        );
+        assert_eq!(
+            operation_get_activate_result(pid, operation),
+            Err(E_ILLEGAL_METHOD_CALL),
+            "a released operation no longer reports a result"
+        );
+        assert_eq!(pop_activation_completion(pid), None);
+    }
+
+    #[test]
+    fn activation_operation_concurrent_completion_and_release_races_keep_the_operation() {
+        use std::sync::{Arc, Barrier};
+        for iteration in 0..16_u32 {
+            let pid = 0x7e00 + iteration;
+            let operation = 0x9_700 + iteration as u64;
+            let interface = 0x9_800 + iteration as u64;
+            register_activation_operation(pid, operation, interface);
+            push_activation_completion(
+                pid,
+                PendingActivationCompletion {
+                    handler_object: 0x31,
+                    handler_method: 0x32,
+                    result_hr: ACTIVATION_S_OK,
+                    interface_object: interface,
+                },
+            );
+            let barrier = Arc::new(Barrier::new(2));
+            let release_barrier = Arc::clone(&barrier);
+            let release = std::thread::spawn(move || {
+                release_barrier.wait();
+                release_activation_operation(pid, operation);
+            });
+            let complete_barrier = Arc::clone(&barrier);
+            let complete = std::thread::spawn(move || {
+                complete_barrier.wait();
+                let completion = pop_activation_completion(pid).expect("queued completion");
+                assert_eq!(
+                    completion.interface_object, operation,
+                    "the completion delivers the operation object under the race"
+                );
+            });
+            release.join().expect("release thread");
+            complete.join().expect("complete thread");
+            // Release always wins the final state (it runs before the join
+            // returns), so the completed result is no longer readable.
+            assert_eq!(
+                operation_get_activate_result(pid, operation),
+                Err(E_ILLEGAL_METHOD_CALL),
+                "release-before-read removes the result exactly once"
+            );
+            assert_eq!(pop_activation_completion(pid), None);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Loopback capture — real render frames read back
     // -----------------------------------------------------------------------
+
+    /// Serializes tests that drive the process-global system-loopback seam and
+    /// resets it (including the global user count) on drop.
+    struct LoopbackTestGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl LoopbackTestGuard {
+        fn unavailable() -> Self {
+            Self::with_capability(SystemLoopbackBackend::Unavailable)
+        }
+
+        fn system(channels: u16, sample_rate: u32) -> (Self, u64) {
+            let guard = Self::with_capability(SystemLoopbackBackend::CoreAudioProcessTap);
+            let generation = guard.install(channels, sample_rate);
+            (guard, generation)
+        }
+
+        fn with_capability(capability: SystemLoopbackBackend) -> Self {
+            let lock = crate::real_audio::lock_system_loopback_tests();
+            SYSTEM_LOOPBACK_USERS.store(0, Ordering::SeqCst);
+            crate::real_audio::set_test_system_loopback_capability(Some(capability));
+            {
+                let mut guard = audio_client_backend();
+                if let Some(backend) = guard.as_mut() {
+                    backend.stop_system_loopback();
+                }
+            }
+            Self { _lock: lock }
+        }
+
+        fn install(&self, channels: u16, sample_rate: u32) -> u64 {
+            let mut guard = audio_client_backend();
+            ensure_audio_client_backend(&mut guard)
+                .expect("test audio backend")
+                .install_test_system_loopback(channels, sample_rate)
+        }
+    }
+
+    impl Drop for LoopbackTestGuard {
+        fn drop(&mut self) {
+            {
+                let mut guard = audio_client_backend();
+                if let Some(backend) = guard.as_mut() {
+                    backend.stop_system_loopback();
+                }
+            }
+            crate::real_audio::set_test_system_loopback_capability(None);
+            SYSTEM_LOOPBACK_USERS.store(0, Ordering::SeqCst);
+        }
+    }
+
+    fn push_system_frames(
+        generation: u64,
+        channels: u16,
+        sample_rate: u32,
+        samples: &[f32],
+    ) -> bool {
+        let mut guard = audio_client_backend();
+        guard
+            .as_mut()
+            .expect("test audio backend")
+            .push_test_system_loopback_frames(generation, channels, sample_rate, samples)
+    }
 
     fn loopback_capture_service(
         pid: u32,
@@ -4204,6 +4663,7 @@ mod tests {
 
     #[test]
     fn loopback_capture_reads_back_the_render_stream_frames() {
+        let _guard = LoopbackTestGuard::unavailable();
         let pid = 0x7d10;
         let object = 0x9_510;
         let service = 0x9_610;
@@ -4311,6 +4771,381 @@ mod tests {
             "loopback is a shared-mode capture path"
         );
         release_audio_object(pid, object);
+    }
+
+    // -----------------------------------------------------------------------
+    // System-wide loopback — real host capture with render-history fallback
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn system_loopback_tap_creation_failure_falls_back_to_render_history() {
+        let _guard = LoopbackTestGuard::unavailable();
+        crate::real_audio::force_next_system_loopback_failure(Some(
+            SystemLoopbackFailure::TapCreation(-50),
+        ));
+        let pid = 0x7d30;
+        let object = 0x9_530;
+        let service = 0x9_630;
+        let device = test_device();
+        let format = loopback_capture_service(
+            pid,
+            object,
+            service,
+            &device,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        );
+        let mut rendered = Vec::new();
+        for frame in 0..32_u32 {
+            rendered.push(frame as f32 / 100.0);
+            rendered.push(-(frame as f32) / 100.0);
+        }
+        push_loopback_render_samples(
+            pid,
+            &device.key,
+            &rendered,
+            format.channels,
+            format.sample_rate,
+        );
+        assert_eq!(set_event_handle(pid, object, 0xE7), AUDCLNT_S_OK);
+        assert_eq!(start(pid, object), AUDCLNT_S_OK);
+        let snapshot = test_client_snapshot(pid, object).expect("snapshot");
+        assert!(
+            !snapshot.system_loopback_held,
+            "creation failure must leave the render-history fallback in force"
+        );
+        assert_eq!(capture_next_packet_size(pid, service), Ok(32));
+        let packet = capture_get_buffer(pid, service).expect("fallback packet");
+        assert_eq!(packet.flags, 0, "render-history frames are real frames");
+        assert_eq!(packet.samples, rendered);
+        capture_release_buffer(pid, service, 32, 0).expect("release fallback packet");
+        assert_eq!(stop(pid, object), AUDCLNT_S_OK);
+        release_audio_object(pid, object);
+        release_audio_object(pid, service);
+    }
+
+    #[test]
+    fn system_loopback_format_mismatch_capture_is_converted_to_the_client_format() {
+        let (guard, generation) = LoopbackTestGuard::system(2, 48_000);
+        let pid = 0x7d31;
+        let object = 0x9_531;
+        let service = 0x9_631;
+        let device = test_device();
+        let format = test_format(WAVE_FORMAT_PCM, 1, 44_100, 16);
+        register_audio_client(pid, object, device, IID_IAUDIO_CLIENT);
+        let plan = plan_initialize(
+            pid,
+            object,
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
+            100_000,
+            0,
+            &format,
+        )
+        .expect("loopback initialize plan");
+        assert_eq!(
+            commit_initialize(pid, object, &plan, &format, 0x7_000, 4410),
+            AUDCLNT_S_OK
+        );
+        bind_service(pid, object, service, AudioServiceKind::CaptureClient);
+
+        // 96 stereo frames at 48 kHz from the real system capture.
+        let mut system_frames = Vec::new();
+        for _ in 0..96 {
+            system_frames.push(0.25_f32);
+            system_frames.push(0.75_f32);
+        }
+        assert!(push_system_frames(generation, 2, 48_000, &system_frames));
+
+        assert_eq!(start(pid, object), AUDCLNT_S_OK);
+        // 44.1 kHz mono client: 96 * 44100 / 48000 = 88 frames.
+        assert_eq!(capture_next_packet_size(pid, service), Ok(88));
+        let packet = capture_get_buffer(pid, service).expect("system packet");
+        assert_eq!(packet.frames, 88);
+        assert_eq!(packet.flags, 0, "captured system audio is not silent");
+        assert_eq!(packet.samples.len(), 88);
+        assert!(
+            packet.samples.iter().all(|sample| *sample == 0.5),
+            "stereo (0.25, 0.75) is averaged into a mono 0.5 client"
+        );
+        capture_release_buffer(pid, service, 88, 0).expect("release system packet");
+        assert_eq!(stop(pid, object), AUDCLNT_S_OK);
+        release_audio_object(pid, object);
+        release_audio_object(pid, service);
+        drop(guard);
+    }
+
+    #[test]
+    fn system_loopback_missing_audio_flow_yields_pinned_silent_packets() {
+        let (guard, _generation) = LoopbackTestGuard::system(2, 48_000);
+        let pid = 0x7d32;
+        let object = 0x9_532;
+        let service = 0x9_632;
+        let format = loopback_capture_service(
+            pid,
+            object,
+            service,
+            &test_device(),
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        );
+        assert_eq!(set_event_handle(pid, object, 0xE8), AUDCLNT_S_OK);
+        assert_eq!(start(pid, object), AUDCLNT_S_OK);
+
+        let mut frames = 0;
+        for _ in 0..200 {
+            frames = capture_next_packet_size(pid, service).expect("packet size");
+            if frames > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(frames > 0, "the capture clock must pace a silent packet");
+        let packet = capture_get_buffer(pid, service).expect("silent packet");
+        assert_eq!(packet.flags, AUDCLNT_BUFFERFLAGS_SILENT);
+        assert_eq!(packet.frames, frames);
+        assert!(
+            packet.samples.iter().all(|sample| *sample == 0.0),
+            "no audio flowing means an all-zero silent packet"
+        );
+        assert!(packet.frames as usize <= 800);
+        assert_eq!(packet.channels, format.channels);
+        capture_release_buffer(pid, service, frames, 0).expect("release silent packet");
+        assert_eq!(stop(pid, object), AUDCLNT_S_OK);
+        release_audio_object(pid, object);
+        release_audio_object(pid, service);
+        drop(guard);
+    }
+
+    fn backend_system_loopback_running() -> bool {
+        let mut guard = audio_client_backend();
+        guard
+            .as_mut()
+            .is_some_and(|backend| backend.system_loopback_running())
+    }
+
+    #[test]
+    fn system_loopback_backend_init_failure_keeps_the_fallback_contract() {
+        let mut guard = None;
+        let result = ensure_audio_client_backend_with(&mut guard, || {
+            Err(crate::error::AppError::new(
+                crate::reason::ReasonCode::RcAudioUnsupported,
+                "forced audio backend init failure",
+            ))
+        });
+        assert_eq!(result.is_none(), true);
+        assert_eq!(
+            guard.is_none(),
+            true,
+            "a failed init never installs a backend"
+        );
+    }
+
+    #[test]
+    fn system_loopback_shared_users_release_only_on_the_last_stop() {
+        let guard = LoopbackTestGuard::with_capability(SystemLoopbackBackend::CoreAudioProcessTap);
+        let _generation = guard.install(2, 48_000);
+        assert!(acquire_system_loopback());
+        assert!(
+            acquire_system_loopback(),
+            "the second user shares the live capture"
+        );
+        assert_eq!(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 2);
+        release_system_loopback_reference();
+        assert_eq!(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 1);
+        assert!(
+            backend_system_loopback_running(),
+            "the capture stays up while a user remains"
+        );
+        release_system_loopback_reference();
+        assert_eq!(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 0);
+        assert!(
+            !backend_system_loopback_running(),
+            "the last release tears the capture down"
+        );
+    }
+
+    #[test]
+    fn system_loopback_stopped_user_and_missing_backend_report_zero() {
+        let _guard = LoopbackTestGuard::unavailable();
+        let pid = 0x7d35;
+        let object = 0x9_535;
+        let service = 0x9_635;
+        let _format = loopback_capture_service(
+            pid,
+            object,
+            service,
+            &test_device(),
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        );
+        // Not started: no capture user exists.
+        {
+            let registry = audio_clients();
+            let state = registry
+                .clients
+                .get(&pid)
+                .and_then(|clients| clients.get(&object))
+                .expect("client state");
+            assert_eq!(
+                system_loopback_available_for(state, false),
+                0,
+                "an unused capture reports no frames without touching the backend"
+            );
+        }
+        assert_eq!(get_current_padding(pid, object), Ok(0));
+        // A user count without a backend must not panic or report frames.
+        SYSTEM_LOOPBACK_USERS.store(1, Ordering::SeqCst);
+        {
+            let mut backend_guard = audio_client_backend();
+            *backend_guard = None;
+        }
+        assert_eq!(
+            get_current_padding(pid, object),
+            Ok(0),
+            "a missing backend is a zero-frame capture, never a panic"
+        );
+        // A backend without a live capture session also reports zero.
+        {
+            let mut backend_guard = audio_client_backend();
+            assert!(ensure_audio_client_backend(&mut backend_guard).is_some());
+        }
+        assert_eq!(get_current_padding(pid, object), Ok(0));
+        SYSTEM_LOOPBACK_USERS.store(0, Ordering::SeqCst);
+        release_audio_object(pid, object);
+        release_audio_object(pid, service);
+    }
+
+    #[test]
+    fn system_loopback_release_while_running_stops_the_capture() {
+        let (_guard, generation) = LoopbackTestGuard::system(2, 48_000);
+        let pid = 0x7d36;
+        let object = 0x9_536;
+        let service = 0x9_636;
+        let device = test_device();
+        let _format = loopback_capture_service(
+            pid,
+            object,
+            service,
+            &device,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        );
+        assert_eq!(set_event_handle(pid, object, 0xEA), AUDCLNT_S_OK);
+        assert_eq!(start(pid, object), AUDCLNT_S_OK);
+        assert!(push_system_frames(generation, 2, 8_000, &[0.25; 4]));
+        assert_eq!(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 1);
+        assert!(backend_system_loopback_running());
+        // The guest releases the endpoint without Stop: the held system
+        // capture reference must be dropped exactly once.
+        release_audio_object(pid, object);
+        assert_eq!(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 0);
+        assert!(
+            !backend_system_loopback_running(),
+            "releasing the last running loopback client stops the tap"
+        );
+        release_audio_object(pid, service);
+    }
+
+    #[test]
+    fn system_loopback_format_mismatch_conversion_edges_are_pinned() {
+        // Empty capture: exact silence, no real frames.
+        let (samples, real) = convert_loopback_frames(&[], 2, 48_000, 1, 44_100, 10);
+        assert_eq!(real, 0);
+        assert_eq!(samples, vec![0.0; 10]);
+        // A dangling partial source frame never becomes a real frame.
+        let (samples, real) = convert_loopback_frames(&[0.5], 2, 48_000, 1, 44_100, 4);
+        assert_eq!(real, 0);
+        assert_eq!(samples, vec![0.0; 4]);
+        // 48 kHz stereo (0.25, 0.75) -> 44.1 kHz mono.
+        let source = [0.25_f32, 0.75, 0.25, 0.75];
+        let (samples, real) = convert_loopback_frames(&source, 2, 48_000, 1, 44_100, 2);
+        assert_eq!(real, 2);
+        assert_eq!(samples, vec![0.5, 0.5]);
+        // 44.1 kHz mono -> 48 kHz stereo duplicates the source channel.
+        let (samples, real) = convert_loopback_frames(&[0.25, -0.5], 1, 44_100, 2, 48_000, 3);
+        assert_eq!(real, 3);
+        assert_eq!(samples, vec![0.25, 0.25, 0.25, 0.25, -0.5, -0.5]);
+        // Unusual destination channel count zero-fills beyond the source.
+        let (samples, real) = convert_loopback_frames(&[0.1, 0.2], 2, 48_000, 4, 48_000, 1);
+        assert_eq!(real, 1);
+        assert_eq!(samples, vec![0.1, 0.2, 0.0, 0.0]);
+        // Requesting more output frames than the source holds stops at the
+        // last real source frame instead of reading past it.
+        let (samples, real) = convert_loopback_frames(&[0.25, 0.75], 2, 48_000, 1, 48_000, 2);
+        assert_eq!(real, 1);
+        assert_eq!(samples, vec![0.5, 0.0]);
+    }
+
+    #[test]
+    fn system_loopback_stale_generation_frames_are_rejected_across_teardown() {
+        let (guard, first_generation) = LoopbackTestGuard::system(2, 48_000);
+        assert!(push_system_frames(first_generation, 2, 48_000, &[0.25; 8]));
+        {
+            let mut backend_guard = audio_client_backend();
+            backend_guard
+                .as_mut()
+                .expect("test backend")
+                .stop_system_loopback();
+        }
+        assert!(
+            !push_system_frames(first_generation, 2, 48_000, &[0.5; 8]),
+            "a callback from the torn-down capture must be rejected"
+        );
+        let second_generation = guard.install(2, 48_000);
+        assert_ne!(second_generation, first_generation);
+        assert!(
+            !push_system_frames(first_generation, 2, 48_000, &[0.75; 8]),
+            "the replacement session must not accept the old generation"
+        );
+        assert!(push_system_frames(second_generation, 2, 48_000, &[0.5; 8]));
+        let mut backend_guard = audio_client_backend();
+        let backend = backend_guard.as_mut().expect("test backend");
+        assert_eq!(backend.system_loopback_available_frames(), 4);
+        assert_eq!(backend.read_system_loopback_data(), vec![0.5; 8]);
+    }
+
+    #[test]
+    fn system_loopback_capture_stop_start_during_teardown_has_no_stale_frames() {
+        let (guard, first_generation) = LoopbackTestGuard::system(2, 8_000);
+        let pid = 0x7d34;
+        let object = 0x9_534;
+        let service = 0x9_634;
+        let _format = loopback_capture_service(
+            pid,
+            object,
+            service,
+            &test_device(),
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        );
+        assert_eq!(set_event_handle(pid, object, 0xE9), AUDCLNT_S_OK);
+        assert_eq!(start(pid, object), AUDCLNT_S_OK);
+        assert!(push_system_frames(first_generation, 2, 8_000, &[0.25; 10]));
+        assert_eq!(capture_next_packet_size(pid, service), Ok(5));
+        assert_eq!(stop(pid, object), AUDCLNT_S_OK);
+        assert!(
+            test_client_snapshot(pid, object)
+                .expect("snapshot")
+                .system_loopback_held
+                == false
+        );
+        assert!(
+            !push_system_frames(first_generation, 2, 8_000, &[0.5; 10]),
+            "frames delivered during tap teardown stay out of the next session"
+        );
+
+        let second_generation = guard.install(2, 8_000);
+        assert_eq!(start(pid, object), AUDCLNT_S_OK);
+        assert!(
+            !push_system_frames(first_generation, 2, 8_000, &[0.75; 10]),
+            "the restarted capture rejects the previous generation"
+        );
+        assert!(push_system_frames(second_generation, 2, 8_000, &[0.5; 6]));
+        assert_eq!(capture_next_packet_size(pid, service), Ok(3));
+        let packet = capture_get_buffer(pid, service).expect("restarted packet");
+        assert_eq!(packet.flags, 0);
+        assert_eq!(packet.samples, vec![0.5; 6]);
+        capture_release_buffer(pid, service, 3, 0).expect("release restarted packet");
+        assert_eq!(stop(pid, object), AUDCLNT_S_OK);
+        release_audio_object(pid, object);
+        release_audio_object(pid, service);
+        drop(guard);
     }
 
     // -----------------------------------------------------------------------

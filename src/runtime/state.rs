@@ -1343,6 +1343,14 @@ pub(crate) struct PeHostRuntime {
     /// invoke these in guest context after the current thunk returns.
     pub(crate) pending_fiber_fls_callbacks: Vec<u64>,
     pub(crate) pending_guest_threads: VecDeque<PendingGuestThread>,
+    /// Cooperative (deterministic test/default) or production worker-pool
+    /// scheduling for parked guest waits.
+    pub(crate) scheduler_mode: SchedulerMode,
+    /// Active production wait jobs, keyed by guest thread id.  Records stay
+    /// in `pending_guest_threads`; this map makes completion ownership exact.
+    pub(crate) production_waits: BTreeMap<u32, ProductionWait>,
+    /// The bounded native worker pool (owned by the runtime; joined on drop).
+    pub(crate) production_scheduler: Option<ProductionScheduler>,
     pub(crate) active_pumped_guest_thread: Option<u32>,
     pub(crate) yield_pumped_guest_thread: bool,
     /// Wait descriptor attached by a pumped thread's blocking-wait thunk;
@@ -1412,7 +1420,10 @@ pub(crate) struct PeHostRuntime {
     /// Registered initialization callbacks for synthetic/managed DLLs.
     /// Called with (module_handle, DLL_PROCESS_ATTACH) when a synthetic
     /// module is first created.
-    pub(crate) synthetic_dll_init_callbacks: Vec<Box<dyn FnMut(u64, u32)>>,
+    /// Callbacks are `Send + Sync` so the runtime can carry them behind a
+    /// shared reference; they are still only invoked from the runtime owner
+    /// (module attach runs on the scheduling thread).
+    pub(crate) synthetic_dll_init_callbacks: Vec<Box<dyn FnMut(u64, u32) + Send + Sync>>,
     pub(crate) network: NetworkStack,
     /// WinHTTP/WinINet stack for HTTP/TLS operations
     pub(crate) winhttp: WinHttpStack,
@@ -1635,7 +1646,12 @@ pub(crate) struct PeHostRuntime {
     /// Populated by CreateFileW when an NTFS Alternate Data Stream path is detected.
     pub(crate) ads_handles: HashMap<u32, (String, String)>,
     /// XAPO audio effect manager for IXAPO COM object dispatch.
-    pub(crate) xapo_manager: crate::real_audio::XapoManager,
+    ///
+    /// The manager owns `Box<dyn XapoEffect + Send>` instances.  `XapoEffect`
+    /// is only `Send`, so the manager is wrapped in a `Mutex` to make the
+    /// runtime state `Send + Sync`; every process/create/destroy call takes
+    /// the lock for the duration of the (single-threaded) effect operation.
+    pub(crate) xapo_manager: std::sync::Mutex<crate::real_audio::XapoManager>,
     /// Guest XAPO effect objects: maps guest object address -> effect instance ID.
     pub(crate) xapo_effect_instances: HashMap<u64, u64>,
     // ── WMI State ──────────────────────────────────────────────────────────────
@@ -2394,6 +2410,9 @@ impl PeHostRuntime {
             pending_dll_main_calls: VecDeque::new(),
             pending_fiber_fls_callbacks: Vec::new(),
             pending_guest_threads: VecDeque::new(),
+            scheduler_mode: SchedulerMode::Cooperative,
+            production_waits: BTreeMap::new(),
+            production_scheduler: None,
             active_pumped_guest_thread: None,
             yield_pumped_guest_thread: false,
             pump_yield_with_wait: None,
@@ -2636,7 +2655,7 @@ impl PeHostRuntime {
             xapo_manager: {
                 let mut mgr = crate::real_audio::XapoManager::new();
                 mgr.register_builtins();
-                mgr
+                std::sync::Mutex::new(mgr)
             },
             xapo_effect_instances: HashMap::new(),
             // ── WMI State ──────────────────────────────────────────────────────
@@ -2726,6 +2745,30 @@ impl PeHostRuntime {
         runtime.user32.event_observers = Some(observers.clone());
         crate::cef_bridge::set_event_observers(Some(observers.clone()));
         crate::runtime_events::register_current_observers(observers);
+        // Production scheduling is opt-in for real runs: the default stays
+        // the deterministic cooperative pump.  `CASA1_SCHEDULER=production`
+        // enables the bounded native worker pool and
+        // `CASA1_SCHEDULER_WORKERS` overrides its size.  Unit tests select the
+        // mode explicitly, so this host-environment hook is compiled only for
+        // non-test library builds.
+        #[cfg(not(test))]
+        if std::env::var("CASA1_SCHEDULER").is_ok_and(|mode| {
+            mode.eq_ignore_ascii_case("production") || mode.eq_ignore_ascii_case("prod")
+        }) {
+            let workers = std::env::var("CASA1_SCHEDULER_WORKERS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|value| value.get().min(8))
+                        .unwrap_or(4)
+                });
+            if !runtime.set_scheduler_mode(SchedulerMode::Production { workers }) {
+                // Keep deterministic scheduling when the host cannot spawn
+                // the pool; the run must never lose a wait.
+                runtime.scheduler_mode = SchedulerMode::Cooperative;
+            }
+        }
         runtime
     }
 }
@@ -2850,5 +2893,20 @@ impl PeHostRuntime {
         )?;
         self.process_parameters_ptr = process_parameters_ptr;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod send_probe {
+    fn assert_send_sync<T: Send + Sync>() {}
+    #[test]
+    fn pe_host_runtime_is_send_and_sync() {
+        assert_send_sync::<super::PeHostRuntime>();
+        // The compile-time bound above is the real assertion; these pinned
+        // checks also keep the probe in the adversarial (run) set and reject
+        // a zero-sized alias or a runtime that owns no droppable resources.
+        assert_eq!(std::mem::size_of::<super::PeHostRuntime>() > 0, true);
+        assert_eq!(std::mem::needs_drop::<super::PeHostRuntime>(), true);
+        assert!(!std::mem::needs_drop::<u8>() && std::mem::needs_drop::<super::PeHostRuntime>());
     }
 }

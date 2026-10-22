@@ -1070,26 +1070,418 @@ const MEMORY_PAGE_MASK: u64 = !(MEMORY_PAGE_SIZE as u64 - 1);
 const LOW_PAGE_DIRECTORY_LEN: usize = (u32::MAX as usize / MEMORY_PAGE_SIZE) + 1;
 const LOW_PAGE_DIRECTORY_MISSING: u32 = u32::MAX;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Size of the flat guest window shared with the JIT.
+///
+/// The canonical store owns one `mmap` of this size.  Guest pages below it are
+/// addressed as `flat_base + guest_address`; pages above it (e.g. a PE image
+/// loaded at 0x1800_0000_0000) are backed by individually allocated 4 KiB
+/// frames owned by the same store.  Both views therefore read and write the
+/// SAME bytes; there is no mirror to synchronise.
+const GUEST_FLAT_SIZE: usize = 4 * 1024 * 1024 * 1024;
+
+/// Canonical guest-memory store.
+///
+/// This is the single owner of guest bytes for one [`MemoryImage`].  The
+/// interpreter's page table stores direct pointers into this store, and the
+/// JIT's flat window is the very same mapping (not a copy), so a store made
+/// through either view is immediately visible through the other.
+///
+/// Resident memory is strictly sparse: the 4 GiB flat window is mapped with
+/// `MAP_NORESERVE` and only pages actually committed by the guest are ever
+/// touched.  Addresses outside the flat window receive one aligned frame each.
+pub(crate) struct GuestMemoryStore {
+    flat_base: *mut u8,
+    flat_size: usize,
+    valid: bool,
+    /// One bit per flat 4 KiB page: set when the page has been committed.
+    /// Atomics keep the SIGBUS path async-signal-safe.
+    materialised: Box<[std::sync::atomic::AtomicU64]>,
+    /// Number of page commitments (a page removed with `unmap_range` and
+    /// committed again is counted again; repeated writes are not).
+    materialisations: std::sync::atomic::AtomicU64,
+    /// Frames for guest addresses outside the flat window.  The map is only
+    /// consulted when creating or releasing a page, never on a data access.
+    high_pages: Mutex<HashMap<u64, *mut u8>>,
+}
+
+// SAFETY: the raw pointers refer to process-wide mappings/frames owned by the
+// store; every data access is bounds-checked by the page table before the
+// pointer is formed, and mutations of the two metadata structures are either
+// atomic or mutex-protected.
+unsafe impl Send for GuestMemoryStore {}
+// SAFETY: same as `Send`: the flat window is a stable mapping and all mutable
+// metadata uses atomics or a mutex.
+unsafe impl Sync for GuestMemoryStore {}
+
+impl GuestMemoryStore {
+    pub(crate) fn new() -> Self {
+        // SAFETY: plain anonymous mmap; fd=-1 with MAP_ANONYMOUS is valid.
+        // MAP_NORESERVE keeps the 4 GiB window virtual until a page is
+        // actually committed, so sparse guests do not reserve swap.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                GUEST_FLAT_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        let valid = base != libc::MAP_FAILED;
+        let flat_base = if valid {
+            base as *mut u8
+        } else {
+            std::ptr::null_mut()
+        };
+        let bitmap_words = GUEST_FLAT_SIZE.div_ceil(MEMORY_PAGE_SIZE * 64);
+        let materialised = (0..bitmap_words)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            flat_base,
+            flat_size: GUEST_FLAT_SIZE,
+            valid,
+            materialised,
+            materialisations: std::sync::atomic::AtomicU64::new(0),
+            high_pages: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn flat_base(&self) -> u64 {
+        self.flat_base as u64
+    }
+
+    #[inline]
+    pub(crate) fn flat_size(&self) -> usize {
+        self.flat_size
+    }
+
+    #[inline]
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    #[inline]
+    fn flat_page_bit(&self, page_base: u64) -> Option<(usize, u64)> {
+        if !self.valid || page_base >= self.flat_size as u64 || !page_base.is_multiple_of(4096) {
+            return None;
+        }
+        let page = page_base as usize / MEMORY_PAGE_SIZE;
+        Some((page / 64, 1_u64 << (page % 64)))
+    }
+
+    /// Commit `page_base` and return its canonical bytes.
+    ///
+    /// This is the ONLY place a guest page is materialised.  The flat-window
+    /// case zeroes the mapped page (a re-committed page must not expose stale
+    /// bytes); the high-address case allocates a zeroed aligned frame.
+    pub(crate) fn materialise_page(&self, page_base: u64) -> *mut u8 {
+        let pointer = if self.valid && page_base < self.flat_size as u64 {
+            // SAFETY: page_base < flat_size and the mapping is live for the
+            // store's lifetime, so this page is inside the mapping.
+            let pointer = unsafe { self.flat_base.add(page_base as usize) };
+            // SAFETY: the page is inside the 4 GiB mapping and correctly
+            // aligned (page_base is a multiple of 4096).
+            unsafe {
+                std::ptr::write_bytes(pointer, 0, MEMORY_PAGE_SIZE);
+            }
+            if let Some((word, bit)) = self.flat_page_bit(page_base) {
+                self.materialised[word].fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+            }
+            pointer
+        } else {
+            let layout = std::alloc::Layout::from_size_align(MEMORY_PAGE_SIZE, MEMORY_PAGE_SIZE)
+                .expect("page layout is valid");
+            // SAFETY: non-zero layout; `alloc_zeroed` returns a 4096-byte,
+            // 4096-aligned frame or null.
+            let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
+                .expect("guest page allocation failed")
+                .as_ptr();
+            let mut high_pages = self
+                .high_pages
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            high_pages.insert(page_base, pointer);
+            pointer
+        };
+        self.materialisations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pointer
+    }
+
+    /// Release the backing frame for a page removed from the guest page table.
+    /// Flat-window pages stay mapped (their address is part of the JIT
+    /// window); a later commit zeroes them.
+    pub(crate) fn release_page(&self, page_base: u64) {
+        if self.valid && page_base < self.flat_size as u64 {
+            if let Some((word, bit)) = self.flat_page_bit(page_base) {
+                self.materialised[word].fetch_and(!bit, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+        let mut high_pages = self
+            .high_pages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pointer) = high_pages.remove(&page_base) {
+            let layout = std::alloc::Layout::from_size_align(MEMORY_PAGE_SIZE, MEMORY_PAGE_SIZE)
+                .expect("page layout is valid");
+            // SAFETY: the pointer was returned by `alloc_zeroed` with this
+            // exact layout and has just been removed from the map.
+            unsafe {
+                std::alloc::dealloc(pointer, layout);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_page_materialised(&self, page_base: u64) -> bool {
+        if self.valid && page_base < self.flat_size as u64 {
+            match self.flat_page_bit(page_base) {
+                Some((word, bit)) => {
+                    self.materialised[word].load(std::sync::atomic::Ordering::Relaxed) & bit != 0
+                }
+                None => false,
+            }
+        } else {
+            self.high_pages
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&page_base)
+        }
+    }
+
+    pub(crate) fn materialised_page_count(&self) -> u64 {
+        let flat: u64 = self
+            .materialised
+            .iter()
+            .map(|word| word.load(std::sync::atomic::Ordering::Relaxed).count_ones() as u64)
+            .sum();
+        let high = self
+            .high_pages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as u64;
+        flat + high
+    }
+
+    #[cfg(test)]
+    pub(crate) fn materialisation_count(&self) -> u64 {
+        self.materialisations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_flat_page_count(&self) -> usize {
+        if !self.valid {
+            return 0;
+        }
+        let mut resident = vec![0_u8; self.flat_size.div_ceil(MEMORY_PAGE_SIZE)];
+        // SAFETY: `flat_base` is a live mapping of `flat_size` bytes and the
+        // vector has one byte per page, as `mincore` requires.
+        let result = unsafe {
+            libc::mincore(
+                self.flat_base as *const libc::c_void,
+                self.flat_size,
+                resident.as_mut_ptr() as *mut libc::c_char,
+            )
+        };
+        assert_eq!(result, 0, "mincore must describe the flat guest window");
+        resident.iter().filter(|byte| **byte & 1 != 0).count()
+    }
+}
+
+#[cfg(test)]
+impl GuestMemoryStore {
+    /// A store whose flat window could not be mapped; used to exercise the
+    /// invalid-view guards without depending on mmap failing in the test host.
+    pub(crate) fn invalid_for_test() -> Self {
+        let bitmap_words = GUEST_FLAT_SIZE.div_ceil(MEMORY_PAGE_SIZE * 64);
+        Self {
+            flat_base: std::ptr::null_mut(),
+            flat_size: GUEST_FLAT_SIZE,
+            valid: false,
+            materialised: (0..bitmap_words)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            materialisations: std::sync::atomic::AtomicU64::new(0),
+            high_pages: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for GuestMemoryStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuestMemoryStore")
+            .field("flat_base", &self.flat_base)
+            .field("flat_size", &self.flat_size)
+            .field("valid", &self.valid)
+            .field("materialised_pages", &self.materialised_page_count())
+            .finish()
+    }
+}
+
+impl Drop for GuestMemoryStore {
+    fn drop(&mut self) {
+        let high_pages = self
+            .high_pages
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let layout = std::alloc::Layout::from_size_align(MEMORY_PAGE_SIZE, MEMORY_PAGE_SIZE)
+            .expect("page layout is valid");
+        for pointer in high_pages.drain().map(|(_, pointer)| pointer) {
+            // SAFETY: every map entry was allocated with this exact layout in
+            // `materialise_page` and is not used after the store is dropped.
+            unsafe {
+                std::alloc::dealloc(pointer, layout);
+            }
+        }
+        if self.valid && !self.flat_base.is_null() {
+            // SAFETY: the mapping was returned by the successful mmap in
+            // `new`; no page table entry survives the store.
+            unsafe {
+                libc::munmap(self.flat_base as *mut libc::c_void, self.flat_size);
+            }
+        }
+    }
+}
+
+/// Bytes of one guest page, permanently aliased into the canonical store.
+#[derive(Clone, Copy)]
+struct GuestPageBytes(*mut u8);
+
+impl GuestPageBytes {
+    #[inline]
+    fn as_ptr(&self) -> *const u8 {
+        self.0
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: the pointer comes from `GuestMemoryStore::materialise_page`
+        // and is valid for exactly MEMORY_PAGE_SIZE bytes for the lifetime of
+        // the store that outlives this page.
+        unsafe { std::slice::from_raw_parts(self.0, MEMORY_PAGE_SIZE) }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: same as `as_slice`; `&mut MemoryPage` guarantees unique
+        // access while this slice is alive.
+        unsafe { std::slice::from_raw_parts_mut(self.0, MEMORY_PAGE_SIZE) }
+    }
+
+    #[inline]
+    fn fill(&mut self, value: u8) {
+        self.as_mut_slice().fill(value);
+    }
+}
+
+impl std::ops::Index<usize> for GuestPageBytes {
+    type Output = u8;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.as_slice()[index]
+    }
+}
+
+impl std::ops::Index<std::ops::Range<usize>> for GuestPageBytes {
+    type Output = [u8];
+
+    #[inline]
+    fn index(&self, range: std::ops::Range<usize>) -> &Self::Output {
+        &self.as_slice()[range]
+    }
+}
+
+impl std::ops::Index<std::ops::RangeFull> for GuestPageBytes {
+    type Output = [u8];
+
+    #[inline]
+    fn index(&self, _range: std::ops::RangeFull) -> &Self::Output {
+        self.as_slice()
+    }
+}
+
+impl std::ops::IndexMut<usize> for GuestPageBytes {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.as_mut_slice()[index]
+    }
+}
+
+impl std::ops::IndexMut<std::ops::Range<usize>> for GuestPageBytes {
+    #[inline]
+    fn index_mut(&mut self, range: std::ops::Range<usize>) -> &mut Self::Output {
+        &mut self.as_mut_slice()[range]
+    }
+}
+
+impl std::fmt::Debug for GuestPageBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuestPageBytes")
+            .field("ptr", &self.0)
+            .finish()
+    }
+}
+
+impl PartialEq for GuestPageBytes {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for GuestPageBytes {}
+
+#[derive(Debug)]
 struct MemoryPage {
-    bytes: Box<[u8; MEMORY_PAGE_SIZE]>,
+    bytes: GuestPageBytes,
     mapped: Box<[u64; MEMORY_PAGE_BITMAP_WORDS]>,
     fully_mapped: bool,
 }
 
 type PageLookup = HashMap<u64, usize>;
 
-impl Default for MemoryPage {
-    fn default() -> Self {
+impl PartialEq for MemoryPage {
+    fn eq(&self, other: &Self) -> bool {
+        self.mapped == other.mapped
+            && self.fully_mapped == other.fully_mapped
+            && self.bytes == other.bytes
+    }
+}
+
+impl Eq for MemoryPage {}
+
+impl MemoryPage {
+    fn new(bytes: *mut u8) -> Self {
         Self {
-            bytes: Box::new([0; MEMORY_PAGE_SIZE]),
+            bytes: GuestPageBytes(bytes),
             mapped: Box::new([0; MEMORY_PAGE_BITMAP_WORDS]),
             fully_mapped: false,
         }
     }
-}
 
-impl MemoryPage {
+    fn snapshot(&self, page_base: u64, store: &GuestMemoryStore) -> Self {
+        let pointer = store.materialise_page(page_base);
+        // SAFETY: both pages are exactly MEMORY_PAGE_SIZE bytes; the new
+        // snapshot store is unique and does not overlap the source.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.bytes.as_ptr(), pointer, MEMORY_PAGE_SIZE);
+        }
+        Self {
+            bytes: GuestPageBytes(pointer),
+            mapped: self.mapped.clone(),
+            fully_mapped: self.fully_mapped,
+        }
+    }
     fn bit_mask(start_bit: usize, end_bit: usize) -> u64 {
         let width = end_bit - start_bit;
         if width == 64 {
@@ -1221,6 +1613,9 @@ pub struct MemoryImage {
     pages: Vec<(u64, MemoryPage)>,
     high_page_lookup: PageLookup,
     low_page_lookup: Box<[u32]>,
+    /// Canonical storage shared with the JIT's flat window.  Every page's
+    /// bytes live here; the page table only records which bytes are mapped.
+    store: Arc<GuestMemoryStore>,
     /// Handle to the canonical virtual-memory layer
     /// ([`crate::vm::VirtualMemory`]).  The loader keeps this null (raw
     /// page-map validation only); the PE runtime attaches its live VM with
@@ -1243,10 +1638,19 @@ pub struct GuestMemoryFault {
 
 impl Clone for MemoryImage {
     fn clone(&self) -> Self {
+        // A clone is a snapshot: it gets its own canonical store and copies
+        // every committed page.  It must never alias the live image.
+        let store = GuestMemoryStore::new();
+        let pages = self
+            .pages
+            .iter()
+            .map(|(page_base, page)| (*page_base, page.snapshot(*page_base, &store)))
+            .collect();
         Self {
-            pages: self.pages.clone(),
+            pages,
             high_page_lookup: self.high_page_lookup.clone(),
             low_page_lookup: self.low_page_lookup.clone(),
+            store: Arc::new(store),
             vm: self.vm,
         }
     }
@@ -1259,6 +1663,7 @@ impl Default for MemoryImage {
             high_page_lookup: PageLookup::default(),
             low_page_lookup: vec![LOW_PAGE_DIRECTORY_MISSING; LOW_PAGE_DIRECTORY_LEN]
                 .into_boxed_slice(),
+            store: Arc::new(GuestMemoryStore::new()),
             vm: std::ptr::null_mut(),
         }
     }
@@ -1326,10 +1731,37 @@ impl MemoryImage {
             return &mut self.pages[index].1;
         }
 
+        let pointer = self.store.materialise_page(page_base);
         let index = self.pages.len();
-        self.pages.push((page_base, MemoryPage::default()));
+        self.pages.push((page_base, MemoryPage::new(pointer)));
         self.record_page_index(page_base, index);
         &mut self.pages[index].1
+    }
+
+    /// The canonical store backing this image.  The JIT attaches its flat
+    /// window to this exact store, so both views alias the same bytes.
+    pub(crate) fn canonical_store(&self) -> &Arc<GuestMemoryStore> {
+        &self.store
+    }
+
+    /// True when the page exists and every byte in it is mapped.  Used by the
+    /// JIT materialisation pass and the SIGBUS fallback; never allocates.
+    pub(crate) fn page_is_fully_mapped(&self, page_base: u64) -> bool {
+        self.page(page_base)
+            .is_some_and(MemoryPage::is_fully_mapped)
+    }
+
+    /// True when the page exists (even partially mapped); never allocates.
+    pub(crate) fn page_exists(&self, page_base: u64) -> bool {
+        self.page(page_base).is_some()
+    }
+
+    /// Signal-safe check for the SIGBUS fallback: is `offset` inside the
+    /// page's mapped byte bitmap?  Never allocates and never takes a lock
+    /// beyond the page table lookup.
+    pub(crate) fn page_byte_is_mapped(&self, page_base: u64, offset: usize) -> bool {
+        self.page(page_base)
+            .is_some_and(|page| offset < MEMORY_PAGE_SIZE && page.is_mapped(offset))
     }
 
     /// Returns the base addresses of all committed (allocated) pages in the
@@ -1450,7 +1882,11 @@ impl MemoryImage {
             .collect();
         to_remove.sort_unstable_by(|a, b| b.cmp(a)); // reverse
         for idx in to_remove {
-            self.pages.swap_remove(idx);
+            let (page_base, _) = self.pages.swap_remove(idx);
+            // High-address frames are owned by the store; release them now.
+            // Flat-window pages remain part of the JIT window and are zeroed
+            // again when re-committed.
+            self.store.release_page(page_base);
         }
         // Rebuild lookup tables by collecting entries first to avoid
         // borrowing self.pages immutably while calling record_page_index.
@@ -4949,14 +5385,15 @@ impl CpuExecutionEngine {
             if jit.is_compiled(guest_address)
                 && let Some(block) = jit.block_cache.get(&guest_address).cloned()
             {
-                // Keep the flat-memory mirror coherent (the AOT path mutates
-                // MemoryImage between JIT executions) and install the SIGBUS
-                // page-sync handler so native loads/stores to unsynced pages
-                // are serviced on demand.
-                jit.sync_all_pages_to_flat(memory);
+                // The flat view aliases the image's canonical pages, so
+                // attaching is an O(1) identity check — there is no mirror to
+                // refresh from the interpreter.  The SIGBUS handler remains
+                // installed only as a fallback for pages the guest has not
+                // committed yet.
+                jit.attach_guest_memory(memory);
                 jit.ensure_sigbus_handler(memory);
 
-                // SAFETY: block.entry points into this runtime's MAP_JIT code
+                // SAFETY: block.entry() points into this runtime's MAP_JIT code
                 // pages (finalized executable); state/memory are the live
                 // guest objects for the duration of the call.
                 let reason = unsafe { jit.execute_block(&block, state, memory) };
@@ -32122,5 +32559,270 @@ mod tests {
 
         // An absent page must be rejected.
         assert!(!unsafe { memory.copy_page_to_raw(0x9000, dst.as_mut_ptr()) });
+    }
+
+    // ── Canonical sparse store ─────────────────────────────────────────
+
+    #[test]
+    fn sparse_two_gib_commit_materialises_pages_once_and_only_touched_pages_resident() {
+        let mut memory = MemoryImage::default();
+        let low = 0x1000_u64;
+        let two_gib = 0x7FFF_F000_u64;
+        memory.map_bytes(low, &[0x11; 4096]);
+        memory.map_bytes(two_gib, &[0xA5; 4096]);
+        let store = Arc::clone(memory.canonical_store());
+
+        assert_eq!(store.materialised_page_count(), 2);
+        assert_eq!(store.materialisation_count(), 2);
+        assert_eq!(
+            store.resident_flat_page_count(),
+            2,
+            "only the two touched pages may be resident in a 4 GiB window"
+        );
+
+        // Repeated reads/writes of committed pages must never re-materialise.
+        for value in 0..16_u64 {
+            memory.write_u64(low, value);
+            memory.write_u64(two_gib, value);
+            assert_eq!(memory.read_u64(low).unwrap(), value);
+            assert_eq!(memory.read_u64(two_gib).unwrap(), value);
+        }
+        assert_eq!(store.materialisation_count(), 2);
+        assert_eq!(store.resident_flat_page_count(), 2);
+
+        // An untouched page is a fault, not a materialisation.
+        let error = memory
+            .read_u8(0x4000_0000)
+            .expect_err("an untouched sparse page must fault");
+        assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+        assert_eq!(store.materialisation_count(), 2);
+        assert!(!store.is_page_materialised(0x4000_0000));
+    }
+
+    #[test]
+    fn overwrite_mapped_page_never_corrupts_neighbour_pages_or_snapshot() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x2000, &[0x11; 4096]);
+        memory.map_bytes(0x3000, &[0x22; 4096]);
+        memory.map_bytes(0x4000, &[0x33; 4096]);
+        let snapshot = memory.clone();
+
+        memory.map_bytes(0x3000, &[0x44; 4096]);
+        assert_eq!(memory.read_u8(0x2FFF).unwrap(), 0x11);
+        assert_eq!(memory.read_u8(0x3000).unwrap(), 0x44);
+        assert_eq!(memory.read_u8(0x3FFF).unwrap(), 0x44);
+        assert_eq!(memory.read_u8(0x4000).unwrap(), 0x33);
+        assert_eq!(
+            snapshot.read_u8(0x3000).unwrap(),
+            0x22,
+            "a clone must remain an independent snapshot"
+        );
+        assert_eq!(snapshot.read_u8(0x2FFF).unwrap(), 0x11);
+        assert_eq!(snapshot.read_u8(0x4000).unwrap(), 0x33);
+
+        let store = Arc::clone(memory.canonical_store());
+        assert_eq!(store.materialisation_count(), 3);
+        memory.unmap_range(0x3000, 4096);
+        assert_eq!(memory.read_u8(0x2000).unwrap(), 0x11);
+        assert_eq!(memory.read_u8(0x4000).unwrap(), 0x33);
+        assert!(
+            memory.read_u8(0x3000).is_err(),
+            "an unmapped page must not remain readable"
+        );
+        memory.map_bytes(0x3000, &[0x55; 16]);
+        assert_eq!(
+            store.materialisation_count(),
+            4,
+            "re-committing an unmapped page is a new materialisation"
+        );
+        assert_eq!(memory.read_u8(0x2000).unwrap(), 0x11);
+        assert_eq!(memory.read_u8(0x3000).unwrap(), 0x55);
+        assert_eq!(memory.read_u8(0x4000).unwrap(), 0x33);
+        assert_eq!(snapshot.canonical_store().materialisation_count(), 3);
+    }
+
+    #[test]
+    fn high_address_edge_page_outside_flat_window_is_never_flat_resident() {
+        let mut memory = MemoryImage::default();
+        // A dynamic-base x64 PE is routinely mapped above the 4 GiB window.
+        let address = 0x1800_0000_0000_u64;
+        memory.map_bytes(address, &[0x7E; 4096]);
+        let store = Arc::clone(memory.canonical_store());
+        assert_eq!(store.materialised_page_count(), 1);
+        assert_eq!(store.materialisation_count(), 1);
+        assert_eq!(
+            store.resident_flat_page_count(),
+            0,
+            "a page above the flat window must not consume flat residency"
+        );
+        assert!(store.is_page_materialised(address));
+        assert_eq!(memory.read_u8(address).unwrap(), 0x7E);
+        memory.write_u8(address + 4095, 0x42);
+        assert_eq!(memory.read_u8(address + 4095).unwrap(), 0x42);
+        assert_eq!(store.materialisation_count(), 1);
+
+        memory.unmap_range(address, 4096);
+        assert_eq!(store.materialised_page_count(), 0);
+        assert!(!store.is_page_materialised(address));
+        assert!(
+            memory.read_u8(address).is_err(),
+            "a released high page must fault"
+        );
+    }
+
+    #[test]
+    fn partial_page_boundary_probes_never_report_unmapped_bytes_or_absent_pages() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x5000, &[0x11; 16]);
+        assert!(memory.page_exists(0x5000));
+        assert!(!memory.page_is_fully_mapped(0x5000));
+        assert!(memory.page_byte_is_mapped(0x5000, 0));
+        assert!(memory.page_byte_is_mapped(0x5000, 15));
+        assert!(!memory.page_byte_is_mapped(0x5000, 16));
+        assert!(!memory.page_byte_is_mapped(0x5000, 4095));
+        assert!(!memory.page_exists(0x6000));
+        assert!(!memory.page_byte_is_mapped(0x6000, 0));
+        assert_eq!(memory.canonical_store().materialisation_count(), 1);
+    }
+
+    #[test]
+    fn concurrent_flat_and_image_atomic_views_never_observe_stale_or_torn_values() {
+        use std::sync::atomic::AtomicU32;
+
+        let mut memory = MemoryImage::default();
+        let address = 0x8000_u64;
+        memory.map_bytes(address, &[0; 4096]);
+        let store = memory.canonical_store();
+        let flat_view = (store.flat_base() + address) as usize;
+        let image_view = memory.atomic_u32_at(address).unwrap() as *const AtomicU32 as usize;
+        let iterations = 100_000_u32;
+
+        // JIT view writes, interpreter view reads.
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                // SAFETY: the canonical page is committed and 4-byte aligned;
+                // the raw address came from the store's flat window.
+                let atomic = unsafe { &*(flat_view as *const AtomicU32) };
+                for value in 1..=iterations {
+                    atomic.store(value, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            // SAFETY: the page is committed and naturally aligned; the image
+            // view is the same physical bytes as the flat view.
+            let reader = unsafe { &*(image_view as *const AtomicU32) };
+            let mut last = 0_u32;
+            while last < iterations {
+                let observed = reader.load(std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    observed >= last,
+                    "the interpreter view moved backwards: {observed} < {last}"
+                );
+                last = observed;
+                std::hint::spin_loop();
+            }
+            writer.join().unwrap();
+        });
+        assert_eq!(memory.read_u32(address).unwrap(), iterations);
+
+        // Interpreter view writes, JIT view reads.
+        let image_atomic = unsafe { &*(image_view as *const AtomicU32) };
+        image_atomic.store(0, std::sync::atomic::Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                // SAFETY: same committed, aligned canonical page as above.
+                let atomic = unsafe { &*(image_view as *const AtomicU32) };
+                for value in 1..=iterations {
+                    atomic.store(value, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            // SAFETY: same committed, aligned canonical page as above.
+            let reader = unsafe { &*(flat_view as *const AtomicU32) };
+            let mut last = 0_u32;
+            while last < iterations {
+                let observed = reader.load(std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    observed >= last,
+                    "the flat view moved backwards: {observed} < {last}"
+                );
+                last = observed;
+                std::hint::spin_loop();
+            }
+            writer.join().unwrap();
+        });
+        assert_eq!(memory.read_u32(address).unwrap(), iterations);
+        assert_eq!(store.materialisation_count(), 1);
+    }
+
+    #[test]
+    fn concurrent_multi_page_stress_keeps_views_coherent_without_rematerialising() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        const PAGES: u64 = 8;
+        const ITERATIONS: u64 = 20_000;
+        let mut memory = MemoryImage::default();
+        let mut views = Vec::new();
+        for page in 0..PAGES {
+            let address = 0x10_0000 + page * 0x1000;
+            memory.map_bytes(address, &[0; 4096]);
+            let image_ptr = memory.page(address).expect("committed page").bytes.as_ptr() as usize;
+            views.push((
+                image_ptr,
+                memory.canonical_store().flat_base() as usize + address as usize,
+            ));
+        }
+        let store = memory.canonical_store();
+        let done = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            let mut writers = Vec::new();
+            for &(_, flat) in &views {
+                writers.push(scope.spawn(move || {
+                    // SAFETY: page base is aligned and committed; each writer
+                    // owns a distinct page.
+                    let atomic = unsafe { &*(flat as *const AtomicU64) };
+                    for _ in 0..ITERATIONS {
+                        atomic.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }));
+            }
+            let mut readers = Vec::new();
+            for &(image, _) in &views {
+                let done = &done;
+                readers.push(scope.spawn(move || {
+                    // SAFETY: page base is aligned and committed; readers only
+                    // load from the same physical atomic the writer updates.
+                    let atomic = unsafe { &*(image as *const AtomicU64) };
+                    let mut last = 0_u64;
+                    while !done.load(std::sync::atomic::Ordering::Acquire) {
+                        let observed = atomic.load(std::sync::atomic::Ordering::SeqCst);
+                        assert!(
+                            observed >= last,
+                            "concurrent view observed a backwards value: {observed} < {last}"
+                        );
+                        last = observed;
+                        std::hint::spin_loop();
+                    }
+                    atomic.load(std::sync::atomic::Ordering::SeqCst)
+                }));
+            }
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+            for reader in readers {
+                assert_eq!(reader.join().unwrap(), ITERATIONS);
+            }
+        });
+
+        for page in 0..PAGES {
+            let address = 0x10_0000 + page * 0x1000;
+            assert_eq!(memory.read_u64(address).unwrap(), ITERATIONS);
+            assert_eq!(
+                memory.page(address).expect("committed page").bytes.as_ptr() as usize,
+                views[page as usize].0
+            );
+        }
+        assert_eq!(store.materialised_page_count(), PAGES);
+        assert_eq!(store.materialisation_count(), PAGES);
     }
 }

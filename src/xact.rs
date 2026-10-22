@@ -502,14 +502,30 @@ impl WaveEntry {
     }
 }
 
+/// A guest file handle plus the guest `XACT_FILEIO_CALLBACKS` entries that
+/// read, seek and close a streaming wave bank.  Every stream operation goes
+/// through the guest's own code; nothing is re-opened on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuestStreamSource {
+    pub(crate) file: u64,
+    /// Offset of the wave-bank header inside the guest file.
+    pub(crate) offset: u32,
+    pub(crate) read: u64,
+    pub(crate) seek: u64,
+    pub(crate) close: u64,
+}
+
 /// A parsed in-memory XWB wave bank.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WaveBank {
     pub(crate) name: String,
     pub(crate) streaming: bool,
     /// Resolved host path for a streaming bank opened through the runtime's
-    /// file tables; `None` for in-memory banks.
+    /// file tables; `None` for in-memory and guest-streamed banks.
     pub(crate) source_path: Option<String>,
+    /// Guest file handle/callbacks for a streaming bank created from
+    /// `XACT_WAVEBANK_STREAMING_PARAMETERS`.
+    pub(crate) guest_source: Option<GuestStreamSource>,
     pub(crate) entry_names: Vec<String>,
     pub(crate) entries: Vec<WaveEntry>,
 }
@@ -701,6 +717,7 @@ impl WaveBank {
             name,
             streaming,
             source_path: None,
+            guest_source: None,
             entry_names,
             entries,
         })
@@ -710,11 +727,31 @@ impl WaveBank {
     /// materialising its wave payload.  `file_length` is the real on-disk
     /// size; every entry's `[data_offset, data_offset + data_length)` range
     /// is validated against it.  Wave PCM is loaded later by
-    /// [`load_streaming_pcm`] with a real seek/read.
+    /// [`load_streaming_entry`] with a real seek/read.
     pub(crate) fn parse_streaming_header(
         data: &[u8],
         file_length: usize,
         source_path: &str,
+    ) -> Result<Self, u32> {
+        Self::parse_streaming_header_with(data, file_length, Some(source_path.to_string()), None)
+    }
+
+    /// The guest-callback form of [`Self::parse_streaming_header`]: the bank
+    /// came from `XACT_WAVEBANK_STREAMING_PARAMETERS`, so later entry loads
+    /// read through the guest's own file callbacks.
+    pub(crate) fn parse_streaming_header_guest(
+        data: &[u8],
+        file_length: usize,
+        source: GuestStreamSource,
+    ) -> Result<Self, u32> {
+        Self::parse_streaming_header_with(data, file_length, None, Some(source))
+    }
+
+    fn parse_streaming_header_with(
+        data: &[u8],
+        file_length: usize,
+        source_path: Option<String>,
+        guest_source: Option<GuestStreamSource>,
     ) -> Result<Self, u32> {
         let magic = u32_at(data, 0)?;
         if magic == WAVEBANK_SIGNATURE_BE || magic != WAVEBANK_SIGNATURE_LE {
@@ -855,7 +892,8 @@ impl WaveBank {
         Ok(Self {
             name,
             streaming,
-            source_path: Some(source_path.to_string()),
+            source_path,
+            guest_source,
             entry_names,
             entries,
         })
@@ -898,13 +936,11 @@ pub(crate) fn open_streaming_wave_bank(path: &str) -> Result<WaveBank, u32> {
     WaveBank::parse_streaming_header(&data, file_length, path)
 }
 
-/// Load one streaming entry's payload with a real seek/read and decode it.
-/// This is the on-demand path used by `Prepare` and `Play`.
-pub(crate) fn load_streaming_pcm(bank: &WaveBank, index: usize) -> Result<Vec<i16>, u32> {
+/// Load one streaming entry's payload from `path` with a real seek/read and
+/// decode it.  This is the on-demand path used by `Prepare` for host-path
+/// streaming banks.
+pub(crate) fn load_streaming_entry(path: &str, entry: &WaveEntry) -> Result<Vec<i16>, u32> {
     use std::io::{Read, Seek, SeekFrom};
-    let (Some(path), Some(entry)) = (bank.source_path.as_deref(), bank.entries.get(index)) else {
-        return Err(XACTENGINE_E_INVALIDWAVEINDEX);
-    };
     let mut file = std::fs::File::open(path).map_err(|_| E_FAIL)?;
     file.seek(SeekFrom::Start(u64::from(entry.data_offset)))
         .map_err(|_| E_FAIL)?;
@@ -1955,8 +1991,11 @@ impl GlobalSettings {
             let visibility = u8_at(data, base + 9)?;
             let release_curve = if category_stride == 11 {
                 match u8_at(data, base + 10)? {
+                    0 => ReleaseCurve::Linear,
                     1 => ReleaseCurve::Logarithmic,
-                    _ => ReleaseCurve::Linear,
+                    2 => ReleaseCurve::EqualPower,
+                    3 => ReleaseCurve::Squared,
+                    _ => return Err(XACTENGINE_E_INVALIDDATA),
                 }
             } else {
                 ReleaseCurve::Linear
@@ -2125,12 +2164,18 @@ impl LiveVoice {
 
 /// The authored release curve form.  XGS categories carry a release-curve
 /// byte in the extended category record; content without the extension uses
-/// the documented linear amplitude form.
+/// the documented linear amplitude form.  The four values are the authored
+/// envelope shapes: linear amplitude, constant-decibel, equal-power and
+/// squared-amplitude tapers.  Any other byte is malformed content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ReleaseCurve {
     #[default]
     Linear,
     Logarithmic,
+    /// Equal-power taper: `sin(linear * pi/2)`.
+    EqualPower,
+    /// Squared-amplitude taper: `linear^2`.
+    Squared,
 }
 
 /// An amplitude release from `start_gain` to zero over the authored category
@@ -2156,6 +2201,8 @@ impl ReleaseFade {
             match self.curve {
                 ReleaseCurve::Linear => linear,
                 ReleaseCurve::Logarithmic => 10.0_f32.powf(-3.0 * (1.0 - linear)),
+                ReleaseCurve::EqualPower => (linear * std::f32::consts::FRAC_PI_2).sin(),
+                ReleaseCurve::Squared => linear * linear,
             }
         }
     }
@@ -2236,6 +2283,22 @@ pub(crate) struct WaveBankState {
     pub(crate) streaming_cache: BTreeMap<u16, Vec<i16>>,
 }
 
+/// The decoded source of a live cue.  Kept so `SetOutputVoices` can reroute
+/// an active cue onto its new destination voices without re-resolving the
+/// variation table or rewinding the authored selection.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CuePlayback {
+    pub(crate) samples: Vec<i16>,
+    pub(crate) channels: u16,
+    pub(crate) sample_rate: u32,
+    pub(crate) loop_count: u8,
+    pub(crate) loop_start_samples: u32,
+    pub(crate) loop_total_samples: u32,
+    pub(crate) volume: f32,
+    pub(crate) pitch: i16,
+    pub(crate) category: u16,
+}
+
 /// A cue object handed to the guest.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CueObject {
@@ -2259,6 +2322,9 @@ pub(crate) struct CueObject {
     /// their channel counts and per-destination matrices.  `None` is the
     /// default route to the engine mastering voice.
     pub(crate) output_voices: Option<Vec<OutputVoiceRoute>>,
+    /// Decoded source of the current live playback, preserved across
+    /// `SetOutputVoices` reroutes.
+    pub(crate) playback: Option<CuePlayback>,
 }
 
 /// A standalone wave object handed to the guest.
@@ -2840,8 +2906,12 @@ pub(crate) mod fixtures {
 
     /// Build an XGS whose category records carry the 11-byte release-curve
     /// extension: a 200 ms fade-out on "Music" and the requested curve byte
-    /// (0 = linear amplitude, 1 = logarithmic amplitude).
+    /// (0 = linear, 1 = logarithmic, 2 = equal-power, 3 = squared).
     pub(crate) fn build_xgs_curve(curve: u8) -> Vec<u8> {
+        build_xgs_curve_with_fade(curve, 200)
+    }
+
+    pub(crate) fn build_xgs_curve_with_fade(curve: u8, fade_out: u16) -> Vec<u8> {
         const CATEGORY_OFFSET: u32 = 80;
         const CATEGORY_STRIDE: u32 = 11;
         const VARIABLE_OFFSET: u32 = CATEGORY_OFFSET + 2 * CATEGORY_STRIDE;
@@ -2875,10 +2945,10 @@ pub(crate) mod fixtures {
         w32(&mut out, 0);
         w32(&mut out, 0);
         out.resize(CATEGORY_OFFSET as usize, 0);
-        for (fade_out, curve_byte) in [(200_u16, curve), (0_u16, 0_u8)] {
+        for (fade, curve_byte) in [(fade_out, curve), (0_u16, 0_u8)] {
             out.push(255);
             w16(&mut out, 0);
-            w16(&mut out, fade_out);
+            w16(&mut out, fade);
             out.push(0);
             w16(&mut out, 0xFFFF);
             out.push(180);
@@ -3057,5 +3127,39 @@ mod tests {
         assert!(!engine.category_includes(1, 2));
         assert_eq!(engine.category_gain(2), 0.25);
         assert_eq!(engine.category_gain(9), 1.0);
+    }
+
+    #[test]
+    fn release_curves_pin_exact_gain_and_reject_malformed_payload() {
+        assert_eq!(release_at(ReleaseCurve::Linear, 50, 100), 0.5);
+        assert!(
+            (release_at(ReleaseCurve::Logarithmic, 50, 100) - 10.0_f32.powf(-1.5)).abs() < 1.0e-6
+        );
+        assert!(
+            (release_at(ReleaseCurve::EqualPower, 50, 100) - std::f32::consts::FRAC_1_SQRT_2).abs()
+                < 1.0e-6
+        );
+        assert_eq!(release_at(ReleaseCurve::Squared, 50, 100), 0.25);
+        assert_eq!(release_at(ReleaseCurve::Squared, 0, 100), 0.0);
+        assert_eq!(
+            release_at(ReleaseCurve::EqualPower, 0, 0),
+            0.0,
+            "invalid zero-length release is silent"
+        );
+        for (byte, curve) in [
+            (0_u8, ReleaseCurve::Linear),
+            (1_u8, ReleaseCurve::Logarithmic),
+            (2_u8, ReleaseCurve::EqualPower),
+            (3_u8, ReleaseCurve::Squared),
+        ] {
+            let settings =
+                GlobalSettings::parse(&build_xgs_curve(byte)).expect("valid release curve");
+            assert_eq!(settings.categories[0].release_curve, curve);
+        }
+        assert_eq!(
+            GlobalSettings::parse(&build_xgs_curve(4)),
+            Err(XACTENGINE_E_INVALIDDATA),
+            "unknown curve byte is malformed content"
+        );
     }
 }

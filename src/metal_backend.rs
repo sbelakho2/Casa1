@@ -127,7 +127,7 @@ impl_encoder_lifecycle!(metal::ParallelRenderCommandEncoder);
 /// never fire even on early-return/error paths.
 pub struct AutoEndEncoder<T: MetalEncoderLifecycle> {
     encoder: T,
-    ended: std::cell::Cell<bool>,
+    ended: std::sync::atomic::AtomicBool,
 }
 
 impl<T: MetalEncoderLifecycle> AutoEndEncoder<T> {
@@ -135,12 +135,12 @@ impl<T: MetalEncoderLifecycle> AutoEndEncoder<T> {
         METAL_ENCODERS_CREATED.fetch_add(1, Ordering::Relaxed);
         Self {
             encoder,
-            ended: std::cell::Cell::new(false),
+            ended: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub fn end(&self) {
-        if !self.ended.replace(true) {
+        if !self.ended.swap(true, Ordering::AcqRel) {
             self.encoder.end_encoding();
             METAL_ENCODERS_ENDED.fetch_add(1, Ordering::Relaxed);
         }
@@ -153,7 +153,7 @@ impl<T: MetalEncoderLifecycle> AutoEndEncoder<T> {
 
 impl<T: MetalEncoderLifecycle> Drop for AutoEndEncoder<T> {
     fn drop(&mut self) {
-        if !self.ended.get() {
+        if !self.ended.load(Ordering::Acquire) {
             self.encoder.end_encoding();
             METAL_ENCODERS_ENDED.fetch_add(1, Ordering::Relaxed);
         }
@@ -5754,9 +5754,15 @@ pub struct MetalSampler {
 ///
 /// Provides a safe interface for encoding compute operations including
 /// dispatch, resource binding, and acceleration structure builds.
+///
+/// Thread affinity: the encoder itself (and every other `metal::*` object in
+/// this file) is created, encoded, and ended on the runtime-owner thread.
+/// `ended` is atomic solely so close/abort observers on other threads can ask
+/// whether the encoder already finished; it is not a licence to encode from a
+/// worker thread.
 pub struct MetalComputeEncoder {
     encoder: metal::ComputeCommandEncoder,
-    ended: std::cell::Cell<bool>,
+    ended: std::sync::atomic::AtomicBool,
 }
 
 impl MetalComputeEncoder {
@@ -5766,7 +5772,7 @@ impl MetalComputeEncoder {
         METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             encoder,
-            ended: std::cell::Cell::new(false),
+            ended: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -5775,7 +5781,7 @@ impl MetalComputeEncoder {
         METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             encoder,
-            ended: std::cell::Cell::new(false),
+            ended: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -5791,7 +5797,7 @@ impl MetalComputeEncoder {
 
     /// End encoding.
     pub fn end_encoding(&self) {
-        if !self.ended.replace(true) {
+        if !self.ended.swap(true, Ordering::AcqRel) {
             self.encoder.end_encoding();
             METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5800,7 +5806,7 @@ impl MetalComputeEncoder {
 
 impl Drop for MetalComputeEncoder {
     fn drop(&mut self) {
-        if !self.ended.get() {
+        if !self.ended.load(Ordering::Acquire) {
             self.encoder.end_encoding();
             METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5813,7 +5819,7 @@ impl Drop for MetalComputeEncoder {
 /// draw calls, resource binding, and pipeline state management.
 pub struct MetalRenderEncoder {
     encoder: metal::RenderCommandEncoder,
-    ended: std::cell::Cell<bool>,
+    ended: std::sync::atomic::AtomicBool,
     /// Whether the pipeline currently bound to the encoder is a native mesh
     /// render pipeline (`MTLMeshRenderPipelineState`). Set by callers via
     /// [`set_mesh_pipeline_bound`] when a mesh pipeline is bound; used by
@@ -5836,7 +5842,7 @@ impl MetalRenderEncoder {
         METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             encoder,
-            ended: std::cell::Cell::new(false),
+            ended: std::sync::atomic::AtomicBool::new(false),
             mesh_pipeline_bound: false,
         })
     }
@@ -5846,7 +5852,7 @@ impl MetalRenderEncoder {
         METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             encoder,
-            ended: std::cell::Cell::new(false),
+            ended: std::sync::atomic::AtomicBool::new(false),
             mesh_pipeline_bound: false,
         }
     }
@@ -5873,7 +5879,7 @@ impl MetalRenderEncoder {
 
     /// End encoding.
     pub fn end_encoding(&self) {
-        if !self.ended.replace(true) {
+        if !self.ended.swap(true, Ordering::AcqRel) {
             self.encoder.end_encoding();
             METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5882,7 +5888,7 @@ impl MetalRenderEncoder {
 
 impl Drop for MetalRenderEncoder {
     fn drop(&mut self) {
-        if !self.ended.get() {
+        if !self.ended.load(Ordering::Acquire) {
             self.encoder.end_encoding();
             METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5894,7 +5900,7 @@ impl Drop for MetalRenderEncoder {
 /// Used for building and refitting ray tracing acceleration structures.
 pub struct MetalAccelerationStructureEncoder {
     encoder: metal::AccelerationStructureCommandEncoder,
-    ended: std::cell::Cell<bool>,
+    ended: std::sync::atomic::AtomicBool,
 }
 
 impl MetalAccelerationStructureEncoder {
@@ -5906,7 +5912,7 @@ impl MetalAccelerationStructureEncoder {
         METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             encoder,
-            ended: std::cell::Cell::new(false),
+            ended: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -5917,7 +5923,7 @@ impl MetalAccelerationStructureEncoder {
 
     /// End encoding.
     pub fn end_encoding(&self) {
-        if !self.ended.replace(true) {
+        if !self.ended.swap(true, Ordering::AcqRel) {
             self.encoder.end_encoding();
             METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5926,7 +5932,7 @@ impl MetalAccelerationStructureEncoder {
 
 impl Drop for MetalAccelerationStructureEncoder {
     fn drop(&mut self) {
-        if !self.ended.get() {
+        if !self.ended.load(Ordering::Acquire) {
             self.encoder.end_encoding();
             METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5945,7 +5951,7 @@ impl Drop for MetalAccelerationStructureEncoder {
 /// function table bindings, which are not directly exposed by the crate.
 pub struct MetalRayTracingEncoder {
     encoder: metal::ComputeCommandEncoder,
-    ended: std::cell::Cell<bool>,
+    ended: std::sync::atomic::AtomicBool,
 }
 
 impl MetalRayTracingEncoder {
@@ -5955,7 +5961,7 @@ impl MetalRayTracingEncoder {
         METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             encoder,
-            ended: std::cell::Cell::new(false),
+            ended: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -6061,7 +6067,7 @@ impl MetalRayTracingEncoder {
 
     /// End encoding of the underlying compute encoder.
     pub fn end_encoding(&self) {
-        if !self.ended.replace(true) {
+        if !self.ended.swap(true, Ordering::AcqRel) {
             self.encoder.end_encoding();
             METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -6070,7 +6076,7 @@ impl MetalRayTracingEncoder {
 
 impl Drop for MetalRayTracingEncoder {
     fn drop(&mut self) {
-        if !self.ended.get() {
+        if !self.ended.load(Ordering::Acquire) {
             self.encoder.end_encoding();
             METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -6111,6 +6117,11 @@ pub struct D2DVertex {
 /// `wait_until_completed`: a completion handler releases a frame slot so the
 /// pool buffer is only reused after the GPU has finished the frame that last
 /// used it (classic multi-buffering, see [`FrameSlotSemaphore`]).
+///
+/// Thread affinity: all Metal objects and the command-buffer lifecycle stay on
+/// the runtime-owner thread.  The vertex-pool cursor/index are atomic only so
+/// a concurrently observing (diagnostic/close) thread can read pool state
+/// without touching the encoder; workers never encode or present.
 pub struct MetalD2DRenderer {
     device: metal::Device,
     queue: metal::CommandQueue,
@@ -6132,9 +6143,9 @@ pub struct MetalD2DRenderer {
     /// buffers of `POOL_BUFFER_BYTES` each.
     vertex_pool: Vec<metal::Buffer>,
     /// Write cursor (bytes) into the current pool buffer.
-    pool_cursor: std::cell::Cell<usize>,
+    pool_cursor: std::sync::atomic::AtomicUsize,
     /// Index of the current pool buffer in `vertex_pool`.
-    pool_buffer: std::cell::Cell<usize>,
+    pool_buffer: std::sync::atomic::AtomicUsize,
     /// Frames committed so far; drives pool-buffer rotation.
     frame_index: usize,
     /// In-flight frame tracking so pool buffers are only reused once the GPU
@@ -6442,8 +6453,8 @@ fragment float4 d2d_tex_ps(VOutFrag in [[stage_in]],
             width,
             height,
             vertex_pool,
-            pool_cursor: std::cell::Cell::new(0),
-            pool_buffer: std::cell::Cell::new(0),
+            pool_cursor: std::sync::atomic::AtomicUsize::new(0),
+            pool_buffer: std::sync::atomic::AtomicUsize::new(0),
             frame_index: 0,
             frame_slots: std::sync::Arc::new(FrameSlotSemaphore::new(POOL_BUFFER_COUNT as u32)),
         })
@@ -6583,11 +6594,11 @@ fragment float4 d2d_tex_ps(VOutFrag in [[stage_in]],
             return None;
         }
         let bytes = std::mem::size_of::<T>().checked_mul(vertices.len())?;
-        let cursor = self.pool_cursor.get();
+        let cursor = self.pool_cursor.load(Ordering::Relaxed);
         if bytes > POOL_BUFFER_BYTES || cursor + bytes > POOL_BUFFER_BYTES {
             return None;
         }
-        let pool_idx = self.pool_buffer.get();
+        let pool_idx = self.pool_buffer.load(Ordering::Relaxed);
         let buffer = &self.vertex_pool[pool_idx];
         // SAFETY: the pool buffers are StorageModeShared and `cursor + bytes`
         // was validated against `POOL_BUFFER_BYTES` above; the pool buffer is
@@ -6597,7 +6608,7 @@ fragment float4 d2d_tex_ps(VOutFrag in [[stage_in]],
             let dst = buffer.contents().add(cursor) as *mut u8;
             std::ptr::copy_nonoverlapping(vertices.as_ptr() as *const u8, dst, bytes);
         }
-        self.pool_cursor.set(cursor + bytes);
+        self.pool_cursor.store(cursor + bytes, Ordering::Relaxed);
         Some((buffer.clone(), cursor as u64))
     }
 
@@ -6963,8 +6974,9 @@ fragment float4 d2d_tex_ps(VOutFrag in [[stage_in]],
         }
         // Rotate the pool buffer for the next frame.
         self.frame_index += 1;
-        self.pool_buffer.set(self.frame_index % POOL_BUFFER_COUNT);
-        self.pool_cursor.set(0);
+        self.pool_buffer
+            .store(self.frame_index % POOL_BUFFER_COUNT, Ordering::Relaxed);
+        self.pool_cursor.store(0, Ordering::Relaxed);
     }
 
     /// Read back the render target pixels to CPU memory.
@@ -16386,7 +16398,9 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
                 .is_none(),
             true
         );
-        renderer.pool_cursor.set(POOL_BUFFER_BYTES - 4);
+        renderer
+            .pool_cursor
+            .store(POOL_BUFFER_BYTES - 4, Ordering::Relaxed);
         assert_eq!(renderer.upload_vertex_data(&[1u64]).is_none(), true);
 
         renderer.begin_frame();
@@ -19167,26 +19181,31 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
         let mut renderer = MetalD2DRenderer::new(&device, 8, 8).expect("D2D renderer");
         renderer.begin_frame();
         assert_eq!(renderer.encoder.is_some(), true);
-        assert_eq!(renderer.pool_cursor.get(), 0);
+        assert_eq!(renderer.pool_cursor.load(Ordering::Relaxed), 0);
 
         renderer.fill_rect(0.0, 0.0, 4.0, 4.0, 0xffff_ffff);
         assert_eq!(
-            renderer.pool_cursor.get(),
+            renderer.pool_cursor.load(Ordering::Relaxed),
             4 * std::mem::size_of::<D2DVertex>(),
             "fill_rect must bind four pooled vertices"
         );
         renderer.draw_line(0.0, 0.0, 4.0, 4.0, 1.0, 0xffff_ffff);
         assert_eq!(
-            renderer.pool_cursor.get(),
+            renderer.pool_cursor.load(Ordering::Relaxed),
             10 * std::mem::size_of::<D2DVertex>(),
             "draw_line must append six pooled vertices"
         );
         renderer.end_frame();
-        assert_eq!(renderer.pool_cursor.get(), 0);
+        assert_eq!(renderer.pool_cursor.load(Ordering::Relaxed), 0);
 
-        renderer.pool_cursor.set(POOL_BUFFER_BYTES - 4);
+        renderer
+            .pool_cursor
+            .store(POOL_BUFFER_BYTES - 4, Ordering::Relaxed);
         assert_eq!(renderer.upload_vertex_data(&[1u64]).is_none(), true);
-        assert_eq!(renderer.pool_cursor.get(), POOL_BUFFER_BYTES - 4);
+        assert_eq!(
+            renderer.pool_cursor.load(Ordering::Relaxed),
+            POOL_BUFFER_BYTES - 4
+        );
     }
 
     #[test]
@@ -19596,10 +19615,12 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
             true,
             "the bitmap fallback needs a live render encoder"
         );
-        renderer.pool_cursor.set(POOL_BUFFER_BYTES);
+        renderer
+            .pool_cursor
+            .store(POOL_BUFFER_BYTES, Ordering::Relaxed);
         renderer.draw_bitmap(&[255u8; 4], 1, 1, 0.0, 0.0, 1.0, 1.0, 0.5);
         assert_eq!(
-            renderer.pool_cursor.get(),
+            renderer.pool_cursor.load(Ordering::Relaxed),
             POOL_BUFFER_BYTES,
             "an exhausted pool must never be overwritten or rewound"
         );
@@ -19623,7 +19644,7 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
         renderer.end_frame();
         assert_eq!(renderer.frame_index, frame_index + 1);
         assert_eq!(
-            renderer.pool_buffer.get(),
+            renderer.pool_buffer.load(Ordering::Relaxed),
             (frame_index + 1) % POOL_BUFFER_COUNT,
             "a frameless end_frame must rotate the pool exactly once"
         );

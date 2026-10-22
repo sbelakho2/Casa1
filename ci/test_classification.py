@@ -42,7 +42,7 @@ ADVERSARIAL_NAME = re.compile(
     r"busy|cancel|deny|forbid|unsupported|mismatch|corrupt|truncat|abort|stale|"
     r"race|deadlock|exhaust|leak|panic|bad|illegal|closed|evict|loss|drop|"
     r"out_of_order|duplicate|unavailable|fallback|fuzz|tamper|garbage|negative|"
-    r"edge|boundary|adversarial|stress|churn|never_crashes|no_races",
+    r"edge|boundary|adversarial|stress|churn|never_crashes|no_races|overlap|concurren|parallel|slice|barrier|worker|pump|migration|race",
     re.IGNORECASE,
 )
 

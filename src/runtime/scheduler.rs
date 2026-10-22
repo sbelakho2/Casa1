@@ -17,6 +17,9 @@
 //! scheduler-side half instead: wait/park/resume semantics (including the
 //! completion-port wait) plus instrumentation that a pool can use.
 use super::*;
+use crate::runtime::object_manager::ObjectId;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 /// Scheduler instrumentation.  Process-wide atomics keep the hot paths
 /// lock-free; tests snapshot deltas so concurrently running tests cannot make
@@ -34,9 +37,36 @@ pub(crate) struct SchedulerCounters {
     /// Wall nanoseconds guest slices actually ran on host threads.
     pub(crate) host_worker_busy_nanos: std::sync::atomic::AtomicU64,
     /// Distinct host threads that have executed a guest slice.  Cooperative
-    /// mode observes exactly the pumping thread; a real worker pool would
-    /// observe one entry per worker.
+    /// mode observes exactly the pumping thread; production mode observes one
+    /// entry per native pool worker that executed a wait job.
     pub(crate) host_workers: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+    /// Real park-signal notifications delivered to a waiting thread (object
+    /// signal, completion-port packet, cross-thread signal, APC).
+    pub(crate) wakeups: std::sync::atomic::AtomicU64,
+    /// Object-manager signal notifications that matched at least one parked
+    /// waiter.
+    pub(crate) object_wakeups: std::sync::atomic::AtomicU64,
+    /// Production waits that completed because their host deadline expired.
+    pub(crate) deadline_wakeups: std::sync::atomic::AtomicU64,
+    /// Production waits woken by an alertable APC notification.
+    pub(crate) apc_wakeups: std::sync::atomic::AtomicU64,
+    /// Wait jobs that were re-parked because a wake did not satisfy the wait.
+    pub(crate) repark_events: std::sync::atomic::AtomicU64,
+    /// Times a wait job was executed by a different host worker than the
+    /// guest thread's previous wait job.
+    pub(crate) migrations: std::sync::atomic::AtomicU64,
+    /// Wait-job starts that overlapped another active wait job (proof that
+    /// two native workers held guest threads at the same time).
+    pub(crate) worker_overlaps: std::sync::atomic::AtomicU64,
+    /// Wait jobs active on native workers right now / high-water mark.
+    pub(crate) active_worker_jobs: std::sync::atomic::AtomicU64,
+    pub(crate) max_concurrent_worker_jobs: std::sync::atomic::AtomicU64,
+    /// Cooperative fallback idle polls (the only 1 ms poll loop).  Production
+    /// waits must leave this counter untouched.
+    pub(crate) poll_iterations: std::sync::atomic::AtomicU64,
+    /// Completion-port slice rechecks (a blocked IOCP wait re-enters the
+    /// port's condition variable; never a 1 ms hot-path poll).
+    pub(crate) port_rechecks: std::sync::atomic::AtomicU64,
 }
 
 /// Point-in-time copy of [`SchedulerCounters`].
@@ -47,6 +77,17 @@ pub(crate) struct SchedulerCountersSnapshot {
     pub(crate) completion_port_wakeups: u64,
     pub(crate) host_worker_busy_nanos: u64,
     pub(crate) host_workers_observed: usize,
+    pub(crate) wakeups: u64,
+    pub(crate) object_wakeups: u64,
+    pub(crate) deadline_wakeups: u64,
+    pub(crate) apc_wakeups: u64,
+    pub(crate) repark_events: u64,
+    pub(crate) migrations: u64,
+    pub(crate) worker_overlaps: u64,
+    pub(crate) active_worker_jobs: u64,
+    pub(crate) max_concurrent_worker_jobs: u64,
+    pub(crate) poll_iterations: u64,
+    pub(crate) port_rechecks: u64,
 }
 
 impl SchedulerCounters {
@@ -63,6 +104,17 @@ impl SchedulerCounters {
                 .lock()
                 .map(|workers| workers.len())
                 .unwrap_or(0),
+            wakeups: self.wakeups.load(Relaxed),
+            object_wakeups: self.object_wakeups.load(Relaxed),
+            deadline_wakeups: self.deadline_wakeups.load(Relaxed),
+            apc_wakeups: self.apc_wakeups.load(Relaxed),
+            repark_events: self.repark_events.load(Relaxed),
+            migrations: self.migrations.load(Relaxed),
+            worker_overlaps: self.worker_overlaps.load(Relaxed),
+            active_worker_jobs: self.active_worker_jobs.load(Relaxed),
+            max_concurrent_worker_jobs: self.max_concurrent_worker_jobs.load(Relaxed),
+            poll_iterations: self.poll_iterations.load(Relaxed),
+            port_rechecks: self.port_rechecks.load(Relaxed),
         }
     }
 
@@ -85,6 +137,18 @@ impl SchedulerCounters {
             .map(|workers| workers.contains(&thread_id))
             .unwrap_or(false)
     }
+
+    /// Register the calling host thread as a scheduler worker without
+    /// charging guest-slice time (a wait job blocks on a condition variable;
+    /// that is not guest execution).
+    fn note_host_worker_identity(&self) {
+        let current = std::thread::current().id();
+        if let Ok(mut workers) = self.host_workers.lock()
+            && !workers.contains(&current)
+        {
+            workers.push(current);
+        }
+    }
 }
 
 pub(crate) static SCHEDULER_COUNTERS: SchedulerCounters = SchedulerCounters {
@@ -93,13 +157,24 @@ pub(crate) static SCHEDULER_COUNTERS: SchedulerCounters = SchedulerCounters {
     completion_port_wakeups: std::sync::atomic::AtomicU64::new(0),
     host_worker_busy_nanos: std::sync::atomic::AtomicU64::new(0),
     host_workers: std::sync::Mutex::new(Vec::new()),
+    wakeups: std::sync::atomic::AtomicU64::new(0),
+    object_wakeups: std::sync::atomic::AtomicU64::new(0),
+    deadline_wakeups: std::sync::atomic::AtomicU64::new(0),
+    apc_wakeups: std::sync::atomic::AtomicU64::new(0),
+    repark_events: std::sync::atomic::AtomicU64::new(0),
+    migrations: std::sync::atomic::AtomicU64::new(0),
+    worker_overlaps: std::sync::atomic::AtomicU64::new(0),
+    active_worker_jobs: std::sync::atomic::AtomicU64::new(0),
+    max_concurrent_worker_jobs: std::sync::atomic::AtomicU64::new(0),
+    poll_iterations: std::sync::atomic::AtomicU64::new(0),
+    port_rechecks: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// What a parked guest wait is waiting for.  The scheduler resumes the
 /// thread only when the descriptor becomes satisfiable — object signals,
 /// overlapped completion, pipe connection, completion-port packet, deadline
 /// expiry or (alertable) APC delivery.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum WaitOperation {
     /// Sleep / SleepEx: no objects; resume at the deadline or via APC
     /// (alertable).  An infinite non-alertable sleep never resumes.
@@ -180,6 +255,7 @@ pub(crate) enum WaitOperation {
 
 /// A parked guest wait: the thread, the objects, the policy, the deadline
 /// and the alertability, as one scheduler wait descriptor.
+#[derive(Debug, Clone)]
 pub(crate) struct GuestWait {
     pub(crate) objects: Vec<u32>,
     pub(crate) wait_all: bool,
@@ -721,6 +797,26 @@ impl PeHostRuntime {
     /// requeues them with the descriptor).  The main loop's thread parks
     /// directly in the queue; the main loop then switches to pump-driven
     /// mode (see `run_pump_driven`) until the run ends.
+    /// Park a pumped guest thread on a native worker when its wait has an
+    /// event source.  Returns `None` after queueing the record (completion
+    /// owns it), or the record itself when cooperative parking is required.
+    fn park_pumped_thread_in_production(
+        &mut self,
+        mut pending_thread: PendingGuestThread,
+    ) -> Option<PendingGuestThread> {
+        pending_thread.state_machine = GuestThreadState::Waiting;
+        let started = pending_thread
+            .wait
+            .as_ref()
+            .is_some_and(|wait| self.start_production_wait(pending_thread.thread_id, wait));
+        if started {
+            self.pending_guest_threads.push_back(pending_thread);
+            None
+        } else {
+            Some(pending_thread)
+        }
+    }
+
     pub(crate) fn park_for_wait(&mut self, state: &mut CpuState, wait: GuestWait) {
         SCHEDULER_COUNTERS
             .parked_waits
@@ -733,6 +829,10 @@ impl PeHostRuntime {
         let handle = self.win32.current_thread_handle();
         let thread_id = self.win32.current_thread_id();
         let rsp = state.get(Register::Rsp);
+        // In production mode the thread is parked on a native worker with a
+        // real wake source; the record still lives in the pending queue so
+        // suspend/terminate bookkeeping observes it.
+        let _ = self.start_production_wait(thread_id, &wait);
         self.pending_guest_threads.push_back(PendingGuestThread {
             handle,
             thread_id,
@@ -782,12 +882,19 @@ impl PeHostRuntime {
                 );
                 return Ok(-2);
             }
+            // Terminated/detached threads no longer own a production wait;
+            // then apply every native-worker completion (a woken thread runs
+            // in this same iteration).
+            self.prune_orphan_production_waits();
+            if self.reap_production_completions(memory)? {
+                continue;
+            }
             let pump_outcome = self.pump_pending_guest_thread(memory)?;
             if let Some(code) = pump_outcome.process_exit {
                 exit_code = code;
                 break;
             }
-            if self.pending_guest_threads.is_empty() {
+            if self.pending_guest_threads.is_empty() && self.production_waits.is_empty() {
                 // All threads exited (the main thread's exit is reported as
                 // process_exit by the pump; this is the belt-and-braces end).
                 break;
@@ -803,10 +910,34 @@ impl PeHostRuntime {
                 continue;
             }
             if !pump_outcome.did_work {
-                // Nothing runnable: the host sleeps briefly and the guest
-                // clock advances so finite deadlines expire.
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                self.win32.record_sleep_observation(1, 1);
+                let cooperative_pending = self
+                    .pending_guest_threads
+                    .iter()
+                    .any(|thread| !self.production_waits.contains_key(&thread.thread_id));
+                if !self.production_waits.is_empty() && !cooperative_pending {
+                    // Every parked thread is on a native worker: block on the
+                    // completion condition variable.  The timeout is
+                    // housekeeping only (run-deadline/timer/APC servicing);
+                    // real wakeups are posted immediately by the workers.
+                    let wait_started = Instant::now();
+                    if let Some(scheduler) = self.production_scheduler.as_ref() {
+                        let _ = scheduler.wait_for_completion(Some(PRODUCTION_HOUSEKEEPING));
+                    }
+                    let elapsed_ms =
+                        wait_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    if elapsed_ms > 0 {
+                        self.win32.record_sleep_observation(elapsed_ms, elapsed_ms);
+                    }
+                } else {
+                    // Nothing runnable and at least one cooperative wait:
+                    // the historical 1 ms idle poll (deterministic mode and
+                    // unsupported wait sources).
+                    std::thread::sleep(Duration::from_millis(1));
+                    self.win32.record_sleep_observation(1, 1);
+                    SCHEDULER_COUNTERS
+                        .poll_iterations
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         Ok(exit_code)
@@ -834,6 +965,11 @@ impl PeHostRuntime {
         thread: &PendingGuestThread,
         memory: &mut MemoryImage,
     ) -> AppResult<CompletionPortPreconsume> {
+        // A production completion already consumed the packet and recorded
+        // the exact resume result: never consume a second packet here.
+        if thread.wait_resume.is_some() {
+            return Ok(CompletionPortPreconsume::Deferred);
+        }
         let Some(wait) = thread.wait.as_ref() else {
             return Ok(CompletionPortPreconsume::Deferred);
         };
@@ -910,6 +1046,12 @@ impl PeHostRuntime {
         &mut self,
         memory: &mut MemoryImage,
     ) -> AppResult<PumpOutcome> {
+        // Production mode: run compiled guest-code slices on native workers
+        // first.  Threads that reach a host barrier are left for the
+        // cooperative owner path below (thunk serialization).
+        if let Some(outcome) = self.try_pump_parallel_slices(memory)? {
+            return Ok(outcome);
+        }
         let now = self.win32.get_tick_count64();
         // The state machine drives readiness: `Runnable` threads are ready;
         // `Waiting`/`AlertableWaiting` threads are only ready once their
@@ -921,6 +1063,11 @@ impl PeHostRuntime {
         // suspension was never released (and suspend/resume on it already
         // fails, so the counters can only stay put).
         let Some(ready_index) = self.pending_guest_threads.iter().position(|thread| {
+            if self.production_waits.contains_key(&thread.thread_id) {
+                // Parked on a native production worker: the completion pass
+                // owns its readiness, not the cooperative predicate.
+                return false;
+            }
             thread.suspended == 0
                 && !self.win32.thread_has_exited(thread.thread_id)
                 && match thread.state_machine {
@@ -1026,8 +1173,28 @@ impl PeHostRuntime {
 
             // Scheduler wait resume: the readiness pass determined the
             // descriptor is satisfiable; consume it atomically and apply the
-            // result (RAX + last_error), then run the thread.
-            let _resumed_from_wait = if let Some(wait) = pending_thread.wait.take() {
+            // result (RAX + last_error), then run the thread.  A production
+            // worker may already have recorded the resume result; that path
+            // must not re-consume the wait.
+            let _resumed_from_wait = if let Some(resume) = pending_thread.wait_resume.take() {
+                let wait = pending_thread.wait.take();
+                if wait.as_ref().is_some_and(|wait| wait.alertable)
+                    && resume.code == crate::win32::WAIT_IO_COMPLETION
+                {
+                    let continue_rip = pending_thread.state.rip;
+                    let _ = self.deliver_current_thread_apcs(&mut pending_thread.state, memory)?;
+                    pending_thread.state.rip = continue_rip;
+                }
+                pending_thread
+                    .state
+                    .set(Register::Rax, u64::from(resume.code));
+                if let Some(error) = resume.last_error {
+                    self.last_error = error;
+                } else {
+                    self.last_error = 0;
+                }
+                wait
+            } else if let Some(wait) = pending_thread.wait.take() {
                 let tid = pending_thread.thread_id;
                 let resume = match preconsumed {
                     CompletionPortPreconsume::Resume(resume) => resume,
@@ -1240,10 +1407,12 @@ impl PeHostRuntime {
                         // requeued record so the readiness pass evaluates it.
                         pending_thread.wait = self.pump_yield_with_wait.take();
                         pending_thread.wait_resume = None;
-                        pending_thread.state_machine = GuestThreadState::Waiting;
+                        // In production mode the record is owned by a native
+                        // worker; otherwise it stays on the cooperative path.
+                        let requeue = self.park_pumped_thread_in_production(pending_thread);
                         Ok((
                             PumpedThreadOutcome {
-                                requeue: Some(pending_thread),
+                                requeue,
                                 process_exit: None,
                             },
                             self.tls_slots.clone(),
@@ -1305,6 +1474,1530 @@ impl PeHostRuntime {
                 }
                 Err(error)
             }
+        }
+    }
+}
+
+// ── Production scheduling ──────────────────────────────────────────────────
+//
+// Cooperative mode (the default) runs every guest thread on the caller's host
+// thread through `pump_pending_guest_thread`, which is byte-for-byte
+// deterministic.  Production mode adds a bounded pool of native host workers:
+// a guest thread that blocks in a mutex / event / semaphore / completion-port
+// wait is handed to a worker as a wait job, parked on a real condition
+// variable (object wake bus, port wait state, or an exact deadline) and woken
+// by a real event — never by a 1 ms host poll.  The woken thread is re-queued
+// for execution on the runtime thread, where wait consumption and guest-state
+// mutation remain single-threaded and atomic.
+//
+// A guest *slice* still executes under the runtime's exclusive `&mut` engine;
+// simultaneous guest-code execution would require splitting `PeHostRuntime`
+// into shared `Arc`-locked subsystems (memory, win32 handles, JIT caches, D3D
+// state).  Production mode therefore provides real native workers, real
+// park/wake events and concurrent parked guest threads, with guest execution
+// serialized by the runtime's single owner.
+
+/// Which scheduler drives parked guest threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchedulerMode {
+    /// Deterministic cooperative pump on the runtime thread (test mode).
+    Cooperative,
+    /// Bounded native host worker pool for parked guest waits.
+    Production { workers: usize },
+}
+
+impl SchedulerMode {
+    pub(crate) fn worker_count(self) -> usize {
+        match self {
+            Self::Cooperative => 0,
+            Self::Production { workers } => workers.clamp(1, MAX_PRODUCTION_WORKERS),
+        }
+    }
+}
+
+/// Bound on the production pool (also bounds host thread cost).
+const MAX_PRODUCTION_WORKERS: usize = 64;
+/// Compiled guest blocks a production worker executes before yielding the
+/// guest thread back to the scheduler.  Bounds slice latency without a host
+/// poll (the block prologue's safepoint check remains the hard interrupt).
+const PRODUCTION_SLICE_BLOCKS: u64 = 512;
+/// Upper bound on how long the runtime owner waits for one parallel slice
+/// round; a stuck worker is a bug, not a scheduling policy.
+const PRODUCTION_SLICE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Completion-port condition-variable slices.  A blocked IOCP wait re-enters
+/// the port's own condvar (never a 1 ms hot-path poll); the slice only lets
+/// the worker observe shutdown and alertable APC notifications.
+const COMPLETION_PORT_WAIT_SLICE: Duration = Duration::from_millis(250);
+const COMPLETION_PORT_ALERTABLE_SLICE: Duration = Duration::from_millis(10);
+/// Idle housekeeping interval for the runtime thread while only production
+/// waits remain: re-check the run deadline, guest timers and APCs.  Wakeups
+/// themselves are condition-variable driven and are not gated by this.
+const PRODUCTION_HOUSEKEEPING: Duration = Duration::from_millis(20);
+
+/// Why a production wait job completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitWakeReason {
+    ObjectSignaled,
+    ObjectClosed,
+    Deadline,
+    Apc,
+    ThreadExit,
+    CompletionPort,
+    PortClosed,
+    PortTimedOut,
+    Shutdown,
+}
+
+/// A park signal: one condition variable per parked guest thread.  A
+/// generation counter closes the register-then-block race: notifications that
+/// arrive before the worker starts waiting are observed immediately.
+#[derive(Debug)]
+struct ParkSignal {
+    state: Mutex<ParkSignalState>,
+    wake: Condvar,
+}
+
+#[derive(Debug)]
+struct ParkSignalState {
+    generation: u64,
+    reason: Option<WaitWakeReason>,
+}
+
+impl ParkSignal {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ParkSignalState {
+                generation: 0,
+                reason: None,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+    }
+
+    fn notify(&self, reason: WaitWakeReason) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.generation = state.generation.wrapping_add(1);
+        state.reason.get_or_insert(reason);
+        drop(state);
+        SCHEDULER_COUNTERS
+            .wakeups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match reason {
+            WaitWakeReason::ObjectSignaled | WaitWakeReason::ObjectClosed => {
+                SCHEDULER_COUNTERS
+                    .object_wakeups
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            WaitWakeReason::Apc => {
+                SCHEDULER_COUNTERS
+                    .apc_wakeups
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.wake.notify_all();
+    }
+
+    /// Wait for a notification newer than `observed`.  `None` timeout waits
+    /// indefinitely.  Returns the wake reason, or `None` on timeout.
+    fn wait(&self, observed: u64, timeout: Option<Duration>) -> (u64, Option<WaitWakeReason>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        loop {
+            if state.generation != observed {
+                return (state.generation, state.reason);
+            }
+            match deadline {
+                None => {
+                    state = self
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return (state.generation, None);
+                    }
+                    let (guard, _) = self
+                        .wake
+                        .wait_timeout(state, deadline - now)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state = guard;
+                }
+            }
+        }
+    }
+}
+
+/// Cross-thread wake bus.  Object ids are process-global, so one bus can serve
+/// every runtime; subscriptions are weak and pruned on notification, so a
+/// finished wait never keeps a signal alive.
+#[derive(Debug)]
+struct WakeBus {
+    state: Mutex<WakeBusState>,
+}
+
+#[derive(Debug, Default)]
+struct WakeBusState {
+    objects: BTreeMap<ObjectId, Vec<std::sync::Weak<ParkSignal>>>,
+    threads: BTreeMap<u32, Vec<std::sync::Weak<ParkSignal>>>,
+}
+
+impl WakeBus {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WakeBusState::default()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, WakeBusState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn subscribe_object(&self, id: ObjectId, signal: &Arc<ParkSignal>) {
+        self.lock()
+            .objects
+            .entry(id)
+            .or_default()
+            .push(Arc::downgrade(signal));
+    }
+
+    fn subscribe_thread(&self, thread_id: u32, signal: &Arc<ParkSignal>) {
+        self.lock()
+            .threads
+            .entry(thread_id)
+            .or_default()
+            .push(Arc::downgrade(signal));
+    }
+
+    fn collect(signals: &mut Vec<std::sync::Weak<ParkSignal>>) -> Vec<Arc<ParkSignal>> {
+        let mut live = Vec::with_capacity(signals.len());
+        let mut upgraded = Vec::with_capacity(signals.len());
+        for weak in signals.drain(..) {
+            if let Some(signal) = weak.upgrade() {
+                upgraded.push(Arc::clone(&signal));
+                live.push(weak);
+            }
+        }
+        *signals = live;
+        upgraded
+    }
+
+    fn notify_object(&self, id: ObjectId, closed: bool) {
+        let signals = {
+            let mut state = self.lock();
+            match state.objects.get_mut(&id) {
+                Some(signals) => Self::collect(signals),
+                None => Vec::new(),
+            }
+        };
+        let reason = if closed {
+            WaitWakeReason::ObjectClosed
+        } else {
+            WaitWakeReason::ObjectSignaled
+        };
+        for signal in signals {
+            signal.notify(reason);
+        }
+    }
+
+    fn notify_thread(&self, thread_id: u32, reason: WaitWakeReason) {
+        let signals = {
+            let mut state = self.lock();
+            match state.threads.get_mut(&thread_id) {
+                Some(signals) => Self::collect(signals),
+                None => Vec::new(),
+            }
+        };
+        for signal in signals {
+            signal.notify(reason);
+        }
+    }
+}
+
+static WAKE_BUS: std::sync::OnceLock<WakeBus> = std::sync::OnceLock::new();
+
+fn wake_bus() -> &'static WakeBus {
+    WAKE_BUS.get_or_init(WakeBus::new)
+}
+
+/// Object-manager hook: a waitable object changed state.  `closed` is set when
+/// the object is being dropped (last handle closed).
+pub(crate) fn notify_object_waiters(id: ObjectId, closed: bool) {
+    if let Some(bus) = WAKE_BUS.get() {
+        bus.notify_object(id, closed);
+    }
+}
+
+/// Scheduler hook: wake a thread parked in an alertable wait (APC queued).
+pub(crate) fn notify_thread_apc(thread_id: u32) {
+    if let Some(bus) = WAKE_BUS.get() {
+        bus.notify_thread(thread_id, WaitWakeReason::Apc);
+    }
+}
+
+/// Scheduler hook: wake waits on a terminating thread's kernel object.
+pub(crate) fn notify_thread_exit(thread_id: u32) {
+    if let Some(bus) = WAKE_BUS.get() {
+        bus.notify_thread(thread_id, WaitWakeReason::ThreadExit);
+    }
+}
+
+#[derive(Debug)]
+enum WaitJobKind {
+    /// Event / mutex / semaphore set; the wake bus drives the wait.
+    Objects,
+    /// Deadline-only wait (Sleep / finite timeout with no event source).
+    DeadlineOnly,
+    /// Blocking completion-port dequeue on the port's own condition variable.
+    CompletionPort {
+        state: Arc<crate::win32::CompletionPortWaitState>,
+        guest_thread_id: u32,
+        max_packets: usize,
+        alertable: bool,
+    },
+}
+
+#[derive(Debug)]
+struct WaitJob {
+    job_id: u64,
+    thread_id: u32,
+    signal: Arc<ParkSignal>,
+    observed_generation: u64,
+    kind: WaitJobKind,
+    deadline: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct WaitCompletion {
+    job_id: u64,
+    thread_id: u32,
+    reason: WaitWakeReason,
+    packets: Vec<crate::win32::IoCompletionPacket>,
+}
+
+#[derive(Default)]
+struct ProductionState {
+    queue: VecDeque<WaitJob>,
+    completions: VecDeque<WaitCompletion>,
+    slice_queue: VecDeque<GuestSliceJob>,
+    slice_completions: VecDeque<GuestSliceCompletion>,
+    shutdown: bool,
+    active_jobs: usize,
+    next_job_id: u64,
+    next_slice_id: u64,
+    last_worker_by_thread: BTreeMap<u32, usize>,
+    signals: Vec<std::sync::Weak<ParkSignal>>,
+}
+
+struct ProductionShared {
+    state: Mutex<ProductionState>,
+    work_ready: Condvar,
+    completion_ready: Condvar,
+    /// Lock-free shutdown flag polled between worker-slice blocks (a native
+    /// guest loop must stop even when it never returns to the dispatcher).
+    shutdown: std::sync::atomic::AtomicBool,
+}
+
+/// Why a production guest-code slice stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuestSliceExit {
+    /// The per-slice block budget was exhausted; the thread is runnable.
+    Budget,
+    /// The next block needs the runtime owner (host thunk/call/ret/indirect
+    /// jump or an uncompiled block).  No host code ran on the worker.
+    HostBarrier { rip: u64 },
+    /// The guest load/store hit memory the worker view cannot service; the
+    /// runtime owner retries it with the full page table/VM.
+    GuestFault { address: u64, write: bool },
+    /// A guest store touched a compiled-code page; the owner must invalidate
+    /// stale blocks before the next slice.
+    CodeWrite,
+    /// The global host safepoint flag asked the block to yield.
+    Safepoint,
+    /// The pool was shutting down while the slice was running.
+    Shutdown,
+}
+
+/// Per-guest-thread execution request for a production worker.
+pub(crate) struct GuestSliceRequest {
+    pub(crate) thread_id: u32,
+    pub(crate) state: CpuState,
+}
+
+/// Result of executing one guest thread's slice on a production worker.
+#[allow(dead_code)] // fields are the scheduler's public test/diagnostic surface
+pub(crate) struct GuestSliceReport {
+    pub(crate) thread_id: u32,
+    pub(crate) state: CpuState,
+    pub(crate) exit: GuestSliceExit,
+    pub(crate) blocks_executed: u64,
+    pub(crate) worker_index: usize,
+    pub(crate) code_writes: Vec<(u64, usize)>,
+}
+
+struct GuestSliceJob {
+    job_id: u64,
+    thread_id: u32,
+    state: CpuState,
+    program: Arc<crate::jit::GuestSliceProgram>,
+    budget: u64,
+    /// Optional simultaneous-start gate shared by all jobs of one round, so
+    /// a multi-thread slice round really overlaps on the workers instead of
+    /// serially finishing tiny slices before the next worker dequeues.
+    start: Option<Arc<SliceStartGate>>,
+}
+
+/// Cancellable simultaneous-start gate.  A plain `Barrier` deadlocks if the
+/// pool is dropped after only some of a round's jobs have been dequeued;
+/// this gate wakes waiters when the pool shuts down.
+struct SliceStartGate {
+    remaining: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl SliceStartGate {
+    fn new(count: usize) -> Self {
+        Self {
+            remaining: Mutex::new(count),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn arrive_and_wait(&self, shutdown: &std::sync::atomic::AtomicBool) {
+        let mut remaining = self
+            .remaining
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *remaining == 0 {
+            return;
+        }
+        *remaining -= 1;
+        if *remaining == 0 {
+            self.ready.notify_all();
+            return;
+        }
+        while *remaining != 0 && !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            let (guard, _) = self
+                .ready
+                .wait_timeout(remaining, Duration::from_millis(5))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            remaining = guard;
+        }
+    }
+}
+
+struct GuestSliceCompletion {
+    job_id: u64,
+    thread_id: u32,
+    state: CpuState,
+    exit: GuestSliceExit,
+    blocks_executed: u64,
+    worker_index: usize,
+    code_writes: Vec<(u64, usize)>,
+}
+
+/// Bounded native host worker pool for parked guest waits.  Dropping the pool
+/// shuts every worker down and joins it.
+pub(crate) struct ProductionScheduler {
+    shared: Arc<ProductionShared>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    worker_count: usize,
+}
+
+impl ProductionScheduler {
+    pub(crate) fn new(workers: usize) -> Self {
+        let workers = workers.clamp(1, MAX_PRODUCTION_WORKERS);
+        let shared = Arc::new(ProductionShared {
+            state: Mutex::new(ProductionState::default()),
+            work_ready: Condvar::new(),
+            completion_ready: Condvar::new(),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut handles = Vec::with_capacity(workers);
+        for index in 0..workers {
+            let worker_shared = Arc::clone(&shared);
+            let handle = std::thread::Builder::new()
+                .name(format!("casa1-guest-worker-{index}"))
+                .spawn(move || production_worker(worker_shared, index))
+                .expect("spawn production scheduler worker");
+            handles.push(handle);
+        }
+        Self {
+            shared,
+            workers: handles,
+            worker_count: workers,
+        }
+    }
+
+    pub(crate) fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
+    fn submit(
+        &self,
+        thread_id: u32,
+        signal: Arc<ParkSignal>,
+        observed_generation: u64,
+        kind: WaitJobKind,
+        deadline: Option<Instant>,
+    ) -> u64 {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let job_id = state.next_job_id;
+        state.next_job_id = state.next_job_id.wrapping_add(1);
+        state.signals.push(Arc::downgrade(&signal));
+        state.queue.push_back(WaitJob {
+            job_id,
+            thread_id,
+            signal,
+            observed_generation,
+            kind,
+            deadline,
+        });
+        drop(state);
+        self.shared.work_ready.notify_one();
+        job_id
+    }
+
+    fn submit_slice(
+        &self,
+        thread_id: u32,
+        state: CpuState,
+        program: Arc<crate::jit::GuestSliceProgram>,
+        budget: u64,
+        start: Option<Arc<SliceStartGate>>,
+    ) -> u64 {
+        let mut shared = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let job_id = shared.next_slice_id;
+        shared.next_slice_id = shared.next_slice_id.wrapping_add(1);
+        shared.slice_queue.push_back(GuestSliceJob {
+            job_id,
+            thread_id,
+            state,
+            program,
+            budget,
+            start,
+        });
+        drop(shared);
+        self.shared.work_ready.notify_one();
+        job_id
+    }
+
+    fn take_completions(&self) -> Vec<WaitCompletion> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.completions.drain(..).collect()
+    }
+
+    fn take_slice_completions(&self) -> Vec<GuestSliceCompletion> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.slice_completions.drain(..).collect()
+    }
+
+    fn wait_for_completion(&self, timeout: Option<Duration>) -> bool {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.completions.is_empty() {
+            return true;
+        }
+        let predicate = |state: &mut ProductionState| {
+            state.completions.is_empty() && state.slice_completions.is_empty() && !state.shutdown
+        };
+        match timeout {
+            Some(timeout) => {
+                let (guard, _) = self
+                    .shared
+                    .completion_ready
+                    .wait_timeout_while(state, timeout, predicate)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state = guard;
+            }
+            None => {
+                state = self
+                    .shared
+                    .completion_ready
+                    .wait_while(state, predicate)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+        !state.completions.is_empty() || !state.slice_completions.is_empty()
+    }
+
+    /// Run one round of production guest-code slices: every request is queued
+    /// independently, so different guest threads execute on different native
+    /// workers, then this (runtime-owner) thread collects every completion.
+    /// Host thunks never run here; a worker that reaches one reports
+    /// [`GuestSliceExit::HostBarrier`] and the owner executes it exactly once.
+    pub(crate) fn run_guest_slices(
+        &self,
+        requests: Vec<GuestSliceRequest>,
+        program: Arc<crate::jit::GuestSliceProgram>,
+        budget: u64,
+    ) -> Vec<GuestSliceReport> {
+        let mut pending = BTreeSet::new();
+        // Only gate rounds that fit the pool; extra jobs would deadlock a
+        // barrier sized for all requests.
+        let start = (requests.len() > 1 && requests.len() <= self.worker_count)
+            .then(|| Arc::new(SliceStartGate::new(requests.len())));
+        for request in requests {
+            let id = self.submit_slice(
+                request.thread_id,
+                request.state,
+                Arc::clone(&program),
+                budget,
+                start.as_ref().map(Arc::clone),
+            );
+            pending.insert(id);
+        }
+        let mut reports = Vec::with_capacity(pending.len());
+        while !pending.is_empty() {
+            if !self.wait_for_completion(Some(PRODUCTION_SLICE_TIMEOUT)) {
+                break;
+            }
+            for completion in self.take_slice_completions() {
+                if pending.remove(&completion.job_id) {
+                    reports.push(GuestSliceReport {
+                        thread_id: completion.thread_id,
+                        state: completion.state,
+                        exit: completion.exit,
+                        blocks_executed: completion.blocks_executed,
+                        worker_index: completion.worker_index,
+                        code_writes: completion.code_writes,
+                    });
+                }
+            }
+            if self
+                .shared
+                .state
+                .lock()
+                .map(|state| state.shutdown)
+                .unwrap_or(true)
+            {
+                break;
+            }
+        }
+        reports
+    }
+
+    #[allow(dead_code)] // used by scheduler tests to observe worker queueing
+    fn active_job_count(&self) -> usize {
+        self.shared
+            .state
+            .lock()
+            .map(|state| state.active_jobs)
+            .unwrap_or(0)
+    }
+}
+impl Drop for ProductionScheduler {
+    fn drop(&mut self) {
+        self.shared
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Worker slice blocks are deliberately unlinked, so each block
+        // returns to the worker dispatcher (which polls `shutdown`) within a
+        // bounded number of instructions.  Do not set the process-wide
+        // safepoint flag here: that would disturb unrelated JIT executions
+        // after cooperative-mode switches.
+        let signals = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.shutdown = true;
+            std::mem::take(&mut state.signals)
+        };
+        for weak in signals {
+            if let Some(signal) = weak.upgrade() {
+                signal.notify(WaitWakeReason::Shutdown);
+            }
+        }
+        self.shared.work_ready.notify_all();
+        self.shared.completion_ready.notify_all();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+enum ProductionJob {
+    Wait(WaitJob),
+    Slice(GuestSliceJob),
+}
+
+fn production_worker(shared: Arc<ProductionShared>, worker_index: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    SCHEDULER_COUNTERS.note_host_worker_identity();
+    loop {
+        let job = {
+            let mut state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if state.shutdown {
+                    return;
+                }
+                let thread_id;
+                let job = if let Some(job) = state.slice_queue.pop_front() {
+                    thread_id = job.thread_id;
+                    ProductionJob::Slice(job)
+                } else if let Some(job) = state.queue.pop_front() {
+                    thread_id = job.thread_id;
+                    ProductionJob::Wait(job)
+                } else {
+                    state = shared
+                        .work_ready
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    continue;
+                };
+                state.active_jobs = state.active_jobs.saturating_add(1);
+                if let Some(previous) = state.last_worker_by_thread.insert(thread_id, worker_index)
+                    && previous != worker_index
+                {
+                    SCHEDULER_COUNTERS.migrations.fetch_add(1, Relaxed);
+                }
+                break job;
+            }
+        };
+        let active = SCHEDULER_COUNTERS
+            .active_worker_jobs
+            .fetch_add(1, Relaxed)
+            .saturating_add(1);
+        SCHEDULER_COUNTERS
+            .max_concurrent_worker_jobs
+            .fetch_max(active, Relaxed);
+        if active > 1 {
+            SCHEDULER_COUNTERS.worker_overlaps.fetch_add(1, Relaxed);
+        }
+        match job {
+            ProductionJob::Wait(job) => {
+                let completion = run_wait_job(job);
+                let mut state = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.active_jobs = state.active_jobs.saturating_sub(1);
+                state.completions.push_back(completion);
+            }
+            ProductionJob::Slice(job) => {
+                let completion = run_guest_slice_job(job, &shared.shutdown, worker_index);
+                let mut state = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.active_jobs = state.active_jobs.saturating_sub(1);
+                state.slice_completions.push_back(completion);
+            }
+        }
+        SCHEDULER_COUNTERS.active_worker_jobs.fetch_sub(1, Relaxed);
+        shared.completion_ready.notify_all();
+    }
+}
+
+fn run_guest_slice_job(
+    job: GuestSliceJob,
+    shutdown: &std::sync::atomic::AtomicBool,
+    worker_index: usize,
+) -> GuestSliceCompletion {
+    use std::sync::atomic::Ordering;
+    let mut state = job.state;
+    let mut blocks_executed = 0_u64;
+    if let Some(start) = job.start.as_ref() {
+        start.arrive_and_wait(shutdown);
+    }
+    let exit;
+    let guard = crate::jit::WorkerSliceGuard::install(&job.program.memory);
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            exit = GuestSliceExit::Shutdown;
+            break;
+        }
+        if blocks_executed >= job.budget {
+            exit = GuestSliceExit::Budget;
+            break;
+        }
+        let Some(block) = job.program.block(state.rip) else {
+            exit = GuestSliceExit::HostBarrier { rip: state.rip };
+            break;
+        };
+        if !block.worker_safe {
+            exit = GuestSliceExit::HostBarrier { rip: state.rip };
+            break;
+        }
+        let mut exit_slot = [u64::MAX, job.program.flat_base];
+        // SAFETY: the block belongs to this worker program (compiled and
+        // finalized by the runtime owner), `state` is owned by this job, and
+        // the memory view is installed for the whole slice.
+        let outcome = unsafe {
+            crate::jit::execute_slice_block(&job.program, block, &mut state, &mut exit_slot)
+        };
+        blocks_executed += 1;
+        if guard.code_written() {
+            exit = GuestSliceExit::CodeWrite;
+            break;
+        }
+        match outcome.reason {
+            crate::jit::JitExitReason::Jump { target } => {
+                state.rip = target;
+            }
+            crate::jit::JitExitReason::ConditionalBranch { taken, .. } => {
+                let info = job
+                    .program
+                    .block(outcome.final_block)
+                    .and_then(|block| block.last_exit_info)
+                    .or(block.last_exit_info);
+                match info {
+                    Some(crate::jit::BlockExitInfo::JumpIf {
+                        target,
+                        fallthrough,
+                        ..
+                    }) => {
+                        state.rip = if taken { target } else { fallthrough };
+                    }
+                    _ => {
+                        exit = GuestSliceExit::HostBarrier { rip: state.rip };
+                        break;
+                    }
+                }
+            }
+            crate::jit::JitExitReason::Safepoint => {
+                exit = GuestSliceExit::Safepoint;
+                // Same protocol as the blocking dispatcher: the request is
+                // consumed when the block yields, unless the pool is shutting
+                // down (Drop sets both).
+                if !shutdown.load(Ordering::Acquire) {
+                    crate::jit::JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+                }
+                break;
+            }
+            crate::jit::JitExitReason::GuestFault => {
+                let address = state.jit_pending_fault.take().unwrap_or(state.rip);
+                let write = std::mem::take(&mut state.jit_pending_fault_write);
+                exit = GuestSliceExit::GuestFault { address, write };
+                break;
+            }
+            _ => {
+                // Host thunk/call/ret/indirect/unimplemented or a normal
+                // straight-line exit: all require the runtime owner.
+                exit = GuestSliceExit::HostBarrier { rip: state.rip };
+                break;
+            }
+        }
+    }
+    let code_writes = job.program.memory.take_code_writes();
+    drop(guard);
+    GuestSliceCompletion {
+        job_id: job.job_id,
+        thread_id: job.thread_id,
+        state,
+        exit,
+        blocks_executed,
+        worker_index,
+        code_writes,
+    }
+}
+
+fn run_wait_job(job: WaitJob) -> WaitCompletion {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut completion = WaitCompletion {
+        job_id: job.job_id,
+        thread_id: job.thread_id,
+        reason: WaitWakeReason::Deadline,
+        packets: Vec::new(),
+    };
+    match job.kind {
+        WaitJobKind::CompletionPort {
+            state,
+            guest_thread_id,
+            max_packets,
+            alertable,
+        } => {
+            let slice = if alertable {
+                COMPLETION_PORT_ALERTABLE_SLICE
+            } else {
+                COMPLETION_PORT_WAIT_SLICE
+            };
+            loop {
+                let timeout = match job.deadline {
+                    Some(deadline) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            completion.reason = WaitWakeReason::PortTimedOut;
+                            SCHEDULER_COUNTERS.deadline_wakeups.fetch_add(1, Relaxed);
+                            return completion;
+                        }
+                        Some((deadline - now).min(slice))
+                    }
+                    None => Some(slice),
+                };
+                match state.wait_dequeue_as(
+                    crate::win32::CompletionPortThreadKey::Guest(guest_thread_id),
+                    timeout,
+                    max_packets,
+                ) {
+                    Ok(packets) => {
+                        completion.reason = WaitWakeReason::CompletionPort;
+                        completion.packets = packets;
+                        return completion;
+                    }
+                    Err(crate::win32::CompletionPortWaitError::Closed) => {
+                        completion.reason = WaitWakeReason::PortClosed;
+                        return completion;
+                    }
+                    Err(crate::win32::CompletionPortWaitError::TimedOut) => {
+                        if job.deadline.is_none() || alertable {
+                            SCHEDULER_COUNTERS.port_rechecks.fetch_add(1, Relaxed);
+                        }
+                        if job
+                            .deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline)
+                        {
+                            completion.reason = WaitWakeReason::PortTimedOut;
+                            SCHEDULER_COUNTERS.deadline_wakeups.fetch_add(1, Relaxed);
+                            return completion;
+                        }
+                        if alertable && job.signal.generation() != job.observed_generation {
+                            completion.reason = WaitWakeReason::Apc;
+                            return completion;
+                        }
+                    }
+                }
+                // Shutdown wakes CP workers through the signal as well.
+                if job.signal.generation() != job.observed_generation {
+                    completion.reason = job
+                        .signal
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .reason
+                        .unwrap_or(WaitWakeReason::Apc);
+                    return completion;
+                }
+            }
+        }
+        WaitJobKind::Objects | WaitJobKind::DeadlineOnly => {
+            let timeout = job.deadline.map(|deadline| {
+                let now = Instant::now();
+                if now >= deadline {
+                    Duration::ZERO
+                } else {
+                    deadline - now
+                }
+            });
+            let (_, reason) = job.signal.wait(job.observed_generation, timeout);
+            completion.reason = match reason {
+                Some(reason) => reason,
+                None => {
+                    SCHEDULER_COUNTERS.deadline_wakeups.fetch_add(1, Relaxed);
+                    WaitWakeReason::Deadline
+                }
+            };
+            completion
+        }
+    }
+}
+
+/// One parked guest thread's active production wait job.
+pub(crate) struct ProductionWait {
+    job_id: u64,
+}
+
+impl PeHostRuntime {
+    /// Ensure the production worker has an unlinked compiled block for
+    /// `rip`.  Returns `false` when the JIT is unavailable or the block is not
+    /// worker-safe (the caller then keeps the thread on the cooperative
+    /// owner path).
+    fn ensure_slice_block(&mut self, memory: &mut MemoryImage, rip: u64) -> AppResult<bool> {
+        if self.jit_runtime.is_none() {
+            return Ok(false);
+        }
+        // A host thunk address is a host-dispatch barrier, not guest code:
+        // only the runtime owner may execute it (exactly once).
+        if self.host_thunks.contains_key(&rip) {
+            return Ok(false);
+        }
+        if let Some(jit) = self.jit_runtime.as_ref()
+            && let Some(block) = jit.slice_block(rip)
+        {
+            return Ok(block.worker_safe);
+        }
+        let config = crate::cpu::CpuEngineConfig::from_profile(
+            self.guest_arch,
+            &self.win32.ge().config.winver,
+            env!("CARGO_PKG_VERSION"),
+            None,
+        )?; // coverage: unreachable — from_profile's only fallible field (virtualization) is skipped for a None profile
+        let mut engine = crate::cpu::CpuExecutionEngine::new(config);
+        let cached = decode_basic_block_cached(
+            &mut engine,
+            memory,
+            &mut self.instruction_cache,
+            &mut self.instruction_cache_lru,
+            &mut self.instruction_cache_generation,
+            INSTRUCTION_CACHE_LIMIT,
+            &mut self.basic_block_cache,
+            &mut self.basic_block_cache_lru,
+            &mut self.basic_block_cache_generation,
+            BASIC_BLOCK_CACHE_LIMIT,
+            rip,
+        )?;
+        let block = self
+            .jit_runtime
+            .as_mut()
+            .expect("checked above")
+            .get_or_compile_slice_block(&cached.translated.ir, rip, self.guest_arch)?;
+        Ok(block.worker_safe)
+    }
+
+    /// Execute one round of guest-code slices for the supplied guest threads
+    /// on the production worker pool.  The runtime owner remains the only
+    /// thread that touches runtime state: worker completions are returned for
+    /// the owner to apply (thunks are never executed on a worker).
+    pub(crate) fn dispatch_parallel_guest_slices(
+        &mut self,
+        memory: &mut MemoryImage,
+        requests: Vec<GuestSliceRequest>,
+        budget: u64,
+    ) -> AppResult<Vec<GuestSliceReport>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.production_scheduler.is_none() {
+            return Ok(Vec::new());
+        }
+        for request in &requests {
+            self.ensure_slice_block(memory, request.state.rip)?;
+        }
+        let program = Arc::new(
+            self.jit_runtime
+                .as_ref()
+                .expect("ensure_slice_block requires a JIT runtime")
+                .build_slice_program(memory),
+        );
+        let scheduler = self.production_scheduler.as_ref().expect("checked above");
+        let reports = scheduler.run_guest_slices(requests, program, budget);
+        if let Some(jit) = self.jit_runtime.as_mut() {
+            let mut wrote_code = false;
+            for report in &reports {
+                for &(address, length) in &report.code_writes {
+                    let start = address & !0xfff;
+                    let end = (address + length as u64 - 1) & !0xfff;
+                    let mut page = start;
+                    let mut pages = BTreeSet::new();
+                    while page <= end {
+                        pages.insert(page);
+                        page += 0x1000;
+                    }
+                    let _ = jit.invalidate_blocks_on_pages(&pages);
+                    wrote_code = true;
+                }
+            }
+            if wrote_code {
+                jit.clear_slice_blocks();
+            }
+        } // coverage: unreachable — jit_runtime was required (unwrapped) before the dispatch, so this if-let cannot take its None path
+        Ok(reports)
+    }
+
+    /// Production pump fast path.  When at least one runnable guest thread
+    /// already has a worker-safe compiled slice, run every such thread on the
+    /// native pool concurrently and requeue them at the barrier/budget.  Any
+    /// thread that needs the runtime owner is left queued for the ordinary
+    /// cooperative pump (which executes host thunks exactly once).
+    fn try_pump_parallel_slices(
+        &mut self,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PumpOutcome>> {
+        if !matches!(self.scheduler_mode, SchedulerMode::Production { .. })
+            || self.production_scheduler.is_none()
+            || self.jit_runtime.is_none()
+            || !self.production_waits.is_empty()
+        {
+            return Ok(None);
+        }
+        let worker_limit = self.scheduler_mode.worker_count();
+        let now = self.win32.get_tick_count64();
+        let candidates: Vec<(u32, CpuState)> = self
+            .pending_guest_threads
+            .iter()
+            .filter(|thread| {
+                thread.started
+                    && thread.suspended == 0
+                    && thread.state_machine == GuestThreadState::Runnable
+                    && thread.wait.is_none()
+                    && thread.wait_resume.is_none()
+                    && !self.production_waits.contains_key(&thread.thread_id)
+                    && !self.win32.thread_has_exited(thread.thread_id)
+                    && thread.state.rip != 0
+                    && thread.wake_tick <= now
+            })
+            .take(worker_limit)
+            .map(|thread| (thread.thread_id, thread.state.clone()))
+            .collect();
+        let mut requests = Vec::with_capacity(candidates.len());
+        for (thread_id, state) in candidates {
+            // A block the slice compiler cannot handle is not an error: the
+            // ordinary cooperative owner path executes it below.
+            if matches!(self.ensure_slice_block(memory, state.rip), Ok(true)) {
+                requests.push(GuestSliceRequest { thread_id, state });
+            }
+        }
+        if requests.is_empty() {
+            return Ok(None);
+        }
+        let reports =
+            self.dispatch_parallel_guest_slices(memory, requests, PRODUCTION_SLICE_BLOCKS)?;
+        if reports.is_empty() {
+            return Ok(None);
+        }
+        let mut processed = BTreeSet::new();
+        for report in reports {
+            if !processed.insert(report.thread_id) {
+                continue;
+            }
+            let Some(index) = self
+                .pending_guest_threads
+                .iter()
+                .position(|thread| thread.thread_id == report.thread_id)
+            else {
+                continue;
+            };
+            let Some(mut thread) = self.pending_guest_threads.remove(index) else {
+                continue; // coverage: unreachable — index came from position() on the same unmodified Vec
+            };
+            thread.state = report.state;
+            thread.state_machine = GuestThreadState::Runnable;
+            self.pending_guest_threads.push_back(thread);
+        }
+        Ok(Some(PumpOutcome {
+            did_work: true,
+            process_exit: None,
+        }))
+    }
+
+    /// The scheduler mode this runtime is configured for.
+    #[allow(dead_code)] // exposed for runtime diagnostics/tests
+    pub(crate) fn scheduler_mode(&self) -> SchedulerMode {
+        self.scheduler_mode
+    }
+
+    /// Select deterministic cooperative scheduling (default/test mode) or a
+    /// bounded production worker pool.  Refuses to switch while guest waits
+    /// are parked on the current mode's workers (the caller must let them
+    /// drain or reset the runtime).
+    pub(crate) fn set_scheduler_mode(&mut self, mode: SchedulerMode) -> bool {
+        if !self.production_waits.is_empty() {
+            return false;
+        }
+        match mode {
+            SchedulerMode::Cooperative => {
+                self.production_scheduler = None;
+                self.scheduler_mode = SchedulerMode::Cooperative;
+                true
+            }
+            SchedulerMode::Production { .. } => {
+                let workers = mode.worker_count();
+                let needs_pool = match self.production_scheduler.as_ref() {
+                    Some(scheduler) => scheduler.worker_count() != workers,
+                    None => true,
+                };
+                if needs_pool {
+                    self.production_scheduler = Some(ProductionScheduler::new(workers));
+                }
+                self.scheduler_mode = SchedulerMode::Production { workers };
+                true
+            }
+        }
+    }
+
+    /// Instrumentation snapshot (process-wide atomics; tests use deltas).
+    #[allow(dead_code)] // exposed for runtime diagnostics/tests
+    pub(crate) fn scheduler_counters(&self) -> SchedulerCountersSnapshot {
+        SCHEDULER_COUNTERS.snapshot()
+    }
+
+    /// Wake a guest thread parked on any alertable production wait after an
+    /// APC was queued for it.
+    pub(crate) fn notify_parked_apc(&self, thread_id: u32) {
+        notify_thread_apc(thread_id);
+    }
+
+    fn production_wait_supported(&self, wait: &GuestWait) -> bool {
+        match &wait.operation {
+            WaitOperation::Sleep => true,
+            WaitOperation::Objects => {
+                !wait.objects.is_empty()
+                    && wait.objects.iter().all(|handle| {
+                        self.win32.describe_handle(*handle).is_ok_and(|descriptor| {
+                            matches!(
+                                descriptor.object_type,
+                                crate::win32::ObjectType::Event
+                                    | crate::win32::ObjectType::Mutex
+                                    | crate::win32::ObjectType::Semaphore
+                                    | crate::win32::ObjectType::Thread
+                            )
+                        })
+                    })
+            }
+            WaitOperation::CompletionPort { port, .. }
+            | WaitOperation::CompletionPortEx { port, .. } => {
+                self.win32.io_completion_port_state(*port).is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    /// Hand a blocked guest thread to a native production worker.  Returns
+    /// `false` when the wait has no event source the production pool can
+    /// block on; the caller then keeps the cooperative pump path as a
+    /// fallback (never loses the wait).
+    fn start_production_wait(&mut self, thread_id: u32, wait: &GuestWait) -> bool {
+        if !matches!(self.scheduler_mode, SchedulerMode::Production { .. }) {
+            return false;
+        }
+        if !self.production_wait_supported(wait) {
+            return false;
+        }
+        let signal = Arc::new(ParkSignal::new());
+        let observed_generation = signal.generation();
+        let now_tick = self.win32.get_tick_count64();
+        let deadline = wait.deadline_ticks.map(|ticks| {
+            let remaining = ticks.saturating_sub(now_tick);
+            Instant::now()
+                .checked_add(Duration::from_millis(remaining))
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(24 * 60 * 60))
+        });
+        let kind = match &wait.operation {
+            WaitOperation::Sleep => {
+                if wait.alertable {
+                    wake_bus().subscribe_thread(thread_id, &signal);
+                }
+                WaitJobKind::DeadlineOnly
+            }
+            WaitOperation::Objects => {
+                for handle in &wait.objects {
+                    let Ok(descriptor) = self.win32.describe_handle(*handle) else {
+                        return false; // coverage: unreachable (validated above, single owner)
+                    };
+                    match descriptor.object_type {
+                        crate::win32::ObjectType::Thread => {
+                            let Ok(target) = self.win32.thread_id_for_handle(*handle) else {
+                                return false; // coverage: unreachable (thread handle validated)
+                            };
+                            wake_bus().subscribe_thread(target, &signal);
+                        }
+                        crate::win32::ObjectType::Event
+                        | crate::win32::ObjectType::Mutex
+                        | crate::win32::ObjectType::Semaphore => {
+                            let Ok(id) = self.win32.handle_object_identity(*handle) else {
+                                return false; // coverage: unreachable (handle validated)
+                            };
+                            wake_bus().subscribe_object(id, &signal);
+                        }
+                        _ => return false, // coverage: unreachable (type checked above)
+                    }
+                }
+                if wait.alertable {
+                    wake_bus().subscribe_thread(thread_id, &signal);
+                }
+                WaitJobKind::Objects
+            }
+            WaitOperation::CompletionPort { port, .. } => {
+                let Ok(state) = self.win32.io_completion_port_state(*port) else {
+                    return false; // coverage: unreachable (port validated above)
+                };
+                if wait.alertable {
+                    wake_bus().subscribe_thread(thread_id, &signal);
+                }
+                WaitJobKind::CompletionPort {
+                    state,
+                    guest_thread_id: thread_id,
+                    max_packets: 1,
+                    alertable: wait.alertable,
+                }
+            }
+            WaitOperation::CompletionPortEx {
+                port, entry_count, ..
+            } => {
+                let Ok(state) = self.win32.io_completion_port_state(*port) else {
+                    return false; // coverage: unreachable (port validated above)
+                };
+                if wait.alertable {
+                    wake_bus().subscribe_thread(thread_id, &signal);
+                }
+                WaitJobKind::CompletionPort {
+                    state,
+                    guest_thread_id: thread_id,
+                    max_packets: (*entry_count).max(1) as usize,
+                    alertable: wait.alertable,
+                }
+            }
+            _ => return false, // coverage: unreachable (supported() rejects it first)
+        };
+        let Some(scheduler) = self.production_scheduler.as_ref() else {
+            return false; // coverage: unreachable (Production mode owns a pool)
+        };
+        let job_id = scheduler.submit(thread_id, signal, observed_generation, kind, deadline);
+        self.production_waits
+            .insert(thread_id, ProductionWait { job_id });
+        true
+    }
+
+    /// Drop wait-job bookkeeping for guest threads that are no longer parked
+    /// (TerminateThread, process-exit abandonment).  Late completions for the
+    /// removed job are ignored by the completion pass.
+    fn prune_orphan_production_waits(&mut self) {
+        if self.production_waits.is_empty() {
+            return;
+        }
+        let live: BTreeSet<u32> = self
+            .pending_guest_threads
+            .iter()
+            .map(|thread| thread.thread_id)
+            .collect();
+        self.production_waits
+            .retain(|thread_id, _| live.contains(thread_id));
+    }
+
+    /// Reap worker completions and re-queue their guest threads.  Runs on the
+    /// runtime thread with exclusive access, so applying a wait result (and
+    /// consuming a signal) is atomic with respect to guest execution.
+    fn reap_production_completions(&mut self, memory: &mut MemoryImage) -> AppResult<bool> {
+        let completions = match self.production_scheduler.as_ref() {
+            Some(scheduler) => scheduler.take_completions(),
+            None => return Ok(false),
+        };
+        let mut did_work = false;
+        for completion in completions {
+            did_work |= self.apply_production_completion(completion, memory)?;
+        }
+        Ok(did_work)
+    }
+
+    fn apply_production_completion(
+        &mut self,
+        completion: WaitCompletion,
+        memory: &mut MemoryImage,
+    ) -> AppResult<bool> {
+        let Some(parked) = self.production_waits.get(&completion.thread_id) else {
+            return Ok(false);
+        };
+        if parked.job_id != completion.job_id {
+            return Ok(false);
+        }
+        let Some(index) = self
+            .pending_guest_threads
+            .iter()
+            .position(|thread| thread.thread_id == completion.thread_id)
+        else {
+            // A terminated record is pruned before completions are applied.
+            self.production_waits.remove(&completion.thread_id); // coverage: unreachable
+            return Ok(false); // coverage: unreachable
+        };
+        let mut thread = self
+            .pending_guest_threads
+            .remove(index)
+            .expect("checked parked thread index");
+        self.production_waits.remove(&completion.thread_id);
+        let Some(wait) = thread.wait.clone() else {
+            self.pending_guest_threads.push_back(thread); // coverage: unreachable
+            return Ok(true); // coverage: unreachable
+        };
+        let resume = match completion.reason {
+            WaitWakeReason::CompletionPort => Some(self.completion_port_packets_resume(
+                &wait.operation,
+                completion.packets,
+                memory,
+            )?),
+            WaitWakeReason::PortClosed => Some(Self::completion_port_closed_resume()),
+            WaitWakeReason::PortTimedOut
+            | WaitWakeReason::Deadline
+            | WaitWakeReason::Apc
+            | WaitWakeReason::ObjectSignaled
+            | WaitWakeReason::ObjectClosed
+            | WaitWakeReason::ThreadExit
+            | WaitWakeReason::Shutdown => {
+                // A worker deadline is real host time; bring the guest clock
+                // to the same deadline before the (guest-clock-driven) wait
+                // consumption pass evaluates the timeout.  Event wakeups do
+                // not advance the clock.
+                if matches!(
+                    completion.reason,
+                    WaitWakeReason::Deadline | WaitWakeReason::PortTimedOut
+                ) && let Some(deadline_ticks) = wait.deadline_ticks
+                {
+                    let now = self.win32.get_tick_count64();
+                    if deadline_ticks > now {
+                        let elapsed = deadline_ticks - now;
+                        self.win32.record_sleep_observation(elapsed, elapsed);
+                    }
+                }
+                if self.wait_satisfiable(&thread) {
+                    Some(self.complete_wait(&wait, completion.thread_id, memory)?)
+                } else {
+                    None
+                }
+            }
+        };
+        match resume {
+            Some(resume) => {
+                thread.wait_resume = Some(resume);
+                thread.state_machine = GuestThreadState::Runnable;
+                // A completion-port packet was already consumed by the
+                // worker; the pump must never consume a second packet.
+                if matches!(
+                    completion.reason,
+                    WaitWakeReason::CompletionPort | WaitWakeReason::PortClosed
+                ) {
+                    thread.wait = None;
+                }
+                self.pending_guest_threads.push_back(thread);
+            }
+            None => {
+                thread.state_machine = GuestThreadState::Waiting;
+                self.pending_guest_threads.push_back(thread);
+                let _ = self.start_production_wait(completion.thread_id, &wait);
+                SCHEDULER_COUNTERS
+                    .repark_events
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Defensive empty-packet resume; production workers never submit an
+    /// empty completion for a packet wait.
+    #[rustfmt::skip]
+    fn empty_packet_resume() -> WaitResume { // coverage: unreachable
+        WaitResume { // coverage: unreachable
+            code: 0, // coverage: unreachable
+            bytes: None, // coverage: unreachable
+            last_error: Some(crate::win32::WAIT_TIMEOUT), // coverage: unreachable
+        } // coverage: unreachable
+    } // coverage: unreachable
+
+    /// Build a resume result from packets a production worker dequeued from a
+    /// completion port.  Writes exactly the same guest out-parameters as the
+    /// cooperative dequeue path.
+    fn completion_port_packets_resume(
+        &self,
+        operation: &WaitOperation,
+        packets: Vec<crate::win32::IoCompletionPacket>,
+        memory: &mut MemoryImage,
+    ) -> AppResult<WaitResume> {
+        use std::sync::atomic::Ordering::Relaxed;
+        match operation {
+            WaitOperation::CompletionPort {
+                bytes_ptr,
+                key_ptr,
+                overlapped_ptr,
+                ..
+            } => {
+                let Some(packet) = packets.into_iter().next() else {
+                    return Ok(Self::empty_packet_resume()); // coverage: unreachable
+                };
+                if *bytes_ptr != 0 {
+                    write_u32(memory, *bytes_ptr, packet.bytes_transferred);
+                }
+                if *key_ptr != 0 {
+                    write_guest_pointer(memory, *key_ptr, packet.completion_key, self.guest_arch)?;
+                }
+                if *overlapped_ptr != 0 {
+                    write_guest_pointer(
+                        memory,
+                        *overlapped_ptr,
+                        packet.overlapped,
+                        self.guest_arch,
+                    )?;
+                }
+                SCHEDULER_COUNTERS
+                    .completion_port_wakeups
+                    .fetch_add(1, Relaxed);
+                Ok(WaitResume {
+                    code: 1, // TRUE
+                    bytes: Some(packet.bytes_transferred),
+                    last_error: None,
+                })
+            }
+            WaitOperation::CompletionPortEx {
+                entries_ptr,
+                removed_ptr,
+                ..
+            } => {
+                if packets.is_empty() {
+                    return Ok(Self::empty_packet_resume()); // coverage: unreachable
+                }
+                let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+                let entry_stride = pointer_bytes * 4;
+                for (index, packet) in packets.iter().enumerate() {
+                    if *entries_ptr == 0 {
+                        break; // coverage: unreachable (caller always supplies entries)
+                    }
+                    let entry = *entries_ptr + index as u64 * entry_stride;
+                    write_guest_pointer(memory, entry, packet.completion_key, self.guest_arch)?;
+                    write_guest_pointer(
+                        memory,
+                        entry + pointer_bytes,
+                        packet.overlapped,
+                        self.guest_arch,
+                    )?;
+                    write_guest_pointer(
+                        memory,
+                        entry + pointer_bytes * 2,
+                        packet.internal,
+                        self.guest_arch,
+                    )?;
+                    write_u32(memory, entry + pointer_bytes * 3, packet.bytes_transferred);
+                }
+                if *removed_ptr != 0 {
+                    write_u32(memory, *removed_ptr, packets.len() as u32);
+                }
+                SCHEDULER_COUNTERS
+                    .completion_port_wakeups
+                    .fetch_add(1, Relaxed);
+                Ok(WaitResume {
+                    code: 1, // TRUE
+                    bytes: Some(packets.len() as u32),
+                    last_error: None,
+                })
+            }
+            _ => Ok(Self::empty_packet_resume()), // coverage: unreachable
         }
     }
 }
@@ -1438,6 +3131,1402 @@ mod tests {
             overlapped,
             internal: 0,
         }
+    }
+
+    fn object_wait(handle: u32) -> GuestWait {
+        GuestWait {
+            objects: vec![handle],
+            wait_all: false,
+            deadline_ticks: None,
+            alertable: false,
+            operation: WaitOperation::Objects,
+        }
+    }
+
+    const RESUME_CODE_PTR: u64 = 0x42_580;
+    const APC_ENTRY: u64 = 0x42_500;
+    const APC_FLAG_PTR: u64 = 0x42_540;
+
+    fn map_resume_code_probe(session: &mut NtThunkSession) {
+        let mut bytes = Vec::new();
+        // mov dword ptr [RESUME_CODE_PTR], eax
+        bytes.push(0xA3);
+        bytes.extend_from_slice(&(RESUME_CODE_PTR as u32).to_le_bytes());
+        // mov dword ptr [FLAG_PTR], 1
+        bytes.extend_from_slice(&[0xC7, 0x05]);
+        bytes.extend_from_slice(&(FLAG_PTR as u32).to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        // xor eax, eax; ret
+        bytes.extend_from_slice(&[0x33, 0xC0, 0xC3]);
+        session.map_guest(ENTRY_POINT, &bytes);
+        session.map_guest(RESUME_CODE_PTR, &[0_u8; 4]);
+        session.map_guest(FLAG_PTR, &[0_u8; 4]);
+    }
+
+    fn map_apc_callback(session: &mut NtThunkSession) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0xC7, 0x05]);
+        bytes.extend_from_slice(&(APC_FLAG_PTR as u32).to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.push(0xC3);
+        session.map_guest(APC_ENTRY, &bytes);
+        session.map_guest(APC_FLAG_PTR, &[0_u8; 4]);
+    }
+
+    fn wait_until_worker_active(session: &NtThunkSession, expected: usize) {
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while scheduler.active_job_count() < expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native worker never picked up the parked guest wait"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn production_event_wait_wakes_with_latency_bound_and_zero_idle_polls_no_busy_wait() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let (event, created) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert!(!created);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+
+        park_main_thread(&mut session, object_wait(event));
+        let tid = session.runtime.pending_guest_threads[0].thread_id;
+        assert_eq!(
+            session.runtime.production_waits.len(),
+            1,
+            "the wait is owned by a native production job"
+        );
+        assert!(
+            !pump_once(&mut session),
+            "a production-parked wait never runs early"
+        );
+        wait_until_worker_active(&session, 1);
+        let before = SCHEDULER_COUNTERS.snapshot();
+
+        let signal_started = std::time::Instant::now();
+        session.runtime.win32.set_event(event).expect("set event");
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(
+            scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))),
+            "the native worker must report the wake"
+        );
+        let wake_latency = signal_started.elapsed();
+        assert!(
+            wake_latency < std::time::Duration::from_millis(500),
+            "wake latency bound exceeded: {wake_latency:?}"
+        );
+
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap"),
+            "the completion must resume the parked thread"
+        );
+        assert_eq!(session.runtime.production_waits.len(), 0);
+        assert!(pump_once(&mut session), "the woken thread runs");
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert!(
+            !session
+                .runtime
+                .win32
+                .event_previous_state(event)
+                .expect("event state"),
+            "auto-reset event consumed exactly once"
+        );
+
+        let after = session.runtime.scheduler_counters();
+        assert_eq!(after.wakeups, SCHEDULER_COUNTERS.snapshot().wakeups);
+        assert_eq!(SchedulerMode::Cooperative.worker_count(), 0);
+        assert_eq!(
+            after.poll_iterations, before.poll_iterations,
+            "a production event wait must not enter the 1 ms idle poll"
+        );
+        assert_ne!(
+            after.wakeups, before.wakeups,
+            "the native wakeup counter must advance"
+        );
+        assert_ne!(
+            after.object_wakeups, before.object_wakeups,
+            "the object-manager notification must reach a parked waiter"
+        );
+        let _ = tid;
+    }
+
+    #[test]
+    fn production_worker_overlap_race_is_exact_on_two_host_workers() {
+        let _guard = test_guard();
+        let scheduler = ProductionScheduler::new(2);
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let first = Arc::new(ParkSignal::new());
+        let second = Arc::new(ParkSignal::new());
+        let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let first_id = scheduler.submit(
+            101,
+            Arc::clone(&first),
+            0,
+            WaitJobKind::DeadlineOnly,
+            deadline,
+        );
+        let second_id = scheduler.submit(
+            102,
+            Arc::clone(&second),
+            0,
+            WaitJobKind::DeadlineOnly,
+            deadline,
+        );
+        let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while scheduler.active_job_count() < 2 {
+            assert!(
+                std::time::Instant::now() < wait_deadline,
+                "both guest waits must occupy native workers at the same time"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            scheduler.active_job_count(),
+            2,
+            "overlap proof: two guest waits active on two host workers"
+        );
+        first.notify(WaitWakeReason::ObjectSignaled);
+        second.notify(WaitWakeReason::ObjectSignaled);
+        let mut completions = Vec::new();
+        let collect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while completions.len() < 2 {
+            assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+            completions.extend(scheduler.take_completions());
+            assert!(
+                std::time::Instant::now() < collect_deadline,
+                "both workers must report their completion"
+            );
+        }
+        assert_eq!(completions.len(), 2);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_ne!(
+            after.worker_overlaps, before.worker_overlaps,
+            "overlap accounting must observe concurrency"
+        );
+        let ids = completions
+            .iter()
+            .map(|completion| completion.job_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 2, "each wait job completes exactly once");
+        assert_eq!(ids, BTreeSet::from([first_id, second_id]));
+        assert_eq!(scheduler.active_job_count(), 0);
+        drop(scheduler);
+    }
+
+    #[test]
+    fn production_blocking_wait_and_shutdown_races_never_lose_a_worker() {
+        let _guard = test_guard();
+        // Blocking (no timeout) completion wait: covered by a late notifier.
+        let scheduler = ProductionScheduler::new(1);
+        let signal = Arc::new(ParkSignal::new());
+        let job_id = scheduler.submit(
+            201,
+            Arc::clone(&signal),
+            0,
+            WaitJobKind::DeadlineOnly,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+        );
+        let notifier = {
+            let signal = Arc::clone(&signal);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                signal.notify(WaitWakeReason::ObjectSignaled);
+            })
+        };
+        assert!(
+            scheduler.wait_for_completion(None),
+            "an untimed completion wait must wake on the real event"
+        );
+        notifier.join().expect("notifier");
+        let completions = scheduler.take_completions();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].job_id, job_id);
+        drop(scheduler);
+
+        // Dropping the pool must join a worker blocked inside the port's own
+        // condvar, even with no packet and no deadline.
+        let (_temp_dir, mut session) = test_session();
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("port");
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+        let scheduler = ProductionScheduler::new(1);
+        let signal = Arc::new(ParkSignal::new());
+        let _ = scheduler.submit(
+            202,
+            signal,
+            0,
+            WaitJobKind::CompletionPort {
+                state: port_state,
+                guest_thread_id: 202,
+                max_packets: 1,
+                alertable: false,
+            },
+            None,
+        );
+        let active_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while scheduler.active_job_count() == 0 {
+            assert!(std::time::Instant::now() < active_deadline);
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let shutdown_started = std::time::Instant::now();
+        drop(scheduler);
+        assert!(
+            shutdown_started.elapsed() < std::time::Duration::from_secs(2),
+            "pool shutdown must wake/join a blocked IOCP worker"
+        );
+    }
+
+    #[test]
+    fn production_migration_counter_race_is_exact() {
+        let _guard = test_guard();
+        let scheduler = ProductionScheduler::new(2);
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let first = Arc::new(ParkSignal::new());
+        let first_id = scheduler.submit(
+            301,
+            Arc::clone(&first),
+            0,
+            WaitJobKind::DeadlineOnly,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while scheduler.active_job_count() < 1 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let second = Arc::new(ParkSignal::new());
+        let second_id = scheduler.submit(
+            301,
+            Arc::clone(&second),
+            0,
+            WaitJobKind::DeadlineOnly,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+        );
+        while scheduler.active_job_count() < 2 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_ne!(
+            SCHEDULER_COUNTERS.snapshot().migrations,
+            before.migrations,
+            "the same guest thread ran on two different host workers"
+        );
+        first.notify(WaitWakeReason::ObjectSignaled);
+        second.notify(WaitWakeReason::ObjectSignaled);
+        let mut ids = BTreeSet::new();
+        while ids.len() < 2 {
+            assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+            for completion in scheduler.take_completions() {
+                ids.insert(completion.job_id);
+            }
+        }
+        assert_eq!(ids, BTreeSet::from([first_id, second_id]));
+        drop(scheduler);
+    }
+
+    #[test]
+    fn production_contention_stress_has_exact_completion_invariants() {
+        let _guard = test_guard();
+        const JOBS: usize = 32;
+        let scheduler = ProductionScheduler::new(4);
+        let mut job_ids = BTreeSet::new();
+        let mut signals = Vec::new();
+        let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        for thread_id in 0..JOBS as u32 {
+            let signal = Arc::new(ParkSignal::new());
+            let job_id = scheduler.submit(
+                thread_id,
+                Arc::clone(&signal),
+                0,
+                WaitJobKind::DeadlineOnly,
+                deadline,
+            );
+            assert!(job_ids.insert(job_id), "job ids are unique");
+            signals.push(signal);
+        }
+        assert_eq!(job_ids.len(), JOBS);
+        for signal in &signals {
+            signal.notify(WaitWakeReason::ObjectSignaled);
+        }
+
+        let mut completed = BTreeSet::new();
+        let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while completed.len() < JOBS {
+            assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+            for completion in scheduler.take_completions() {
+                assert_eq!(
+                    completion.reason,
+                    WaitWakeReason::ObjectSignaled,
+                    "every job must observe its real wake, not a timeout"
+                );
+                assert!(
+                    completed.insert(completion.job_id),
+                    "a wait job must never complete twice"
+                );
+            }
+            assert!(
+                std::time::Instant::now() < wait_deadline,
+                "contention stress lost a completion"
+            );
+        }
+        assert_eq!(completed, job_ids);
+        assert_eq!(scheduler.active_job_count(), 0);
+        drop(scheduler);
+    }
+
+    #[test]
+    fn production_port_close_race_wakes_with_abandoned_error_not_a_packet() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create port");
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        park_main_thread(&mut session, cp_wait(port, None));
+        wait_until_worker_active(&session, 1);
+        let before = SCHEDULER_COUNTERS.snapshot();
+
+        session
+            .runtime
+            .win32
+            .close_handle(port)
+            .expect("close port while parked");
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(
+            session.runtime.last_error,
+            crate::win32::ERROR_ABANDONED_WAIT_0
+        );
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert_eq!(session.runtime.production_waits.len(), 0);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_eq!(
+            after.completion_port_wakeups, before.completion_port_wakeups,
+            "a closed port is not a packet handoff"
+        );
+        assert_eq!(
+            after.poll_iterations, before.poll_iterations,
+            "close wakeup is event-driven"
+        );
+    }
+
+    #[test]
+    fn production_pump_driven_completion_port_wake_is_event_driven_without_busy_wait() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create port");
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        park_main_thread(&mut session, cp_wait(port, None));
+        let before = SCHEDULER_COUNTERS.snapshot();
+
+        let posted_at = Arc::new(std::sync::Mutex::new(None));
+        let poster_state = Arc::clone(&port_state);
+        let poster_posted_at = Arc::clone(&posted_at);
+        let poster = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            *poster_posted_at.lock().unwrap() = Some(std::time::Instant::now());
+            poster_state
+                .post(test_packet(7, 0x5151, 0x6161))
+                .expect("post packet");
+        });
+
+        let mut steps = 0_u64;
+        let exit_code = session
+            .runtime
+            .run_pump_driven(&mut session.memory, &mut steps, 0)
+            .expect("pump-driven run");
+        poster.join().expect("poster");
+        let posted_at = posted_at.lock().unwrap().expect("post timestamp");
+        assert_eq!(exit_code, 0);
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert_eq!(read_u32_guest(&session, BYTES_PTR), 7);
+        assert_eq!(read_u32_guest(&session, KEY_PTR), 0x5151);
+        assert_eq!(read_u32_guest(&session, OVERLAPPED_PTR), 0x6161);
+        assert_eq!(port_state.queued_packet_count(), 0);
+        let wake_latency = posted_at.elapsed();
+        assert!(
+            wake_latency < std::time::Duration::from_millis(500),
+            "parked IOCP wake latency bound exceeded: {wake_latency:?}"
+        );
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_eq!(
+            after.poll_iterations, before.poll_iterations,
+            "production pump-driven idle waiting must not use the 1 ms poll"
+        );
+        assert_eq!(session.runtime.production_waits.len(), 0);
+    }
+
+    #[test]
+    fn production_mutex_release_wake_race_is_exact_without_busy_wait() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let main_tid = session.runtime.win32.current_thread_id();
+        let owner_tid = main_tid.wrapping_add(1);
+
+        let mutex = session.runtime.win32.create_mutex(false, false);
+        session.runtime.win32.set_current_thread_id(owner_tid);
+        assert_eq!(
+            session
+                .runtime
+                .win32
+                .wait_for_single_object_instant(mutex, crate::win32::ObjectType::Mutex, owner_tid)
+                .expect("acquire"),
+            crate::win32::WaitStatus::Object0
+        );
+        session.runtime.win32.set_current_thread_id(main_tid);
+        park_main_thread(&mut session, object_wait(mutex));
+        wait_until_worker_active(&session, 1);
+        session.runtime.win32.set_current_thread_id(owner_tid);
+        session
+            .runtime
+            .win32
+            .release_mutex(mutex)
+            .expect("release mutex");
+        session.runtime.win32.set_current_thread_id(main_tid);
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        // The resumed waiter took ownership; ending the guest thread in the
+        // pump (its continuation returned) abandons the owned mutex, so a
+        // third thread observes WAIT_ABANDONED — proof the waiter acquired it.
+        assert_eq!(
+            session
+                .runtime
+                .win32
+                .wait_for_single_object_instant(mutex, crate::win32::ObjectType::Mutex, owner_tid)
+                .expect("mutex probe"),
+            crate::win32::WaitStatus::Abandoned
+        );
+
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_eq!(
+            after.poll_iterations, before.poll_iterations,
+            "mutex wake is event-driven"
+        );
+        assert_ne!(after.object_wakeups, before.object_wakeups);
+    }
+
+    #[test]
+    fn production_semaphore_release_wake_race_is_exact_without_busy_wait() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let semaphore = session.runtime.win32.create_semaphore(0, 2, false);
+        park_main_thread(&mut session, object_wait(semaphore));
+        wait_until_worker_active(&session, 1);
+        assert_eq!(
+            session
+                .runtime
+                .win32
+                .release_semaphore(semaphore, 1)
+                .expect("release semaphore"),
+            0,
+            "the permit count was exhausted before release"
+        );
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(
+            read_u32_guest(&session, FLAG_PTR),
+            1,
+            "the semaphore waiter resumed"
+        );
+        assert_eq!(
+            session
+                .runtime
+                .win32
+                .release_semaphore(semaphore, 1)
+                .expect("post-acquire count"),
+            0,
+            "the resumed waiter consumed the released permit"
+        );
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_eq!(
+            after.poll_iterations, before.poll_iterations,
+            "semaphore wake is event-driven"
+        );
+        assert_ne!(after.object_wakeups, before.object_wakeups);
+    }
+
+    #[test]
+    fn production_deadline_wake_race_advances_guest_clock_exactly() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_resume_code_probe(&mut session);
+        let (event, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let deadline = session.runtime.win32.get_tick_count64().saturating_add(30);
+        let mut wait = object_wait(event);
+        wait.deadline_ticks = Some(deadline);
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let started = std::time::Instant::now();
+        park_main_thread(&mut session, wait);
+        wait_until_worker_active(&session, 1);
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(
+            read_u32_guest(&session, RESUME_CODE_PTR),
+            crate::win32::WAIT_TIMEOUT
+        );
+        assert!(session.runtime.win32.get_tick_count64() >= deadline);
+        assert_eq!(session.runtime.production_waits.len(), 0);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_ne!(after.deadline_wakeups, before.deadline_wakeups);
+        assert_eq!(after.poll_iterations, before.poll_iterations);
+    }
+
+    #[test]
+    fn production_alertable_apc_race_resumes_with_io_completion() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        map_apc_callback(&mut session);
+        let (event, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let mut wait = object_wait(event);
+        wait.alertable = true;
+        park_main_thread(&mut session, wait);
+        wait_until_worker_active(&session, 1);
+        let thread = &session.runtime.pending_guest_threads[0];
+        let thread_handle = thread.handle;
+        let tid = thread.thread_id;
+        session
+            .runtime
+            .win32
+            .queue_user_apc(thread_handle, APC_ENTRY, 0)
+            .expect("queue APC");
+        session
+            .runtime
+            .apc_queues
+            .entry(u64::from(tid))
+            .or_default()
+            .queue_user_apc(APC_ENTRY, 0);
+        let before = SCHEDULER_COUNTERS.snapshot();
+        session.runtime.notify_parked_apc(tid);
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(
+            read_u32_guest(&session, APC_FLAG_PTR),
+            1,
+            "the APC callback ran before the wait reported"
+        );
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_ne!(after.apc_wakeups, before.apc_wakeups);
+        assert_eq!(after.poll_iterations, before.poll_iterations);
+    }
+
+    #[test]
+    fn production_completion_port_alertable_apc_race_wakes_the_waiter() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        map_apc_callback(&mut session);
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("port");
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let mut wait = cp_wait(port, None);
+        wait.alertable = true;
+        park_main_thread(&mut session, wait);
+        wait_until_worker_active(&session, 1);
+        let thread = &session.runtime.pending_guest_threads[0];
+        let thread_handle = thread.handle;
+        let tid = thread.thread_id;
+        session
+            .runtime
+            .win32
+            .queue_user_apc(thread_handle, APC_ENTRY, 0)
+            .expect("queue APC");
+        session
+            .runtime
+            .apc_queues
+            .entry(u64::from(tid))
+            .or_default()
+            .queue_user_apc(APC_ENTRY, 0);
+        let before = SCHEDULER_COUNTERS.snapshot();
+        session.runtime.notify_parked_apc(tid);
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(read_u32_guest(&session, APC_FLAG_PTR), 1);
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_ne!(after.apc_wakeups, before.apc_wakeups);
+        assert_ne!(after.port_rechecks, before.port_rechecks);
+    }
+
+    #[test]
+    fn production_wait_all_repark_race_is_exact() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let (first, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        let (second, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let mut wait = object_wait(first);
+        wait.objects = vec![first, second];
+        wait.wait_all = true;
+        park_main_thread(&mut session, wait);
+        wait_until_worker_active(&session, 1);
+
+        session.runtime.win32.set_event(first).expect("first event");
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert_eq!(
+            session.runtime.production_waits.len(),
+            1,
+            "a partial wait-all wake must re-park, never resume"
+        );
+        assert!(!pump_once(&mut session));
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 0);
+        assert_ne!(
+            SCHEDULER_COUNTERS.snapshot().repark_events,
+            before.repark_events
+        );
+
+        session
+            .runtime
+            .win32
+            .set_event(second)
+            .expect("second event");
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert_eq!(session.runtime.production_waits.len(), 0);
+    }
+
+    #[test]
+    fn production_sleep_wait_race_uses_native_deadline_worker() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let deadline = session.runtime.win32.get_tick_count64().saturating_add(30);
+        let wait = GuestWait {
+            objects: Vec::new(),
+            wait_all: false,
+            deadline_ticks: Some(deadline),
+            alertable: true,
+            operation: WaitOperation::Sleep,
+        };
+        let before = SCHEDULER_COUNTERS.snapshot();
+        park_main_thread(&mut session, wait);
+        wait_until_worker_active(&session, 1);
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert_eq!(session.runtime.production_waits.len(), 0);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_ne!(after.deadline_wakeups, before.deadline_wakeups);
+        assert_eq!(after.poll_iterations, before.poll_iterations);
+
+        // A deadline already in the past completes immediately (zero wait).
+        let job = WaitJob {
+            job_id: 0,
+            thread_id: 0,
+            signal: Arc::new(ParkSignal::new()),
+            observed_generation: 0,
+            kind: WaitJobKind::DeadlineOnly,
+            deadline: Some(std::time::Instant::now()),
+        };
+        assert_eq!(run_wait_job(job).reason, WaitWakeReason::Deadline);
+    }
+
+    #[test]
+    fn production_pumped_thread_dispatch_race_is_exact() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let (event, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        // Create the record on the cooperative path, then hand it to the
+        // production dispatcher exactly as the pump's yield branch does.
+        park_main_thread(&mut session, object_wait(event));
+        let record = session
+            .runtime
+            .pending_guest_threads
+            .pop_back()
+            .expect("parked record");
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        assert!(
+            session
+                .runtime
+                .park_pumped_thread_in_production(record)
+                .is_none(),
+            "a supported pumped wait is owned by a native worker"
+        );
+        assert_eq!(session.runtime.production_waits.len(), 1);
+        assert_eq!(session.runtime.pending_guest_threads.len(), 1);
+        wait_until_worker_active(&session, 1);
+        session.runtime.win32.set_event(event).expect("set event");
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+
+        // An unsupported wait source must come back to the cooperative pump,
+        // never lose the record, and never create a native wait job.
+        let (_temp_dir2, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let (event2, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        park_main_thread(&mut session, object_wait(event2));
+        let mut record = session
+            .runtime
+            .pending_guest_threads
+            .pop_back()
+            .expect("parked record");
+        session.runtime.production_waits.remove(&record.thread_id);
+        record.wait = Some(GuestWait {
+            objects: Vec::new(),
+            wait_all: false,
+            deadline_ticks: None,
+            alertable: false,
+            operation: WaitOperation::PipeIo {
+                pipe_handle: 0,
+                kind: crate::win32::OverlappedKind::Read,
+                overlapped_id: 0,
+                buffer_ptr: 0,
+                length: 0,
+                bytes_read_ptr: 0,
+            },
+        });
+        assert!(
+            session
+                .runtime
+                .park_pumped_thread_in_production(record)
+                .is_some(),
+            "an unsupported wait stays on the cooperative path"
+        );
+        assert_eq!(session.runtime.production_waits.len(), 0);
+    }
+
+    #[test]
+    fn production_completion_port_ex_race_writes_every_entry() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create port");
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let mut ex_wait = cp_wait_ex(port, 1);
+        ex_wait.alertable = true;
+        // Queue the packet before the worker starts: a live worker may
+        // (correctly) resume on the first available packet.
+        port_state
+            .post(test_packet(11, 0xAAA, 0xBBB))
+            .expect("packet");
+        assert_eq!(port_state.queued_packet_count(), 1);
+        park_main_thread(&mut session, ex_wait);
+        // The packet is already queued, so the worker may complete before we
+        // could observe it active; wait for the completion, not the job slot.
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert_eq!(read_u32_guest(&session, ENTRIES_PTR), 0xAAA);
+        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 4), 0xBBB);
+        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 12), 11);
+        assert_eq!(read_u32_guest(&session, REMOVED_PTR), 1);
+        assert_eq!(port_state.queued_packet_count(), 0);
+
+        // Multi-entry handoff is a pure write path; exercise it directly so
+        // the assertion is independent of host scheduling.
+        session.map_guest(ENTRIES_PTR, &[0_u8; 32]);
+        session.map_guest(REMOVED_PTR, &[0_u8; 4]);
+        let operation = WaitOperation::CompletionPortEx {
+            port,
+            entries_ptr: ENTRIES_PTR,
+            entry_count: 4,
+            removed_ptr: REMOVED_PTR,
+        };
+        let resume = session
+            .runtime
+            .completion_port_packets_resume(
+                &operation,
+                vec![test_packet(11, 0xAAA, 0xBBB), test_packet(22, 0xCCC, 0xDDD)],
+                &mut session.memory,
+            )
+            .expect("multi-entry resume");
+        assert_eq!(resume.code, 1);
+        assert_eq!(resume.bytes, Some(2));
+        assert_eq!(read_u32_guest(&session, ENTRIES_PTR), 0xAAA);
+        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 4), 0xBBB);
+        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 12), 11);
+        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 16), 0xCCC);
+        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 20), 0xDDD);
+        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 28), 22);
+        assert_eq!(read_u32_guest(&session, REMOVED_PTR), 2);
+    }
+
+    #[test]
+    fn production_completion_port_timeout_race_reports_wait_timeout() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create port");
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let deadline = session.runtime.win32.get_tick_count64().saturating_add(25);
+        let before = SCHEDULER_COUNTERS.snapshot();
+        park_main_thread(&mut session, cp_wait(port, Some(deadline)));
+        wait_until_worker_active(&session, 1);
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(session.runtime.last_error, crate::win32::WAIT_TIMEOUT);
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert_eq!(session.runtime.production_waits.len(), 0);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_ne!(after.deadline_wakeups, before.deadline_wakeups);
+        assert_eq!(after.poll_iterations, before.poll_iterations);
+
+        // A completion-port deadline already elapsed before the worker runs
+        // completes immediately, without entering the port's condvar.
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+        let job = WaitJob {
+            job_id: 0,
+            thread_id: 0,
+            signal: Arc::new(ParkSignal::new()),
+            observed_generation: 0,
+            kind: WaitJobKind::CompletionPort {
+                state: port_state,
+                guest_thread_id: 0,
+                max_packets: 1,
+                alertable: false,
+            },
+            deadline: Some(std::time::Instant::now()),
+        };
+        assert_eq!(run_wait_job(job).reason, WaitWakeReason::PortTimedOut);
+    }
+
+    #[test]
+    fn production_thread_exit_race_wakes_join_without_polling() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let target = session.runtime.win32.create_thread(
+            crate::win32::ThreadPlan {
+                exit_code: None,
+                priority: 0,
+                signaled: false,
+            },
+            false,
+        );
+        let target_tid = session
+            .runtime
+            .win32
+            .thread_id_for_handle(target)
+            .expect("target thread id");
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let before = SCHEDULER_COUNTERS.snapshot();
+        park_main_thread(&mut session, object_wait(target));
+        wait_until_worker_active(&session, 1);
+        session
+            .runtime
+            .win32
+            .set_thread_exit_code_by_id(target_tid, 7)
+            .expect("terminate target");
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert_eq!(
+            session
+                .runtime
+                .win32
+                .wait_for_single_object_instant(
+                    target,
+                    crate::win32::ObjectType::Thread,
+                    session.runtime.win32.current_thread_id()
+                )
+                .expect("thread probe"),
+            crate::win32::WaitStatus::Object0
+        );
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_eq!(after.poll_iterations, before.poll_iterations);
+    }
+
+    #[test]
+    fn production_mode_switch_race_refuses_while_wait_parked() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let (event, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        park_main_thread(&mut session, object_wait(event));
+        wait_until_worker_active(&session, 1);
+        assert!(
+            !session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Cooperative),
+            "the mode switch must refuse while a wait is parked"
+        );
+        session.runtime.win32.set_event(event).expect("set event");
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap")
+        );
+        assert!(pump_once(&mut session));
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Cooperative)
+        );
+        assert_eq!(session.runtime.scheduler_mode(), SchedulerMode::Cooperative);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+    }
+
+    #[test]
+    fn cooperative_pump_driven_idle_poll_race_remains_bounded() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create port");
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+        assert_eq!(session.runtime.scheduler_mode(), SchedulerMode::Cooperative);
+        park_main_thread(&mut session, cp_wait(port, None));
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let poster_state = Arc::clone(&port_state);
+        let poster = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            poster_state
+                .post(test_packet(5, 0x7777, 0x8888))
+                .expect("post");
+        });
+        let mut steps = 0_u64;
+        let exit_code = session
+            .runtime
+            .run_pump_driven(&mut session.memory, &mut steps, 0)
+            .expect("cooperative pump run");
+        poster.join().expect("poster");
+        assert_eq!(exit_code, 0);
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert_eq!(read_u32_guest(&session, BYTES_PTR), 5);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert!(
+            after.poll_iterations > before.poll_iterations,
+            "cooperative mode keeps the 1 ms idle poll (deterministic fallback)"
+        );
+    }
+
+    #[test]
+    fn production_terminate_race_prunes_parked_wait_and_never_resumes() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let (event, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        park_main_thread(&mut session, object_wait(event));
+        wait_until_worker_active(&session, 1);
+
+        let tid = session.runtime.pending_guest_threads[0].thread_id;
+        let job_id = session
+            .runtime
+            .production_waits
+            .get(&tid)
+            .expect("parked job")
+            .job_id;
+        // A stale completion from an older/replaced job must not touch this
+        // wait.
+        assert!(
+            !session
+                .runtime
+                .apply_production_completion(
+                    WaitCompletion {
+                        job_id: job_id.wrapping_add(1),
+                        thread_id: tid,
+                        reason: WaitWakeReason::ObjectSignaled,
+                        packets: Vec::new(),
+                    },
+                    &mut session.memory,
+                )
+                .expect("stale completion")
+        );
+        assert_eq!(session.runtime.production_waits.len(), 1);
+        // TerminateThread's queued-thread path removes the record; the
+        // scheduler must drop the orphaned production wait instead of
+        // letting the run loop wait forever.
+        session
+            .runtime
+            .pending_guest_threads
+            .retain(|thread| thread.thread_id != tid);
+        session.runtime.prune_orphan_production_waits();
+        assert_eq!(session.runtime.production_waits.len(), 0);
+
+        session.runtime.win32.set_event(event).expect("set event");
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        assert!(scheduler.wait_for_completion(Some(std::time::Duration::from_secs(2))));
+        assert!(
+            !session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap"),
+            "a completion for a terminated thread is ignored"
+        );
+        assert!(!pump_once(&mut session));
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 0);
+        assert!(session.runtime.pending_guest_threads.is_empty());
+        assert_eq!(session.runtime.production_waits.len(), 0);
+    }
+
+    #[test]
+    fn deterministic_mode_stays_identical_without_stale_production_wakeups() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let (event, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert_eq!(
+            session.runtime.scheduler_mode(),
+            SchedulerMode::Cooperative,
+            "deterministic cooperative scheduling is the default"
+        );
+        assert!(session.runtime.production_scheduler.is_none());
+        let before = SCHEDULER_COUNTERS.snapshot();
+        // No production waiter is subscribed to this id (and the object is
+        // "closed"): the wake bus must stay a no-op.
+        let _ = wake_bus();
+        notify_object_waiters(ObjectId(0xDEAD_BEEF), true);
+        notify_object_waiters(ObjectId(0xDEAD_BEEF), false);
+
+        park_main_thread(&mut session, object_wait(event));
+        assert!(!pump_once(&mut session));
+        session.runtime.win32.set_event(event).expect("set event");
+        assert!(
+            pump_once(&mut session),
+            "cooperative pump resumes the waiter"
+        );
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert!(session.runtime.production_waits.is_empty());
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_eq!(after.wakeups, before.wakeups);
+        assert_eq!(after.migrations, before.migrations);
+        assert_eq!(after.worker_overlaps, before.worker_overlaps);
+        assert_eq!(after.poll_iterations, before.poll_iterations);
     }
 
     #[test]
@@ -1644,5 +4733,1410 @@ mod tests {
         assert_eq!(read_u32_guest(&session, BYTES_PTR), 11);
         assert_eq!(read_u32_guest(&session, KEY_PTR), 0xCC);
         assert_eq!(read_u32_guest(&session, OVERLAPPED_PTR), 0xDD);
+    }
+    const SLICE_CODE: u64 = 0x31_000;
+    const SLICE_CODE_2: u64 = 0x32_000;
+    const SLICE_COUNTER_A: u64 = 0x40_000;
+    const SLICE_COUNTER_B: u64 = 0x40_008;
+    const SLICE_STACK_A: u64 = 0x10_E00;
+    const SLICE_STACK_B: u64 = 0x10_F00;
+    const SLICE_THUNK_SLOT: u64 = 0x30_F00;
+
+    fn install_jit(session: &mut NtThunkSession) {
+        if session.runtime.jit_runtime.is_none() {
+            session.runtime.jit_runtime = Some(crate::jit::JitRuntime::new(GuestArch::X86));
+        }
+    }
+
+    fn loop_with_counter(counter: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        // mov eax, [counter]
+        bytes.push(0xA1);
+        bytes.extend_from_slice(&(counter as u32).to_le_bytes());
+        // add eax, 1
+        bytes.extend_from_slice(&[0x83, 0xC0, 0x01]);
+        // mov [counter], eax
+        bytes.push(0xA3);
+        bytes.extend_from_slice(&(counter as u32).to_le_bytes());
+        // sub ecx, 1; cmp ecx, 0 (the JIT emits real flag updates for
+        // Compare even though SubImm itself does not maintain EFLAGS)
+        bytes.extend_from_slice(&[0x83, 0xE9, 0x01, 0x83, 0xF9, 0x00]);
+        // jnz loop_start (next rip 21, target 0 -> -21)
+        bytes.extend_from_slice(&[0x75, 0xEB]);
+        // ret (the loop fallthrough after ECX reaches zero)
+        bytes.push(0xC3);
+        bytes
+    }
+
+    fn push_guest_thread(
+        session: &mut NtThunkSession,
+        handle: u32,
+        thread_id: u32,
+        rip: u64,
+        rsp: u64,
+        ecx: u32,
+    ) {
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = rip;
+        state.set(Register::Rsp, rsp);
+        state.set(Register::Rcx, u64::from(ecx));
+        state.segment_bases.fs = session.runtime.teb_base;
+        session
+            .runtime
+            .pending_guest_threads
+            .push_back(PendingGuestThread {
+                handle,
+                thread_id,
+                start_address: rip,
+                parameter: 0,
+                initial_rsp: rsp,
+                started: true,
+                suspended: 0,
+                wake_tick: 0,
+                teb_base: session.runtime.teb_base,
+                tls_vector_ptr: session.runtime.tls_vector_ptr,
+                tls_slots: BTreeMap::new(),
+                fls_slots: BTreeMap::new(),
+                state,
+                state_machine: GuestThreadState::Runnable,
+                exit_code_override: None,
+                wait: None,
+                wait_resume: None,
+            });
+    }
+
+    fn session_pending_rips(session: &NtThunkSession) -> Vec<u64> {
+        session
+            .runtime
+            .pending_guest_threads
+            .iter()
+            .map(|thread| thread.state.rip)
+            .collect()
+    }
+
+    fn trace_calls(session: &NtThunkSession, category: &str, call_id: &str) -> usize {
+        session
+            .runtime
+            .trace_events
+            .iter()
+            .filter(|event| event.category == category && event.call_id == call_id)
+            .count()
+    }
+
+    #[test]
+    fn production_slice_race_two_guest_loops_overlap_with_exact_counters() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        session.map_guest(SLICE_CODE, &loop_with_counter(SLICE_COUNTER_A));
+        session.map_guest(SLICE_CODE_2, &loop_with_counter(SLICE_COUNTER_B));
+        session.map_guest(SLICE_COUNTER_A, &[0_u8; 4]);
+        session.map_guest(SLICE_COUNTER_B, &[0_u8; 4]);
+        push_guest_thread(&mut session, 0x200, 0xA1, SLICE_CODE, SLICE_STACK_A, 2_048);
+        push_guest_thread(
+            &mut session,
+            0x201,
+            0xA2,
+            SLICE_CODE_2,
+            SLICE_STACK_B,
+            2_048,
+        );
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let requests = session
+            .runtime
+            .pending_guest_threads
+            .iter()
+            .map(|thread| GuestSliceRequest {
+                thread_id: thread.thread_id,
+                state: thread.state.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.state.rip)
+                .collect::<Vec<_>>(),
+            vec![SLICE_CODE, SLICE_CODE_2]
+        );
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let reports = session
+            .runtime
+            .dispatch_parallel_guest_slices(&mut session.memory, requests, 2_048)
+            .expect("dispatch two production slices");
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert!(
+            session
+                .runtime
+                .jit_runtime
+                .as_ref()
+                .expect("jit")
+                .slice_block(SLICE_CODE)
+                .expect("slice block A")
+                .worker_safe,
+            "loop block A must be worker-safe"
+        );
+        assert!(
+            session
+                .runtime
+                .jit_runtime
+                .as_ref()
+                .expect("jit")
+                .slice_block(SLICE_CODE_2)
+                .expect("slice block B")
+                .worker_safe,
+            "loop block B must be worker-safe"
+        );
+        assert_eq!(reports.len(), 2, "both guest threads must produce a report");
+        for report in &reports {
+            assert!(
+                matches!(report.exit, GuestSliceExit::Budget),
+                "worker must run the loop block, got {:?} for thread {:#x}",
+                report.exit,
+                report.thread_id
+            );
+        }
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.blocks_executed)
+                .sum::<u64>(),
+            4_096,
+            "each thread's slice must execute exactly its budget"
+        );
+        assert_eq!(read_u32_guest(&session, SLICE_COUNTER_A), 2_048);
+        assert_eq!(read_u32_guest(&session, SLICE_COUNTER_B), 2_048);
+        assert!(
+            after.worker_overlaps > before.worker_overlaps,
+            "two guest slices must occupy two host workers at the same time"
+        );
+        session.runtime.pending_guest_threads.clear();
+    }
+
+    #[test]
+    fn production_worker_barrier_never_double_dispatches_host_thunk() {
+        // The owner's x86 thunk path runs the callback machinery, whose host
+        // frames are deeper than the default 2 MiB test-thread stack.
+        with_big_stack(|| {
+            let _guard = test_guard();
+            let (_temp_dir, mut session) = test_session();
+            install_jit(&mut session);
+            let thunk = session.alloc_thunk(HostThunk::GetTickCount64);
+            assert!(
+                thunk <= u64::from(u32::MAX),
+                "x86 thunk address fits 32 bits"
+            );
+            // call dword ptr [SLICE_THUNK_SLOT] ; ret.  The x86 indirect-call
+            // form is dispatched by the owner loop with explicit next-RIP
+            // advancement, so the thunk must run exactly once.
+            let mut code = vec![0xFF, 0x15];
+            code.extend_from_slice(&(SLICE_THUNK_SLOT as u32).to_le_bytes());
+            code.push(0xC3);
+            session.map_guest(SLICE_CODE_2, &code);
+            session.map_guest(SLICE_THUNK_SLOT, &(thunk as u32).to_le_bytes());
+            push_guest_thread(&mut session, 0x300, 0xB1, SLICE_CODE_2, SLICE_STACK_B, 1);
+            assert!(
+                session
+                    .runtime
+                    .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+            );
+            let before = trace_calls(&session, "time", "GetTickCount64");
+            let request = GuestSliceRequest {
+                thread_id: 0xB1,
+                state: session.runtime.pending_guest_threads[0].state.clone(),
+            };
+            let reports = session
+                .runtime
+                .dispatch_parallel_guest_slices(&mut session.memory, vec![request], 16)
+                .expect("dispatch slice");
+            assert_eq!(reports.len(), 1);
+            assert_eq!(
+                reports[0].exit,
+                GuestSliceExit::HostBarrier { rip: SLICE_CODE_2 }
+            );
+            assert_eq!(reports[0].blocks_executed, 0);
+            assert_eq!(
+                trace_calls(&session, "time", "GetTickCount64"),
+                before,
+                "a production worker must never run the host thunk"
+            );
+            let mut rounds = 0;
+            while pump_once(&mut session) {
+                rounds += 1;
+                assert!(rounds < 64, "the cooperative owner must finish the thread");
+            }
+            assert_eq!(
+                trace_calls(&session, "time", "GetTickCount64"),
+                before + 1,
+                "the runtime owner executes the thunk exactly once"
+            );
+            assert_eq!(session.runtime.pending_guest_threads.len(), 0);
+        });
+    }
+
+    #[test]
+    fn cooperative_and_production_guest_loops_no_races_byte_identical() {
+        let _guard = test_guard();
+        let iterations = 300_u32;
+        let (coop_dir, mut cooperative) = test_session();
+        cooperative.map_guest(SLICE_CODE, &loop_with_counter(SLICE_COUNTER_A));
+        cooperative.map_guest(SLICE_COUNTER_A, &[0_u8; 4]);
+        push_guest_thread(
+            &mut cooperative,
+            0x400,
+            0xC1,
+            SLICE_CODE,
+            SLICE_STACK_A,
+            iterations,
+        );
+        let mut rounds = 0;
+        while pump_once(&mut cooperative) && rounds < 10_000 {
+            rounds += 1;
+        }
+        assert_eq!(
+            read_u32_guest(&cooperative, SLICE_COUNTER_A),
+            iterations,
+            "cooperative loop did not finish in {rounds} rounds"
+        );
+        let (prod_dir, mut production) = test_session();
+        install_jit(&mut production);
+        production.map_guest(SLICE_CODE, &loop_with_counter(SLICE_COUNTER_A));
+        production.map_guest(SLICE_COUNTER_A, &[0_u8; 4]);
+        push_guest_thread(
+            &mut production,
+            0x401,
+            0xC2,
+            SLICE_CODE,
+            SLICE_STACK_A,
+            iterations,
+        );
+        assert!(
+            production
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let request = GuestSliceRequest {
+            thread_id: 0xC2,
+            state: production.runtime.pending_guest_threads[0].state.clone(),
+        };
+        let reports = production
+            .runtime
+            .dispatch_parallel_guest_slices(&mut production.memory, vec![request], 512)
+            .expect("production slice");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].state.rip,
+            SLICE_CODE + 21,
+            "loop must fall through to ret after {iterations} iterations (exit {:?})",
+            reports[0].exit
+        );
+        production.runtime.pending_guest_threads[0].state = reports[0].state.clone();
+        rounds = 0;
+        while pump_once(&mut production) && rounds < 100 {
+            rounds += 1;
+        }
+        assert_eq!(
+            session_pending_rips(&production),
+            Vec::<u64>::new(),
+            "production thread did not exit after {rounds} rounds"
+        );
+        assert_eq!(
+            read_u32_guest(&cooperative, SLICE_COUNTER_A),
+            iterations,
+            "cooperative result"
+        );
+        assert_eq!(
+            read_u32_guest(&production, SLICE_COUNTER_A),
+            iterations,
+            "production result"
+        );
+        assert_eq!(
+            read_u32_guest(&cooperative, SLICE_COUNTER_A),
+            read_u32_guest(&production, SLICE_COUNTER_A)
+        );
+        assert_eq!(
+            cooperative.read_guest(SLICE_COUNTER_A, 16),
+            production.read_guest(SLICE_COUNTER_A, 16),
+            "the canonical guest bytes must be identical in both modes"
+        );
+        drop(coop_dir);
+        drop(prod_dir);
+    }
+
+    #[test]
+    fn production_slice_close_race_shutdown_joins_active_guest_loop() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        session.map_guest(SLICE_CODE, &loop_with_counter(SLICE_COUNTER_A));
+        session.map_guest(SLICE_COUNTER_A, &[0_u8; 4]);
+        push_guest_thread(
+            &mut session,
+            0x500,
+            0xD1,
+            SLICE_CODE,
+            SLICE_STACK_A,
+            u32::MAX,
+        );
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        assert!(
+            session
+                .runtime
+                .ensure_slice_block(&mut session.memory, SLICE_CODE)
+                .expect("compile shutdown loop"),
+            "the shutdown loop block must be worker-safe"
+        );
+        let program = std::sync::Arc::new(
+            session
+                .runtime
+                .jit_runtime
+                .as_ref()
+                .expect("jit")
+                .build_slice_program(&session.memory),
+        );
+        let state = session.runtime.pending_guest_threads[0].state.clone();
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        let _job = scheduler.submit_slice(0xD1, state, program, u64::MAX, None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while scheduler.active_job_count() == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let start = std::time::Instant::now();
+        session.runtime.production_scheduler = None;
+        assert_eq!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            true,
+            "dropping the pool must join an active guest slice"
+        );
+        assert_eq!(session.runtime.production_scheduler.is_none(), true);
+        crate::jit::JIT_SAFEPOINT_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
+    }
+    #[test]
+    fn production_thunk_serialization_stress_is_exactly_once_under_two_threads() {
+        with_big_stack(|| {
+            let _guard = test_guard();
+            let (_temp_dir, mut session) = test_session();
+            install_jit(&mut session);
+            let thunk = session.alloc_thunk(HostThunk::GetTickCount64);
+            assert!(thunk <= u64::from(u32::MAX));
+            // call [slot]; sub ecx,1; cmp ecx,0; jnz call; ret
+            let mut code = vec![0xFF, 0x15];
+            code.extend_from_slice(&(SLICE_THUNK_SLOT as u32).to_le_bytes());
+            code.extend_from_slice(&[0x83, 0xE9, 0x01, 0x83, 0xF9, 0x00, 0x75, 0xF2, 0xC3]);
+            session.map_guest(SLICE_CODE_2, &code);
+            session.map_guest(SLICE_THUNK_SLOT, &(thunk as u32).to_le_bytes());
+            let iterations = 8_u32;
+            push_guest_thread(
+                &mut session,
+                0x600,
+                0xE1,
+                SLICE_CODE_2,
+                SLICE_STACK_A,
+                iterations,
+            );
+            push_guest_thread(
+                &mut session,
+                0x601,
+                0xE2,
+                SLICE_CODE_2,
+                SLICE_STACK_B,
+                iterations,
+            );
+            assert!(
+                session
+                    .runtime
+                    .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+            );
+            let before = trace_calls(&session, "time", "GetTickCount64");
+            let mut rounds = 0;
+            while pump_once(&mut session) && rounds < 1_000 {
+                rounds += 1;
+            }
+            assert_eq!(
+                trace_calls(&session, "time", "GetTickCount64"),
+                before + 2 * iterations as usize,
+                "every guest call must dispatch its thunk exactly once"
+            );
+            assert_eq!(session.runtime.pending_guest_threads.len(), 0);
+        });
+    }
+    #[test]
+    fn production_pump_race_dispatches_two_guest_loops_to_two_workers() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        session.map_guest(SLICE_CODE, &loop_with_counter(SLICE_COUNTER_A));
+        session.map_guest(SLICE_CODE_2, &loop_with_counter(SLICE_COUNTER_B));
+        session.map_guest(SLICE_COUNTER_A, &[0_u8; 4]);
+        session.map_guest(SLICE_COUNTER_B, &[0_u8; 4]);
+        push_guest_thread(&mut session, 0x700, 0xF1, SLICE_CODE, SLICE_STACK_A, 10_000);
+        push_guest_thread(
+            &mut session,
+            0x701,
+            0xF2,
+            SLICE_CODE_2,
+            SLICE_STACK_B,
+            10_000,
+        );
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let before = SCHEDULER_COUNTERS.snapshot();
+        assert_eq!(pump_once(&mut session), true);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_eq!(read_u32_guest(&session, SLICE_COUNTER_A), 512);
+        assert_eq!(read_u32_guest(&session, SLICE_COUNTER_B), 512);
+        assert!(
+            after.worker_overlaps > before.worker_overlaps,
+            "the production pump must overlap the two guest slices"
+        );
+        session.runtime.pending_guest_threads.clear();
+    }
+    #[test]
+    fn production_worker_guest_fault_boundary_is_reported_to_the_owner() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        // mov eax, [0x9000]; jmp $ — the code page is mapped, the data page
+        // is not.  A jump terminator keeps the block worker-safe (a ret
+        // terminator would make the whole block a host barrier).
+        let mut code = vec![0xA1];
+        code.extend_from_slice(&0x9000_u32.to_le_bytes());
+        code.extend_from_slice(&[0xEB, 0xFE]);
+        session.map_guest(SLICE_CODE, &code);
+        push_guest_thread(&mut session, 0x800, 0x1F1, SLICE_CODE, SLICE_STACK_A, 1);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let request = GuestSliceRequest {
+            thread_id: 0x1F1,
+            state: session.runtime.pending_guest_threads[0].state.clone(),
+        };
+        let reports = session
+            .runtime
+            .dispatch_parallel_guest_slices(&mut session.memory, vec![request], 4)
+            .expect("dispatch faulting slice");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].exit,
+            GuestSliceExit::GuestFault {
+                address: 0x9000,
+                write: false
+            }
+        );
+        assert_eq!(reports[0].blocks_executed, 1);
+        session.runtime.pending_guest_threads.clear();
+    }
+
+    const SLICE_JUMP_CODE: u64 = 0x34_000;
+    const SLICE_SAFEPOINT_CODE: u64 = 0x35_000;
+    const SLICE_STRAIGHT_CODE: u64 = 0x36_000;
+    const SLICE_JUMPIF_CODE: u64 = 0x37_000;
+    const SLICE_CODE_WRITE_CODE: u64 = 0x38_000;
+
+    fn fake_scheduler(worker_count: usize, shutdown: bool) -> ProductionScheduler {
+        ProductionScheduler {
+            shared: Arc::new(ProductionShared {
+                state: Mutex::new(ProductionState {
+                    shutdown,
+                    ..ProductionState::default()
+                }),
+                work_ready: Condvar::new(),
+                completion_ready: Condvar::new(),
+                shutdown: std::sync::atomic::AtomicBool::new(shutdown),
+            }),
+            workers: Vec::new(),
+            worker_count,
+        }
+    }
+
+    fn slice_program(session: &mut NtThunkSession, rip: u64) -> Arc<crate::jit::GuestSliceProgram> {
+        install_jit(session);
+        assert_eq!(
+            session
+                .runtime
+                .ensure_slice_block(&mut session.memory, rip)
+                .expect("compile slice block"),
+            true,
+            "the test block must be worker-safe"
+        );
+        Arc::new(
+            session
+                .runtime
+                .jit_runtime
+                .as_ref()
+                .expect("jit runtime")
+                .build_slice_program(&session.memory),
+        )
+    }
+
+    fn slice_job(
+        thread_id: u32,
+        state: CpuState,
+        program: Arc<crate::jit::GuestSliceProgram>,
+        budget: u64,
+    ) -> GuestSliceJob {
+        GuestSliceJob {
+            job_id: 0,
+            thread_id,
+            state,
+            program,
+            budget,
+            start: None,
+        }
+    }
+
+    fn slice_completion(job_id: u64, thread_id: u32, state: CpuState) -> GuestSliceCompletion {
+        GuestSliceCompletion {
+            job_id,
+            thread_id,
+            state,
+            exit: GuestSliceExit::Budget,
+            blocks_executed: 1,
+            worker_index: 0,
+            code_writes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn production_slice_start_gate_over_arrival_race_returns_without_deadlock() {
+        let _guard = test_guard();
+        let gate = SliceStartGate::new(1);
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        gate.arrive_and_wait(&shutdown);
+        gate.arrive_and_wait(&shutdown);
+        assert_eq!(
+            *gate
+                .remaining
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            0,
+            "an over-arrival must observe the already-emptied gate"
+        );
+        assert_eq!(
+            shutdown.load(std::sync::atomic::Ordering::Acquire),
+            false,
+            "the over-arrival must not fake a shutdown"
+        );
+    }
+
+    #[test]
+    fn production_slice_round_shutdown_race_skips_all_worker_reports() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        session.map_guest(SLICE_JUMP_CODE, &[0xEB, 0xFE]);
+        let program = slice_program(&mut session, SLICE_JUMP_CODE);
+        let scheduler = fake_scheduler(1, true);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = SLICE_JUMP_CODE;
+        let reports = scheduler.run_guest_slices(
+            vec![GuestSliceRequest {
+                thread_id: 0x5A,
+                state,
+            }],
+            program,
+            4,
+        );
+        assert_eq!(
+            reports.len(),
+            0,
+            "a shutdown round must never report a slice as executed"
+        );
+    }
+
+    #[test]
+    fn production_slice_round_shutdown_race_drains_completion_before_stop() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        session.map_guest(SLICE_JUMP_CODE, &[0xEB, 0xFE]);
+        let program = slice_program(&mut session, SLICE_JUMP_CODE);
+        let scheduler = fake_scheduler(1, true);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = SLICE_JUMP_CODE;
+        scheduler
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .completions
+            .push_back(WaitCompletion {
+                job_id: 7,
+                thread_id: 0x5B,
+                reason: WaitWakeReason::Deadline,
+                packets: Vec::new(),
+            });
+        let reports = scheduler.run_guest_slices(
+            vec![GuestSliceRequest {
+                thread_id: 0x5B,
+                state,
+            }],
+            program,
+            4,
+        );
+        assert_eq!(
+            reports.len(),
+            0,
+            "shutdown must stop the round even when a wait completion woke it"
+        );
+        assert_eq!(
+            scheduler.take_completions().len(),
+            1,
+            "slice rounds must leave wait completions for the owner"
+        );
+    }
+
+    #[test]
+    fn slice_ensure_block_rejects_missing_jit_thunk_and_unmapped_rip() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        assert_eq!(
+            session
+                .runtime
+                .ensure_slice_block(&mut session.memory, SLICE_JUMP_CODE)
+                .expect("missing jit"),
+            false,
+            "a runtime without a JIT cannot produce worker slices"
+        );
+        install_jit(&mut session);
+        let thunk = session.alloc_thunk(HostThunk::GetTickCount64);
+        assert_eq!(
+            session
+                .runtime
+                .ensure_slice_block(&mut session.memory, thunk)
+                .expect("host thunk"),
+            false,
+            "a host thunk address is never worker guest code"
+        );
+        let error = session
+            .runtime
+            .ensure_slice_block(&mut session.memory, 0xDEAD_0000)
+            .expect_err("an unmapped rip must fail decoding");
+        assert_eq!(
+            error.code,
+            crate::reason::ReasonCode::RcUnimplInsn,
+            "the decode failure must propagate to the caller"
+        );
+    }
+
+    #[test]
+    fn production_slice_dispatch_rejects_empty_or_missing_pool() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let empty = session
+            .runtime
+            .dispatch_parallel_guest_slices(&mut session.memory, Vec::new(), 8)
+            .expect("empty request set");
+        assert_eq!(
+            empty.len(),
+            0,
+            "an empty request set must dispatch no slices"
+        );
+        let request = GuestSliceRequest {
+            thread_id: 0x6A,
+            state: CpuState::new(GuestArch::X86),
+        };
+        let no_pool = session
+            .runtime
+            .dispatch_parallel_guest_slices(&mut session.memory, vec![request], 8)
+            .expect("missing pool");
+        assert_eq!(
+            no_pool.len(),
+            0,
+            "cooperative mode has no production pool to dispatch to"
+        );
+        assert_eq!(
+            session.runtime.production_scheduler.is_none(),
+            true,
+            "the dispatch must not create a pool implicitly"
+        );
+    }
+
+    #[test]
+    fn production_slice_jump_exit_race_updates_rip_exactly_once() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        session.map_guest(SLICE_JUMP_CODE, &[0xEB, 0xFE]);
+        push_guest_thread(&mut session, 0x900, 0x77, SLICE_JUMP_CODE, SLICE_STACK_A, 0);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let request = GuestSliceRequest {
+            thread_id: 0x77,
+            state: session.runtime.pending_guest_threads[0].state.clone(),
+        };
+        let reports = session
+            .runtime
+            .dispatch_parallel_guest_slices(&mut session.memory, vec![request], 1)
+            .expect("jump slice");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].state.rip, SLICE_JUMP_CODE,
+            "a jump exit must land on the jump target"
+        );
+        assert_eq!(
+            reports[0].blocks_executed, 1,
+            "the budget must stop the slice after the jump"
+        );
+        assert_eq!(
+            reports[0].exit,
+            GuestSliceExit::Budget,
+            "the jump target re-enters the same worker-safe loop"
+        );
+        session.runtime.pending_guest_threads.clear();
+    }
+
+    #[test]
+    fn production_slice_safepoint_exit_race_consumes_request() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        session.map_guest(SLICE_SAFEPOINT_CODE, &[0xEB, 0xFE]);
+        push_guest_thread(
+            &mut session,
+            0x901,
+            0x78,
+            SLICE_SAFEPOINT_CODE,
+            SLICE_STACK_A,
+            0,
+        );
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        crate::jit::JIT_SAFEPOINT_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+        let request = GuestSliceRequest {
+            thread_id: 0x78,
+            state: session.runtime.pending_guest_threads[0].state.clone(),
+        };
+        let reports = session
+            .runtime
+            .dispatch_parallel_guest_slices(&mut session.memory, vec![request], 4)
+            .expect("safepoint slice");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].exit,
+            GuestSliceExit::Safepoint,
+            "the worker must stop at the safepoint, not run guest code"
+        );
+        assert_eq!(
+            reports[0].blocks_executed, 1,
+            "the safepoint is observed after the block prologue ran"
+        );
+        crate::jit::JIT_SAFEPOINT_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
+        session.runtime.pending_guest_threads.clear();
+    }
+
+    #[test]
+    fn production_slice_straight_line_fallback_is_host_barrier() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        let ir = vec![crate::cpu::IrInstruction::MovImm {
+            dst: Register::Rax,
+            value: 0x1234,
+        }];
+        let block = session
+            .runtime
+            .jit_runtime
+            .as_mut()
+            .expect("jit runtime")
+            .get_or_compile_slice_block(&ir, SLICE_STRAIGHT_CODE, GuestArch::X86)
+            .expect("compile straight-line slice")
+            .clone();
+        let mut program = session
+            .runtime
+            .jit_runtime
+            .as_ref()
+            .expect("jit runtime")
+            .build_slice_program(&session.memory);
+        program.blocks.insert(SLICE_STRAIGHT_CODE, block);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = SLICE_STRAIGHT_CODE;
+        let completion = run_guest_slice_job(
+            slice_job(0x79, state, Arc::new(program), 4),
+            &std::sync::atomic::AtomicBool::new(false),
+            0,
+        );
+        assert_eq!(
+            completion.exit,
+            GuestSliceExit::HostBarrier {
+                rip: SLICE_STRAIGHT_CODE
+            },
+            "a straight-line exit must return to the runtime owner"
+        );
+        assert_eq!(
+            completion.blocks_executed, 1,
+            "the straight-line block executed exactly once"
+        );
+        assert_eq!(
+            completion.state.get(Register::Rax),
+            0x1234,
+            "the worker applied the block result before the barrier"
+        );
+    }
+
+    #[test]
+    fn production_slice_missing_exit_metadata_is_host_barrier() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        let ir = vec![crate::cpu::IrInstruction::JumpIf {
+            condition: crate::cpu::ConditionCode::NotEqual,
+            target: SLICE_JUMPIF_CODE + 0x20,
+            fallthrough: SLICE_JUMPIF_CODE + 0x40,
+        }];
+        let mut block = session
+            .runtime
+            .jit_runtime
+            .as_mut()
+            .expect("jit runtime")
+            .get_or_compile_slice_block(&ir, SLICE_JUMPIF_CODE, GuestArch::X86)
+            .expect("compile conditional slice")
+            .clone();
+        block.last_exit_info = None;
+        let mut program = session
+            .runtime
+            .jit_runtime
+            .as_ref()
+            .expect("jit runtime")
+            .build_slice_program(&session.memory);
+        program.blocks.insert(SLICE_JUMPIF_CODE, block);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = SLICE_JUMPIF_CODE;
+        let completion = run_guest_slice_job(
+            slice_job(0x7A, state, Arc::new(program), 4),
+            &std::sync::atomic::AtomicBool::new(false),
+            0,
+        );
+        assert_eq!(
+            completion.exit,
+            GuestSliceExit::HostBarrier {
+                rip: SLICE_JUMPIF_CODE
+            },
+            "conditional exit metadata loss must never fabricate a RIP"
+        );
+        assert_eq!(
+            completion.state.rip, SLICE_JUMPIF_CODE,
+            "the owner re-dispatches the original block address"
+        );
+    }
+
+    #[test]
+    fn production_slice_code_write_race_clears_stale_blocks() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        let mut code = vec![0xC7, 0x05];
+        code.extend_from_slice(&(SLICE_CODE_WRITE_CODE as u32).to_le_bytes());
+        code.extend_from_slice(&0x9090_9090_u32.to_le_bytes());
+        code.extend_from_slice(&[0xEB, 0xFE]);
+        session.map_guest(SLICE_CODE_WRITE_CODE & !0xfff, &vec![0_u8; 0x1000]);
+        session.map_guest(SLICE_CODE_WRITE_CODE, &code);
+        session
+            .runtime
+            .jit_runtime
+            .as_mut()
+            .expect("jit runtime")
+            .code_pages
+            .insert(SLICE_CODE_WRITE_CODE & !0xfff);
+        push_guest_thread(
+            &mut session,
+            0x902,
+            0x7B,
+            SLICE_CODE_WRITE_CODE,
+            SLICE_STACK_A,
+            0,
+        );
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let request = GuestSliceRequest {
+            thread_id: 0x7B,
+            state: session.runtime.pending_guest_threads[0].state.clone(),
+        };
+        let reports = session
+            .runtime
+            .dispatch_parallel_guest_slices(&mut session.memory, vec![request], 4)
+            .expect("code-write slice");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].exit,
+            GuestSliceExit::CodeWrite,
+            "a guest store to a compiled-code page must yield to the owner"
+        );
+        assert_eq!(
+            reports[0].code_writes,
+            vec![(SLICE_CODE_WRITE_CODE, 4)],
+            "the exact code write must be reported for invalidation"
+        );
+        assert_eq!(
+            session
+                .runtime
+                .jit_runtime
+                .as_ref()
+                .expect("jit runtime")
+                .slice_block(SLICE_CODE_WRITE_CODE)
+                .is_none(),
+            true,
+            "a code write must clear stale worker slice blocks"
+        );
+        session.runtime.pending_guest_threads.clear();
+    }
+
+    #[test]
+    fn production_completion_port_shutdown_race_reports_signal_reason() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create port");
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+        let signal = Arc::new(ParkSignal::new());
+        let job = WaitJob {
+            job_id: 3,
+            thread_id: 0x7C,
+            signal: Arc::clone(&signal),
+            observed_generation: signal.generation(),
+            kind: WaitJobKind::CompletionPort {
+                state: port_state,
+                guest_thread_id: 0x7C,
+                max_packets: 1,
+                alertable: false,
+            },
+            deadline: None,
+        };
+        let before = SCHEDULER_COUNTERS.snapshot();
+        signal.notify(WaitWakeReason::Shutdown);
+        let started = std::time::Instant::now();
+        let completion = run_wait_job(job);
+        assert_eq!(
+            completion.reason,
+            WaitWakeReason::Shutdown,
+            "a shutdown notification must win after the port slice expires"
+        );
+        assert_eq!(
+            completion.packets.len(),
+            0,
+            "a shutdown wake must not fabricate a packet"
+        );
+        assert_eq!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            true,
+            "the worker must observe shutdown within one port slice"
+        );
+        assert_ne!(
+            SCHEDULER_COUNTERS.snapshot().port_rechecks,
+            before.port_rechecks,
+            "the blocked port wait must recheck exactly once per slice"
+        );
+    }
+
+    #[test]
+    fn production_object_wait_rejects_unsupported_iocp_handle() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create port");
+        assert_eq!(
+            session
+                .runtime
+                .production_wait_supported(&object_wait(port)),
+            false,
+            "an IOCP handle is not a supported object-wait source"
+        );
+    }
+
+    #[test]
+    fn production_completion_port_invalid_pointer_race_propagates_error() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let operation = WaitOperation::CompletionPort {
+            port: 0,
+            bytes_ptr: 0,
+            key_ptr: KEY_PTR,
+            overlapped_ptr: OVERLAPPED_PTR,
+        };
+        let mut packet = test_packet(1, 0x5151, 0x6161);
+        packet.completion_key = 0x1_0000_0000;
+        let error = session
+            .runtime
+            .completion_port_packets_resume(&operation, vec![packet], &mut session.memory)
+            .err()
+            .expect("a non-fitting x86 completion key must fail");
+        assert_eq!(error.code, crate::reason::ReasonCode::RcUnimplInsn);
+        let mut packet = test_packet(1, 0x5151, 0x6161);
+        packet.overlapped = 0x1_0000_0000;
+        let error = session
+            .runtime
+            .completion_port_packets_resume(&operation, vec![packet], &mut session.memory)
+            .err()
+            .expect("a non-fitting x86 overlapped pointer must fail");
+        assert_eq!(error.code, crate::reason::ReasonCode::RcUnimplInsn);
+        let operation_ex = WaitOperation::CompletionPortEx {
+            port: 0,
+            entries_ptr: ENTRIES_PTR,
+            entry_count: 1,
+            removed_ptr: REMOVED_PTR,
+        };
+        let mut packet = test_packet(1, 0xAAA, 0xBBB);
+        packet.overlapped = 0x1_0000_0000;
+        let error = session
+            .runtime
+            .completion_port_packets_resume(&operation_ex, vec![packet], &mut session.memory)
+            .err()
+            .expect("the second entry write must fail on a non-fitting pointer");
+        assert_eq!(error.code, crate::reason::ReasonCode::RcUnimplInsn);
+        let mut packet = test_packet(1, 0xAAA, 0xBBB);
+        packet.internal = 0x1_0000_0000;
+        let error = session
+            .runtime
+            .completion_port_packets_resume(&operation_ex, vec![packet], &mut session.memory)
+            .err()
+            .expect("the third entry write must fail on a non-fitting pointer");
+        assert_eq!(error.code, crate::reason::ReasonCode::RcUnimplInsn);
+        let resume = session
+            .runtime
+            .completion_port_packets_resume(
+                &operation_ex,
+                vec![test_packet(2, 0xAAA, 0xBBB)],
+                &mut session.memory,
+            )
+            .expect("well-formed entry");
+        assert_eq!(resume.code, 1);
+        assert_eq!(resume.bytes, Some(1));
+        assert_eq!(read_u32_guest(&session, REMOVED_PTR), 1);
+        let no_optional_outputs = WaitOperation::CompletionPort {
+            port: 0,
+            bytes_ptr: 0,
+            key_ptr: 0,
+            overlapped_ptr: 0,
+        };
+        let resume = session
+            .runtime
+            .completion_port_packets_resume(
+                &no_optional_outputs,
+                vec![test_packet(2, 0xAAA, 0xBBB)],
+                &mut session.memory,
+            )
+            .expect("NULL completion out-pointers");
+        assert_eq!(resume.code, 1);
+        assert_eq!(resume.bytes, Some(2));
+    }
+
+    #[test]
+    fn production_packet_failure_race_propagates_through_completion_apply() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create port");
+        push_guest_thread(&mut session, 0x903, 0x7D, ENTRY_POINT, CONTINUATION_RSP, 0);
+        {
+            let thread = session
+                .runtime
+                .pending_guest_threads
+                .back_mut()
+                .expect("parked record");
+            thread.state_machine = GuestThreadState::Waiting;
+            thread.wait = Some(GuestWait {
+                objects: Vec::new(),
+                wait_all: false,
+                deadline_ticks: None,
+                alertable: false,
+                operation: WaitOperation::CompletionPort {
+                    port,
+                    bytes_ptr: 0,
+                    key_ptr: KEY_PTR,
+                    overlapped_ptr: 0,
+                },
+            });
+        }
+        session
+            .runtime
+            .production_waits
+            .insert(0x7D, ProductionWait { job_id: 11 });
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let mut packet = test_packet(3, 0x5151, 0x6161);
+        packet.completion_key = 0x1_0000_0000;
+        let error = session
+            .runtime
+            .apply_production_completion(
+                WaitCompletion {
+                    job_id: 11,
+                    thread_id: 0x7D,
+                    reason: WaitWakeReason::CompletionPort,
+                    packets: vec![packet],
+                },
+                &mut session.memory,
+            )
+            .expect_err("a malformed completion key must fail the apply");
+        assert_eq!(error.code, crate::reason::ReasonCode::RcUnimplInsn);
+        assert_eq!(
+            session.runtime.production_waits.len(),
+            0,
+            "the failed apply consumed the parked wait"
+        );
+        assert_eq!(
+            session.runtime.pending_guest_threads.len(),
+            0,
+            "the failed apply must not requeue a thread with no resume result"
+        );
+        assert_eq!(
+            SCHEDULER_COUNTERS.snapshot().completion_port_wakeups,
+            before.completion_port_wakeups,
+            "a failed out-parameter write is not a packet handoff"
+        );
+    }
+
+    #[test]
+    fn production_pump_slice_shutdown_race_reports_no_work() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        session.map_guest(SLICE_JUMP_CODE, &[0xEB, 0xFE]);
+        push_guest_thread(&mut session, 0x904, 0x7E, SLICE_JUMP_CODE, SLICE_STACK_A, 0);
+        session.runtime.scheduler_mode = SchedulerMode::Production { workers: 2 };
+        session.runtime.production_scheduler = Some(fake_scheduler(2, true));
+        let outcome = session
+            .runtime
+            .try_pump_parallel_slices(&mut session.memory)
+            .expect("shutdown pump");
+        assert_eq!(
+            outcome.is_none(),
+            true,
+            "a slice round that reports nothing must fall back to the owner pump"
+        );
+        assert_eq!(
+            session.runtime.pending_guest_threads.len(),
+            1,
+            "the runnable thread must stay queued for the owner"
+        );
+    }
+
+    #[test]
+    fn production_pump_slice_duplicate_completion_race_applies_once() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        session.map_guest(SLICE_JUMP_CODE, &[0xEB, 0xFE]);
+        push_guest_thread(&mut session, 0x905, 0x7F, SLICE_JUMP_CODE, SLICE_STACK_A, 0);
+        push_guest_thread(&mut session, 0x906, 0x7F, SLICE_JUMP_CODE, SLICE_STACK_B, 0);
+        session.runtime.scheduler_mode = SchedulerMode::Production { workers: 2 };
+        let scheduler = fake_scheduler(2, false);
+        let mut applied = session.runtime.pending_guest_threads[0].state.clone();
+        applied.rip = SLICE_JUMP_CODE + 2;
+        scheduler
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .slice_completions
+            .extend([
+                slice_completion(0, 0x7F, applied.clone()),
+                slice_completion(1, 0x7F, applied),
+            ]);
+        session.runtime.production_scheduler = Some(scheduler);
+        let outcome = session
+            .runtime
+            .try_pump_parallel_slices(&mut session.memory)
+            .expect("duplicate pump");
+        assert_eq!(
+            outcome
+                .expect("duplicate reports still count as work")
+                .did_work,
+            true
+        );
+        assert_eq!(
+            session.runtime.pending_guest_threads.len(),
+            2,
+            "neither duplicate record may be lost"
+        );
+        assert_eq!(
+            session
+                .runtime
+                .pending_guest_threads
+                .iter()
+                .filter(|thread| thread.state.rip == SLICE_JUMP_CODE + 2)
+                .count(),
+            1,
+            "a duplicate completion must update exactly one thread record"
+        );
+    }
+
+    #[test]
+    fn production_pump_slice_stale_completion_race_skips_unknown_thread() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        session.map_guest(SLICE_JUMP_CODE, &[0xEB, 0xFE]);
+        push_guest_thread(&mut session, 0x907, 0x80, SLICE_JUMP_CODE, SLICE_STACK_A, 0);
+        session.runtime.scheduler_mode = SchedulerMode::Production { workers: 2 };
+        let scheduler = fake_scheduler(2, false);
+        let mut stale_state = CpuState::new(GuestArch::X86);
+        stale_state.rip = SLICE_JUMP_CODE + 0x40;
+        scheduler
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .slice_completions
+            .push_back(slice_completion(0, 0xDEAD, stale_state));
+        session.runtime.production_scheduler = Some(scheduler);
+        let outcome = session
+            .runtime
+            .try_pump_parallel_slices(&mut session.memory)
+            .expect("stale pump");
+        assert_eq!(
+            outcome
+                .expect("a stale report is still worker work")
+                .did_work,
+            true
+        );
+        assert_eq!(
+            session.runtime.pending_guest_threads.len(),
+            1,
+            "a stale completion must not consume an unrelated thread"
+        );
+        assert_eq!(
+            session.runtime.pending_guest_threads[0].thread_id, 0x80,
+            "the live thread stays parked in the queue"
+        );
+    }
+
+    #[test]
+    fn production_completion_port_late_signal_race_repolls_without_busy_wait() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create port");
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+        let signal = Arc::new(ParkSignal::new());
+        let job = WaitJob {
+            job_id: 4,
+            thread_id: 0x83,
+            signal: Arc::clone(&signal),
+            observed_generation: signal.generation(),
+            kind: WaitJobKind::CompletionPort {
+                state: port_state,
+                guest_thread_id: 0x83,
+                max_packets: 1,
+                alertable: false,
+            },
+            deadline: None,
+        };
+        let notifier = {
+            let signal = Arc::clone(&signal);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                signal.notify(WaitWakeReason::ObjectSignaled);
+            })
+        };
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let started = std::time::Instant::now();
+        let completion = run_wait_job(job);
+        notifier.join().expect("notifier");
+        assert_eq!(
+            completion.reason,
+            WaitWakeReason::ObjectSignaled,
+            "the late signal must be observed on the next slice recheck"
+        );
+        assert_eq!(
+            completion.packets.len(),
+            0,
+            "the signal wake must not fabricate a packet"
+        );
+        assert_eq!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            true,
+            "the recheck must be bounded by the port slice, not a busy poll"
+        );
+        assert_ne!(
+            SCHEDULER_COUNTERS.snapshot().port_rechecks,
+            before.port_rechecks,
+            "an empty port slice must re-enter the port condition variable"
+        );
+    }
+
+    #[test]
+    fn cooperative_pumped_slice_yield_race_requeues_exactly_once() {
+        with_big_stack(|| {
+            let _guard = test_guard();
+            let (_temp_dir, mut session) = test_session();
+            let thunk = session.alloc_thunk(HostThunk::SwitchToThread);
+            assert!(
+                thunk <= u64::from(u32::MAX),
+                "the x86 thunk address must fit 32 bits"
+            );
+            let mut code = vec![0xFF, 0x15];
+            code.extend_from_slice(&(SLICE_THUNK_SLOT as u32).to_le_bytes());
+            code.push(0xC3);
+            session.map_guest(SLICE_CODE_2, &code);
+            session.map_guest(SLICE_THUNK_SLOT, &(thunk as u32).to_le_bytes());
+            push_guest_thread(&mut session, 0x908, 0x81, SLICE_CODE_2, SLICE_STACK_A, 0);
+            push_guest_thread(&mut session, 0x909, 0x82, SLICE_CODE_2, SLICE_STACK_B, 0);
+            let before = SCHEDULER_COUNTERS.snapshot();
+            assert_eq!(pump_once(&mut session), true, "the yielding slice ran");
+            assert_eq!(
+                session.runtime.pending_guest_threads.len(),
+                2,
+                "a yielded pumped thread must be requeued exactly once"
+            );
+            assert_eq!(
+                session
+                    .runtime
+                    .pending_guest_threads
+                    .iter()
+                    .filter(|thread| thread.state_machine == GuestThreadState::Waiting)
+                    .count(),
+                1,
+                "only the yielding thread is parked in the wait queue"
+            );
+            assert_ne!(
+                SCHEDULER_COUNTERS.snapshot().guest_thread_switches,
+                before.guest_thread_switches,
+                "the yield must count as one guest-thread switch"
+            );
+        });
     }
 }
