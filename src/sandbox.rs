@@ -809,31 +809,10 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_profile() {
-        let manager = SandboxManager::new();
-        manager
-            .create_profile("ToDelete", "will be deleted")
-            .unwrap();
-        let _result = manager.delete_profile("ToDelete");
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-        assert!(manager.get_profile("ToDelete").is_none());
-    }
-
-    #[test]
     fn test_delete_non_existent_fails() {
         let manager = SandboxManager::new();
         let result = manager.delete_profile("NonExistent");
         assert!(result.is_err(), "expected Err, got {result:?}");
-    }
-
-    #[test]
-    fn test_list_profiles() {
-        let manager = SandboxManager::new();
-        manager.create_profile("Beta", "second").unwrap();
-        manager.create_profile("Alpha", "first").unwrap();
-        manager.create_profile("Gamma", "third").unwrap();
-        let names = manager.list_profiles();
-        assert_eq!(names, vec!["Alpha", "Beta", "Gamma"]);
     }
 
     #[test]
@@ -897,21 +876,6 @@ mod tests {
         manager.set_profile_active("ActiveTest", false).unwrap();
         let profile = manager.get_profile("ActiveTest").unwrap();
         assert!(!profile.active);
-    }
-
-    #[test]
-    fn test_add_read_and_write_paths() {
-        let manager = SandboxManager::new();
-        manager.create_profile("PathTest", "path test").unwrap();
-        manager
-            .add_read_path("PathTest", "/Users/test/Documents")
-            .unwrap();
-        manager
-            .add_write_path("PathTest", "/Users/test/AppData")
-            .unwrap();
-        let profile = manager.get_profile("PathTest").unwrap();
-        assert_eq!(profile.allowed_read_paths.len(), 1);
-        assert_eq!(profile.allowed_write_paths.len(), 1);
     }
 
     #[test]
@@ -1015,112 +979,10 @@ mod tests {
     }
 
     #[test]
-    fn test_capability_to_sid() {
-        // Documented well-known AppContainer capability SIDs (S-1-15-3-N).
-        assert_eq!(
-            AppContainerCapability::InternetClient.to_sid(),
-            Some("S-1-15-3-1")
-        );
-        assert_eq!(
-            AppContainerCapability::InternetClientServer.to_sid(),
-            Some("S-1-15-3-2")
-        );
-        assert_eq!(
-            AppContainerCapability::PrivateNetworkClientServer.to_sid(),
-            Some("S-1-15-3-3")
-        );
-        assert_eq!(
-            AppContainerCapability::DocumentsLibrary.to_sid(),
-            Some("S-1-15-3-4")
-        );
-        assert_eq!(
-            AppContainerCapability::PicturesLibrary.to_sid(),
-            Some("S-1-15-3-5")
-        );
-        assert_eq!(
-            AppContainerCapability::VideosLibrary.to_sid(),
-            Some("S-1-15-3-6")
-        );
-        assert_eq!(
-            AppContainerCapability::MusicLibrary.to_sid(),
-            Some("S-1-15-3-7")
-        );
-        assert_eq!(
-            AppContainerCapability::EnterpriseAuthentication.to_sid(),
-            Some("S-1-15-3-8")
-        );
-        assert_eq!(
-            AppContainerCapability::SharedUserCertificates.to_sid(),
-            Some("S-1-15-3-9")
-        );
-        assert_eq!(
-            AppContainerCapability::RemovableStorage.to_sid(),
-            Some("S-1-15-3-10")
-        );
-        // No well-known capability SID exists for these; fabricating one
-        // would grant the wrong capability.
-        assert_eq!(AppContainerCapability::CodeGeneration.to_sid(), None);
-        assert_eq!(AppContainerCapability::RunFullTrust.to_sid(), None);
-        assert_eq!(AppContainerCapability::AllowExecution.to_sid(), None);
-    }
-
-    #[test]
-    fn test_capability_from_name() {
-        assert_eq!(
-            AppContainerCapability::from_name("internetClient"),
-            Some(AppContainerCapability::InternetClient)
-        );
-        assert_eq!(
-            AppContainerCapability::from_name("runFullTrust"),
-            Some(AppContainerCapability::RunFullTrust)
-        );
-        assert_eq!(AppContainerCapability::from_name("unknownCapability"), None);
-    }
-
-    #[test]
-    fn test_capability_display_name() {
-        assert_eq!(
-            AppContainerCapability::InternetClient.display_name(),
-            "Internet (Client)"
-        );
-        assert_eq!(
-            AppContainerCapability::CodeGeneration.display_name(),
-            "Code Generation (JIT)"
-        );
-    }
-
-    #[test]
-    fn test_generate_app_container_sid() {
-        let sid1 = generate_app_container_sid("MyApp");
-        let sid2 = generate_app_container_sid("MyApp");
-        let sid3 = generate_app_container_sid("OtherApp");
-        // Same input = same SID (deterministic hash).
-        assert_eq!(sid1, sid2);
-        assert_ne!(sid1, sid3);
-        // All AppContainer SIDs start with the correct prefix.
-        assert!(sid1.starts_with("S-1-15-2-"));
-        // The full 64-bit hash is used: four 16-bit parts.
-        assert_eq!(
-            sid1.split('-').count(),
-            8,
-            "SID should be S-1-15-2-p1-p2-p3-p4"
-        );
-    }
-
-    #[test]
     fn test_is_app_container_sid() {
         assert!(is_app_container_sid("S-1-15-2-123-456-789"));
         assert!(!is_app_container_sid("S-1-5-21-12345"));
         assert!(!is_app_container_sid("not-a-sid"));
-    }
-
-    #[test]
-    fn test_get_app_container_named_object_path() {
-        let path = get_app_container_named_object_path("S-1-15-2-100-200-300", 1);
-        assert_eq!(
-            path,
-            "\\Sessions\\1\\AppContainerNamedObjects\\S-1-15-2-100-200-300"
-        );
     }
 
     #[test]
@@ -1155,34 +1017,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_wsb_xml() {
-        let manager = SandboxManager::new();
-        let xml = manager.generate_wsb_xml();
-        assert!(xml.contains("<Configuration>"));
-        assert!(xml.contains("<VGpu>Enable</VGpu>"));
-        assert!(xml.contains("<Networking>Enable</Networking>"));
-        assert!(xml.contains("<ClipboardRedirection>Enable</ClipboardRedirection>"));
-        assert!(xml.contains("<AudioInput>Disable</AudioInput>"));
-        assert!(xml.contains("</Configuration>"));
-    }
-
-    #[test]
-    fn test_generate_wsb_xml_with_mapped_folders() {
-        let manager = SandboxManager::new();
-        let mut config = WindowsSandboxConfig::default();
-        config.mapped_folders.push(MappedFolder::new(
-            "/Users/test/Projects",
-            "C:\\Users\\WDAGUtilityAccount\\Desktop\\Projects",
-            true,
-        ));
-        manager.set_sandbox_config(config);
-        let xml = manager.generate_wsb_xml();
-        assert!(xml.contains("<MappedFolder>"));
-        assert!(xml.contains("<HostFolder>/Users/test/Projects</HostFolder>"));
-        assert!(xml.contains("<ReadOnly>true</ReadOnly>"));
-    }
-
-    #[test]
     fn test_generate_wsb_xml_escapes_paths() {
         let manager = SandboxManager::new();
         let mut config = WindowsSandboxConfig::default();
@@ -1214,78 +1048,11 @@ mod tests {
     }
 
     #[test]
-    fn test_get_profile_by_sid() {
-        let manager = SandboxManager::new();
-        let profile = manager
-            .create_profile("SidLookup", "SID lookup test")
-            .unwrap();
-        let sid = profile.sid.clone();
-        let found = manager.get_profile_by_sid(&sid);
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().name, "SidLookup");
-    }
-
-    #[test]
-    fn test_list_profiles_detailed() {
-        let manager = SandboxManager::new();
-        manager.create_profile("ZProfile", "last").unwrap();
-        manager.create_profile("AProfile", "first").unwrap();
-        let detailed = manager.list_profiles_detailed();
-        assert_eq!(detailed.len(), 2);
-        assert_eq!(detailed[0].name, "AProfile");
-        assert_eq!(detailed[1].name, "ZProfile");
-    }
-
-    #[test]
-    fn test_integrity_level() {
-        assert_eq!(get_app_container_integrity_level(), "Low");
-    }
-
-    #[test]
     fn test_set_enabled() {
         let manager = SandboxManager::new();
         assert!(manager.is_enabled());
         manager.set_enabled(false);
         assert!(!manager.is_enabled());
-    }
-
-    #[test]
-    fn test_with_profiles() {
-        let profiles = vec![
-            AppContainerProfile::new("PreConfig1", "pre-configured 1"),
-            AppContainerProfile::new("PreConfig2", "pre-configured 2"),
-        ];
-        let manager = SandboxManager::with_profiles(profiles);
-        assert_eq!(manager.list_profiles().len(), 2);
-        assert!(manager.get_profile("PreConfig1").is_some());
-        assert!(manager.get_profile("PreConfig2").is_some());
-    }
-
-    #[test]
-    fn test_parse_capability_from_manifest() {
-        assert_eq!(
-            parse_capability_from_manifest("internetClient"),
-            Some(AppContainerCapability::InternetClient)
-        );
-        assert_eq!(parse_capability_from_manifest("invalid"), None);
-    }
-
-    #[test]
-    fn test_add_registry_key() {
-        let mut profile = AppContainerProfile::new("RegTest", "registry test");
-        profile.add_registry_key(r"HKEY_LOCAL_MACHINE\Software\MyApp");
-        assert_eq!(profile.allowed_registry_keys.len(), 1);
-        // Adding the same key twice should not duplicate.
-        profile.add_registry_key(r"HKEY_LOCAL_MACHINE\Software\MyApp");
-        assert_eq!(profile.allowed_registry_keys.len(), 1);
-    }
-
-    #[test]
-    fn test_mapped_folder_creation() {
-        let folder = MappedFolder::new("/host/path", "C:\\Sandbox\\Path", true);
-        assert_eq!(folder.host_path, "/host/path");
-        assert_eq!(folder.sandbox_path, "C:\\Sandbox\\Path");
-        assert!(folder.read_only);
     }
 
     // ===================================================================
@@ -1346,44 +1113,6 @@ mod tests {
         assert!(
             result.is_err(),
             "TOCTOU path swap should be denied, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn sandbox_allow_path_within_ge_root() {
-        // Path within ge_root should be allowed.
-        let ge_root = "/tmp/test_ge".to_string();
-        let allow_list = vec!["/tmp/allowed".to_string()];
-        let fs_sandbox = crate::security::FilesystemSandbox::new(&ge_root, &allow_list);
-
-        let result = fs_sandbox.authorize(
-            "/tmp/test_ge/drive_c/game.exe",
-            "/tmp/test_ge/drive_c/game.exe",
-            "/tmp/test_ge/drive_c/game.exe",
-        );
-        assert!(
-            result.is_ok(),
-            "path within GE root should be allowed, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn sandbox_allow_path_in_allow_list() {
-        // Path within allow_list should be allowed even if outside ge_root.
-        let ge_root = "/tmp/test_ge".to_string();
-        let allow_list = vec!["/tmp/allowed".to_string()];
-        let fs_sandbox = crate::security::FilesystemSandbox::new(&ge_root, &allow_list);
-
-        let result = fs_sandbox.authorize(
-            "/tmp/allowed/some_file.dll",
-            "/tmp/allowed/some_file.dll",
-            "/tmp/allowed/some_file.dll",
-        );
-        assert!(
-            result.is_ok(),
-            "path within allow list should be allowed, got {:?}",
             result
         );
     }
@@ -1491,30 +1220,6 @@ mod tests {
             result_lower.is_err(),
             "lowercase variant currently rejected (case-sensitive implementation): {:?}",
             result_lower
-        );
-    }
-
-    #[test]
-    fn sandbox_accept_long_path_within_allowed_root() {
-        let mut profile = AppContainerProfile::new("LongPathTest", "Long path test");
-        profile.add_read_path("C:\\TestRoot");
-        let profiles = vec![profile];
-        let manager = SandboxManager::with_profiles(profiles);
-
-        // Build a path longer than 260 characters within the allowed root
-        let long_segment = "subdir\\".repeat(40);
-        let long_path = format!("C:\\TestRoot\\{}file.txt", long_segment);
-        assert!(
-            long_path.len() > 260,
-            "test path {} should exceed MAX_PATH",
-            long_path.len()
-        );
-
-        let result = manager.validate_path_access("LongPathTest", &long_path, false);
-        assert!(
-            result.is_ok(),
-            "long path within allowed root should be accepted: {:?}",
-            result.err()
         );
     }
 

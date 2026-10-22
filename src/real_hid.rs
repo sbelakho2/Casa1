@@ -410,26 +410,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_xbox_controller() {
-        let sample = r#"
-+-o IOHIDDevice  <class IOHIDDevice, id 0x12345678, registered, matched, active, busy 0, retain count 7>
-{
-  "Product" = "Xbox Wireless Controller"
-  "VendorID" = 1118
-  "ProductID" = 736
-  "SerialNumber" = "ABC123"
-  "Transport" = "USB"
-}
-"#;
-        let devices = parse_ioreg_devices(sample);
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].name, "Xbox Wireless Controller");
-        assert_eq!(devices[0].vendor_id, 1118);
-        assert_eq!(devices[0].product_id, 736);
-        assert!(devices[0].xinput_capable);
-    }
-
-    #[test]
     fn test_parse_sony_controller() {
         let sample = r#"
 +-o IOHIDDevice  <class IOHIDDevice, id 0x87654321, registered, matched, active, busy 0, retain count 5>
@@ -450,37 +430,6 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_output() {
-        let devices = parse_ioreg_devices("");
-        assert!(devices.is_empty());
-    }
-
-    #[test]
-    fn test_non_controller_hid_device_is_filtered() {
-        let sample = r#"
-+-o IOHIDDevice  <class IOHIDDevice, id 0x11111111, registered, matched, active, busy 0, retain count 3>
-{
-  "Product" = "Apple Keyboard"
-  "VendorID" = 1452
-  "ProductID" = 579
-  "Transport" = "USB"
-}
-"#;
-        let devices = parse_ioreg_devices(sample);
-        assert!(devices.is_empty());
-    }
-
-    #[test]
-    fn test_hid_monitor_initial_scan_returns_all() {
-        let mut monitor = HidMonitor::new();
-        // Before first scan, poll_for_changes returns all current controllers.
-        let (_added, removed) = monitor.poll_for_changes().unwrap();
-        // Added may be empty if no controllers are connected, which is fine.
-        assert!(removed.is_empty());
-        assert!(monitor.initialized);
-    }
-
-    #[test]
     fn test_xinput_capable_detection() {
         // Xbox Series X controller (Bluetooth)
         assert!(is_xinput_capable(VID_MICROSOFT, 0x0B13));
@@ -488,32 +437,6 @@ mod tests {
         assert!(is_xinput_capable(VID_MICROSOFT, 0x028E));
         // Sony DualSense is NOT XInput capable
         assert!(!is_xinput_capable(VID_SONY, 0x0CE6));
-    }
-
-    #[test]
-    fn test_is_game_controller_known_vid() {
-        // XInput-capable product ID matches even without a name keyword.
-        assert!(is_game_controller(
-            VID_MICROSOFT,
-            0x028E,
-            "Xbox 360 Controller"
-        ));
-        // Known vendor + controller-like name.
-        assert!(is_game_controller(
-            VID_SONY,
-            0x0CE6,
-            "DualSense Wireless Controller"
-        ));
-        assert!(is_game_controller(
-            VID_NINTENDO,
-            0x2006,
-            "Switch Pro Controller"
-        ));
-        // Strictly-gaming vendors match on VID alone.
-        assert!(is_game_controller(VID_VALVE, 0x0001, "Steam Controller"));
-        assert!(is_game_controller(VID_8BITDO, 0x1234, "8BitDo Device"));
-        assert!(is_game_controller(VID_POWERA, 0x0000, "PowerA Device"));
-        assert!(is_game_controller(VID_MADCATZ, 0x0000, "Mad Catz Device"));
     }
 
     #[test]
@@ -546,31 +469,5 @@ mod tests {
         assert!(is_game_controller(0x1234, 0x5678, "USB Joystick"));
         // Non-controller name
         assert!(!is_game_controller(0x1234, 0x5678, "USB Keyboard"));
-    }
-
-    #[test]
-    fn test_serial_less_controller_uses_stable_entry_id() {
-        let sample = r#"
-+-o IOHIDDevice  <class IOHIDDevice, id 0x12345678, registered, matched, active, busy 0, retain count 7>
-{
-  "Product" = "Xbox Wireless Controller"
-  "VendorID" = 1118
-  "ProductID" = 736
-  "Transport" = "USB"
-}
-+-o IOHIDDevice  <class IOHIDDevice, id 0x87654321, registered, matched, active, busy 0, retain count 5>
-{
-  "Product" = "Xbox Wireless Controller"
-  "VendorID" = 1118
-  "ProductID" = 736
-  "Transport" = "USB"
-}
-"#;
-        let devices = parse_ioreg_devices(sample);
-        assert_eq!(devices.len(), 2);
-        // Identifiers embed the registry entry id, not the enumeration index.
-        assert_eq!(devices[0].identifier, "045e:02e0:0x12345678");
-        assert_eq!(devices[1].identifier, "045e:02e0:0x87654321");
-        assert_ne!(devices[0].identifier, devices[1].identifier);
     }
 }

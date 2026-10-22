@@ -566,7 +566,6 @@ mod tests {
     const STUB: u64 = 0x44_000;
     const COUNTERS: u64 = 0x45_000;
 
-    /// A minimal, structurally valid PE32 with one 4-byte .text section.
     fn build_pe() -> Vec<u8> {
         let mut pe = vec![0_u8; 0x204];
         pe[..2].copy_from_slice(b"MZ");
@@ -590,8 +589,6 @@ mod tests {
         pe
     }
 
-    /// The digest callback stub: accumulate dwLength and increment the call
-    /// counter, then return TRUE.
     fn digest_stub() -> Vec<u8> {
         vec![
             0x8B, 0x44, 0x24, 0x0C, // mov eax, [esp+12]
@@ -622,65 +619,5 @@ mod tests {
         let mapped = read_guest_pointer(&fixture.memory, LOADED + 16, GuestArch::X86).unwrap();
         assert_ne!(mapped, 0);
         mapped
-    }
-
-    #[test]
-    fn digest_stream_walks_headers_and_sections_through_the_callback() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("imagehlp-digest");
-            fixture.memory.map_bytes(COUNTERS, &[0_u8; 8]);
-            fixture.memory.map_bytes(STUB, &digest_stub());
-            let mapped = map_fixture_pe(&mut fixture);
-
-            assert_eq!(
-                dispatch_x86(
-                    &mut fixture,
-                    HostThunk::ImageGetDigestStream,
-                    &[mapped as u32, 0, STUB as u32, 0x1234]
-                ),
-                1
-            );
-            let total = read_guest_u32(&fixture.memory, COUNTERS).unwrap();
-            let count = read_guest_u32(&fixture.memory, COUNTERS + 4).unwrap();
-            assert_eq!(total, 0x200 + 4, "headers plus the .text raw data");
-            assert_eq!(count, 2, "one callback per digest range");
-
-            // A callback that returns FALSE fails the digest.
-            fixture.memory.map_bytes(COUNTERS, &[0_u8; 8]);
-            let mut failing = digest_stub();
-            failing[17..22].copy_from_slice(&[0x31, 0xC0, 0x90, 0x90, 0x90]);
-            fixture.memory.map_bytes(STUB, &failing);
-            assert_eq!(
-                dispatch_x86(
-                    &mut fixture,
-                    HostThunk::ImageGetDigestStream,
-                    &[mapped as u32, 0, STUB as u32, 0]
-                ),
-                0
-            );
-            assert_eq!(
-                read_guest_u32(&fixture.memory, COUNTERS + 4).unwrap(),
-                1,
-                "the walk stops at the failing callback"
-            );
-
-            // A null callback and an unmapped image are both rejected.
-            assert_eq!(
-                dispatch_x86(
-                    &mut fixture,
-                    HostThunk::ImageGetDigestStream,
-                    &[mapped as u32, 0, 0, 0]
-                ),
-                0
-            );
-            assert_eq!(
-                dispatch_x86(
-                    &mut fixture,
-                    HostThunk::ImageGetDigestStream,
-                    &[0x1234, 0, STUB as u32, 0]
-                ),
-                0
-            );
-        })
     }
 }

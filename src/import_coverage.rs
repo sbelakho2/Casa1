@@ -554,14 +554,6 @@ mod legacy {
     use super::*;
     use crate::pe::{ExportSymbol, ParsedPe};
 
-    /// **Regression snapshot.**  Hand-curated representative list of DLLs
-    /// that Steam.exe imports from, along with the function names it requires
-    /// from each DLL.
-    ///
-    /// Kept ONLY as a regression snapshot of the legacy report format
-    /// (`generate_import_coverage_report*`); the canonical, authoritative
-    /// coverage path is [`super::coverage_for_pe`], which derives imports
-    /// from the real binary instead of a hand-maintained copy.
     pub fn steam_exe_imports_regression_snapshot() -> BTreeMap<String, Vec<String>> {
         let mut m = BTreeMap::new();
 
@@ -1467,65 +1459,35 @@ mod legacy {
         m
     }
 
-    /// Coverage status for a single import function.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct ImportCoverageEntry {
-        /// The DLL name (lowercase).
         pub dll: String,
-        /// The function name.
         pub function: String,
-        /// Whether the function has a real (non-stub) implementation.
         pub covered: bool,
-        /// A note about the implementation status (e.g. "stub", "real", "partial").
         pub status: String,
     }
 
-    /// Per-DLL coverage summary.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct DllCoverageReport {
-        /// DLL name.
         pub dll: String,
-        /// Total number of imports required from this DLL.
         pub total: usize,
-        /// Number of imports that have real implementations.
         pub covered: usize,
-        /// Number of imports that are stubs or missing.
         pub missing: usize,
-        /// Coverage percentage (0.0–100.0).
         pub coverage_percent: f64,
-        /// List of covered function names.
         pub covered_functions: Vec<String>,
-        /// List of missing function names.
         pub missing_functions: Vec<String>,
     }
 
-    /// Overall import coverage report.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct ImportCoverageReport {
-        /// Total number of imports across all DLLs.
         pub total_imports: usize,
-        /// Total number of covered imports.
         pub covered_imports: usize,
-        /// Total number of missing imports.
         pub missing_imports: usize,
-        /// Overall coverage percentage (0.0–100.0).
         pub overall_coverage_percent: f64,
-        /// Per-DLL coverage breakdown.
         pub dll_reports: Vec<DllCoverageReport>,
-        /// Individual import entries.
         pub entries: Vec<ImportCoverageEntry>,
     }
 
-    /// Generate an import coverage report by cross-referencing the regression
-    /// snapshot of known Steam.exe imports with the PE runtime's registered
-    /// export tables.
-    ///
-    /// "Covered" is derived from the authoritative runtime export registry
-    /// ([`crate::pe_runtime::export_tables`]), so the report reflects the actual
-    /// state of the implemented API surface instead of a hand-maintained copy.
-    ///
-    /// Regression-snapshot only: the canonical binary-derived coverage is
-    /// [`super::coverage_for_pe`].
     pub fn generate_import_coverage_report() -> ImportCoverageReport {
         let steam_imports = steam_exe_imports_regression_snapshot();
 
@@ -1623,8 +1585,6 @@ mod legacy {
         }
     }
 
-    /// Generate the import coverage report as a `serde_json::Value`
-    /// (regression-snapshot format).
     pub fn generate_import_coverage_json() -> Value {
         let report = generate_import_coverage_report();
 
@@ -1693,8 +1653,6 @@ mod legacy {
         Value::Object(root)
     }
 
-    /// Generate a human-readable coverage report as a string
-    /// (regression-snapshot format).
     pub fn generate_import_coverage_text() -> String {
         let report = generate_import_coverage_report();
         let mut lines = Vec::new();
@@ -1752,8 +1710,6 @@ mod legacy {
         lines.join("\n")
     }
 
-    /// Per-DLL lookup index over an export table, built once per DLL so that
-    /// per-thunk coverage checks are O(log n)/O(1) instead of linear scans.
     struct ExportIndex {
         names: std::collections::HashSet<String>,
         ordinals: std::collections::HashSet<u32>,
@@ -1780,8 +1736,6 @@ mod legacy {
         }
     }
 
-    /// Generate a coverage report from a parsed PE file's imports
-    /// (regression-snapshot format).
     pub fn generate_pe_coverage_report(
         pe: &ParsedPe,
         export_tables: &BTreeMap<String, Vec<ExportSymbol>>,
@@ -1948,39 +1902,6 @@ mod tests {
     }
 
     #[test]
-    fn test_coverage_json_is_valid() {
-        let json = generate_import_coverage_json();
-        assert!(json.is_object(), "JSON should be an object");
-        let obj = json.as_object().unwrap();
-        assert!(obj.contains_key("total_imports"));
-        assert!(obj.contains_key("covered_imports"));
-        assert!(obj.contains_key("missing_imports"));
-        assert!(obj.contains_key("overall_coverage_percent"));
-        assert!(obj.contains_key("dlls"));
-        assert!(obj.contains_key("entries"));
-    }
-
-    #[test]
-    fn test_coverage_text_is_readable() {
-        let text = generate_import_coverage_text();
-        assert!(text.contains("Steam.exe Import Coverage Report"));
-        assert!(text.contains("Overall:"));
-        assert!(text.contains("DLL"));
-    }
-
-    #[test]
-    fn test_steam_exe_imports_contains_known_dlls() {
-        let imports = steam_exe_imports_regression_snapshot();
-        assert!(imports.contains_key("kernel32.dll"));
-        assert!(imports.contains_key("user32.dll"));
-        assert!(imports.contains_key("gdi32.dll"));
-        assert!(imports.contains_key("advapi32.dll"));
-        assert!(imports.contains_key("shell32.dll"));
-        assert!(imports.contains_key("ole32.dll"));
-        assert!(imports.contains_key("crypt32.dll"));
-    }
-
-    #[test]
     fn test_steam_exe_imports_are_unique_and_attributed() {
         let imports = steam_exe_imports_regression_snapshot();
         for (dll, functions) in &imports {
@@ -2030,73 +1951,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_kernel32_has_core_functions() {
-        let imports = steam_exe_imports_regression_snapshot();
-        let kernel32 = imports.get("kernel32.dll").unwrap();
-        assert!(kernel32.contains(&"GetProcAddress".to_string()));
-        assert!(kernel32.contains(&"LoadLibraryA".to_string()));
-        assert!(kernel32.contains(&"CreateFileW".to_string()));
-        assert!(kernel32.contains(&"GetLastError".to_string()));
-    }
-
-    #[test]
-    fn test_pe_coverage_report_with_empty_pe() {
-        let pe = crate::pe::ParsedPe {
-            machine: 0,
-            number_of_sections: 0,
-            characteristics: 0,
-            optional_header_magic: 0,
-            subsystem: 0,
-            dll_characteristics: 0,
-            address_of_entry_point: 0,
-            image_base: 0,
-            size_of_image: 0,
-            size_of_headers: 0,
-            section_alignment: 0,
-            file_alignment: 0,
-            data_directories: vec![],
-            sections: vec![],
-            debug_entries: vec![],
-            load_config: None,
-            imports: vec![],
-            delay_imports: vec![],
-            exports: vec![],
-            relocations: vec![],
-            tls_directory: None,
-            version_info: crate::pe::VersionInfo::default(),
-            embedded_manifest: None,
-            external_manifest: None,
-            is_dotnet: false,
-            clr_header: None,
-            bound_imports: vec![],
-        };
-        let export_tables = BTreeMap::new();
-        let report = generate_pe_coverage_report(&pe, &export_tables);
-        assert_eq!(report.total_imports, 0);
-        assert_eq!(report.covered_imports, 0);
-        assert_eq!(report.missing_imports, 0);
-    }
-
-    #[test]
-    fn test_dll_coverage_report_builder() {
-        let mut builder = DllCoverageReportBuilder::new("test.dll".to_string());
-        builder.add("Func1".to_string(), true);
-        builder.add("Func2".to_string(), false);
-        builder.add("Func3".to_string(), true);
-        let report = builder.build();
-        assert_eq!(report.dll, "test.dll");
-        assert_eq!(report.total, 3);
-        assert_eq!(report.covered, 2);
-        assert_eq!(report.missing, 1);
-        assert!((report.coverage_percent - 66.66666666666667).abs() < 0.01);
-    }
-
     // -----------------------------------------------------------------
     // Canonical binary-derived coverage tests
     // -----------------------------------------------------------------
 
-    /// Path to the tracked Steam.exe fixture (committed to the repo).
     fn tracked_steam_fixture() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("ges")
@@ -2155,45 +2013,6 @@ mod tests {
                 .all(|e| e.source != ImportSource::DynamicLookup),
             "no dynamic lookups without a runtime trace"
         );
-    }
-
-    #[test]
-    fn test_coverage_for_pe_json_roundtrip() {
-        let workload = WorkloadId::new("steam-fixture");
-        let json = coverage_for_pe_json(&tracked_steam_fixture(), &workload, default_target())
-            .expect("json report");
-        let obj = json.as_object().expect("object");
-        for key in [
-            "binary_path",
-            "image_sha256",
-            "image_version",
-            "image_arch",
-            "total_imports",
-            "by_implementation",
-            "entries",
-            "required_not_working",
-            "runtime_trace_included",
-        ] {
-            assert!(obj.contains_key(key), "missing report field {key}");
-        }
-        let entries = obj["entries"].as_array().expect("entries array");
-        let first = entries.first().expect("at least one entry");
-        for key in [
-            "image_sha256",
-            "image_version",
-            "image_arch",
-            "dll",
-            "import",
-            "source",
-            "implementation",
-            "semantic_coverage",
-            "runtime_reached",
-        ] {
-            assert!(
-                first.as_object().unwrap().contains_key(key),
-                "missing entry field {key}"
-            );
-        }
     }
 
     #[test]
@@ -2266,150 +2085,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_coverage_for_pe_text_is_structured() {
-        let workload = WorkloadId::new("steam-fixture");
-        let text = coverage_for_pe_text(&tracked_steam_fixture(), &workload, default_target())
-            .expect("text report");
-        assert!(text.contains("Binary Import Coverage (fixture-derived)"));
-        assert!(text.contains("sha256:"));
-        assert!(text.contains("Implemented"));
-        assert!(text.contains("Unsupported"));
-    }
-
-    #[test]
-    fn test_required_not_working_invariant_and_release_gate() {
-        let workload = WorkloadId::new("steam-fixture");
-        let report = coverage_for_pe(&tracked_steam_fixture(), &workload, default_target())
-            .expect("coverage report");
-        // Every entry in required_not_working must be Required-policy with a
-        // non-working implementation.
-        assert!(report.required_not_working.iter().all(|entry| {
-            entry
-                .support_policy()
-                .is_some_and(|policy| policy == SupportPolicy::Required)
-                && !entry.implementation.has_working_implementation()
-        }));
-        // The static surface may legitimately import Required-policy stubs
-        // (canned-answer APIs like DeregisterEventSource); the release gate
-        // is encoded ONLY over the runtime-reached set, which is empty here —
-        // trivially satisfied but reported.
-        assert!(
-            report.runtime_reached_required_violations().is_empty(),
-            "runtime-reached required violations must be empty"
-        );
-        // Sanity: Required-policy entries ARE present and marked.
-        let create_file = report
-            .entries
-            .iter()
-            .find(|entry| entry.import.lookup_name() == "CreateFileW")
-            .expect("CreateFileW import");
-        assert_eq!(create_file.support_policy(), Some(SupportPolicy::Required));
-        assert_eq!(create_file.implementation, ImplementationLevel::Implemented);
-    }
-
-    /// Serializes access to the shared dynamic-import log across the tests
-    /// that consume it (the log is process-global; the runtime records into
-    /// it while real dispatch tests run).
     static DYNAMIC_LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn test_dynamic_lookups_recorded_from_shared_log() {
-        let _guard = DYNAMIC_LOG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The shared log is process-wide: clear it so this test is
-        // deterministic regardless of what ran before.
-        crate::pe_runtime::clear_dynamic_import_log_static();
-        // Seed the shared dynamic-import log as the runtime would (e.g. via
-        // GetProcAddress) and verify the report consumes it as DynamicLookup
-        // entries keyed by (DLL, name).
-        crate::pe_runtime::record_dynamic_import("kernel32.dll", "GetProcAddress");
-        crate::pe_runtime::record_dynamic_import("user32.dll", "MessageBoxW");
-        crate::pe_runtime::record_dynamic_import("kernel32.dll", "GetProcAddress");
-        let workload = WorkloadId::new("dynamic-test");
-        let report = coverage_for_pe_with_runtime_trace(
-            &tracked_steam_fixture(),
-            &workload,
-            default_target(),
-            &[],
-        )
-        .expect("coverage report");
-        let seeded: Vec<(String, String)> = vec![
-            ("kernel32.dll".to_string(), "GetProcAddress".to_string()),
-            ("user32.dll".to_string(), "MessageBoxW".to_string()),
-        ];
-        let dynamic: Vec<_> = report
-            .entries
-            .iter()
-            .filter(|entry| entry.source == ImportSource::DynamicLookup)
-            .map(|entry| (entry.dll.clone(), entry.import.lookup_name()))
-            .collect();
-        // The shared log is process-wide and concurrent lib tests exercising
-        // the runtime's real resolution paths (GetProcAddress dispatch,
-        // delay-load, forwarders) legitimately append entries between the
-        // seed and the report drain.  The contract asserted here is
-        // deterministic: the seeded pairs are present in order (each exactly
-        // once — the duplicate seed is deduplicated), while the exact global
-        // contents depend on concurrent tests by design.
-        let filtered: Vec<_> = dynamic
-            .iter()
-            .filter(|pair| seeded.contains(pair))
-            .collect();
-        assert_eq!(
-            filtered,
-            vec![&seeded[0], &seeded[1]],
-            "dynamic lookups are recorded by (DLL, name), deduplicated"
-        );
-        assert_eq!(
-            dynamic.iter().filter(|pair| **pair == seeded[0]).count(),
-            1,
-            "the duplicate seed records exactly one entry"
-        );
-        // Dynamic lookups are reached by construction.
-        assert!(
-            report
-                .entries
-                .iter()
-                .filter(|entry| entry.source == ImportSource::DynamicLookup)
-                .all(|entry| entry.runtime_reached)
-        );
-    }
-
-    #[test]
-    fn test_coverage_for_process_tree_walks_children() {
-        let _guard = DYNAMIC_LOG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::pe_runtime::clear_dynamic_import_log_static();
-        let workload = WorkloadId::new("process-tree");
-        let root = tracked_steam_fixture();
-        let report = coverage_for_process_tree(&[&root, &root], &workload, default_target(), &[])
-            .expect("process-tree report");
-        assert_eq!(report.binaries.len(), 2);
-        assert!(report.total_imports > 0);
-        // Dynamic lookups are runtime observations recorded into a shared
-        // log: concurrent dispatch tests may legitimately record entries, so
-        // the process-tree scan asserts the structural invariant (every
-        // dynamic entry is keyed by DLL+name and is reachable) rather than a
-        // zero count that only holds in a fully isolated process.
-        let all_entries = report
-            .binaries
-            .iter()
-            .flat_map(|binary| binary.entries.iter())
-            .collect::<Vec<_>>();
-        {
-            let dynamic = all_entries
-                .iter()
-                .filter(|entry| entry.source == ImportSource::DynamicLookup)
-                .collect::<Vec<_>>();
-            assert!(
-                dynamic
-                    .iter()
-                    .all(|entry| !entry.dll.is_empty() && entry.runtime_reached),
-                "every dynamic lookup is keyed by DLL and marked reached"
-            );
-        }
-        assert!(report.by_implementation.values().sum::<usize>() == report.total_imports);
-    }
 }

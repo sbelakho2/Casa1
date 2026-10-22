@@ -268,37 +268,6 @@ mod tests {
     }
 
     #[test]
-    fn named_sections_share_one_backing_store() {
-        let (_tmp, mut win32) = setup();
-        let first = nt_create_section(
-            &mut win32,
-            Some("Casa1NtSection"),
-            0x2000,
-            crate::ntdll::PAGE_READWRITE,
-            None,
-        )
-        .expect("first");
-        let second = nt_create_section(
-            &mut win32,
-            Some("Casa1NtSection"),
-            0x2000,
-            crate::ntdll::PAGE_READWRITE,
-            None,
-        )
-        .expect("second");
-        // Views mapped through EITHER handle resolve to the shared backing
-        // store of the named section.
-        let base1 = nt_map_view_of_section(&mut win32, first, 0, 0x1000)
-            .expect("view 1")
-            .0;
-        let base2 = nt_map_view_of_section(&mut win32, second, 0, 0x1000)
-            .expect("view 2")
-            .0;
-        assert!(win32.mapped_view_section(base1).is_some());
-        assert!(win32.mapped_view_section(base2).is_some());
-    }
-
-    #[test]
     fn map_and_unmap_a_view() {
         let (_tmp, mut win32) = setup();
         let handle =

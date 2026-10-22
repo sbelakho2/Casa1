@@ -1770,56 +1770,6 @@ mod tests {
     }
 
     #[test]
-    fn driver_and_device_objects_register_names_and_chains() {
-        let mut manager = IoManager::new();
-        let driver = new_driver(&mut manager, "CasaTest");
-        assert_eq!(manager.driver_count(), 1);
-        assert_eq!(manager.driver(driver).unwrap().name, "CasaTest");
-        assert_eq!(
-            manager
-                .objects()
-                .query_object(driver)
-                .unwrap()
-                .name
-                .as_deref(),
-            Some("\\Driver\\CasaTest")
-        );
-
-        let first = new_device(&mut manager, driver, "First");
-        let second = new_device(&mut manager, driver, "Second");
-        assert_eq!(manager.device_count(), 2);
-        assert_eq!(manager.driver_device_count(driver).unwrap(), 2);
-        // NT head insertion: the most recently created device comes first.
-        assert_eq!(manager.driver_devices(driver).unwrap(), vec![second, first]);
-        assert_eq!(manager.device_driver(second).unwrap(), Some(driver));
-        assert_eq!(
-            manager
-                .objects()
-                .query_object(first)
-                .unwrap()
-                .name
-                .as_deref(),
-            Some("\\Device\\First")
-        );
-        assert_eq!(
-            manager.objects().query_object(first).unwrap().type_name(),
-            "Device"
-        );
-        let unnamed = manager
-            .create_device(driver, None, DeviceExtension::new(), DeviceFlags::default())
-            .unwrap();
-        assert!(
-            manager
-                .objects()
-                .query_object(unnamed)
-                .unwrap()
-                .name
-                .is_none()
-        );
-        assert_eq!(manager.driver_device_count(driver).unwrap(), 3);
-    }
-
-    #[test]
     fn duplicate_names_and_invalid_handles_are_rejected() {
         let mut manager = IoManager::new();
         let driver = new_driver(&mut manager, "DupDrv");

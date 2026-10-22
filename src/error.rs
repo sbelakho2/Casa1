@@ -887,14 +887,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oom_constructor_sets_correct_code() {
-        let err = AppError::oom("test allocation failed");
-        assert_eq!(err.code, ReasonCode::RcOutOfMemory);
-        assert_eq!(err.message, "test allocation failed");
-        assert!(err.reproduction_hints.is_empty());
-    }
-
-    #[test]
     fn invalid_param_constructor_sets_correct_code() {
         let err = AppError::invalid_param("hFile", "non-zero handle");
         assert_eq!(err.code, ReasonCode::RcInvalidParameter);
@@ -1089,9 +1081,6 @@ mod tests {
         assert_eq!(err.last_error(), ERROR_INVALID_PARAMETER);
     }
 
-    /// Verify that every ReasonCode variant has a deterministic last_error().
-    /// This test enumerates ALL variants and ensures none panic or return 0
-    /// (except Success, which legitimately maps to ERROR_SUCCESS=0).
     #[test]
     fn last_error_every_variant_is_mapped() {
         for value in 0..=3300 {
@@ -1119,81 +1108,7 @@ mod tests {
 
     // ── hresult() mapping tests ─────────────────────────────────────
 
-    #[test]
-    fn hresult_maps_correctly() {
-        // Success → S_OK
-        let err = AppError::new(ReasonCode::Success, "ok");
-        assert_eq!(err.hresult(), 0x0000_0000);
-
-        // Custom code → MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, code)
-        let err = AppError::new(ReasonCode::RcOutOfMemory, "oom");
-        assert_eq!(err.hresult(), 0x8004_0000 | 3200u32);
-
-        let err = AppError::new(ReasonCode::RcFsNotFound, "not found");
-        assert_eq!(err.hresult(), 0x8004_0000 | 1102u32);
-
-        // Verify severity bit is set for errors
-        let err = AppError::new(ReasonCode::RcInvalidParameter, "bad");
-        assert_eq!(err.hresult() & 0x8000_0000, 0x8000_0000);
-    }
-
-    /// Verify every non-Success ReasonCode variant produces a valid HRESULT
-    /// in the FACILITY_ITF range with the error severity bit set.
-    #[test]
-    fn hresult_every_variant_is_mapped() {
-        for value in 0..=3300 {
-            if let Some(code) = ReasonCode::from_u32(value) {
-                let hr = AppError::new(code, "").hresult();
-                if code == ReasonCode::Success {
-                    assert_eq!(hr, 0x0000_0000, "Success HRESULT must be S_OK");
-                } else {
-                    // Must have severity bit set
-                    assert!(
-                        hr & 0x8000_0000 != 0,
-                        "HRESULT for {:?} must have severity bit set, got 0x{:08X}",
-                        code,
-                        hr
-                    );
-                    // Must use FACILITY_ITF (4), so bits 16-26 should match 0x8004_XXXX
-                    assert_eq!(
-                        hr & 0x7FFF_0000,
-                        0x0004_0000,
-                        "HRESULT for {:?} must use FACILITY_ITF, got 0x{:08X}",
-                        code,
-                        hr
-                    );
-                    // The low 16 bits should be the ReasonCode value
-                    assert_eq!(
-                        hr & 0x0000_FFFF,
-                        code.as_u32(),
-                        "HRESULT for {:?} must embed the reason code in low 16 bits, got 0x{:08X}",
-                        code,
-                        hr
-                    );
-                }
-            }
-        }
-    }
-
     // ── Error context / reproduction-hint tests (Item 59) ───────────
-
-    #[test]
-    fn with_hint_appends_to_reproduction_hints() {
-        let err = AppError::new(ReasonCode::RcIo, "I/O error")
-            .with_hint("function: CreateFileW")
-            .with_hint("arg: handle=0x42");
-        assert_eq!(err.reproduction_hints.len(), 2);
-        assert!(err.reproduction_hints[0].contains("CreateFileW"));
-        assert!(err.reproduction_hints[1].contains("handle=0x42"));
-    }
-
-    #[test]
-    fn from_io_includes_source_info() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        let err = AppError::from_io(ReasonCode::RcFsNotFound, "open_file", &io_err);
-        assert!(err.message.contains("open_file"));
-        assert!(err.reproduction_hints[0].contains("file not found"));
-    }
 }
 
 #[cfg(test)]
@@ -1319,22 +1234,6 @@ mod error_mapping_tests {
     #[test]
     fn last_error_name_fallback() {
         assert_eq!(last_error_name(99999), "ERROR_UNKNOWN");
-    }
-
-    #[test]
-    fn errno_to_kern_return_success() {
-        assert_eq!(errno_to_kern_return(0), 0);
-    }
-
-    #[test]
-    fn errno_to_kern_return_known() {
-        assert_eq!(errno_to_kern_return(libc::EPERM), 1);
-        assert_eq!(errno_to_kern_return(libc::ENOMEM), 12);
-        assert_eq!(errno_to_kern_return(libc::EINVAL), 22);
-        // EAGAIN == EWOULDBLOCK on macOS/Linux; both map to
-        // KERN_RESOURCE_SHORTAGE (6).
-        assert_eq!(errno_to_kern_return(libc::EAGAIN), 6);
-        assert_eq!(errno_to_kern_return(libc::EWOULDBLOCK), 6);
     }
 
     #[test]

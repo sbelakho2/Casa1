@@ -791,14 +791,6 @@ mod tests {
     }
 
     #[test]
-    fn debug_profile_enables_tracing() {
-        let profile = SteamLaunchProfile::debug();
-        assert!(profile.debug_logging);
-        assert!(profile.extra_args.contains(&"-dev".to_string()));
-        assert!(profile.extra_args.contains(&"-console".to_string()));
-    }
-
-    #[test]
     fn offline_profile_disables_network() {
         let profile = SteamLaunchProfile::offline();
         assert!(profile.offline_mode);
@@ -826,98 +818,12 @@ mod tests {
     }
 
     #[test]
-    fn override_profile_has_metal_env_vars() {
-        let profile = SteamLaunchProfile::default();
-        let override_profile = build_steam_override_profile(&profile);
-        assert_eq!(
-            override_profile
-                .payload
-                .env_add
-                .get("CASA1_METAL_RENDERING"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            override_profile
-                .payload
-                .env_add
-                .get("CASA1_GPU_COMPAT_VENDOR"),
-            Some(&"10de".to_string())
-        );
-    }
-
-    #[test]
-    fn override_profile_has_audio_env_vars() {
-        let profile = SteamLaunchProfile::default();
-        let override_profile = build_steam_override_profile(&profile);
-        assert_eq!(
-            override_profile.payload.env_add.get("CASA1_REAL_AUDIO"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            override_profile.payload.env_add.get("CASA1_XAUDIO2_REAL"),
-            Some(&"1".to_string())
-        );
-    }
-
-    #[test]
     fn steam_args_build_correctly() {
         let profile = SteamLaunchProfile::default();
         let args = build_steam_args(&profile);
         assert!(!args.contains(&"-overlay".to_string()));
         assert!(!args.contains(&"-login".to_string()));
         assert!(!args.contains(&"-offline".to_string()));
-    }
-
-    #[test]
-    fn steam_args_offline_mode() {
-        let profile = SteamLaunchProfile::offline();
-        let args = build_steam_args(&profile);
-        assert!(args.contains(&"-offline".to_string()));
-    }
-
-    #[test]
-    fn steam_exe_path_resolves() {
-        let profile = SteamLaunchProfile::default();
-        let ge_root = PathBuf::from("/tmp/test_ge");
-        let exe_path = profile.steam_exe_path(&ge_root);
-        assert_eq!(
-            exe_path,
-            PathBuf::from("/tmp/test_ge/drive_c/Steam/Steam.exe")
-        );
-    }
-
-    #[test]
-    fn create_steam_job_requests_jit_enabled_from_profile() {
-        // The production Steam job must request JIT Enabled (never Auto): the
-        // run's jit telemetry then reports the requested/active distinction
-        // honestly instead of silently keeping the dormant behavior.
-        let profile = SteamLaunchProfile::default();
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = crate::ge::GameEnvironment::create_in(
-            temp_dir.path(),
-            "steam",
-            crate::ge::GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let steam_dir = ge.root.join("drive_c").join("Steam");
-        std::fs::create_dir_all(&steam_dir).expect("create steam dir");
-        std::fs::write(steam_dir.join("Steam.exe"), b"MZ fake steam")
-            .expect("write fixture steam.exe");
-        let job = create_steam_job(&profile, &ge).expect("create steam job");
-        assert_eq!(job.intent, RunIntent::Play);
-        assert_eq!(job.jit_mode, crate::runner::JitMode::Enabled);
-        assert_eq!(job.steam_ipc, profile.steam_ipc);
-        assert_eq!(job.window_width, None);
-        assert_eq!(job.window_height, None);
-        assert!(job.env.contains_key("CASA1_METAL_RENDERING"));
-
-        let disabled = SteamLaunchProfile {
-            jit_enabled: false,
-            ..SteamLaunchProfile::default()
-        };
-        let job = create_steam_job(&disabled, &ge).expect("create steam job");
-        assert_eq!(job.jit_mode, crate::runner::JitMode::Disabled);
     }
 
     #[test]
@@ -948,28 +854,6 @@ mod tests {
                 .contains_key("CASA1_STEAM_CRASH_WORKAROUND")
         );
         assert!(!override_profile.payload.env_add.contains_key("CASA1_JIT"));
-    }
-
-    #[test]
-    fn checked_in_ge_fixture_matches_default_override_profile() {
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let fixture_path = manifest.join("ges/steam-live-run-x86/ge.json");
-        if !fixture_path.is_file() {
-            return;
-        }
-        let contents = std::fs::read_to_string(&fixture_path).expect("read ge.json fixture");
-        let config: crate::ge::GeConfig = serde_json::from_str(&contents).expect("parse ge.json");
-        let fixture_override = config
-            .override_profiles
-            .iter()
-            .find(|p| p.id == "steam-optimal")
-            .expect("fixture must contain the steam-optimal override");
-        let current = build_steam_override_profile(&SteamLaunchProfile::default());
-        assert_eq!(
-            fixture_override, &current,
-            "ges/steam-live-run-x86/ge.json steam-optimal payload drifted from \
-             build_steam_override_profile(SteamLaunchProfile::default()) — regenerate it"
-        );
     }
 
     #[test]

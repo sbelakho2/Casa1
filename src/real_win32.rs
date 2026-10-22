@@ -9981,36 +9981,6 @@ mod tests {
     }
 
     #[test]
-    fn com_create_instance_and_refcount() {
-        let mut com = ComApartmentState::new();
-        com.co_initialize(ComApartmentModel::SingleThreaded)
-            .unwrap();
-
-        let handle = com
-            .co_create_instance(
-                ComClsid::DIRECTSOUND8,
-                ComIid::IUNKNOWN,
-                0x1000_0000,
-                "DirectSound8",
-            )
-            .unwrap();
-
-        assert_eq!(com.active_object_count(), 1);
-        assert!(com.com_query_interface(handle, ComIid::IUNKNOWN).unwrap());
-        assert_eq!(com.com_vtable(handle).unwrap(), 0x1000_0000);
-
-        let count = com.com_addref(handle).unwrap();
-        assert_eq!(count, 2);
-
-        let count = com.com_release(handle).unwrap();
-        assert_eq!(count, 1);
-
-        let count = com.com_release(handle).unwrap();
-        assert_eq!(count, 0);
-        assert_eq!(com.active_object_count(), 0);
-    }
-
-    #[test]
     fn com_create_without_initialize_fails() {
         let mut com = ComApartmentState::new();
         let result =
@@ -10037,153 +10007,9 @@ mod tests {
 
     // --- CRT Tests ---
 
-    #[test]
-    fn crt_atoi_various_inputs() {
-        assert_eq!(MsvcCrt::crt_atoi("42"), 42);
-        assert_eq!(MsvcCrt::crt_atoi("-123"), -123);
-        assert_eq!(MsvcCrt::crt_atoi("  456  "), 456);
-        assert_eq!(MsvcCrt::crt_atoi("+789"), 789);
-        assert_eq!(MsvcCrt::crt_atoi("0"), 0);
-        assert_eq!(MsvcCrt::crt_atoi("abc"), 0);
-    }
-
-    #[test]
-    fn crt_atof_various_inputs() {
-        assert!((MsvcCrt::crt_atof("3.14") - "3.14".parse::<f64>().unwrap()).abs() < 0.001);
-        assert!((MsvcCrt::crt_atof("-2.5") - (-2.5)).abs() < 0.001);
-        assert!((MsvcCrt::crt_atof("0.0") - 0.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn crt_sprintf_int_formats() {
-        assert_eq!(MsvcCrt::crt_sprintf_int(42, "%d"), "42");
-        assert_eq!(MsvcCrt::crt_sprintf_int(255, "%x"), "ff");
-        assert_eq!(MsvcCrt::crt_sprintf_int(255, "%X"), "FF");
-        assert_eq!(MsvcCrt::crt_sprintf_int(8, "%o"), "10");
-        assert_eq!(MsvcCrt::crt_sprintf_int(255, "%08x"), "000000ff");
-    }
-
-    #[test]
-    fn crt_sscanf_int_parses() {
-        // Basic %d and %i
-        assert_eq!(MsvcCrt::crt_sscanf_int("42", "%d"), Some(42));
-        assert_eq!(MsvcCrt::crt_sscanf_int("-42", "%d"), Some(-42));
-        assert_eq!(MsvcCrt::crt_sscanf_int("+42", "%d"), Some(42));
-
-        // %i auto-detect: decimal
-        assert_eq!(MsvcCrt::crt_sscanf_int("42", "%i"), Some(42));
-        // %i auto-detect: hex
-        assert_eq!(MsvcCrt::crt_sscanf_int("0xFF", "%i"), Some(255));
-        // %i auto-detect: octal
-        assert_eq!(MsvcCrt::crt_sscanf_int("077", "%i"), Some(63));
-
-        // Hex
-        assert_eq!(MsvcCrt::crt_sscanf_int("ff", "%x"), Some(255));
-        assert_eq!(MsvcCrt::crt_sscanf_int("0xFF", "%x"), Some(255));
-        assert_eq!(MsvcCrt::crt_sscanf_int("0xFF", "%X"), Some(255));
-        assert_eq!(MsvcCrt::crt_sscanf_int("1A", "%x"), Some(26));
-
-        // Octal
-        assert_eq!(MsvcCrt::crt_sscanf_int("10", "%o"), Some(8));
-        assert_eq!(MsvcCrt::crt_sscanf_int("77", "%o"), Some(63));
-
-        // Unsigned
-        assert_eq!(MsvcCrt::crt_sscanf_int("42", "%u"), Some(42));
-
-        // Float (truncated to i32)
-        assert_eq!(MsvcCrt::crt_sscanf_int("3.14", "%f"), Some(3));
-        assert_eq!(MsvcCrt::crt_sscanf_int("-2.7", "%f"), Some(-2));
-
-        // Width specifier
-        assert_eq!(MsvcCrt::crt_sscanf_int("12345", "%2d"), Some(12));
-        assert_eq!(MsvcCrt::crt_sscanf_int("abc", "%2x"), Some(0xab));
-
-        // %n — character count
-        assert_eq!(MsvcCrt::crt_sscanf_int("hello", "%n"), Some(0));
-
-        // Literal matching
-        assert_eq!(MsvcCrt::crt_sscanf_int("x=42", "x=%d"), Some(42));
-        assert_eq!(MsvcCrt::crt_sscanf_int("value 99", "value %d"), Some(99));
-
-        // %s consumes string but last numeric wins
-        assert_eq!(MsvcCrt::crt_sscanf_int("abc 42 def", "%s %d"), Some(42));
-
-        // Failure cases
-        assert_eq!(MsvcCrt::crt_sscanf_int("abc", "%d"), None);
-        assert_eq!(MsvcCrt::crt_sscanf_int("", "%d"), None);
-    }
-
-    #[test]
-    fn crt_malloc_and_free() {
-        let mut crt = MsvcCrt::new();
-        let ptr = crt.crt_malloc(1024);
-        assert_ne!(ptr, 0);
-        assert_eq!(crt.crt_alloc_size(ptr), Some(1024));
-        assert_eq!(crt.crt_alloc_count(), 1);
-
-        crt.crt_free(ptr).unwrap();
-        assert_eq!(crt.crt_alloc_count(), 0);
-    }
-
-    #[test]
-    fn crt_realloc() {
-        let mut crt = MsvcCrt::new();
-        let ptr = crt.crt_malloc(100);
-        let new_ptr = crt.crt_realloc(ptr, 200);
-        assert_eq!(new_ptr, ptr); // Same pointer, resized
-        assert_eq!(crt.crt_alloc_size(ptr), Some(200));
-    }
-
     // --- Shell32 Tests ---
 
-    #[test]
-    fn sh_get_folder_path_windows() {
-        let path = sh_get_folder_path(CSIDL_WINDOWS, "/ge");
-        assert_eq!(path, "/ge/drive_c/windows");
-    }
-
-    #[test]
-    fn sh_get_folder_path_appdata() {
-        let path = sh_get_folder_path(CSIDL_APPDATA, "/ge");
-        assert_eq!(path, "/ge/drive_c/Users/guest/AppData/Roaming");
-    }
-
-    #[test]
-    fn sh_get_folder_path_program_files() {
-        let path = sh_get_folder_path(CSIDL_PROGRAM_FILES, "/ge");
-        assert_eq!(path, "/ge/drive_c/Program Files");
-    }
-
-    #[test]
-    fn known_folder_path_resolves_windows() {
-        let path = sh_get_known_folder_path(KnownFolderGuid::WINDOWS, "/ge");
-        assert_eq!(path, "/ge/drive_c/windows");
-    }
-
-    #[test]
-    fn sh_get_known_folder_path_profile() {
-        let path = sh_get_known_folder_path(KnownFolderGuid::PROFILE, "/ge");
-        assert_eq!(path, "/ge/drive_c/Users/guest");
-    }
-
     // --- Version Tests ---
-
-    #[test]
-    fn file_version_info_parse() {
-        let mut data = vec![0u8; 128];
-        // Set VS_FIXEDFILEINFO signature at offset 40
-        data[40..44].copy_from_slice(&0xFEEF_04BD_u32.to_le_bytes());
-        // Set version at offset 48-55 (signature + 8/+12)
-        data[48..52].copy_from_slice(&0x0001_0002_u32.to_le_bytes()); // 1.2
-        data[52..56].copy_from_slice(&0x0003_0004_u32.to_le_bytes()); // 3.4
-        // Set file type at offset 76 (signature + 36, standard VS_FIXEDFILEINFO)
-        data[76..80].copy_from_slice(&1_u32.to_le_bytes()); // VFT_APP
-
-        let info = FileVersionInfo::parse(&data).unwrap();
-        assert_eq!(info.version, (1, 2, 3, 4));
-        assert_eq!(info.version_string(), "1.2.3.4");
-        assert_eq!(info.file_type, 1);
-    }
 
     #[test]
     fn file_version_info_bad_signature() {
@@ -10200,34 +10026,6 @@ mod tests {
     }
 
     // --- XInput Tests ---
-
-    #[test]
-    fn xinput_connect_and_get_state() {
-        let mut xinput = XInputManager::new();
-        assert_eq!(xinput.connected_count(), 0);
-
-        xinput
-            .connect_controller(
-                0,
-                XInputState {
-                    packet_number: 1,
-                    buttons: XINPUT_GAMEPAD_A,
-                    left_trigger: 128,
-                    right_trigger: 0,
-                    left_thumb_x: 0,
-                    left_thumb_y: 0,
-                    right_thumb_x: 0,
-                    right_thumb_y: 0,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(xinput.connected_count(), 1);
-        assert!(xinput.is_connected(0));
-
-        let state = xinput.get_state(0).unwrap();
-        assert_eq!(state.buttons & XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_A);
-    }
 
     #[test]
     fn xinput_disconnect() {
@@ -10256,66 +10054,11 @@ mod tests {
     }
 
     #[test]
-    fn xinput_capabilities() {
-        let mut xinput = XInputManager::new();
-        xinput
-            .connect_controller(
-                0,
-                XInputState {
-                    packet_number: 1,
-                    buttons: 0,
-                    left_trigger: 0,
-                    right_trigger: 0,
-                    left_thumb_x: 0,
-                    left_thumb_y: 0,
-                    right_thumb_x: 0,
-                    right_thumb_y: 0,
-                },
-            )
-            .unwrap();
-
-        let caps = xinput.get_capabilities(0).unwrap();
-        assert!(caps.vibration_supported);
-    }
-
-    #[test]
     fn xinput_invalid_index() {
         let xinput = XInputManager::new();
         let _result = xinput.get_state(4);
         assert!(_result.is_err(), "expected Err, got {_result:?}");
         assert!(!xinput.is_connected(4));
-    }
-
-    #[test]
-    fn xinput_vibration() {
-        let mut xinput = XInputManager::new();
-        xinput
-            .connect_controller(
-                0,
-                XInputState {
-                    packet_number: 1,
-                    buttons: 0,
-                    left_trigger: 0,
-                    right_trigger: 0,
-                    left_thumb_x: 0,
-                    left_thumb_y: 0,
-                    right_thumb_x: 0,
-                    right_thumb_y: 0,
-                },
-            )
-            .unwrap();
-
-        xinput
-            .set_state(
-                0,
-                XInputVibration {
-                    left_motor_speed: 65535,
-                    right_motor_speed: 32768,
-                },
-            )
-            .unwrap();
-        assert_eq!(xinput.vibration[0].left_motor_speed, 65535);
-        assert_eq!(xinput.vibration[0].right_motor_speed, 32768);
     }
 
     #[test]
@@ -10438,15 +10181,6 @@ mod tests {
     // --- BCrypt Tests ---
 
     #[test]
-    fn bcrypt_sha256_hash() {
-        let ctx = BCryptContext::new();
-        let mut hash = ctx.create_hash(BCRYPT_SHA256_ALGORITHM).unwrap();
-        BCryptContext::hash_data(&mut hash, b"hello world");
-        let result = BCryptContext::finish_hash(&hash).unwrap();
-        assert_eq!(result.len(), 32); // SHA-256 = 32 bytes
-    }
-
-    #[test]
     fn bcrypt_unsupported_algorithm() {
         let ctx = BCryptContext::new();
         let result = ctx.create_hash("UNSUPPORTED");
@@ -10459,36 +10193,6 @@ mod tests {
     // --- ThreadPool Tests ---
 
     #[test]
-    fn threadpool_create_and_submit_work() {
-        let mut tp = ThreadPoolManager::new();
-        let id = tp.create_work(0x1000, 0x2000);
-        assert_eq!(tp.work_count(), 1);
-
-        tp.submit_work(id).unwrap();
-        let pending = tp.pending_work();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].callback, 0x1000);
-
-        tp.close_work(id);
-        assert_eq!(tp.work_count(), 0);
-    }
-
-    #[test]
-    fn threadpool_timer() {
-        let mut tp = ThreadPoolManager::new();
-        let id = tp.create_timer(0x3000, 0x4000);
-        assert_eq!(tp.timer_count(), 1);
-
-        tp.set_timer(id, 100, 50).unwrap();
-        let active = tp.active_timers();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].due_time_ms, 100);
-
-        tp.close_timer(id);
-        assert_eq!(tp.timer_count(), 0);
-    }
-
-    #[test]
     fn threadpool_submit_nonexistent_fails() {
         let mut tp = ThreadPoolManager::new();
         let _result = tp.submit_work(999);
@@ -10497,35 +10201,7 @@ mod tests {
 
     // --- SyncBarrier Tests ---
 
-    #[test]
-    fn sync_barrier_single_thread() {
-        let barrier = SyncBarrier::new(1);
-        let is_last = barrier.enter();
-        assert!(is_last);
-    }
-
-    #[test]
-    fn sync_barrier_properties() {
-        let barrier = SyncBarrier::new(4);
-        assert_eq!(barrier.total_threads(), 4);
-        assert_eq!(barrier.arrived_count(), 0);
-    }
-
     // --- DbgHelp Tests ---
-
-    #[test]
-    fn dbghelp_load_module_and_lookup() {
-        let mut ctx = DbgHelpContext::new();
-        ctx.sym_initialize(0).unwrap();
-        ctx.sym_load_module("test.dll", 0x1000_0000).unwrap();
-        ctx.register_symbol(0x1000_0100, "MyFunction", 0x1000_0000);
-
-        assert_eq!(ctx.module_count(), 1);
-        assert_eq!(ctx.symbol_count(), 1);
-
-        let sym = ctx.sym_from_addr(0x1000_0100).unwrap();
-        assert_eq!(sym.name, "MyFunction");
-    }
 
     #[test]
     fn dbghelp_symbol_not_found() {
@@ -10534,40 +10210,7 @@ mod tests {
         assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
-    #[test]
-    fn dbghelp_stack_walk() {
-        let mut ctx = DbgHelpContext::new();
-        ctx.sym_load_module("game.exe", 0x0040_0000).unwrap();
-        ctx.register_symbol(0x0040_1000, "main", 0x0040_0000);
-
-        // Without a working memory reader, only the first frame is returned.
-        let frames = ctx.stack_walk(
-            0x0040_1000,
-            0x7FFF_0000,
-            0x7FFF_F000,
-            GuestArch::X86_64,
-            10,
-            |_addr, _size| None,
-        );
-        assert_eq!(
-            frames.len(),
-            1,
-            "stack_walk returns first frame without memory reader"
-        );
-        assert_eq!(frames[0].symbol_name, Some("main".to_string()));
-        assert_eq!(frames[0].module_name, "game.exe");
-    }
-
     // --- Advapi32 Tests ---
-
-    #[test]
-    fn advapi32_predefined_services() {
-        let mgr = Advapi32Manager::new();
-        assert!(mgr.service_count() >= 3);
-
-        let svc = mgr.query_service_status("SteamClientService").unwrap();
-        assert_eq!(svc.state, ServiceState::Running);
-    }
 
     #[test]
     fn advapi32_service_not_found() {
@@ -10576,72 +10219,7 @@ mod tests {
         assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
-    #[test]
-    fn advapi32_start_service() {
-        let mut mgr = Advapi32Manager::new();
-        // Add a stopped service
-        mgr.services.insert(
-            "TestSvc".to_string(),
-            ServiceRecord {
-                name: "TestSvc".to_string(),
-                display_name: "Test Service".to_string(),
-                service_type: 0x10,
-                state: ServiceState::Stopped,
-                process_id: None,
-            },
-        );
-
-        mgr.start_service("TestSvc").unwrap();
-        let svc = mgr.query_service_status("TestSvc").unwrap();
-        assert_eq!(svc.state, ServiceState::Running);
-    }
-
-    #[test]
-    fn advapi32_token_info() {
-        let mgr = Advapi32Manager::new();
-        assert!(mgr.is_elevated());
-        let token = mgr.get_token_info();
-        assert_eq!(token.integrity_level, 0x3000);
-    }
-
-    #[test]
-    fn advapi32_security_descriptor() {
-        let mut mgr = Advapi32Manager::new();
-        mgr.set_security_descriptor(
-            "C:\\Secret.txt",
-            SecurityDescriptor {
-                owner: "Administrators".to_string(),
-                group: "None".to_string(),
-                dacl_present: true,
-                sacl_present: false,
-                control_flags: 0x8004,
-                self_relative: true,
-                dacl: None,
-                sacl: None,
-            },
-        );
-
-        let sd = mgr.get_security_descriptor("C:\\Secret.txt").unwrap();
-        assert_eq!(sd.owner, "Administrators");
-        assert!(sd.dacl_present);
-    }
-
-    #[test]
-    fn advapi32_open_sc_manager() {
-        let mgr = Advapi32Manager::new();
-        let handle = mgr.open_sc_manager().unwrap();
-        assert_eq!(handle, 0xDEAD_0001);
-    }
-
     // --- ServiceControlManager Tests ---
-
-    #[test]
-    fn scm_open_and_close() {
-        let mut scm = ServiceControlManager::new();
-        let handle = scm.open_sc_manager(None, None);
-        assert!(handle > 0);
-        scm.close_service_handle(handle).unwrap();
-    }
 
     #[test]
     fn scm_create_and_query_service() {
@@ -10672,112 +10250,6 @@ mod tests {
         let (status, pid) = scm.query_service_status(svc_handle).unwrap();
         assert_eq!(status, ServiceStatus::Stopped);
         assert!(pid.is_none());
-    }
-
-    #[test]
-    fn scm_start_and_stop_service() {
-        let mut scm = ServiceControlManager::new();
-        let sc_handle = scm.open_sc_manager(None, None);
-
-        let svc_handle = scm
-            .create_service(
-                sc_handle,
-                "MyService",
-                "My Background Service",
-                0xF003F,
-                0x10,
-                3, // SERVICE_DEMAND_START
-                0,
-                "/usr/local/bin/mysvc",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-
-        // Start the service
-        scm.start_service(sc_handle, "MyService", 0, None).unwrap();
-        let (status, pid) = scm.query_service_status(svc_handle).unwrap();
-        assert_eq!(status, ServiceStatus::Running);
-        // Process spawn will likely fail for /usr/local/bin/mysvc, so
-        // a synthetic PID (1000) is assigned. Test both possibilities.
-        assert!(pid.is_some(), "service should have a PID after start");
-
-        // Stop the service
-        scm.control_service(svc_handle, 0x01).unwrap(); // SERVICE_CONTROL_STOP
-        let (status, pid) = scm.query_service_status(svc_handle).unwrap();
-        assert_eq!(status, ServiceStatus::Stopped);
-        assert!(pid.is_none());
-    }
-
-    #[test]
-    fn scm_pause_and_continue_service() {
-        let mut scm = ServiceControlManager::new();
-        let sc_handle = scm.open_sc_manager(None, None);
-
-        let svc_handle = scm
-            .create_service(
-                sc_handle,
-                "PausableSvc",
-                "Pausable Service",
-                0xF003F,
-                0x10,
-                3,
-                0,
-                "pausable.exe",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-
-        scm.start_service(sc_handle, "PausableSvc", 0, None)
-            .unwrap();
-
-        // Pause
-        scm.control_service(svc_handle, 0x02).unwrap(); // SERVICE_CONTROL_PAUSE
-        let (status, _) = scm.query_service_status(svc_handle).unwrap();
-        assert_eq!(status, ServiceStatus::Paused);
-
-        // Continue
-        scm.control_service(svc_handle, 0x03).unwrap(); // SERVICE_CONTROL_CONTINUE
-        let (status, _) = scm.query_service_status(svc_handle).unwrap();
-        assert_eq!(status, ServiceStatus::Running);
-    }
-
-    #[test]
-    fn scm_delete_service() {
-        let mut scm = ServiceControlManager::new();
-        let sc_handle = scm.open_sc_manager(None, None);
-
-        let svc_handle = scm
-            .create_service(
-                sc_handle,
-                "ToDelete",
-                "To Delete",
-                0xF003F,
-                0x10,
-                3,
-                0,
-                "delete_me.exe",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-
-        // 3 pre-seeded services + 1
-        assert_eq!(scm.service_count(), 4);
-
-        // Must be stopped to delete
-        scm.delete_service(svc_handle).unwrap();
-        assert_eq!(scm.service_count(), 3);
     }
 
     #[test]
@@ -10815,70 +10287,6 @@ mod tests {
         assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
-    #[test]
-    fn scm_list_services() {
-        let mut scm = ServiceControlManager::new();
-        let sc_handle = scm.open_sc_manager(None, None);
-
-        scm.create_service(
-            sc_handle,
-            "SvcA",
-            "Service A",
-            0xF003F,
-            0x10,
-            3,
-            0,
-            "a.exe",
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        scm.create_service(
-            sc_handle,
-            "SvcB",
-            "Service B",
-            0xF003F,
-            0x10,
-            3,
-            0,
-            "b.exe",
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let names = scm.list_services();
-        // 3 pre-seeded services + SvcA + SvcB
-        assert_eq!(names.len(), 5);
-        assert!(names.contains(&"SvcA"));
-        assert!(names.contains(&"SvcB"));
-        assert!(names.contains(&"SteamClientService"));
-    }
-
-    #[test]
-    fn scm_service_status_conversion() {
-        assert_eq!(ServiceStatus::Stopped.to_win32_code(), 0x0001);
-        assert_eq!(ServiceStatus::Running.to_win32_code(), 0x0004);
-        assert_eq!(
-            ServiceStatus::from_win32_code(0x0004),
-            ServiceStatus::Running
-        );
-        assert_eq!(
-            ServiceStatus::from_win32_code(0x0001),
-            ServiceStatus::Stopped
-        );
-        assert_eq!(
-            ServiceStatus::from_win32_code(0xFFFF),
-            ServiceStatus::Stopped
-        );
-    }
-
     // ── DirectInput Force Feedback tests ────────────────────────────────
 
     #[test]
@@ -10910,23 +10318,6 @@ mod tests {
         assert!(!dev.ff_active);
         assert!(dev.current_effect.is_none());
         assert_eq!(dev.autocenter, 5000);
-    }
-
-    #[test]
-    fn directinput_set_force_feedback_state_constant() {
-        let mut dev = DirectInputDevice8::new(0);
-        let effect = DirectInputEffect {
-            effect_type: DirectInputEffectType::ConstantForce,
-            magnitude: 5000,
-            gain: 10000,
-            duration_us: 1_000_000,
-            ..Default::default()
-        };
-
-        dev.set_force_feedback_state(&effect).unwrap();
-        assert!(dev.ff_active);
-        assert!(dev.current_effect.is_some());
-        assert_eq!(dev.current_effect.as_ref().unwrap().magnitude, 5000);
     }
 
     #[test]

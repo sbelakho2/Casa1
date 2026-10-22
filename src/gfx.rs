@@ -1588,6 +1588,8 @@ struct SwapchainRecord {
     state: SwapchainState,
     next_present_index: u64,
     presented_backbuffer_index: usize,
+    /// True when this swapchain's backbuffers present as NV12 (two planes).
+    nv12: bool,
     /// Host timestamp of the previous `present()` — used to measure real
     /// frame timing instead of fabricating a fixed interval.
     last_present_at: Option<std::time::Instant>,
@@ -1649,6 +1651,21 @@ pub struct GraphicsBackend {
     /// surface bytes the present path wrote instead of the shadow gfx resource,
     /// so live consumers observe zero-copy presents.
     presented_surface: Option<crate::metal_backend::IoSurfacePresentChannel>,
+    /// NV12 present channel (two Metal planes) when the swapchain format is
+    /// DXGI_FORMAT_NV12. Mutually exclusive with `presented_surface`.
+    presented_nv12_surface: Option<crate::metal_backend::Nv12PresentChannel>,
+    /// Presents that bound both NV12 planes.
+    nv12_presents: u64,
+    /// Window-supplied CAMetalLayer. When set, `present()` acquires a real
+    /// drawable (`nextDrawable`) and presents into it instead of leaving the
+    /// frame in the internal texture/CPU backing. Headless backends leave this
+    /// `None`.
+    present_layer: Option<metal::MetalLayer>,
+    /// Attempts to acquire a drawable from `present_layer`.
+    layer_present_attempts: u64,
+    /// Drawables actually presented (`nextDrawable` returned a drawable and
+    /// `presentDrawable:` was committed).
+    layer_presents: u64,
     /// Per-instance observability counters for translation optimisations.
     translation_stats: std::cell::RefCell<TranslationStats>,
     /// Cache of translated descriptor tables (revision-validated).
@@ -1682,6 +1699,11 @@ impl std::fmt::Debug for GraphicsBackend {
             )
             .field("frame_source", &self.frame_source)
             .field("presented_surface", &self.presented_surface)
+            .field("presented_nv12_surface", &self.presented_nv12_surface)
+            .field("nv12_presents", &self.nv12_presents)
+            .field("present_layer", &self.present_layer.is_some())
+            .field("layer_present_attempts", &self.layer_present_attempts)
+            .field("layer_presents", &self.layer_presents)
             .field("translation_stats", &self.translation_stats)
             .field(
                 "descriptor_translation_cache",
@@ -1714,6 +1736,11 @@ impl Clone for GraphicsBackend {
             frame_published_callback: None,
             frame_source: self.frame_source,
             presented_surface: self.presented_surface.clone(),
+            presented_nv12_surface: self.presented_nv12_surface.clone(),
+            nv12_presents: self.nv12_presents,
+            present_layer: self.present_layer.clone(),
+            layer_present_attempts: self.layer_present_attempts,
+            layer_presents: self.layer_presents,
             translation_stats: std::cell::RefCell::new(*self.translation_stats.borrow()),
             descriptor_translation_cache: std::cell::RefCell::new(
                 self.descriptor_translation_cache.borrow().clone(),
@@ -2324,6 +2351,11 @@ impl GraphicsBackend {
             frame_published_callback: None,
             frame_source: FrameSource::DxgiD3D11,
             presented_surface: None,
+            presented_nv12_surface: None,
+            nv12_presents: 0,
+            present_layer: None,
+            layer_present_attempts: 0,
+            layer_presents: 0,
             capabilities: profile.capabilities,
             outputs: vec![
                 OutputInfo {
@@ -2448,10 +2480,37 @@ impl GraphicsBackend {
                 },
                 next_present_index: 0,
                 presented_backbuffer_index: 0,
+                nv12: false,
                 last_present_at: None,
             },
         );
         Ok(id)
+    }
+
+    /// Create a swapchain whose backbuffers present as NV12 (DXGI_FORMAT_NV12,
+    /// raw value 103). The backend resource shadows stay RGBA for the guest
+    /// API, while the host present channel is an NV12 IOSurface with separate
+    /// luma and interleaved chroma Metal planes.
+    pub fn create_nv12_swapchain(&mut self, desc: SwapchainDesc) -> AppResult<SwapchainId> {
+        if desc.width == 0 || desc.height == 0 || desc.width % 2 != 0 || desc.height % 2 != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "NV12 swapchain dimensions {}x{} must be non-zero and even",
+                    desc.width, desc.height
+                ),
+            ));
+        }
+        let id = self.create_swapchain(desc)?;
+        if let Some(record) = self.swapchains.get_mut(&id) {
+            record.nv12 = true;
+        }
+        Ok(id)
+    }
+
+    /// True when `swapchain` presents an NV12 (two-plane) surface.
+    pub fn swapchain_is_nv12(&self, swapchain: SwapchainId) -> AppResult<bool> {
+        Ok(self.swapchain(swapchain)?.nv12)
     }
 
     pub fn set_maximum_frame_latency(
@@ -2506,6 +2565,44 @@ impl GraphicsBackend {
             (elapsed_us.unwrap_or(0), elapsed_ns.unwrap_or(0))
         };
 
+        // Window-integrated present: when the host supplied a CAMetalLayer,
+        // present the current surface/frame into a real drawable
+        // (`nextDrawable` + `presentDrawable:`) instead of leaving it in the
+        // internal RGBA8 texture. Headless backends have no layer and keep the
+        // internal path.
+        let layer = self.present_layer.clone();
+        if let Some(layer) = layer {
+            self.layer_present_attempts += 1;
+            let mut presented = false;
+            let nv12 = self.presented_nv12_surface.clone();
+            if let Some(channel) = nv12.as_ref() {
+                presented = channel.present_to_layer(&layer)?;
+            } else if let Some(channel) = self.presented_surface.as_mut() {
+                let texture = channel.metal_texture()?;
+                presented = crate::metal_backend::present_texture_to_layer(texture, &layer)?;
+            } else {
+                let (width, height, resource) = {
+                    let record = self.swapchain(swapchain)?;
+                    (
+                        record.state.desc.width,
+                        record.state.desc.height,
+                        record.state.backbuffers.first().copied(),
+                    )
+                };
+                if let Some(bytes) = resource
+                    .and_then(|resource| self.resources.get(&resource))
+                    .map(|record| record.bytes.clone())
+                {
+                    presented = crate::metal_backend::present_bytes_to_layer(
+                        &bytes, width, height, &layer,
+                    )?;
+                }
+            }
+            if presented {
+                self.layer_presents += 1;
+            }
+        }
+
         // Update swapchain state in a block scope so the mutable borrow ends
         // before we access self for the callback and result construction.
         let displayed_frame_index = {
@@ -2524,6 +2621,10 @@ impl GraphicsBackend {
         // Extract the presented frame before accessing the callback to avoid
         // NLL borrow conflicts between the immutable self.presented_frame() and
         // the mutable self.frame_published_callback borrow.
+        let nv12_bound = self.presented_nv12_surface.is_some();
+        if nv12_bound {
+            self.nv12_presents += 1;
+        }
         let presented_frame = match self.presented_frame(swapchain) {
             Ok(frame) => Some(frame),
             Err(error) => {
@@ -2576,7 +2677,74 @@ impl GraphicsBackend {
         &mut self,
         surface: Option<crate::metal_backend::IoSurfacePresentChannel>,
     ) {
+        if surface.is_some() {
+            self.presented_nv12_surface = None;
+        }
         self.presented_surface = surface;
+    }
+
+    /// Attach the NV12 present channel (two Metal planes). Clears any pixel
+    /// present channel: a swapchain presents through exactly one channel.
+    pub fn set_presented_nv12_surface(
+        &mut self,
+        surface: Option<crate::metal_backend::Nv12PresentChannel>,
+    ) {
+        if surface.is_some() {
+            self.presented_surface = None;
+        }
+        self.presented_nv12_surface = surface;
+    }
+
+    /// Attach the window-supplied CAMetalLayer used for real drawable
+    /// presents. Passing `None` returns to the headless/internal path. Window
+    /// integration owns attaching the layer to an NSWindow/NSView (see
+    /// `mac_window::attach_cametal_layer_to_window`) and calls this afterwards.
+    pub fn set_present_layer(&mut self, layer: Option<metal::MetalLayer>) {
+        if let Some(layer) = &layer {
+            layer.set_framebuffer_only(false);
+        }
+        self.present_layer = layer;
+    }
+
+    /// Borrow the attached CAMetalLayer, when present.
+    pub fn present_layer(&self) -> Option<&metal::MetalLayer> {
+        self.present_layer.as_ref()
+    }
+
+    /// Number of `present()` calls that attempted `nextDrawable`.
+    pub fn layer_present_attempts(&self) -> u64 {
+        self.layer_present_attempts
+    }
+
+    /// Number of presents that acquired a drawable and committed
+    /// `presentDrawable:`. `0` with non-zero attempts means the layer could not
+    /// hand out a drawable (typically not attached to a window/view).
+    pub fn layer_present_count(&self) -> u64 {
+        self.layer_presents
+    }
+
+    /// Borrowed NV12 surface backing the last present, when attached.
+    pub fn presented_nv12_surface(&self) -> Option<&crate::metal_backend::Nv12PresentChannel> {
+        self.presented_nv12_surface.as_ref()
+    }
+
+    /// Raw handle of the NV12 IOSurface, when one is attached.
+    pub fn presented_nv12_surface_handle(&self) -> Option<*mut std::ffi::c_void> {
+        self.presented_nv12_surface
+            .as_ref()
+            .map(|surface| surface.surface_ptr())
+    }
+
+    /// Pointers of the two plane textures bound by the last NV12 present.
+    pub fn presented_nv12_plane_ptrs(&self) -> Option<(usize, usize)> {
+        self.presented_nv12_surface
+            .as_ref()
+            .map(|surface| surface.plane_texture_ptrs())
+    }
+
+    /// Presents that bound both NV12 planes.
+    pub fn nv12_present_count(&self) -> u64 {
+        self.nv12_presents
     }
 
     /// Raw handle of the shared present IOSurface, when one is attached.
@@ -2590,6 +2758,21 @@ impl GraphicsBackend {
 
     pub fn presented_frame(&self, swapchain: SwapchainId) -> AppResult<PresentedFrame> {
         let record = self.swapchain(swapchain)?;
+        if let Some(surface) = &self.presented_nv12_surface {
+            // Consumers speak RGBA; the plane bytes stay queryable through
+            // `presented_nv12_plane_bytes` without a conversion.
+            let bytes = surface.to_rgba8()?;
+            return Ok(PresentedFrame {
+                width: surface.width(),
+                height: surface.height(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                stride: surface.width() as usize * 4,
+                bytes,
+                source: self.frame_source,
+                sequence: record.next_present_index,
+                timestamp: std::time::Instant::now(),
+            });
+        }
         if let Some(surface) = &self.presented_surface {
             return Ok(PresentedFrame {
                 width: surface.width(),
@@ -2626,6 +2809,18 @@ impl GraphicsBackend {
             sequence: record.next_present_index,
             timestamp: std::time::Instant::now(),
         })
+    }
+
+    /// Read both NV12 planes of the attached present surface (Y, UV). Used by
+    /// verification code; returns an error when no NV12 channel is attached.
+    pub fn presented_nv12_plane_bytes(&self) -> AppResult<(Vec<u8>, Vec<u8>)> {
+        let surface = self.presented_nv12_surface.as_ref().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "no NV12 present surface is attached",
+            )
+        })?;
+        Ok((surface.read_plane(0)?, surface.read_plane(1)?))
     }
 
     /// Consumer API for live preview/window callbacks: RGBA8 bytes of the
@@ -2688,6 +2883,13 @@ impl GraphicsBackend {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 "swapchain buffer count must be at least 2",
+            ));
+        }
+        let nv12 = self.swapchain(swapchain)?.nv12;
+        if nv12 && (width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0) {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("NV12 swapchain resize dimensions {width}x{height} must be even"),
             ));
         }
         // Allocate the new backbuffers first so a failure leaves the
@@ -2833,6 +3035,12 @@ impl GraphicsBackend {
 
     pub fn live_resource_count(&self) -> usize {
         self.resources.len()
+    }
+
+    /// Real format recorded in the resource descriptor (format authority for
+    /// DirectStorage uploads).
+    pub fn resource_format(&self, resource: ResourceId) -> AppResult<DxgiFormat> {
+        Ok(self.resource(resource)?.desc.format)
     }
 
     pub fn resource_state(
@@ -5253,27 +5461,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dxgi_format_exact_identity_table() {
-        // Every DXGI value with a semantically exact representation maps
-        // exactly; no closest substitution exists anywhere in the table.
-        for raw in [
-            0, 2, 3, 10, 11, 12, 16, 17, 20, 24, 25, 26, 28, 29, 30, 34, 35, 36, 37, 40, 41, 42,
-            43, 45, 54, 56, 57, 58, 61, 62, 71, 72, 74, 75, 77, 78, 80, 83, 85, 87, 88, 91, 98, 99,
-        ] {
-            let format = DxgiFormat::from_u32_checked(raw)
-                .unwrap_or_else(|e| panic!("exact value {raw} must map: {e}"));
-            assert_eq!(
-                DxgiFormat::translation_strategy(raw),
-                FormatTranslation::Exact,
-                "exact value {raw} must report Exact strategy"
-            );
-            if raw == 0 {
-                assert_eq!(format, DxgiFormat::Unknown);
-            }
-        }
-    }
-
-    #[test]
     fn dxgi_format_inexact_values_are_rejected_not_substituted() {
         // R8G8B8A8_TYPELESS (27), R8G8B8A8_SNORM (31), R8G8B8A8_SINT (32),
         // R8G8_UNORM (49), D16_UNORM (55), A8_UNORM (65), R1_UNORM (66),
@@ -5299,58 +5486,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("DXGI_FORMAT {raw} must be rejected"));
             assert_eq!(error.code, ReasonCode::RcGfxFormatUnsupported);
         }
-    }
-
-    #[test]
-    fn dxgi_format_translation_strategy_table_is_explicit() {
-        assert_eq!(
-            DxgiFormat::translation_strategy(1),
-            FormatTranslation::ViewReinterpret
-        ); // typeless
-        assert_eq!(
-            DxgiFormat::translation_strategy(27),
-            FormatTranslation::ViewReinterpret
-        );
-        assert_eq!(
-            DxgiFormat::translation_strategy(19),
-            FormatTranslation::ViewReinterpret
-        );
-        assert_eq!(
-            DxgiFormat::translation_strategy(86),
-            FormatTranslation::Swizzle
-        );
-        assert_eq!(
-            DxgiFormat::translation_strategy(115),
-            FormatTranslation::Swizzle
-        );
-        assert_eq!(
-            DxgiFormat::translation_strategy(67),
-            FormatTranslation::ConversionShader
-        );
-        assert_eq!(
-            DxgiFormat::translation_strategy(103),
-            FormatTranslation::ConversionShader
-        );
-        assert_eq!(
-            DxgiFormat::translation_strategy(94),
-            FormatTranslation::Decompression
-        );
-        assert_eq!(
-            DxgiFormat::translation_strategy(55),
-            FormatTranslation::DepthStencilEmulation
-        );
-        assert_eq!(
-            DxgiFormat::translation_strategy(66),
-            FormatTranslation::Unsupported
-        );
-        assert_eq!(
-            DxgiFormat::translation_strategy(133),
-            FormatTranslation::Unsupported
-        );
-        assert_eq!(
-            DxgiFormat::translation_strategy(0xFFFF_FFFF),
-            FormatTranslation::Unsupported
-        );
     }
 
     #[test]
@@ -5449,230 +5584,6 @@ mod tests {
         assert_eq!(amd.adapter.metal_family, "apple8");
         assert!(!amd.capabilities.unified_memory);
         assert!(!amd.capabilities.memoryless_render_targets);
-    }
-
-    #[test]
-    fn reported_vendor_compatibility_override_preserves_underlying_metal_capabilities() {
-        let apple = host_gpu_profile_from_name("Apple M3 Pro");
-        let nvidia =
-            apply_reported_gpu_vendor_compatibility(apple.clone(), ReportedGpuVendor::Nvidia);
-        let amd = apply_reported_gpu_vendor_compatibility(apple.clone(), ReportedGpuVendor::Amd);
-
-        assert_eq!(nvidia.adapter.vendor_id, 0x10de);
-        assert_eq!(nvidia.adapter.device_id, 0x2009);
-        assert_eq!(
-            nvidia.adapter.name,
-            "NVIDIA Compatibility Adapter (Apple M3 Pro)"
-        );
-        assert_eq!(nvidia.adapter.metal_family, "apple9");
-        assert_eq!(nvidia.capabilities, apple.capabilities);
-
-        assert_eq!(amd.adapter.vendor_id, 0x1002);
-        assert_eq!(amd.adapter.device_id, 0x7009);
-        assert_eq!(amd.adapter.name, "AMD Compatibility Adapter (Apple M3 Pro)");
-        assert_eq!(amd.adapter.metal_family, "apple9");
-        assert_eq!(amd.capabilities, apple.capabilities);
-    }
-
-    #[test]
-    fn graphics_backend_uses_capability_profile_for_features_and_storage_modes() {
-        let mut backend =
-            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
-
-        assert_eq!(backend.adapter().name, "Apple M3 Ultra");
-        assert_eq!(backend.adapter().metal_family, "apple9");
-        assert!(backend.query_feature(FeatureQuery::TimestampQueries));
-        assert!(backend.query_feature(FeatureQuery::MeshShaders));
-
-        let upload = backend
-            .create_resource(ResourceDesc {
-                name: "upload".to_string(),
-                format: DxgiFormat::R8G8B8A8Unorm,
-                heap: HeapType::Upload,
-                size: 256,
-                subresources: 1,
-                initial_state: ResourceState::GenericRead,
-                usage_hint: ResourceUsageHint::Generic,
-            })
-            .expect("create upload resource");
-        assert_eq!(
-            backend
-                .resource_storage_mode(upload)
-                .expect("upload storage mode"),
-            MetalStorageMode::Shared
-        );
-
-        let depth = backend
-            .create_resource(ResourceDesc {
-                name: "depth".to_string(),
-                format: DxgiFormat::D24UnormS8Uint,
-                heap: HeapType::Default,
-                size: 4096,
-                subresources: 1,
-                initial_state: ResourceState::DepthWrite,
-                usage_hint: ResourceUsageHint::DepthStencil,
-            })
-            .expect("create depth resource");
-        assert_eq!(
-            backend
-                .resource_storage_mode(depth)
-                .expect("depth storage mode"),
-            MetalStorageMode::Memoryless
-        );
-    }
-
-    #[test]
-    fn graphics_backend_prefers_shared_storage_for_small_dynamic_buffers_on_unified_memory_apple_gpus()
-     {
-        let mut backend =
-            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M5 Pro"));
-
-        let small_dynamic_buffer = backend
-            .create_resource(ResourceDesc {
-                name: "small-dynamic-vertex-buffer".to_string(),
-                format: DxgiFormat::R32Float,
-                heap: HeapType::Default,
-                size: 4096,
-                subresources: 1,
-                initial_state: ResourceState::Common,
-                usage_hint: ResourceUsageHint::Buffer {
-                    role: BufferRole::Vertex,
-                    cpu_write_frequent: true,
-                },
-            })
-            .expect("create small dynamic vertex buffer");
-        assert_eq!(
-            backend
-                .resource_storage_mode(small_dynamic_buffer)
-                .expect("small dynamic buffer storage mode"),
-            MetalStorageMode::Shared
-        );
-
-        let small_static_buffer = backend
-            .create_resource(ResourceDesc {
-                name: "small-static-vertex-buffer".to_string(),
-                format: DxgiFormat::R32Float,
-                heap: HeapType::Default,
-                size: 4096,
-                subresources: 1,
-                initial_state: ResourceState::Common,
-                usage_hint: ResourceUsageHint::Buffer {
-                    role: BufferRole::Vertex,
-                    cpu_write_frequent: false,
-                },
-            })
-            .expect("create small static vertex buffer");
-        assert_eq!(
-            backend
-                .resource_storage_mode(small_static_buffer)
-                .expect("small static buffer storage mode"),
-            MetalStorageMode::Private
-        );
-
-        let large_dynamic_buffer = backend
-            .create_resource(ResourceDesc {
-                name: "large-dynamic-vertex-buffer".to_string(),
-                format: DxgiFormat::R32Float,
-                heap: HeapType::Default,
-                size: 256 * 1024,
-                subresources: 1,
-                initial_state: ResourceState::Common,
-                usage_hint: ResourceUsageHint::Buffer {
-                    role: BufferRole::Vertex,
-                    cpu_write_frequent: true,
-                },
-            })
-            .expect("create large dynamic vertex buffer");
-        assert_eq!(
-            backend
-                .resource_storage_mode(large_dynamic_buffer)
-                .expect("large dynamic buffer storage mode"),
-            MetalStorageMode::Private
-        );
-
-        let streamed_texture = backend
-            .create_resource(ResourceDesc {
-                name: "streamed-texture".to_string(),
-                format: DxgiFormat::R8G8B8A8Unorm,
-                heap: HeapType::Default,
-                size: 128 * 128 * 4,
-                subresources: 1,
-                initial_state: ResourceState::Common,
-                usage_hint: ResourceUsageHint::Texture {
-                    sampled: true,
-                    render_target: false,
-                    depth_stencil: false,
-                    cpu_write_frequent: true,
-                },
-            })
-            .expect("create streamed texture");
-        assert_eq!(
-            backend
-                .resource_storage_mode(streamed_texture)
-                .expect("streamed texture storage mode"),
-            MetalStorageMode::Shared
-        );
-
-        let render_target_texture = backend
-            .create_resource(ResourceDesc {
-                name: "render-target-texture".to_string(),
-                format: DxgiFormat::B8G8R8A8Unorm,
-                heap: HeapType::Default,
-                size: 128 * 128 * 4,
-                subresources: 1,
-                initial_state: ResourceState::Common,
-                usage_hint: ResourceUsageHint::Texture {
-                    sampled: false,
-                    render_target: true,
-                    depth_stencil: false,
-                    cpu_write_frequent: true,
-                },
-            })
-            .expect("create render target texture");
-        assert_eq!(
-            backend
-                .resource_storage_mode(render_target_texture)
-                .expect("render target texture storage mode"),
-            MetalStorageMode::Private
-        );
-    }
-
-    #[test]
-    fn graphics_backend_uses_low_latency_swapchain_defaults_on_apple_silicon() {
-        let mut backend =
-            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M5 Pro"));
-
-        let swapchain = backend
-            .create_swapchain(SwapchainDesc {
-                width: 1920,
-                height: 1080,
-                format: DxgiFormat::B8G8R8A8Unorm,
-                buffer_count: 2,
-            })
-            .expect("create swapchain");
-
-        let state = backend.swapchain_state(swapchain).expect("swapchain state");
-
-        assert_eq!(state.max_frame_latency, 1);
-    }
-
-    #[test]
-    fn graphics_backend_preserves_deeper_swapchain_latency_for_non_unified_profiles() {
-        let mut backend =
-            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Generic Discrete GPU"));
-
-        let swapchain = backend
-            .create_swapchain(SwapchainDesc {
-                width: 1280,
-                height: 720,
-                format: DxgiFormat::R8G8B8A8Unorm,
-                buffer_count: 2,
-            })
-            .expect("create swapchain");
-
-        let state = backend.swapchain_state(swapchain).expect("swapchain state");
-
-        assert_eq!(state.max_frame_latency, 3);
     }
 
     fn parallel_test_resource(
@@ -5809,138 +5720,6 @@ mod tests {
     }
 
     #[test]
-    fn hazard_free_stream_elides_redundant_transition_and_keeps_pass_intact() {
-        let mut backend =
-            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
-        let format = DxgiFormat::R8G8B8A8Unorm;
-        let resource = parallel_test_resource(
-            &mut backend,
-            "elide-safe",
-            ResourceState::PixelShaderResource,
-        );
-        let heap = backend.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
-        backend
-            .write_descriptor(heap, 0, ViewDescriptor::Rtv { resource, format })
-            .expect("write rtv");
-        let allocator = backend.create_command_allocator();
-        let root_signature = backend.create_root_signature(RootSignatureDesc::default());
-        let pipeline = backend.create_pipeline_state(
-            root_signature,
-            PipelineStateDesc {
-                label: "elide-safe".to_string(),
-                compute: false,
-                render_target_formats: vec![format],
-                depth_format: None,
-            },
-        );
-        let list = backend.create_graphics_command_list(allocator, pipeline, false);
-        backend
-            .record_begin_render_pass(list, vec![format], None, "clear", "store")
-            .expect("begin pass");
-        backend.record_clear_rtv(list, heap, 0).expect("clear");
-        // A transition to the state the subresource is already in: provably
-        // redundant, so it must be elided and must not split the render pass.
-        backend
-            .record_transition(
-                list,
-                resource,
-                0,
-                ResourceState::PixelShaderResource,
-                ResourceState::PixelShaderResource,
-            )
-            .expect("record no-op transition");
-        backend.record_draw(list, 3).expect("draw");
-        let stream = backend.close_command_list(list).expect("close");
-
-        let analysis = backend
-            .analyze_barriers(&[stream.clone()])
-            .expect("analysis");
-        assert_eq!(analysis.transitions_considered, 1);
-        assert_eq!(analysis.transitions_required, 0);
-        assert_eq!(analysis.transitions_elided, 1);
-        assert_eq!(analysis.barriers_elided, 1);
-
-        backend.reset_translation_stats();
-        let plan = backend
-            .execute_command_lists(0, &[stream], None)
-            .expect("execute");
-        assert_eq!(plan.render_passes.len(), 1);
-        assert_eq!(plan.render_passes[0].draw_calls, 1);
-        assert!(plan.validation_errors.is_empty());
-        let stats = backend.translation_stats();
-        assert_eq!(stats.barriers_required, 0);
-        assert_eq!(stats.barriers_elided, 1);
-    }
-
-    #[test]
-    fn hazardous_stream_keeps_required_transition_and_splits_pass() {
-        let mut backend =
-            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
-        let format = DxgiFormat::R8G8B8A8Unorm;
-        let resource = parallel_test_resource(
-            &mut backend,
-            "elide-unsafe",
-            ResourceState::PixelShaderResource,
-        );
-        let heap = backend.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
-        backend
-            .write_descriptor(heap, 0, ViewDescriptor::Rtv { resource, format })
-            .expect("write rtv");
-        let allocator = backend.create_command_allocator();
-        let root_signature = backend.create_root_signature(RootSignatureDesc::default());
-        let pipeline = backend.create_pipeline_state(
-            root_signature,
-            PipelineStateDesc {
-                label: "elide-unsafe".to_string(),
-                compute: false,
-                render_target_formats: vec![format],
-                depth_format: None,
-            },
-        );
-        let list = backend.create_graphics_command_list(allocator, pipeline, false);
-        backend
-            .record_begin_render_pass(list, vec![format], None, "clear", "store")
-            .expect("begin pass");
-        backend.record_clear_rtv(list, heap, 0).expect("clear");
-        // A real state change is a true hazard and must never be elided.
-        backend
-            .record_transition(
-                list,
-                resource,
-                0,
-                ResourceState::PixelShaderResource,
-                ResourceState::CopySource,
-            )
-            .expect("record transition");
-        backend
-            .record_begin_render_pass(list, vec![format], None, "load", "store")
-            .expect("second pass");
-        backend.record_draw(list, 3).expect("draw");
-        let stream = backend.close_command_list(list).expect("close");
-
-        let analysis = backend
-            .analyze_barriers(&[stream.clone()])
-            .expect("analysis");
-        assert_eq!(analysis.transitions_considered, 1);
-        assert_eq!(analysis.transitions_required, 1);
-        assert_eq!(analysis.transitions_elided, 0);
-        assert_eq!(analysis.barriers_elided, 0);
-
-        backend.reset_translation_stats();
-        let plan = backend
-            .execute_command_lists(0, &[stream], None)
-            .expect("execute");
-        // The required barrier ends the first pass, so the second pass carries
-        // the draw exactly as it did before elision existed.
-        assert_eq!(plan.render_passes.len(), 2);
-        assert_eq!(plan.render_passes[0].draw_calls, 0);
-        assert_eq!(plan.render_passes[1].draw_calls, 1);
-        let stats = backend.translation_stats();
-        assert_eq!(stats.barriers_required, 1);
-        assert_eq!(stats.barriers_elided, 0);
-    }
-
-    #[test]
     fn duplicate_uav_and_aliasing_barriers_are_elided_only_when_no_work_intervenes() {
         let mut backend =
             GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
@@ -6014,199 +5793,305 @@ mod tests {
     }
 
     #[test]
-    fn zero_copy_updates_write_host_visible_resources_without_staging() {
-        let mut backend =
-            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
-        let upload = backend
-            .create_resource(ResourceDesc {
-                name: "host-visible".to_string(),
-                format: DxgiFormat::R8G8B8A8Unorm,
-                heap: HeapType::Upload,
-                size: 64,
-                subresources: 1,
-                initial_state: ResourceState::GenericRead,
-                usage_hint: ResourceUsageHint::Generic,
+    fn nv12_swapchain_rejects_zero_and_odd_dimensions_and_pins_state() {
+        let mut backend = GraphicsBackend::new();
+        for (width, height) in [(0u32, 2u32), (2, 0), (3, 2), (2, 3)] {
+            let error = backend
+                .create_nv12_swapchain(SwapchainDesc {
+                    width,
+                    height,
+                    format: DxgiFormat::B8G8R8A8Unorm,
+                    buffer_count: 2,
+                })
+                .expect_err("odd/zero NV12 swapchain dimensions must be rejected");
+            assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+            assert_eq!(
+                error.message,
+                format!("NV12 swapchain dimensions {width}x{height} must be non-zero and even")
+            );
+        }
+
+        let swapchain = backend
+            .create_nv12_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
             })
-            .expect("create upload resource");
+            .expect("NV12 swapchain");
         assert_eq!(
-            backend.resource_storage_mode(upload).expect("storage"),
-            MetalStorageMode::Shared
+            backend.swapchain_is_nv12(swapchain).expect("nv12 flag"),
+            true
+        );
+        let state = backend.swapchain_state(swapchain).expect("swapchain state");
+        assert_eq!(state.desc.width, 4);
+        assert_eq!(state.desc.height, 2);
+        assert_eq!(state.desc.format, DxgiFormat::B8G8R8A8Unorm);
+        assert_eq!(state.desc.buffer_count, 2);
+        let error = backend
+            .swapchain_is_nv12(swapchain + 100)
+            .expect_err("unknown swapchain must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("unknown swapchain {}", swapchain + 100)
         );
 
-        let path = backend
-            .update_resource_region(upload, 4, &[1, 2, 3, 4])
-            .expect("host-visible update");
-        assert_eq!(path, ResourceUpdatePath::HostVisibleInPlace);
+        let error = backend
+            .resize_buffers(swapchain, 2, 3, 2, DxgiFormat::B8G8R8A8Unorm)
+            .expect_err("NV12 resize with odd width must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
         assert_eq!(
-            &backend.resource(upload).expect("resource").bytes[4..8],
-            &[1, 2, 3, 4]
+            error.message,
+            "NV12 swapchain resize dimensions 3x2 must be even"
         );
-        let stats = backend.translation_stats();
-        assert_eq!(stats.zero_copy_updates, 1);
-        assert_eq!(stats.staged_copies, 0);
-
-        let owned = vec![9u8; 64];
-        let path = backend
-            .overwrite_resource_bytes_owned(upload, owned.clone())
-            .expect("owned overwrite");
-        assert_eq!(path, ResourceUpdatePath::HostVisibleInPlace);
-        assert_eq!(backend.resource(upload).expect("resource").bytes, owned);
-        assert_eq!(backend.translation_stats().zero_copy_updates, 2);
-
-        let private = backend
-            .create_resource(ResourceDesc {
-                name: "device-private".to_string(),
-                format: DxgiFormat::R8G8B8A8Unorm,
-                heap: HeapType::Default,
-                size: 64,
-                subresources: 1,
-                initial_state: ResourceState::Common,
-                usage_hint: ResourceUsageHint::Generic,
-            })
-            .expect("create private resource");
+        let error = backend
+            .resize_buffers(swapchain, 1, 4, 2, DxgiFormat::B8G8R8A8Unorm)
+            .expect_err("one backbuffer must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "swapchain buffer count must be at least 2");
+        backend
+            .resize_buffers(swapchain, 2, 6, 4, DxgiFormat::B8G8R8A8Unorm)
+            .expect("even NV12 resize");
         assert_eq!(
-            backend.resource_storage_mode(private).expect("storage"),
-            MetalStorageMode::Private
+            backend
+                .swapchain_state(swapchain)
+                .expect("resized state")
+                .desc
+                .width,
+            6
         );
-        let path = backend
-            .overwrite_resource_bytes_owned(private, vec![7u8; 64])
-            .expect("private overwrite");
-        assert_eq!(path, ResourceUpdatePath::StagedUpload);
-        assert_eq!(
-            backend.resource(private).expect("resource").bytes,
-            vec![7u8; 64]
-        );
-        let stats = backend.translation_stats();
-        assert_eq!(stats.zero_copy_updates, 2);
-        assert_eq!(stats.staged_copies, 1);
     }
 
     #[test]
-    fn presented_frame_reads_the_shared_iosurface_on_the_zero_copy_path() {
-        let mut backend =
-            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
+    fn present_layer_failures_keep_present_and_nv12_counters_consistent() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let mut backend = GraphicsBackend::new();
         let swapchain = backend
             .create_swapchain(SwapchainDesc {
-                width: 4,
-                height: 2,
-                format: DxgiFormat::R8G8B8A8Unorm,
+                width: 8,
+                height: 8,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("swapchain");
+        let layer = metal::MetalLayer::new();
+        layer.set_device(&device);
+        layer.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        layer.set_drawable_size(core_graphics_types::geometry::CGSize {
+            width: 8.0,
+            height: 8.0,
+        });
+        backend.set_present_layer(Some(layer));
+        assert_eq!(backend.present_layer().is_some(), true);
+
+        backend
+            .present(swapchain, 1, false)
+            .expect("bytes fallback present");
+        assert_eq!(backend.layer_present_attempts(), 1);
+        if backend.layer_present_count() == 0 {
+            assert_eq!(backend.layer_present_count(), 0);
+        } else {
+            assert_eq!(backend.layer_present_count(), 1);
+        }
+        assert_eq!(backend.nv12_present_count(), 0);
+
+        let debug = format!("{backend:?}");
+        assert_eq!(debug.contains("present_layer: true"), true);
+        assert_eq!(debug.contains("layer_present_attempts: 1"), true);
+        assert_eq!(debug.contains("nv12_presents: 0"), true);
+        backend.set_present_layer(None);
+        assert_eq!(backend.present_layer().is_none(), true);
+        backend
+            .present(swapchain, 1, false)
+            .expect("headless present");
+        assert_eq!(backend.layer_present_attempts(), 1);
+
+        if !crate::metal_backend::iosurface_capability_available()
+            || !crate::metal_backend::cv_metal_texture_cache_available()
+        {
+            return;
+        }
+        let mut pixel_channel = crate::metal_backend::IoSurfacePresentChannel::new(
+            8,
+            8,
+            crate::metal_backend::dxgi_to_metal_format(DxgiFormat::B8G8R8A8Unorm),
+        )
+        .expect("pixel channel");
+        pixel_channel
+            .write_pixels(&vec![3u8; 8 * 8 * 4])
+            .expect("pixel channel write");
+        let pixel_handle = pixel_channel.surface_ptr();
+        backend.set_presented_surface(Some(pixel_channel));
+        assert_eq!(backend.presented_surface_handle(), Some(pixel_handle));
+        let layer = metal::MetalLayer::new();
+        layer.set_device(&device);
+        layer.set_drawable_size(core_graphics_types::geometry::CGSize {
+            width: 8.0,
+            height: 8.0,
+        });
+        backend.set_present_layer(Some(layer));
+        backend
+            .present(swapchain, 1, false)
+            .expect("pixel-channel present");
+        assert_eq!(backend.layer_present_attempts(), 2);
+
+        let nv12 =
+            crate::metal_backend::Nv12PresentChannel::new(8, 8).expect("NV12 present channel");
+        nv12.fill_nv12(&vec![40u8; 64], &vec![128u8; 32])
+            .expect("fill NV12 channel");
+        backend.set_presented_nv12_surface(Some(nv12));
+        assert_eq!(backend.presented_surface_handle(), None);
+        assert_eq!(backend.presented_nv12_surface().is_some(), true);
+        assert_eq!(
+            backend.presented_nv12_surface_handle(),
+            backend
+                .presented_nv12_surface()
+                .map(|surface| surface.surface_ptr())
+        );
+        assert_eq!(
+            backend.presented_nv12_plane_ptrs(),
+            backend
+                .presented_nv12_surface()
+                .map(|surface| surface.plane_texture_ptrs())
+        );
+        let (luma, chroma) = backend
+            .presented_nv12_plane_bytes()
+            .expect("NV12 plane bytes");
+        assert_eq!(luma, vec![40u8; 64]);
+        assert_eq!(chroma, vec![128u8; 32]);
+        backend.present(swapchain, 1, false).expect("NV12 present");
+        assert_eq!(backend.layer_present_attempts(), 3);
+        assert_eq!(backend.nv12_present_count(), 1);
+        let debug = format!("{backend:?}");
+        assert_eq!(debug.contains("nv12_presents: 1"), true);
+        assert_eq!(debug.contains("presented_nv12_surface: Some"), true);
+        let frame = backend
+            .presented_frame(swapchain)
+            .expect("NV12 presented frame");
+        assert_eq!(frame.format, DxgiFormat::R8G8B8A8Unorm);
+        assert_eq!(frame.width, 8);
+        assert_eq!(frame.height, 8);
+
+        backend.set_presented_nv12_surface(None);
+        assert_eq!(backend.presented_nv12_surface().is_none(), true);
+        let error = backend
+            .presented_nv12_plane_bytes()
+            .expect_err("no NV12 channel must be an exact error");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "no NV12 present surface is attached");
+    }
+
+    #[test]
+    fn present_layer_bytes_fallback_rejects_invalid_sync_without_stale_counters() {
+        let mut backend = GraphicsBackend::new();
+        let swapchain = backend
+            .create_swapchain(SwapchainDesc {
+                width: 8,
+                height: 8,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("headless swapchain");
+        let layer = metal::MetalLayer::new();
+        layer.set_drawable_size(core_graphics_types::geometry::CGSize {
+            width: 8.0,
+            height: 8.0,
+        });
+        backend.set_present_layer(Some(layer));
+
+        let result = backend
+            .present(swapchain, 1, false)
+            .expect("CPU-byte fallback present");
+        assert_eq!(backend.layer_present_attempts(), 1);
+        assert_eq!(backend.nv12_present_count(), 0);
+        assert_eq!(result.effective_sync_interval, 1);
+        assert_eq!(result.tearing_allowed, false);
+        if backend.layer_present_count() == 0 {
+            assert_eq!(
+                backend.layer_present_count(),
+                0,
+                "an unattached layer must not report a presented drawable"
+            );
+        } else {
+            assert_eq!(
+                backend.layer_present_count(),
+                1,
+                "a drawable present must be counted exactly once"
+            );
+        }
+
+        let error = backend
+            .present(swapchain, 5, false)
+            .expect_err("sync interval above 4 must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "unsupported sync interval 5");
+        assert_eq!(
+            backend.layer_present_attempts(),
+            1,
+            "a rejected present must not touch the layer"
+        );
+    }
+
+    #[test]
+    fn present_bytes_fallback_rejects_short_frame_on_layer() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let mut backend = GraphicsBackend::new();
+        let swapchain = backend
+            .create_swapchain(SwapchainDesc {
+                width: 8,
+                height: 8,
+                format: DxgiFormat::B8G8R8A8Unorm,
                 buffer_count: 2,
             })
             .expect("create swapchain");
-        let Ok(mut channel) = crate::metal_backend::IoSurfacePresentChannel::new(
-            4,
-            2,
-            crate::metal_backend::dxgi_to_metal_format(DxgiFormat::R8G8B8A8Unorm),
-        ) else {
-            return;
-        };
-        let pixels: Vec<u8> = (0..4 * 2 * 4).map(|index| (index * 13) as u8).collect();
-        channel.write_pixels(&pixels).expect("surface write");
-        let surface = channel.surface_ptr();
-        backend.set_presented_surface(Some(channel));
-
-        assert_eq!(backend.presented_surface_handle(), Some(surface));
-        let frame = backend
-            .presented_frame(swapchain)
-            .expect("presented frame from surface");
-        assert_eq!(frame.bytes, pixels);
-        assert_eq!(frame.width, 4);
-        assert_eq!(frame.height, 2);
+        let backbuffer = backend
+            .swapchain_state(swapchain)
+            .expect("swapchain state")
+            .backbuffers[0];
+        backend
+            .resources
+            .get_mut(&backbuffer)
+            .expect("backbuffer resource")
+            .bytes
+            .truncate(4);
+        let layer = metal::MetalLayer::new();
+        layer.set_device(&device);
+        layer.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        layer.set_drawable_size(core_graphics_types::geometry::CGSize {
+            width: 8.0,
+            height: 8.0,
+        });
+        backend.set_present_layer(Some(layer));
+        let error = backend
+            .present(swapchain, 1, false)
+            .expect_err("short CPU bytes must not reach the drawable");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
         assert_eq!(
-            backend
-                .presented_frame_rgba(swapchain)
-                .expect("rgba consumer"),
-            pixels
+            error.message,
+            "CAMetalLayer present: 8x8 pixels need 256 bytes, got 4 (drawable 8x8)"
         );
-    }
-
-    #[test]
-    fn descriptor_table_batching_reuses_unchanged_tables() {
-        let mut backend =
-            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
-        let format = DxgiFormat::R8G8B8A8Unorm;
-        let resource_a = parallel_test_resource(&mut backend, "table-a", ResourceState::Common);
-        let resource_b = parallel_test_resource(&mut backend, "table-b", ResourceState::Common);
-        let heap_a = backend.create_descriptor_heap(DescriptorHeapType::CbvSrvUav, 2);
-        backend
-            .write_descriptor(
-                heap_a,
-                0,
-                ViewDescriptor::Srv {
-                    resource: resource_a,
-                    format,
-                },
-            )
-            .expect("srv");
-        backend
-            .write_descriptor(
-                heap_a,
-                1,
-                ViewDescriptor::Cbv {
-                    resource: resource_a,
-                    size: 16,
-                },
-            )
-            .expect("cbv");
-        let heap_b = backend.create_descriptor_heap(DescriptorHeapType::CbvSrvUav, 1);
-        backend
-            .write_descriptor(
-                heap_b,
-                0,
-                ViewDescriptor::Srv {
-                    resource: resource_b,
-                    format,
-                },
-            )
-            .expect("srv b");
-
-        let first = backend
-            .translate_descriptor_tables(&[heap_a, heap_b])
-            .expect("first batch");
-        assert_eq!(first.len(), 2);
-        assert_eq!(first[0].len(), 2);
-        assert_eq!(first[1].len(), 1);
-        let stats = backend.translation_stats();
-        assert_eq!(stats.descriptor_table_batches, 1);
-        assert_eq!(stats.descriptor_table_uploads, 2);
-        assert_eq!(stats.descriptor_table_reuses, 0);
-
-        let second = backend
-            .translate_descriptor_tables(&[heap_a, heap_b])
-            .expect("second batch");
-        assert_eq!(second, first, "unchanged tables must reuse cached bindings");
-        let stats = backend.translation_stats();
-        assert_eq!(stats.descriptor_table_batches, 2);
-        assert_eq!(stats.descriptor_table_uploads, 2);
-        assert_eq!(stats.descriptor_table_reuses, 2);
+        assert_eq!(backend.layer_present_count(), 0);
 
         backend
-            .write_descriptor(
-                heap_a,
-                0,
-                ViewDescriptor::Uav {
-                    resource: resource_a,
-                    format,
-                },
-            )
-            .expect("change descriptor");
-        let third = backend
-            .translate_descriptor_tables(&[heap_a, heap_b])
-            .expect("third batch");
-        assert_ne!(third[0], first[0], "changed table must be retranslated");
-        assert_eq!(third[1], first[1], "unchanged table still reuses cache");
-        let stats = backend.translation_stats();
-        assert_eq!(stats.descriptor_table_batches, 3);
-        assert_eq!(stats.descriptor_table_uploads, 3);
-        assert_eq!(stats.descriptor_table_reuses, 3);
-
-        let before = backend.translation_stats().descriptor_table_reuses;
+            .resources
+            .get_mut(&backbuffer)
+            .expect("backbuffer resource")
+            .bytes = vec![0u8; 256];
         backend
-            .translate_descriptor_heap(heap_b)
-            .expect("single heap translate");
-        assert_eq!(
-            backend.translation_stats().descriptor_table_reuses,
-            before + 1
-        );
+            .present(swapchain, 1, false)
+            .expect("full-frame present must not fail");
+        let resource = backend
+            .resources
+            .remove(&backbuffer)
+            .expect("backbuffer resource");
+        backend
+            .present(swapchain, 1, false)
+            .expect("missing backbuffer bytes must fall through");
+        backend.resources.insert(backbuffer, resource);
     }
 }

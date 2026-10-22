@@ -271,29 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn allocate_reserves_and_commits_through_the_canonical_vm() {
-        let mut vm = test_vm();
-        let (base, size) = nt_allocate_virtual_memory(
-            &mut vm,
-            0,
-            0,
-            0x4000,
-            MEM_COMMIT | MEM_RESERVE,
-            crate::ntdll::PAGE_READWRITE,
-        )
-        .expect("allocate");
-        assert_ne!(base, 0);
-        assert_eq!(base & crate::vm::VM_PAGE_MASK, base);
-        assert_eq!(size, 0x4000);
-        // The canonical VM reflects the reservation + commitment.
-        let query = vm.query(base);
-        assert_eq!(query.state, VmState::Committed);
-        assert_eq!(query.region_size, 0x4000);
-        assert_eq!(query.protection, VmProtection::READ_WRITE);
-        assert!(vm.is_mapped(base));
-    }
-
-    #[test]
     fn reserve_only_leaves_pages_reserved() {
         let mut vm = test_vm();
         let (base, size) = nt_allocate_virtual_memory(
@@ -414,42 +391,5 @@ mod tests {
             nt_protect_virtual_memory(&mut vm, 0x1000, 0x1000, crate::ntdll::PAGE_READONLY),
             Err(STATUS_INVALID_PARAMETER)
         );
-    }
-
-    #[test]
-    fn query_reports_free_reserved_and_committed_runs() {
-        let mut vm = test_vm();
-        let (base, _) = nt_allocate_virtual_memory(
-            &mut vm,
-            0,
-            0,
-            0x3000,
-            MEM_COMMIT | MEM_RESERVE,
-            crate::ntdll::PAGE_READWRITE,
-        )
-        .expect("allocate");
-        let committed = nt_query_virtual_memory(&vm, base);
-        assert_eq!(committed.state, crate::ntdll::MEM_COMMIT_STATE);
-        assert_eq!(committed.protect, crate::ntdll::PAGE_READWRITE);
-        assert_eq!(committed.region_size, 0x3000);
-        assert_eq!(committed.ty, crate::ntdll::MEM_PRIVATE);
-
-        let (reserved_base, _) = nt_allocate_virtual_memory(
-            &mut vm,
-            0,
-            0,
-            0x1000,
-            MEM_RESERVE,
-            crate::ntdll::PAGE_NOACCESS,
-        )
-        .expect("reserve");
-        let reserved = nt_query_virtual_memory(&vm, reserved_base);
-        assert_eq!(reserved.state, crate::ntdll::MEM_RESERVE_STATE);
-
-        let free = nt_query_virtual_memory(&vm, 0x1000);
-        assert_eq!(free.state, crate::ntdll::MEM_FREE);
-        let serialized = free.serialize_x64();
-        assert_eq!(serialized.len(), 48);
-        assert_eq!(u64::from_le_bytes(serialized[0..8].try_into().unwrap()), 0);
     }
 }

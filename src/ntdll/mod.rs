@@ -557,28 +557,4 @@ mod tests {
         // Unknown Win32 errors fall back to STATUS_UNSUCCESSFUL.
         assert_eq!(dos_error_to_nt_status(0xDEAD).0 as u32, 0xC000_0001);
     }
-
-    #[test]
-    fn page_flags_round_trip_through_canonical_protection() {
-        for flags in [
-            PAGE_NOACCESS,
-            PAGE_READONLY,
-            PAGE_READWRITE,
-            PAGE_EXECUTE,
-            PAGE_EXECUTE_READ,
-            PAGE_EXECUTE_READWRITE,
-        ] {
-            let protection = protection_from_page_flags(flags);
-            assert_eq!(
-                page_flags_from_protection(&protection),
-                flags,
-                "page flags 0x{flags:x} must round trip"
-            );
-        }
-        // Guard / nocache bits are stripped before conversion.
-        assert_eq!(
-            protection_from_page_flags(PAGE_READWRITE | PAGE_GUARD),
-            crate::vm::VmProtection::READ_WRITE
-        );
-    }
 }

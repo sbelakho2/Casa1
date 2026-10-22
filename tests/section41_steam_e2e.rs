@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Phase 41 — Real Steam E2E acceptance (S0-S13).
 //!
 //! Runs the REAL Steam client from `ges/steam/drive_c/Steam/Steam.exe`
@@ -49,10 +50,8 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The Steam GE whose `drive_c/Steam/Steam.exe` is the real client.
 const STEAM_GE: &str = "steam";
 
-/// The E2E gate: `CASA1_STEAM_E2E=1` is required even with `--ignored`.
 fn steam_e2e_gate() -> bool {
     if std::env::var("CASA1_STEAM_E2E").as_deref() != Ok("1") {
         eprintln!(
@@ -68,9 +67,6 @@ fn steam_e2e_gate() -> bool {
     true
 }
 
-/// Resolve the Steam GE root: the CI hydration stage points
-/// `CASA1_STEAM_E2E_GE_ROOT` at the hydrated fixture it produced; locally the
-/// tracked `ges/<name>` fixture is used.
 fn e2e_ge_name() -> String {
     std::env::var("CASA1_STEAM_E2E_GE_NAME").unwrap_or_else(|_| STEAM_GE.to_string())
 }

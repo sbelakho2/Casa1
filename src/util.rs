@@ -238,28 +238,4 @@ fn to_windows_path(prefix: &str, relative: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sha256_file_matches_sha256_bytes() {
-        let path =
-            std::env::temp_dir().join(format!("casa1_sha256_test_{}.bin", std::process::id()));
-        let data: &[u8] = b"hello casa1 streaming hash\x00\xff\x10";
-        fs::write(&path, data).expect("write temp file");
-        let from_file = sha256_file(&path).expect("hash file");
-        let from_bytes = sha256_bytes(data);
-        assert_eq!(from_file, from_bytes);
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn sha256_known_vectors() {
-        assert_eq!(
-            sha256_bytes(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha256_bytes(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
 }

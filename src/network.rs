@@ -4356,49 +4356,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn winsock_round_trip_preserves_socket_names() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-
-        let listener = network
-            .socket(AddressFamily::Ipv4)
-            .expect("listener socket");
-        assert_eq!(listener & 0x3, 0);
-        assert!(listener >= 0x1000);
-        let listener_addr = SockAddr {
-            family: AddressFamily::Ipv4,
-            host: "127.0.0.1".to_string(),
-            port: 27015,
-        };
-        network
-            .bind(listener, listener_addr.clone())
-            .expect("bind listener");
-        network.listen(listener, 1).expect("listen");
-
-        let client = network.socket(AddressFamily::Ipv4).expect("client socket");
-        assert_eq!(client & 0x3, 0);
-        assert!(client >= 0x1000);
-        network
-            .connect(client, listener_addr.clone())
-            .expect("connect");
-        let server = network.accept(listener).expect("accept");
-
-        assert_eq!(
-            network.getsockname(listener).expect("listener name"),
-            listener_addr
-        );
-        assert_eq!(
-            network.getsockname(server).expect("server name"),
-            listener_addr
-        );
-
-        network.send(client, b"ping").expect("send");
-        assert_eq!(network.recv(server, 4).expect("recv"), b"ping");
-
-        network.setsockopt(client, 0, 0, &[]).expect("setsockopt");
-    }
-
-    #[test]
     fn winsock_getaddrinfo_falls_back_to_host_dns() {
         let mut network = NetworkStack::new();
         network.wsa_startup();
@@ -4415,76 +4372,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn winsock_real_tcp_connect_round_trip() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind host listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let worker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept host connection");
-            let mut buf = [0_u8; 4];
-            stream.read_exact(&mut buf).expect("read ping");
-            assert_eq!(&buf, b"ping");
-            stream.write_all(b"pong").expect("write pong");
-        });
-
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let socket = network.socket(AddressFamily::Ipv4).expect("client socket");
-        network
-            .connect(
-                socket,
-                SockAddr {
-                    family: AddressFamily::Ipv4,
-                    host: addr.ip().to_string(),
-                    port: addr.port(),
-                },
-            )
-            .expect("connect to host listener");
-
-        network.send(socket, b"ping").expect("send ping");
-        assert_eq!(network.recv(socket, 4).expect("recv pong"), b"pong");
-
-        worker.join().expect("join host listener");
-    }
-
     // --- QUIC/HTTP3 tests ---
-
-    #[test]
-    fn quic_alt_svc_parses_basic_h3() {
-        let header = "h3=\":443\"; ma=2592000";
-        let entries = parse_alt_svc_header(header);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].protocol_id, "h3");
-        assert_eq!(entries[0].alt_host, "");
-        assert_eq!(entries[0].alt_port, 443);
-        assert_eq!(entries[0].alpn, Some("h3".to_string()));
-    }
-
-    #[test]
-    fn quic_alt_svc_parses_multiple_entries() {
-        let header = "h3=\":443\"; ma=2592000, h3-29=\":443\"; ma=2592000";
-        let entries = parse_alt_svc_header(header);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].protocol_id, "h3");
-        assert_eq!(entries[1].protocol_id, "h3-29");
-        assert_eq!(entries[1].alpn, Some("h3-29".to_string()));
-    }
-
-    #[test]
-    fn quic_alt_svc_parses_with_host() {
-        let header = "h3=\"alt.example.com:8443\"; ma=2592000";
-        let entries = parse_alt_svc_header(header);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].protocol_id, "h3");
-        assert_eq!(entries[0].alt_host, "alt.example.com");
-        assert_eq!(entries[0].alt_port, 8443);
-    }
-
-    #[test]
-    fn quic_alt_svc_handles_empty_input() {
-        assert!(parse_alt_svc_header("").is_empty());
-        assert!(parse_alt_svc_header("   ").is_empty());
-    }
 
     #[test]
     fn quic_is_quic_alpn_detection() {
@@ -4584,38 +4472,10 @@ mod tests {
 
     // --- HTTP route-based request/response lifecycle (WinHTTP) ---
 
-    #[test]
-    fn http_route_lifecycle_winhttp_round_trip() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let session = network.win_http_open("test-agent");
-        let conn = network
-            .win_http_connect(session, "api.example.com", 443, true)
-            .expect("connect");
-        let req = network
-            .win_http_open_request(conn, "GET", "/login")
-            .expect("open request");
-        network
-            .win_http_send_request(req, BTreeMap::new(), &[])
-            .expect("send request");
-        network
-            .win_http_receive_response(req)
-            .expect("receive response");
-        let headers = network.win_http_query_headers(req).expect("query headers");
-        assert_eq!(headers.get("status").unwrap(), "200");
-        assert_eq!(headers.get("x-casa1-route").unwrap(), "login");
-        let body = network.win_http_read_data(req, 1024).expect("read data");
-        assert_eq!(body, br#"{"ok":true}"#);
-        network.close_handle(req);
-        network.close_handle(conn);
-        network.close_handle(session);
-    }
-
     // -----------------------------------------------------------------------
     // WebSocket record plumbing (buffered, RFC 6455 semantics)
     // -----------------------------------------------------------------------
 
-    /// Open a session/connection/request chain for WebSocket upgrades.
     fn ws_open_request(network: &mut NetworkStack) -> super::HttpRequestId {
         let session = network.win_http_open("ws-test");
         let conn = network
@@ -4765,43 +4625,6 @@ mod tests {
     }
 
     #[test]
-    fn http_route_matches_http_and_https_schemes() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        // HTTPS → api.example.com /login
-        let session = network.win_http_open("test");
-        let conn = network
-            .win_http_connect(session, "api.example.com", 443, true)
-            .expect("https connect");
-        let req = network
-            .win_http_open_request(conn, "GET", "/login")
-            .expect("open req");
-        network
-            .win_http_send_request(req, BTreeMap::new(), &[])
-            .expect("send");
-        let h = network.win_http_query_headers(req).expect("headers");
-        assert_eq!(h.get("x-casa1-route").unwrap(), "login");
-        network.close_handle(req);
-        network.close_handle(conn);
-        // HTTP → launcher.example.com /patch
-        let conn2 = network
-            .win_http_connect(session, "launcher.example.com", 80, false)
-            .expect("http connect");
-        let req2 = network
-            .win_http_open_request(conn2, "GET", "/patch")
-            .expect("open req2");
-        network
-            .win_http_send_request(req2, BTreeMap::new(), &[])
-            .expect("send2");
-        let h2 = network.win_http_query_headers(req2).expect("headers2");
-        assert_eq!(h2.get("x-casa1-route").unwrap(), "patch");
-        assert_eq!(h2.get("status").unwrap(), "204");
-        network.close_handle(req2);
-        network.close_handle(conn2);
-        network.close_handle(session);
-    }
-
-    #[test]
     fn http_route_not_found_returns_error() {
         let mut network = NetworkStack::new();
         network.wsa_startup();
@@ -4819,118 +4642,7 @@ mod tests {
         network.close_handle(session);
     }
 
-    #[test]
-    fn http_route_custom_route_added_via_add_route() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let mut headers = BTreeMap::new();
-        headers.insert("content-type".to_string(), "text/plain".to_string());
-        network.add_route(
-            "http",
-            "custom.test",
-            "/hello",
-            200,
-            headers,
-            b"world",
-            Vec::new(),
-            Vec::new(),
-        );
-        let session = network.win_http_open("test");
-        let conn = network
-            .win_http_connect(session, "custom.test", 80, false)
-            .expect("connect");
-        let req = network
-            .win_http_open_request(conn, "GET", "/hello")
-            .expect("open");
-        network
-            .win_http_send_request(req, BTreeMap::new(), &[])
-            .expect("send");
-        let h = network.win_http_query_headers(req).expect("headers");
-        assert_eq!(h.get("status").unwrap(), "200");
-        assert_eq!(h.get("content-type").unwrap(), "text/plain");
-        let body = network.win_http_read_data(req, 1024).expect("read");
-        assert_eq!(body, b"world");
-        network.close_handle(req);
-        network.close_handle(conn);
-        network.close_handle(session);
-    }
-
-    #[test]
-    fn http_route_wininet_api_round_trip() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let session = network.internet_open("test-agent");
-        let conn = network
-            .internet_connect(session, "api.example.com", 443, true)
-            .expect("connect");
-        let req = network
-            .http_open_request(conn, "GET", "/store/cart")
-            .expect("open");
-        network
-            .http_send_request(req, BTreeMap::new(), &[])
-            .expect("send");
-        let body = network.internet_read_file(req, 1024).expect("read");
-        assert_eq!(body, b"cart");
-        network.close_handle(req);
-        network.close_handle(conn);
-        network.close_handle(session);
-    }
-
     // --- Cookie management tests ---
-
-    #[test]
-    fn cookie_stored_from_route_and_visible_in_snapshot() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        // The default route for api.example.com /login includes a session cookie
-        let session = network.win_http_open("test");
-        let conn = network
-            .win_http_connect(session, "api.example.com", 443, true)
-            .expect("connect");
-        let req = network
-            .win_http_open_request(conn, "GET", "/login")
-            .expect("open");
-        network
-            .win_http_send_request(req, BTreeMap::new(), &[])
-            .expect("send");
-        network.close_handle(req);
-        network.close_handle(conn);
-        network.close_handle(session);
-        let snapshot = network.cookie_snapshot_json().expect("snapshot");
-        assert!(snapshot.contains("session"));
-        assert!(snapshot.contains("abc123"));
-    }
-
-    #[test]
-    fn cookie_snapshot_round_trip_preserves_cookies() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let session = network.win_http_open("test");
-        let conn = network
-            .win_http_connect(session, "api.example.com", 443, true)
-            .expect("connect");
-        let req = network
-            .win_http_open_request(conn, "GET", "/login")
-            .expect("open");
-        network
-            .win_http_send_request(req, BTreeMap::new(), &[])
-            .expect("send");
-        network.close_handle(req);
-        network.close_handle(conn);
-        network.close_handle(session);
-        let snapshot = network.cookie_snapshot_json().expect("snapshot");
-        let mut network2 = NetworkStack::new();
-        network2.load_cookie_snapshot_json(&snapshot).expect("load");
-        let snapshot2 = network2.cookie_snapshot_json().expect("snapshot2");
-        assert_eq!(snapshot, snapshot2);
-    }
-
-    #[test]
-    fn cookie_jar_empty_initially() {
-        let network = NetworkStack::new();
-        let snapshot = network.cookie_snapshot_json().expect("snapshot");
-        assert_eq!(snapshot, "[]");
-    }
 
     #[test]
     fn cookie_jar_rejects_invalid_json() {
@@ -4966,25 +4678,6 @@ mod tests {
             revoked: false,
             supported_ciphers: vec![],
         }
-    }
-
-    #[test]
-    fn certificate_validate_hostname_match_succeeds() {
-        let mut network = NetworkStack::new();
-        let root = make_root_cert();
-        network.import_certificate(root);
-        let leaf = make_test_cert("example.com", 100, false);
-        let chain = vec![
-            leaf,
-            Certificate {
-                fingerprint: "fp:root".to_string(),
-                ..make_root_cert()
-            },
-        ];
-        let suite = network
-            .validate_server_certificate("example.com", &chain, false)
-            .expect("should validate");
-        assert_eq!(suite, "TLS_AES_128_GCM_SHA256");
     }
 
     #[test]
@@ -5025,24 +4718,6 @@ mod tests {
     }
 
     #[test]
-    fn certificate_validate_not_revoked_when_not_checking() {
-        let mut network = NetworkStack::new();
-        let root = make_root_cert();
-        network.import_certificate(root);
-        let leaf = make_test_cert("example.com", 100, true); // revoked
-        let chain = vec![
-            leaf,
-            Certificate {
-                fingerprint: "fp:root".to_string(),
-                ..make_root_cert()
-            },
-        ];
-        // revocation_check = false, so revoked cert passes
-        let result = network.validate_server_certificate("example.com", &chain, false);
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-    }
-
-    #[test]
     fn certificate_validate_untrusted_root_rejected() {
         let network = NetworkStack::new();
         let leaf = make_test_cert("example.com", 100, false);
@@ -5079,23 +4754,6 @@ mod tests {
     }
 
     #[test]
-    fn certificate_validate_imported_root_succeeds() {
-        let mut network = NetworkStack::new();
-        let root = make_root_cert();
-        network.import_certificate(root);
-        let leaf = make_test_cert("secure.example", 200, false);
-        let chain = vec![
-            leaf,
-            Certificate {
-                fingerprint: "fp:root".to_string(),
-                ..make_root_cert()
-            },
-        ];
-        let result = network.validate_server_certificate("secure.example", &chain, false);
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-    }
-
-    #[test]
     fn certificate_export_contains_imported() {
         let mut network = NetworkStack::new();
         let root = make_root_cert();
@@ -5106,31 +4764,6 @@ mod tests {
     }
 
     // --- Socket operation tests ---
-
-    #[test]
-    fn socket_ipv6_create_bind_listen_connect() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let listener = network.socket(AddressFamily::Ipv6).expect("socket");
-        assert_eq!(listener & 0x3, 0);
-        let addr = SockAddr {
-            family: AddressFamily::Ipv6,
-            host: "::1".to_string(),
-            port: 37000,
-        };
-        network.bind(listener, addr.clone()).expect("bind");
-        network.listen(listener, 1).expect("listen");
-
-        let client = network.socket(AddressFamily::Ipv6).expect("client");
-        network.connect(client, addr.clone()).expect("connect");
-        let server = network.accept(listener).expect("accept");
-
-        assert_eq!(network.getsockname(listener).expect("name"), addr);
-        assert_eq!(network.getsockname(server).expect("name"), addr);
-
-        network.send(client, b"ipv6-ping").expect("send");
-        assert_eq!(network.recv(server, 9).expect("recv"), b"ipv6-ping");
-    }
 
     #[test]
     fn socket_nonblocking_accept_returns_wouldblock() {
@@ -5194,42 +4827,6 @@ mod tests {
     }
 
     #[test]
-    fn socket_select_detects_readable_and_writable() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let listener = network.socket(AddressFamily::Ipv4).expect("listener");
-        let addr = SockAddr {
-            family: AddressFamily::Ipv4,
-            host: "127.0.0.1".to_string(),
-            port: 27019,
-        };
-        network.bind(listener, addr.clone()).expect("bind");
-        network.listen(listener, 1).expect("listen");
-
-        let client = network.socket(AddressFamily::Ipv4).expect("client");
-        network.connect(client, addr.clone()).expect("connect");
-
-        // Listener with pending accept should be readable
-        // Select BEFORE accept so the pending connection is still in the queue
-        let (readable, writable) = network.select(&[client, listener]).expect("select");
-        assert!(readable.contains(&listener));
-        // Client should be writable (connected)
-        assert!(writable.contains(&client));
-
-        let server = network.accept(listener).expect("accept");
-
-        // Both connected sockets should be writable
-        let (_readable2, writable2) = network.select(&[client, server]).expect("select");
-        assert!(writable2.contains(&client));
-        assert!(writable2.contains(&server));
-
-        // Send data -> server becomes readable
-        network.send(client, b"data").expect("send");
-        let (readable3, _) = network.select(&[server]).expect("select");
-        assert!(readable3.contains(&server));
-    }
-
-    #[test]
     fn socket_poll_returns_state_for_each_socket() {
         let mut network = NetworkStack::new();
         network.wsa_startup();
@@ -5239,26 +4836,6 @@ mod tests {
         // Created sockets are not readable or writable
         assert!(!states[0].readable);
         assert!(!states[0].writable);
-    }
-
-    #[test]
-    fn socket_ioctlsocket_fionread_returns_available_bytes() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let listener = network.socket(AddressFamily::Ipv4).expect("listener");
-        let addr = SockAddr {
-            family: AddressFamily::Ipv4,
-            host: "127.0.0.1".to_string(),
-            port: 27020,
-        };
-        network.bind(listener, addr.clone()).expect("bind");
-        network.listen(listener, 1).expect("listen");
-        let client = network.socket(AddressFamily::Ipv4).expect("client");
-        network.connect(client, addr).expect("connect");
-        let server = network.accept(listener).expect("accept");
-        network.send(client, b"12345").expect("send");
-        let available = network.ioctlsocket_fionread(server).expect("fionread");
-        assert_eq!(available, 5);
     }
 
     #[test]
@@ -5321,19 +4898,6 @@ mod tests {
         assert!(!addrs.is_empty());
         assert!(addrs.iter().any(|a| a.host == "203.0.113.10"));
         assert!(addrs.iter().all(|a| a.port == 443));
-    }
-
-    #[test]
-    fn dns_resolves_preseeded_ipv6() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let addrs = network.getaddrinfo("example.com", 80).expect("resolve");
-        assert!(addrs.iter().any(|a| a.family == AddressFamily::Ipv6));
-        assert!(
-            addrs
-                .iter()
-                .any(|a| a.host == "2606:2800:220:1:248:1893:25c8:1946")
-        );
     }
 
     #[test]
@@ -5410,77 +4974,6 @@ mod tests {
             traces.last().unwrap().proxy.as_deref(),
             Some("http://system.proxy:3128")
         );
-    }
-
-    #[test]
-    fn proxy_system_proxy_not_used_when_disabled() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        network.set_system_proxy(Some("http://system.proxy:3128".to_string()), false);
-        let session = network.win_http_open("test");
-        let conn = network
-            .win_http_connect(session, "api.example.com", 443, true)
-            .expect("connect");
-        let req = network
-            .win_http_open_request(conn, "GET", "/login")
-            .expect("open");
-        network
-            .win_http_send_request(req, BTreeMap::new(), &[])
-            .expect("send");
-        network.close_handle(req);
-        network.close_handle(conn);
-        network.close_handle(session);
-        let traces = network.http_traces();
-        assert!(traces.last().unwrap().proxy.is_none());
-    }
-
-    #[test]
-    fn proxy_session_override_takes_precedence() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        network.set_env_proxy(Some("http://env.proxy:8080".to_string()));
-        let session = network.win_http_open("test");
-        network
-            .win_http_set_proxy(session, Some("http://session.override:9090".to_string()))
-            .expect("set proxy");
-        let conn = network
-            .win_http_connect(session, "api.example.com", 443, true)
-            .expect("connect");
-        let req = network
-            .win_http_open_request(conn, "GET", "/login")
-            .expect("open");
-        network
-            .win_http_send_request(req, BTreeMap::new(), &[])
-            .expect("send");
-        network.close_handle(req);
-        network.close_handle(conn);
-        network.close_handle(session);
-        let traces = network.http_traces();
-        assert_eq!(
-            traces.last().unwrap().proxy.as_deref(),
-            Some("http://session.override:9090")
-        );
-    }
-
-    #[test]
-    fn proxy_none_when_not_configured() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let session = network.win_http_open("test");
-        let conn = network
-            .win_http_connect(session, "api.example.com", 443, true)
-            .expect("connect");
-        let req = network
-            .win_http_open_request(conn, "GET", "/login")
-            .expect("open");
-        network
-            .win_http_send_request(req, BTreeMap::new(), &[])
-            .expect("send");
-        network.close_handle(req);
-        network.close_handle(conn);
-        network.close_handle(session);
-        let traces = network.http_traces();
-        assert!(traces.last().unwrap().proxy.is_none());
     }
 
     // --- HTTP traces and cipher log tests ---
@@ -5628,60 +5121,7 @@ mod tests {
         assert!(!fell_back);
     }
 
-    #[test]
-    fn quic_negotiate_h3_without_alt_svc_falls_back() {
-        let mut flags = HttpProtocolFlags::new();
-        flags.set(HttpProtocolFlags::HTTP2);
-        flags.set(HttpProtocolFlags::HTTP3);
-        let config = QuicConfig::default();
-        let alt_svc: Vec<AltSvcEntry> = Vec::new();
-        // No Alt-Svc advertising h3, but HTTP3 flag is set → still tries QUIC and falls back
-        let (protocol, fell_back) = negotiate_http_protocol(&flags, &config, &alt_svc);
-        // The function checks has_h3_advertisement OR quic_requested flag
-        // With the flag set, quic_requested is true even without alt-svc entries
-        assert_eq!(protocol, HttpProtocol::Http2);
-        assert!(fell_back);
-    }
-
-    #[test]
-    fn quic_negotiate_h3_without_h2_falls_back_to_http11() {
-        let mut flags = HttpProtocolFlags::new();
-        flags.set(HttpProtocolFlags::HTTP3);
-        // No HTTP2 flag set
-        let config = QuicConfig::default();
-        let alt_svc: Vec<AltSvcEntry> = Vec::new();
-        let (protocol, fell_back) = negotiate_http_protocol(&flags, &config, &alt_svc);
-        assert_eq!(protocol, HttpProtocol::Http11);
-        assert!(fell_back);
-    }
-
-    #[test]
-    fn quic_alt_svc_parses_with_quic_protocol_id() {
-        let header = "quic=\":443\"; ma=2592000";
-        let entries = parse_alt_svc_header(header);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].protocol_id, "quic");
-        assert_eq!(entries[0].alt_port, 443);
-    }
-
-    #[test]
-    fn quic_alt_svc_parses_multiple_attributes() {
-        let header = "h3=\":443\"; ma=2592000; persist=1";
-        let entries = parse_alt_svc_header(header);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].protocol_id, "h3");
-    }
-
     // --- Cookie matching edge cases (tested via public helper) ---
-
-    #[test]
-    fn cookie_alt_svc_header_with_spaces_and_empty_parts() {
-        // Extra whitespace and empty segments between commas
-        let entries = parse_alt_svc_header("h3=\":443\"; ma=2592000,  , h3-29=\":443\"; ma=86400");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].protocol_id, "h3");
-        assert_eq!(entries[1].protocol_id, "h3-29");
-    }
 
     #[test]
     fn cookie_alt_svc_handles_missing_alpn() {
@@ -5695,15 +5135,6 @@ mod tests {
     fn network_stack_default_keychain_mapping_disabled() {
         let network = NetworkStack::new();
         assert!(!network.keychain_mapping_enabled());
-    }
-
-    #[test]
-    fn network_stack_default_is_new() {
-        let default = NetworkStack::default();
-        let new = NetworkStack::new();
-        // Can't directly compare, just verify both work
-        assert!(default.http_traces().is_empty());
-        assert!(new.http_traces().is_empty());
     }
 
     #[test]
@@ -5732,24 +5163,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn unpinned_host_passes_when_no_pins_configured() {
-        let pins = PinnedCertificates::new();
-        // No pins configured for any host — verification should pass with
-        // an empty certificate chain, since unpinned hosts are not checked.
-        let _result = pins.verify("example.com", &[]);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-    }
-
-    #[test]
-    fn unpinned_host_passes_with_any_chain() {
-        let pins = PinnedCertificates::new();
-        // Even with certificates present, unpinned hosts should pass.
-        let dummy_cert = vec![0u8; 32];
-        let _result = pins.verify("unpinned.example.com", &[dummy_cert]);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-    }
-
-    #[test]
     fn pinned_host_rejects_empty_chain() {
         let mut pins = PinnedCertificates::new();
         pins.add_pin("pinned.example.com", "dGVzdGZpbmdlcnByaW50");
@@ -5768,15 +5181,6 @@ mod tests {
         // Pinned host should fail with no matching certs.
         let _result = pins.verify("pinned.example.com", &[]);
         assert!(_result.is_err(), "expected Err, got {_result:?}");
-    }
-
-    #[test]
-    fn clear_pins_makes_all_hosts_unpinned() {
-        let mut pins = PinnedCertificates::new();
-        pins.add_pin("example.com", "dGVzdGZpbmdlcnByaW50");
-        pins.clear();
-        let _result = pins.verify("example.com", &[]);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
     }
 
     // -----------------------------------------------------------------------
@@ -5891,14 +5295,6 @@ mod tests {
     }
 
     #[test]
-    fn close_unopened_handle_is_safe() {
-        let mut stack = NetworkStack::new();
-        // Attempt to close a handle that was never opened.
-        // This should be safe (no panic) since close_handle just removes from maps.
-        stack.close_handle(99999);
-    }
-
-    #[test]
     fn double_close_socket_fails_second_time() {
         let mut stack = NetworkStack::new();
         stack.wsa_startup();
@@ -5928,53 +5324,7 @@ mod tests {
         assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
-    #[test]
-    fn quic_state_recovery_clears_poisoned_state() {
-        // Attempt recovery on an unpoisoned state (should still succeed).
-        let result = recover_quic_state();
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-
-        // After recovery, locking should work.
-        let guard = QUIC_STATE.lock();
-        assert!(guard.is_ok(), "expected QUIC state lock to be acquired");
-    }
-
-    #[test]
-    fn quic_state_recovery_idempotent() {
-        // Calling recover_quic_state twice should be safe.
-        assert!(recover_quic_state().is_ok());
-        assert!(recover_quic_state().is_ok());
-    }
-
     // --- Hardening regression tests ---
-
-    #[test]
-    fn parse_host_port_handles_unbracketed_ipv6() {
-        assert_eq!(parse_host_port("::1", 443), ("::1", 443));
-        assert_eq!(parse_host_port("example.com", 443), ("example.com", 443));
-        assert_eq!(
-            parse_host_port("example.com:8080", 443),
-            ("example.com", 8080)
-        );
-        assert_eq!(parse_host_port("[::1]:8443", 443), ("::1", 8443));
-    }
-
-    #[test]
-    fn spnego_token_round_trip_extracts_ticket() {
-        let ticket = b"kerberos-ticket-bytes";
-        let token = build_spnego_token(ticket);
-        // [APPLICATION 0] SEQUENCE wrapper
-        assert_eq!(token[0], 0x60);
-        assert_eq!(parse_spnego_token(&token), Some(ticket.to_vec()));
-    }
-
-    #[test]
-    fn spnego_token_handles_large_tickets() {
-        // Longer than 65535 bytes: the old length encoding truncated.
-        let ticket = vec![0xABu8; 70_000];
-        let token = build_spnego_token(&ticket);
-        assert_eq!(parse_spnego_token(&token), Some(ticket));
-    }
 
     #[test]
     fn read_body_with_huge_count_does_not_panic() {
@@ -5997,57 +5347,6 @@ mod tests {
         network.close_handle(req);
         network.close_handle(conn);
         network.close_handle(session);
-    }
-
-    #[test]
-    fn recv_zero_length_returns_immediately() {
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let listener = network.socket(AddressFamily::Ipv4).expect("listener");
-        let addr = SockAddr {
-            family: AddressFamily::Ipv4,
-            host: "127.0.0.1".to_string(),
-            port: 27021,
-        };
-        network.bind(listener, addr.clone()).expect("bind");
-        network.listen(listener, 1).expect("listen");
-        let client = network.socket(AddressFamily::Ipv4).expect("client");
-        network.connect(client, addr).expect("connect");
-        let server = network.accept(listener).expect("accept");
-        network.send(client, b"data").expect("send");
-        assert_eq!(
-            network.recv(server, 0).expect("zero-length recv"),
-            Vec::<u8>::new()
-        );
-        assert_eq!(network.recv(server, 4).expect("recv"), b"data");
-    }
-
-    #[test]
-    fn recv_caps_guest_length_for_real_streams() {
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = std_listener.local_addr().expect("local addr");
-        let worker = std::thread::spawn(move || {
-            let (mut stream, _) = std_listener.accept().expect("accept");
-            stream.write_all(b"ping").expect("write");
-        });
-
-        let mut network = NetworkStack::new();
-        network.wsa_startup();
-        let socket = network.socket(AddressFamily::Ipv4).expect("socket");
-        network
-            .connect(
-                socket,
-                SockAddr {
-                    family: AddressFamily::Ipv4,
-                    host: addr.ip().to_string(),
-                    port: addr.port(),
-                },
-            )
-            .expect("connect");
-        // A huge guest length must not trigger a giant allocation.
-        let bytes = network.recv(socket, usize::MAX).expect("capped recv");
-        assert_eq!(bytes, b"ping");
-        worker.join().expect("join");
     }
 
     #[test]

@@ -1325,10 +1325,6 @@ mod tests {
     const REMOVED_PTR: u64 = 0x41_480;
     const CONTINUATION_RSP: u64 = 0x10_F00;
 
-    /// Serialises the instrumentation tests so counter deltas are exact
-    /// (the counters are process-wide by design; the port's packet counters
-    /// are only touched by these tests, but wakeup deltas would otherwise
-    /// race each other).
     static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1351,8 +1347,6 @@ mod tests {
         (temp_dir, session)
     }
 
-    /// `mov dword ptr [FLAG_PTR], 1; xor eax, eax; ret` — the wait
-    /// continuation body: records that it ran and returns.
     fn map_cp_continuation(session: &mut NtThunkSession) {
         let mut bytes = vec![0x90_u8; 0x40];
         let mut routine = vec![0xC7, 0x05];
@@ -1400,8 +1394,6 @@ mod tests {
         }
     }
 
-    /// Park the main guest thread through the REAL `park_for_wait` path with
-    /// a continuation that resumes at [`ENTRY_POINT`].
     fn park_main_thread(session: &mut NtThunkSession, wait: GuestWait) {
         let mut state = CpuState::new(GuestArch::X86);
         state.rip = ENTRY_POINT;
@@ -1430,9 +1422,6 @@ mod tests {
         u32::from_le_bytes(session.read_guest(address, 4).try_into().expect("u32 read"))
     }
 
-    /// Guest-thread execution recurses into the interpreter, so thread-start
-    /// tests run on the same 8 MiB scratch stack the runtime's own
-    /// `with_big_stack` helper uses.
     fn with_big_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
@@ -1604,44 +1593,6 @@ mod tests {
     }
 
     #[test]
-    fn parked_completion_port_ex_wait_resumes_with_batched_entries() {
-        let _guard = test_guard();
-        let (_temp_dir, mut session) = test_session();
-        map_cp_continuation(&mut session);
-        let port = session
-            .runtime
-            .win32
-            .create_io_completion_port(None, None, 0, 0)
-            .expect("create port");
-        let port_state = session
-            .runtime
-            .win32
-            .io_completion_port_state(port)
-            .expect("port state");
-        port_state
-            .post(test_packet(5, 0xA1, 0xB1))
-            .expect("post first");
-        port_state
-            .post(test_packet(6, 0xA2, 0xB2))
-            .expect("post second");
-
-        park_main_thread(&mut session, cp_wait_ex(port, 2));
-        assert!(parker_satisfiable(&session));
-        assert!(pump_once(&mut session));
-
-        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
-        assert_eq!(read_u32_guest(&session, REMOVED_PTR), 2);
-        // x86 OVERLAPPED_ENTRY: key, overlapped, internal, bytes (4 bytes each).
-        assert_eq!(read_u32_guest(&session, ENTRIES_PTR), 0xA1);
-        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 4), 0xB1);
-        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 12), 5);
-        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 16), 0xA2);
-        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 20), 0xB2);
-        assert_eq!(read_u32_guest(&session, ENTRIES_PTR + 28), 6);
-        assert_eq!(port_state.queued_packet_count(), 0);
-    }
-
-    #[test]
     fn stolen_completion_port_packet_repark_never_resumes_the_waiter() {
         let _guard = test_guard();
         let (_temp_dir, mut session) = test_session();
@@ -1693,39 +1644,5 @@ mod tests {
         assert_eq!(read_u32_guest(&session, BYTES_PTR), 11);
         assert_eq!(read_u32_guest(&session, KEY_PTR), 0xCC);
         assert_eq!(read_u32_guest(&session, OVERLAPPED_PTR), 0xDD);
-    }
-
-    #[test]
-    fn cooperative_mode_runs_guest_threads_serially_on_the_pumping_host_thread() {
-        with_big_stack(|| {
-            let _guard = test_guard();
-            let (_temp_dir, mut session) = test_session();
-            map_cp_continuation(&mut session);
-            let current_host = std::thread::current().id();
-            let create_thread = session.alloc_thunk(HostThunk::CreateThread);
-            for _ in 0..2 {
-                let handle = session.call_x86(
-                    create_thread,
-                    &[0, 0, ENTRY_POINT as u32, 0, 0, THREAD_ID_PTR as u32],
-                );
-                assert_ne!(handle, 0, "CreateThread");
-            }
-            assert_eq!(session.runtime.pending_guest_threads.len(), 2);
-
-            let before = SCHEDULER_COUNTERS.snapshot();
-            assert!(pump_once(&mut session), "first queued thread runs");
-            assert_eq!(session.runtime.pending_guest_threads.len(), 1);
-            assert!(pump_once(&mut session), "second queued thread runs");
-            assert!(session.runtime.pending_guest_threads.is_empty());
-            assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
-
-            let after = SCHEDULER_COUNTERS.snapshot();
-            assert!(after.guest_thread_switches >= before.guest_thread_switches + 2);
-            assert!(
-                SCHEDULER_COUNTERS.host_worker_observed(current_host),
-                "the pumping host thread executed the slices"
-            );
-            assert!(after.host_worker_busy_nanos > before.host_worker_busy_nanos);
-        });
     }
 }

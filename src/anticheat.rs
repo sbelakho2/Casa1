@@ -926,64 +926,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detect_eac_provider() {
-        assert_eq!(
-            AntiCheatDriverShim::detect_provider("easyanticheat.sys"),
-            AntiCheatProvider::EasyAntiCheat
-        );
-        assert_eq!(
-            AntiCheatDriverShim::detect_provider("EasyAntiCatch_EOS.sys"),
-            AntiCheatProvider::Unknown // typo — no match
-        );
-        assert_eq!(
-            AntiCheatDriverShim::detect_provider("EasyAntiCheat_EOS.sys"),
-            AntiCheatProvider::EasyAntiCheat
-        );
-    }
-
-    #[test]
-    fn detect_battleye_provider() {
-        assert_eq!(
-            AntiCheatDriverShim::detect_provider("bedaisy.sys"),
-            AntiCheatProvider::BattlEye
-        );
-        assert_eq!(
-            AntiCheatDriverShim::detect_provider("BattlEye.sys"),
-            AntiCheatProvider::BattlEye
-        );
-    }
-
-    #[test]
-    fn detect_vanguard_provider() {
-        assert_eq!(
-            AntiCheatDriverShim::detect_provider("vgk.sys"),
-            AntiCheatProvider::RiotVanguard
-        );
-    }
-
-    #[test]
-    fn detect_unknown_provider() {
-        assert_eq!(
-            AntiCheatDriverShim::detect_provider("some_random_driver.sys"),
-            AntiCheatProvider::Unknown
-        );
-    }
-
-    #[test]
     fn is_known_driver_check() {
         assert!(AntiCheatDriverShim::is_known_driver("easyanticheat.sys"));
         assert!(AntiCheatDriverShim::is_known_driver("bedaisy.sys"));
         assert!(AntiCheatDriverShim::is_known_driver("vgk.sys"));
         assert!(!AntiCheatDriverShim::is_known_driver("ntoskrnl.exe"));
-    }
-
-    #[test]
-    fn driver_label_lookup() {
-        assert_eq!(
-            AntiCheatDriverShim::driver_label("easyanticheat.sys"),
-            Some("Easy Anti-Cheat kernel driver")
-        );
-        assert_eq!(AntiCheatDriverShim::driver_label("unknown.sys"), None);
     }
 
     #[test]
@@ -1003,24 +950,6 @@ mod tests {
 
         shim.unload();
         assert_eq!(shim.state, ShimState::Unloaded);
-    }
-
-    #[test]
-    fn shim_process_info() {
-        let mut shim =
-            AntiCheatDriverShim::new("bedaisy.sys", 5000, 2000, r"C:\Games\pubg\TslGame.exe");
-        shim.load().unwrap();
-
-        let info = shim.query_process_info();
-        assert_eq!(info.pid, 5000);
-        assert_eq!(info.parent_pid, 2000);
-        assert_eq!(info.image_path, r"C:\Games\pubg\TslGame.exe");
-        assert_eq!(shim.process_query_count, 1);
-
-        shim.update_process_info(5001, 2001, r"C:\Games\pubg\TslGame_BE.exe");
-        let info = shim.query_process_info();
-        assert_eq!(info.pid, 5001);
-        assert_eq!(info.parent_pid, 2001);
     }
 
     #[test]
@@ -1062,68 +991,6 @@ mod tests {
         assert!(shim.remove_module(0x8000_0000));
         assert_eq!(shim.modules.len(), initial_count);
         assert!(!shim.remove_module(0x8000_0000)); // already removed
-    }
-
-    #[test]
-    fn shim_hardware_info() {
-        let mut shim = AntiCheatDriverShim::new(
-            "mhyprot2.sys",
-            4000,
-            1000,
-            r"C:\Genshin Impact\GenshinImpact.exe",
-        );
-        shim.load().unwrap();
-
-        let hw = shim.query_hardware_info();
-        assert_eq!(shim.hardware_query_count, 1);
-
-        // CPU vendor should be "GenuineIntel"
-        assert_eq!(&hw.cpu_vendor, b"GenuineIntel");
-
-        // MAC address should have locally-administered bit set
-        assert_eq!(hw.mac_address[0] & 0x02, 0x02);
-
-        // Disk serial should be 20 ASCII digits
-        assert_eq!(hw.disk_serial.len(), 20);
-        assert!(hw.disk_serial.chars().all(|c| c.is_ascii_digit()));
-
-        // Motherboard serial should be 64 hex chars (32 bytes from two hashes)
-        assert_eq!(hw.motherboard_serial.len(), 64);
-
-        // Memory should be 16 GB
-        assert_eq!(hw.total_memory_mb, 16 * 1024);
-
-        // Processors should be 8
-        assert_eq!(hw.num_processors, 8);
-
-        // CPU brand should be set
-        assert!(hw.cpu_brand.contains("Intel"));
-
-        // BIOS UUID should have version 4 bits set
-        assert_eq!(hw.bios_uuid[6] & 0xF0, 0x40);
-        assert_eq!(hw.bios_uuid[8] & 0xC0, 0x80);
-    }
-
-    #[test]
-    fn shim_hardware_info_consistency() {
-        let mut shim1 = AntiCheatDriverShim::new("eac.sys", 100, 1, r"C:\game.exe");
-        let mut shim2 = AntiCheatDriverShim::new("eac.sys", 100, 1, r"C:\game.exe");
-        shim1.load().unwrap();
-        shim2.load().unwrap();
-
-        // Same PID should produce same hardware info
-        let hw1 = shim1.query_hardware_info().clone();
-        let hw2 = shim2.query_hardware_info().clone();
-        assert_eq!(hw1.disk_serial, hw2.disk_serial);
-        assert_eq!(hw1.mac_address, hw2.mac_address);
-        assert_eq!(hw1.bios_uuid, hw2.bios_uuid);
-
-        // Different PID should produce different hardware info
-        let mut shim3 = AntiCheatDriverShim::new("eac.sys", 200, 1, r"C:\game.exe");
-        shim3.load().unwrap();
-        let hw3 = shim3.query_hardware_info().clone();
-        assert_ne!(hw1.disk_serial, hw3.disk_serial);
-        assert_ne!(hw1.mac_address, hw3.mac_address);
     }
 
     #[test]

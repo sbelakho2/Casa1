@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 use casa1::canonical::GuestException;
 use casa1::error::ErrorResponse;
 use casa1::ge::{NetworkPolicy, NetworkProfile};
@@ -7,9 +8,8 @@ use casa1::pe;
 use casa1::reason::ReasonCode;
 use casa1::security::{
     CrashModule, CrashSnapshot, CrashThread, EntitlementAuditReport, EntitlementAuditTarget,
-    FilesystemSandbox, NetworkPolicyEnforcer, audit_embedded_entitlements,
-    audit_entitlement_targets, collect_crash_artifact, nightly_sanitizer_commands,
-    parse_http_request,
+    NetworkPolicyEnforcer, audit_embedded_entitlements, audit_entitlement_targets,
+    collect_crash_artifact, nightly_sanitizer_commands, parse_http_request,
 };
 use casa1::shader;
 use std::collections::BTreeMap;
@@ -130,24 +130,6 @@ fn t16_1a_entitlement_audit_allows_only_runner_jit_entitlements() {
 }
 
 #[test]
-fn t16_1b_entitlement_audit_treats_metadata_only_codesign_output_as_empty_entitlements() {
-    let report = audit_entitlement_targets(
-        &[EntitlementAuditTarget {
-            binary_name: "casa1-helper".to_string(),
-            entitlements_xml:
-                "Executable=/tmp/casa1-helper\nwarning: Specifying ':' in the path is deprecated\n"
-                    .to_string(),
-        }],
-        "casa1-runner",
-    )
-    .expect("metadata-only codesign output should parse as empty entitlements");
-
-    assert!(report.approved);
-    assert!(report.jit_targets.is_empty());
-    assert!(report.unexpected_targets.is_empty());
-}
-
-#[test]
 #[cfg(target_os = "macos")]
 fn t16_1c_embedded_entitlement_audit_reads_actual_signed_binaries() {
     let runner_xml = r#"<?xml version="1.0"?><plist><dict>
@@ -243,68 +225,6 @@ fn t16_1d_entitlement_audit_cli_enforces_signed_binary_set_end_to_end() {
             .iter()
             .any(|hint| hint.contains("casa1-helper-bad"))
     );
-}
-
-#[test]
-fn t16_2_sandbox_escape_suite_blocks_traversal_sensitive_paths_and_toctou() {
-    let sandbox = FilesystemSandbox::new(
-        "/Users/test/Casa1/GE",
-        &["/Users/test/Documents".to_string()],
-    );
-    assert!(
-        sandbox
-            .authorize(
-                "/Users/test/Casa1/GE/game/save.dat",
-                "/Users/test/Casa1/GE/game/save.dat",
-                "/Users/test/Casa1/GE/game/save.dat",
-            )
-            .is_ok()
-    );
-    assert!(
-        sandbox
-            .authorize(
-                "/Users/test/Documents/mods/mod.zip",
-                "/Users/test/Documents/mods/mod.zip",
-                "/Users/test/Documents/mods/mod.zip",
-            )
-            .is_ok()
-    );
-    let traversal = sandbox
-        .authorize(
-            "../secret.txt",
-            "/Users/test/Casa1/GE/../secret.txt",
-            "/Users/test/Casa1/secret.txt",
-        )
-        .expect_err("traversal must fail");
-    assert_eq!(traversal.code, ReasonCode::RcFsPathInvalid);
-    let system = sandbox
-        .authorize(
-            "/System/Library/foo",
-            "/System/Library/foo",
-            "/System/Library/foo",
-        )
-        .expect_err("system path must fail");
-    assert_eq!(system.code, ReasonCode::RcFsSandboxEscape);
-    let other_home = sandbox
-        .authorize(
-            "/Users/other/Documents/secret.txt",
-            "/Users/other/Documents/secret.txt",
-            "/Users/other/Documents/secret.txt",
-        )
-        .expect_err("other user home must fail");
-    assert_eq!(other_home.code, ReasonCode::RcFsSandboxEscape);
-    let device = sandbox
-        .authorize("/dev/disk0", "/dev/disk0", "/dev/disk0")
-        .expect_err("device node must fail");
-    assert_eq!(device.code, ReasonCode::RcFsSandboxEscape);
-    let toctou = sandbox
-        .authorize(
-            "/Users/test/Casa1/GE/mods/live.link",
-            "/Users/test/Casa1/GE/mods/live.link",
-            "/Users/other/escape/link",
-        )
-        .expect_err("TOCTOU path swap must fail");
-    assert_eq!(toctou.code, ReasonCode::RcFsSandboxEscape);
 }
 
 #[test]

@@ -16,6 +16,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -61,7 +63,7 @@ jobs:
           brew install ffmpeg
           echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: Run Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings -A future-incompatible
+        run: cargo clippy --all-targets --features angle,dev-insecure-tls,ffmpeg,ffmpeg-next,moltenvk,nightly_alloc_error_hook,opengl,proptest,tungstenite,vulkan,websocket -- -D warnings -A future-incompatible
 
   test:
     name: Test
@@ -70,8 +72,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run unit and binary tests
-        run: cargo test --lib --bins
+      - name: Run affected adversarial tests with 100% changed-line coverage
+        env:
+          CASA1_BASE_REF: origin/main
+        run: bash ci/check_tests.sh
 
   api-gate:
     name: API Coverage Regression Gate

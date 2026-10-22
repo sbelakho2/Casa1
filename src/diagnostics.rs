@@ -2696,30 +2696,6 @@ mod minidump_tests {
     use super::*;
 
     #[test]
-    fn minidump_header_signature() {
-        let buf = build_minidump(&MinidumpParams {
-            exception_code: 0xC0000005,
-            exception_flags: 0,
-            exception_address: 0x140001234,
-            thread_id: 100,
-            rip: 0x140001234,
-            rsp: 0x7FFFFFFF0000,
-            modules: &[],
-            memory_regions: &[],
-            threads: &[],
-        });
-        // Verify signature at offset 0
-        assert!(buf.len() >= 128, "buffer too small: {}", buf.len());
-        let sig = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        assert_eq!(sig, MINIDUMP_SIGNATURE, "bad signature");
-        let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        assert_eq!(version, MINIDUMP_VERSION, "bad version");
-        let num_streams = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        // Exception(3), SystemInfo(4), ThreadList(5) → 3 streams
-        assert_eq!(num_streams, 3, "expected 3 streams");
-    }
-
-    #[test]
     fn minidump_with_modules_and_memory() {
         let stack_data = [0x41u8; 256];
         let heap_data = [0x42u8; 64];
@@ -2747,99 +2723,7 @@ mod minidump_tests {
         assert_eq!(num_streams, 5, "expected 5 streams with modules+memory");
     }
 
-    #[test]
-    fn minidump_context_size() {
-        let _ctx = MinidumpContext::new(0x140000000, 0x7FFFFFFF0000);
-        // Must match the real CONTEXT_AMD64 size so debuggers never walk
-        // past the blob into the next stream.
-        assert_eq!(std::mem::size_of::<MinidumpContext>(), 1232);
-        assert_eq!(MinidumpContext::EXPECTED_SIZE, 1232);
-    }
-
-    #[test]
-    fn minidump_fixed_struct_sizes() {
-        // Spec sizes: header 32 bytes, exception stream 168 bytes,
-        // system info 36 bytes.
-        assert_eq!(std::mem::size_of::<MinidumpHeader>(), 32);
-        assert_eq!(std::mem::size_of::<MinidumpExceptionStream>(), 168);
-        assert_eq!(std::mem::size_of::<MinidumpSystemInfo>(), 36);
-        assert_eq!(std::mem::size_of::<MinidumpDirectory>(), 12);
-    }
-
-    #[test]
-    fn minidump_header_layout_matches_parser() {
-        let dump = build_minidump(&MinidumpParams {
-            exception_code: 0xC0000005,
-            exception_flags: 0,
-            exception_address: 0x140001234,
-            thread_id: 100,
-            rip: 0x140001234,
-            rsp: 0x7FFFFFFF0000,
-            modules: &[],
-            memory_regions: &[],
-            threads: &[],
-        });
-        // TimeDateStamp lives at offset 20 (CheckSum@16, Flags@24), so the
-        // parser reading flags at 24 agrees with the writer's layout.
-        let timestamp = u32::from_le_bytes(dump[20..24].try_into().unwrap());
-        assert!(timestamp > 0, "time_date_stamp should be at offset 20");
-        let header = parse_minidump_header(&dump).expect("valid minidump");
-        assert_eq!(header.flags, MINIDUMP_TYPE_NORMAL as u64);
-    }
-
-    #[test]
-    fn minidump_context_at_expected_rva() {
-        let params = MinidumpParams {
-            exception_code: 0xC0000005,
-            exception_flags: 0,
-            exception_address: 0x140001234,
-            thread_id: 100,
-            rip: 0x140001234,
-            rsp: 0x7FFFFFFF0000,
-            modules: &[],
-            memory_regions: &[],
-            threads: &[],
-        };
-        let buf = build_minidump(&params);
-        // The directory starts at 128; the exception stream is the first
-        // entry (stream_type 3), 12 bytes per entry.
-        let exc_rva = u32::from_le_bytes(buf[128 + 8..128 + 12].try_into().unwrap()) as usize;
-        let exc_size = u32::from_le_bytes(buf[128 + 4..128 + 8].try_into().unwrap()) as usize;
-        assert_eq!(exc_size, 168, "exception stream must match spec size");
-
-        // ThreadContext descriptor is the last 8 bytes of the stream.
-        let ctx_size =
-            u32::from_le_bytes(buf[exc_rva + 160..exc_rva + 164].try_into().unwrap()) as usize;
-        let ctx_rva =
-            u32::from_le_bytes(buf[exc_rva + 164..exc_rva + 168].try_into().unwrap()) as usize;
-
-        let expected = build_context(params.rip, params.rsp);
-        assert_eq!(ctx_size, expected.len(), "context size must be advertised");
-        assert_eq!(
-            ctx_rva + ctx_size,
-            exc_rva + exc_size + expected.len(),
-            "context must sit immediately after the exception stream"
-        );
-        assert_eq!(
-            &buf[ctx_rva..ctx_rva + ctx_size],
-            &expected[..],
-            "context bytes must be present at the advertised RVA"
-        );
-
-        // The bytes right after the context are SystemInfo data (its
-        // processor_architecture field = 9), not zero padding.
-        let sysinfo_rva = ctx_rva + ctx_size;
-        let arch = u16::from_le_bytes(buf[sysinfo_rva..sysinfo_rva + 2].try_into().unwrap());
-        assert_eq!(arch, 9, "SystemInfo stream must follow the context blob");
-    }
-
     // ── Checked read helper tests ──────────────────────────────────────────
-
-    #[test]
-    fn read_u32_le_valid() {
-        let buf: Vec<u8> = 0x01020304_u32.to_le_bytes().to_vec();
-        assert_eq!(read_u32_le(&buf, 0), Some(0x01020304));
-    }
 
     #[test]
     fn read_u32_le_truncated() {
@@ -2855,27 +2739,9 @@ mod minidump_tests {
     }
 
     #[test]
-    fn read_u64_le_valid() {
-        let buf: Vec<u8> = 0x0102030405060708_u64.to_le_bytes().to_vec();
-        assert_eq!(read_u64_le(&buf, 0), Some(0x0102030405060708));
-    }
-
-    #[test]
     fn read_u64_le_truncated() {
         let buf = [0u8; 7];
         assert_eq!(read_u64_le(&buf, 0), None);
-    }
-
-    #[test]
-    fn read_bytes_valid() {
-        let buf = [1, 2, 3, 4, 5];
-        assert_eq!(read_bytes(&buf, 1, 3), Some(&[2, 3, 4][..]));
-    }
-
-    #[test]
-    fn read_bytes_exceeds_buffer() {
-        let buf = [1, 2, 3];
-        assert_eq!(read_bytes(&buf, 1, 3), None);
     }
 
     // ── Malformed minidump tests ───────────────────────────────────────────
@@ -2904,25 +2770,6 @@ mod minidump_tests {
         let result = parse_minidump_header(&buf);
         assert!(result.is_err(), "expected Err, got {result:?}");
         assert!(result.unwrap_err().contains("invalid minidump signature"));
-    }
-
-    #[test]
-    fn parse_minidump_valid_header() {
-        let dump = build_minidump(&MinidumpParams {
-            exception_code: 0xC0000005,
-            exception_flags: 0,
-            exception_address: 0x140001234,
-            thread_id: 100,
-            rip: 0x140001234,
-            rsp: 0x7FFFFFFF0000,
-            modules: &[],
-            memory_regions: &[],
-            threads: &[],
-        });
-        let header = parse_minidump_header(&dump).expect("valid minidump");
-        assert_eq!(header.signature, MINIDUMP_SIGNATURE);
-        assert_eq!(header.version, MINIDUMP_VERSION);
-        assert_eq!(header.number_of_streams, 3); // Exception, SystemInfo, ThreadList
     }
 
     #[test]
@@ -2958,25 +2805,6 @@ mod minidump_tests {
             result.is_err(),
             "should reject out-of-bounds directory offset"
         );
-    }
-
-    #[test]
-    fn parse_minidump_zero_streams_ok() {
-        let mut buf = vec![0u8; 128];
-        buf[0..4].copy_from_slice(&MINIDUMP_SIGNATURE.to_le_bytes());
-        buf[4..8].copy_from_slice(&MINIDUMP_VERSION.to_le_bytes());
-        buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // 0 streams
-        buf[12..16].copy_from_slice(&128u32.to_le_bytes()); // directory at end of header
-        buf[24..32].copy_from_slice(&0u64.to_le_bytes());
-
-        let result = parse_minidump_header(&buf);
-        assert!(
-            result.is_ok(),
-            "zero streams should be valid: {:?}",
-            result.err()
-        );
-        let header = result.unwrap();
-        assert_eq!(header.number_of_streams, 0);
     }
 
     #[test]

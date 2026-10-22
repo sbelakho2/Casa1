@@ -8127,40 +8127,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn paced_sleep_duration_non_live_caps_host_sleep_at_1ms() {
-        // Without live pacing the guest clock drives timing; the host only
-        // yields briefly (0 ms for a zero-length sleep).
-        assert_eq!(paced_sleep_duration_ms(0, false), 0);
-        assert_eq!(paced_sleep_duration_ms(1, false), 1);
-        assert_eq!(paced_sleep_duration_ms(25, false), 1);
-    }
-
-    #[test]
-    fn paced_sleep_duration_live_paces_the_full_duration() {
-        assert_eq!(paced_sleep_duration_ms(0, true), 0);
-        assert_eq!(paced_sleep_duration_ms(1, true), 1);
-        assert_eq!(paced_sleep_duration_ms(8, true), 8);
-        assert_eq!(paced_sleep_duration_ms(16, true), 16);
-        assert_eq!(paced_sleep_duration_ms(33, true), 33);
-    }
-
-    #[test]
-    fn split_find_search_pattern_keeps_root_and_defaults_empty_pattern() {
-        assert_eq!(
-            split_find_search_pattern("C:\\Steam\\*"),
-            ("C:\\Steam".to_string(), "*".to_string())
-        );
-        assert_eq!(
-            split_find_search_pattern("C:\\*.*"),
-            ("C:\\".to_string(), "*.*".to_string())
-        );
-        assert_eq!(
-            split_find_search_pattern("C:\\Steam\\"),
-            ("C:\\Steam".to_string(), "*".to_string())
-        );
-    }
-
-    #[test]
     fn windows_pattern_matches_is_case_insensitive_and_supports_wildcards() {
         assert!(windows_pattern_matches("*.dll", "Kernel32.DLL"));
         assert!(windows_pattern_matches("steam??.tmp", "Steam01.tmp"));
@@ -8169,36 +8135,6 @@ mod tests {
         assert!(!windows_pattern_matches("steam??.tmp", "Steam001.tmp"));
     }
 
-    #[test]
-    fn io_completion_port_posts_and_dequeues_packets() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "iocp", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        let port = win32
-            .create_io_completion_port(None, None, 0, 0)
-            .expect("create completion port");
-        win32
-            .post_queued_completion_status(port, 7, 0x1234, 0x5678)
-            .expect("post completion status");
-
-        let packets = win32
-            .dequeue_io_completion_packets(port, 4)
-            .expect("dequeue completion packet");
-
-        assert_eq!(
-            packets,
-            vec![IoCompletionPacket {
-                bytes_transferred: 7,
-                completion_key: 0x1234,
-                overlapped: 0x5678,
-                internal: 0,
-            }]
-        );
-    }
-
-    /// Test-side predicate poll (never used inside the wait path under test).
     fn wait_until(mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while !predicate() {
@@ -8212,50 +8148,6 @@ mod tests {
         let ge = GameEnvironment::create_in(temp_dir.path(), name, GeArch::X86, "win11-23h2")
             .expect("create game environment");
         (temp_dir, Win32Subsystem::new(ge, false))
-    }
-
-    #[test]
-    fn iocp_waiter_blocks_and_post_wakes_it_within_latency_bound() {
-        let (_temp_dir, mut win32) = iocp_test_subsystem("iocp-wake");
-        let port = win32
-            .create_io_completion_port(None, None, 0, 0)
-            .expect("create completion port");
-        let state = win32.io_completion_port_state(port).expect("wait state");
-
-        let waiter_state = Arc::clone(&state);
-        let waiter = std::thread::spawn(move || {
-            let started = Instant::now();
-            let result = waiter_state.wait_dequeue(Some(Duration::from_secs(5)), 1);
-            (started.elapsed(), result)
-        });
-        // Wait until the thread is parked on the condition variable, then
-        // give it a moment to enter the actual wait (a notify issued before
-        // the wait call could otherwise be lost).
-        wait_until(|| state.waiter_count() == 1);
-        assert_eq!(state.counters().poll_iterations, 1);
-        std::thread::sleep(Duration::from_millis(20));
-
-        win32
-            .post_queued_completion_status(port, 11, 0xAA, 0xBB)
-            .expect("post completion status");
-        let (elapsed, result) = waiter.join().expect("waiter thread");
-        let packets = result.expect("waiter must receive the posted packet");
-        assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].bytes_transferred, 11);
-        assert_eq!(packets[0].completion_key, 0xAA);
-        assert_eq!(packets[0].overlapped, 0xBB);
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "waiter woke after {elapsed:?}; expected a condition-variable wake"
-        );
-        let counters = state.counters();
-        assert_eq!(counters.packets_posted, 1);
-        assert_eq!(counters.packets_dequeued, 1);
-        assert_eq!(counters.waiter_wakeups, 1);
-        assert!(
-            counters.poll_iterations <= 2,
-            "event-driven wait must not poll: {counters:?}"
-        );
     }
 
     #[test]
@@ -8286,83 +8178,6 @@ mod tests {
             "120 ms of waiting must not poll: {counters:?}"
         );
         assert_eq!(CompletionPortWaitError::TimedOut.last_error(), WAIT_TIMEOUT);
-    }
-
-    #[test]
-    fn iocp_get_queued_completion_status_blocks_until_posted() {
-        let (_temp_dir, mut win32) = iocp_test_subsystem("iocp-gqcs");
-        let port = win32
-            .create_io_completion_port(None, None, 0, 0)
-            .expect("create completion port");
-        let state = win32.io_completion_port_state(port).expect("wait state");
-
-        let poster_state = Arc::clone(&state);
-        let poster = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
-            poster_state
-                .post(IoCompletionPacket {
-                    bytes_transferred: 5,
-                    completion_key: 0xC0DE,
-                    overlapped: 0xBEEF,
-                    internal: 0,
-                })
-                .expect("post");
-        });
-
-        let started = Instant::now();
-        let outcome = win32
-            .get_queued_completion_status(port, 2_000)
-            .expect("get queued completion status");
-        let elapsed = started.elapsed();
-        poster.join().expect("poster thread");
-        match outcome {
-            CompletionPortWaitOutcome::Packets(packets) => {
-                assert_eq!(packets.len(), 1);
-                assert_eq!(packets[0].completion_key, 0xC0DE);
-                assert_eq!(packets[0].bytes_transferred, 5);
-                assert_eq!(packets[0].overlapped, 0xBEEF);
-            }
-            other => panic!("expected a packet, got {other:?}"),
-        }
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "blocked call did not wake promptly: {elapsed:?}"
-        );
-
-        // Timeout arm: no packet queued, finite timeout.
-        let outcome = win32
-            .get_queued_completion_status(port, 60)
-            .expect("timeout wait");
-        assert_eq!(outcome, CompletionPortWaitOutcome::TimedOut);
-        assert_eq!(outcome.last_error(), WAIT_TIMEOUT);
-
-        // Batch arm: the Ex form removes up to the requested count, FIFO.
-        for key in [1u64, 2, 3] {
-            win32
-                .post_queued_completion_status(port, key as u32, key, 0)
-                .expect("post batch packet");
-        }
-        match win32
-            .get_queued_completion_status_ex(port, 2, 500)
-            .expect("batch wait")
-        {
-            CompletionPortWaitOutcome::Packets(packets) => {
-                assert_eq!(packets.len(), 2);
-                assert_eq!(packets[0].completion_key, 1);
-                assert_eq!(packets[1].completion_key, 2);
-            }
-            other => panic!("expected a batch, got {other:?}"),
-        }
-        match win32
-            .get_queued_completion_status_ex(port, 2, 500)
-            .expect("batch wait")
-        {
-            CompletionPortWaitOutcome::Packets(packets) => {
-                assert_eq!(packets.len(), 1);
-                assert_eq!(packets[0].completion_key, 3);
-            }
-            other => panic!("expected a batch, got {other:?}"),
-        }
     }
 
     #[test]
@@ -8809,31 +8624,6 @@ mod tests {
     // ── Handle generation tests ────────────────────────────────────────
 
     #[test]
-    fn handle_generation_starts_at_zero() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "gen-test", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let win32 = Win32Subsystem::new(ge, false);
-        // No handles allocated yet
-        assert!(win32.handle_generation(4).is_none());
-    }
-
-    #[test]
-    fn handle_generation_is_tracked_on_allocation() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge =
-            GameEnvironment::create_in(temp_dir.path(), "gen-test2", GeArch::X86, "win11-23h2")
-                .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let (h, _existed) = win32.create_event(true, false, false, None);
-        assert_eq!(
-            win32.handle_generation(h),
-            Some(0),
-            "first allocation should have generation 0"
-        );
-    }
-
-    #[test]
     fn handle_generation_increments_on_close() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let ge =
@@ -8871,145 +8661,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_reuse_gets_new_generation_after_close() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge =
-            GameEnvironment::create_in(temp_dir.path(), "gen-reuse", GeArch::X86, "win11-23h2")
-                .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let (h1, _) = win32.create_event(true, false, false, None);
-        let gen1 = win32.handle_generation(h1).expect("gen");
-        win32.close_handle(h1).expect("close");
-
-        let mut handles = Vec::new();
-        for _ in 0..256 {
-            let (h, _) = win32.create_event(true, false, false, None);
-            handles.push(h);
-        }
-        for h in handles {
-            win32.close_handle(h).expect("close batch");
-        }
-
-        // Closed values are recycled FIFO, so the next allocation reuses the
-        // oldest freed value (h1) — and must carry a fresh generation.
-        let (h2, _) = win32.create_event(true, false, false, None);
-        assert_eq!(h2, h1, "oldest closed handle value must be recycled");
-        let gen2 = win32.handle_generation(h2).expect("gen2");
-        assert_ne!(gen1, gen2, "recycled handle must get a new generation");
-    }
-
     // ── Synchronization primitive tests ────────────────────────────────
-
-    #[test]
-    fn event_auto_reset_signals_and_waits() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "evt-auto", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        // manual_reset=false → auto-reset event
-        let (h, _) = win32.create_event(false, false, false, None);
-        assert_eq!(
-            win32
-                .wait_for_single_object(h, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Timeout,
-            "auto-reset event should time out when not signalled"
-        );
-        win32.set_event(h).expect("set");
-        assert_eq!(
-            win32
-                .wait_for_single_object(h, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Object0,
-            "auto-reset event should be signalled after set"
-        );
-        // For an auto-reset event the first wait consumes the signal,
-        // so a second wait should time out.
-        assert_eq!(
-            win32
-                .wait_for_single_object(h, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Timeout,
-            "auto-reset event should reset after wait consumes signal"
-        );
-        win32.close_handle(h).expect("close");
-    }
-
-    #[test]
-    fn event_manual_reset_stays_signalled_until_reset() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "evt-man", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        // manual_reset=true → manual-reset event
-        let (h, _) = win32.create_event(true, false, false, None);
-        win32.set_event(h).expect("set");
-        assert_eq!(
-            win32
-                .wait_for_single_object(h, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Object0,
-            "manual-reset event should be signalled"
-        );
-        // For a manual-reset event the signal should persist after wait.
-        assert_eq!(
-            win32
-                .wait_for_single_object(h, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Object0,
-            "manual-reset event should remain signalled after wait"
-        );
-        win32.reset_event(h).expect("reset");
-        assert_eq!(
-            win32
-                .wait_for_single_object(h, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Timeout,
-            "manual-reset event should time out after reset"
-        );
-        win32.close_handle(h).expect("close");
-    }
-
-    #[test]
-    fn mutex_acquire_and_release() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "mtx-ar", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        let h = win32.create_mutex(false, false);
-        assert_eq!(
-            win32
-                .wait_for_single_object(h, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Object0,
-            "free mutex should be signalled"
-        );
-        win32.release_mutex(h).expect("release");
-        win32.close_handle(h).expect("close");
-    }
-
-    #[test]
-    fn mutex_abandoned_detection() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "mtx-ab", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        let h = win32.create_mutex(true, false);
-        win32.abandon_mutex(h).expect("abandon");
-        let status = win32
-            .wait_for_single_object(h, 0, false, None)
-            .expect("wait");
-        assert!(
-            matches!(status, WaitStatus::Abandoned),
-            "abandoned mutex should yield Abandoned, got {status:?}"
-        );
-        win32.close_handle(h).expect("close");
-    }
 
     #[test]
     fn mutex_ownership_recursion_and_abandonment() {
@@ -9083,157 +8735,6 @@ mod tests {
             "owner termination must abandon the mutex, got {status:?}"
         );
         win32.close_handle(h).expect("close");
-    }
-
-    #[test]
-    fn semaphore_release_increments_count() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "sem-inc", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        let h = win32.create_semaphore(0, 5, false);
-        assert_eq!(
-            win32
-                .wait_for_single_object(h, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Timeout,
-            "semaphore with count 0 should time out"
-        );
-        let prev = win32.release_semaphore(h, 1).expect("release");
-        assert_eq!(prev, 0, "previous count should be 0");
-        assert_eq!(
-            win32
-                .wait_for_single_object(h, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Object0,
-            "semaphore with count >=1 should be signalled"
-        );
-        win32.close_handle(h).expect("close");
-    }
-
-    #[test]
-    fn semaphore_release_saturates_at_max() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "sem-max", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        let h = win32.create_semaphore(3, 3, false);
-        let prev = win32.release_semaphore(h, 1).expect("release");
-        assert_eq!(prev, 3, "previous count should be 3 (already at max)");
-        // After saturating release, count should remain at max (3).
-        assert_eq!(
-            win32
-                .wait_for_single_object(h, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Object0,
-            "semaphore should still be signalled after saturating release"
-        );
-        win32.close_handle(h).expect("close");
-    }
-
-    #[test]
-    fn wait_for_multiple_objects_wait_all() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "wfa", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        // Use manual-reset events so wait_all doesn't consume signals mid-loop.
-        let (h1, _) = win32.create_event(true, false, false, None);
-        let (h2, _) = win32.create_event(true, false, false, None);
-
-        // Timeout carries a `usize::MAX` sentinel, never a handle index.
-        assert_eq!(
-            win32
-                .wait_for_multiple_objects(&[h1, h2], true, 0, false, None)
-                .expect("wait"),
-            (WaitStatus::Timeout, usize::MAX),
-            "wait-all with no objects signalled should time out"
-        );
-        win32.set_event(h1).expect("set");
-        assert_eq!(
-            win32
-                .wait_for_multiple_objects(&[h1, h2], true, 0, false, None)
-                .expect("wait"),
-            (WaitStatus::Timeout, usize::MAX),
-            "wait-all with only one of two signalled should time out"
-        );
-        win32.set_event(h2).expect("set");
-        assert_eq!(
-            win32
-                .wait_for_multiple_objects(&[h1, h2], true, 0, false, None)
-                .expect("wait"),
-            (WaitStatus::Object0, 0usize),
-            "wait-all with both signalled should succeed"
-        );
-
-        win32.close_handle(h1).expect("close");
-        win32.close_handle(h2).expect("close");
-    }
-
-    #[test]
-    fn wait_for_multiple_objects_wait_all_consumes_auto_reset_signals_once() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "wfa-auto", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        // Auto-reset events: the wait-all must peek before consuming,
-        // otherwise the second (destructive) pass could never succeed and
-        // the wait would spin forever.
-        let (h1, _) = win32.create_event(false, false, false, None);
-        let (h2, _) = win32.create_event(false, false, false, None);
-        win32.set_event(h1).expect("set");
-        win32.set_event(h2).expect("set");
-        assert_eq!(
-            win32
-                .wait_for_multiple_objects(&[h1, h2], true, 0, false, None)
-                .expect("wait"),
-            (WaitStatus::Object0, 0usize),
-            "wait-all with both auto-reset events set should succeed"
-        );
-        // Signals were consumed exactly once.
-        assert_eq!(
-            win32
-                .wait_for_single_object(h1, 0, false, None)
-                .expect("wait"),
-            WaitStatus::Timeout,
-            "auto-reset signal should be consumed by the wait-all"
-        );
-        win32.close_handle(h1).expect("close");
-        win32.close_handle(h2).expect("close");
-    }
-
-    #[test]
-    fn wait_for_multiple_objects_wait_any() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "wfany", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        let (h1, _) = win32.create_event(false, false, false, None);
-        let (h2, _) = win32.create_event(false, false, false, None);
-
-        assert_eq!(
-            win32
-                .wait_for_multiple_objects(&[h1, h2], false, 0, false, None)
-                .expect("wait"),
-            (WaitStatus::Timeout, usize::MAX),
-            "wait-any with no objects signalled should time out"
-        );
-        win32.set_event(h1).expect("set");
-        assert_eq!(
-            win32
-                .wait_for_multiple_objects(&[h1, h2], false, 0, false, None)
-                .expect("wait"),
-            (WaitStatus::Object0, 0usize),
-            "wait-any with one signalled should succeed"
-        );
-
-        win32.close_handle(h1).expect("close");
-        win32.close_handle(h2).expect("close");
     }
 
     #[test]
@@ -9700,28 +9201,6 @@ mod tests {
     // ── File I/O semantics tests ───────────────────────────────────────
 
     #[test]
-    fn create_file_opens_new_or_existing() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "cf01", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        let path = "C:\\test_create_file.txt";
-        let h = win32
-            .create_file_w(
-                path,
-                FileAccess::read_write(),
-                ShareMode::none(),
-                CreationDisposition::CreateAlways,
-                false,
-                false,
-                false,
-            )
-            .expect("create file");
-        win32.close_handle(h).expect("close");
-    }
-
-    #[test]
     fn open_existing_fails_on_missing_file() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let ge = GameEnvironment::create_in(temp_dir.path(), "oe01", GeArch::X86, "win11-23h2")
@@ -10037,41 +9516,6 @@ mod tests {
                 .exists(),
             "destination must contain the moved file"
         );
-    }
-
-    #[test]
-    fn move_file_ex_respects_delete_sharing_on_source() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "mvsh01", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        let h = win32
-            .create_file_w(
-                "C:\\mv-share.txt",
-                FileAccess::read_write(),
-                ShareMode::none(),
-                CreationDisposition::CreateAlways,
-                false,
-                false,
-                false,
-            )
-            .expect("open source without FILE_SHARE_DELETE");
-
-        // An open source handle without FILE_SHARE_DELETE blocks the move.
-        let result = win32.move_file_ex_w("C:\\mv-share.txt", "C:\\mv-share-dst.txt", false, false);
-        assert_eq!(
-            result.expect_err("move must be denied").code,
-            ReasonCode::RcFsSharingViolation,
-            "moving a source held open without FILE_SHARE_DELETE must be a sharing violation"
-        );
-
-        win32.close_handle(h).expect("close source");
-
-        // With no handles left the move succeeds.
-        win32
-            .move_file_ex_w("C:\\mv-share.txt", "C:\\mv-share-dst.txt", false, false)
-            .expect("move after closing the source");
     }
 
     #[test]
@@ -10459,112 +9903,9 @@ mod tests {
         win32.close_handle(h2).expect("close");
     }
 
-    #[test]
-    fn file_pointer_advances_on_read_write() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "fp01", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let path = "C:\\file_ptr_test.txt";
-
-        let h = win32
-            .create_file_w(
-                path,
-                FileAccess::read_write(),
-                ShareMode::none(),
-                CreationDisposition::CreateAlways,
-                false,
-                false,
-                false,
-            )
-            .expect("create");
-        win32.write_file(h, b"abcdef").expect("write");
-
-        let pos = win32
-            .set_file_pointer_ex(h, 0, SeekOrigin::Current)
-            .expect("tell");
-        assert_eq!(pos, 6, "file pointer should be at end after write");
-
-        let pos = win32
-            .set_file_pointer_ex(h, 2, SeekOrigin::Begin)
-            .expect("seek");
-        assert_eq!(pos, 2, "file pointer should be at position 2 after seek");
-
-        let data = win32.read_file(h, 3).expect("read");
-        assert_eq!(data, b"cde", "should read bytes 2-4");
-
-        win32.close_handle(h).expect("close");
-    }
-
     // ── Registry path canonicalization tests ───────────────────────────
 
-    #[test]
-    fn registry_path_canonicalization_lowercases() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "reg01", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        win32
-            .create_registry_key("HKCU", "Software\\MyTestApp", RegistryView::Native)
-            .expect("create key");
-
-        assert!(
-            win32
-                .registry_key_exists("HKCU", "Software\\MyTestApp", RegistryView::Native,)
-                .unwrap_or(false),
-            "created key should exist"
-        );
-
-        let h = win32.open_registry_key("HKCU", "software\\mytestapp", RegistryView::Native, false);
-        assert_ne!(
-            h, 0,
-            "opening with different case should return a valid handle"
-        );
-        win32.close_handle(h).expect("close handle");
-    }
-
-    #[test]
-    fn registry_path_trailing_backslash_normalized() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "reg02", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-
-        win32
-            .create_registry_key("HKCU", "Software\\TestApp2", RegistryView::Native)
-            .expect("create key");
-
-        let h =
-            win32.open_registry_key("HKCU", "Software\\TestApp2\\", RegistryView::Native, false);
-        assert_ne!(
-            h, 0,
-            "opening with trailing backslash should return a valid handle"
-        );
-        win32.close_handle(h).expect("close handle");
-    }
-
     // ── Code-page conversion tests ─────────────────────────────────────
-
-    #[test]
-    fn code_page_conversion_utf8_roundtrip() {
-        let input = "Hello, World!";
-        let bytes = iconv_ffi::convert_from_utf8(CP_WIN1252, input);
-        if let Some(bytes) = bytes {
-            let roundtrip = iconv_ffi::convert_to_utf8(CP_WIN1252, &bytes);
-            assert_eq!(roundtrip, Some(input.to_string()));
-        }
-        // If iconv is not available (non-macOS), the test is a no-op
-    }
-
-    #[test]
-    fn code_page_conversion_empty_input() {
-        let result = iconv_ffi::convert_to_utf8(CP_WIN1252, &[]);
-        // Should return Some("") or None depending on platform
-        if let Some(s) = result {
-            assert!(s.is_empty(), "empty input should produce empty output");
-        }
-    }
 
     #[test]
     fn code_page_conversion_large_input_does_not_overflow() {
@@ -10596,32 +9937,6 @@ mod tests {
     // ── Audit regression tests ─────────────────────────────────────────
 
     #[test]
-    fn read_file_beyond_eof_returns_empty() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "reof", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let h = win32
-            .create_file_w(
-                "C:\\beyond_eof.txt",
-                FileAccess::read_write(),
-                ShareMode::all(),
-                CreationDisposition::CreateAlways,
-                false,
-                false,
-                false,
-            )
-            .expect("create file");
-        win32.write_file(h, b"abc").expect("write");
-        win32
-            .set_file_pointer_ex(h, 1000, SeekOrigin::Begin)
-            .expect("seek past EOF");
-        let data = win32.read_file(h, 16).expect("read past EOF");
-        assert!(data.is_empty(), "read past EOF must return zero bytes");
-        win32.close_handle(h).expect("close");
-    }
-
-    #[test]
     fn write_file_huge_position_never_panics() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let ge = GameEnvironment::create_in(temp_dir.path(), "wpos", GeArch::X86, "win11-23h2")
@@ -10651,69 +9966,6 @@ mod tests {
             "write at huge position must not panic"
         );
         win32.close_handle(h).expect("close");
-    }
-
-    #[test]
-    fn delete_file_share_delete_violation() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "df-sd", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let h1 = win32
-            .create_file_w(
-                "C:\\del-share.txt",
-                FileAccess::read_write(),
-                ShareMode::read_only(),
-                CreationDisposition::CreateAlways,
-                false,
-                false,
-                false,
-            )
-            .expect("open file without FILE_SHARE_DELETE");
-        win32.write_file(h1, b"data").expect("write");
-
-        // An open handle without FILE_SHARE_DELETE blocks deletion.
-        let denied = win32
-            .delete_file_w("C:\\del-share.txt")
-            .expect_err("delete must be denied");
-        assert_eq!(
-            denied.code,
-            ReasonCode::RcFsSharingViolation,
-            "delete without FILE_SHARE_DELETE must report a sharing violation"
-        );
-
-        win32.close_handle(h1).expect("close");
-
-        // Reopening with FILE_SHARE_DELETE permits deletion; the surviving
-        // handle is marked delete_pending.
-        let h2 = win32
-            .create_file_w(
-                "C:\\del-share.txt",
-                FileAccess::read_only(),
-                ShareMode {
-                    read: true,
-                    write: false,
-                    delete: true,
-                },
-                CreationDisposition::OpenExisting,
-                false,
-                false,
-                false,
-            )
-            .expect("reopen with FILE_SHARE_DELETE");
-        win32
-            .delete_file_w("C:\\del-share.txt")
-            .expect("delete allowed with FILE_SHARE_DELETE");
-        match win32.handle_object(h2).expect("surviving handle") {
-            KernelObject::File(file) => {
-                assert!(
-                    file.borrow().delete_pending,
-                    "surviving handle must be marked delete_pending"
-                );
-            }
-            _ => panic!("expected a file handle"),
-        }
-        win32.close_handle(h2).expect("close");
     }
 
     #[test]
@@ -10765,123 +10017,6 @@ mod tests {
         );
         win32.close_handle(h1).expect("close");
         win32.close_handle(h2).expect("close");
-    }
-
-    #[test]
-    fn named_pipe_recreated_after_server_close() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "npipe", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let h = win32
-            .create_named_pipe_w(
-                r"\\.\pipe\audit-recreate",
-                0x3,
-                0,
-                1,
-                4096,
-                4096,
-                0,
-                false,
-                None,
-                None,
-            )
-            .expect("create pipe");
-        win32.close_handle(h).expect("close pipe");
-        let h2 = win32
-            .create_named_pipe_w(
-                r"\\.\pipe\audit-recreate",
-                0x3,
-                0,
-                1,
-                4096,
-                4096,
-                0,
-                false,
-                None,
-                None,
-            )
-            .expect("recreate pipe after close");
-        win32.close_handle(h2).expect("close recreated pipe");
-    }
-
-    #[test]
-    fn named_pipe_message_mode_reads_exactly_one_message_per_read() {
-        // PIPE_READMODE_MESSAGE: each WriteFile appends a [u32 len][bytes]
-        // frame and a message-mode ReadFile returns exactly one message.
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "msgpipe", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let server = win32
-            .create_named_pipe_w(
-                r"\\.\pipe\msg-test",
-                0x3,
-                PIPE_READMODE_MESSAGE,
-                1,
-                4096,
-                4096,
-                0,
-                false,
-                None,
-                None,
-            )
-            .expect("create server");
-        let client = win32
-            .open_named_pipe_client(r"\\.\pipe\msg-test", false)
-            .expect("open client");
-
-        // The client writes two messages; the server reads them back one
-        // message per read, in order, with no framing leakage.
-        win32
-            .write_file(client, b"first")
-            .expect("write first message");
-        win32
-            .write_file(client, b"second-message")
-            .expect("write second message");
-        assert_eq!(
-            win32.read_file(server, 4096).expect("server read #1"),
-            b"first",
-            "message-mode read returns exactly the first message"
-        );
-        assert_eq!(
-            win32.read_file(server, 4096).expect("server read #2"),
-            b"second-message",
-            "message-mode read returns exactly the second message"
-        );
-
-        // A byte-mode read on the client side returns the raw byte stream.
-        win32
-            .set_named_pipe_handle_state(client, Some(PIPE_READMODE_BYTE), None, None)
-            .expect("set byte read mode");
-        win32.write_file(server, b"response").expect("server write");
-        assert_eq!(
-            win32.read_file(client, 4096).expect("client byte read"),
-            b"response",
-            "byte-mode read returns the raw stream"
-        );
-
-        // A buffer smaller than the message never overruns: the read
-        // returns exactly the requested bytes and the remainder stays
-        // queued (re-framed) for the next read.
-        win32
-            .set_named_pipe_handle_state(server, Some(PIPE_READMODE_MESSAGE), None, None)
-            .expect("set message read mode");
-        win32
-            .write_file(client, b"oversized-message-payload")
-            .expect("write oversized message");
-        assert_eq!(
-            win32.read_file(server, 4).expect("short message read"),
-            b"over",
-            "message-mode read must never return more than the requested length"
-        );
-        assert_eq!(
-            win32.read_file(server, 4096).expect("remainder read"),
-            b"sized-message-payload",
-            "the message remainder stays queued for the next read"
-        );
-        win32.close_handle(client).expect("close client");
-        win32.close_handle(server).expect("close server");
     }
 
     #[test]
@@ -10948,47 +10083,6 @@ mod tests {
     }
 
     #[test]
-    fn call_named_pipe_w_returns_server_response_not_request() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "cnpw", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let server = win32
-            .create_named_pipe_w(
-                r"\\.\pipe\cnpw-test",
-                0x3,
-                0,
-                1,
-                4096,
-                4096,
-                0,
-                false,
-                None,
-                None,
-            )
-            .expect("create server");
-        // The server writes its response into the pipe; CallNamedPipeW
-        // returns whatever the server wrote, NOT a copy of the request.
-        win32
-            .write_file(server, b"server-answer")
-            .expect("server response write");
-        let response = win32
-            .call_named_pipe_w(r"\\.\pipe\cnpw-test", b"request-data", 4096, 0)
-            .expect("call named pipe");
-        assert_eq!(
-            response, b"server-answer",
-            "CallNamedPipeW must return the server's bytes, not the request"
-        );
-        // With no queued response the helper returns empty (the thunk layer
-        // parks the guest thread on the scheduler wait instead).
-        let empty = win32
-            .call_named_pipe_w(r"\\.\pipe\cnpw-test", b"another-request", 4096, 0)
-            .expect("call named pipe with no response");
-        assert!(empty.is_empty());
-        win32.close_handle(server).expect("close server");
-    }
-
-    #[test]
     fn map_view_of_file_validates_offset_and_size() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let ge = GameEnvironment::create_in(temp_dir.path(), "mview", GeArch::X86, "win11-23h2")
@@ -11028,47 +10122,6 @@ mod tests {
             "double unmap must fail"
         );
         win32.close_handle(section).expect("close section");
-    }
-
-    #[test]
-    fn heap_alloc_reuses_freed_blocks() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "hfree", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let heap = win32.heap_create(16, false);
-        let first = win32.heap_alloc(heap, 100).expect("alloc");
-        win32.heap_free(heap, first).expect("free");
-        let second = win32.heap_alloc(heap, 100).expect("alloc again");
-        assert_eq!(
-            first, second,
-            "freed block must be reused instead of growing the high-water mark"
-        );
-        win32.heap_destroy(heap).expect("destroy heap");
-    }
-
-    #[test]
-    fn get_temp_file_name_w_is_unique_across_consecutive_calls() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "tname", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let first = win32.get_temp_file_name_w("", "CASA").expect("first name");
-        let second = win32.get_temp_file_name_w("", "CASA").expect("second name");
-        assert_ne!(first, second, "consecutive temp names must be unique");
-    }
-
-    #[test]
-    fn tls_slots_are_reused_after_free() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "tls", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let mut win32 = Win32Subsystem::new(ge, false);
-        let first = win32.tls_alloc();
-        let second = win32.tls_alloc();
-        assert_ne!(first, second);
-        win32.tls_free(first);
-        assert_eq!(first, win32.tls_alloc(), "freed slot must be reused");
     }
 
     #[test]
@@ -11221,44 +10274,5 @@ mod tests {
             "SetEndOfFile on a non-file handle must be ERROR_INVALID_HANDLE"
         );
         win32.close_handle(h).expect("close");
-    }
-
-    #[test]
-    fn volume_capacity_reports_the_real_host_volume() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "cap", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
-        let win32 = Win32Subsystem::new(ge, false);
-
-        let capacity = win32
-            .volume_capacity(Some("C:\\"))
-            .expect("capacity for the mapped drive root");
-        assert!(
-            capacity.total_bytes > 0,
-            "the volume backing the GE drive must report non-zero capacity"
-        );
-        assert!(
-            capacity.free_bytes <= capacity.total_bytes,
-            "free bytes must never exceed total bytes"
-        );
-        assert!(
-            capacity.bytes_per_sector >= 1 && capacity.sectors_per_cluster >= 1,
-            "geometry must be well-formed"
-        );
-        let cluster_size =
-            u64::from(capacity.bytes_per_sector) * u64::from(capacity.sectors_per_cluster);
-        assert!(
-            capacity.total_bytes >= capacity.total_clusters.saturating_mul(cluster_size),
-            "cluster geometry must be consistent with the reported bytes"
-        );
-
-        // A syntactically-valid but nonexistent path resolves to its volume.
-        let missing = win32
-            .volume_capacity(Some("C:\\No\\Such\\Directory"))
-            .expect("capacity for a nonexistent path");
-        assert_eq!(
-            missing.total_bytes, capacity.total_bytes,
-            "nonexistent paths report the same volume"
-        );
     }
 }

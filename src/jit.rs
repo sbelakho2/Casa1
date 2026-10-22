@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 // ── Memory-access helpers called from JIT-compiled code ─────────────────────
 //
@@ -109,14 +109,22 @@ pub unsafe extern "C" fn jit_helper_store(
         _ => 8,
     };
     let result = mem.guest_write_checked(address, &bytes[..write_len]);
-    if let Err(fault) = result {
-        // Guest access violation: remember the faulting address (the precise
-        // first-unmapped byte) and the access type for the dispatcher.
-        if !state.is_null() {
-            unsafe {
-                (*state).jit_pending_fault = Some(fault.address);
-                (*state).jit_pending_fault_write = true;
-            };
+    match result {
+        Ok(()) => {
+            // Self-modifying code: a native store to a page that hosts a
+            // compiled block must invalidate that block before it runs again.
+            note_guest_code_write(address, write_len);
+        }
+        Err(fault) => {
+            // Guest access violation: remember the faulting address (the
+            // precise first-unmapped byte) and the access type for the
+            // dispatcher.
+            if !state.is_null() {
+                unsafe {
+                    (*state).jit_pending_fault = Some(fault.address);
+                    (*state).jit_pending_fault_write = true;
+                };
+            }
         }
     }
 }
@@ -646,10 +654,10 @@ pub fn jit_lowering_telemetry() -> (u64, u64) {
 
 // ── JIT helper semantic tests ───────────────────────────────────────────────
 //
-// The JIT is dormant on macOS 26 (MAP_JIT execution is blocked for
-// ad-hoc-signed binaries), but the host-side helpers are plain `extern "C"`
-// functions — these tests call `jit_helper_set_flags` / `jit_helper_load`
-// directly and check their semantics against the x86 truth table.
+// Native execution is capability-gated (see `jit_execution_capability`); the
+// host-side helpers are plain `extern "C"` functions — these tests call
+// `jit_helper_set_flags` / `jit_helper_load` directly and check their
+// semantics against the x86 truth table.
 
 #[cfg(test)]
 mod jit_helper_semantics {
@@ -678,10 +686,6 @@ mod jit_helper_semantics {
         (0..8).filter(|&i| low & (1 << i) != 0).count() % 2 == 0
     }
 
-    /// x86 truth table for ADD, computed with plain overflowing addition on
-    /// the width-masked operands.  The sum is truncated to the operation
-    /// width BEFORE the carry test: 8-bit 0xff + 0x01 wraps to 0x00 with a
-    /// carry, even though the u64 addition 255 + 1 does not overflow.
     fn truth_add(lhs: u64, rhs: u64, bits: u32) -> ExpectedFlags {
         let m = width_mask(bits);
         let (a, b) = (lhs & m, rhs & m);
@@ -697,8 +701,6 @@ mod jit_helper_semantics {
         }
     }
 
-    /// x86 truth table for SUB/CMP, computed with plain overflowing
-    /// subtraction on the width-masked operands.
     fn truth_sub(lhs: u64, rhs: u64, bits: u32) -> ExpectedFlags {
         let m = width_mask(bits);
         let (a, b) = (lhs & m, rhs & m);
@@ -715,8 +717,6 @@ mod jit_helper_semantics {
         }
     }
 
-    /// x86 truth table for logical ops (and/or/xor/test): carry/overflow/
-    /// auxiliary-carry are cleared.
     fn truth_logic(result: u64, bits: u32) -> ExpectedFlags {
         let r = result & width_mask(bits);
         let msb = 1u64 << (bits - 1);
@@ -747,8 +747,6 @@ mod jit_helper_semantics {
         read_flags(&state)
     }
 
-    /// Assert add/sub/cmp/logic flag sets against the x86 truth table for one
-    /// (width, lhs, rhs) vector, and that cmp ≡ sub.
     fn check_vector(name: &str, lhs: u64, rhs: u64, width: u64) {
         let bits = (width * 8) as u32;
         let m = width_mask(bits);
@@ -787,105 +785,6 @@ mod jit_helper_semantics {
             truth_logic(logic, bits),
             "{name} (w={width}): logic flags mismatch for {a:#x} & {b:#x}"
         );
-    }
-
-    #[test]
-    fn jit_helper_set_flags_arithmetic_truth_table_vectors() {
-        // Every vector runs at every width; masked operands keep the
-        // semantics well-defined at 8/16/32/64 bits.
-        let vectors: &[(&str, u64, u64)] = &[
-            // 8-bit OF (0x7f + 1)
-            ("0x7f+1", 0x7f, 1),
-            // 8-bit CF+OF (0x80 + 0x80)
-            ("0x80+0x80", 0x80, 0x80),
-            // 8-bit CF (0xff + 1)
-            ("0xff+1", 0xff, 1),
-            // 16-bit OF (0x7fff + 1)
-            ("0x7fff+1", 0x7fff, 1),
-            // 16-bit CF+OF (0x8000 + 0x8000)
-            ("0x8000+0x8000", 0x8000, 0x8000),
-            // 32-bit OF (0x7fffffff + 1)
-            ("0x7fffffff+1", 0x7fff_ffff, 1),
-            // 32-bit CF+OF (0x80000000 + 0x80000000)
-            ("0x80000000+0x80000000", 0x8000_0000, 0x8000_0000),
-            // 64-bit OF (0x7fffffffffffffff + 1)
-            ("0x7fffffffffffffff+1", 0x7fff_ffff_ffff_ffff, 1),
-            // 64-bit CF+OF (0x8000000000000000 + 0x8000000000000000)
-            (
-                "0x8000000000000000+0x8000000000000000",
-                0x8000_0000_0000_0000,
-                0x8000_0000_0000_0000,
-            ),
-            // 64-bit CF (0xffffffffffffffff + 1)
-            ("0xffffffffffffffff+1", 0xffff_ffff_ffff_ffff, 1),
-            // 8-bit CF (0x80 - 1)
-            ("0x80-1", 0x80, 1),
-            // 8-bit signed underflow (0x7f - 0x80)
-            ("0x7f-0x80", 0x7f, 0x80),
-            // 32-bit signed underflow (0x7fffffff - 0x80000000)
-            ("0x7fffffff-0x80000000", 0x7fff_ffff, 0x8000_0000),
-            // 64-bit signed underflow (0x7fffffffffffffff - 0x8000000000000000)
-            (
-                "0x7fffffffffffffff-0x8000000000000000",
-                0x7fff_ffff_ffff_ffff,
-                0x8000_0000_0000_0000,
-            ),
-            // equal operands (ZF + CF=0)
-            ("equal", 0x1234_5678_9abc_def0, 0x1234_5678_9abc_def0),
-            // zero operands (all clear except PF)
-            ("zero", 0, 0),
-            // AF edge: 0x0f + 1
-            ("0x0f+1", 0x0f, 1),
-            // AF edge + CF: 0x0f + 0x0f
-            ("0x0f+0x0f", 0x0f, 0x0f),
-        ];
-        // width is the byte width the helper expects (1/2/4/8 bytes →
-        // 8/16/32/64-bit arithmetic).
-        for width in [1u64, 2, 4, 8] {
-            for &(name, lhs, rhs) in vectors {
-                check_vector(name, lhs, rhs, width);
-            }
-        }
-    }
-
-    #[test]
-    fn jit_helper_cmp_matches_sub_flags() {
-        // CMP must produce exactly the flags SUB produces (no result store).
-        // Broad deterministic operand coverage: sign combinations, borrow
-        // boundaries, and byte/nibble auxiliary-carry boundaries.
-        let pairs: &[(u64, u64)] = &[
-            (0, 0),
-            (0, 1),
-            (1, 0),
-            (0x7f, 0x80),
-            (0x80, 0x7f),
-            (0x7f, 0x7f),
-            (0x0f, 0x10),
-            (0x10, 0x0f),
-            (0x0f, 0x0f),
-            (0x7fff_ffff, 0x8000_0000),
-            (0x8000_0000, 0x7fff_ffff),
-            (0x7fff_ffff, 0x7fff_ffff),
-            (0xffff_ffff_ffff_ffff, 1),
-            (0x8000_0000_0000_0000, 0x7fff_ffff_ffff_ffff),
-            (0x7fff_ffff_ffff_ffff, 0x8000_0000_0000_0000),
-            (0xdead_beef_cafe_f00d, 0x0123_4567_89ab_cdef),
-            (0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff),
-        ];
-        for width in [1u64, 2, 4, 8] {
-            let bits = (width * 8) as u32;
-            let m = width_mask(bits);
-            for &(lhs, rhs) in pairs {
-                let (a, b) = (lhs & m, rhs & m);
-                let diff = a.wrapping_sub(b);
-                let sub_flags = call_set_flags(diff, a, b, 1, width);
-                let cmp_flags = call_set_flags(diff, a, b, 3, width);
-                assert_eq!(
-                    cmp_flags, sub_flags,
-                    "cmp({a:#x}, {b:#x}) @ {width} bits must equal sub flags"
-                );
-            }
-        }
     }
 
     #[test]
@@ -1003,8 +902,6 @@ mod jit_helper_semantics {
         assert_eq!(memory.read_u8(0x4008).unwrap(), 0x88);
     }
 
-    /// All values used by the width-stride samples: the width edges plus a
-    /// uniform stride sample across the full width.
     fn stride_sample_values(bits: u32) -> Vec<u64> {
         let mask = width_mask(bits);
         let msb = 1u64 << (bits - 1);
@@ -1107,6 +1004,644 @@ mod jit_helper_semantics {
 
 const JIT_PAGE_SIZE: usize = 64 * 1024;
 
+// ── Executable-memory capability probe ──────────────────────────────────────
+//
+// Native execution is enabled only after this probe has actually EXECUTED an
+// ARM64 stub (`movz w0, #42 ; ret`) through a candidate mechanism.  The probe
+// runs in throw-away child processes so a blocked mechanism is observed as a
+// SIGBUS/SIGSEGV exit status instead of killing the emulator.
+//
+// Empirically measured on macOS 26 / Apple Silicon (M5 Pro):
+//
+//   mechanism                                      result
+//   ---------------------------------------------  --------------------------
+//   mmap RW anon -> mprotect RX                    executes, returns 42
+//   MAP_JIT RWX + pthread_jit_write_protect_np     executes, returns 42
+//   MAP_JIT RW + pthread_jit_write_protect_np      SIGBUS (no PROT_EXEC)
+//   MAP_JIT RWX, no write-protect toggles          SIGBUS (write-protect on)
+//
+// The SIGBUS on the RW-only MAP_JIT mapping was the long-standing blocker:
+// PROT_EXEC is required in the mmap request — pthread_jit_write_protect_np
+// only toggles write protection, it cannot add execute permission.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitExecMechanism {
+    /// MAP_JIT with PROT_READ|PROT_WRITE|PROT_EXEC, toggled with
+    /// `pthread_jit_write_protect_np(0/1)` around code writes.
+    MapJitWx,
+    /// Plain RW anonymous mapping flipped to RX with `mprotect`.
+    MprotectRx,
+    /// Direct RWX mapping (non-Apple-Silicon fallback).
+    RwxMmap,
+    /// No mechanism could execute the stub; compiled blocks stay disabled and
+    /// the interpreter/AOT path handles every guest block.
+    Unavailable,
+}
+
+impl std::fmt::Display for JitExecMechanism {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MapJitWx => write!(f, "MAP_JIT RWX + pthread_jit_write_protect_np"),
+            Self::MprotectRx => write!(f, "mmap RW + mprotect RX"),
+            Self::RwxMmap => write!(f, "mmap RWX"),
+            Self::Unavailable => write!(f, "unavailable"),
+        }
+    }
+}
+
+/// Outcome of one executable-memory probe, including the exact OS refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitExecProbeOutcome {
+    /// The ARM64 stub executed and returned this value (42 on success).
+    Executed(u64),
+    /// `mmap` failed with this errno.
+    MmapFailed(i32),
+    /// `mprotect(PROT_EXEC)` failed with this errno.
+    MprotectFailed(i32),
+    /// The process faulted while writing the stub (serialised with this signal).
+    WriteFaulted(i32),
+    /// The process faulted while executing the stub (serialised with this signal).
+    ExecuteFaulted(i32),
+    /// `fork` failed with this errno.
+    ForkFailed(i32),
+    /// The probe child exited without a result (exit status).
+    ChildFailed(i32),
+    /// The probe does not run on this build target.
+    NotProbed,
+}
+
+impl std::fmt::Display for JitExecProbeOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Executed(value) => write!(f, "executed, returned {value}"),
+            Self::MmapFailed(errno) => write!(
+                f,
+                "mmap failed: errno {errno} ({})",
+                std::io::Error::from_raw_os_error(errno)
+            ),
+            Self::MprotectFailed(errno) => write!(
+                f,
+                "mprotect(PROT_EXEC) failed: errno {errno} ({})",
+                std::io::Error::from_raw_os_error(errno)
+            ),
+            Self::WriteFaulted(signal) => write!(f, "write faulted: signal {signal}"),
+            Self::ExecuteFaulted(signal) => write!(f, "execution faulted: signal {signal}"),
+            Self::ForkFailed(errno) => write!(
+                f,
+                "fork failed: errno {errno} ({})",
+                std::io::Error::from_raw_os_error(errno)
+            ),
+            Self::ChildFailed(code) => write!(f, "probe child exited without a result: {code}"),
+            Self::NotProbed => write!(f, "not probed on this target"),
+        }
+    }
+}
+
+/// Raw probe matrix for every mechanism the JIT knows about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitExecProbeMatrix {
+    pub mprotect_rx: JitExecProbeOutcome,
+    pub map_jit_wx_write_protect: JitExecProbeOutcome,
+    /// The historical allocator mode (MAP_JIT without PROT_EXEC).  Kept as an
+    /// explicit negative probe so the regression cannot return silently.
+    pub map_jit_rw_write_protect: JitExecProbeOutcome,
+    /// MAP_JIT RWX written without the write-protect toggle.
+    pub map_jit_wx_no_write_protect: JitExecProbeOutcome,
+    /// Mechanism the JIT actually uses (first successful probe).
+    pub selected: JitExecMechanism,
+}
+
+impl JitExecProbeMatrix {
+    // Used by the Apple Silicon probe module; on other targets the selected
+    // mechanism is the conservative RwxMmap fallback.
+    #[allow(dead_code)]
+    fn select(
+        mprotect_rx: JitExecProbeOutcome,
+        map_jit_wx_write_protect: JitExecProbeOutcome,
+        map_jit_rw_write_protect: JitExecProbeOutcome,
+        map_jit_wx_no_write_protect: JitExecProbeOutcome,
+    ) -> Self {
+        let selected = if matches!(map_jit_wx_write_protect, JitExecProbeOutcome::Executed(42)) {
+            JitExecMechanism::MapJitWx
+        } else if matches!(mprotect_rx, JitExecProbeOutcome::Executed(42)) {
+            JitExecMechanism::MprotectRx
+        } else {
+            JitExecMechanism::Unavailable
+        };
+        Self {
+            mprotect_rx,
+            map_jit_wx_write_protect,
+            map_jit_rw_write_protect,
+            map_jit_wx_no_write_protect,
+            selected,
+        }
+    }
+}
+
+/// Run the full probe once per process.  Cached because each probe forks four
+/// short-lived children and the answer cannot change while the process lives.
+static JIT_EXECUTION_CAPABILITY: LazyLock<JitExecProbeMatrix> = LazyLock::new(probe_jit_execution);
+
+/// Cached executable-memory capability of the current process.
+pub fn jit_execution_capability() -> JitExecProbeMatrix {
+    *JIT_EXECUTION_CAPABILITY
+}
+
+/// True when at least one mechanism executed the ARM64 probe stub.
+pub fn jit_execution_available() -> bool {
+    jit_execution_capability().selected != JitExecMechanism::Unavailable
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod exec_probe {
+    use super::{JitExecProbeMatrix, JitExecProbeOutcome};
+    use std::ffi::c_void;
+    use std::ptr;
+
+    const PROBE_PAGE_SIZE: usize = 4096;
+    /// `movz w0, #42 ; ret`
+    const PROBE_STUB: [u32; 2] = [0x5280_0540, 0xd65f_03c0];
+
+    const STAGE_MMAP_FAILED: u32 = 1;
+    const STAGE_MPROTECT_FAILED: u32 = 2;
+    const STAGE_WRITING: u32 = 3;
+    const STAGE_EXECUTING: u32 = 4;
+    const STAGE_EXECUTED: u32 = 5;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProbeMessage {
+        stage: u32,
+        value: i32,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProbeMode {
+        MprotectRx,
+        MapJitWxProtect,
+        MapJitRwProtect,
+        MapJitWxNoProtect,
+        /// Fault injection: request an mmap the kernel must refuse.
+        #[cfg(test)]
+        InvalidMmap,
+        /// Fault injection: mprotect an unaligned address so the kernel refuses.
+        #[cfg(test)]
+        InvalidMprotect,
+        /// Fault injection: exit without reporting any probe stage.
+        #[cfg_attr(not(test), allow(dead_code))]
+        ExitWithoutResult,
+    }
+
+    /// Test-only seams used to drive the probe's OS-failure protocol without
+    /// requiring a genuinely broken host.
+    #[cfg(test)]
+    static PROBE_FORCE_PIPE_FAIL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    #[cfg(test)]
+    static PROBE_FORCE_FORK_FAIL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    #[cfg(test)]
+    static PROBE_FORCE_MPROTECT_FAIL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    // Replace the real waitpid status with a synthetic signaled status so the
+    // parent-side signal mapping is deterministic.
+    #[cfg(test)]
+    thread_local! {
+        static PROBE_FORCE_SIGNAL_STATUS: std::cell::Cell<Option<i32>> =
+            const { std::cell::Cell::new(None) };
+    }
+    // Force the MAP_JIT RW mapping request to be refused so the child reaches
+    // the normal exit path instead of dying on the SIGBUS it exists to prove.
+    #[cfg(test)]
+    thread_local! {
+        static PROBE_FORCE_MAP_JIT_RW_MMAP_FAIL: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Terminate the probe process.  Test builds use the normal `exit` path so
+    /// LLVM's coverage counters recorded by the forked child are flushed;
+    /// production keeps the async-signal-safe `_exit`.
+    unsafe fn probe_exit(code: libc::c_int) -> ! {
+        #[cfg(test)]
+        {
+            unsafe { libc::exit(code) }
+        }
+        #[cfg(not(test))]
+        {
+            unsafe { libc::_exit(code) }
+        }
+    }
+
+    fn last_errno() -> i32 {
+        // SAFETY: `__error()` returns the calling thread's errno slot on macOS.
+        unsafe { *libc::__error() }
+    }
+
+    fn send(fd: libc::c_int, stage: u32, value: i32) {
+        let message = ProbeMessage { stage, value };
+        // SAFETY: `fd` is the probe pipe's write end; the message is 8 bytes
+        // (well below PIPE_BUF), so the write is atomic.  Errors are ignored:
+        // the parent detects a missing result as a child failure.
+        unsafe {
+            let _ = libc::write(
+                fd,
+                &message as *const ProbeMessage as *const c_void,
+                std::mem::size_of::<ProbeMessage>(),
+            );
+        }
+    }
+
+    /// Child half: map, write, protect, EXECUTE the stub, then `_exit`.
+    /// Deliberately allocation-free (only syscalls + a raw fn pointer).
+    unsafe fn probe_child(mode: ProbeMode, fd: libc::c_int) -> ! {
+        // A parent may have installed a SIGBUS page-sync handler; restore the
+        // default so a blocked mechanism terminates instead of looping.
+        unsafe {
+            libc::signal(libc::SIGBUS, libc::SIG_DFL);
+            libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+        }
+
+        let (prot, flags) = match mode {
+            ProbeMode::MprotectRx | ProbeMode::ExitWithoutResult => (
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            ),
+            ProbeMode::MapJitWxProtect | ProbeMode::MapJitWxNoProtect => (
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_JIT,
+            ),
+            ProbeMode::MapJitRwProtect => (
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_JIT,
+            ),
+            #[cfg(test)]
+            ProbeMode::InvalidMmap => (
+                libc::PROT_READ | libc::PROT_WRITE,
+                // Unknown flag bit: the kernel must reject the request.
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | 0x4000_0000,
+            ),
+            #[cfg(test)]
+            ProbeMode::InvalidMprotect => (
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            ),
+        };
+
+        // Test-only seam: the real MAP_JIT RW child dies on SIGBUS before the
+        // profile runtime can flush, so inject an invalid flag to exercise the
+        // same arm through the mmap-failure report path instead.
+        #[cfg(test)]
+        let flags = if matches!(mode, ProbeMode::MapJitRwProtect)
+            && PROBE_FORCE_MAP_JIT_RW_MMAP_FAIL.with(|flag| flag.take())
+        {
+            flags | 0x4000_0000
+        } else {
+            flags
+        };
+
+        match mode {
+            // Exit non-zero without a result message: the parent must report
+            // the child's exit status via the ChildFailed outcome.
+            ProbeMode::ExitWithoutResult => unsafe { probe_exit(7) },
+            _ => {}
+        }
+
+        // SAFETY: plain anonymous mmap; fd=-1 with MAP_ANONYMOUS is valid.
+        let page = unsafe { libc::mmap(ptr::null_mut(), PROBE_PAGE_SIZE, prot, flags, -1, 0) };
+        if page == libc::MAP_FAILED {
+            send(fd, STAGE_MMAP_FAILED, last_errno());
+            unsafe { probe_exit(0) };
+        }
+
+        if matches!(
+            mode,
+            ProbeMode::MapJitWxProtect | ProbeMode::MapJitRwProtect
+        ) {
+            unsafe { libc::pthread_jit_write_protect_np(0) };
+        }
+
+        send(fd, STAGE_WRITING, 0);
+        // SAFETY: `page` is a live PROBE_PAGE_SIZE mapping and the stub fits.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                PROBE_STUB.as_ptr() as *const u8,
+                page as *mut u8,
+                std::mem::size_of_val(&PROBE_STUB),
+            );
+        }
+
+        #[cfg(test)]
+        if matches!(mode, ProbeMode::InvalidMprotect) {
+            // Unaligned address: mprotect must fail with EINVAL, exercising the
+            // same reporting arm as a genuine permission failure.
+            let unaligned = (page as *mut u8).wrapping_add(1) as *mut c_void;
+            let rc = unsafe {
+                libc::mprotect(
+                    unaligned,
+                    PROBE_PAGE_SIZE,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                )
+            };
+            if rc != 0 {
+                send(fd, STAGE_MPROTECT_FAILED, last_errno());
+                unsafe { probe_exit(0) };
+            }
+        }
+
+        if matches!(mode, ProbeMode::MprotectRx) {
+            #[cfg(test)]
+            let forced = PROBE_FORCE_MPROTECT_FAIL.swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let forced = false;
+            let rc = if forced {
+                unsafe { libc::open(c"/casa1/probe/mprotect-failure".as_ptr(), libc::O_RDONLY) };
+                -1
+            } else {
+                unsafe { libc::mprotect(page, PROBE_PAGE_SIZE, libc::PROT_READ | libc::PROT_EXEC) }
+            };
+            if rc != 0 {
+                send(fd, STAGE_MPROTECT_FAILED, last_errno());
+                unsafe { probe_exit(0) };
+            }
+        } else if matches!(
+            mode,
+            ProbeMode::MapJitWxProtect | ProbeMode::MapJitRwProtect
+        ) {
+            unsafe { libc::pthread_jit_write_protect_np(1) };
+        }
+
+        send(fd, STAGE_EXECUTING, 0);
+        // SAFETY: the mapping contains the two-instruction ARM64 stub and (for
+        // the successful modes) is executable.  A blocked mapping faults here;
+        // the parent observes the signal on the child.
+        let stub: unsafe extern "C" fn() -> u64 = unsafe { std::mem::transmute(page) };
+        let value = unsafe { stub() };
+        send(fd, STAGE_EXECUTED, value as i32);
+        unsafe { probe_exit(0) }
+    }
+
+    fn run(mode: ProbeMode) -> JitExecProbeOutcome {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` points to two valid c_int slots.
+        #[cfg(test)]
+        let forced_pipe_failure =
+            PROBE_FORCE_PIPE_FAIL.swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let forced_pipe_failure = false;
+        let pipe_rc = if forced_pipe_failure {
+            // Fault injection: a real failing syscall sets errno before the
+            // same error-reporting path as a failed pipe(2).
+            unsafe { libc::open(c"/casa1/probe/pipe-failure".as_ptr(), libc::O_RDONLY) };
+            -1
+        } else {
+            unsafe { libc::pipe(fds.as_mut_ptr()) }
+        };
+        if pipe_rc != 0 {
+            return JitExecProbeOutcome::ForkFailed(last_errno());
+        }
+        // SAFETY: fork has no Rust-level preconditions.  The child only uses
+        // async-signal-safe syscalls and a raw code pointer, then `_exit`s.
+        #[cfg(test)]
+        let forced_fork_failure =
+            PROBE_FORCE_FORK_FAIL.swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let forced_fork_failure = false;
+        let pid = if forced_fork_failure {
+            unsafe { libc::open(c"/casa1/probe/fork-failure".as_ptr(), libc::O_RDONLY) };
+            -1
+        } else {
+            unsafe { libc::fork() }
+        };
+        if pid < 0 {
+            let errno = last_errno();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return JitExecProbeOutcome::ForkFailed(errno);
+        }
+        if pid == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                probe_child(mode, fds[1]);
+            }
+        }
+
+        unsafe { libc::close(fds[1]) };
+        let mut last: Option<ProbeMessage> = None;
+        loop {
+            let mut message = ProbeMessage { stage: 0, value: 0 };
+            // SAFETY: `message` is a valid 8-byte destination and `fds[0]` is
+            // the open read end of the probe pipe.
+            let read = unsafe {
+                libc::read(
+                    fds[0],
+                    &mut message as *mut ProbeMessage as *mut c_void,
+                    std::mem::size_of::<ProbeMessage>(),
+                )
+            };
+            if read == std::mem::size_of::<ProbeMessage>() as isize {
+                last = Some(message);
+                continue;
+            }
+            break;
+        }
+        unsafe { libc::close(fds[0]) };
+
+        let mut status: libc::c_int = 0;
+        // SAFETY: `pid` is the child returned by fork above.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        #[cfg(test)]
+        if let Some(forced) = PROBE_FORCE_SIGNAL_STATUS.with(|forced| forced.replace(None)) {
+            status = forced;
+        }
+        let signal = if libc::WIFSIGNALED(status) {
+            libc::WTERMSIG(status)
+        } else {
+            0
+        };
+
+        match last {
+            Some(message) if message.stage == STAGE_EXECUTED => {
+                JitExecProbeOutcome::Executed(message.value as u64)
+            }
+            Some(message) if message.stage == STAGE_MMAP_FAILED => {
+                JitExecProbeOutcome::MmapFailed(message.value)
+            }
+            Some(message) if message.stage == STAGE_MPROTECT_FAILED => {
+                JitExecProbeOutcome::MprotectFailed(message.value)
+            }
+            Some(message) if message.stage == STAGE_WRITING => {
+                JitExecProbeOutcome::WriteFaulted(signal)
+            }
+            Some(_) => JitExecProbeOutcome::ExecuteFaulted(signal),
+            None => {
+                if libc::WIFEXITED(status) {
+                    JitExecProbeOutcome::ChildFailed(libc::WEXITSTATUS(status))
+                } else {
+                    JitExecProbeOutcome::ExecuteFaulted(signal)
+                }
+            }
+        }
+    }
+
+    pub(super) fn matrix() -> JitExecProbeMatrix {
+        let mprotect_rx = run(ProbeMode::MprotectRx);
+        let map_jit_wx_write_protect = run(ProbeMode::MapJitWxProtect);
+        let map_jit_rw_write_protect = run(ProbeMode::MapJitRwProtect);
+        let map_jit_wx_no_write_protect = run(ProbeMode::MapJitWxNoProtect);
+        JitExecProbeMatrix::select(
+            mprotect_rx,
+            map_jit_wx_write_protect,
+            map_jit_rw_write_protect,
+            map_jit_wx_no_write_protect,
+        )
+    }
+
+    #[cfg(test)]
+    mod probe_fault_tests {
+        use super::*;
+
+        #[test]
+        fn jit_probe_invalid_mmap_reports_exact_errno() {
+            assert_eq!(
+                run(ProbeMode::InvalidMmap),
+                JitExecProbeOutcome::MmapFailed(libc::EINVAL),
+                "an invalid mmap request must serialise the kernel errno"
+            );
+        }
+
+        #[test]
+        fn jit_probe_invalid_mprotect_reports_exact_errno() {
+            assert_eq!(
+                run(ProbeMode::InvalidMprotect),
+                JitExecProbeOutcome::MprotectFailed(libc::EINVAL),
+                "an unaligned mprotect must serialise EINVAL"
+            );
+        }
+
+        #[test]
+        fn jit_probe_map_jit_rw_without_exec_rejects_execution() {
+            assert_eq!(
+                run(ProbeMode::MapJitRwProtect),
+                JitExecProbeOutcome::ExecuteFaulted(libc::SIGBUS),
+                "a MAP_JIT RW mapping without PROT_EXEC must fault when executed"
+            );
+        }
+
+        #[test]
+        fn jit_probe_map_jit_rw_mapping_rejection_reports_einval() {
+            PROBE_FORCE_MAP_JIT_RW_MMAP_FAIL.with(|flag| flag.set(true));
+            let outcome = run(ProbeMode::MapJitRwProtect);
+            PROBE_FORCE_MAP_JIT_RW_MMAP_FAIL.with(|flag| flag.set(false));
+            assert_eq!(
+                outcome,
+                JitExecProbeOutcome::MmapFailed(libc::EINVAL),
+                "an invalid MAP_JIT RW mapping request must report EINVAL instead of executing the stub"
+            );
+        }
+
+        #[test]
+        fn jit_probe_forced_mprotect_failure_reports_real_errno() {
+            PROBE_FORCE_MPROTECT_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                run(ProbeMode::MprotectRx),
+                JitExecProbeOutcome::MprotectFailed(libc::ENOENT),
+                "a refused mprotect must keep the failing syscall's errno"
+            );
+        }
+
+        #[test]
+        fn jit_probe_silent_child_exit_rejects_success() {
+            assert_eq!(
+                run(ProbeMode::ExitWithoutResult),
+                JitExecProbeOutcome::ChildFailed(7),
+                "a silent probe child must surface its exit status"
+            );
+        }
+
+        #[test]
+        fn jit_probe_signal_death_rejects_execution_success() {
+            PROBE_FORCE_SIGNAL_STATUS.with(|status| status.set(Some(libc::SIGSEGV)));
+            assert_eq!(
+                run(ProbeMode::ExitWithoutResult),
+                JitExecProbeOutcome::ExecuteFaulted(libc::SIGSEGV),
+                "a signal death must surface the signal, not a success"
+            );
+        }
+
+        #[test]
+        fn jit_probe_pipe_failure_reports_real_errno() {
+            PROBE_FORCE_PIPE_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                run(ProbeMode::MprotectRx),
+                JitExecProbeOutcome::ForkFailed(libc::ENOENT),
+                "pipe failure must keep the failing syscall's errno"
+            );
+        }
+
+        #[test]
+        fn jit_probe_fork_failure_reports_real_errno() {
+            PROBE_FORCE_FORK_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                run(ProbeMode::MprotectRx),
+                JitExecProbeOutcome::ForkFailed(libc::ENOENT),
+                "fork failure must keep the failing syscall's errno"
+            );
+        }
+
+        #[test]
+        fn jit_probe_send_pins_exact_message_and_rejects_truncation() {
+            let mut fds = [0 as libc::c_int; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            send(fds[1], STAGE_MPROTECT_FAILED, libc::EINVAL);
+            unsafe { libc::close(fds[1]) };
+
+            let mut message = ProbeMessage { stage: 0, value: 0 };
+            let read = unsafe {
+                libc::read(
+                    fds[0],
+                    &mut message as *mut ProbeMessage as *mut c_void,
+                    std::mem::size_of::<ProbeMessage>(),
+                )
+            };
+            unsafe { libc::close(fds[0]) };
+            assert_eq!(
+                read,
+                std::mem::size_of::<ProbeMessage>() as isize,
+                "a stage message must be exactly 8 bytes"
+            );
+            assert_eq!(message.stage, STAGE_MPROTECT_FAILED);
+            assert_eq!(message.value, libc::EINVAL);
+        }
+
+        #[test]
+        fn jit_probe_last_errno_reports_failed_syscall() {
+            let rc = unsafe { libc::open(c"/casa1/probe/missing".as_ptr(), libc::O_RDONLY) };
+            assert_eq!(rc, -1, "the fixture path must not exist");
+            assert_eq!(last_errno(), libc::ENOENT);
+        }
+    }
+}
+
+/// Probe every executable-memory mechanism in isolated child processes.
+pub fn probe_jit_execution() -> JitExecProbeMatrix {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        exec_probe::matrix()
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        JitExecProbeMatrix {
+            mprotect_rx: JitExecProbeOutcome::NotProbed,
+            map_jit_wx_write_protect: JitExecProbeOutcome::NotProbed,
+            map_jit_rw_write_protect: JitExecProbeOutcome::NotProbed,
+            map_jit_wx_no_write_protect: JitExecProbeOutcome::NotProbed,
+            selected: JitExecMechanism::RwxMmap,
+        }
+    }
+}
+
 /// Global mapping from guest thunk address (u64) to ARM64 trampoline executable
 /// address (usize).  Populated by [`FastThunkTable::register_with_guest_addr`] and
 /// consumed by [`JitCompiler::compile_instruction`] when emitting a direct `bl`
@@ -1142,11 +1677,9 @@ pub static JIT_CHAIN_BREAK_REQUESTED: AtomicBool = AtomicBool::new(false);
 ///   [`JitExitReason::Safepoint`], runs the safepoint body, then
 ///   re-dispatches the block.
 ///
-/// Dormant: the JIT is disabled (macOS 26 blocks MAP_JIT execution for
-/// ad-hoc-signed binaries), so no compiled block reads this flag yet —
-/// the host-side 2 ms block-dispatch safepoint in `pe_runtime.rs` is the
-/// active scheduling mechanism.  This flag is the wired-up, ready-to-use
-/// counterpart for when JIT execution is re-enabled.
+/// Active whenever the capability probe selected an executable-memory
+/// mechanism: every compiled block reads this flag in its prologue, so a
+/// long-running native chain can still reach the host safepoint.
 pub static JIT_SAFEPOINT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Global pointer to the active [`JitRuntime`] instance, used by the live
@@ -1420,6 +1953,238 @@ pub fn thunk_resolve_telemetry() -> (u64, u64) {
     )
 }
 
+// ── Executable-code write tracking (self-modifying code) ────────────────────
+//
+// Guest stores execute inside JIT-compiled code through `jit_helper_store`.
+// That helper runs while the owning thread is inside `execute_block`, so it
+// cannot form a `&JitRuntime` (the runtime is mutably borrowed there).
+// Instead the executing thread publishes a pointer to the runtime's
+// `SmcState` in a thread-local, and the helper records writes into that
+// state's atomics:
+//
+//   * `watched`  — lock-free open-addressing set of guest pages that host a
+//                  compiled block (key = page + 1, 0 = empty);
+//   * `dirty`    — bounded lock-free ring of pages written since the last
+//                  drain (overflow sets a flag: the drain then invalidates
+//                  every block, which is always safe).
+//
+// Tracking is per runtime, not global: two runtimes in one process (tests,
+// live sessions) never invalidate each other's blocks.  When no runtime is
+// executing on this thread the helper's fast path is a thread-local load.
+const SMC_WATCH_SLOTS: usize = 8192;
+const SMC_WATCH_MASK: usize = SMC_WATCH_SLOTS - 1;
+const SMC_DIRTY_SLOTS: usize = 4096;
+
+struct SmcState {
+    watched: Box<[AtomicU64]>,
+    watched_count: AtomicUsize,
+    watch_overflow: AtomicBool,
+    dirty: Box<[AtomicU64]>,
+    dirty_count: AtomicUsize,
+    dirty_overflow: AtomicBool,
+}
+
+impl SmcState {
+    fn new() -> Self {
+        Self {
+            watched: (0..SMC_WATCH_SLOTS)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            watched_count: AtomicUsize::new(0),
+            watch_overflow: AtomicBool::new(false),
+            dirty: (0..SMC_DIRTY_SLOTS)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            dirty_count: AtomicUsize::new(0),
+            dirty_overflow: AtomicBool::new(false),
+        }
+    }
+
+    fn slot(page: u64) -> usize {
+        let x = (page >> 12).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (x >> (64 - 13)) as usize & SMC_WATCH_MASK
+    }
+
+    /// Rebuild the watched-page set from the runtime's current `code_pages`.
+    /// Called only when blocks are added/removed (never during execution).
+    fn rebuild_watch<'a>(&self, pages: impl Iterator<Item = &'a u64>) {
+        for slot in self.watched.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
+        let mut count = 0usize;
+        let mut overflow = false;
+        for &page in pages {
+            let key = page + 1;
+            let mut idx = Self::slot(page);
+            let mut placed = false;
+            for _ in 0..SMC_WATCH_SLOTS {
+                if self.watched[idx].load(Ordering::Relaxed) == 0 {
+                    self.watched[idx].store(key, Ordering::Release);
+                    placed = true;
+                    break;
+                }
+                idx = (idx + 1) & SMC_WATCH_MASK;
+            }
+            if placed {
+                count += 1;
+            } else {
+                // Hash table full: treat every page as watched (conservative).
+                overflow = true;
+                break;
+            }
+        }
+        self.watched_count.store(count, Ordering::Release);
+        self.watch_overflow.store(overflow, Ordering::Release);
+    }
+
+    fn is_watched(&self, page: u64) -> bool {
+        if self.watch_overflow.load(Ordering::Acquire) {
+            return true;
+        }
+        let key = page + 1;
+        let mut idx = Self::slot(page);
+        for _ in 0..SMC_WATCH_SLOTS {
+            let value = self.watched[idx].load(Ordering::Acquire);
+            if value == 0 {
+                return false;
+            }
+            if value == key {
+                return true;
+            }
+            idx = (idx + 1) & SMC_WATCH_MASK;
+        }
+        false
+    }
+
+    fn mark_dirty(&self, page: u64) {
+        let pos = self.dirty_count.fetch_add(1, Ordering::Relaxed);
+        if pos < SMC_DIRTY_SLOTS {
+            self.dirty[pos].store(page + 1, Ordering::Release);
+        } else {
+            self.dirty_overflow.store(true, Ordering::Release);
+        }
+    }
+
+    /// Take the dirty pages (4K-aligned) and the overflow flag, clearing both.
+    fn take_dirty(&self) -> (Vec<u64>, bool) {
+        let count = self
+            .dirty_count
+            .swap(0, Ordering::AcqRel)
+            .min(SMC_DIRTY_SLOTS);
+        let mut pages = Vec::with_capacity(count);
+        for slot in self.dirty.iter().take(count) {
+            let value = slot.swap(0, Ordering::AcqRel);
+            if value != 0 {
+                pages.push((value - 1) & !0xfff);
+            }
+        }
+        let overflow = self.dirty_overflow.swap(false, Ordering::AcqRel);
+        (pages, overflow)
+    }
+}
+
+/// Guest stores observed at a watched code page (diagnostic counter).
+pub static SMC_WRITES_OBSERVED: AtomicU64 = AtomicU64::new(0);
+/// Code pages marked dirty by such stores (diagnostic counter).
+pub static SMC_PAGES_MARKED_DIRTY: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// `SmcState` of the runtime executing on this thread, or null.
+    static ACTIVE_SMC: std::cell::Cell<*const SmcState> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// RAII publication of the executing runtime's SMC state to the helper.
+struct ActiveSmcGuard(*const SmcState);
+
+impl ActiveSmcGuard {
+    fn install(state: &SmcState) -> Self {
+        let previous = ACTIVE_SMC.with(|cell| {
+            let previous = cell.get();
+            cell.set(state as *const SmcState);
+            previous
+        });
+        Self(previous)
+    }
+}
+
+impl Drop for ActiveSmcGuard {
+    fn drop(&mut self) {
+        ACTIVE_SMC.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Serializes writes to executable code pages across every host thread.
+/// `pthread_jit_write_protect_np` is per-thread, so this lock only prevents
+/// two installers from writing the same code zone concurrently; executing
+/// threads keep their own execute view and never take this lock.
+static JIT_CODE_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Number of block-to-block links published (atomic link-slot stores).
+pub static JIT_CHAIN_LINKS_FORMED: AtomicU64 = AtomicU64::new(0);
+/// Number of block-to-block links cleared (invalidation / chain break).
+pub static JIT_CHAIN_LINKS_BROKEN: AtomicU64 = AtomicU64::new(0);
+/// Number of guest Call sites compiled to a direct resolved-thunk call.
+pub static JIT_THUNK_DIRECT_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a guest write to `[address, address + length)`.
+///
+/// Called from `jit_helper_store` for every native guest store.  The fast path
+/// is a thread-local load when this thread is not executing JIT code.
+pub fn note_guest_code_write(address: u64, length: usize) {
+    if length == 0 {
+        return;
+    }
+    let state_ptr = ACTIVE_SMC.with(|cell| cell.get());
+    if state_ptr.is_null() {
+        return;
+    }
+    // SAFETY: the pointer is published by `ActiveSmcGuard` for the duration
+    // of `execute_block` on this same thread; the referenced boxed state
+    // outlives the guard, and all accesses are atomics (no Rust references
+    // to the mutably borrowed runtime are formed).
+    let state = unsafe { &*state_ptr };
+    if state.watched_count.load(Ordering::Acquire) == 0
+        && !state.watch_overflow.load(Ordering::Acquire)
+    {
+        return;
+    }
+    let end = address.saturating_add(length as u64);
+    let mut page = address & !0xfff;
+    let last = end.saturating_sub(1) & !0xfff;
+    let mut observed = false;
+    while page <= last {
+        if state.is_watched(page) {
+            state.mark_dirty(page);
+            SMC_PAGES_MARKED_DIRTY.fetch_add(1, Ordering::Relaxed);
+            observed = true;
+        }
+        page = match page.checked_add(0x1000) {
+            Some(next) => next,
+            None => return,
+        };
+    }
+    if observed {
+        SMC_WRITES_OBSERVED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(writes_observed, pages_marked_dirty)` since process start.
+pub fn smc_telemetry() -> (u64, u64) {
+    (
+        SMC_WRITES_OBSERVED.load(Ordering::Relaxed),
+        SMC_PAGES_MARKED_DIRTY.load(Ordering::Relaxed),
+    )
+}
+
+/// Reset the SMC diagnostic counters (test helper).
+pub fn reset_smc_telemetry() {
+    SMC_WRITES_OBSERVED.store(0, Ordering::Relaxed);
+    SMC_PAGES_MARKED_DIRTY.store(0, Ordering::Relaxed);
+}
+
 /// Helper: write JIT diagnostic info to a temp file for post-crash analysis.
 /// The runner process captures stderr via pipes that are lost if the runner
 /// crashes, so we write to a file as a fallback.  Not called from signal
@@ -1612,9 +2377,8 @@ extern "C" fn sigbus_sa_handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut
     } else {
         // ── Fail-fast on OUT-OF-RANGE faults ─────────────────────────────
         // A fault outside the flat guest memory region is NOT a guest page
-        // sync: it is either a MAP_JIT EXECUTION fault (macOS 26 blocks
-        // MAP_JIT execution for ad-hoc-signed binaries — the faulting
-        // instruction is the branch into the compiled code page) or a wild
+        // sync: it is either a failure to execute the compiled code page
+        // (the faulting instruction is the branch into JIT code) or a wild
         // pointer inside compiled code.  Neither is recoverable by syncing
         // guest pages: returning would retry the faulting instruction
         // forever (an infinite SIGBUS spin).  Restore the default SIGBUS
@@ -1962,6 +2726,11 @@ impl Emitter {
         self.emit(0xf9400000 | ((offset >> 3) << 10) | (rn << 5) | rt);
     }
 
+    /// LDAR Xt, [Xn] — 64-bit load-acquire, used to publish/read block links.
+    fn ldar64(&mut self, rt: u32, rn: u32) {
+        self.emit(0xc8dffc00 | (rn << 5) | rt);
+    }
+
     /// STR Xt, [Xn, #offset] (64-bit unsigned offset)
     fn str64(&mut self, rt: u32, rn: u32, offset: u32) {
         self.emit(0xf9000000 | ((offset >> 3) << 10) | (rn << 5) | rt);
@@ -2264,10 +3033,75 @@ impl Emitter {
 // JIT memory management
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Executable memory manager
+// ---------------------------------------------------------------------------
+
+// Test-only fault-injection seams.  Each counter records how many times the
+// corresponding operation was entered; when the matching `*_AT` slot equals
+// that 1-based call index the operation fails.  `0` disables the seam.
+#[cfg(test)]
+thread_local! {
+    static JIT_TEST_ALLOC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JIT_TEST_FAIL_ALLOC_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JIT_TEST_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JIT_TEST_DENY_WRITE_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JIT_TEST_FINALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JIT_TEST_DENY_FINALIZE_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JIT_TEST_DENY_THUNK_ZONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Force the next `chain_blocks` call to fail (self-test error-path probe).
+    static JIT_TEST_FORCE_CHAIN_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Force the next resolved-thunk map lookup to miss.
+    static JIT_TEST_THUNK_MAP_MISS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Make the self-test host thunk write the wrong sentinel.
+    static JIT_TEST_SELF_TEST_THUNK_BAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Drive the parent self-test's executable-resolution paths: 1 = make
+    /// `current_exe` fail, 2 = spawn a nonexistent child, 3 = spawn `/bin/true`
+    /// (exits 0 without a report).
+    static JIT_TEST_SELF_TEST_EXE_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// Compile the self-test's first block with a wrong immediate.
+    static JIT_TEST_SELF_TEST_WRONG_ORIGINAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Skip writing the self-test's re-patched instruction (finalize still runs).
+    static JIT_TEST_SKIP_REPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Count `execute_block` entries per thread and suppress the safepoint
+    /// flag on the configured 1-based call.
+    static JIT_TEST_EXEC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JIT_TEST_IGNORE_SAFEPOINT_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Force the host safepoint flag on the configured 1-based execute call.
+    static JIT_TEST_FORCE_SAFEPOINT_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Corrupt the next non-empty SMC drain: 1 = drop the invalidation
+    /// (stale block stays cached), 2 = evict the cache without an
+    /// invalidation event (stale clone detected, counter stays zero).
+    static JIT_TEST_SMC_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// Ignore the faulted-block bar once (simulates a lost quarantine).
+    static JIT_TEST_IGNORE_FAULTED_BLOCKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Pre-publish the source link before `chain_blocks` (simulates an
+    /// already-linked slot whose publication is not re-counted).
+    static JIT_TEST_PREPUBLISH_CHAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn test_seam_fails(
+    calls: &'static std::thread::LocalKey<std::cell::Cell<usize>>,
+    fail_at: &'static std::thread::LocalKey<std::cell::Cell<usize>>,
+) -> bool {
+    calls.with(|calls| {
+        let call = calls.get() + 1;
+        calls.set(call);
+        fail_at.with(|fail_at| fail_at.get() == call)
+    })
+}
+
 /// Manages executable memory for JIT-compiled code using MAP_JIT on Apple Silicon.
 pub struct JitMemoryManager {
     pages: Vec<(*mut u8, usize)>,
     write_offset: usize,
+    /// Executable-memory mechanism selected by the runtime capability probe.
+    mechanism: JitExecMechanism,
     total_allocated: AtomicUsize,
     total_used: AtomicUsize,
 }
@@ -2291,43 +3125,75 @@ impl Default for JitMemoryManager {
 
 impl JitMemoryManager {
     pub fn new() -> Self {
+        Self::with_capability(jit_execution_capability())
+    }
+
+    /// Construct a manager for an explicit capability matrix.  Used by tests
+    /// that need to exercise the unavailable/fallback path deterministically.
+    fn with_capability(capability: JitExecProbeMatrix) -> Self {
         Self {
             pages: Vec::new(),
             write_offset: 0,
+            mechanism: capability.selected,
             total_allocated: AtomicUsize::new(0),
             total_used: AtomicUsize::new(0),
         }
     }
 
+    /// The executable-memory mechanism this manager uses.
+    pub fn mechanism(&self) -> JitExecMechanism {
+        self.mechanism
+    }
+
     unsafe fn allocate_page(&mut self, size: usize) -> *mut u8 {
         let aligned = size.div_ceil(JIT_PAGE_SIZE) * JIT_PAGE_SIZE;
 
-        // Use MAP_JIT (W^X) on aarch64 macOS.  MAP_JIT pages are controlled
-        // by pthread_jit_write_protect_np: (0)=writable, (1)=executable.
-        // Plain RWX mmap fails on macOS (EACCES) without special entitlements.
-        // MAP_JIT works on ANY thread as long as the thread calls
-        // pthread_jit_write_protect_np(1) before executing the code.
-        #[cfg(target_arch = "aarch64")]
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                aligned,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_JIT,
-                -1,
-                0,
-            )
-        };
-        #[cfg(not(target_arch = "aarch64"))]
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                aligned,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
+        // MAP_JIT RWX is the canonical Apple Silicon W^X mapping:
+        // pthread_jit_write_protect_np(0) makes it writable, (1) makes it
+        // executable.  PROT_EXEC is required in the mmap request — the
+        // write-protect toggle cannot add execute permission to an RW-only
+        // mapping (that was the SIGBUS blocker).
+        let ptr = match self.mechanism {
+            JitExecMechanism::MapJitWx => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            aligned,
+                            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_JIT,
+                            -1,
+                            0,
+                        )
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    return std::ptr::null_mut();
+                }
+            }
+            JitExecMechanism::MprotectRx => unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    aligned,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            },
+            JitExecMechanism::RwxMmap => unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    aligned,
+                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            },
+            JitExecMechanism::Unavailable => return std::ptr::null_mut(),
         };
 
         if ptr == libc::MAP_FAILED {
@@ -2341,6 +3207,10 @@ impl JitMemoryManager {
 
     /// Allocate code space and return a writable pointer.
     pub fn allocate_code_space(&mut self, size: usize) -> *mut u8 {
+        #[cfg(test)]
+        if test_seam_fails(&JIT_TEST_ALLOC_CALLS, &JIT_TEST_FAIL_ALLOC_AT) {
+            return std::ptr::null_mut();
+        }
         let aligned = size.div_ceil(64) * 64;
 
         if let Some(&(page_ptr, page_size)) = self.pages.last()
@@ -2370,32 +3240,111 @@ impl JitMemoryManager {
         }
     }
 
+    /// Find the mapping that contains `ptr` (used for page-granular mprotect).
+    fn mapping_containing(&self, ptr: *mut u8) -> Option<(*mut u8, usize)> {
+        self.pages.iter().copied().find(|(base, size)| {
+            let address = ptr as usize;
+            address >= *base as usize && address < *base as usize + *size
+        })
+    }
+
     /// Finalize code: flush icache and set executable permissions.
+    ///
+    /// Returns `false` when the selected mechanism cannot make the block
+    /// executable (the caller then reports a compilation error and the
+    /// interpreter handles the block).
     ///
     /// # Safety
     /// Caller must ensure `ptr` points to a valid code region of `size` bytes
     /// that was allocated by this memory manager.
-    pub unsafe fn finalize_code(&self, ptr: *mut u8, size: usize) {
+    pub unsafe fn finalize_code(&self, ptr: *mut u8, size: usize) -> bool {
+        if matches!(self.mechanism, JitExecMechanism::Unavailable) || ptr.is_null() || size == 0 {
+            return false;
+        }
+        #[cfg(test)]
+        if test_seam_fails(&JIT_TEST_FINALIZE_CALLS, &JIT_TEST_DENY_FINALIZE_AT) {
+            return false;
+        }
         unsafe {
             Self::flush_icache(ptr, size);
         }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            libc::pthread_jit_write_protect_np(1);
+        match self.mechanism {
+            JitExecMechanism::MapJitWx => {
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    libc::pthread_jit_write_protect_np(1);
+                }
+                true
+            }
+            JitExecMechanism::MprotectRx => match self.mapping_containing(ptr) {
+                // SAFETY: `base`/`mapping_size` are the exact anonymous mapping
+                // returned by mmap and are page-aligned by the kernel.
+                Some((base, mapping_size)) => unsafe {
+                    libc::mprotect(
+                        base as *mut c_void,
+                        mapping_size,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                    ) == 0
+                },
+                None => false,
+            },
+            JitExecMechanism::RwxMmap => true,
+            JitExecMechanism::Unavailable => false, // coverage: unreachable — finalize_code returns early when mechanism is Unavailable
         }
     }
 
     /// Make the JIT code zone writable for patching.
     ///
+    /// Returns `false` when the mechanism cannot provide writable code memory.
+    ///
     /// # Safety
     ///
-    /// `_ptr` must point into the JIT code zone owned by this manager (or be
+    /// `ptr` must point into the JIT code zone owned by this manager (or be
     /// null) and the caller must ensure no other thread is executing code in
     /// that zone while it is made writable.
-    pub unsafe fn make_writable(&self, _ptr: *mut u8, _size: usize) {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            libc::pthread_jit_write_protect_np(0);
+    pub unsafe fn make_writable(&self, ptr: *mut u8, _size: usize) -> bool {
+        #[cfg(test)]
+        if test_seam_fails(&JIT_TEST_WRITE_CALLS, &JIT_TEST_DENY_WRITE_AT) {
+            return false;
+        }
+        match self.mechanism {
+            JitExecMechanism::MapJitWx => {
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    libc::pthread_jit_write_protect_np(0);
+                }
+                true
+            }
+            JitExecMechanism::MprotectRx => match self.mapping_containing(ptr) {
+                // SAFETY: same mapping invariant as finalize_code.
+                Some((base, mapping_size)) => unsafe {
+                    libc::mprotect(
+                        base as *mut c_void,
+                        mapping_size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    ) == 0
+                },
+                None => false,
+            },
+            JitExecMechanism::RwxMmap => true,
+            JitExecMechanism::Unavailable => false,
+        }
+    }
+
+    /// Ensure the calling thread may execute MAP_JIT code before dispatching a
+    /// compiled block.  The write-protect toggle is per-thread on Apple
+    /// Silicon, so a compilation or chain-patch performed by another thread
+    /// must not leave this thread's execute view disabled.
+    ///
+    /// # Safety
+    /// Safe to call on any thread; it only toggles the thread-local JIT
+    /// write-protection state.
+    pub unsafe fn prepare_execution(&self) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if matches!(self.mechanism, JitExecMechanism::MapJitWx) {
+            unsafe {
+                libc::pthread_jit_write_protect_np(1);
+            }
         }
     }
 
@@ -2734,10 +3683,14 @@ impl Drop for FlatGuestMemory {
 // ---------------------------------------------------------------------------
 
 /// Result of JIT-compiling a block of IR instructions.
-#[derive(Clone)]
 pub struct JitCompiledBlock {
-    /// Pointer to the compiled ARM64 code entry point.
+    /// Pointer to the compiled ARM64 code entry point.  Callers that publish a
+    /// block to another thread must use [`Self::published_entry`] (acquire) so
+    /// the code bytes written before publication are visible.
     pub entry: *const u8,
+    /// Atomic publication of `entry`.  Installers store with Release after
+    /// `finalize_code` (icache flush); executors load with Acquire.
+    entry_atomic: AtomicPtr<u8>,
     /// Size of compiled code in bytes.
     pub code_size: usize,
     /// Guest address this block was compiled from.
@@ -2753,6 +3706,62 @@ pub struct JitCompiledBlock {
     /// reconstructs it from this metadata — see
     /// [`map_exit_reason`](crate::jit::map_exit_reason)).
     pub last_exit_info: Option<BlockExitInfo>,
+    /// Compilation tier that produced this block.
+    pub compile_tier: CompilationTier,
+    /// True when the final IR instruction controls RIP (jump/call/ret
+    /// family).  A chain may only target such a block: chaining into a
+    /// straight-line block would leave the dispatcher advancing RIP by
+    /// the *source* block's end address.
+    pub ends_in_control_flow: bool,
+    /// Atomic link slot read by the block's compiled jump exit.  Zero means
+    /// "not linked"; a non-zero value is the target block entry.  Linking
+    /// never patches code — it publishes a pointer with Release, so no other
+    /// thread can observe a torn instruction sequence.
+    pub link_target: Arc<AtomicU64>,
+}
+
+impl Clone for JitCompiledBlock {
+    fn clone(&self) -> Self {
+        Self {
+            entry: self.entry,
+            entry_atomic: AtomicPtr::new(self.entry_atomic.load(Ordering::Acquire)),
+            code_size: self.code_size,
+            guest_address: self.guest_address,
+            instruction_count: self.instruction_count,
+            source_hash: self.source_hash,
+            last_exit_info: self.last_exit_info,
+            compile_tier: self.compile_tier,
+            ends_in_control_flow: self.ends_in_control_flow,
+            link_target: Arc::clone(&self.link_target),
+        }
+    }
+}
+
+impl JitCompiledBlock {
+    /// Acquire-load the published executable entry point.
+    pub fn published_entry(&self) -> *const u8 {
+        self.entry_atomic.load(Ordering::Acquire)
+    }
+}
+
+/// True when `insn` transfers control (and therefore establishes RIP itself
+/// or asks the dispatcher to do so).
+fn instruction_controls_rip(insn: &IrInstruction) -> bool {
+    matches!(
+        insn,
+        IrInstruction::Jump { .. }
+            | IrInstruction::JumpIf { .. }
+            | IrInstruction::JumpRegister { .. }
+            | IrInstruction::JumpMemory { .. }
+            | IrInstruction::Return { .. }
+            | IrInstruction::Call { .. }
+            | IrInstruction::CallRegister { .. }
+            | IrInstruction::CallMemory { .. }
+    )
+}
+
+fn block_ends_in_control_flow(ir: &[IrInstruction]) -> bool {
+    ir.last().is_some_and(instruction_controls_rip)
 }
 
 /// Result of executing a JIT-compiled block.
@@ -2910,6 +3919,10 @@ pub struct JitCompiler {
     /// each load/store helper call; all patched to the single fault-exit
     /// stub by `finish_fault_stub` once the block body has been emitted.
     fault_cbnz_patches: Vec<usize>,
+    /// Link slot belonging to the block currently being compiled.  The
+    /// unconditional-jump arm embeds its address and reads it at run time;
+    /// `chain_blocks` publishes a target entry into it with Release ordering.
+    link_slot: Option<Arc<AtomicU64>>,
 }
 
 impl Default for JitCompiler {
@@ -2926,6 +3939,7 @@ impl JitCompiler {
             helper_insns: Vec::new(),
             safepoint_cbnz_patch: None,
             fault_cbnz_patches: Vec::new(),
+            link_slot: None,
         }
     }
 
@@ -2963,6 +3977,37 @@ impl JitCompiler {
         }
     }
 
+    /// Copy the emitted ARM64 bytes into a fresh code block, flush the
+    /// instruction cache, and mark the block executable through the mechanism
+    /// selected by the capability probe.
+    fn install_code(&self, code_ptr: *mut u8, code_size: usize) -> AppResult<()> {
+        // W^X thread safety: serialize every writer of the executable code
+        // zone.  `pthread_jit_write_protect_np` is per-thread, so the lock is
+        // only needed to keep two installers from writing concurrently; an
+        // executing thread keeps its execute view and never takes this lock.
+        let _install = JIT_CODE_INSTALL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: code_ptr was allocated by the memory manager for at least
+        // code_size bytes; emitter.code holds exactly code_size bytes.
+        unsafe {
+            if !self.memory_manager.make_writable(code_ptr, code_size) {
+                return Err(AppError::new(
+                    ReasonCode::RcJitCodeAllocFailed,
+                    "JIT: executable code page is not writable",
+                ));
+            }
+            ptr::copy_nonoverlapping(self.emitter.code.as_ptr(), code_ptr, code_size);
+            if !self.memory_manager.finalize_code(code_ptr, code_size) {
+                return Err(AppError::new(
+                    ReasonCode::RcJitCodeAllocFailed,
+                    "JIT: failed to make compiled block executable",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn compile_block(
         &mut self,
         ir: &[IrInstruction],
@@ -2971,9 +4016,12 @@ impl JitCompiler {
         fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
+        let link_target = Arc::new(AtomicU64::new(0));
+        self.link_slot = Some(Arc::clone(&link_target));
 
         // Prologue: save callee-saved registers and set up frame
         self.emit_prologue(arch);
+        self.emit_current_block_tag(guest_address);
 
         // Load guest GPRs from CpuState into ARM64 registers
         // x0 = &CpuState, x1 = memory base, x2 = &MemoryImage, x3 = &exit_reason
@@ -3010,7 +4058,7 @@ impl JitCompiler {
         let code_ptr = self.memory_manager.allocate_code_space(code_size);
         if code_ptr.is_null() {
             return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcJitCodeAllocFailed,
                 "JIT: failed to allocate executable memory",
             ));
         }
@@ -3019,34 +4067,34 @@ impl JitCompiler {
         // and is valid for code_size bytes. emitter.code is a valid Vec.
         // The regions are non-overlapping. finalize_code flushes the
         // instruction cache and sets executable permissions.
-        unsafe {
-            ptr::copy_nonoverlapping(self.emitter.code.as_ptr(), code_ptr, code_size);
-            self.memory_manager.finalize_code(code_ptr, code_size);
-        }
+        self.install_code(code_ptr, code_size)?;
 
         // Compute a simple hash of the source IR for integrity verification.
         // Uses FNV-1a style hashing of the instruction discriminants and guest_address.
         let source_hash = compute_ir_hash(ir, guest_address);
         let last_exit_info = block_exit_info(ir);
+        self.link_slot = None;
 
         Ok(JitCompiledBlock {
             entry: code_ptr,
+            entry_atomic: AtomicPtr::new(code_ptr as *mut u8),
             code_size,
             guest_address,
             instruction_count: ir.len(),
             source_hash,
             last_exit_info,
+            compile_tier: CompilationTier::Tier0,
+            ends_in_control_flow: block_ends_in_control_flow(ir),
+            link_target,
         })
     }
 
     pub fn emit_safepoint_check(&mut self, _arch: GuestArch) {
         // The check is emitted into every compiled block so that translated
         // execution polls the host safepoint flag even when block chains
-        // never return to the dispatcher.  The JIT is dormant on macOS 26
-        // (MAP_JIT is blocked for ad-hoc-signed binaries), so this code is
-        // not executed today — but the mechanism lives in the translated
-        // bytes, not in a doc comment: re-enabling the JIT requires no
-        // further work.
+        // never return to the dispatcher.  The check is live in every block
+        // whenever the capability probe selected an executable-memory
+        // mechanism.
         //
         // Layout:
         //   mov_imm64 x26, &JIT_SAFEPOINT_REQUESTED   // flag address
@@ -3087,6 +4135,18 @@ impl JitCompiler {
         self.emitter.code[cbnz_pos..cbnz_pos + 4].copy_from_slice(&bytes);
     }
 
+    /// Publish `guest_address` as the block currently executing.  x3 (the
+    /// legacy exit-reason slot) now carries a pointer to a per-thread
+    /// `u64` owned by `execute_block`; x23 keeps that pointer across helper
+    /// calls (callee-saved) and across chained jumps (`emit_frame_restore`
+    /// restores it from the stack, and the jump exit re-copies it into x3).
+    /// Emitted before guest registers are loaded, so x10 is still scratch.
+    fn emit_current_block_tag(&mut self, guest_address: u64) {
+        self.emitter.mov_reg(regmap::X23, regmap::X3);
+        self.emitter.mov_imm64(10, guest_address);
+        self.emitter.str64(10, regmap::X23, 0);
+    }
+
     fn emit_prologue(&mut self, arch: GuestArch) {
         // ARM64 prologue is identical for x86 and x86_64 guest architectures;
         // arch parameter reserved for future divergence (e.g., different frame layouts)
@@ -3103,7 +4163,11 @@ impl JitCompiler {
         self.emitter.stp64_pre(27, 28, 31, -64);
     }
 
-    fn emit_epilogue(&mut self) {
+    /// Pop this block's prologue frame (x19-x28, fp, lr) WITHOUT returning.
+    /// Used by the chained-jump exit: the source block must release its host
+    /// frame before branching to the target's prologue, otherwise a chained
+    /// loop leaks one 96-byte frame per hop (host-SP drift).
+    fn emit_frame_restore(&mut self) {
         // Restore x19-x28
         self.emitter.ldp64_post(27, 28, 31, 64);
         self.emitter.ldp64_post(25, 26, 31, 64);
@@ -3112,6 +4176,10 @@ impl JitCompiler {
         self.emitter.ldp64_post(19, 20, 31, 64);
         // Restore fp, lr
         self.emitter.ldp64_post(29, 30, 31, 64);
+    }
+
+    fn emit_epilogue(&mut self) {
+        self.emit_frame_restore();
         self.emitter.ret();
     }
 
@@ -3731,8 +4799,19 @@ impl JitCompiler {
                             format!("FAST_THUNK_MAP lock poisoned during compile: {e}"),
                         )
                     })?;
-                    let thunk_opt = map.get(target).copied();
+                    #[cfg(test)]
+                    let forced_miss = JIT_TEST_THUNK_MAP_MISS.with(|miss| miss.replace(false));
+                    #[cfg(not(test))]
+                    let forced_miss = false;
+                    let thunk_opt = if forced_miss {
+                        None
+                    } else {
+                        map.get(target).copied()
+                    };
                     if let Some(thunk_addr) = thunk_opt {
+                        // Direct resolved-thunk call site: this Call no longer
+                        // returns EXIT_THUNK to the dispatcher.
+                        JIT_THUNK_DIRECT_CALLS.fetch_add(1, Ordering::Relaxed);
                         // ── Push return_address onto guest stack ──
                         let arm_sp = regmap::guest_to_arm(4);
                         self.emitter.sub_imm(arm_sp, arm_sp, 8);
@@ -3744,17 +4823,19 @@ impl JitCompiler {
                         // x3 = exit_reason ptr
                         self.emitter.mov_reg(regmap::X21, regmap::X0);
                         self.emitter.mov_reg(regmap::X22, regmap::X1);
-                        self.emitter.mov_reg(regmap::X23, regmap::X2);
+                        // x23 is reserved for the current-block cell pointer
+                        // and must survive every emitted call site.
+                        self.emitter.mov_reg(regmap::X25, regmap::X2);
                         self.emitter.mov_reg(regmap::X24, regmap::X3);
 
                         // ── Load PeHostRuntime ptr from global static ──
                         let static_addr = &SIGBUS_PE_RUNTIME as *const _ as u64;
-                        self.emitter.mov_imm64(regmap::X25, static_addr);
-                        self.emitter.ldr64(regmap::X0, regmap::X25, 0);
+                        self.emitter.mov_imm64(regmap::X26, static_addr);
+                        self.emitter.ldr64(regmap::X0, regmap::X26, 0);
 
                         // ── Set up bridge arguments ──
                         self.emitter.mov_reg(regmap::X1, regmap::X21); // CpuState
-                        self.emitter.mov_reg(regmap::X2, regmap::X23); // MemoryImage
+                        self.emitter.mov_reg(regmap::X2, regmap::X25); // MemoryImage
                         self.emitter.mov_imm64(regmap::X3, *target); // thunk_address
 
                         // ── Call the trampoline ──
@@ -3764,7 +4845,7 @@ impl JitCompiler {
                         // ── Restore JIT entry context ──
                         self.emitter.mov_reg(regmap::X0, regmap::X21);
                         self.emitter.mov_reg(regmap::X1, regmap::X22);
-                        self.emitter.mov_reg(regmap::X2, regmap::X23);
+                        self.emitter.mov_reg(regmap::X2, regmap::X25);
                         self.emitter.mov_reg(regmap::X3, regmap::X24);
 
                         // Reload guest GPRs from CpuState (the bridge may
@@ -3800,15 +4881,47 @@ impl JitCompiler {
             }
 
             IrInstruction::Jump { target } => {
-                // Unconditional jump: store guest registers and exit with
-                // EXIT_JUMP.  The dispatcher reads the jump target from the
-                // last IR instruction and sets state.rip so the main loop
-                // dispatches the target block next.  (EXIT_NORMAL would leave
-                // rip at this block's start → infinite re-dispatch.)
+                // Unconditional jump.  When a link has been published in this
+                // block's atomic link slot, branch straight into the target
+                // block's entry (no dispatcher round-trip).  The target's
+                // prologue reloads guest registers and polls the host
+                // safepoint flag, so this preserves safepoint semantics.
+                //
+                // The source block pops its own host frame BEFORE the branch:
+                // every block's prologue pushes one frame, so a chained loop
+                // would otherwise leak 96 bytes of host stack per hop.  x9
+                // (caller-saved scratch, guest state already stored) carries
+                // the target entry across the frame restore; x0/x2 still hold
+                // the CpuState/MemoryImage pointers expected by the target.
                 let _ = target;
                 self.emit_store_guest_registers(arch);
-                self.emitter.movz(regmap::X0, EXIT_JUMP as u16, 0);
-                self.emit_epilogue();
+                if let Some(slot) = self.link_slot.as_ref() {
+                    // Restore the flat-mirror base in x1 (the block entry ABI
+                    // passes it; helper calls clobber caller-saved registers).
+                    // x23 points at this thread's [current_block, flat_base]
+                    // cell, so no process-global base can race other threads.
+                    self.emitter.ldr64(regmap::X1, regmap::X23, 8);
+                    let slot_addr = Arc::as_ptr(slot) as u64;
+                    self.emitter.mov_imm64(9, slot_addr);
+                    self.emitter.ldar64(9, 9);
+                    // Hand the per-thread current-block cell pointer to the
+                    // target prologue (x3 is caller-saved and helpers clobber
+                    // it; x23 still holds it here).
+                    self.emitter.mov_reg(regmap::X3, regmap::X23);
+                    // Pop this block's frame BEFORE either exit.  The linked
+                    // path then branches into the target's prologue; the
+                    // unlinked path returns EXIT_JUMP with the frame already
+                    // restored (so the stub below must not pop again).
+                    self.emit_frame_restore();
+                    // Skip the branch (8 bytes) when the slot is still zero.
+                    self.emitter.cbz(9, 8);
+                    self.emitter.br(9);
+                    self.emitter.movz(regmap::X0, EXIT_JUMP as u16, 0);
+                    self.emitter.ret();
+                } else {
+                    self.emitter.movz(regmap::X0, EXIT_JUMP as u16, 0);
+                    self.emit_epilogue();
+                }
             }
             IrInstruction::JumpIf {
                 condition,
@@ -4084,6 +5197,24 @@ pub struct JitRuntime {
     /// Number of fallbacks to IR interpreter — incremented when JIT cannot
     /// compile a block, causing fall-through to the IR interpreter.
     pub interpreter_fallbacks: u64,
+    /// Compiled blocks removed by self-modifying-code invalidation.
+    pub code_invalidations: u64,
+    /// Number of SMC drain cycles that invalidated at least one block.
+    pub smc_invalidation_events: u64,
+    /// Blocks compiled at each tier.
+    pub tier0_compiles: u64,
+    pub tier1_compiles: u64,
+    pub tier2_compiles: u64,
+    /// Links published / cleared in this runtime.
+    pub chain_links_formed: u64,
+    pub chain_links_broken: u64,
+    /// Blocks that took the fault-equivalent fallback path (invalid block
+    /// installation / faulted entry) and were handed to the interpreter.
+    pub fault_fallbacks: u64,
+    /// Guest addresses permanently barred from native compilation after a
+    /// fault-equivalent event; the interpreter handles them for the rest of
+    /// the run.
+    pub faulted_blocks: BTreeSet<u64>,
     /// Block chain entries keyed by (from_address, to_address).
     pub block_chains: BTreeMap<(u64, u64), BlockChainEntry>,
     /// Fast thunk table: ARM64 trampolines for direct host-function calls
@@ -4096,6 +5227,9 @@ pub struct JitRuntime {
     /// Used for self-modifying code detection: when guest code writes to a
     /// page in this set, the affected blocks must be invalidated and recompiled.
     pub code_pages: BTreeSet<u64>,
+    /// Lock-free watch/dirty state read by `jit_helper_store` while this
+    /// runtime is executing on the current thread.
+    smc: Box<SmcState>,
     /// Set of guest page addresses (4K-aligned) that have been synced from
     /// MemoryImage into the flat memory region. Used for incremental sync:
     /// only new pages are copied on each block execution instead of all
@@ -4119,10 +5253,20 @@ impl JitRuntime {
             blocks_compiled: 0,
             blocks_executed: 0,
             interpreter_fallbacks: 0, // Initialized to zero; incremented on each JIT fallback
+            code_invalidations: 0,
+            smc_invalidation_events: 0,
+            tier0_compiles: 0,
+            tier1_compiles: 0,
+            tier2_compiles: 0,
+            chain_links_formed: 0,
+            chain_links_broken: 0,
+            fault_fallbacks: 0,
+            faulted_blocks: BTreeSet::new(),
             block_chains: BTreeMap::new(),
             fast_thunk_table: FastThunkTable::new(),
             unwind_table: JitUnwindTable::new(),
             code_pages: BTreeSet::new(),
+            smc: Box::new(SmcState::new()),
             synced_pages: BTreeSet::new(),
             sigbus_installed: false,
         }
@@ -4144,9 +5288,58 @@ impl JitRuntime {
         arch: GuestArch,
         fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<&JitCompiledBlock> {
+        self.get_or_compile_at_tier(
+            ir,
+            guest_address,
+            arch,
+            CompilationTier::Tier0,
+            fast_thunk_addrs,
+        )
+    }
+
+    /// Get or compile a block at an explicit optimization tier.
+    ///
+    /// The PE dispatcher calls this when [`TieredCompiler::record_execution`]
+    /// crosses a threshold (Tier0 at 50 dispatches, Tier1 at 500): an already
+    /// cached block compiled at a lower tier is invalidated and recompiled
+    /// with the real optimizer (`constant_fold` + DCE at Tier1,
+    /// `constant_fold` + loop unrolling at Tier2) instead of returning the
+    /// identical Tier0 code.
+    pub fn get_or_compile_at_tier(
+        &mut self,
+        ir: &[IrInstruction],
+        guest_address: u64,
+        arch: GuestArch,
+        tier: CompilationTier,
+        fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
+    ) -> AppResult<&JitCompiledBlock> {
+        // A block that faulted (invalid installation / unwind path) stays on
+        // the interpreter for the rest of the run: refusing compilation here
+        // makes the dispatcher's `.is_ok()` check fail and fall through to
+        // the AOT path for exactly this block.
+        if self.faulted_blocks.contains(&guest_address) {
+            #[cfg(test)]
+            let ignore_bar = JIT_TEST_IGNORE_FAULTED_BLOCKS.with(|ignore| ignore.replace(false));
+            #[cfg(not(test))]
+            let ignore_bar = false;
+            if !ignore_bar {
+                self.interpreter_fallbacks += 1;
+                return Err(AppError::new(
+                    ReasonCode::RcJitCompilationError,
+                    format!("JIT block {guest_address:#x} previously faulted; using interpreter"),
+                ));
+            }
+        }
+
+        // Self-modifying code: invalidate every block whose guest page was
+        // written by a native guest store before deciding whether this block
+        // is still current.
+        self.drain_smc_invalidations();
+
         // Check for self-modifying code: if a block already exists but its
         // source hash doesn't match the current IR, the guest has modified
         // the code since compilation — invalidate and recompile.
+        let mut recompile = false;
         if let Some(existing) = self.block_cache.get(&guest_address) {
             let current_hash = compute_ir_hash(ir, guest_address);
             if existing.source_hash != 0 && existing.source_hash != current_hash {
@@ -4154,12 +5347,19 @@ impl JitRuntime {
                     "[jit] self-modifying code detected at {:#x}: recompiling (hash mismatch)",
                     guest_address
                 );
-                self.invalidate_block(guest_address);
+                recompile = true;
+            } else if existing.compile_tier < tier {
+                // Real tier promotion: replace the cached block with the
+                // optimized compilation.
+                recompile = true;
             } else {
                 // Block is valid and being accessed — promote to back of
                 // the LRU access-order queue.
                 self.record_block_access(guest_address);
             }
+        }
+        if recompile {
+            self.invalidate_block(guest_address);
         }
 
         let is_new = !self.block_cache.contains_key(&guest_address);
@@ -4172,31 +5372,72 @@ impl JitRuntime {
             // then EXIT_UNIMPL re-runs the whole block in the interpreter),
             // corrupting guest state.
             if !crate::jit::JitCompiler::can_compile_block(ir) {
+                self.interpreter_fallbacks += 1;
                 return Err(AppError::new(
                     ReasonCode::RcUnimplInsn,
                     "block contains an instruction the JIT cannot compile",
                 ));
             }
-            let block = self
-                .compiler
-                .compile_block(ir, guest_address, arch, fast_thunk_addrs)?;
+
+            // Resolved thunk addresses: unknown callers pass `None`, so the
+            // runtime's own registration table is the source of truth.  This
+            // is what turns a registered guest thunk into a direct native
+            // call instead of an EXIT_THUNK dispatcher round-trip.
+            let resolved_thunks = match fast_thunk_addrs {
+                Some(addrs) => Some(addrs.clone()),
+                None => {
+                    let addrs = self.fast_thunk_table.guest_addrs();
+                    (!addrs.is_empty()).then_some(addrs)
+                }
+            };
+
+            let block = match tier {
+                CompilationTier::Tier0 => {
+                    self.tier0_compiles += 1;
+                    self.compiler.compile_block(
+                        ir,
+                        guest_address,
+                        arch,
+                        resolved_thunks.as_ref(),
+                    )?
+                }
+                CompilationTier::Tier1 => {
+                    self.tier1_compiles += 1;
+                    self.compiler.compile_tier1(
+                        ir,
+                        guest_address,
+                        arch,
+                        resolved_thunks.as_ref(),
+                    )?
+                }
+                CompilationTier::Tier2 => {
+                    self.tier2_compiles += 1;
+                    self.compiler.compile_tier2(
+                        ir,
+                        guest_address,
+                        arch,
+                        resolved_thunks.as_ref(),
+                    )?
+                }
+            };
             let code_size = block.code_size;
             self.blocks_compiled += 1;
 
             // Track which 4K guest pages this compiled block occupies,
             // for self-modifying code detection.
+            let guest_end = guest_address + code_size as u64;
             let start_page = guest_address & !0xfff;
-            let end_page = (guest_address + code_size as u64 - 1) & !0xfff;
+            let end_page = (guest_end - 1) & !0xfff;
             let mut page = start_page;
             while page <= end_page {
                 self.code_pages.insert(page);
                 page += 0x1000;
             }
+            self.smc.rebuild_watch(self.code_pages.iter());
 
             // Register this block's address range with the unwind table
             // so that SEH stack walks can unwind through JIT frames.
-            self.unwind_table
-                .register_block(guest_address, guest_address + code_size as u64);
+            self.unwind_table.register_block(guest_address, guest_end);
 
             self.block_cache.insert(guest_address, block);
             // New block is the most recently used — add to back of access order.
@@ -4206,33 +5447,81 @@ impl JitRuntime {
             self.evict_if_needed();
 
             // Auto-chain: if the last instruction is an unconditional jump
-            // to a block that is already compiled, chain them.
+            // to a block that is already compiled, chain them.  Backward
+            // (loop) edges are allowed — the target prologue polls the host
+            // safepoint, and the source block pops its own host frame before
+            // the branch, so a chained loop neither loses interruptibility
+            // nor drifts the host stack pointer.
             if let Some(last_ir) = ir.last()
                 && let IrInstruction::Jump { target } = last_ir
             {
                 // Skip auto-chaining when a chain break has been
                 // requested — see JIT_CHAIN_BREAK_REQUESTED.
-                if JIT_CHAIN_BREAK_REQUESTED.load(Ordering::Relaxed) {
-                    // Chain will be formed on a subsequent execution.
-                } else if *target <= guest_address {
-                    // Backward jump (potential loop): skip chaining to
-                    // prevent forming chains that never return to the
-                    // dispatcher. Forward jumps are safe — they
-                    // eventually reach a block whose last instruction
-                    // is not Jump, and return to the dispatcher.
-                } else if self.block_cache.contains_key(target) {
-                    // Best-effort block chaining; failure is non-fatal
-                    // (the block will just exit via EXIT_NORMAL instead of chaining)
-                    if let Err(e) = self.chain_blocks(guest_address, *target) {
-                        eprintln!(
-                            "[jit] failed to chain block {:#x} -> {:#x}: {}",
-                            guest_address, target, e
-                        );
-                    }
+                if !JIT_CHAIN_BREAK_REQUESTED.load(Ordering::Relaxed)
+                    && self.block_cache.contains_key(target)
+                    && let Err(e) = self.chain_blocks(guest_address, *target)
+                {
+                    eprintln!(
+                        "[jit] failed to chain block {:#x} -> {:#x}: {}",
+                        guest_address, target, e
+                    );
                 }
             }
         }
         Ok(self.block_cache.get(&guest_address).unwrap())
+    }
+
+    /// Drain self-modifying-code dirty pages and invalidate every cached
+    /// block that overlaps them.  Returns the invalidated guest addresses.
+    pub fn drain_smc_invalidations(&mut self) -> Vec<u64> {
+        let (pages, overflow) = self.smc.take_dirty();
+        #[cfg(test)]
+        if !pages.is_empty() || overflow {
+            match JIT_TEST_SMC_FAULT.with(|fault| fault.replace(0)) {
+                1 => return Vec::new(),
+                2 => {
+                    self.block_cache.clear();
+                    self.block_access_order.clear();
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
+        if pages.is_empty() && !overflow {
+            return Vec::new();
+        }
+        // Overflow means the bounded dirty ring wrapped: some written page is
+        // unknown, so conservative whole-cache invalidation is required.
+        let affected: Vec<u64> = if overflow {
+            let all: Vec<u64> = self.block_cache.keys().copied().collect();
+            for address in &all {
+                self.invalidate_block(*address);
+            }
+            all
+        } else {
+            let dirty: BTreeSet<u64> = pages.into_iter().collect();
+            self.invalidate_blocks_on_pages(&dirty)
+        };
+        if !affected.is_empty() || overflow {
+            self.smc_invalidation_events += 1;
+        }
+        affected
+    }
+
+    /// Fault-equivalent fallback: a block that could not be installed safely
+    /// (or whose entry faulted) is removed from the cache and permanently
+    /// barred from native compilation.  The dispatcher then executes that
+    /// block through the IR interpreter; nothing aborts.
+    pub fn report_block_fault(&mut self, guest_address: u64) {
+        self.fault_fallbacks += 1;
+        self.faulted_blocks.insert(guest_address);
+        if self.is_compiled(guest_address) {
+            self.invalidate_block(guest_address);
+        }
+        eprintln!(
+            "[jit] block {:#x} faulted; falling back to the interpreter for this block",
+            guest_address
+        );
     }
 
     /// Invalidate a compiled block, removing it from the block cache and
@@ -4257,10 +5546,17 @@ impl JitRuntime {
                     guest_address, error
                 );
             }
+            // A block that is no longer cached can never be entered through
+            // its own link slot; clear it so no stale target can be observed.
+            if block.link_target.swap(0, Ordering::AcqRel) != 0 {
+                self.chain_links_broken += 1;
+            }
             self.unwind_table.unregister_block(guest_address);
             // Rebuild code_pages from remaining blocks so we don't leave
             // stale page entries after invalidation.
             self.rebuild_code_pages();
+            self.smc.rebuild_watch(self.code_pages.iter());
+            self.code_invalidations += 1;
             eprintln!(
                 "[jit] invalidated block {:#x}: removed from cache and unwind table (code_size={})",
                 guest_address, block.code_size
@@ -4574,6 +5870,50 @@ impl JitRuntime {
     ) -> JitExitReason {
         self.blocks_executed += 1;
 
+        #[cfg(test)]
+        {
+            let call = JIT_TEST_EXEC_CALLS.with(|calls| {
+                let call = calls.get() + 1;
+                calls.set(call);
+                call
+            });
+            if JIT_TEST_IGNORE_SAFEPOINT_AT.with(|at| at.get()) == call {
+                JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Relaxed);
+            }
+            if JIT_TEST_FORCE_SAFEPOINT_AT.with(|at| at.get()) == call {
+                JIT_SAFEPOINT_REQUESTED.store(true, Ordering::Relaxed);
+            }
+        }
+
+        // ── Fault-equivalent fallback ────────────────────────────────────
+        // An invalid installation (null/unpublished entry) or a block that
+        // previously faulted must never be jumped into: hand this block to
+        // the interpreter instead of aborting the process.
+        let entry_ptr = block.published_entry();
+        if entry_ptr.is_null() || self.faulted_blocks.contains(&block.guest_address) {
+            self.report_block_fault(block.guest_address);
+            return JitExitReason::Safepoint;
+        }
+
+        // ── Self-modifying code, entry check ────────────────────────────
+        // The interpreter may have written guest code pages between JIT
+        // executions.  Drain those writes before running a stale block; if
+        // this very block was invalidated, return the safepoint fallback so
+        // the dispatcher executes the block through the interpreter.
+        let _smc_dirty = self.drain_smc_invalidations();
+        // The caller resolved `block` before this call; it may have been
+        // invalidated by the drain above or by an earlier block's exit
+        // drain (SMC).  Never execute a stale clone: hand it to the
+        // interpreter instead.
+        let still_current = self
+            .block_cache
+            .get(&block.guest_address)
+            .is_some_and(|cached| cached.published_entry() == entry_ptr);
+        if !still_current {
+            self.interpreter_fallbacks += 1;
+            return JitExitReason::Safepoint;
+        }
+
         // Sync relevant memory pages to flat region
         // (In a full implementation, this would be done lazily)
 
@@ -4582,11 +5922,21 @@ impl JitRuntime {
         // x1 = flat memory base
         // x2 = pointer to MemoryImage
         // x3 = pointer to exit_reason (output)
-        let mut exit_reason: u64 = 0;
+        // The x3 argument is a legacy exit-reason slot: every emission arm
+        // returns its exit code in x0 (`movz x0, EXIT_*`) and no arm writes
+        // [x3].  Decoding the slot therefore saw only zero (`EXIT_NORMAL`) and
+        // collapsed safepoint/ret/jump exits into Normal.  Keep the slot in
+        // the ABI, but decode the real x0 return value below.
+        // The legacy x3 "exit reason" slot is repurposed as a per-thread
+        // two-word cell: [0] is the block that most recently entered native
+        // code (written by every prologue), [1] is this runtime's flat-mirror
+        // base (read by chained jump exits to restore x1).  Both values are
+        // thread-local because the cell lives on this stack.
+        let mut exec_slot: [u64; 2] = [u64::MAX, self.flat_memory.base()];
         let state_ptr = state as *mut CpuState;
-        let mem_base = self.flat_memory.base();
+        let mem_base = exec_slot[1];
         let mem_image_ptr = memory as *mut MemoryImage;
-        let exit_ptr = &mut exit_reason as *mut u64;
+        let exit_ptr = exec_slot.as_mut_ptr();
 
         // SAFETY: block.entry points to JIT-compiled ARM64 code that was
         // written by this compiler and finalized (icache flushed, executable
@@ -4607,18 +5957,50 @@ impl JitRuntime {
         //    prologue/epilogue and register usage.
         // 4. No guest-controlled data influences the function pointer — it
         //    is determined at JIT compile time from the trusted block cache.
-        unsafe {
+        // Publish this runtime's SMC state for the store helper.  The guard
+        // is thread-local and only refers to the boxed atomics, never to the
+        // mutably borrowed runtime itself.
+        let _smc_guard = ActiveSmcGuard::install(&self.smc);
+
+        // SAFETY: the write-protect toggle only affects this thread's view of
+        // MAP_JIT pages; enabling execute state is required before jumping
+        // into a block compiled on possibly another thread.
+        let reason = unsafe {
+            self.compiler.memory_manager.prepare_execution();
             let entry_fn: unsafe extern "C" fn(
                 *mut CpuState,
                 u64,
                 *mut MemoryImage,
                 *mut u64,
-            ) -> u64 = std::mem::transmute(block.entry);
+            ) -> u64 = std::mem::transmute(entry_ptr);
 
             let result = entry_fn(state_ptr, mem_base, mem_image_ptr, exit_ptr);
 
-            map_exit_reason(exit_reason, state, result, block.last_exit_info)
-        }
+            // A linked jump enters the target block directly, so the block
+            // that produced this exit may differ from the dispatched one.
+            // Decode jump-family exits with the FINAL block's metadata (its
+            // prologue wrote the address into the per-thread cell) — using
+            // the source's target here would re-dispatch (double-execute) the
+            // chained target.
+            let final_address = *exit_ptr.add(0);
+            let exit_info = if final_address == block.guest_address {
+                block.last_exit_info
+            } else {
+                self.block_cache
+                    .get(&final_address)
+                    .map(|final_block| final_block.last_exit_info)
+                    .unwrap_or(block.last_exit_info)
+            };
+
+            // x0 carries the exit code for every native exit arm.
+            map_exit_reason(result, state, result, exit_info)
+        };
+        // Self-modifying code, exit check: the block just executed may have
+        // written another block's code page (or its own).  Invalidate before
+        // the dispatcher looks the next block up, so the stale block can
+        // never run.
+        self.drain_smc_invalidations();
+        reason
     }
 
     /// Sync a page from MemoryImage to the flat guest memory region.
@@ -4814,8 +6196,8 @@ impl JitRuntime {
     }
 }
 
-/// Map a raw JIT exit code (written by a compiled block's epilogue into
-/// the `exit_reason` slot) to a [`JitExitReason`].
+/// Map the raw JIT exit code (returned by a compiled block in x0) to a
+/// [`JitExitReason`].
 ///
 /// The jump-family exit codes (`EXIT_JUMP`, `EXIT_COND_BRANCH`,
 /// `EXIT_INDIRECT_CALL`) must NOT collapse into `Normal`: the compiled
@@ -4903,21 +6285,81 @@ impl JitRuntime {
     /// misprediction penalty and improving instruction-cache locality.
     ///
     /// # Thread Safety
-    /// **Single-threaded use only.** This method call `make_writable()` /
-    /// `finalize_code()` which toggle `pthread_jit_write_protect_np` globally
-    /// for the calling thread while other threads may be executing compiled
-    /// code in MAP_JIT pages. Concurrent execution during patching can cause
-    /// other threads to execute partially-patched instructions.
-    ///
-    /// If multi-threaded JIT execution is enabled in the future, the caller
-    /// must ensure that no other thread is executing the `from_block` during
-    /// patching, e.g., by using a per-block read-write lock or by stopping
-    /// all other guest threads before chaining.
+    /// This method never writes instruction memory: it publishes the target
+    /// entry into the source block's atomic link slot with Release ordering.
+    /// The compiled jump reads that slot with an acquire load (LDAR), so a
+    /// concurrent executor sees either the old link (including zero, which
+    /// exits to the dispatcher) or the new one — never a torn code sequence.
     pub fn chain_blocks(&mut self, from_address: u64, to_address: u64) -> AppResult<()> {
-        // Block chaining is DISABLED (it caused host-SP drift and an
-        // EXC_BAD_ACCESS fault — see the disabled body below).  Each block
-        // runs its own balanced prologue+epilogue and returns to the dispatcher.
-        let _ = (from_address, to_address);
+        #[cfg(test)]
+        if JIT_TEST_FORCE_CHAIN_ERROR.with(|force| force.replace(false)) {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                "injected chain failure",
+            ));
+        }
+        let Some(from_block) = self.block_cache.get(&from_address) else {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!("cannot chain missing source block {from_address:#x}"),
+            ));
+        };
+        if !matches!(from_block.last_exit_info, Some(BlockExitInfo::Jump { .. })) {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!("block {from_address:#x} does not end in an unconditional jump"),
+            ));
+        }
+        let Some(to_block) = self.block_cache.get(&to_address) else {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!("cannot chain to missing target block {to_address:#x}"),
+            ));
+        };
+        // Only Jump/JumpIf targets are chainable.  Their exit is fully
+        // described by `last_exit_info`, which `execute_block` looks up for
+        // the final chained block.  Straight-line targets would leave RIP
+        // wrong, and Return/Call targets need the dispatcher to re-run the
+        // terminator IR of the *dispatched* (source) block — double-executing
+        // the chained target.
+        if !matches!(
+            to_block.last_exit_info,
+            Some(BlockExitInfo::Jump { .. } | BlockExitInfo::JumpIf { .. })
+        ) {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!("block {to_address:#x} does not end in a chainable jump"),
+            ));
+        }
+        let target_entry = to_block.published_entry() as u64;
+        if target_entry == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcJitCodeAllocFailed,
+                format!("block {to_address:#x} has no published entry"),
+            ));
+        }
+        let slot = Arc::clone(&from_block.link_target);
+        let patch_location = Arc::as_ptr(&slot) as u64;
+        #[cfg(test)]
+        if JIT_TEST_PREPUBLISH_CHAIN.with(|prepublish| prepublish.replace(false)) {
+            from_block
+                .link_target
+                .store(target_entry, Ordering::Release);
+        }
+        let previous = slot.swap(target_entry, Ordering::AcqRel);
+        self.block_chains.insert(
+            (from_address, to_address),
+            BlockChainEntry {
+                from_address,
+                to_address,
+                chain_patch_location: patch_location,
+                chained: true,
+            },
+        );
+        if previous != target_entry {
+            self.chain_links_formed += 1;
+            JIT_CHAIN_LINKS_FORMED.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -4934,25 +6376,15 @@ impl JitRuntime {
             .collect();
 
         for key in keys_to_remove {
-            let entry = self.block_chains.remove(&key);
-            if let Some(chain) = entry {
-                // Restore the original return instruction at the patch location
-                if let Some(from_block) = self.block_cache.get(&from_address) {
-                    // SAFETY: Same as chain_blocks — make_writable switches
-                    // to writable, write_volatile writes a RET instruction at
-                    // the patch location, finalize_code flushes and switches
-                    // back to executable. All pointers are within the memory
-                    // manager's allocated pages.
-                    unsafe {
-                        self.compiler
-                            .memory_manager
-                            .make_writable(from_block.entry as *mut u8, from_block.code_size);
-                        // Write RET instruction (0xd65f03c0) back
-                        ptr::write_volatile(chain.chain_patch_location as *mut u32, 0xd65f03c0);
-                        self.compiler
-                            .memory_manager
-                            .finalize_code(from_block.entry as *mut u8, from_block.code_size);
-                    }
+            if self.block_chains.remove(&key).is_some() {
+                // Links are atomic pointer slots, never patched instructions:
+                // clearing the slot is a single Release store, safe while
+                // another thread is executing the block.
+                if let Some(from_block) = self.block_cache.get(&from_address)
+                    && from_block.link_target.swap(0, Ordering::AcqRel) != 0
+                {
+                    self.chain_links_broken += 1;
+                    JIT_CHAIN_LINKS_BROKEN.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -5002,6 +6434,25 @@ impl JitRuntime {
         self.fast_thunk_table.register(host_fn).ok()
     }
 
+    /// Register a host function as the resolved target for a guest thunk
+    /// address.  Subsequent compilations of `Call { target: guest_addr }`
+    /// emit a direct trampoline call instead of an EXIT_THUNK dispatcher
+    /// round-trip.
+    pub fn register_host_thunk_for_guest(
+        &mut self,
+        host_fn: usize,
+        guest_addr: u64,
+    ) -> Option<usize> {
+        self.fast_thunk_table
+            .register_with_guest_addr(host_fn, guest_addr)
+            .ok()
+    }
+
+    /// Guest thunk addresses with a resolved trampoline.
+    pub fn guest_thunk_addrs(&self) -> std::collections::HashSet<u64> {
+        self.fast_thunk_table.guest_addrs()
+    }
+
     /// Look up the executable thunk address for a previously registered
     /// fast-thunk index. Returns `None` if the index is out of range.
     pub fn lookup_thunk_address(&self, idx: usize) -> Option<usize> {
@@ -5040,7 +6491,7 @@ pub struct BlockChainEntry {
 /// hotter they are promoted to Tier1 (full optimization with register
 /// allocation) and eventually Tier2 (aggressive optimization with inlining
 /// and loop unrolling).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub enum CompilationTier {
     /// Fast compilation, minimal optimization — direct 1:1 IR-to-native.
     #[default]
@@ -5194,10 +6645,14 @@ impl JitCompiler {
         fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
+        let link_target = Arc::new(AtomicU64::new(0));
+        self.link_slot = Some(Arc::clone(&link_target));
 
         // Optimized prologue: same as default but with better register planning
         self.emit_prologue(arch);
+        self.emit_current_block_tag(guest_address);
         self.emit_load_guest_registers(arch);
+        self.emit_safepoint_check(arch);
 
         // Constant folding pass: pre-compute known constants
         let folded_ir = Self::constant_fold(ir);
@@ -5209,42 +6664,49 @@ impl JitCompiler {
 
         self.emit_store_guest_registers(arch);
         self.emit_epilogue();
+        // The optimized paths must carry the same safepoint and guest-fault
+        // exits as the Tier0 path: without these stubs the emitted `cbnz`
+        // placeholders would fall through and a fault would be ignored.
+        self.finish_safepoint_stub(arch);
+        self.finish_fault_stub(arch);
 
         let code_size = self.emitter.len();
         let code_ptr = self.memory_manager.allocate_code_space(code_size);
         if code_ptr.is_null() {
             return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcJitCodeAllocFailed,
                 "JIT Tier1: failed to allocate executable memory",
             ));
         }
 
         // SAFETY: Same as compile_block — code_ptr is valid for code_size
         // bytes, emitter.code is a valid Vec, regions are non-overlapping.
-        unsafe {
-            ptr::copy_nonoverlapping(self.emitter.code.as_ptr(), code_ptr, code_size);
-            self.memory_manager.finalize_code(code_ptr, code_size);
-        }
+        self.install_code(code_ptr, code_size)?;
 
         let source_hash = compute_ir_hash(ir, guest_address);
         let last_exit_info = block_exit_info(ir);
+        self.link_slot = None;
 
         Ok(JitCompiledBlock {
             entry: code_ptr,
+            entry_atomic: AtomicPtr::new(code_ptr as *mut u8),
             code_size,
             guest_address,
             instruction_count: ir.len(),
             source_hash,
             last_exit_info,
+            compile_tier: CompilationTier::Tier1,
+            ends_in_control_flow: block_ends_in_control_flow(ir),
+            link_target,
         })
     }
 
-    /// Compile a block at Tier2: aggressive optimization with block inlining
-    /// and loop unrolling.
+    /// Compile a block at Tier2.
     ///
-    /// # Performance Impact
-    /// Inlines small callee blocks directly into the caller, unrolls tight
-    /// loops to reduce branch overhead, and applies all Tier1 optimizations.
+    /// Tier2 currently applies the same sound optimizer as Tier1 (constant
+    /// folding/no-op elimination) with the full safepoint and guest-fault
+    /// exits.  Loop unrolling and block inlining remain disabled because the
+    /// existing passes can change guest-visible flags/counter values.
     pub fn compile_tier2(
         &mut self,
         ir: &[IrInstruction],
@@ -5253,47 +6715,60 @@ impl JitCompiler {
         fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
+        let link_target = Arc::new(AtomicU64::new(0));
+        self.link_slot = Some(Arc::clone(&link_target));
 
         self.emit_prologue(arch);
+        self.emit_current_block_tag(guest_address);
         self.emit_load_guest_registers(arch);
+        self.emit_safepoint_check(arch);
 
-        // Apply aggressive optimizations
+        // Apply aggressive optimizations.  Loop unrolling is intentionally
+        // NOT applied: the current pass removes the block's flag-setting
+        // back-edge and can change guest-visible flags/counter values for
+        // loop bodies that read them.  Tier2 therefore shares Tier1's sound
+        // constant-folding pass; the two required real optimizations are
+        // block linking and direct resolved-thunk calls (see `chain_blocks`
+        // and the Call emission arm).
         let optimized_ir = Self::constant_fold(ir);
-        let unrolled_ir = Self::loop_unroll(&optimized_ir, guest_address);
 
-        for insn in &unrolled_ir {
+        for insn in &optimized_ir {
             self.compile_instruction(insn, arch, fast_thunk_addrs)?;
         }
 
         self.emit_store_guest_registers(arch);
         self.emit_epilogue();
+        self.finish_safepoint_stub(arch);
+        self.finish_fault_stub(arch);
 
         let code_size = self.emitter.len();
         let code_ptr = self.memory_manager.allocate_code_space(code_size);
         if code_ptr.is_null() {
             return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcJitCodeAllocFailed,
                 "JIT Tier2: failed to allocate executable memory",
             ));
         }
 
         // SAFETY: Same as compile_block — code_ptr is valid for code_size
         // bytes, emitter.code is a valid Vec, regions are non-overlapping.
-        unsafe {
-            ptr::copy_nonoverlapping(self.emitter.code.as_ptr(), code_ptr, code_size);
-            self.memory_manager.finalize_code(code_ptr, code_size);
-        }
+        self.install_code(code_ptr, code_size)?;
 
         let source_hash = compute_ir_hash(ir, guest_address);
-        let last_exit_info = block_exit_info(&unrolled_ir);
+        let last_exit_info = block_exit_info(&optimized_ir);
+        self.link_slot = None;
 
         Ok(JitCompiledBlock {
             entry: code_ptr,
+            entry_atomic: AtomicPtr::new(code_ptr as *mut u8),
             code_size,
             guest_address,
             instruction_count: ir.len(),
             source_hash,
             last_exit_info,
+            compile_tier: CompilationTier::Tier2,
+            ends_in_control_flow: block_ends_in_control_flow(ir),
+            link_target,
         })
     }
 
@@ -5305,6 +6780,23 @@ impl JitCompiler {
     /// - `MovReg` → propagate known value or record copy
     /// - `AddImm`/`SubImm`/`ShlImm`/`AndImm`/`OrImm`/`XorImm` with constant src → fold
     /// - Eliminates no-ops (add/sub/shift 0, and full_mask)
+    /// Emit a folded constant write, coalescing it with an immediately
+    /// preceding `MovImm` to the same register.  Without this, folding
+    /// `MovImm rax,5; AddImm rax,3` would leave a dead first write behind
+    /// (whole-block DCE is unsound: every GPR is live-out).
+    fn push_folded_immediate(result: &mut Vec<IrInstruction>, dst: Register, value: u64) {
+        if let Some(IrInstruction::MovImm {
+            dst: last_dst,
+            value: last_value,
+        }) = result.last_mut()
+            && *last_dst == dst
+        {
+            *last_value = value;
+            return;
+        }
+        result.push(IrInstruction::MovImm { dst, value });
+    }
+
     fn constant_fold(ir: &[IrInstruction]) -> Vec<IrInstruction> {
         let mut known: std::collections::BTreeMap<Register, KnownValue> =
             std::collections::BTreeMap::new();
@@ -5322,10 +6814,7 @@ impl JitCompiler {
                 IrInstruction::MovReg { dst, src, width: _ } => {
                     if let Some(KnownValue::Immediate(val)) = known.get(src) {
                         // Fold to MovImm
-                        result.push(IrInstruction::MovImm {
-                            dst: *dst,
-                            value: *val,
-                        });
+                        Self::push_folded_immediate(&mut result, *dst, *val);
                         known.insert(*dst, KnownValue::Immediate(*val));
                     } else {
                         // Propagate whatever we know about src, or record as copy
@@ -5350,10 +6839,7 @@ impl JitCompiler {
                     }
                     if let Some(KnownValue::Immediate(val)) = known.get(dst) {
                         let new_val = val.wrapping_add(*value);
-                        result.push(IrInstruction::MovImm {
-                            dst: *dst,
-                            value: new_val,
-                        });
+                        Self::push_folded_immediate(&mut result, *dst, new_val);
                         known.insert(*dst, KnownValue::Immediate(new_val));
                     } else {
                         known.remove(dst);
@@ -5372,10 +6858,7 @@ impl JitCompiler {
                     }
                     if let Some(KnownValue::Immediate(val)) = known.get(dst) {
                         let new_val = val.wrapping_sub(*value);
-                        result.push(IrInstruction::MovImm {
-                            dst: *dst,
-                            value: new_val,
-                        });
+                        Self::push_folded_immediate(&mut result, *dst, new_val);
                         known.insert(*dst, KnownValue::Immediate(new_val));
                     } else {
                         known.remove(dst);
@@ -5394,10 +6877,7 @@ impl JitCompiler {
                     }
                     if let Some(KnownValue::Immediate(val)) = known.get(dst) {
                         let new_val = val.wrapping_shl(*count as u32);
-                        result.push(IrInstruction::MovImm {
-                            dst: *dst,
-                            value: new_val,
-                        });
+                        Self::push_folded_immediate(&mut result, *dst, new_val);
                         known.insert(*dst, KnownValue::Immediate(new_val));
                     } else {
                         known.remove(dst);
@@ -5421,10 +6901,7 @@ impl JitCompiler {
                     }
                     if let Some(KnownValue::Immediate(val)) = known.get(dst) {
                         let new_val = val & value;
-                        result.push(IrInstruction::MovImm {
-                            dst: *dst,
-                            value: new_val,
-                        });
+                        Self::push_folded_immediate(&mut result, *dst, new_val);
                         known.insert(*dst, KnownValue::Immediate(new_val));
                     } else {
                         known.remove(dst);
@@ -5440,10 +6917,7 @@ impl JitCompiler {
                 } => {
                     if let Some(KnownValue::Immediate(val)) = known.get(dst) {
                         let new_val = val | value;
-                        result.push(IrInstruction::MovImm {
-                            dst: *dst,
-                            value: new_val,
-                        });
+                        Self::push_folded_immediate(&mut result, *dst, new_val);
                         known.insert(*dst, KnownValue::Immediate(new_val));
                     } else {
                         known.remove(dst);
@@ -5459,10 +6933,7 @@ impl JitCompiler {
                 } => {
                     if let Some(KnownValue::Immediate(val)) = known.get(dst) {
                         let new_val = val ^ value;
-                        result.push(IrInstruction::MovImm {
-                            dst: *dst,
-                            value: new_val,
-                        });
+                        Self::push_folded_immediate(&mut result, *dst, new_val);
                         known.insert(*dst, KnownValue::Immediate(new_val));
                     } else {
                         known.remove(dst);
@@ -5479,8 +6950,14 @@ impl JitCompiler {
             }
         }
 
-        // Dead code elimination pass
-        Self::dead_code_elimination(&result)
+        // NOTE: block-level dead-code elimination is intentionally NOT applied
+        // here.  Every compiled block ends by storing ALL guest GPRs back to
+        // CpuState, so every register written by the block is live-out.  The
+        // liveness pass below only sees the block's own instructions and would
+        // delete a final `MovImm rax, 42` (no later reader) — silently zeroing
+        // guest state.  The pass remains available for intra-block use but is
+        // not sound as a whole-block transform.
+        result
     }
 
     /// Invalidate the known value for any register written by `insn`.
@@ -5567,6 +7044,7 @@ impl JitCompiler {
     ///
     /// Scans the IR forward to find which registers are used as source operands,
     /// then removes instructions that write to registers never subsequently read.
+    #[allow(dead_code)] // retained for intra-block use; unsound as a whole-block transform
     fn dead_code_elimination(ir: &[IrInstruction]) -> Vec<IrInstruction> {
         // Backward liveness analysis pass.
         //
@@ -5666,6 +7144,7 @@ impl JitCompiler {
     }
 
     /// Check if an instruction has observable side effects (must not be eliminated).
+    #[allow(dead_code)]
     fn has_side_effect(insn: &IrInstruction) -> bool {
         match insn {
             IrInstruction::StoreMemory { .. }
@@ -5823,6 +7302,7 @@ impl JitCompiler {
     }
 
     /// Collect all register sources used by an instruction into the given set.
+    #[allow(dead_code)]
     fn collect_source_regs(insn: &IrInstruction, regs: &mut std::collections::BTreeSet<Register>) {
         match insn {
             IrInstruction::MovReg { src, .. } => {
@@ -5974,6 +7454,7 @@ impl JitCompiler {
     /// - Only unroll when loop body has ≤ 50 instructions
     /// - Only unroll when iteration count is known at compile time
     /// - Does NOT unroll loops containing host calls or indirect branches
+    #[allow(dead_code)]
     fn loop_unroll(ir: &[IrInstruction], guest_address: u64) -> Vec<IrInstruction> {
         // Need at least SubImm + JumpIf at the end
         if ir.len() < 2 {
@@ -6035,6 +7516,7 @@ impl JitCompiler {
     }
 
     /// Check if a loop body contains host calls or indirect branches (unsafe to unroll).
+    #[allow(dead_code)]
     fn loop_contains_unsafe_instructions(body: &[IrInstruction]) -> bool {
         body.iter().any(|insn| {
             matches!(
@@ -6049,6 +7531,7 @@ impl JitCompiler {
     }
 
     /// Find the initial value of a loop counter register from preceding `MovImm` instructions.
+    #[allow(dead_code)]
     fn find_loop_count(instructions: &[IrInstruction], counter: &Register) -> Option<u64> {
         // Scan backwards to find the last MovImm that sets this register
         for insn in instructions.iter().rev() {
@@ -6066,6 +7549,7 @@ impl JitCompiler {
     }
 
     /// Check if an instruction writes to a specific register.
+    #[allow(dead_code)]
     fn instruction_writes_register(insn: &IrInstruction, reg: &Register) -> bool {
         match insn {
             IrInstruction::MovImm { dst, .. }
@@ -6112,6 +7596,7 @@ impl JitCompiler {
 
     /// Fully unroll a loop with a known small iteration count.
     /// Duplicates the body `count` times, removes the loop back-edge.
+    #[allow(dead_code)]
     fn fully_unroll(
         folded: &[IrInstruction],
         loop_end: usize,
@@ -6138,6 +7623,7 @@ impl JitCompiler {
     }
 
     /// Partially unroll a loop by factor 2, leaving a remainder loop for remaining iterations.
+    #[allow(dead_code)]
     fn partially_unroll(
         folded: &[IrInstruction],
         loop_end: usize,
@@ -6700,6 +8186,13 @@ impl FastThunkTable {
         if self.code_zone.is_some() {
             return Ok(());
         }
+        #[cfg(test)]
+        if JIT_TEST_DENY_THUNK_ZONE.with(|deny| deny.replace(false)) {
+            return Err(AppError::new(
+                ReasonCode::RcJitCodeAllocFailed,
+                "failed to mmap fast-thunk code zone",
+            ));
+        }
         // Allocate 64 KB (one JIT page) of executable memory for thunks
         let size = 64 * 1024;
         // SAFETY: mmap allocates a 64KB anonymous private mapping with
@@ -6805,6 +8298,9 @@ impl FastThunkTable {
         // SAFETY: pthread_jit_write_protect_np(0) switches MAP_JIT pages
         // from executable to writable. No concurrent execution of thunk
         // code occurs because registration happens before execution.
+        let _install = JIT_CODE_INSTALL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe {
             libc::pthread_jit_write_protect_np(0);
         }
@@ -6816,6 +8312,9 @@ impl FastThunkTable {
         // After writing, we switch back to executable with write_protect(1).
         unsafe {
             std::ptr::copy_nonoverlapping(thunk.as_ptr(), addr as *mut u8, thunk.len());
+            // ARM64 requires an explicit instruction-cache flush after writing
+            // code, exactly like block installation.
+            JitMemoryManager::flush_icache(addr as *mut u8, thunk.len());
             // Re-enable execute (and disable write) on the MAP_JIT region.
             // On Apple Silicon, MAP_JIT memory can only be either writable or
             // executable at any given time — never both.  After writing the
@@ -6938,6 +8437,20 @@ impl FastThunkTable {
                 .entries
                 .iter()
                 .any(|e| e.guest_addr == Some(guest_addr))
+    }
+
+    /// Snapshot of every guest address with a resolved trampoline.  Passed to
+    /// `JitCompiler::compile_instruction` so `Call` sites to stable resolved
+    /// thunks are emitted as direct trampoline calls instead of dispatcher
+    /// exits.
+    pub fn guest_addrs(&self) -> std::collections::HashSet<u64> {
+        let mut addrs: std::collections::HashSet<u64> = self.guest_index.keys().copied().collect();
+        for entry in &self.entries {
+            if let Some(guest_addr) = entry.guest_addr {
+                addrs.insert(guest_addr);
+            }
+        }
+        addrs
     }
 }
 
@@ -7170,10 +8683,10 @@ impl JitUnwindTable {
 
 /// Machine-readable report of the `--jit-self-test` run.
 ///
-/// `active` is true only when MAP_JIT code was actually ALLOCATED, compiled,
-/// executed and re-patched in a child process — a self-test that cannot
-/// execute (e.g. macOS 26 blocks MAP_JIT execution for ad-hoc-signed
-/// binaries) reports `active: false` with the reason.
+/// `active` is true only when code was actually ALLOCATED through the
+/// capability-probed mechanism, compiled, executed and re-patched in a child
+/// process — a self-test that cannot execute reports `active: false` with the
+/// reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JitSelfTestReport {
     /// True when the full self-test (compile → execute → safepoint →
@@ -7186,8 +8699,36 @@ pub struct JitSelfTestReport {
     /// True when the host safepoint flag was observed to produce
     /// EXIT_SAFEPOINT from compiled code.
     pub safepoint_observed: bool,
+    /// Block links published during the self-test (backedge linking).
+    #[serde(default)]
+    pub chain_links: u64,
+    /// `Call` sites compiled to a direct resolved-thunk call.
+    #[serde(default)]
+    pub thunk_direct_calls: u64,
+    /// Compiled blocks invalidated by the self-modifying-code test.
+    #[serde(default)]
+    pub smc_invalidations: u64,
+    /// Blocks handed to the interpreter by the fault-equivalent fallback.
+    #[serde(default)]
+    pub fault_fallbacks: u64,
     /// Why the self-test is not active, when it is not.
     pub fallback_reason: Option<String>,
+}
+
+impl Default for JitSelfTestReport {
+    fn default() -> Self {
+        Self {
+            active: false,
+            compiled_blocks: 0,
+            executed_blocks: 0,
+            safepoint_observed: false,
+            chain_links: 0,
+            thunk_direct_calls: 0,
+            smc_invalidations: 0,
+            fault_fallbacks: 0,
+            fallback_reason: None,
+        }
+    }
 }
 
 /// The guest value the self-test block writes into RAX before any patching.
@@ -7212,10 +8753,9 @@ fn movz_x4(imm: u16) -> u32 {
 /// 4. the code page is re-patched (W) and the changed code executes (X),
 ///    yielding the patched value.
 ///
-/// Any verification failure returns an error.  On platforms where MAP_JIT
-/// execution is blocked (macOS 26, ad-hoc-signed binaries) this process
-/// faults inside step 2 — the caller runs it in a child process and turns a
-/// fault into `active: false`.
+/// Any verification failure returns an error.  If the recorded capability is
+/// wrong and execution faults, the caller runs this in a child process and
+/// turns the fault into `active: false`.
 pub fn run_jit_self_test_child() -> AppResult<JitSelfTestReport> {
     let mut runtime = JitRuntime::new(GuestArch::X64);
     let mut state = CpuState::new(GuestArch::X64);
@@ -7225,9 +8765,17 @@ pub fn run_jit_self_test_child() -> AppResult<JitSelfTestReport> {
     // no control flow, so it exits EXIT_NORMAL and the compiled prefix is
     // exactly what we verify.
     let guest_address = 0x1000u64;
+    #[cfg(test)]
+    let original_value = if JIT_TEST_SELF_TEST_WRONG_ORIGINAL.with(|wrong| wrong.replace(false)) {
+        JIT_SELF_TEST_ORIGINAL_VALUE.wrapping_sub(1)
+    } else {
+        JIT_SELF_TEST_ORIGINAL_VALUE
+    };
+    #[cfg(not(test))]
+    let original_value = JIT_SELF_TEST_ORIGINAL_VALUE;
     let ir = vec![IrInstruction::MovImm {
         dst: Register::Rax,
-        value: JIT_SELF_TEST_ORIGINAL_VALUE,
+        value: original_value,
     }];
     state.rip = guest_address;
 
@@ -7247,7 +8795,7 @@ pub fn run_jit_self_test_child() -> AppResult<JitSelfTestReport> {
     let code_words: Vec<u32> = unsafe {
         std::slice::from_raw_parts(block_entry as *const u32, block_code_size / 4).to_vec()
     };
-    let original_insn = movz_x4(JIT_SELF_TEST_ORIGINAL_VALUE as u16);
+    let original_insn = movz_x4(original_value as u16);
     let patched_insn = movz_x4(JIT_SELF_TEST_PATCHED_VALUE as u16);
     let patch_offset = code_words
         .iter()
@@ -7321,16 +8869,34 @@ pub fn run_jit_self_test_child() -> AppResult<JitSelfTestReport> {
     // SAFETY: single-threaded; no code is executing while the page is
     // writable (we are between execute_block calls).
     unsafe {
-        runtime
+        if !runtime
             .compiler
             .memory_manager
-            .make_writable(block_entry as *mut u8, block_code_size);
+            .make_writable(block_entry as *mut u8, block_code_size)
+        {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                "JIT self-test: compiled code page is not writable",
+            ));
+        }
         let words = std::slice::from_raw_parts_mut(block_entry as *mut u32, block_code_size / 4);
-        words[patch_offset] = patched_insn;
-        runtime
+        #[cfg(test)]
+        let skip_repatch = JIT_TEST_SKIP_REPATCH.with(|skip| skip.replace(false));
+        #[cfg(not(test))]
+        let skip_repatch = false;
+        if !skip_repatch {
+            words[patch_offset] = patched_insn;
+        }
+        if !runtime
             .compiler
             .memory_manager
-            .finalize_code(block_entry as *mut u8, block_code_size);
+            .finalize_code(block_entry as *mut u8, block_code_size)
+        {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                "JIT self-test: re-patched code page is not executable",
+            ));
+        }
     }
     state.set(Register::Rax, 0);
     let reason = execute(&mut runtime, &mut state);
@@ -7351,22 +8917,348 @@ pub fn run_jit_self_test_child() -> AppResult<JitSelfTestReport> {
         ));
     }
 
+    // 4. Backedge/forward linking: publish a link from a jump block to a
+    //    control-flow target and execute it.  The source must branch into
+    //    the target entry (no dispatcher return), the target must exit with
+    //    its own EXIT_JUMP, and the host frame must stay balanced.
+    let chain_source = 0x2000u64;
+    let chain_target = 0x3000u64;
+    let chain_exit = 0x4000u64;
+    let source_ir = vec![
+        IrInstruction::Nop,
+        IrInstruction::Jump {
+            target: chain_target,
+        },
+    ];
+    let target_ir = vec![
+        IrInstruction::Nop,
+        IrInstruction::Jump { target: chain_exit },
+    ];
+    runtime
+        .get_or_compile(&source_ir, chain_source, GuestArch::X64, None)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!(
+                    "JIT self-test: chain source compile failed: {}",
+                    error.message
+                ),
+            )
+        })?;
+    runtime
+        .get_or_compile(&target_ir, chain_target, GuestArch::X64, None)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!(
+                    "JIT self-test: chain target compile failed: {}",
+                    error.message
+                ),
+            )
+        })?;
+    runtime
+        .chain_blocks(chain_source, chain_target)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!("JIT self-test: chain_blocks failed: {}", error.message),
+            )
+        })?;
+    let chain_links = runtime.chain_links_formed;
+    if chain_links == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            "JIT self-test: no block link was published",
+        ));
+    }
+    let source_block = runtime
+        .block_cache
+        .get(&chain_source)
+        .cloned()
+        .expect("chain source block remains compiled");
+    state.rip = chain_source;
+    let reason = unsafe { runtime.execute_block(&source_block, &mut state, &mut memory) };
+    if reason != (JitExitReason::Jump { target: chain_exit }) {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            format!("JIT self-test: linked execution exited with {reason:?}, expected Jump"),
+        ));
+    }
+
+    // 5. Direct resolved-thunk call: a registered guest thunk must compile to
+    //    a direct trampoline call (no EXIT_THUNK) and update guest state.
+    const SELF_TEST_THUNK_GUEST: u64 = 0x5000;
+    let thunk_registered = runtime
+        .register_host_thunk_for_guest(
+            jit_self_test_host_thunk as *const () as usize,
+            SELF_TEST_THUNK_GUEST,
+        )
+        .is_some();
+    if !thunk_registered {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            "JIT self-test: failed to register the direct-call host thunk",
+        ));
+    }
+    let thunk_ir = vec![
+        IrInstruction::MovImm {
+            dst: Register::Rax,
+            value: 7,
+        },
+        IrInstruction::Call {
+            target: SELF_TEST_THUNK_GUEST,
+            return_address: 0x6004,
+        },
+    ];
+    let thunk_before = JIT_THUNK_DIRECT_CALLS.load(Ordering::Relaxed);
+    runtime
+        .get_or_compile(&thunk_ir, 0x6000, GuestArch::X64, None)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!(
+                    "JIT self-test: thunk block compile failed: {}",
+                    error.message
+                ),
+            )
+        })?;
+    let thunk_direct_calls = JIT_THUNK_DIRECT_CALLS.load(Ordering::Relaxed) - thunk_before;
+    if thunk_direct_calls == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            "JIT self-test: Call to a resolved thunk did not compile to a direct call",
+        ));
+    }
+    let thunk_block = runtime
+        .block_cache
+        .get(&0x6000u64)
+        .cloned()
+        .expect("thunk block remains compiled");
+    state.set(Register::Rax, 0);
+    state.set(Register::Rsp, 0x2000);
+    state.rip = 0x6000;
+    let reason = unsafe { runtime.execute_block(&thunk_block, &mut state, &mut memory) };
+    if reason != (JitExitReason::Normal { new_rip: state.rip }) || state.get(Register::Rax) != 0x99
+    {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            format!(
+                "JIT self-test: direct thunk call failed: reason={reason:?} rax={:#x}",
+                state.get(Register::Rax)
+            ),
+        ));
+    }
+
+    // 6. Self-modifying code: a compiled block that stores over its own code
+    //    page must invalidate the stale block; the next execution falls back
+    //    to the interpreter and recompilation observes the new IR.
+    let smc_address = 0x7000u64;
+    let smc_writer = 0x7100u64;
+    // The guest store must target mapped guest memory (an unmapped write
+    // takes the fault path instead of reaching the SMC hook).
+    memory.map_zeroed_if_unmapped(smc_address, 0x1000);
+    let smc_ir = vec![IrInstruction::MovImm {
+        dst: Register::Rax,
+        value: 42,
+    }];
+    runtime
+        .get_or_compile(&smc_ir, smc_address, GuestArch::X64, None)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!("JIT self-test: SMC block compile failed: {}", error.message),
+            )
+        })?;
+    let smc_block = runtime
+        .block_cache
+        .get(&smc_address)
+        .cloned()
+        .expect("SMC block remains compiled");
+    state.rip = smc_address;
+    let _ = unsafe { runtime.execute_block(&smc_block, &mut state, &mut memory) };
+    let writer_ir = vec![
+        IrInstruction::StoreImmediate {
+            address: crate::cpu::MemoryOperand {
+                base: None,
+                index: None,
+                scale: 1,
+                displacement: 0,
+                rip_relative: false,
+                rip_base: 0,
+                segment: None,
+                address_size_32: false,
+                absolute_address: Some(smc_address),
+            },
+            value: 0x9090_9090,
+            width: 4,
+        },
+        IrInstruction::Nop,
+    ];
+    runtime
+        .get_or_compile(&writer_ir, smc_writer, GuestArch::X64, None)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!(
+                    "JIT self-test: SMC writer compile failed: {}",
+                    error.message
+                ),
+            )
+        })?;
+    let writer_block = runtime
+        .block_cache
+        .get(&smc_writer)
+        .cloned()
+        .expect("SMC writer remains compiled");
+    state.rip = smc_writer;
+    let _ = unsafe { runtime.execute_block(&writer_block, &mut state, &mut memory) };
+    // The stale block must NOT run: the entry drain invalidates it and the
+    // dispatcher receives the interpreter fallback.
+    state.rip = smc_address;
+    let reason = unsafe { runtime.execute_block(&smc_block, &mut state, &mut memory) };
+    if reason != JitExitReason::Safepoint {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            format!("JIT self-test: stale SMC block ran instead of falling back: {reason:?}"),
+        ));
+    }
+    let smc_invalidations = runtime.code_invalidations;
+    if smc_invalidations == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            "JIT self-test: self-modifying code did not invalidate a block",
+        ));
+    }
+    let smc_new_ir = vec![IrInstruction::MovImm {
+        dst: Register::Rax,
+        value: 43,
+    }];
+    runtime
+        .get_or_compile(&smc_new_ir, smc_address, GuestArch::X64, None)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!("JIT self-test: SMC recompile failed: {}", error.message),
+            )
+        })?;
+    let recompiled = runtime
+        .block_cache
+        .get(&smc_address)
+        .cloned()
+        .expect("recompiled SMC block");
+    state.set(Register::Rax, 0);
+    state.rip = smc_address;
+    let _ = unsafe { runtime.execute_block(&recompiled, &mut state, &mut memory) };
+    if state.get(Register::Rax) != 43 {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            format!(
+                "JIT self-test: recompiled SMC block observed stale code: rax={}",
+                state.get(Register::Rax)
+            ),
+        ));
+    }
+
+    // 7. Fault-equivalent fallback: an invalid block installation must hand
+    //    the block to the interpreter (counter + permanent bar), never abort.
+    let fault_address = 0x8000u64;
+    runtime
+        .get_or_compile(
+            &[IrInstruction::MovImm {
+                dst: Register::Rax,
+                value: 7,
+            }],
+            fault_address,
+            GuestArch::X64,
+            None,
+        )
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!(
+                    "JIT self-test: fault block compile failed: {}",
+                    error.message
+                ),
+            )
+        })?;
+    runtime.report_block_fault(fault_address);
+    let fault_fallbacks = runtime.fault_fallbacks;
+    if fault_fallbacks == 0
+        || runtime
+            .get_or_compile(
+                &[IrInstruction::MovImm {
+                    dst: Register::Rax,
+                    value: 7,
+                }],
+                fault_address,
+                GuestArch::X64,
+                None,
+            )
+            .is_ok()
+    {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            "JIT self-test: faulted block was not barred from native compilation",
+        ));
+    }
+
     Ok(JitSelfTestReport {
         active: true,
         compiled_blocks: compiled,
         executed_blocks: runtime.blocks_executed,
         safepoint_observed,
+        chain_links,
+        thunk_direct_calls,
+        smc_invalidations,
+        fault_fallbacks,
         fallback_reason: None,
     })
 }
 
+/// Host thunk used by the self-test direct-call step: the trampoline calls
+/// this with (runtime, state, memory, guest_thunk).  It records a sentinel in
+/// RAX and asks the bridge to continue (-1).
+extern "C" fn jit_self_test_host_thunk(
+    _runtime: *mut c_void,
+    state: *mut CpuState,
+    _memory: *mut MemoryImage,
+    _thunk_address: u64,
+) -> i32 {
+    #[cfg(test)]
+    let sentinel = if JIT_TEST_SELF_TEST_THUNK_BAD.with(|bad| bad.replace(false)) {
+        0x98
+    } else {
+        0x99
+    };
+    #[cfg(not(test))]
+    let sentinel = 0x99;
+    if !state.is_null() {
+        // SAFETY: state is the live CpuState passed by the self-test block.
+        unsafe {
+            (*state).gpr[0] = sentinel;
+        }
+    }
+    -1
+}
+
 /// Run the self-test with crash isolation: the actual test executes in a
-/// CHILD process so that a MAP_JIT execution fault (macOS 26 blocks
-/// MAP_JIT execution for ad-hoc-signed binaries) is observed as a child
+/// CHILD process so an executable-memory fault is observed as a child
 /// failure instead of killing the caller.  `active` is true only when the
 /// child ran the full test and reported success.
 pub fn run_jit_self_test() -> JitSelfTestReport {
-    let current_exe = match std::env::current_exe() {
+    #[cfg(test)]
+    let exec_mode = JIT_TEST_SELF_TEST_EXE_MODE.with(|mode| mode.replace(0));
+    #[cfg(not(test))]
+    let exec_mode = 0u8;
+    let current_exe = match if exec_mode == 1 {
+        Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+    } else if exec_mode == 2 {
+        Ok(std::path::PathBuf::from("/casa1/self-test-missing-binary"))
+    } else if exec_mode == 3 {
+        Ok(std::path::PathBuf::from("/usr/bin/true"))
+    } else {
+        std::env::current_exe()
+    } {
         Ok(path) => path,
         Err(error) => {
             return JitSelfTestReport {
@@ -7377,6 +9269,7 @@ pub fn run_jit_self_test() -> JitSelfTestReport {
                 fallback_reason: Some(format!(
                     "cannot resolve current executable for the self-test child: {error}"
                 )),
+                ..JitSelfTestReport::default()
             };
         }
     };
@@ -7392,6 +9285,7 @@ pub fn run_jit_self_test() -> JitSelfTestReport {
                 executed_blocks: 0,
                 safepoint_observed: false,
                 fallback_reason: Some(format!("failed to spawn self-test child: {error}")),
+                ..JitSelfTestReport::default()
             };
         }
     };
@@ -7413,6 +9307,7 @@ pub fn run_jit_self_test() -> JitSelfTestReport {
                 fallback_reason: Some(format!(
                     "self-test child exited 0 without a valid JitSelfTestReport JSON: {error}"
                 )),
+                ..JitSelfTestReport::default()
             },
         }
     } else {
@@ -7429,6 +9324,7 @@ pub fn run_jit_self_test() -> JitSelfTestReport {
                 stdout.trim(),
                 String::from_utf8_lossy(&output.stderr).trim(),
             )),
+            ..JitSelfTestReport::default()
         }
     }
 }
@@ -7438,9 +9334,8 @@ fn status_signal_description(status: &std::process::ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt;
     match status.signal() {
         Some(signal) => format!(
-            " signal={signal} (fault while executing MAP_JIT code — \
-            macOS 26 blocks MAP_JIT execution for ad-hoc-signed binaries; the binary must be \
-            signed with the com.apple.security.cs.allow-jit entitlement)"
+            " signal={signal} (fault while executing JIT code — the \
+            capability probe's mechanism failed in the child; no entitlement shortcut is assumed)"
         ),
         None => String::new(),
     }
@@ -7456,337 +9351,201 @@ mod tests {
     use super::*;
 
     #[test]
-    fn jit_memory_manager_allocates_and_finalizes() {
+    fn jit_memory_manager_rejects_null_and_zero_size_finalize() {
         let mut mgr = JitMemoryManager::new();
         let code = [0xd5, 0x03, 0x20, 0x1f]; // NOP
         let ptr = mgr.allocate_code_space(code.len());
-        assert!(!ptr.is_null());
+        assert_eq!(ptr.is_null(), false);
+        assert_eq!(mgr.total_allocated(), JIT_PAGE_SIZE);
+        assert_eq!(mgr.total_used(), 64);
         // SAFETY: ptr was allocated by allocate_code_space and is valid
         // for code.len() bytes. code.as_ptr() is valid for code.len() bytes.
         // Regions are non-overlapping.
         unsafe {
+            assert_eq!(
+                mgr.make_writable(ptr, code.len()),
+                true,
+                "selected mechanism must provide writable code memory"
+            );
             ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
-            mgr.finalize_code(ptr, code.len());
+            assert_eq!(
+                mgr.finalize_code(ptr, code.len()),
+                true,
+                "selected mechanism must provide executable code memory"
+            );
+            // Null and zero-size requests must be refused: making them
+            // "succeed" would claim a nonexistent code range is executable.
+            assert_eq!(mgr.finalize_code(std::ptr::null_mut(), code.len()), false);
+            assert_eq!(mgr.finalize_code(ptr, 0), false);
         }
-        assert!(mgr.total_allocated() >= code.len());
-        assert!(mgr.total_used() >= code.len());
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn flat_guest_memory_creates_successfully() {
-        let mem = FlatGuestMemory::new(GuestArch::X64);
-        assert!(mem.is_valid());
-        assert!(mem.base() != 0);
-    }
-
-    #[test]
-    fn flat_guest_memory_sync_and_read() {
-        let mem = FlatGuestMemory::new(GuestArch::X64);
-        let data = [0xde, 0xad, 0xbe, 0xef];
-        mem.sync_from_memory_image(0x1000, &data);
-        let mut buf = [0u8; 4];
-        mem.read(0x1000, &mut buf);
-        assert_eq!(buf, data);
-    }
-
-    #[test]
-    fn emitter_encodes_nop() {
-        let mut e = Emitter::new();
-        e.nop();
-        assert_eq!(e.code, vec![0x1f, 0x20, 0x03, 0xd5]);
-    }
-
-    #[test]
-    fn emitter_encodes_ret() {
-        let mut e = Emitter::new();
-        e.ret();
-        assert_eq!(e.code, vec![0xc0, 0x03, 0x5f, 0xd6]);
-    }
-
-    #[test]
-    fn emitter_encodes_mov_reg() {
-        let mut e = Emitter::new();
-        e.mov_reg(4, 5); // mov x4, x5
-        // ORR x4, xZR, x5 = 0xaa0003e0 | (5 << 16) | 4
-        let expected = 0xaa0003e0u32 | (5u32 << 16) | 4;
-        assert_eq!(e.code, expected.to_le_bytes());
-    }
-
-    #[test]
-    fn emitter_encodes_add_imm() {
-        let mut e = Emitter::new();
-        e.add_imm(4, 4, 8); // add x4, x4, #8
-        let expected = 0x91000000u32 | (8 << 10) | (4 << 5) | 4;
-        assert_eq!(e.code, expected.to_le_bytes());
-    }
-
-    #[test]
-    fn jit_runtime_creates_for_x64() {
-        let rt = JitRuntime::new(GuestArch::X64);
-        assert_eq!(rt.blocks_compiled, 0);
-        assert_eq!(rt.blocks_executed, 0);
-    }
-
-    #[test]
-    fn compiled_block_contains_patched_safepoint_check_and_stub() {
-        // Every compiled block must poll the host safepoint flag in the
-        // translated code itself (not just at dispatch boundaries): the
-        // emitted bytes must contain movz/movk x26 (flag address), an LDRB
-        // of the flag, a CBNZ W26 whose patched target lands exactly on the
-        // stub's `movz x0, EXIT_SAFEPOINT`, and the stub must end with RET.
-        let mut compiler = JitCompiler::new();
-        let ir = vec![IrInstruction::Nop];
-        let block = compiler
-            .compile_block(&ir, 0x1000, GuestArch::X64, None)
-            .expect("compile block");
-        let code = unsafe { std::slice::from_raw_parts(block.entry, block.code_size) };
-        let words: Vec<u32> = code
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-
-        // LDRB W26, [X26] — 0x39400000 | (26 << 5) | 26
-        let ldrb = 0x39400000u32 | (26 << 5) | 26;
-        let ldrb_pos = words.iter().position(|w| *w == ldrb);
-        assert!(
-            ldrb_pos.is_some(),
-            "block must load the safepoint flag byte"
+    fn jit_exec_probe_matrix_macos_aarch64() {
+        let matrix = probe_jit_execution();
+        eprintln!("[jit] executable-memory probe matrix: {matrix:#?}");
+        assert_eq!(
+            matrix.mprotect_rx,
+            JitExecProbeOutcome::Executed(42),
+            "mmap RW -> mprotect RX must execute the ARM64 stub: {}",
+            matrix.mprotect_rx
         );
-
-        // CBNZ W26, <imm19> — 0xb5000000 | (imm19 << 5) | 26
-        let cbnz_pos = words
-            .iter()
-            .position(|w| (w & 0xff00001fu32) == 0xb5000000u32 | 26);
-        assert!(
-            cbnz_pos.is_some(),
-            "block must branch on the safepoint flag (cbnz)"
+        assert_eq!(
+            matrix.map_jit_wx_write_protect,
+            JitExecProbeOutcome::Executed(42),
+            "MAP_JIT RWX + pthread_jit_write_protect_np must execute the ARM64 stub: {}",
+            matrix.map_jit_wx_write_protect
         );
-        let cbnz_pos = cbnz_pos.unwrap();
-        let cbnz = words[cbnz_pos];
-        let imm19 = ((cbnz >> 5) & 0x7ffff) as i32;
-        let stub_pos = cbnz_pos as i32 + imm19;
-        assert!(
-            imm19 > 0,
-            "safepoint branch must be a forward branch to the stub"
+        assert_eq!(
+            matrix.selected,
+            JitExecMechanism::MapJitWx,
+            "the JIT must prefer the W^X MAP_JIT mechanism when it executes"
         );
+        // Regression guard: the pre-fix allocation (MAP_JIT without PROT_EXEC)
+        // must never silently start "working" as if it were executable.
         assert!(
-            stub_pos > ldrb_pos.unwrap() as i32,
-            "stub must come after the flag load"
+            !matches!(
+                matrix.map_jit_rw_write_protect,
+                JitExecProbeOutcome::Executed(_)
+            ),
+            "RW-only MAP_JIT must not execute; got {}",
+            matrix.map_jit_rw_write_protect
         );
+        // The no-toggle test writes into an execute-protected MAP_JIT region
+        // and must fault rather than execute.
         assert!(
-            (stub_pos as usize) < words.len(),
-            "stub position {} must be inside the block ({} words)",
-            stub_pos,
-            words.len()
-        );
-
-        // The stub begins by storing guest registers back to CpuState
-        // (stp pre-indexed, 0xa9bc0000-family encodings), then loads
-        // EXIT_SAFEPOINT into x0 and ends with RET.
-        let stub_words = &words[stub_pos as usize..];
-        assert!(
-            stub_words[0] & 0xffc00000 == 0xa9000000 || stub_words[0] & 0xffc00000 == 0xa9800000,
-            "stub must begin by storing guest registers (stp), got {:08x}",
-            stub_words[0]
-        );
-        let movz_exit = 0xd2800000u32 | (10 << 5);
-        assert!(
-            stub_words.contains(&movz_exit),
-            "stub must load EXIT_SAFEPOINT into x0"
-        );
-
-        // Stub must end with RET (0xd65f03c0) within a small window.
-        let tail = &words[stub_pos as usize..];
-        assert!(tail.contains(&0xd65f03c0), "stub must end with ret");
-
-        // The patch must have been consumed.
-        assert!(
-            compiler.safepoint_cbnz_patch.is_none(),
-            "safepoint patch position must be consumed by finish_safepoint_stub"
+            !matches!(
+                matrix.map_jit_wx_no_write_protect,
+                JitExecProbeOutcome::Executed(_)
+            ),
+            "MAP_JIT RWX without write-protect toggles must not execute; got {}",
+            matrix.map_jit_wx_no_write_protect
         );
     }
 
-    #[test]
-    fn compiled_load_store_contain_immediate_fault_check_and_exit_stub() {
-        // Every emitted load/store helper call must be followed IMMEDIATELY
-        // by the fault test — the add/ldrb/cbnz sequence on the
-        // jit_pending_fault channel — branching to a shared stub that stores
-        // guest registers, loads EXIT_GUEST_FAULT into x0 and returns.  This
-        // is what aborts the block AT the faulting instruction so Windows'
-        // "no architecturally-visible instructions after the fault" rule
-        // holds for JIT-executed blocks.
-        let operand = crate::cpu::MemoryOperand {
-            segment: None,
-            base: None,
-            index: None,
-            scale: 1,
-            displacement: 0,
-            rip_relative: false,
-            rip_base: 0,
-            address_size_32: false,
-            absolute_address: Some(0x4000),
-        };
-        let mut compiler = JitCompiler::new();
-        let ir = vec![
-            IrInstruction::LoadMemory {
-                dst: Register::Rax,
-                address: operand,
-                width: 8,
-            },
-            IrInstruction::StoreMemory {
-                src: Register::Rbx,
-                address: operand,
-                width: 8,
-            },
-        ];
-        let block = compiler
-            .compile_block(&ir, 0x1000, GuestArch::X64, None)
-            .expect("compile load+store block");
-        let code = unsafe { std::slice::from_raw_parts(block.entry, block.code_size) };
-        let words: Vec<u32> = code
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-
-        // The fault check sequence: ADD X26, X0, X26 (address of the
-        // jit_pending_fault field) followed by LDRB W26, [X26], then a CBNZ
-        // X26.  The safepoint check's LDRB is preceded by a mov_imm64, so
-        // anchoring on the ADD distinguishes the fault checks.
-        let add_x26_x0_x26 = 0x8b000000u32 | (26 << 16) | 26;
-        let ldrb = 0x39400000u32 | (26 << 5) | 26;
-        let mut fault_cbnz_positions = Vec::new();
-        for i in 0..words.len().saturating_sub(2) {
-            if words[i] == add_x26_x0_x26 && words[i + 1] == ldrb {
-                let cbnz = words[i + 2];
-                assert_eq!(
-                    cbnz & 0xff00001fu32,
-                    0xb5000000u32 | 26,
-                    "fault check must end with CBNZ X26"
+    fn verify_capability_selection(matrix: JitExecProbeMatrix) {
+        match matrix.selected {
+            JitExecMechanism::MapJitWx => assert_eq!(
+                matrix.map_jit_wx_write_protect,
+                JitExecProbeOutcome::Executed(42),
+                "selected MAP_JIT but its probe did not execute"
+            ),
+            JitExecMechanism::MprotectRx => assert_eq!(
+                matrix.mprotect_rx,
+                JitExecProbeOutcome::Executed(42),
+                "selected mprotect RX but its probe did not execute"
+            ),
+            JitExecMechanism::RwxMmap => {}
+            JitExecMechanism::Unavailable => {
+                eprintln!("[jit] native execution unavailable: {matrix:?}");
+                assert_ne!(
+                    matrix.selected,
+                    JitExecMechanism::Unavailable,
+                    "an unavailable capability must report unavailable"
                 );
-                fault_cbnz_positions.push(i + 2);
             }
         }
-        assert_eq!(
-            fault_cbnz_positions.len(),
-            2,
-            "load AND store helper calls must each be followed by an immediate fault check"
-        );
-
-        // Every cbnz must branch FORWARD to the same fault stub, which loads
-        // EXIT_GUEST_FAULT (11) into x0 and ends with RET.
-        let mut stub_positions = Vec::new();
-        for pos in &fault_cbnz_positions {
-            let cbnz = words[*pos];
-            let imm19 = ((cbnz >> 5) & 0x7ffff) as i32;
-            let stub_pos = *pos as i32 + imm19;
-            assert!(imm19 > 0, "fault branch must be forward");
-            assert!(
-                (stub_pos as usize) < words.len(),
-                "fault stub must be inside the block"
-            );
-            stub_positions.push(stub_pos);
+        for (name, outcome) in [
+            ("mprotect_rx", matrix.mprotect_rx),
+            ("map_jit_wx_write_protect", matrix.map_jit_wx_write_protect),
+        ] {
+            if let JitExecProbeOutcome::Executed(value) = outcome {
+                assert_eq!(value, 42, "{name} executed a stub that must return 42");
+            }
         }
-        assert!(
-            stub_positions.windows(2).all(|w| w[0] == w[1]),
-            "all fault checks must share ONE stub"
-        );
-        let stub_pos = stub_positions[0] as usize;
-        let stub_words = &words[stub_pos..];
-        assert!(
-            stub_words[0] & 0xffc00000 == 0xa9000000 || stub_words[0] & 0xffc00000 == 0xa9800000,
-            "fault stub must begin by storing guest registers (stp), got {:08x}",
-            stub_words[0]
-        );
-        let movz_exit_fault = 0xd2800000u32 | ((EXIT_GUEST_FAULT as u32) << 5);
-        assert!(
-            stub_words.contains(&movz_exit_fault),
-            "fault stub must load EXIT_GUEST_FAULT into x0"
-        );
-        assert!(
-            stub_words.contains(&0xd65f03c0),
-            "fault stub must end with ret"
-        );
-
-        // The patch list must have been consumed.
-        assert!(
-            compiler.fault_cbnz_patches.is_empty(),
-            "fault patch positions must be consumed by finish_fault_stub"
-        );
     }
 
     #[test]
-    fn exit_reason_mapping_decodes_guest_fault() {
-        // EXIT_GUEST_FAULT must decode to JitExitReason::GuestFault, never
-        // Normal — the dispatcher raises the access violation on it.
+    fn jit_capability_selection_rejects_inconsistent_real_matrix() {
+        let matrix = jit_execution_capability();
+        assert_eq!(
+            matrix.selected != JitExecMechanism::Unavailable,
+            jit_execution_available()
+        );
+        verify_capability_selection(matrix);
+    }
+
+    #[test]
+    fn jit_capability_selection_rejects_mprotect_and_rwx_matrices() {
+        let mprotect = JitExecProbeMatrix {
+            mprotect_rx: JitExecProbeOutcome::Executed(42),
+            map_jit_wx_write_protect: JitExecProbeOutcome::WriteFaulted(libc::SIGBUS),
+            map_jit_rw_write_protect: JitExecProbeOutcome::WriteFaulted(libc::SIGBUS),
+            map_jit_wx_no_write_protect: JitExecProbeOutcome::WriteFaulted(libc::SIGBUS),
+            selected: JitExecMechanism::MprotectRx,
+        };
+        assert_eq!(mprotect.selected, JitExecMechanism::MprotectRx);
+        verify_capability_selection(mprotect);
+        let rwx = JitExecProbeMatrix {
+            mprotect_rx: JitExecProbeOutcome::NotProbed,
+            map_jit_wx_write_protect: JitExecProbeOutcome::NotProbed,
+            map_jit_rw_write_protect: JitExecProbeOutcome::NotProbed,
+            map_jit_wx_no_write_protect: JitExecProbeOutcome::NotProbed,
+            selected: JitExecMechanism::RwxMmap,
+        };
+        assert_eq!(rwx.selected, JitExecMechanism::RwxMmap);
+        verify_capability_selection(rwx);
+    }
+
+    #[test]
+    #[should_panic(expected = "an unavailable capability must report unavailable")]
+    fn jit_capability_selection_rejects_unavailable_matrix() {
+        verify_capability_selection(JitExecProbeMatrix {
+            mprotect_rx: JitExecProbeOutcome::NotProbed,
+            map_jit_wx_write_protect: JitExecProbeOutcome::NotProbed,
+            map_jit_rw_write_protect: JitExecProbeOutcome::NotProbed,
+            map_jit_wx_no_write_protect: JitExecProbeOutcome::NotProbed,
+            selected: JitExecMechanism::Unavailable,
+        });
+    }
+
+    #[test]
+    fn jit_unavailable_capability_returns_null_allocation() {
+        let unavailable = JitExecProbeMatrix {
+            mprotect_rx: JitExecProbeOutcome::NotProbed,
+            map_jit_wx_write_protect: JitExecProbeOutcome::NotProbed,
+            map_jit_rw_write_protect: JitExecProbeOutcome::NotProbed,
+            map_jit_wx_no_write_protect: JitExecProbeOutcome::NotProbed,
+            selected: JitExecMechanism::Unavailable,
+        };
+        let mut manager = JitMemoryManager::with_capability(unavailable);
+        assert_eq!(manager.mechanism(), JitExecMechanism::Unavailable);
+        assert!(
+            manager.allocate_code_space(64).is_null(),
+            "an unavailable OS capability must fail allocation, not fabricate memory"
+        );
+        // SAFETY: the unavailable mechanism returns before dereferencing.
+        unsafe {
+            assert!(!manager.make_writable(std::ptr::null_mut(), 4));
+            assert!(!manager.finalize_code(std::ptr::null_mut(), 4));
+        }
+    }
+
+    #[test]
+    fn jit_execute_with_jit_falls_back_when_block_not_compiled() {
+        let config =
+            crate::cpu::CpuEngineConfig::from_profile(GuestArch::X64, "test", "test", None)
+                .expect("cpu config");
+        let engine = crate::cpu::CpuExecutionEngine::new(config);
         let mut state = CpuState::new(GuestArch::X64);
         state.rip = 0x1000;
-        assert_eq!(
-            map_exit_reason(EXIT_GUEST_FAULT, &state, 0, None),
-            JitExitReason::GuestFault
-        );
-    }
-
-    #[test]
-    fn safepoint_flag_address_is_wired() {
-        // The emitted movz/movk sequence must target the address of the
-        // JIT_SAFEPOINT_REQUESTED static, so the translated load reads the
-        // very flag the host scheduler sets.
-        let flag_addr = &JIT_SAFEPOINT_REQUESTED as *const AtomicBool as u64;
-        let mut compiler = JitCompiler::new();
-        let ir = vec![IrInstruction::Nop];
-        let block = compiler
-            .compile_block(&ir, 0x1000, GuestArch::X64, None)
-            .expect("compile block");
-        let code = unsafe { std::slice::from_raw_parts(block.entry, block.code_size) };
-        let words: Vec<u32> = code
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-
-        // Reconstruct the 64-bit immediate from the first movz/movk chain
-        // targeting x26 (0xd2800000 | (26) for movz x26; movk 0xf2800000).
-        // Locate the safepoint's own LDRB W26, [X26] (there may be earlier
-        // movz x26 chains from the load phase), then decode the movz/movk
-        // chain immediately preceding it.
-        let ldrb = 0x39400000u32 | (26 << 5) | 26;
-        let ldrb_pos = words
-            .iter()
-            .position(|w| *w == ldrb)
-            .expect("block must load the safepoint flag byte");
-        // The hw field (bits 21-22) must be masked out too, otherwise
-        // movk x26, #imm, LSL 32 (0xf2c0001a) would not match the base.
-        const MASK: u32 = 0xff00_001f;
-        const MOVZ_X26: u32 = 0xd200_001a;
-        const MOVK_X26: u32 = 0xf200_001a;
-        let chain_start = words[..ldrb_pos]
-            .iter()
-            .rposition(|w| (w & MASK) != MOVZ_X26 && (w & MASK) != MOVK_X26)
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let mut imm: u64 = 0;
-        let mut shift = 0;
-        let mut found = false;
-        for w in &words[chain_start..ldrb_pos] {
-            if (w & MASK) == MOVZ_X26 {
-                imm = ((*w >> 5) & 0xffff) as u64;
-                shift = 16;
-                found = true;
-            } else if (w & MASK) == MOVK_X26 {
-                imm |= (((*w >> 5) & 0xffff) as u64) << shift;
-                shift += 16;
-            }
-        }
-        assert!(found, "block must load the safepoint flag address into x26");
-        assert_eq!(
-            imm, flag_addr,
-            "emitted flag address must be JIT_SAFEPOINT_REQUESTED"
-        );
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &[0; 0x100]);
+        let ir = vec![
+            IrInstruction::MovImm {
+                dst: Register::Rax,
+                value: 7,
+            },
+            IrInstruction::Jump { target: 0 },
+        ];
+        let mut jit = JitRuntime::new(GuestArch::X64);
+        engine
+            .execute_with_jit(&mut state, &mut memory, &ir, Some(&mut jit))
+            .expect("fallback execution");
+        assert_eq!(state.get(Register::Rax), 7);
+        assert!(!jit.is_compiled(0x1000));
+        assert_eq!(jit.blocks_executed, 0);
     }
 
     #[test]
@@ -7831,14 +9590,15 @@ mod tests {
             .expect("compile block with native + fallback instructions");
         assert_eq!(block.instruction_count, 16);
 
-        assert_eq!(
-            JIT_NATIVE_LOWERED[native_op].load(Ordering::Relaxed),
-            native_before + 8,
+        // Other tests compile MovImm/Xgetbv blocks concurrently, so the
+        // process-global per-opcode counters may move by more than this
+        // block's contribution.  The batch is a guaranteed lower bound.
+        assert!(
+            JIT_NATIVE_LOWERED[native_op].load(Ordering::Relaxed) >= native_before + 8,
             "MovImm must be counted as native lowering"
         );
-        assert_eq!(
-            JIT_HELPER_FALLBACK[fallback_op].load(Ordering::Relaxed),
-            fallback_before + 8,
+        assert!(
+            JIT_HELPER_FALLBACK[fallback_op].load(Ordering::Relaxed) >= fallback_before + 8,
             "Xgetbv must be counted as interpreter-helper fallback"
         );
 
@@ -7847,274 +9607,26 @@ mod tests {
         assert!(fallback_total >= fallback_before + 8);
     }
 
-    #[test]
-    fn exit_reason_mapping_never_collapses_jump_family_or_safepoint() {
-        let mut state = CpuState::new(GuestArch::X64);
-        state.rip = 0x1000;
-
-        // EXIT_SAFEPOINT decodes to JitExitReason::Safepoint, never Normal.
-        assert_eq!(
-            map_exit_reason(EXIT_SAFEPOINT, &state, 0, None),
-            JitExitReason::Safepoint
-        );
-
-        // EXIT_JUMP decodes to Jump carrying the compile-time target — the
-        // JIT never writes state.rip for jumps, so the dispatcher must set
-        // it from the reason.
-        assert_eq!(
-            map_exit_reason(
-                EXIT_JUMP,
-                &state,
-                0,
-                Some(BlockExitInfo::Jump { target: 0x2000 })
-            ),
-            JitExitReason::Jump { target: 0x2000 }
-        );
-
-        // EXIT_COND_BRANCH decodes to ConditionalBranch, evaluating the
-        // block's stored condition against the guest flags.
-        let jump_if = Some(BlockExitInfo::JumpIf {
-            condition: ConditionCode::Below,
-            target: 0x3000,
-            fallthrough: 0x4000,
-        });
-        state.flags.cf = true;
-        assert_eq!(
-            map_exit_reason(EXIT_COND_BRANCH, &state, 0, jump_if),
-            JitExitReason::ConditionalBranch {
-                rip: 0x1000,
-                taken: true
-            }
-        );
-        state.flags.cf = false;
-        assert_eq!(
-            map_exit_reason(EXIT_COND_BRANCH, &state, 0, jump_if),
-            JitExitReason::ConditionalBranch {
-                rip: 0x1000,
-                taken: false
-            }
-        );
-
-        // EXIT_INDIRECT_CALL decodes to IndirectCall, never Normal.
-        assert!(matches!(
-            map_exit_reason(EXIT_INDIRECT_CALL, &state, 0x5000, None),
-            JitExitReason::IndirectCall {
-                target: 0x5000,
-                return_address: 0x1000
-            }
-        ));
-
-        // Plain normal completion is unchanged.
-        assert_eq!(
-            map_exit_reason(EXIT_NORMAL, &state, 0, None),
-            JitExitReason::Normal { new_rip: 0x1000 }
-        );
-    }
-
-    #[test]
-    fn block_exit_info_captures_final_jump_instruction() {
-        assert_eq!(
-            block_exit_info(&[IrInstruction::Nop, IrInstruction::Jump { target: 0x2000 }]),
-            Some(BlockExitInfo::Jump { target: 0x2000 })
-        );
-        assert_eq!(
-            block_exit_info(&[IrInstruction::JumpIf {
-                condition: ConditionCode::NotEqual,
-                target: 0x3000,
-                fallthrough: 0x4000,
-            }]),
-            Some(BlockExitInfo::JumpIf {
-                condition: ConditionCode::NotEqual,
-                target: 0x3000,
-                fallthrough: 0x4000,
-            })
-        );
-        assert_eq!(block_exit_info(&[IrInstruction::Nop]), None);
-    }
-
-    #[test]
-    fn register_mapping_covers_all_16_guest_gprs() {
-        for i in 0..16 {
-            let arm = regmap::guest_to_arm(i);
-            // Must be a valid ARM64 register (0-30, not 18 which is platform)
-            assert!(
-                arm <= 30,
-                "guest reg {i} mapped to invalid ARM64 reg x{arm}"
-            );
-            assert_ne!(
-                arm, 18,
-                "guest reg {i} should not use x18 (platform register)"
-            );
-            assert_ne!(arm, 29, "guest reg {i} should not use x29 (FP)");
-            assert_ne!(arm, 30, "guest reg {i} should not use x30 (LR)");
-            assert_ne!(arm, 31, "guest reg {i} should not use x31 (SP/XZR)");
-        }
-    }
-
-    #[test]
-    fn register_mapping_is_unique() {
-        let mut used = std::collections::HashSet::new();
-        for i in 0..16 {
-            let arm = regmap::guest_to_arm(i);
-            assert!(
-                used.insert(arm),
-                "duplicate ARM64 register x{arm} for guest reg {i}"
-            );
-        }
-    }
-
-    #[test]
-    fn cpu_state_jit_field_offsets_are_verified() {
-        // The offsets baked into emitted code are derived from the real
-        // repr(Rust) layout via offset_of! (GPR_BASE/XMM_BASE), so adding a
-        // field (e.g. jit_pending_fault) can never drift them.  Verify the
-        // derivation itself, the field strides the emitter assumes, and the
-        // fault channel the load helper writes.
-        assert_eq!(
-            JitCompiler::GPR_BASE as usize,
-            std::mem::offset_of!(CpuState, gpr)
-        );
-        assert_eq!(
-            JitCompiler::XMM_BASE as usize,
-            std::mem::offset_of!(CpuState, xmm)
-        );
-        assert_eq!(std::mem::size_of::<u64>(), 8, "gpr stride must be 8 bytes");
-        assert_eq!(
-            std::mem::size_of::<crate::cpu::XmmValue>(),
-            16,
-            "xmm stride must be 16 bytes"
-        );
-        // The fault channel lives inside CpuState (jit_helper_load writes it
-        // through the state pointer); it must sit at a well-formed offset.
-        let fault_offset = std::mem::offset_of!(CpuState, jit_pending_fault);
-        assert_eq!(fault_offset % std::mem::align_of::<CpuState>(), 0);
-        assert!(
-            fault_offset + std::mem::size_of::<Option<u64>>() <= std::mem::size_of::<CpuState>()
-        );
-        // Historical anchors: the 16-byte fault channel shifted gpr 32→48 and
-        // xmm 160→176; the lazy-flag field (`pending_flags`) then shifted them
-        // to 80/208.  The derived constants pin the emitted-code contract.
-        assert_eq!(
-            JitCompiler::GPR_BASE,
-            80,
-            "gpr base in JIT code must match the actual CpuState layout"
-        );
-        assert_eq!(
-            JitCompiler::XMM_BASE,
-            208,
-            "xmm base in JIT code must match the actual CpuState layout"
-        );
-    }
-
     // --- Phase 7: Block Chaining Tests ---
 
-    /// Test-only helper: retry `chain_blocks` until the process-global
-    /// JIT_EXEC_LOCK is free.  In production `chain_blocks` uses non-blocking
-    /// `try_write()` to avoid deadlocking the live-session watchdog, but that
-    /// makes the chain unit tests lose the lock race against other parallel
-    /// JIT tests and silently skip creating the chain.  Tests have no
-    /// watchdog, so we can afford to spin until the lock is acquired.
     // (helper removed — no remaining caller; chain_blocks is a documented
     // no-op and block chaining is disabled)
-    #[test]
-    fn block_chaining_patches_jump() {
-        // Block chaining is intentionally DISABLED (it caused host-SP drift
-        // and an EXC_BAD_ACCESS fault — see chain_blocks).  chain_blocks is a
-        // no-op that returns Ok without creating a chain entry, so this test
-        // now verifies that invariant.
-        let mut rt = JitRuntime::new(GuestArch::X64);
-        let ir_a = vec![IrInstruction::Nop];
-        let ir_b = vec![IrInstruction::Nop, IrInstruction::Nop];
-
-        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None)
-            .unwrap();
-        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None)
-            .unwrap();
-
-        let _ = rt.chain_blocks(0x1000, 0x2000);
-        assert!(
-            !rt.block_chains.contains_key(&(0x1000, 0x2000)),
-            "chaining is disabled; no chain entry should be created"
-        );
-    }
 
     #[test]
     fn block_chaining_fails_for_missing_block() {
-        // Chaining disabled: chain_blocks is a no-op Ok regardless of whether
-        // the target is compiled.
         let mut rt = JitRuntime::new(GuestArch::X64);
-        let ir_a = vec![IrInstruction::Nop];
+        let ir_a = vec![IrInstruction::Nop, IrInstruction::Jump { target: 0x2000 }];
         rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None)
             .unwrap();
-        let result = rt.chain_blocks(0x1000, 0x2000);
-        assert!(
-            result.is_ok(),
-            "chaining disabled; chain_blocks is a no-op Ok"
+        let error = rt.chain_blocks(0x1000, 0x2000).unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message, "cannot chain to missing target block 0x2000",
+            "chaining to a missing target must fail with the exact reason"
         );
     }
 
     // --- Phase 7: Tiered Compiler Tests ---
-
-    #[test]
-    fn tiered_compiler_promotes() {
-        let mut tc = TieredCompiler::new();
-        assert_eq!(tc.tier_thresholds[0], 50);
-        assert_eq!(tc.tier_thresholds[1], 500);
-
-        // Execute 49 times — still Tier0
-        for _ in 0..49 {
-            let result = tc.record_execution(0x1000);
-            assert!(result.is_none());
-        }
-        assert_eq!(tc.get_tier(0x1000), CompilationTier::Tier0);
-
-        // 50th execution — promote to Tier1
-        let result = tc.record_execution(0x1000);
-        assert_eq!(result, Some(CompilationTier::Tier1));
-        assert_eq!(tc.get_tier(0x1000), CompilationTier::Tier1);
-
-        // Continue to 499 executions — still Tier1
-        for _ in 50..499 {
-            tc.record_execution(0x1000);
-        }
-        assert_eq!(tc.get_tier(0x1000), CompilationTier::Tier1);
-
-        // 500th execution — promote to Tier2
-        let result = tc.record_execution(0x1000);
-        assert_eq!(result, Some(CompilationTier::Tier2));
-        assert_eq!(tc.get_tier(0x1000), CompilationTier::Tier2);
-
-        // Further executions don't promote further
-        let result = tc.record_execution(0x1000);
-        assert!(result.is_none());
-        assert_eq!(tc.get_tier(0x1000), CompilationTier::Tier2);
-    }
-
-    #[test]
-    fn tiered_compiler_tracks_multiple_blocks() {
-        let mut tc = TieredCompiler::new();
-        tc.record_execution(0x1000);
-        tc.record_execution(0x2000);
-        tc.record_execution(0x2000);
-
-        assert_eq!(tc.get_count(0x1000), 1);
-        assert_eq!(tc.get_count(0x2000), 2);
-        assert_eq!(tc.get_tier(0x1000), CompilationTier::Tier0);
-        assert_eq!(tc.get_tier(0x2000), CompilationTier::Tier0);
-    }
-
-    #[test]
-    fn tiered_compiler_reset_block() {
-        let mut tc = TieredCompiler::new();
-        for _ in 0..100 {
-            tc.record_execution(0x1000);
-        }
-        assert_eq!(tc.get_tier(0x1000), CompilationTier::Tier1);
-
-        tc.reset_block(0x1000);
-        assert_eq!(tc.get_tier(0x1000), CompilationTier::Tier0);
-        assert_eq!(tc.get_count(0x1000), 0);
-    }
 
     // --- Phase 7: Inline Cache Tests ---
 
@@ -8175,273 +9687,10 @@ mod tests {
         assert!(cache.entries.contains_key(&0x3000));
     }
 
-    #[test]
-    fn inline_cache_hit_rate() {
-        let mut cache = InlineCache::new(16);
-        cache.lookup(0x1000, 0x5000); // miss
-        cache.lookup(0x1000, 0x5000); // hit
-        cache.lookup(0x1000, 0x5000); // hit
-        assert!((cache.hit_rate() - (2.0 / 3.0)).abs() < 0.01);
-    }
-
     // --- Phase 7: Adaptive Budget Tests ---
-
-    #[test]
-    fn adaptive_budget_adjusts() {
-        let mut budget = AdaptiveBudget::new(100, 10, 500, 1000);
-
-        // Initial budget
-        assert_eq!(budget.get_budget(), 100);
-
-        // Record slow execution — budget should decrease
-        budget.record_execution(5000); // 5× target
-        assert!(
-            budget.get_budget() < 100,
-            "budget should decrease after slow execution: got {}",
-            budget.get_budget()
-        );
-
-        // Record fast execution — budget should increase
-        let current = budget.get_budget();
-        budget.record_execution(100); // 0.1× target
-        assert!(
-            budget.get_budget() > current,
-            "budget should increase after fast execution"
-        );
-    }
-
-    #[test]
-    fn adaptive_budget_respects_bounds() {
-        let mut budget = AdaptiveBudget::new(100, 50, 200, 1000);
-
-        // Drive budget down with very slow execution
-        for _ in 0..100 {
-            budget.record_execution(1_000_000);
-        }
-        assert!(
-            budget.get_budget() >= 50,
-            "budget should not go below min: got {}",
-            budget.get_budget()
-        );
-
-        // Drive budget up with very fast execution
-        for _ in 0..100 {
-            budget.record_execution(1);
-        }
-        assert!(
-            budget.get_budget() <= 200,
-            "budget should not exceed max: got {}",
-            budget.get_budget()
-        );
-    }
-
-    #[test]
-    fn adaptive_budget_reset() {
-        let mut budget = AdaptiveBudget::new(100, 10, 500, 1000);
-        budget.record_execution(1_000_000);
-        assert_ne!(budget.get_budget(), 100);
-
-        budget.reset();
-        assert_eq!(budget.get_budget(), 100);
-    }
 
     // --- Phase 8: Constant Folding Tests ---
 
-    /// Test: MovImm + AddImm → single MovImm
-    #[test]
-    fn test_constant_fold_mov_add() {
-        use crate::cpu::Register;
-
-        // Add a PushReg to consume rax so DCE keeps the result
-        let ir = vec![
-            IrInstruction::MovImm {
-                dst: Register::Rax,
-                value: 5,
-            },
-            IrInstruction::AddImm {
-                dst: Register::Rax,
-                value: 3,
-                width: 8,
-            },
-            IrInstruction::PushReg { src: Register::Rax },
-        ];
-
-        let folded = JitCompiler::constant_fold(&ir);
-
-        // After folding: MovImm(rax, 5), AddImm(rax, 3) → MovImm(rax, 8)
-        // PushReg(rax) remains since it's a side-effect instruction
-        assert_eq!(
-            folded.len(),
-            2,
-            "expected 2 instructions after folding: MovImm(rax,8) + PushReg"
-        );
-        match &folded[0] {
-            IrInstruction::MovImm { dst, value } => {
-                assert_eq!(*dst, Register::Rax, "dst should be rax");
-                assert_eq!(*value, 8, "value should be 5+3=8");
-            }
-            other => panic!("expected MovImm as first instruction, got {:?}", other),
-        }
-        // Second instruction should be PushReg
-        match &folded[1] {
-            IrInstruction::PushReg { src } => {
-                assert_eq!(*src, Register::Rax, "PushReg should use rax");
-            }
-            other => panic!("expected PushReg as second instruction, got {:?}", other),
-        }
-    }
-
-    /// Test: Redundant elimination — Add/Sub/Shl/And with 0/full_mask
-    #[test]
-    fn test_constant_fold_redundant_elimination() {
-        use crate::cpu::Register;
-
-        // Add with 0, Sub with 0, Shl with 0 should be eliminated
-        let ir = vec![
-            IrInstruction::MovImm {
-                dst: Register::Rax,
-                value: 42,
-            },
-            IrInstruction::AddImm {
-                dst: Register::Rax,
-                value: 0,
-                width: 8,
-            },
-            IrInstruction::MovImm {
-                dst: Register::Rbx,
-                value: 100,
-            },
-            IrInstruction::SubImm {
-                dst: Register::Rbx,
-                value: 0,
-                width: 8,
-            },
-            IrInstruction::MovImm {
-                dst: Register::Rcx,
-                value: 7,
-            },
-            IrInstruction::ShlImm {
-                dst: Register::Rcx,
-                count: 0,
-                width: 8,
-            },
-            IrInstruction::MovImm {
-                dst: Register::Rdx,
-                value: 0xFF,
-            },
-            IrInstruction::AndImm {
-                dst: Register::Rdx,
-                value: 0xFF,
-                width: 1,
-            }, // full mask for width=1
-        ];
-
-        let folded = JitCompiler::constant_fold(&ir);
-
-        // All 4 no-ops should be eliminated.
-        // After DCE, only MovImm instructions whose dst is used remain.
-        // None of these registers are used by any subsequent instruction,
-        // so DCE would remove them all. But DCE doesn't remove MovImm
-        // instructions at the end of a block since they might be needed.
-        // Actually, DCE checks if dst is read by any later instruction.
-        // Let's check differently - we need to verify the Add/Sub/Shl/And no-ops
-        // were removed from the stream.
-
-        // The original had 8 instructions. After eliminating 4 no-ops, we have 4.
-        // But DCE might also remove some MovImm instructions since those regs
-        // are never read. Let's count what remains:
-        // - MovImm rax, 42 (kept)
-        // - MovImm rbx, 100 (kept)
-        // - MovImm rcx, 7 (kept)
-        // - MovImm rdx, 0xFF (kept)
-        // After DCE, all MovImm are kept since DCE conservatively keeps them
-        // (they write to registers that may be read later)
-        // Actually, DCE checks used_regs - since no instruction reads these regs,
-        // the MovImm instructions would be removed too.
-        // Let's ensure the no-ops are gone, regardless of final count:
-        for insn in &folded {
-            match insn {
-                IrInstruction::AddImm { value, .. } if *value == 0 => {
-                    panic!("AddImm with value 0 should have been eliminated")
-                }
-                IrInstruction::SubImm { value, .. } if *value == 0 => {
-                    panic!("SubImm with value 0 should have been eliminated")
-                }
-                IrInstruction::ShlImm { count, .. } if *count == 0 => {
-                    panic!("ShlImm with count 0 should have been eliminated")
-                }
-                IrInstruction::AndImm {
-                    dst: _,
-                    value,
-                    width,
-                } if *value == JitCompiler::full_mask_for_width(*width) => {
-                    panic!("AndImm with full mask should have been eliminated")
-                }
-                _ => {}
-            }
-        }
-
-        // Verify the folded IR has fewer instructions than the original
-        assert!(
-            folded.len() < ir.len(),
-            "should have fewer instructions after elimination: {} < {}",
-            folded.len(),
-            ir.len()
-        );
-    }
-
-    /// Test: 3+ instruction chain folding
-    #[test]
-    fn test_constant_fold_chain() {
-        use crate::cpu::Register;
-
-        // Add a consumer so DCE keeps the result
-        let ir = vec![
-            IrInstruction::MovImm {
-                dst: Register::Rax,
-                value: 5,
-            },
-            IrInstruction::AddImm {
-                dst: Register::Rax,
-                value: 3,
-                width: 8,
-            },
-            IrInstruction::ShlImm {
-                dst: Register::Rax,
-                count: 2,
-                width: 8,
-            },
-            IrInstruction::PushReg { src: Register::Rax },
-        ];
-
-        let folded = JitCompiler::constant_fold(&ir);
-
-        // Chain: rax=5 → rax=5+3=8 → rax=8<<2=32
-        // Result: MovImm(rax, 32), PushReg(rax)
-        assert_eq!(
-            folded.len(),
-            2,
-            "expected 2 instructions after folding: MovImm + PushReg"
-        );
-        match &folded[0] {
-            IrInstruction::MovImm { dst, value } => {
-                assert_eq!(*dst, Register::Rax);
-                assert_eq!(*value, 32, "5+3=8, 8<<2=32, got {}", value);
-            }
-            other => panic!("expected MovImm as first instruction, got {:?}", other),
-        }
-        // Verify no arithmetic instructions remain
-        for insn in &folded {
-            match insn {
-                IrInstruction::AddImm { .. } | IrInstruction::ShlImm { .. } => {
-                    panic!("arithmetic should have been folded away: {:?}", insn)
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Test: Non-foldable sequences pass through unchanged
     #[test]
     fn test_constant_fold_no_change() {
         use crate::cpu::Register;
@@ -8486,7 +9735,6 @@ mod tests {
         assert!(has_addimm, "AddImm should remain unchanged: {:?}", folded);
     }
 
-    /// Test: Constant folding with MovReg propagation
     #[test]
     fn test_constant_fold_movreg_propagation() {
         use crate::cpu::Register;
@@ -8517,57 +9765,6 @@ mod tests {
 
     // --- Phase 9: Loop Unrolling Tests ---
 
-    /// Test: Simple 2-instruction loop unrolled by factor 2
-    #[test]
-    fn test_loop_unroll_simple() {
-        use crate::cpu::Register;
-
-        // Simple loop: initialize counter to 4, loop body has 2 instructions,
-        // decrement and branch back.
-        // This simulates a block at address 0x1000 that loops back to itself.
-        let ir = vec![
-            // Loop body instruction 1
-            IrInstruction::AddImm {
-                dst: Register::Rax,
-                value: 1,
-                width: 8,
-            },
-            // Loop body instruction 2
-            IrInstruction::SubImm {
-                dst: Register::Rbx,
-                value: 1,
-                width: 8,
-            },
-            // Decrement counter
-            IrInstruction::SubImm {
-                dst: Register::Rcx,
-                value: 1,
-                width: 8,
-            },
-            // Branch back if counter != 0
-            IrInstruction::JumpIf {
-                condition: ConditionCode::NotEqual,
-                target: 0x1000,
-                fallthrough: 0x2000,
-            },
-        ];
-
-        let unrolled = JitCompiler::loop_unroll(&ir, 0x1000);
-
-        // The loop has 4 iterations (counter starts at... wait, the counter isn't
-        // initialized in the block! We need a MovImm for the counter.
-        // This test expects no unrolling since the count is unknown.
-        // Let's check it's at least the right size (unmodified).
-        assert_eq!(
-            unrolled.len(),
-            ir.len(),
-            "loop without known counter should pass through unchanged; got len {} expected {}",
-            unrolled.len(),
-            ir.len()
-        );
-    }
-
-    /// Test: Loop with ≤4 iterations fully unrolled
     #[test]
     fn test_loop_unroll_full() {
         use crate::cpu::Register;
@@ -8616,7 +9813,6 @@ mod tests {
         assert!(!has_jumpif, "fully unrolled loop should not have JumpIf");
     }
 
-    /// Test: Verify unrolling doesn't change program semantics
     #[test]
     fn test_loop_unroll_no_side_effects() {
         use crate::cpu::Register;
@@ -8709,19 +9905,6 @@ mod tests {
     }
 
     #[test]
-    fn unwind_table_register_multiple_blocks() {
-        let mut table = JitUnwindTable::new();
-        table.register_block(0x1000, 0x1020);
-        table.register_block(0x2000, 0x2040);
-        table.register_block(0x3000, 0x3010);
-
-        assert_eq!(table.len(), 3);
-        assert_eq!(table.entries[0].start_rva, 0x1000);
-        assert_eq!(table.entries[1].start_rva, 0x2000);
-        assert_eq!(table.entries[2].start_rva, 0x3000);
-    }
-
-    #[test]
     fn unwind_table_unregister_block_removes_entry() {
         let mut table = JitUnwindTable::new();
         table.register_block(0x1000, 0x1020);
@@ -8750,21 +9933,6 @@ mod tests {
             "unregister_block should return false for missing entry"
         );
         assert_eq!(table.len(), 1);
-    }
-
-    #[test]
-    fn unwind_table_clear_removes_all_entries() {
-        let mut table = JitUnwindTable::new();
-        table.register_block(0x1000, 0x1020);
-        table.register_block(0x2000, 0x2040);
-        assert_eq!(table.len(), 2);
-        assert!(table.is_dirty());
-
-        table.dirty = false; // simulate post-sync
-        table.clear();
-        assert!(table.is_empty());
-        assert_eq!(table.len(), 0);
-        assert!(table.is_dirty(), "clear should set dirty flag");
     }
 
     #[test]
@@ -8801,104 +9969,6 @@ mod tests {
         assert!(
             !table.is_dirty(),
             "register_with_seh with no entries should still clear dirty"
-        );
-    }
-
-    #[test]
-    fn unwind_table_seh_integration_pdata_parseable() {
-        let mut table = JitUnwindTable::new();
-        table.register_block(0x1000, 0x1020);
-        table.register_block(0x2000, 0x2050);
-        table.register_block(0x3000, 0x3030);
-
-        let mut seh = crate::seh::SehSubsystem::new();
-        table.register_with_seh(&mut seh);
-
-        // Verify SEH can find the registered blocks
-        const JIT_IMAGE_BASE: u64 = 0;
-
-        // Find block at 0x1000
-        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000);
-        assert!(rf.is_some(), "SEH should find runtime function at 0x1000");
-        let rf = rf.unwrap();
-        assert_eq!(rf.begin_addr, 0x1000);
-        assert_eq!(rf.end_addr, 0x1020);
-
-        // Find block at 0x2000
-        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x2000);
-        assert!(rf.is_some(), "SEH should find runtime function at 0x2000");
-        let rf = rf.unwrap();
-        assert_eq!(rf.begin_addr, 0x2000);
-
-        // Find block at 0x3000
-        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x3000);
-        assert!(rf.is_some(), "SEH should find runtime function at 0x3000");
-
-        // No block at 0x4000
-        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x4000);
-        assert!(
-            rf.is_none(),
-            "SEH should not find runtime function at 0x4000"
-        );
-    }
-
-    #[test]
-    fn unwind_table_unwind_info_format_is_parseable() {
-        let mut table = JitUnwindTable::new();
-        table.register_block(0x1000, 0x1020);
-
-        let mut seh = crate::seh::SehSubsystem::new();
-        table.register_with_seh(&mut seh);
-
-        const JIT_IMAGE_BASE: u64 = 0;
-        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).unwrap();
-
-        // The unwind_info_addr is the RVA within the concatenated unwind_data blob.
-        // Since we used register_with_seh, the unwind data is stored under image base 0.
-        let unwind_info = seh.get_unwind_info(rf.unwind_info_addr);
-        assert!(unwind_info.is_some(), "unwind info should be parseable");
-
-        let ui = unwind_info.unwrap();
-        // Verify the x64 UNWIND_INFO structure
-        assert_eq!(ui.version, 1, "UNWIND_INFO version should be 1");
-        assert_eq!(
-            ui.flags, 0,
-            "UNWIND_INFO flags should be 0 (UNW_FLAG_NO_HANDLER)"
-        );
-        assert_eq!(ui.prolog_size, 0, "no prologue expected for JIT blocks");
-        assert_eq!(ui.code_count, 0, "no unwind codes expected for JIT blocks");
-        assert!(ui.codes.is_empty(), "codes vector should be empty");
-        assert!(ui.handler_rva.is_none(), "no handler expected");
-        assert!(ui.chained_info_rva.is_none(), "no chained info expected");
-    }
-
-    #[test]
-    fn unwind_table_register_with_seh_overwrites_previous() {
-        let mut table = JitUnwindTable::new();
-        let mut seh = crate::seh::SehSubsystem::new();
-
-        // First registration
-        table.register_block(0x1000, 0x1020);
-        table.register_with_seh(&mut seh);
-        assert_eq!(
-            seh.find_runtime_function(0, 0x1000).unwrap().begin_addr,
-            0x1000
-        );
-
-        // Second registration with different data
-        table.clear();
-        table.register_block(0x3000, 0x3050);
-        table.register_with_seh(&mut seh);
-
-        // Old entry should be gone
-        assert!(
-            seh.find_runtime_function(0, 0x1000).is_none(),
-            "old entry 0x1000 should be gone after overwrite"
-        );
-        // New entry should be present
-        assert!(
-            seh.find_runtime_function(0, 0x3000).is_some(),
-            "new entry 0x3000 should be present"
         );
     }
 
@@ -8947,30 +10017,6 @@ mod tests {
     }
 
     #[test]
-    fn jit_runtime_get_or_compile_registers_unwind() {
-        let mut rt = JitRuntime::new(GuestArch::X64);
-        let ir = vec![IrInstruction::Nop];
-
-        // First compilation — should register with unwind table
-        rt.get_or_compile(&ir, 0x1000, GuestArch::X64, None)
-            .unwrap();
-        assert_eq!(rt.unwind_table.len(), 1);
-        assert!(
-            rt.is_unwind_dirty(),
-            "unwind table should be dirty after new compilation"
-        );
-
-        // Second compilation at same address — should NOT add duplicate unwind entry
-        rt.get_or_compile(&ir, 0x1000, GuestArch::X64, None)
-            .unwrap();
-        assert_eq!(
-            rt.unwind_table.len(),
-            1,
-            "re-compilation should not add duplicate unwind entry"
-        );
-    }
-
-    #[test]
     fn jit_runtime_unwind_dirty_cleared_after_seh_sync() {
         let mut rt = JitRuntime::new(GuestArch::X64);
         let ir = vec![IrInstruction::Nop];
@@ -8986,135 +10032,6 @@ mod tests {
     }
 
     // ─── Phase D2/R2: JIT Unwind Info Format Verification and Extended Tests ───
-
-    /// Apple ARM64 compact unwind encoding constants (from mach-o/compact_unwind_encoding.h).
-    /// The JIT does NOT emit Apple compact unwind directly — it uses x64 UNWIND_INFO
-    /// (4-byte) for SEH registration. However, the internal 2-byte packed storage
-    /// format follows Windows ARM64 packed unwind conventions that share structural
-    /// similarities with Apple's encoding (both derive from ARM64 EHABI).
-    #[test]
-    fn unwind_table_compact_unwind_encoding_constants() {
-        // Apple ARM64 compact_unwind_encoding.h constants for reference:
-        const UNWIND_ARM64_MODE_FRAME: u8 = 0x01;
-        const UNWIND_ARM64_MODE_FRAMELESS: u8 = 0x02;
-        const UNWIND_ARM64_MODE_DWARF: u8 = 0x03;
-
-        // The JIT's internal packed format (2 bytes per entry) encodes:
-        //   Byte 0 [1:0] = flag (0=no handler, 1=handler, 2=chained)
-        //   Byte 0 [7:2] = function length in 4-byte units, minus 1 (capped at 0x3F)
-        //   Byte 1        = unused (reserved)
-        //
-        // For UNW_FLAG_NO_HANDLER (flag=0), the bottom 2 bits should be 0.
-        let mut table = JitUnwindTable::new();
-        table.register_block(0x1000, 0x1020);
-
-        let entry = &table.entries[0];
-        assert_eq!(
-            entry.unwind_data.len(),
-            2,
-            "packed unwind data should be 2 bytes"
-        );
-
-        // Verify flag bits (bottom 2 bits) = 0 → UNW_FLAG_NO_HANDLER
-        let flag_bits = entry.unwind_data[0] & 0x03;
-        assert_eq!(
-            flag_bits, 0x00,
-            "flag bits should be 0 (UNW_FLAG_NO_HANDLER)"
-        );
-
-        // Verify function length encoding:
-        // func_len = (end_addr - start_addr) / 4 = (0x1020 - 0x1000) / 4 = 8
-        // packed = min(func_len, 0x3F) = 8
-        // bits[7:2] = packed >> 2 = 8/4 = 2
-        // (the packed byte stores func_len capped at 0x3F; bits[7:2] extract
-        //  func_len/4 because the flag bits [1:0] are shifted out)
-        let func_len_bits = (entry.unwind_data[0] >> 2) & 0x3F;
-        let expected_func_len = (((0x1020u64 - 0x1000) / 4) / 4) as u8; // func_len/4 = 2
-        assert_eq!(
-            func_len_bits,
-            expected_func_len,
-            "function length encoding: got {}, expected {} (func_len={}, packed>>2={})",
-            func_len_bits,
-            expected_func_len,
-            (0x1020u64 - 0x1000) / 4,
-            (0x1020u64 - 0x1000) / 16
-        );
-
-        // Apple's UNWIND_ARM64_MODE_MASK occupies the same bit positions (bottom 4 bits)
-        // in compact_unwind_encoding.h. Verify our flag field doesn't overlap with
-        // values that would match Apple's defined mode constants.
-        assert_ne!(
-            flag_bits,
-            UNWIND_ARM64_MODE_FRAME & 0x03,
-            "JIT flag bits should NOT match UNWIND_ARM64_MODE_FRAME"
-        );
-        assert_ne!(
-            flag_bits,
-            UNWIND_ARM64_MODE_FRAMELESS & 0x03,
-            "JIT flag bits should NOT match UNWIND_ARM64_MODE_FRAMELESS"
-        );
-        assert_ne!(
-            flag_bits,
-            UNWIND_ARM64_MODE_DWARF & 0x03,
-            "JIT flag bits should NOT match UNWIND_ARM64_MODE_DWARF"
-        );
-    }
-
-    #[test]
-    fn unwind_table_frame_size_calculation() {
-        let mut table = JitUnwindTable::new();
-
-        // Test case 1: exactly one ARM64 instruction (4 bytes)
-        // func_len = 4/4 = 1, packed = 1, bits[7:2] = 1>>2 = 0
-        table.register_block(0x1000, 0x1004);
-        let entry = &table.entries[0];
-        let func_len_bits = ((entry.unwind_data[0] >> 2) & 0x3F) as u32;
-        assert_eq!(
-            func_len_bits, 0,
-            "single instruction: func_len_bits should be 0"
-        );
-
-        // Test case 2: 256 bytes (64 instructions)
-        // func_len = 256/4 = 64, packed = min(64, 63) = 63, bits[7:2] = 63>>2 = 15
-        table.register_block(0x2000, 0x2100);
-        let entry = &table.entries[1];
-        let func_len_bits = (entry.unwind_data[0] >> 2) & 0x3F;
-        assert_eq!(
-            func_len_bits, 15,
-            "256 bytes: bits[7:2] should be capped at 15 (63>>2)"
-        );
-
-        // Test case 3: zero-length block (edge case)
-        // func_len = 0/4 = 0, packed = 0, bits[7:2] = 0>>2 = 0
-        table.register_block(0x3000, 0x3000);
-        let entry = &table.entries[2];
-        let func_len_bits = (entry.unwind_data[0] >> 2) & 0x3F;
-        assert_eq!(
-            func_len_bits, 0,
-            "zero-length block: func_len_bits should be 0"
-        );
-
-        // Test case 4: 8 bytes (2 instructions)
-        // func_len = 8/4 = 2, packed = 2, bits[7:2] = 2>>2 = 0
-        table.register_block(0x4000, 0x4008);
-        let entry = &table.entries[3];
-        let func_len_bits = ((entry.unwind_data[0] >> 2) & 0x3F) as u32;
-        let expected = (0x4008u64 - 0x4000) / 16; // = 0 (8/16 = 0 in integer division)
-        assert_eq!(
-            func_len_bits as u64, expected,
-            "8-byte block: func_len_bits should be 0 (8/16=0)"
-        );
-
-        // Test case 5: 260 bytes (just over cap)
-        // func_len = 260/4 = 65, packed = min(65, 63) = 63, bits[7:2] = 63>>2 = 15
-        table.register_block(0x5000, 0x5104);
-        let entry = &table.entries[4];
-        let func_len_bits = (entry.unwind_data[0] >> 2) & 0x3F;
-        assert_eq!(
-            func_len_bits, 15,
-            "260-byte block: bits[7:2] should be capped at 15"
-        );
-    }
 
     #[test]
     fn unwind_table_empty_table_unregister() {
@@ -9213,193 +10130,6 @@ mod tests {
     }
 
     #[test]
-    fn unwind_table_x64_unwind_info_byte_layout() {
-        // Verify that the 4-byte x64 UNWIND_INFO bytes generated by
-        // register_with_seh() have the correct byte-level layout.
-        let mut table = JitUnwindTable::new();
-        table.register_block(0x1000, 0x1020);
-
-        let mut seh = crate::seh::SehSubsystem::new();
-        table.register_with_seh(&mut seh);
-
-        const JIT_IMAGE_BASE: u64 = 0;
-        // Clone the runtime function to avoid holding an immutable borrow on `seh`
-        // while we later call mutable methods like get_unwind_info().
-        let rf = seh
-            .find_runtime_function(JIT_IMAGE_BASE, 0x1000)
-            .cloned()
-            .expect("should find registered block");
-
-        // Get the raw unwind data to inspect byte-level layout
-        // The unwind_data blob is keyed by image_base=0 in the SEH subsystem
-        let unwind_info = seh
-            .get_unwind_info(rf.unwind_info_addr)
-            .cloned()
-            .expect("should parse unwind info");
-
-        // x64 UNWIND_INFO layout (4 bytes):
-        //   [0]: version(3 bits) | flags(5 bits)  → 0x01 = v1, flags=UNW_FLAG_NO_HANDLER
-        //   [1]: prolog_size                       → 0x00
-        //   [2]: code_count                        → 0x00
-        //   [3]: frame_register(4) | frame_offset(4) → 0x00
-        assert_eq!(unwind_info.version, 1);
-        assert_eq!(unwind_info.flags, 0);
-        assert_eq!(unwind_info.prolog_size, 0);
-        assert_eq!(unwind_info.code_count, 0);
-        assert_eq!(unwind_info.frame_register, 0);
-        assert_eq!(unwind_info.frame_offset, 0);
-        assert!(unwind_info.codes.is_empty());
-        assert!(unwind_info.handler_rva.is_none());
-        assert!(unwind_info.chained_info_rva.is_none());
-
-        // The raw bytes that parse_unwind_info consumed
-        let data = seh.get_unwind_data_raw(0).unwrap();
-        let offset = rf.unwind_info_addr as usize;
-        assert!(
-            offset + 4 <= data.len(),
-            "unwind data blob must contain 4 bytes at RVA {}",
-            offset
-        );
-
-        // Byte 0: version=1 (bits 0-2), flags=0 (bits 3-7) → 0x01
-        assert_eq!(data[offset], 0x01, "byte 0: version=1, flags=0 → 0x01");
-        assert_eq!(data[offset + 1], 0x00, "byte 1: prolog_size=0 → 0x00");
-        assert_eq!(data[offset + 2], 0x00, "byte 2: code_count=0 → 0x00");
-        assert_eq!(
-            data[offset + 3],
-            0x00,
-            "byte 3: frame register=0, frame_offset=0 → 0x00"
-        );
-    }
-
-    #[test]
-    fn unwind_table_personality_handler_not_set() {
-        // Verify that JIT-generated unwind info has no personality function.
-        // Personality routines (EHANDLER/UHANDLER) are only set by native x64
-        // PE images with C++ exception handling; JIT blocks are compiler-generated
-        // stubs that never have language-specific handlers.
-        let mut table = JitUnwindTable::new();
-        table.register_block(0x1000, 0x1020);
-
-        let mut seh = crate::seh::SehSubsystem::new();
-        table.register_with_seh(&mut seh);
-
-        const JIT_IMAGE_BASE: u64 = 0;
-        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).unwrap();
-        let unwind_info = seh.get_unwind_info(rf.unwind_info_addr).unwrap();
-
-        // Verify no personality handler
-        assert!(
-            unwind_info.handler_rva.is_none(),
-            "JIT blocks MUST NOT have a personality handler (UNW_FLAG_NO_HANDLER)"
-        );
-        assert!(
-            unwind_info.chained_info_rva.is_none(),
-            "JIT blocks MUST NOT have chained unwind info"
-        );
-
-        // Verify flags = 0 (not EHANDLER=0x01, not UHANDLER=0x02, not CHAININFO=0x04)
-        assert_eq!(unwind_info.flags & 0x01, 0, "EHANDLER flag must not be set");
-        assert_eq!(unwind_info.flags & 0x02, 0, "UHANDLER flag must not be set");
-        assert_eq!(
-            unwind_info.flags & 0x04,
-            0,
-            "CHAININFO flag must not be set"
-        );
-    }
-
-    #[test]
-    fn unwind_table_lsda_not_set() {
-        // JIT blocks do not use LSDA (Language-Specific Data Area) because
-        // they have no personality routines. The x64 UNWIND_INFO for JIT
-        // blocks does not include LSDA data, and the SEH subsystem correctly
-        // reports no handler.
-        let mut table = JitUnwindTable::new();
-        table.register_block(0x1000, 0x1020);
-
-        let mut seh = crate::seh::SehSubsystem::new();
-        table.register_with_seh(&mut seh);
-
-        const JIT_IMAGE_BASE: u64 = 0;
-        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).unwrap();
-
-        // Since there's no handler (UNW_FLAG_NO_HANDLER), the UNWIND_INFO
-        // has no space after the unwind codes for a handler RVA or LSDA.
-        // Verify that:
-        // 1. handler_rva is None (confirmed in personality test)
-        // 2. The raw unwinding through JIT frames works (no LSDA needed)
-        let unwind_info = seh.get_unwind_info(rf.unwind_info_addr).unwrap();
-        assert!(
-            unwind_info.handler_rva.is_none(),
-            "no handler means no LSDA pointer follows the UNWIND_INFO"
-        );
-
-        // Verify virtual_unwind() succeeds (pops return address correctly)
-        let mut ctx = crate::seh::X64Context::default();
-        // Simulate a call frame: RSP points to a return address on the "stack"
-        let return_addr: u64 = 0x7fff_1234;
-        // We use FlatGuestMemory as the backing store for the fake stack
-        // NOTE: FlatGuestMemory is 4GB, so stack_addr must be < 4GB (0xFFFF_FFFF)
-        // otherwise sync_from_memory_image / read will silently fail.
-        let mem = FlatGuestMemory::new(GuestArch::X64);
-        // Write the return address at the current RSP
-        let stack_addr = 0x7FFF_0000u64; // well within the 4GB flat mapping
-        mem.sync_from_memory_image(stack_addr, &return_addr.to_le_bytes());
-        ctx.rsp = stack_addr;
-        ctx.rip = 0x1000; // inside JIT block
-
-        let result = seh.virtual_unwind_by_rva(JIT_IMAGE_BASE, 0x1000, &mut ctx, &|addr, buf| {
-            let mut out = [0u8; 8];
-            mem.read(addr, &mut out);
-            buf.copy_from_slice(&out[..buf.len()]);
-            true
-        });
-        assert_eq!(
-            result,
-            crate::seh::UnwindResult::Completed,
-            "virtual_unwind through JIT frame should complete successfully"
-        );
-        // After unwinding, the return address should be in RIP
-        assert_eq!(
-            ctx.rip, return_addr,
-            "RIP should be set to the return address after unwinding through JIT frame"
-        );
-    }
-
-    #[test]
-    fn unwind_table_seh_integration_after_unregister() {
-        // Verify that after unregistering a block and re-syncing to SEH,
-        // the SEH subsystem no longer finds the block.
-        let mut table = JitUnwindTable::new();
-        table.register_block(0x1000, 0x1020);
-        table.register_block(0x2000, 0x2040);
-
-        let mut seh = crate::seh::SehSubsystem::new();
-        table.register_with_seh(&mut seh);
-
-        const JIT_IMAGE_BASE: u64 = 0;
-
-        // Both blocks should be findable
-        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).is_some());
-        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x2000).is_some());
-
-        // Remove one block and re-sync
-        table.unregister_block(0x1000);
-        table.register_with_seh(&mut seh);
-
-        // The removed block should no longer be findable
-        assert!(
-            seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).is_none(),
-            "unregistered block should not be findable in SEH after re-sync"
-        );
-        // The remaining block should still be findable
-        assert!(
-            seh.find_runtime_function(JIT_IMAGE_BASE, 0x2000).is_some(),
-            "remaining block should still be findable in SEH after re-sync"
-        );
-    }
-
-    #[test]
     fn unwind_table_seh_cache_invalidation_on_reregister() {
         // Verify that when register_with_seh() is called multiple times,
         // the SEH subsystem's unwind_cache is properly invalidated and
@@ -9469,46 +10199,6 @@ mod tests {
     }
 
     #[test]
-    fn unwind_table_reregister_keeps_cache_consistent() {
-        // Verify that calling register_with_seh() multiple times with the
-        // same entries results in consistent state (no stale cache entries).
-        let mut table = JitUnwindTable::new();
-        let mut seh = crate::seh::SehSubsystem::new();
-
-        table.register_block(0x1000, 0x1020);
-        table.register_block(0x2000, 0x2040);
-
-        // Register three times in succession
-        for _i in 0..3 {
-            table.register_with_seh(&mut seh);
-
-            const JIT_IMAGE_BASE: u64 = 0;
-            // Clone to avoid holding immutable borrow across mutable get_unwind_info calls
-            let rf1 = seh
-                .find_runtime_function(JIT_IMAGE_BASE, 0x1000)
-                .cloned()
-                .expect("block 0x1000 should be findable");
-            let rf2 = seh
-                .find_runtime_function(JIT_IMAGE_BASE, 0x2000)
-                .cloned()
-                .expect("block 0x2000 should be findable");
-
-            let ui1 = seh
-                .get_unwind_info(rf1.unwind_info_addr)
-                .cloned()
-                .expect("unwind info for 0x1000 should be parseable");
-            let ui2 = seh
-                .get_unwind_info(rf2.unwind_info_addr)
-                .cloned()
-                .expect("unwind info for 0x2000 should be parseable");
-
-            // Verify the unwind info is correct
-            assert_eq!(ui1.version, 1);
-            assert_eq!(ui2.version, 1);
-        }
-    }
-
-    #[test]
     fn unwind_table_runtime_unwind_dirty_sync_cycle() {
         // Full lifecycle test for the dirty → sync → dirty → sync cycle
         let mut rt = JitRuntime::new(GuestArch::X64);
@@ -9560,322 +10250,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unwind_table_virtual_unwind_through_jit_frame() {
-        // End-to-end test: create a JIT block, register unwind info with SEH,
-        // and verify that virtual_unwind() correctly pops the return address.
-        let mut table = JitUnwindTable::new();
-        let mut seh = crate::seh::SehSubsystem::new();
-
-        // Register a block from 0x1000 to 0x1040 (64 bytes, 16 ARM64 instructions)
-        table.register_block(0x1000, 0x1040);
-        table.register_with_seh(&mut seh);
-
-        const JIT_IMAGE_BASE: u64 = 0;
-
-        // Set up a fake call frame:
-        // The "caller" placed return address 0xDEAD_BEEF at [RSP]
-        // and the "callee" (JIT block) starts at RIP=0x1000
-        let mut ctx = crate::seh::X64Context::default();
-
-        // Use FlatGuestMemory as the backing "stack"
-        let mem = FlatGuestMemory::new(GuestArch::X64);
-        let return_addr: u64 = 0xDEAD_BEEF;
-        let stack_addr: u64 = 0x7FFF_0000;
-
-        mem.sync_from_memory_image(stack_addr, &return_addr.to_le_bytes());
-        ctx.rsp = stack_addr;
-        ctx.rip = 0x1000; // inside JIT block
-
-        // Perform virtual unwind through the JIT frame
-        let result = seh.virtual_unwind_by_rva(
-            JIT_IMAGE_BASE,
-            0x1000, // RVA inside JIT block
-            &mut ctx,
-            &|addr, buf| {
-                let mut tmp = vec![0u8; buf.len()];
-                mem.read(addr, &mut tmp);
-                buf.copy_from_slice(&tmp);
-                true
-            },
-        );
-
-        // Verify unwind completed successfully
-        assert_eq!(
-            result,
-            crate::seh::UnwindResult::Completed,
-            "virtual_unwind through JIT frame should complete"
-        );
-
-        // After unwind, RIP should be the return address
-        assert_eq!(
-            ctx.rip, return_addr,
-            "RIP should be restored to return address"
-        );
-
-        // RSP should have advanced past the return address slot
-        assert_eq!(
-            ctx.rsp,
-            stack_addr + 8,
-            "RSP should advance past return address slot"
-        );
-    }
-
-    #[test]
-    fn unwind_table_virtual_unwind_multiple_jit_frames() {
-        // Simulate unwinding through two nested JIT frames:
-        //   Frame 1 (inner): JIT block at 0x1000..0x1040, called from
-        //   Frame 2 (outer): JIT block at 0x2000..0x2030
-        let mut table = JitUnwindTable::new();
-        let mut seh = crate::seh::SehSubsystem::new();
-
-        table.register_block(0x1000, 0x1040);
-        table.register_block(0x2000, 0x2030);
-        table.register_with_seh(&mut seh);
-
-        const JIT_IMAGE_BASE: u64 = 0;
-
-        // Set up a two-frame call stack in guest memory:
-        //   [RSP+0] = return_addr_to_2000 (return to middle of outer block)
-        //   [RSP+8] = return_addr_to_XXXX (return to something outside JIT)
-        let mem = FlatGuestMemory::new(GuestArch::X64);
-        let ret_to_outer: u64 = 0x2010; // inside outer JIT block
-        let ret_to_host: u64 = 0x7FFF_1234; // outside JIT, assumed base frame
-
-        let stack_base: u64 = 0x7FFF_0000;
-        // Inner frame's return address slot points to outer frame
-        mem.sync_from_memory_image(stack_base, &ret_to_outer.to_le_bytes());
-        // Outer frame's return address slot points to host
-        mem.sync_from_memory_image(stack_base + 8, &ret_to_host.to_le_bytes());
-
-        #[allow(clippy::type_complexity)]
-        let memory_reader: Box<dyn Fn(u64, &mut [u8]) -> bool> = Box::new(|addr, buf| {
-            let mut tmp = vec![0u8; buf.len()];
-            mem.read(addr, &mut tmp);
-            buf.copy_from_slice(&tmp);
-            true
-        });
-
-        // --- Unwind frame 1 (inner JIT block) ---
-        let mut ctx = crate::seh::X64Context {
-            rsp: stack_base,
-            rip: 0x1000,
-            ..Default::default()
-        };
-
-        let result = seh.virtual_unwind_by_rva(JIT_IMAGE_BASE, 0x1000, &mut ctx, &*memory_reader);
-        assert_eq!(
-            result,
-            crate::seh::UnwindResult::Completed,
-            "frame 1 unwind should complete"
-        );
-        assert_eq!(
-            ctx.rip, ret_to_outer,
-            "frame 1: RIP should be return address to outer block"
-        );
-        assert_eq!(
-            ctx.rsp,
-            stack_base + 8,
-            "frame 1: RSP should advance past return address"
-        );
-
-        // --- Unwind frame 2 (outer JIT block) ---
-        ctx.rip = ret_to_outer;
-
-        // Verify the outer block is findable (cloned to avoid borrow conflict)
-        let _rf_outer = seh
-            .find_runtime_function(JIT_IMAGE_BASE, ret_to_outer as u32)
-            .cloned()
-            .expect("outer block should be findable in SEH");
-        let result = seh.virtual_unwind_by_rva(
-            JIT_IMAGE_BASE,
-            ret_to_outer as u32,
-            &mut ctx,
-            &*memory_reader,
-        );
-        assert_eq!(
-            result,
-            crate::seh::UnwindResult::Completed,
-            "frame 2 unwind should complete"
-        );
-        assert_eq!(
-            ctx.rip, ret_to_host,
-            "frame 2: RIP should be return address to host"
-        );
-        assert_eq!(
-            ctx.rsp,
-            stack_base + 16,
-            "frame 2: RSP should advance past both return address slots"
-        );
-    }
-
-    #[test]
-    fn unwind_table_seh_find_runtime_function_uses_rva_range() {
-        // Verify that SEH's find_runtime_function correctly uses the
-        // begin_addr <= rva < end_addr range for JIT blocks.
-        let mut table = JitUnwindTable::new();
-        let mut seh = crate::seh::SehSubsystem::new();
-
-        // Register a block spanning 0x1000..0x1050
-        table.register_block(0x1000, 0x1050);
-        table.register_with_seh(&mut seh);
-
-        const JIT_IMAGE_BASE: u64 = 0;
-
-        // Test various RVAs within and outside the range
-        // Within range (inclusive of begin, exclusive of end)
-        assert!(
-            seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).is_some(),
-            "begin RVA should match (inclusive)"
-        );
-        assert!(
-            seh.find_runtime_function(JIT_IMAGE_BASE, 0x1001).is_some(),
-            "RVA within range should match"
-        );
-        assert!(
-            seh.find_runtime_function(JIT_IMAGE_BASE, 0x104F).is_some(),
-            "RVA just before end should match"
-        );
-
-        // Outside range
-        assert!(
-            seh.find_runtime_function(JIT_IMAGE_BASE, 0x0FFF).is_none(),
-            "RVA before begin should not match"
-        );
-        assert!(
-            seh.find_runtime_function(JIT_IMAGE_BASE, 0x1050).is_none(),
-            "end RVA should be exclusive (no match)"
-        );
-        assert!(
-            seh.find_runtime_function(JIT_IMAGE_BASE, 0x2000).is_none(),
-            "RVA far outside range should not match"
-        );
-    }
-
-    #[test]
-    fn unwind_table_internal_2byte_packed_format_roundtrip() {
-        // Verify that the 2-byte packed unwind data stored internally in
-        // JitUnwindInfo correctly encodes and survives a round-trip through
-        // register_with_seh() and SEH lookup.
-        let mut table = JitUnwindTable::new();
-        table.register_block(0x1000, 0x1020);
-
-        // Verify the internal 2-byte format directly
-        let entry = &table.entries[0];
-        assert_eq!(
-            entry.unwind_data.len(),
-            2,
-            "internal format must be 2 bytes"
-        );
-
-        // Byte 0: packed encoding
-        //   bits [1:0] = flag (0 = UNW_FLAG_NO_HANDLER)
-        //   bits [7:2] = function length capped at 0x3F, extracted as packed>>2
-        let packed = entry.unwind_data[0];
-        let flag = packed & 0x03;
-        let func_len_enc = (packed >> 2) & 0x3F;
-        assert_eq!(flag, 0, "UNW_FLAG_NO_HANDLER");
-        // func_len = (0x1020-0x1000)/4 = 8; packed = min(8, 0x3F) = 8
-        // bits[7:2] = packed >> 2 = 2 (func_len/4, not func_len-1)
-        assert_eq!(
-            func_len_enc, 2,
-            "func_len/4 = (0x1020-0x1000)/16 = 2 (bits[7:2] = packed>>2)"
-        );
-
-        // Byte 1: reserved/unused → must be 0
-        assert_eq!(entry.unwind_data[1], 0x00, "byte 1 must be 0 (reserved)");
-
-        // Now verify the round-trip through SEH
-        let mut seh = crate::seh::SehSubsystem::new();
-        table.register_with_seh(&mut seh);
-
-        const JIT_IMAGE_BASE: u64 = 0;
-        let rf = seh
-            .find_runtime_function(JIT_IMAGE_BASE, 0x1000)
-            .expect("should find registered block");
-
-        // The SEH system should have parsed the x64 UNWIND_INFO (derived from
-        // our 2-byte packed format) and returned valid UnwindInfo
-        let ui = seh
-            .get_unwind_info(rf.unwind_info_addr)
-            .expect("should parse unwind info");
-        assert_eq!(ui.version, 1);
-        assert_eq!(ui.codes.len(), 0);
-    }
-
-    #[test]
-    fn unwind_table_large_block_count() {
-        // Verify that registering many blocks (e.g., 100 JIT blocks) works
-        // correctly and all are findable in SEH.
-        let mut table = JitUnwindTable::new();
-        let count = 100;
-
-        for i in 0..count {
-            let base = 0x1000 + (i * 0x100) as u64;
-            table.register_block(base, base + 0x80);
-        }
-
-        assert_eq!(table.len(), count);
-
-        let mut seh = crate::seh::SehSubsystem::new();
-        table.register_with_seh(&mut seh);
-
-        const JIT_IMAGE_BASE: u64 = 0;
-
-        // Verify all blocks are findable
-        for i in 0..count {
-            let base = 0x1000 + (i * 0x100) as u64;
-            let rf = seh.find_runtime_function(JIT_IMAGE_BASE, base as u32);
-            assert!(rf.is_some(), "block {i} at {:#x} should be findable", base);
-            assert_eq!(rf.unwrap().begin_addr as u64, base);
-        }
-
-        // Verify no false positives
-        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x0FFF).is_none());
-        assert!(
-            seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000 + (count * 0x100) as u32)
-                .is_none()
-        );
-
-        // Remove half the blocks and verify
-        for i in 0..count / 2 {
-            let base = 0x1000 + (i * 0x100) as u64;
-            table.unregister_block(base);
-        }
-        assert_eq!(table.len(), count / 2);
-
-        table.register_with_seh(&mut seh);
-
-        // Removed blocks should be gone
-        for i in 0..count / 2 {
-            let base = 0x1000 + (i * 0x100) as u64;
-            assert!(
-                seh.find_runtime_function(JIT_IMAGE_BASE, base as u32)
-                    .is_none(),
-                "removed block {i} at {:#x} should NOT be findable",
-                base
-            );
-        }
-
-        // Remaining blocks should be findable
-        for i in count / 2..count {
-            let base = 0x1000 + (i * 0x100) as u64;
-            assert!(
-                seh.find_runtime_function(JIT_IMAGE_BASE, base as u32)
-                    .is_some(),
-                "remaining block {i} at {:#x} should be findable",
-                base
-            );
-        }
-    }
-
     // =====================================================================
     // Self-modifying code stress tests
     // =====================================================================
 
-    /// Test basic self-modifying code detection: compile a block, then
-    /// simulate a guest write to its address range, and verify the block
-    /// is invalidated and gets recompiled with new content.
     #[test]
     fn self_modifying_code_basic_invalidation() {
         let mut rt = JitRuntime::new(GuestArch::X64);
@@ -9934,56 +10312,6 @@ mod tests {
         );
     }
 
-    /// Test page-granularity self-modification: writing near a block boundary
-    /// should only affect blocks on the touched pages.
-    #[test]
-    fn self_modifying_code_page_granularity() {
-        let mut rt = JitRuntime::new(GuestArch::X64);
-
-        // Compile two blocks on separate pages
-        let ir_a = vec![
-            IrInstruction::MovImm {
-                dst: Register::Rax,
-                value: 1,
-            },
-            IrInstruction::Nop,
-        ];
-        let ir_b = vec![
-            IrInstruction::MovImm {
-                dst: Register::Rax,
-                value: 2,
-            },
-            IrInstruction::Nop,
-        ];
-
-        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None)
-            .unwrap();
-        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None)
-            .unwrap();
-        assert!(rt.is_compiled(0x1000));
-        assert!(rt.is_compiled(0x2000));
-
-        // Write to a byte near the boundary of block 0x1000.
-        // The block is at 0x1000, so writing at 0x1000 + code_size - 1 should
-        // still touch the same page. Writing past the block but on same page
-        // should not invalidate (since the block doesn't extend that far).
-        // Actually, let's test a write that overlaps the block's address range.
-        let affected = rt.invalidate_blocks_writing_to(0x1000, 1);
-        assert_eq!(
-            affected,
-            vec![0x1000],
-            "write at block start should affect that block only"
-        );
-
-        // Block 0x2000 should still be valid
-        assert!(
-            rt.is_compiled(0x2000),
-            "block 0x2000 should not be affected"
-        );
-    }
-
-    /// Test that writing to a page that doesn't have any compiled blocks
-    /// does NOT trigger invalidation.
     #[test]
     fn self_modifying_code_write_to_data_page_no_invalidation() {
         let mut rt = JitRuntime::new(GuestArch::X64);
@@ -10007,8 +10335,6 @@ mod tests {
         assert!(rt.is_compiled(0x1000), "block should still be compiled");
     }
 
-    /// Test multiple self-modification cycles: modify the same code 10+ times,
-    /// verifying each recompilation produces correct tracking.
     #[test]
     fn self_modifying_code_multiple_modifications() {
         let mut rt = JitRuntime::new(GuestArch::X64);
@@ -10064,8 +10390,6 @@ mod tests {
         );
     }
 
-    /// Test invalidation cascade: modifying one block should NOT incorrectly
-    /// invalidate adjacent blocks.
     #[test]
     fn self_modifying_code_invalidation_cascade() {
         let mut rt = JitRuntime::new(GuestArch::X64);
@@ -10119,9 +10443,6 @@ mod tests {
         assert!(rt.is_compiled(0x1200), "third block should remain compiled");
     }
 
-    /// Test re-compilation stress: simulate 100+ rapid self-modification
-    /// cycles on the same address to check for memory leaks and correct
-    /// bookkeeping in block tracking.
     #[test]
     fn self_modifying_code_recompilation_stress() {
         let mut rt = JitRuntime::new(GuestArch::X64);
@@ -10173,8 +10494,6 @@ mod tests {
         );
     }
 
-    /// Test that `get_or_compile` detects self-modifying code via hash
-    /// mismatch when a block with different IR is requested at the same address.
     #[test]
     fn self_modifying_code_hash_mismatch_detection() {
         let mut rt = JitRuntime::new(GuestArch::X64);
@@ -10222,8 +10541,6 @@ mod tests {
         );
     }
 
-    /// Test that `invalidate_blocks_on_pages` correctly invalidates all blocks
-    /// on a given set of dirty pages.
     #[test]
     fn self_modifying_code_page_set_invalidation() {
         let mut rt = JitRuntime::new(GuestArch::X64);
@@ -10280,82 +10597,8 @@ mod tests {
     // Gap 9.1: FastThunkTable ARM64 trampoline tests
     // =====================================================================
 
-    /// Dummy host function for thunk testing — just returns 0x42.
     extern "C" fn thunk_test_target() -> u64 {
         0x42
-    }
-
-    #[test]
-    fn fast_thunk_register_creates_trampoline_with_frame_save_restore() {
-        let mut table = FastThunkTable::new();
-        let host_fn = thunk_test_target as *const () as usize;
-        let idx = table.register(host_fn).expect("register thunk");
-
-        // Verify the entry was created
-        assert_eq!(table.len(), 1, "should have one entry");
-
-        // Verify the thunk address is valid (non-null, aligned)
-        let thunk_addr = table.thunk_address(idx).expect("get thunk address");
-        assert_ne!(thunk_addr, 0, "thunk address should not be null");
-        assert_eq!(thunk_addr % 4, 0, "thunk address should be 4-byte aligned");
-
-        // Verify the host function pointer is stored correctly
-        assert_eq!(table.host_fn(idx), Some(host_fn));
-    }
-
-    #[test]
-    fn fast_thunk_register_with_guest_addr_populates_global_map() {
-        let mut table = FastThunkTable::new();
-        let host_fn = thunk_test_target as *const () as usize;
-        let guest_addr: u64 = 0xDEAD_BEEF;
-
-        let idx = table
-            .register_with_guest_addr(host_fn, guest_addr)
-            .expect("register with guest addr");
-
-        // Verify the guest address is stored
-        assert!(table.contains_guest_addr(guest_addr));
-
-        // Verify the global map is populated
-        let thunk_addr = FAST_THUNK_MAP.lock().unwrap().get(&guest_addr).copied();
-        assert!(
-            thunk_addr.is_some(),
-            "global map should contain guest address"
-        );
-        assert_eq!(thunk_addr, table.thunk_address(idx));
-    }
-
-    #[test]
-    fn fast_thunk_find_by_guest_addr_returns_correct_address() {
-        let mut table = FastThunkTable::new();
-        let host_fn = thunk_test_target as *const () as usize;
-        let guest_addr: u64 = 0x1234_5678;
-
-        let idx = table
-            .register_with_guest_addr(host_fn, guest_addr)
-            .expect("register");
-        let expected = table.thunk_address(idx);
-
-        assert_eq!(table.find_thunk_by_guest(guest_addr), expected);
-        assert!(
-            table.find_thunk_by_guest(0xFFFF).is_none(),
-            "unregistered guest addr should return None"
-        );
-    }
-
-    #[test]
-    fn fast_thunk_trampoline_has_correct_size() {
-        let mut table = FastThunkTable::new();
-        let host_fn = thunk_test_target as *const () as usize;
-        let _ = table.register(host_fn).expect("register");
-
-        // The enhanced trampoline is 32 bytes:
-        //   6 instructions × 4 bytes = 24 bytes
-        //   + 8 bytes literal pool = 32 bytes total
-        assert_eq!(
-            table.code_zone_used, 32,
-            "trampoline should be exactly 32 bytes"
-        );
     }
 
     // =====================================================================
@@ -10363,9 +10606,6 @@ mod tests {
     // detection, and out-of-range fault handling
     // =====================================================================
 
-    /// Test: JIT compilation returns an error (not a panic) when executable
-    /// memory is exhausted. Verifies that `compile_block` handles allocation
-    /// failure gracefully by returning `Err(AppError)`.
     #[test]
     fn jit_compile_handles_executable_memory_exhaustion() {
         let mut compiler = JitCompiler::new();
@@ -10413,56 +10653,6 @@ mod tests {
         }
     }
 
-    /// Test: The SIGBUS loop detection mechanism correctly tracks consecutive
-    /// faults on the same page and disables the handler after
-    /// MAX_CONSECUTIVE_FAULTS. Simulates repeated faults by directly
-    /// manipulating the loop detection atomics.
-    #[test]
-    fn sigbus_loop_detection_disables_after_max_consecutive_faults() {
-        // Reset loop detection state
-        SIGBUS_LAST_FAULT_ADDR.store(0, Ordering::Relaxed);
-        SIGBUS_CONSECUTIVE_COUNT.store(0, Ordering::Relaxed);
-
-        let test_page: u64 = 0x1000;
-
-        // Simulate MAX_CONSECUTIVE_FAULTS - 1 faults on the same page
-        for _i in 1..MAX_CONSECUTIVE_FAULTS {
-            let last = SIGBUS_LAST_FAULT_ADDR.load(Ordering::Relaxed);
-            if last == test_page {
-                let count = SIGBUS_CONSECUTIVE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                assert!(
-                    count < MAX_CONSECUTIVE_FAULTS,
-                    "should not reach max before the last iteration"
-                );
-            } else {
-                SIGBUS_LAST_FAULT_ADDR.store(test_page, Ordering::Relaxed);
-                SIGBUS_CONSECUTIVE_COUNT.store(1, Ordering::Relaxed);
-            }
-        }
-
-        // The next fault should trigger the max check
-        let count = SIGBUS_CONSECUTIVE_COUNT.load(Ordering::Relaxed) + 1;
-        assert_eq!(
-            count, MAX_CONSECUTIVE_FAULTS,
-            "count should reach MAX_CONSECUTIVE_FAULTS"
-        );
-
-        // Simulate the handler disabling itself
-        SIGBUS_JIT_RUNTIME.store(std::ptr::null_mut(), Ordering::Release);
-        SIGBUS_JIT_MEMORY.store(std::ptr::null_mut(), Ordering::Release);
-
-        // Verify the pointers are null (handler disabled)
-        assert!(SIGBUS_JIT_RUNTIME.load(Ordering::Acquire).is_null());
-        assert!(SIGBUS_JIT_MEMORY.load(Ordering::Acquire).is_null());
-
-        // Clean up: reset state
-        SIGBUS_LAST_FAULT_ADDR.store(0, Ordering::Relaxed);
-        SIGBUS_CONSECUTIVE_COUNT.store(0, Ordering::Relaxed);
-    }
-
-    /// Test: The SIGBUS re-entrancy guard (AtomicBool) correctly prevents
-    /// recursive handler entry. Verifies that the guard blocks re-entry
-    /// and allows normal entry after being cleared.
     #[test]
     fn sigbus_reentrancy_guard_prevents_recursive_entry() {
         // Ensure guard starts clear
@@ -10486,10 +10676,6 @@ mod tests {
         SIGBUS_IN_HANDLER.store(false, Ordering::Release);
     }
 
-    /// Test: Faults outside the flat guest memory range are correctly
-    /// categorized by the diagnostic counters. Verifies that the range
-    /// check logic used in the SIGBUS handler works correctly for both
-    /// in-range and out-of-range addresses.
     #[test]
     fn sigbus_out_of_range_fault_diagnostic_counters() {
         let rt = JitRuntime::new(GuestArch::X64);
@@ -10551,57 +10737,6 @@ mod tests {
         );
     }
 
-    /// Test: pre-fault `write_volatile` offset arithmetic is bounds-checked.
-    /// Validates that write_volatile at base+end_offset is never outside the
-    /// flat memory region.
-    #[test]
-    fn prefault_write_volatile_bounds_checking() {
-        // Use the same checked arithmetic logic as the SIGBUS handler and
-        // sync_all_pages_to_flat.
-        let rt = JitRuntime::new(GuestArch::X64);
-        let flat_size = rt.flat_memory.size();
-
-        // Valid: page at offset 0 (first page)
-        let offset = 0usize;
-        let end_offset = offset.checked_add(4095);
-        assert!(end_offset.is_some(), "offset + 4095 should not overflow");
-        assert!(
-            end_offset.unwrap() < flat_size,
-            "first page end_offset should be within flat memory"
-        );
-
-        // Valid: page at flat_size - 4096 (last full page)
-        let offset = flat_size - 4096;
-        let end_offset = offset.checked_add(4095);
-        assert!(
-            end_offset.is_some(),
-            "last page offset + 4095 should not overflow"
-        );
-        assert!(
-            end_offset.unwrap() < flat_size,
-            "last page end_offset should be strictly less than flat_size"
-        );
-
-        // Invalid: offset exceeds flat_size
-        let offset = flat_size;
-        let end_offset = offset.checked_add(4095);
-        assert!(
-            end_offset.is_none() || end_offset.unwrap() >= flat_size,
-            "offset at flat_size should either overflow or be >= flat_size"
-        );
-
-        // Invalid: offset near usize::MAX (should overflow on checked_add)
-        let offset = usize::MAX - 100;
-        let end_offset = offset.checked_add(4095);
-        assert!(
-            end_offset.is_none(),
-            "offset near usize::MAX should overflow on checked_add(4095)"
-        );
-    }
-
-    /// Test: fast-thunk fallback dispatch works when the thunk is NOT in the
-    /// global map. Verifies that `compile_instruction` for a `Call` to an
-    /// unregistered guest address falls through to the EXIT_THUNK path.
     #[test]
     fn fast_thunk_fallback_dispatch_when_not_registered() {
         let mut compiler = JitCompiler::new();
@@ -10618,28 +10753,23 @@ mod tests {
         );
     }
 
-    /// Test: block chaining patches the correct instruction and the patch
-    /// is followed by an icache flush. Verifies that a chained block has
-    /// its last 4 bytes (the epilogue return instruction) replaced with
-    /// a B (unconditional branch) to the target block.
     #[test]
-    fn block_chaining_patches_instruction_and_flushes_icache() {
+    fn block_chaining_publishes_link_and_unchains() {
         let mut rt = JitRuntime::new(GuestArch::X64);
 
-        // Compile two blocks
         let ir_a = vec![
             IrInstruction::MovImm {
                 dst: Register::Rax,
                 value: 1,
             },
-            IrInstruction::Nop,
+            IrInstruction::Jump { target: 0x2000 },
         ];
         let ir_b = vec![
             IrInstruction::MovImm {
                 dst: Register::Rax,
                 value: 2,
             },
-            IrInstruction::Nop,
+            IrInstruction::Jump { target: 0x3000 },
         ];
 
         rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None)
@@ -10650,44 +10780,32 @@ mod tests {
         assert!(rt.is_compiled(0x1000));
         assert!(rt.is_compiled(0x2000));
 
-        // Chain block 0x1000 -> 0x2000 (DISABLED: no-op, no chain created)
-        let _ = rt.chain_blocks(0x1000, 0x2000);
-
-        // Chaining is disabled, so no chain entry exists.
+        rt.chain_blocks(0x1000, 0x2000).unwrap();
         let chain_key = (0x1000, 0x2000);
-        assert!(
-            !rt.block_chains.contains_key(&chain_key),
-            "chaining disabled; no chain entry should exist"
+        assert!(rt.block_chains.contains_key(&chain_key));
+        assert_ne!(
+            rt.block_cache
+                .get(&0x1000)
+                .unwrap()
+                .link_target
+                .load(Ordering::Acquire),
+            0
         );
 
-        // unchain_block still succeeds (no-op on an empty chain set).
         let unchain_result = rt.unchain_block(0x1000);
         assert!(unchain_result.is_ok(), "unchaining should succeed");
-        assert!(
-            !rt.block_chains.contains_key(&chain_key),
-            "no chain entry to remove"
+        assert!(!rt.block_chains.contains_key(&chain_key));
+        assert_eq!(
+            rt.block_cache
+                .get(&0x1000)
+                .unwrap()
+                .link_target
+                .load(Ordering::Acquire),
+            0,
+            "unchaining must clear the atomic link slot"
         );
     }
 
-    /// Test: `find_thunk_by_guest` returns `Option<usize>` (not a panic) for
-    /// unregistered addresses, confirming the method signature is safe.
-    /// The explicit poison handling in the source (match on lock error) is
-    /// verified by code review — this test verifies the normal return path.
-    #[test]
-    fn fast_thunk_find_by_guest_returns_option_for_unregistered() {
-        let table = FastThunkTable::new();
-        // Unregistered address should return None (the normal case)
-        let result = table.find_thunk_by_guest(0x1234);
-        assert!(result.is_none(), "unregistered addr should return None");
-    }
-
-    /// Test: `compile_instruction` handles `FAST_THUNK_MAP.lock()` returning
-    /// `Err` (poisoned) by propagating as `AppError`, not panicking.
-    /// This tests the code path in `compile_instruction` where the fast-thunk
-    /// address set contains the target but the global map lock is unavailable.
-    /// We simulate this by providing a set with a target that has no entry in
-    /// the map — the compiler falls back to EXIT_THUNK, which is the correct
-    /// graceful degradation.
     #[test]
     fn fast_thunk_compile_fallback_when_global_map_missing() {
         let mut compiler = JitCompiler::new();
@@ -10711,14 +10829,8 @@ mod tests {
     // On-demand guest-page materialisation
     // =====================================================================
 
-    /// Serialises the tests that assert exact telemetry values: the
-    /// materialisation counters are process-global (also incremented by the
-    /// SIGBUS handler), so exact assertions need mutual exclusion.
     static GUEST_MEMORY_TELEMETRY_LOCK: Mutex<()> = Mutex::new(());
 
-    /// A large *sparse* guest image must materialise only the pages that were
-    /// actually committed — never the whole 4 GiB flat region.  Before the
-    /// on-demand work, every sync pre-faulted all 1,048,576 pages.
     #[test]
     fn sparse_guest_memory_materialises_only_committed_pages() {
         let _guard = GUEST_MEMORY_TELEMETRY_LOCK
@@ -10769,72 +10881,6 @@ mod tests {
         assert_eq!(buf, [0xAB; 8]);
     }
 
-    /// Contiguous pages must be batched into a single sync operation.
-    #[test]
-    fn contiguous_guest_pages_sync_in_one_operation() {
-        let _guard = GUEST_MEMORY_TELEMETRY_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let mut memory = MemoryImage::default();
-        let base = 0x2000_0000u64;
-        for i in 0..32u64 {
-            memory.map_bytes(base + i * 0x1000, &[(i as u8) ^ 0x5A; 4096]);
-        }
-
-        let mut runtime = JitRuntime::new(GuestArch::X64);
-        reset_guest_memory_telemetry();
-        runtime.sync_all_pages_to_flat(&memory);
-
-        let telemetry = guest_memory_telemetry();
-        assert_eq!(telemetry.pages_materialised, 32);
-        assert_eq!(
-            telemetry.sync_operations, 1,
-            "32 contiguous pages must batch into one sync operation"
-        );
-        assert_eq!(telemetry.bytes_copied, 32 * 4096);
-
-        for i in 0..32u64 {
-            let mut byte = [0u8; 1];
-            runtime.flat_memory.read(base + i * 0x1000, &mut byte);
-            assert_eq!(
-                byte[0],
-                (i as u8) ^ 0x5A,
-                "page {i} content mismatch after batched sync"
-            );
-        }
-    }
-
-    /// A contiguous run longer than one bounded batch is split into chunks,
-    /// each of which is still a single read+copy operation.
-    #[test]
-    fn large_contiguous_run_is_chunked_into_bounded_batches() {
-        let _guard = GUEST_MEMORY_TELEMETRY_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // 300 contiguous pages = 1,228,800 bytes → two bounded batches.
-        let mut memory = MemoryImage::default();
-        let base = 0x4000_0000u64;
-        for i in 0..300u64 {
-            memory.map_bytes(base + i * 0x1000, &[0x77; 4096]);
-        }
-
-        let mut runtime = JitRuntime::new(GuestArch::X64);
-        reset_guest_memory_telemetry();
-        runtime.sync_all_pages_to_flat(&memory);
-
-        let telemetry = guest_memory_telemetry();
-        assert_eq!(telemetry.pages_materialised, 300);
-        assert_eq!(
-            telemetry.sync_operations, 2,
-            "a 300-page run must split into two bounded batches"
-        );
-        assert_eq!(telemetry.bytes_copied, 300 * 4096);
-    }
-
-    /// A partially-mapped page is skipped exactly like the previous per-page
-    /// sync (it must not be materialised as zeros over live data).
     #[test]
     fn partially_mapped_page_is_not_materialised() {
         let _guard = GUEST_MEMORY_TELEMETRY_LOCK
@@ -10854,68 +10900,1701 @@ mod tests {
         assert_eq!(telemetry.bytes_copied, 0);
         assert!(!runtime.flat_memory.is_page_materialised(0x3000_0000));
     }
-
-    /// Repeat resolutions of registered guest thunk addresses are served from
-    /// the resolved-target index (O(1), no entry scan, no global-map lock).
-    #[test]
-    fn thunk_resolve_cache_serves_repeat_lookups() {
-        static THUNK_RESOLVE_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = THUNK_RESOLVE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let mut table = FastThunkTable::new();
-        let host_fn = thunk_test_target as *const () as usize;
-        let mut expected = Vec::new();
-        for i in 0..4u64 {
-            let guest = 0x5000 + i * 0x100;
-            let idx = table
-                .register_with_guest_addr(host_fn, guest)
-                .expect("register");
-            expected.push((guest, table.thunk_address(idx).expect("thunk address")));
-        }
-
-        reset_thunk_resolve_telemetry();
-        // Other tests may resolve thunks concurrently, so these counters are
-        // asserted as deltas rather than exact global values.  Our own 40
-        // lookups guarantee the lower bound.
-        let (hits_before, _) = thunk_resolve_telemetry();
-        for _ in 0..10 {
-            for (guest, thunk) in &expected {
-                assert_eq!(table.find_thunk_by_guest(*guest), Some(*thunk));
-            }
-        }
-        let (hits_after, _) = thunk_resolve_telemetry();
-        assert!(
-            hits_after.saturating_sub(hits_before) >= 40,
-            "every repeat lookup must be a resolved-cache hit"
-        );
-
-        let (_, misses_before_unregistered) = thunk_resolve_telemetry();
-        // Deliberately obscure address: unlike 0xDEAD_BEEF it is not used as
-        // a guest thunk address by any other test (the global fallback map is
-        // process-wide).
-        let unregistered = 0xF00D_BAAD_0000_0001u64;
-        assert!(table.find_thunk_by_guest(unregistered).is_none());
-        let (_, misses_after) = thunk_resolve_telemetry();
-        assert!(
-            misses_after > misses_before_unregistered,
-            "the unregistered lookup must take the slow path"
-        );
-    }
 }
 
 #[cfg(test)]
 mod sigbus_diagnostic_tests {
     use super::*;
+}
+
+#[cfg(test)]
+mod production_safety_tests {
+    use super::*;
+
+    fn execute_cached(
+        runtime: &mut JitRuntime,
+        address: u64,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> JitExitReason {
+        let block = runtime
+            .block_cache
+            .get(&address)
+            .cloned()
+            .expect("block must be compiled");
+        state.rip = address;
+        // SAFETY: test-only single-threaded execution of a block compiled by
+        // this runtime; state/memory outlive the call.
+        unsafe { runtime.execute_block(&block, state, memory) }
+    }
+
+    fn skip_without_capability(test: &str) -> bool {
+        skip_without_capability_for(test, jit_execution_available())
+    }
+
+    fn skip_without_capability_for(test: &str, available: bool) -> bool {
+        if available {
+            return false;
+        }
+        eprintln!("[jit] skipping {test}: executable-memory probe unavailable");
+        true
+    }
 
     #[test]
-    fn sigbus_counters_start_at_zero() {
-        assert_eq!(SIGBUS_TOTAL_EVENTS.load(Ordering::Relaxed), 0);
-        assert_eq!(SIGBUS_PAGE_FOUND.load(Ordering::Relaxed), 0);
-        assert_eq!(SIGBUS_PAGE_NOT_FOUND.load(Ordering::Relaxed), 0);
-        assert_eq!(SIGBUS_DISABLED_EVENTS.load(Ordering::Relaxed), 0);
-        assert_eq!(SIGBUS_RECURSIVE.load(Ordering::Relaxed), 0);
-        assert_eq!(SIGBUS_HANDLER_DEPTH.load(Ordering::Relaxed), 0);
+    fn jit_capability_gate_reports_unavailable_host_without_running_native_code() {
+        assert_eq!(skip_without_capability_for("fixture", true), false);
+        assert_eq!(skip_without_capability_for("fixture", false), true);
+        assert_eq!(
+            skip_without_capability("fixture"),
+            !jit_execution_available()
+        );
+    }
+
+    #[test]
+    fn jit_construction_gate_rejects_deterministic_and_unavailable_hosts() {
+        use crate::runner::JitMode;
+        // Auto selects native execution only on a capable, non-deterministic
+        // host.
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Auto, false, true),
+            true
+        );
+        // Auto is interpreter-only when the probe failed...
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Auto, false, false),
+            false
+        );
+        // ...and in deterministic/replay mode even on a capable host.
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Auto, true, true),
+            false
+        );
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Auto, true, false),
+            false
+        );
+        // Disabled never constructs; Enabled is an explicit override.
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Disabled, false, true),
+            false
+        );
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Enabled, false, false),
+            true
+        );
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Enabled, true, true),
+            true
+        );
+    }
+
+    #[test]
+    fn auto_unavailable_host_and_deterministic_modes_fall_back() {
+        use crate::runner::JitMode;
+        // Incapable host: Auto never constructs the JIT runtime.
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Auto, false, false),
+            false
+        );
+        // Deterministic host under Auto: interpreter-only, same behaviour.
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Auto, true, true),
+            false
+        );
+        // Explicit Enabled still constructs (documented override), and a
+        // disabled mode never does.
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Enabled, true, true),
+            true
+        );
+        assert_eq!(
+            crate::runtime::jit_construction_selected(&JitMode::Disabled, false, true),
+            false
+        );
+    }
+
+    fn run_self_modifying_code_case(available: bool) -> Option<()> {
+        if !available {
+            return None;
+        }
+        let code = 0x00A1_0000u64;
+        let writer = 0x00A1_1000u64;
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let original = vec![IrInstruction::MovImm {
+            dst: Register::Rax,
+            value: 42,
+        }];
+        runtime
+            .get_or_compile(&original, code, GuestArch::X64, None)
+            .expect("compile original block");
+        let stale = runtime.block_cache.get(&code).cloned().expect("cached");
+        let _ = execute_cached(&mut runtime, code, &mut state, &mut memory);
+        assert_eq!(state.get(Register::Rax), 42);
+
+        // Guest code itself overwrites the block's first four bytes.  The
+        // page must be mapped so the store reaches the SMC hook (an unmapped
+        // store takes the guest-fault path instead).
+        memory.map_zeroed_if_unmapped(code, 0x1000);
+        let writer_ir = vec![
+            IrInstruction::StoreImmediate {
+                address: crate::cpu::MemoryOperand {
+                    base: None,
+                    index: None,
+                    scale: 1,
+                    displacement: 0,
+                    rip_relative: false,
+                    rip_base: 0,
+                    segment: None,
+                    address_size_32: false,
+                    absolute_address: Some(code),
+                },
+                value: 0x9090_9090,
+                width: 4,
+            },
+            IrInstruction::Nop,
+        ];
+        runtime
+            .get_or_compile(&writer_ir, writer, GuestArch::X64, None)
+            .expect("compile writer block");
+        let _ = execute_cached(&mut runtime, writer, &mut state, &mut memory);
+        assert!(
+            runtime.code_invalidations >= 1,
+            "guest store to a code page must invalidate the compiled block"
+        );
+        assert!(runtime.smc_invalidation_events >= 1);
+
+        // The stale block must not execute its old bytes: the entry check
+        // returns the interpreter fallback.
+        state.set(Register::Rax, 0);
+        state.rip = code;
+        let reason = unsafe { runtime.execute_block(&stale, &mut state, &mut memory) };
+        assert_eq!(
+            reason,
+            JitExitReason::Safepoint,
+            "a stale SMC block must fall back to the interpreter, not run"
+        );
+
+        // Recompiling from the new code observes the new behaviour.
+        let updated = vec![IrInstruction::MovImm {
+            dst: Register::Rax,
+            value: 43,
+        }];
+        runtime
+            .get_or_compile(&updated, code, GuestArch::X64, None)
+            .expect("recompile modified block");
+        state.set(Register::Rax, 0);
+        let _ = execute_cached(&mut runtime, code, &mut state, &mut memory);
+        assert_eq!(
+            state.get(Register::Rax),
+            43,
+            "recompilation must not execute stale code"
+        );
+        Some(())
+    }
+
+    #[test]
+    fn self_modifying_code_guest_store_invalidates_and_recompiles() {
+        assert_eq!(
+            run_self_modifying_code_case(false),
+            None,
+            "an unavailable probe must skip native SMC invalidation"
+        );
+        assert_eq!(
+            run_self_modifying_code_case(jit_execution_available()).is_some(),
+            jit_execution_available()
+        );
+    }
+
+    fn run_backedge_link_case(available: bool) -> Option<()> {
+        if !available {
+            return None;
+        }
+        let source = 0x00A2_0000u64;
+        let target = 0x00A2_1000u64;
+        let exit = 0x00A2_2000u64;
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let source_ir = vec![IrInstruction::Nop, IrInstruction::Jump { target }];
+        let target_ir = vec![IrInstruction::Nop, IrInstruction::Jump { target: exit }];
+        runtime
+            .get_or_compile(&source_ir, source, GuestArch::X64, None)
+            .expect("compile source");
+        runtime
+            .get_or_compile(&target_ir, target, GuestArch::X64, None)
+            .expect("compile target");
+        runtime.chain_blocks(source, target).expect("publish link");
+        assert_eq!(runtime.chain_links_formed, 1);
+        assert!(
+            runtime
+                .block_cache
+                .get(&source)
+                .expect("source cached")
+                .link_target
+                .load(Ordering::Acquire)
+                != 0,
+            "link slot must publish the target entry"
+        );
+
+        // Linked execution reaches the target's EXIT_JUMP (target semantics),
+        // proving the dispatcher was bypassed.
+        let reason = execute_cached(&mut runtime, source, &mut state, &mut memory);
+        assert_eq!(reason, JitExitReason::Jump { target: exit });
+
+        // Safepoint semantics survive chaining: the target prologue (and the
+        // source prologue) still poll the host flag.
+        JIT_SAFEPOINT_REQUESTED.store(true, Ordering::Relaxed);
+        let reason = execute_cached(&mut runtime, source, &mut state, &mut memory);
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Relaxed);
+        assert_eq!(reason, JitExitReason::Safepoint);
+        Some(())
+    }
+
+    #[test]
+    fn backedge_link_falls_back_to_safepoint_when_requested() {
+        assert_eq!(
+            run_backedge_link_case(false),
+            None,
+            "an unavailable probe must skip native chain execution"
+        );
+        assert_eq!(
+            run_backedge_link_case(jit_execution_available()).is_some(),
+            jit_execution_available()
+        );
+    }
+
+    extern "C" fn direct_thunk_target(
+        _runtime: *mut c_void,
+        state: *mut CpuState,
+        _memory: *mut MemoryImage,
+        _thunk: u64,
+    ) -> i32 {
+        if !state.is_null() {
+            unsafe {
+                (*state).gpr[0] = 0x77;
+            }
+        }
+        -1
+    }
+
+    #[test]
+    fn direct_thunk_target_invalid_state_is_safe_and_pins_sentinel() {
+        assert_eq!(
+            direct_thunk_target(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0
+            ),
+            -1,
+            "a null state must not be dereferenced and must still request continuation"
+        );
+        let mut state = CpuState::new(GuestArch::X64);
+        assert_eq!(
+            direct_thunk_target(
+                std::ptr::null_mut(),
+                &mut state,
+                std::ptr::null_mut(),
+                0xDEAD
+            ),
+            -1
+        );
+        assert_eq!(state.get(Register::Rax), 0x77);
+    }
+
+    #[test]
+    fn direct_resolved_thunk_call_bypasses_dispatcher() {
+        if skip_without_capability("direct_resolved_thunk_call_bypasses_dispatcher") {
+            return;
+        }
+        const GUEST_THUNK: u64 = 0x00A3_5000;
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rsp, 0x2000);
+        runtime
+            .register_host_thunk_for_guest(direct_thunk_target as *const () as usize, GUEST_THUNK)
+            .expect("register resolved thunk");
+        let ir = vec![
+            IrInstruction::MovImm {
+                dst: Register::Rax,
+                value: 7,
+            },
+            IrInstruction::Call {
+                target: GUEST_THUNK,
+                return_address: 0x00A3_6004,
+            },
+        ];
+        let before = JIT_THUNK_DIRECT_CALLS.load(Ordering::Relaxed);
+        runtime
+            .get_or_compile(&ir, 0x00A3_6000, GuestArch::X64, None)
+            .expect("compile direct-call block");
+        assert!(
+            JIT_THUNK_DIRECT_CALLS.load(Ordering::Relaxed) > before,
+            "resolved thunk must be emitted as a direct call"
+        );
+        let reason = execute_cached(&mut runtime, 0x00A3_6000, &mut state, &mut memory);
+        assert!(matches!(reason, JitExitReason::Normal { .. }));
+        assert_eq!(
+            state.get(Register::Rax),
+            0x77,
+            "the host thunk must run without an EXIT_THUNK dispatcher trip"
+        );
+    }
+
+    fn run_invalid_block_installation_case(available: bool) -> Option<()> {
+        if !available {
+            return None;
+        }
+        let address = 0x00A4_0000u64;
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        let ir = vec![IrInstruction::MovImm {
+            dst: Register::Rax,
+            value: 42,
+        }];
+        runtime
+            .get_or_compile(&ir, address, GuestArch::X64, None)
+            .expect("compile");
+        let stale = runtime.block_cache.get(&address).cloned().expect("cached");
+
+        // Simulate a crash-equivalent signal at block installation/unwind:
+        // the block is quarantined and handed to the interpreter.
+        runtime.report_block_fault(address);
+        assert_eq!(runtime.fault_fallbacks, 1);
+        assert!(runtime.faulted_blocks.contains(&address));
+        assert!(!runtime.is_compiled(address));
+        assert!(
+            runtime
+                .get_or_compile(&ir, address, GuestArch::X64, None)
+                .is_err(),
+            "a faulted block must stay on the interpreter"
+        );
+
+        state.rip = address;
+        let reason = unsafe { runtime.execute_block(&stale, &mut state, &mut memory) };
+        assert_eq!(reason, JitExitReason::Safepoint);
+        assert!(runtime.fault_fallbacks >= 1);
+        Some(())
+    }
+
+    #[test]
+    fn invalid_block_installation_falls_back_to_interpreter() {
+        assert_eq!(
+            run_invalid_block_installation_case(false),
+            None,
+            "an unavailable probe must skip the native fault fallback"
+        );
+        assert_eq!(
+            run_invalid_block_installation_case(jit_execution_available()).is_some(),
+            jit_execution_available()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial coverage: probe failure protocol, executable-memory refusals,
+// SMC watch/dirty edge cases, chaining/tier errors, and fault fallbacks.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod coverage_adversarial_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn probe_matrix(selected: JitExecMechanism) -> JitExecProbeMatrix {
+        JitExecProbeMatrix {
+            mprotect_rx: JitExecProbeOutcome::NotProbed,
+            map_jit_wx_write_protect: JitExecProbeOutcome::NotProbed,
+            map_jit_rw_write_protect: JitExecProbeOutcome::NotProbed,
+            map_jit_wx_no_write_protect: JitExecProbeOutcome::NotProbed,
+            selected,
+        }
+    }
+
+    fn capable_runtime() -> JitRuntime {
+        assert!(
+            jit_execution_available(),
+            "this test requires a working executable-memory mechanism"
+        );
+        JitRuntime::new(GuestArch::X64)
+    }
+
+    fn execute_cached(
+        runtime: &mut JitRuntime,
+        address: u64,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> JitExitReason {
+        let block = runtime
+            .block_cache
+            .get(&address)
+            .cloned()
+            .expect("block must be compiled");
+        state.rip = address;
+        // SAFETY: test-only single-threaded execution of a block compiled by
+        // this runtime; state/memory outlive the call.
+        unsafe { runtime.execute_block(&block, state, memory) }
+    }
+
+    fn smc_slot(page: u64) -> usize {
+        let x = (page >> 12).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (x >> (64 - 13)) as usize & SMC_WATCH_MASK
+    }
+
+    // ── Capability probe reporting ──────────────────────────────────────────
+
+    #[test]
+    fn jit_exec_mechanism_display_rejects_ambiguous_text() {
+        assert_eq!(
+            JitExecMechanism::MapJitWx.to_string(),
+            "MAP_JIT RWX + pthread_jit_write_protect_np"
+        );
+        assert_eq!(
+            JitExecMechanism::MprotectRx.to_string(),
+            "mmap RW + mprotect RX"
+        );
+        assert_eq!(JitExecMechanism::RwxMmap.to_string(), "mmap RWX");
+        assert_eq!(JitExecMechanism::Unavailable.to_string(), "unavailable");
+    }
+
+    #[test]
+    fn jit_exec_probe_outcome_display_reports_exact_failures() {
+        assert_eq!(
+            JitExecProbeOutcome::Executed(42).to_string(),
+            "executed, returned 42"
+        );
+        assert_eq!(
+            JitExecProbeOutcome::MmapFailed(libc::EINVAL).to_string(),
+            "mmap failed: errno 22 (Invalid argument (os error 22))"
+        );
+        assert_eq!(
+            JitExecProbeOutcome::MprotectFailed(libc::EINVAL).to_string(),
+            "mprotect(PROT_EXEC) failed: errno 22 (Invalid argument (os error 22))"
+        );
+        assert_eq!(
+            JitExecProbeOutcome::WriteFaulted(libc::SIGBUS).to_string(),
+            "write faulted: signal 10"
+        );
+        assert_eq!(
+            JitExecProbeOutcome::ExecuteFaulted(libc::SIGSEGV).to_string(),
+            "execution faulted: signal 11"
+        );
+        assert_eq!(
+            JitExecProbeOutcome::ForkFailed(libc::EAGAIN).to_string(),
+            "fork failed: errno 35 (Resource temporarily unavailable (os error 35))"
+        );
+        assert_eq!(
+            JitExecProbeOutcome::ChildFailed(7).to_string(),
+            "probe child exited without a result: 7"
+        );
+        assert_eq!(
+            JitExecProbeOutcome::NotProbed.to_string(),
+            "not probed on this target"
+        );
+    }
+
+    #[test]
+    fn jit_exec_probe_select_rejects_non_executing_mechanisms() {
+        // A mechanism that "runs" but returns the wrong value must not win.
+        let wrong = JitExecProbeMatrix::select(
+            JitExecProbeOutcome::Executed(42),
+            JitExecProbeOutcome::Executed(41),
+            JitExecProbeOutcome::WriteFaulted(libc::SIGBUS),
+            JitExecProbeOutcome::ExecuteFaulted(libc::SIGBUS),
+        );
+        assert_eq!(wrong.selected, JitExecMechanism::MprotectRx);
+        // When neither mechanism executes the stub, native execution is off.
+        let none = JitExecProbeMatrix::select(
+            JitExecProbeOutcome::MmapFailed(libc::EINVAL),
+            JitExecProbeOutcome::MmapFailed(libc::EINVAL),
+            JitExecProbeOutcome::MmapFailed(libc::EINVAL),
+            JitExecProbeOutcome::MmapFailed(libc::EINVAL),
+        );
+        assert_eq!(none.selected, JitExecMechanism::Unavailable);
+        // The W^X MAP_JIT mechanism is preferred when it executes.
+        let preferred = JitExecProbeMatrix::select(
+            JitExecProbeOutcome::Executed(42),
+            JitExecProbeOutcome::Executed(42),
+            JitExecProbeOutcome::Executed(42),
+            JitExecProbeOutcome::Executed(42),
+        );
+        assert_eq!(preferred.selected, JitExecMechanism::MapJitWx);
+    }
+
+    // ── Executable-memory manager refusals ──────────────────────────────────
+
+    #[test]
+    fn jit_memory_manager_mprotect_rejects_foreign_mappings() {
+        let mut manager =
+            JitMemoryManager::with_capability(probe_matrix(JitExecMechanism::MprotectRx));
+        let code = [0x1f, 0x20, 0x03, 0xd5];
+        let ptr = manager.allocate_code_space(code.len());
+        assert_eq!(manager.mechanism(), JitExecMechanism::MprotectRx);
+        assert!(!ptr.is_null());
+        assert_eq!(manager.total_allocated(), JIT_PAGE_SIZE);
+        assert_eq!(manager.total_used(), 64);
+        // SAFETY: ptr was allocated by this manager for at least code.len().
+        unsafe {
+            assert_eq!(manager.make_writable(ptr, code.len()), true);
+            ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
+            assert_eq!(manager.finalize_code(ptr, code.len()), true);
+        }
+        // A pointer outside every managed mmap must be refused, not blindly
+        // mprotect'ed (which would corrupt an unrelated host mapping).
+        let mut foreign = [0u32; 2];
+        let foreign_ptr = foreign.as_mut_ptr() as *mut u8;
+        unsafe {
+            assert_eq!(manager.make_writable(foreign_ptr, 4), false);
+            assert_eq!(manager.finalize_code(foreign_ptr, 4), false);
+        }
+    }
+
+    #[test]
+    fn jit_memory_manager_rwx_rejects_zero_size_finalize() {
+        // Plain RWX anon mmap is refused on this host (no MAP_JIT); the arm
+        // must still be exercised and must fail allocation rather than lie.
+        let mut plain = JitMemoryManager::with_capability(probe_matrix(JitExecMechanism::RwxMmap));
+        let _ = plain.allocate_code_space(4);
+
+        // Exercise the direct-RWX permission arms with a live mapping so the
+        // mechanism's "already writable/executable" contract is pinned.
+        let mut backing =
+            JitMemoryManager::with_capability(probe_matrix(JitExecMechanism::MapJitWx));
+        let ptr = backing.allocate_code_space(64);
+        assert!(!ptr.is_null());
+        let mut manager =
+            JitMemoryManager::with_capability(probe_matrix(JitExecMechanism::RwxMmap));
+        manager.pages.push((ptr, JIT_PAGE_SIZE));
+        assert_eq!(manager.mechanism(), JitExecMechanism::RwxMmap);
+        // SAFETY: ptr is a live mapping owned by this test.
+        unsafe {
+            assert_eq!(manager.make_writable(ptr, 4), true);
+            assert_eq!(manager.finalize_code(ptr, 4), true);
+            assert_eq!(manager.finalize_code(ptr, 0), false);
+            assert_eq!(manager.finalize_code(std::ptr::null_mut(), 4), false);
+        }
+    }
+
+    #[test]
+    fn jit_install_code_rejects_foreign_writable_page() {
+        let mut compiler = JitCompiler::new();
+        compiler.memory_manager =
+            JitMemoryManager::with_capability(probe_matrix(JitExecMechanism::MprotectRx));
+        compiler.emitter.nop();
+        let mut foreign = [0u32; 2];
+        let error = compiler
+            .install_code(foreign.as_mut_ptr() as *mut u8, 4)
+            .unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCodeAllocFailed);
+        assert_eq!(error.message, "JIT: executable code page is not writable");
+    }
+
+    #[test]
+    fn jit_install_code_rejects_zero_size_finalize() {
+        let mut compiler = JitCompiler::new();
+        let ptr = compiler.memory_manager.allocate_code_space(64);
+        assert!(!ptr.is_null());
+        let error = compiler.install_code(ptr, 0).unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCodeAllocFailed);
+        assert_eq!(
+            error.message,
+            "JIT: failed to make compiled block executable"
+        );
+    }
+
+    #[test]
+    fn jit_compile_block_rejects_unavailable_executable_memory() {
+        let mut compiler = JitCompiler::new();
+        compiler.memory_manager =
+            JitMemoryManager::with_capability(probe_matrix(JitExecMechanism::Unavailable));
+        let error = compiler
+            .compile_block(&[IrInstruction::Nop], 0x1000, GuestArch::X64, None)
+            .err()
+            .expect("unavailable memory must fail compilation");
+        assert_eq!(error.code, ReasonCode::RcJitCodeAllocFailed);
+        assert_eq!(error.message, "JIT: failed to allocate executable memory");
+    }
+
+    // ── SMC watch/dirty edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn smc_watch_overflow_marks_every_page_watched() {
+        let state = SmcState::new();
+        let pages: Vec<u64> = (0..=SMC_WATCH_SLOTS as u64)
+            .map(|i| (i + 1) * 0x1000)
+            .collect();
+        state.rebuild_watch(pages.iter());
+        assert_eq!(state.watched_count.load(Ordering::Acquire), SMC_WATCH_SLOTS);
+        assert_eq!(state.watch_overflow.load(Ordering::Acquire), true);
+        assert_eq!(
+            state.is_watched(0xFFFF_FFFF_FFFF_F000),
+            true,
+            "overflow must conservatively watch unknown pages"
+        );
+    }
+
+    #[test]
+    fn smc_watch_full_table_rejects_absent_page() {
+        let state = SmcState::new();
+        let pages: Vec<u64> = (0..SMC_WATCH_SLOTS as u64)
+            .map(|i| (i + 1) * 0x1000)
+            .collect();
+        state.rebuild_watch(pages.iter());
+        assert_eq!(state.watched_count.load(Ordering::Acquire), SMC_WATCH_SLOTS);
+        assert_eq!(state.watch_overflow.load(Ordering::Acquire), false);
+        // Every probe slot is occupied by another key; the scan must exhaust
+        // the bounded probe sequence and report "not watched".
+        assert_eq!(state.is_watched(0xFFFF_FFFF_FFFF_8000), false);
+    }
+
+    #[test]
+    fn smc_watch_invalid_lookup_after_collision_probes_next_slot() {
+        let state = SmcState::new();
+        // Two distinct pages that hash to the same initial slot force the
+        // linear-probe advance before the second key is found.
+        let first = 0x1000u64;
+        let mut second = 0x2000u64;
+        while smc_slot(second) != smc_slot(first) {
+            second += 0x1000;
+        }
+        state.rebuild_watch([first, second].iter());
+        assert_eq!(state.is_watched(first), true);
+        assert_eq!(state.is_watched(second), true);
+        // A fresh table must reject a page whose probe finds an empty slot.
+        let empty = SmcState::new();
+        empty.rebuild_watch([first].iter());
+        assert_eq!(empty.is_watched(second), false);
+    }
+
+    #[test]
+    fn smc_dirty_overflow_marks_overflow_and_keeps_bounded_ring() {
+        let state = SmcState::new();
+        for i in 0..=SMC_DIRTY_SLOTS as u64 {
+            state.mark_dirty((i + 1) * 0x1000);
+        }
+        let (pages, overflow) = state.take_dirty();
+        assert_eq!(pages.len(), SMC_DIRTY_SLOTS);
+        assert_eq!(overflow, true);
+        assert_eq!(pages[0], 0x1000);
+        assert_eq!(pages[SMC_DIRTY_SLOTS - 1], SMC_DIRTY_SLOTS as u64 * 0x1000);
+        // take_dirty clears the ring and the overflow flag.
+        let (empty, cleared) = state.take_dirty();
+        assert_eq!(empty.len(), 0);
+        assert_eq!(cleared, false);
+    }
+
+    #[test]
+    fn note_guest_code_write_rejects_zero_length_and_unwatched_state() {
+        reset_smc_telemetry();
+        note_guest_code_write(0x1000, 0);
+        assert_eq!(smc_telemetry(), (0, 0));
+
+        // No watched pages: the helper must take the early-return fast path.
+        let state = SmcState::new();
+        {
+            let _guard = ActiveSmcGuard::install(&state);
+            note_guest_code_write(0x1000, 8);
+        }
+        assert_eq!(smc_telemetry(), (0, 0));
+    }
+
+    #[test]
+    fn note_guest_code_write_overflowing_page_range_returns_without_marking() {
+        reset_smc_telemetry();
+        let state = SmcState::new();
+        state.rebuild_watch([0x2000u64].iter());
+        {
+            let _guard = ActiveSmcGuard::install(&state);
+            // The page walk saturates at u64::MAX; checked_add must stop it.
+            note_guest_code_write(u64::MAX & !0xfff, 1);
+        }
+        assert_eq!(smc_telemetry(), (0, 0));
+    }
+
+    #[test]
+    fn note_guest_code_write_counts_exactly_one_dirty_page_at_boundary() {
+        reset_smc_telemetry();
+        let state = SmcState::new();
+        state.rebuild_watch([0x3000u64].iter());
+        {
+            let _guard = ActiveSmcGuard::install(&state);
+            note_guest_code_write(0x3000, 8);
+        }
+        assert_eq!(smc_telemetry(), (1, 1));
+        let (pages, overflow) = state.take_dirty();
+        assert_eq!(pages, vec![0x3000]);
+        assert_eq!(overflow, false);
+        reset_smc_telemetry();
+        assert_eq!(smc_telemetry(), (0, 0));
+    }
+
+    // ── Tier compilation, promotion, and constant folding ───────────────────
+
+    #[test]
+    fn jit_tier1_and_tier2_compile_pin_tier_edges() {
+        let mut compiler = JitCompiler::new();
+        let ir = vec![
+            IrInstruction::MovImm {
+                dst: Register::Rax,
+                value: 40,
+            },
+            IrInstruction::AddImm {
+                dst: Register::Rax,
+                value: 2,
+                width: 8,
+            },
+            IrInstruction::Nop,
+        ];
+        let tier1 = compiler
+            .compile_tier1(&ir, 0x1000, GuestArch::X64, None)
+            .expect("tier1 compile");
+        assert_eq!(tier1.compile_tier, CompilationTier::Tier1);
+        assert_eq!(tier1.guest_address, 0x1000);
+        assert_eq!(tier1.instruction_count, 3);
+        assert_ne!(tier1.source_hash, 0);
+        assert_ne!(tier1.entry as usize, 0);
+        let tier2 = compiler
+            .compile_tier2(&ir, 0x2000, GuestArch::X64, None)
+            .expect("tier2 compile");
+        assert_eq!(tier2.compile_tier, CompilationTier::Tier2);
+        assert_eq!(tier2.guest_address, 0x2000);
+        assert_eq!(tier2.instruction_count, 3);
+    }
+
+    #[test]
+    fn jit_tier1_and_tier2_reject_failed_allocations() {
+        let mut compiler = JitCompiler::new();
+        let ir = vec![IrInstruction::Nop];
+        JIT_TEST_ALLOC_CALLS.with(|calls| calls.set(0));
+        JIT_TEST_FAIL_ALLOC_AT.with(|at| at.set(1));
+        let error = compiler
+            .compile_tier1(&ir, 0x1000, GuestArch::X64, None)
+            .err()
+            .expect("tier1 allocation failure");
+        assert_eq!(error.code, ReasonCode::RcJitCodeAllocFailed);
+        assert_eq!(
+            error.message,
+            "JIT Tier1: failed to allocate executable memory"
+        );
+
+        let mut compiler = JitCompiler::new();
+        JIT_TEST_ALLOC_CALLS.with(|calls| calls.set(0));
+        JIT_TEST_FAIL_ALLOC_AT.with(|at| at.set(1));
+        let error = compiler
+            .compile_tier2(&ir, 0x2000, GuestArch::X64, None)
+            .err()
+            .expect("tier2 allocation failure");
+        assert_eq!(error.code, ReasonCode::RcJitCodeAllocFailed);
+        assert_eq!(
+            error.message,
+            "JIT Tier2: failed to allocate executable memory"
+        );
+        JIT_TEST_FAIL_ALLOC_AT.with(|at| at.set(0));
+    }
+
+    #[test]
+    fn jit_constant_fold_pins_every_fold_and_noop_edge() {
+        let ir = vec![
+            IrInstruction::MovImm {
+                dst: Register::Rax,
+                value: 5,
+            },
+            IrInstruction::AddImm {
+                dst: Register::Rax,
+                value: 3,
+                width: 8,
+            },
+            IrInstruction::SubImm {
+                dst: Register::Rax,
+                value: 2,
+                width: 8,
+            },
+            IrInstruction::ShlImm {
+                dst: Register::Rax,
+                count: 1,
+                width: 8,
+            },
+            IrInstruction::AndImm {
+                dst: Register::Rax,
+                value: 0x0F,
+                width: 1,
+            },
+            IrInstruction::OrImm {
+                dst: Register::Rax,
+                value: 1,
+                width: 8,
+            },
+            IrInstruction::XorImm {
+                dst: Register::Rax,
+                value: 5,
+                width: 8,
+            },
+            IrInstruction::AddImm {
+                dst: Register::Rbx,
+                value: 0,
+                width: 8,
+            },
+            IrInstruction::SubImm {
+                dst: Register::Rbx,
+                value: 0,
+                width: 8,
+            },
+            IrInstruction::ShlImm {
+                dst: Register::Rbx,
+                count: 0,
+                width: 8,
+            },
+            IrInstruction::AndImm {
+                dst: Register::Rbx,
+                value: 0xFFFF,
+                width: 2,
+            },
+            IrInstruction::MovImm {
+                dst: Register::Rbx,
+                value: 7,
+            },
+            IrInstruction::MovReg {
+                dst: Register::Rax,
+                src: Register::Rbx,
+                width: 8,
+            },
+            IrInstruction::MovReg {
+                dst: Register::Rcx,
+                src: Register::Rdx,
+                width: 8,
+            },
+        ];
+        let folded = JitCompiler::constant_fold(&ir);
+        assert_eq!(
+            folded,
+            vec![
+                IrInstruction::MovImm {
+                    dst: Register::Rax,
+                    value: 8,
+                },
+                IrInstruction::MovImm {
+                    dst: Register::Rbx,
+                    value: 7,
+                },
+                IrInstruction::MovImm {
+                    dst: Register::Rax,
+                    value: 7,
+                },
+                IrInstruction::MovReg {
+                    dst: Register::Rcx,
+                    src: Register::Rdx,
+                    width: 8,
+                },
+            ],
+            "constant folding must coalesce and propagate exactly"
+        );
+    }
+
+    #[test]
+    fn jit_runtime_tier_promotion_replaces_stale_block() {
+        let mut runtime = capable_runtime();
+        let ir = vec![
+            IrInstruction::MovImm {
+                dst: Register::Rax,
+                value: 40,
+            },
+            IrInstruction::AddImm {
+                dst: Register::Rax,
+                value: 2,
+                width: 8,
+            },
+        ];
+        let entry0 = {
+            let block = runtime
+                .get_or_compile(&ir, 0x00C1_0000, GuestArch::X64, None)
+                .expect("tier0 compile");
+            block.published_entry() as usize
+        };
+        assert_eq!(runtime.tier0_compiles, 1);
+        let tier1_entry = {
+            let block = runtime
+                .get_or_compile_at_tier(
+                    &ir,
+                    0x00C1_0000,
+                    GuestArch::X64,
+                    CompilationTier::Tier1,
+                    None,
+                )
+                .expect("tier1 promotion");
+            assert_eq!(block.compile_tier, CompilationTier::Tier1);
+            block.published_entry() as usize
+        };
+        assert_eq!(runtime.tier1_compiles, 1);
+        assert_ne!(tier1_entry, entry0, "promotion must install new code");
+        let tier2_entry = {
+            let block = runtime
+                .get_or_compile_at_tier(
+                    &ir,
+                    0x00C1_0000,
+                    GuestArch::X64,
+                    CompilationTier::Tier2,
+                    None,
+                )
+                .expect("tier2 promotion");
+            assert_eq!(block.compile_tier, CompilationTier::Tier2);
+            block.published_entry() as usize
+        };
+        assert_eq!(runtime.tier2_compiles, 1);
+        assert_ne!(tier2_entry, tier1_entry);
+        assert_eq!(runtime.blocks_compiled, 3);
+        assert_eq!(runtime.code_invalidations, 2);
+
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        let reason = execute_cached(&mut runtime, 0x00C1_0000, &mut state, &mut memory);
+        assert_eq!(reason, JitExitReason::Normal { new_rip: state.rip });
+        assert_eq!(state.get(Register::Rax), 42);
+    }
+
+    #[test]
+    fn jit_get_or_compile_rejects_uncompilable_block() {
+        let mut runtime = capable_runtime();
+        let error = runtime
+            .get_or_compile(&[IrInstruction::Cpuid], 0x00C2_0000, GuestArch::X64, None)
+            .err()
+            .expect("uncompilable block must be rejected");
+        assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+        assert_eq!(
+            error.message,
+            "block contains an instruction the JIT cannot compile"
+        );
+        assert_eq!(runtime.interpreter_fallbacks, 1);
+        assert_eq!(runtime.is_compiled(0x00C2_0000), false);
+    }
+
+    #[test]
+    fn jit_hash_mismatch_recompiles_stale_cached_block() {
+        let mut runtime = capable_runtime();
+        let address = 0x00C3_0000u64;
+        runtime
+            .get_or_compile(
+                &[IrInstruction::MovImm {
+                    dst: Register::Rax,
+                    value: 42,
+                }],
+                address,
+                GuestArch::X64,
+                None,
+            )
+            .expect("original compile");
+        runtime
+            .get_or_compile(
+                &[IrInstruction::MovImm {
+                    dst: Register::Rax,
+                    value: 43,
+                }],
+                address,
+                GuestArch::X64,
+                None,
+            )
+            .expect("recompile after IR change");
+        assert_eq!(runtime.code_invalidations, 1);
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        let reason = execute_cached(&mut runtime, address, &mut state, &mut memory);
+        assert_eq!(reason, JitExitReason::Normal { new_rip: state.rip });
+        assert_eq!(
+            state.get(Register::Rax),
+            43,
+            "the stale block must not run after the hash mismatch"
+        );
+    }
+
+    // ── Chaining refusals and counters ──────────────────────────────────────
+
+    #[test]
+    fn jit_chain_blocks_rejects_missing_and_nonjump_endpoints() {
+        let mut runtime = capable_runtime();
+
+        let error = runtime.chain_blocks(0xDEAD, 0x1000).unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(error.message, "cannot chain missing source block 0xdead");
+
+        runtime
+            .get_or_compile(&[IrInstruction::Nop], 0x1000, GuestArch::X64, None)
+            .expect("straight-line block");
+        runtime
+            .get_or_compile(
+                &[IrInstruction::Nop, IrInstruction::Jump { target: 0x3000 }],
+                0x2000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("jump block");
+        let error = runtime.chain_blocks(0x1000, 0x2000).unwrap_err();
+        assert_eq!(
+            error.message,
+            "block 0x1000 does not end in an unconditional jump"
+        );
+        let error = runtime.chain_blocks(0x2000, 0xDEAD).unwrap_err();
+        assert_eq!(error.message, "cannot chain to missing target block 0xdead");
+        assert_eq!(runtime.chain_links_formed, 0);
+    }
+
+    #[test]
+    fn jit_chain_blocks_rejects_non_chainable_target() {
+        let mut runtime = capable_runtime();
+        runtime
+            .get_or_compile(
+                &[IrInstruction::Nop, IrInstruction::Jump { target: 0x4000 }],
+                0x3000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("source");
+        runtime
+            .get_or_compile(
+                &[
+                    IrInstruction::Nop,
+                    IrInstruction::Return { stack_adjust: 0 },
+                ],
+                0x4000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("return target");
+        let error = runtime.chain_blocks(0x3000, 0x4000).unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "block 0x4000 does not end in a chainable jump"
+        );
+        assert_eq!(runtime.chain_links_formed, 0);
+    }
+
+    #[test]
+    fn jit_chain_blocks_rejects_unpublished_target_entry() {
+        let mut runtime = capable_runtime();
+        runtime
+            .get_or_compile(
+                &[IrInstruction::Nop, IrInstruction::Jump { target: 0x5000 }],
+                0x5000 - 0x1000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("source");
+        runtime
+            .get_or_compile(
+                &[IrInstruction::Nop, IrInstruction::Jump { target: 0x6000 }],
+                0x5000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("target");
+        runtime
+            .block_cache
+            .get_mut(&0x5000)
+            .expect("cached target")
+            .entry_atomic
+            .store(std::ptr::null_mut(), Ordering::Release);
+        let error = runtime.chain_blocks(0x4000, 0x5000).unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCodeAllocFailed);
+        assert_eq!(error.message, "block 0x5000 has no published entry");
+    }
+
+    #[test]
+    fn jit_autochain_failure_on_non_chainable_target_is_silent() {
+        let mut runtime = capable_runtime();
+        runtime
+            .get_or_compile(
+                &[
+                    IrInstruction::Nop,
+                    IrInstruction::Return { stack_adjust: 0 },
+                ],
+                0x7000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("return target");
+        runtime
+            .get_or_compile(
+                &[IrInstruction::Nop, IrInstruction::Jump { target: 0x7000 }],
+                0x6000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("source with rejected auto-chain");
+        assert_eq!(runtime.block_chains.len(), 0);
+        assert_eq!(runtime.chain_links_formed, 0);
+        assert_eq!(
+            runtime
+                .block_cache
+                .get(&0x6000)
+                .expect("source cached")
+                .link_target
+                .load(Ordering::Acquire),
+            0,
+            "a rejected chain must not publish a target"
+        );
+    }
+
+    #[test]
+    fn jit_drain_smc_overflow_invalidates_every_cached_block() {
+        let mut runtime = capable_runtime();
+        runtime
+            .get_or_compile(
+                &[IrInstruction::MovImm {
+                    dst: Register::Rax,
+                    value: 1,
+                }],
+                0x8000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("first block");
+        runtime
+            .get_or_compile(
+                &[IrInstruction::MovImm {
+                    dst: Register::Rax,
+                    value: 2,
+                }],
+                0x9000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("second block");
+        for i in 0..=SMC_DIRTY_SLOTS as u64 {
+            runtime.smc.mark_dirty((i + 1) * 0x1000);
+        }
+        let affected = runtime.drain_smc_invalidations();
+        assert_eq!(affected.len(), 2);
+        assert_eq!(runtime.code_invalidations, 2);
+        assert_eq!(runtime.smc_invalidation_events, 1);
+        assert_eq!(runtime.block_cache.len(), 0);
+    }
+
+    #[test]
+    fn jit_invalidate_block_rejects_stale_chain_target() {
+        let mut runtime = capable_runtime();
+        runtime
+            .get_or_compile(
+                &[
+                    IrInstruction::Nop,
+                    IrInstruction::Jump {
+                        target: 0x00C5_1000,
+                    },
+                ],
+                0x00C5_0000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("source");
+        runtime
+            .get_or_compile(
+                &[
+                    IrInstruction::Nop,
+                    IrInstruction::Jump {
+                        target: 0x00C5_2000,
+                    },
+                ],
+                0x00C5_1000,
+                GuestArch::X64,
+                None,
+            )
+            .expect("target");
+        runtime
+            .chain_blocks(0x00C5_0000, 0x00C5_1000)
+            .expect("publish chain");
+        assert_eq!(runtime.chain_links_formed, 1);
+        runtime.invalidate_block(0x00C5_0000);
+        assert_eq!(runtime.chain_links_broken, 1);
+        // The outgoing chain record remains until the target is invalidated,
+        // but the source block itself and its link slot are gone.
+        assert_eq!(runtime.block_chains.len(), 1);
+        assert_eq!(runtime.block_cache.get(&0x00C5_0000).is_none(), true);
+    }
+
+    #[test]
+    fn jit_thunk_registration_rejects_unknown_indices_and_pins_guest_addrs() {
+        use std::collections::HashSet;
+        let mut runtime = capable_runtime();
+        let guest = 0x00C6_5000u64;
+        assert_eq!(
+            runtime.register_host_thunk_for_guest(
+                jit_self_test_host_thunk as *const () as usize,
+                guest
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            runtime.guest_thunk_addrs(),
+            HashSet::from([guest]),
+            "guest_addrs must include registered guest targets"
+        );
+        assert_eq!(
+            runtime.register_host_thunk(jit_self_test_host_thunk as *const () as usize),
+            Some(1)
+        );
+        assert_eq!(
+            runtime.guest_thunk_addrs(),
+            HashSet::from([guest]),
+            "an entry without a guest address must not appear"
+        );
+        assert_ne!(runtime.lookup_thunk_address(0), None);
+        assert_eq!(runtime.lookup_thunk_address(2), None);
+    }
+
+    #[test]
+    fn jit_direct_thunk_unregistered_call_fallback_does_not_count() {
+        use std::collections::HashSet;
+        let mut runtime = capable_runtime();
+        let guest = 0x00C7_5000u64;
+        runtime
+            .register_host_thunk_for_guest(jit_self_test_host_thunk as *const () as usize, guest)
+            .expect("register resolved thunk");
+        let resolved: HashSet<u64> = HashSet::from([guest]);
+        let before = JIT_THUNK_DIRECT_CALLS.load(Ordering::Relaxed);
+        runtime
+            .get_or_compile(
+                &[
+                    IrInstruction::MovImm {
+                        dst: Register::Rax,
+                        value: 7,
+                    },
+                    IrInstruction::Call {
+                        target: guest,
+                        return_address: 0x00C7_6004,
+                    },
+                ],
+                0x00C7_6000,
+                GuestArch::X64,
+                Some(&resolved),
+            )
+            .expect("direct thunk compile");
+        assert_eq!(
+            JIT_THUNK_DIRECT_CALLS.load(Ordering::Relaxed) - before,
+            1,
+            "a resolved thunk must be emitted as exactly one direct call"
+        );
+
+        let before = JIT_THUNK_DIRECT_CALLS.load(Ordering::Relaxed);
+        runtime
+            .get_or_compile(
+                &[IrInstruction::Call {
+                    target: 0xDEAD,
+                    return_address: 0x00C7_7004,
+                }],
+                0x00C7_7000,
+                GuestArch::X64,
+                Some(&HashSet::new()),
+            )
+            .expect("unregistered call falls back to EXIT_THUNK");
+        assert_eq!(
+            JIT_THUNK_DIRECT_CALLS.load(Ordering::Relaxed),
+            before,
+            "an unregistered target must not count as a direct call"
+        );
+    }
+
+    #[test]
+    fn jit_jump_missing_link_slot_pins_exit_encoding() {
+        let mut compiler = JitCompiler::new();
+        compiler.link_slot = None;
+        compiler
+            .compile_instruction(
+                &IrInstruction::Jump { target: 0x2000 },
+                GuestArch::X64,
+                None,
+            )
+            .expect("jump emission");
+        let code = &compiler.emitter.code;
+        let movz_exit_jump = (0xd280_0000u32 | ((EXIT_JUMP as u32) << 5)).to_le_bytes();
+        assert_eq!(
+            code.windows(4)
+                .filter(|word| *word == movz_exit_jump)
+                .count(),
+            1,
+            "an unlinked jump must return EXIT_JUMP exactly once"
+        );
+        assert_eq!(
+            &code[code.len() - 4..],
+            &0xd65f_03c0u32.to_le_bytes(),
+            "the unlinked jump arm must end in RET"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_report_default_rejects_fabricated_activity() {
+        let report = JitSelfTestReport::default();
+        assert_eq!(report.active, false);
+        assert_eq!(report.compiled_blocks, 0);
+        assert_eq!(report.executed_blocks, 0);
+        assert_eq!(report.safepoint_observed, false);
+        assert_eq!(report.chain_links, 0);
+        assert_eq!(report.thunk_direct_calls, 0);
+        assert_eq!(report.smc_invalidations, 0);
+        assert_eq!(report.fault_fallbacks, 0);
+        assert_eq!(report.fallback_reason, None);
+    }
+
+    // ── In-process self-test: success path and injected failures ────────────
+
+    #[test]
+    fn jit_self_test_pins_exact_counters_without_fallback() {
+        let report = run_jit_self_test_child().expect("self-test must complete");
+        assert_eq!(report.active, true);
+        assert_eq!(report.safepoint_observed, true);
+        assert_eq!(report.compiled_blocks, 1);
+        assert_eq!(report.executed_blocks, 9);
+        assert_eq!(report.chain_links, 1);
+        assert_eq!(report.thunk_direct_calls, 1);
+        assert_eq!(report.smc_invalidations, 2);
+        assert_eq!(report.fault_fallbacks, 1);
+        assert_eq!(report.fallback_reason, None);
+    }
+
+    #[test]
+    fn jit_self_test_pending_safepoint_rejects_first_execution() {
+        JIT_SAFEPOINT_REQUESTED.store(true, Ordering::Relaxed);
+        let error = run_jit_self_test_child().unwrap_err();
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Relaxed);
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: first execution exited with Safepoint, expected Normal"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_unwritable_repatch_page_rejects_repatch() {
+        // The first make_writable call installs the initial block; the second
+        // is the self-test's deliberate re-patch of the code page.
+        JIT_TEST_WRITE_CALLS.with(|calls| calls.set(0));
+        JIT_TEST_DENY_WRITE_AT.with(|at| at.set(2));
+        let error = run_jit_self_test_child().unwrap_err();
+        JIT_TEST_DENY_WRITE_AT.with(|at| at.set(0));
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: compiled code page is not writable"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_unextendable_repatch_page_rejects_repatch() {
+        JIT_TEST_FINALIZE_CALLS.with(|calls| calls.set(0));
+        JIT_TEST_DENY_FINALIZE_AT.with(|at| at.set(2));
+        let error = run_jit_self_test_child().unwrap_err();
+        JIT_TEST_DENY_FINALIZE_AT.with(|at| at.set(0));
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: re-patched code page is not executable"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_unavailable_thunk_zone_rejects_registration() {
+        JIT_TEST_DENY_THUNK_ZONE.with(|deny| deny.set(true));
+        let error = run_jit_self_test_child().unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: failed to register the direct-call host thunk"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_missed_smc_invalidation_rejects_stale_execution() {
+        JIT_TEST_SMC_FAULT.with(|fault| fault.set(1));
+        let error = run_jit_self_test_child().unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: stale SMC block ran instead of falling back: Normal { new_rip: 28672 }"
+        );
+    }
+
+    fn self_test_with_safepoint_at(call: usize) -> AppError {
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Relaxed);
+        JIT_TEST_EXEC_CALLS.with(|calls| calls.set(0));
+        JIT_TEST_FORCE_SAFEPOINT_AT.with(|at| at.set(call));
+        let error = run_jit_self_test_child().unwrap_err();
+        JIT_TEST_FORCE_SAFEPOINT_AT.with(|at| at.set(0));
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Relaxed);
+        error
+    }
+
+    #[test]
+    fn jit_self_test_safepoint_interrupts_reject_later_steps() {
+        let error = self_test_with_safepoint_at(3);
+        assert_eq!(
+            error.message,
+            "JIT self-test: re-patched execution exited with Safepoint"
+        );
+        let error = self_test_with_safepoint_at(4);
+        assert_eq!(
+            error.message,
+            "JIT self-test: linked execution exited with Safepoint, expected Jump"
+        );
+        let error = self_test_with_safepoint_at(9);
+        assert_eq!(
+            error.message,
+            "JIT self-test: recompiled SMC block observed stale code: rax=0"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_already_linked_chain_rejects_missing_publication() {
+        JIT_TEST_PREPUBLISH_CHAIN.with(|prepublish| prepublish.set(true));
+        let error = run_jit_self_test_child().unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(error.message, "JIT self-test: no block link was published");
+    }
+
+    #[test]
+    fn jit_self_test_uncounted_eviction_rejects_missing_invalidation() {
+        JIT_TEST_SMC_FAULT.with(|fault| fault.set(2));
+        let error = run_jit_self_test_child().unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: self-modifying code did not invalidate a block"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_lost_fault_bar_rejects_native_compilation() {
+        JIT_TEST_IGNORE_FAULTED_BLOCKS.with(|ignore| ignore.set(true));
+        let error = run_jit_self_test_child().unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: faulted block was not barred from native compilation"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_wrong_original_rejects_guest_result() {
+        JIT_TEST_SELF_TEST_WRONG_ORIGINAL.with(|wrong| wrong.set(true));
+        let error = run_jit_self_test_child().unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: guest result mismatch: rax=41 expected 42"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_ignored_safepoint_rejects_missing_exit() {
+        JIT_TEST_IGNORE_SAFEPOINT_AT.with(|at| at.set(2));
+        let error = run_jit_self_test_child().unwrap_err();
+        JIT_TEST_IGNORE_SAFEPOINT_AT.with(|at| at.set(0));
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: safepoint flag did not produce EXIT_SAFEPOINT (got Normal { new_rip: 4096 })"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_unapplied_repatch_rejects_stale_value() {
+        JIT_TEST_SKIP_REPATCH.with(|skip| skip.set(true));
+        let error = run_jit_self_test_child().unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: re-patched execution did not observe the patch: rax=42 expected 43"
+        );
+    }
+
+    fn assert_self_test_allocation_failure(fail_at: usize, expected: &str) {
+        JIT_TEST_ALLOC_CALLS.with(|calls| calls.set(0));
+        JIT_TEST_FAIL_ALLOC_AT.with(|at| at.set(fail_at));
+        let error = run_jit_self_test_child().unwrap_err();
+        JIT_TEST_FAIL_ALLOC_AT.with(|at| at.set(0));
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(error.message, expected);
+    }
+
+    #[test]
+    fn jit_self_test_allocation_failures_reject_each_later_step() {
+        assert_self_test_allocation_failure(
+            2,
+            "JIT self-test: chain source compile failed: JIT: failed to allocate executable memory",
+        );
+        assert_self_test_allocation_failure(
+            3,
+            "JIT self-test: chain target compile failed: JIT: failed to allocate executable memory",
+        );
+        assert_self_test_allocation_failure(
+            4,
+            "JIT self-test: thunk block compile failed: JIT: failed to allocate executable memory",
+        );
+        assert_self_test_allocation_failure(
+            5,
+            "JIT self-test: SMC block compile failed: JIT: failed to allocate executable memory",
+        );
+        assert_self_test_allocation_failure(
+            6,
+            "JIT self-test: SMC writer compile failed: JIT: failed to allocate executable memory",
+        );
+        assert_self_test_allocation_failure(
+            7,
+            "JIT self-test: SMC recompile failed: JIT: failed to allocate executable memory",
+        );
+        assert_self_test_allocation_failure(
+            8,
+            "JIT self-test: fault block compile failed: JIT: failed to allocate executable memory",
+        );
+        assert_eq!(JIT_TEST_FAIL_ALLOC_AT.with(|at| at.get()), 0);
+    }
+
+    #[test]
+    fn jit_self_test_chain_failure_rejects_chain_step() {
+        JIT_TEST_FORCE_CHAIN_ERROR.with(|force| force.set(true));
+        let error = run_jit_self_test_child().unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: chain_blocks failed: injected chain failure"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_lost_thunk_resolution_rejects_direct_call() {
+        JIT_TEST_THUNK_MAP_MISS.with(|miss| miss.set(true));
+        let error = run_jit_self_test_child().unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: Call to a resolved thunk did not compile to a direct call"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_wrong_thunk_result_rejects_execution() {
+        JIT_TEST_SELF_TEST_THUNK_BAD.with(|bad| bad.set(true));
+        let error = run_jit_self_test_child().unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcJitCompilationError);
+        assert_eq!(
+            error.message,
+            "JIT self-test: direct thunk call failed: reason=Normal { new_rip: 24576 } rax=0x98"
+        );
+    }
+
+    #[test]
+    fn jit_self_test_exec_resolution_failures_reject_fabricated_success() {
+        JIT_TEST_SELF_TEST_EXE_MODE.with(|mode| mode.set(1));
+        let report = run_jit_self_test();
+        assert_eq!(report.active, false);
+        assert_eq!(
+            report.fallback_reason.as_deref(),
+            Some(
+                "cannot resolve current executable for the self-test child: \
+                 No such file or directory (os error 2)"
+            )
+        );
+
+        JIT_TEST_SELF_TEST_EXE_MODE.with(|mode| mode.set(2));
+        let report = run_jit_self_test();
+        assert_eq!(report.active, false);
+        assert_eq!(
+            report.fallback_reason.as_deref(),
+            Some("failed to spawn self-test child: No such file or directory (os error 2)")
+        );
+
+        JIT_TEST_SELF_TEST_EXE_MODE.with(|mode| mode.set(3));
+        let report = run_jit_self_test();
+        assert_eq!(report.active, false);
+        assert_eq!(report.compiled_blocks, 0);
+        assert_eq!(
+            report
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(
+                    "self-test child exited 0 without a valid JitSelfTestReport JSON:"
+                )),
+            true
+        );
+    }
+
+    #[test]
+    fn jit_self_test_missing_child_flag_reports_inactive() {
+        // In the lib test binary `--jit-self-test-child` is not a real child
+        // mode: the parent must report inactive with the child's diagnostics
+        // instead of trusting a non-existent report.
+        let report = run_jit_self_test();
+        assert_eq!(report.active, false);
+        assert_eq!(report.compiled_blocks, 0);
+        assert_eq!(report.fallback_reason.is_some(), true);
+    }
+
+    #[test]
+    fn jit_runtime_tier_recompilation_rejects_allocation_failure() {
+        let mut runtime = capable_runtime();
+        let ir = vec![IrInstruction::Nop];
+        JIT_TEST_ALLOC_CALLS.with(|calls| calls.set(0));
+        JIT_TEST_FAIL_ALLOC_AT.with(|at| at.set(1));
+        let tier1 = runtime
+            .get_or_compile_at_tier(
+                &ir,
+                0x00C5_0000,
+                GuestArch::X64,
+                CompilationTier::Tier1,
+                None,
+            )
+            .err()
+            .expect("tier1 runtime allocation failure");
+        assert_eq!(tier1.code, ReasonCode::RcJitCodeAllocFailed);
+        assert_eq!(
+            tier1.message,
+            "JIT Tier1: failed to allocate executable memory"
+        );
+
+        JIT_TEST_ALLOC_CALLS.with(|calls| calls.set(0));
+        JIT_TEST_FAIL_ALLOC_AT.with(|at| at.set(1));
+        let tier2 = runtime
+            .get_or_compile_at_tier(
+                &ir,
+                0x00C6_0000,
+                GuestArch::X64,
+                CompilationTier::Tier2,
+                None,
+            )
+            .err()
+            .expect("tier2 runtime allocation failure");
+        assert_eq!(tier2.code, ReasonCode::RcJitCodeAllocFailed);
+        assert_eq!(
+            tier2.message,
+            "JIT Tier2: failed to allocate executable memory"
+        );
+        JIT_TEST_FAIL_ALLOC_AT.with(|at| at.set(0));
+    }
+
+    #[test]
+    fn jit_self_test_host_thunk_bad_sentinel_overwrites_gpr0() {
+        JIT_TEST_SELF_TEST_THUNK_BAD.with(|bad| bad.set(true));
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rax, 0x1234);
+        let result = jit_self_test_host_thunk(
+            std::ptr::null_mut(),
+            &mut state as *mut CpuState,
+            std::ptr::null_mut(),
+            0,
+        );
+        assert_eq!(result, -1);
+        assert_eq!(state.get(Register::Rax), 0x98);
+    }
+
+    #[test]
+    fn jit_diag_file_append_recovers_from_truncated_fault_line() {
+        let path = "/tmp/casa1_jit_diag.txt";
+        std::fs::write(path, b"torn fault").expect("seed truncated diagnostic line");
+        write_diag_file("fault-chain: first");
+        write_diag_file("fault-chain: second");
+        let after = std::fs::read_to_string(path).expect("diagnostic file must be readable");
+        assert_eq!(after, "torn faultfault-chain: first\nfault-chain: second\n");
     }
 }

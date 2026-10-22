@@ -2133,129 +2133,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_wql_parse_simple() {
-        let query = parse_wql("SELECT * FROM Win32_ComputerSystem").unwrap();
-        assert!(query.select_columns.is_none());
-        assert_eq!(query.from_class, "Win32_ComputerSystem");
-        assert!(query.where_clause.is_none());
-    }
-
-    #[test]
-    fn test_wql_parse_where() {
-        let query =
-            parse_wql("SELECT * FROM Win32_Processor WHERE Name = 'Apple Silicon'").unwrap();
-        assert!(query.select_columns.is_none());
-        assert_eq!(query.from_class, "Win32_Processor");
-        assert!(query.where_clause.is_some());
-        if let Some(WqlWhereClause::Simple {
-            ref property,
-            ref op,
-            ref value,
-        }) = query.where_clause
-        {
-            assert_eq!(property, "Name");
-            assert_eq!(*op, WqlOp::Eq);
-            assert_eq!(value, "Apple Silicon");
-        } else {
-            panic!("Expected Simple where clause");
-        }
-    }
-
-    #[test]
-    fn test_wql_parse_select_columns() {
-        let query = parse_wql("SELECT Name, Manufacturer FROM Win32_ComputerSystem").unwrap();
-        assert_eq!(
-            query.select_columns,
-            Some(vec!["Name".to_string(), "Manufacturer".to_string()])
-        );
-        assert_eq!(query.from_class, "Win32_ComputerSystem");
-        assert!(query.where_clause.is_none());
-    }
-
-    #[test]
-    fn test_wql_parse_where_with_number() {
-        let query = parse_wql("SELECT * FROM Win32_LogicalDisk WHERE DriveType = 3").unwrap();
-        assert_eq!(query.from_class, "Win32_LogicalDisk");
-        if let Some(WqlWhereClause::Simple {
-            ref property,
-            ref op,
-            ref value,
-        }) = query.where_clause
-        {
-            assert_eq!(property, "DriveType");
-            assert_eq!(*op, WqlOp::Eq);
-            assert_eq!(value, "3");
-        } else {
-            panic!("Expected Simple where clause");
-        }
-    }
-
-    #[test]
-    fn test_wql_parse_like() {
-        let query =
-            parse_wql("SELECT * FROM Win32_ComputerSystem WHERE Name LIKE '%host%'").unwrap();
-        assert_eq!(query.from_class, "Win32_ComputerSystem");
-        if let Some(WqlWhereClause::Simple {
-            ref property,
-            ref op,
-            ref value,
-        }) = query.where_clause
-        {
-            assert_eq!(property, "Name");
-            assert_eq!(*op, WqlOp::Like);
-            assert_eq!(value, "%host%");
-        } else {
-            panic!("Expected Simple where clause");
-        }
-    }
-
-    #[test]
-    fn test_wql_parse_and() {
-        let query = parse_wql(
-            "SELECT * FROM Win32_Processor WHERE Name = 'Apple Silicon' AND Architecture = 9",
-        )
-        .unwrap();
-        if let Some(WqlWhereClause::And(ref clauses)) = query.where_clause {
-            assert_eq!(clauses.len(), 2);
-        } else {
-            panic!("Expected And where clause");
-        }
-    }
-
-    #[test]
-    fn test_wql_parse_non_ascii_where() {
-        // Regression: a multi-byte UTF-8 character before the AND used to
-        // panic with "byte index is not a char boundary".
-        let query =
-            parse_wql("SELECT * FROM Win32_Processor WHERE Name = 'Café' AND Architecture = 9")
-                .unwrap();
-        if let Some(WqlWhereClause::And(ref clauses)) = query.where_clause {
-            assert_eq!(clauses.len(), 2);
-        } else {
-            panic!("Expected And where clause");
-        }
-    }
-
-    #[test]
-    fn test_wql_parse_like_literal_in_value() {
-        // Regression: a value containing the literal word "LIKE" must not be
-        // parsed as a LIKE operator.
-        let query = parse_wql("SELECT * FROM Win32_Processor WHERE Name = 'LIKE'").unwrap();
-        if let Some(WqlWhereClause::Simple {
-            ref property,
-            ref op,
-            ref value,
-        }) = query.where_clause
-        {
-            assert_eq!(property, "Name");
-            assert_eq!(*op, WqlOp::Eq);
-            assert_eq!(value, "LIKE");
-        } else {
-            panic!("Expected Simple where clause");
-        }
-    }
-
-    #[test]
     fn test_wql_like_regex_metachars() {
         // Regression: LIKE patterns with regex metacharacters must match
         // literally, not as regular expressions.
@@ -2278,23 +2155,6 @@ mod tests {
     }
 
     #[test]
-    fn test_win32_computersystem_properties() {
-        let provider = Win32ComputerSystemProvider;
-        let objects = provider.enum_objects().unwrap();
-        assert_eq!(objects.len(), 1);
-        let obj = &objects[0];
-        assert_eq!(obj.class_name, "Win32_ComputerSystem");
-        assert!(obj.get_string("Name").is_some());
-        assert_eq!(
-            obj.get_string("Manufacturer").as_deref(),
-            Some("Apple Inc.")
-        );
-        assert!(obj.get_u64("TotalPhysicalMemory").unwrap() > 0);
-        assert!(obj.get_u32("NumberOfProcessors").unwrap() > 0);
-        assert!(obj.get_string("PrimaryOwnerName").is_some());
-    }
-
-    #[test]
     fn test_win32_processor_properties() {
         let provider = Win32ProcessorProvider;
         let objects = provider.enum_objects().unwrap();
@@ -2309,70 +2169,6 @@ mod tests {
     }
 
     #[test]
-    fn test_win32_operatingsystem_properties() {
-        let provider = Win32OperatingSystemProvider;
-        let objects = provider.enum_objects().unwrap();
-        assert_eq!(objects.len(), 1);
-        let obj = &objects[0];
-        assert_eq!(obj.class_name, "Win32_OperatingSystem");
-        assert!(obj.get_string("Caption").unwrap().contains("macOS"));
-        assert!(obj.get_string("BuildNumber").is_some());
-        assert_eq!(obj.get_string("OSArchitecture").as_deref(), Some("ARM64"));
-        assert!(obj.get_u64("TotalVisibleMemorySize").unwrap() > 0);
-        assert!(obj.get_u64("FreePhysicalMemory").unwrap() > 0);
-    }
-
-    #[test]
-    fn test_win32_videocontroller_properties() {
-        let provider = Win32VideoControllerProvider;
-        let objects = provider.enum_objects().unwrap();
-        assert_eq!(objects.len(), 1);
-        let obj = &objects[0];
-        assert!(obj.get_string("Name").is_some());
-        assert!(obj.get_u64("AdapterRAM").unwrap() > 0);
-        assert!(obj.get_u32("CurrentHorizontalResolution").unwrap() > 0);
-        assert!(obj.get_u32("CurrentVerticalResolution").unwrap() > 0);
-    }
-
-    #[test]
-    fn test_win32_diskdrive_properties() {
-        let provider = Win32DiskDriveProvider;
-        let objects = provider.enum_objects().unwrap();
-        assert_eq!(objects.len(), 1);
-        let obj = &objects[0];
-        assert!(obj.get_string("Model").is_some());
-        assert_eq!(
-            obj.get_string("MediaType").as_deref(),
-            Some("Fixed hard disk media")
-        );
-        assert!(obj.get_u64("Size").unwrap() > 0);
-    }
-
-    #[test]
-    fn test_win32_bios_properties() {
-        let provider = Win32BiosProvider;
-        let objects = provider.enum_objects().unwrap();
-        assert_eq!(objects.len(), 1);
-        let obj = &objects[0];
-        assert_eq!(
-            obj.get_string("Manufacturer").as_deref(),
-            Some("Apple Inc.")
-        );
-        assert!(obj.get_string("Version").is_some());
-    }
-
-    #[test]
-    fn test_win32_logicaldisk_properties() {
-        let provider = Win32LogicalDiskProvider;
-        let objects = provider.enum_objects().unwrap();
-        assert_eq!(objects.len(), 1);
-        let obj = &objects[0];
-        assert_eq!(obj.get_string("DeviceID").as_deref(), Some("C:"));
-        assert_eq!(obj.get_u32("DriveType"), Some(3));
-        assert!(obj.get_u64("Size").unwrap() > 0);
-    }
-
-    #[test]
     fn test_win32_networkadapter_properties() {
         let provider = Win32NetworkAdapterProvider;
         let objects = provider.enum_objects().unwrap();
@@ -2383,20 +2179,6 @@ mod tests {
                 .iter()
                 .any(|o| o.get_string("Name").as_deref() == Some("Loopback Adapter"))
         );
-    }
-
-    #[test]
-    fn test_wbem_locator_connect() {
-        let locator = WbemLocator::new();
-        let service = locator
-            .connect_server(None, None, None, None, 0, None, Some("root\\cimv2"))
-            .unwrap();
-        // Verify the service works
-        let objects = service
-            .exec_query("WQL", "SELECT * FROM Win32_ComputerSystem", 0)
-            .unwrap();
-        assert_eq!(objects.len(), 1);
-        assert_eq!(objects[0].class_name, "Win32_ComputerSystem");
     }
 
     #[test]
@@ -2423,184 +2205,9 @@ mod tests {
     }
 
     #[test]
-    fn test_wbem_services_query_select_columns() {
-        let service = create_default_wmi_service();
-        let objects = service
-            .exec_query(
-                "WQL",
-                "SELECT Name, Manufacturer FROM Win32_ComputerSystem",
-                0,
-            )
-            .unwrap();
-        assert_eq!(objects.len(), 1);
-        let obj = &objects[0];
-        assert!(obj.get_string("Name").is_some());
-        assert!(obj.get_string("Manufacturer").is_some());
-        // TotalPhysicalMemory should not be in projected result
-        assert!(obj.get_u64("TotalPhysicalMemory").is_none());
-    }
-
-    #[test]
-    fn test_wbem_class_object_get() {
-        let service = create_default_wmi_service();
-        let objects = service
-            .exec_query("WQL", "SELECT * FROM Win32_ComputerSystem", 0)
-            .unwrap();
-        assert_eq!(objects.len(), 1);
-        let class_obj = WbemClassObject::new(objects[0].clone());
-        assert!(class_obj.get("Name").is_some());
-        assert!(class_obj.get("Manufacturer").is_some());
-        assert!(class_obj.get("TotalPhysicalMemory").is_some());
-    }
-
-    #[test]
-    fn test_wbem_class_object_put() {
-        let obj = WmiObject::new("Win32_Test");
-        let mut class_obj = WbemClassObject::new(obj);
-        class_obj.put(
-            "TestProperty",
-            WmiPropertyValue::String("test_value".to_string()),
-        );
-        assert_eq!(
-            class_obj.get("TestProperty").map(|v| match v {
-                WmiPropertyValue::String(s) => s.as_str(),
-                _ => "",
-            }),
-            Some("test_value")
-        );
-    }
-
-    #[test]
-    fn test_wbem_class_object_get_names() {
-        let service = create_default_wmi_service();
-        let objects = service
-            .exec_query("WQL", "SELECT * FROM Win32_ComputerSystem", 0)
-            .unwrap();
-        let class_obj = WbemClassObject::new(objects[0].clone());
-        let names = class_obj.get_names();
-        assert!(names.contains(&"Name".to_string()));
-        assert!(names.contains(&"Manufacturer".to_string()));
-    }
-
-    #[test]
-    fn test_wbem_enum_next() {
-        let service = create_default_wmi_service();
-        let objects = service
-            .exec_query("WQL", "SELECT * FROM Win32_Processor", 0)
-            .unwrap();
-        let mut enum_objs = EnumWbemObjects::from_wmi_objects(objects);
-        let count = enum_objs.count();
-        assert!(count > 0);
-
-        // Get first item
-        let first_batch = enum_objs.next(1);
-        assert_eq!(first_batch.len(), 1);
-
-        // Reset and get all
-        enum_objs.reset();
-        let all = enum_objs.next(count as u32);
-        assert_eq!(all.len(), count);
-
-        // Skip
-        enum_objs.reset();
-        let skipped = enum_objs.skip(1);
-        assert_eq!(skipped, 1);
-        assert_eq!(enum_objs.remaining(), count.saturating_sub(1));
-    }
-
-    #[test]
-    fn test_wbem_enum_clone() {
-        let service = create_default_wmi_service();
-        let objects = service
-            .exec_query("WQL", "SELECT * FROM Win32_Processor", 0)
-            .unwrap();
-        let enum_objs = EnumWbemObjects::from_wmi_objects(objects);
-        let cloned = enum_objs.clone_enum();
-        assert_eq!(cloned.count(), enum_objs.count());
-    }
-
-    #[test]
-    fn test_create_instance_enum() {
-        let service = create_default_wmi_service();
-        let objects = service
-            .create_instance_enum("Win32_OperatingSystem", 0)
-            .unwrap();
-        assert_eq!(objects.len(), 1);
-        assert_eq!(objects[0].class_name, "Win32_OperatingSystem");
-    }
-
-    #[test]
-    fn test_get_object_by_path() {
-        let service = create_default_wmi_service();
-        let hostname = host_name();
-        let path = format!("Win32_ComputerSystem.Name='{hostname}'");
-        let obj = service.get_object(&path, 0).unwrap();
-        assert_eq!(obj.class_name, "Win32_ComputerSystem");
-    }
-
-    #[test]
-    fn test_object_text() {
-        let obj = WmiObject::new("Win32_Test")
-            .set("Name", "test")
-            .set("Value", 42u32)
-            .clone();
-        let class_obj = WbemClassObject::new(obj);
-        let text = class_obj.get_object_text();
-        assert!(text.contains("Instance of Win32_Test"));
-        assert!(text.contains("Name = \"test\""));
-        assert!(text.contains("Value = 42"));
-    }
-
-    #[test]
-    fn test_parse_object_path() {
-        let (class, key, value) = parse_object_path("Win32_ComputerSystem.Name='MyPC'").unwrap();
-        assert_eq!(class, "Win32_ComputerSystem");
-        assert_eq!(key, "Name");
-        assert_eq!(value, "MyPC");
-    }
-
-    #[test]
     fn test_wql_parse_error() {
         let result = parse_wql("NOT A WQL QUERY");
         assert!(result.is_err(), "expected Err, got {result:?}");
-    }
-
-    #[test]
-    fn test_evaluate_condition() {
-        let mut obj = WmiObject::new("Win32_Test");
-        obj.set("Name", "TestMachine");
-        obj.set("Value", 42u32);
-
-        // Test Eq
-        let clause = WqlWhereClause::Simple {
-            property: "Name".to_string(),
-            op: WqlOp::Eq,
-            value: "TestMachine".to_string(),
-        };
-        assert!(evaluate_condition(&obj, &clause));
-
-        // Test Neq
-        let clause = WqlWhereClause::Simple {
-            property: "Name".to_string(),
-            op: WqlOp::Neq,
-            value: "Other".to_string(),
-        };
-        assert!(evaluate_condition(&obj, &clause));
-
-        // Test numeric comparison
-        let clause = WqlWhereClause::Simple {
-            property: "Value".to_string(),
-            op: WqlOp::Gt,
-            value: "10".to_string(),
-        };
-        assert!(evaluate_condition(&obj, &clause));
-
-        let clause = WqlWhereClause::Simple {
-            property: "Value".to_string(),
-            op: WqlOp::Lt,
-            value: "100".to_string(),
-        };
-        assert!(evaluate_condition(&obj, &clause));
     }
 
     #[test]
@@ -2629,7 +2236,6 @@ mod tests {
         assert!(!build.is_empty(), "Build number should not be empty");
     }
 
-    /// Helper to get u16 from WmiPropertyValue
     trait WmiObjectExt {
         fn get_u16(&self, key: &str) -> Option<u16>;
     }

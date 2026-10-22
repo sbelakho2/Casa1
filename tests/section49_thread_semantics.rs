@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Thread semantics hardening — suspension, exit races and suspend-aware
 //! waits across the Win32 and Nt dispatch paths.
 //!
@@ -47,7 +48,6 @@ fn setup_session() -> (TempDir, NtThunkSession) {
     (temp_dir, session)
 }
 
-/// The scratch arena addresses (mapped by the session).
 const ENTRY_POINT: u64 = 0x41_100;
 const FLAG_PTR: u64 = 0x41_200;
 const THREAD_ID_PTR: u64 = 0x41_204;
@@ -56,8 +56,6 @@ const OUT_PTR: u64 = 0x41_300;
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 const THREAD_SUSPEND_FAILED: u32 = 0xFFFF_FFFF;
 
-/// Map a trivial thread start routine: `mov eax, FLAG_PTR; mov dword ptr
-/// [eax], 1; xor eax, eax; ret` — writes the flag and returns exit code 0.
 fn map_thread_entrypoint(session: &mut NtThunkSession) {
     let mut bytes = vec![0x90; 0x40];
     bytes[..14].copy_from_slice(&[
@@ -82,8 +80,6 @@ fn map_thread_entrypoint(session: &mut NtThunkSession) {
     session.map_guest(OUT_PTR, &[0_u8; 16]);
 }
 
-/// Create a queued (not-yet-run) x86 guest thread.  Returns the thread
-/// handle and its guest thread id.
 fn create_queued_thread(
     session: &mut NtThunkSession,
     create_thread: u64,
@@ -111,8 +107,6 @@ fn create_queued_thread(
     (handle, thread_id)
 }
 
-/// NtQueryInformationThread helper: query a u32-sized class and return the
-/// value written at the output buffer.
 fn query_thread_u32(session: &mut NtThunkSession, query: u64, handle: u32, info_class: u32) -> u32 {
     session.map_guest(OUT_PTR, &[0_u8; 32]);
     let status = session.call_x86(query, &[handle, info_class, OUT_PTR as u32, 32, 0]);

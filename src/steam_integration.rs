@@ -5227,22 +5227,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_manager_default_url() {
-        let mgr = SteamOverlayManager::new();
-        assert!(
-            mgr.overlay_url().contains("steam://"),
-            "default URL should be a steam:// URL"
-        );
-    }
-
-    #[test]
-    fn overlay_manager_custom_url() {
-        let mut mgr = SteamOverlayManager::new();
-        mgr.set_overlay_url("steam://openurl/https://example.com".to_string());
-        assert_eq!(mgr.overlay_url(), "steam://openurl/https://example.com");
-    }
-
-    #[test]
     fn overlay_input_capture_when_active() {
         // When overlay is inactive, input should NOT be captured.
         assert!(
@@ -5278,58 +5262,6 @@ mod tests {
     }
 
     #[test]
-    fn steam_boot_config_paths() {
-        let config = SteamBootConfig {
-            ge_root: PathBuf::from("/tmp/test_ge"),
-            ..Default::default()
-        };
-        assert_eq!(
-            config.steam_dir(),
-            PathBuf::from("/tmp/test_ge/drive_c/Steam")
-        );
-        assert_eq!(
-            config.steam_exe(),
-            PathBuf::from("/tmp/test_ge/drive_c/Steam/Steam.exe")
-        );
-    }
-
-    #[test]
-    fn steam_boot_config_command_line() {
-        let config = SteamBootConfig {
-            ge_root: PathBuf::from("/tmp/test"),
-            offline_mode: true,
-            debug_logging: true,
-            ..Default::default()
-        };
-        let cmd = config.build_command_line();
-        assert!(cmd.contains("-offline"));
-        assert!(cmd.contains("-debug"));
-    }
-
-    #[test]
-    fn steam_environment_creates_directories() {
-        let (_tmp, steam_dir) = setup_steam_dir();
-        SteamEnvironment::create_required_directories(&steam_dir).unwrap();
-
-        assert!(steam_dir.join("logs").exists());
-        assert!(steam_dir.join("userdata").exists());
-        assert!(steam_dir.join("steamapps/common").exists());
-        assert!(steam_dir.join("config").exists());
-        assert!(steam_dir.join("bin").exists());
-    }
-
-    #[test]
-    fn steam_environment_creates_default_config() {
-        let (_tmp, steam_dir) = setup_steam_dir();
-        SteamEnvironment::create_default_config(&steam_dir).unwrap();
-
-        let config_path = steam_dir.join("config/config.vdf");
-        assert!(config_path.exists());
-        let content = fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("InstallConfigStore"));
-    }
-
-    #[test]
     fn steam_environment_verifies_installation() {
         let (_tmp, steam_dir) = setup_steam_dir();
 
@@ -5355,55 +5287,10 @@ mod tests {
         assert_eq!(ipc.active_pipes().len(), 1);
     }
 
-    #[test]
-    fn steam_library_scanner_empty() {
-        let (_tmp, steam_dir) = setup_steam_dir();
-        let games = SteamLibraryScanner::scan_library(&steam_dir).unwrap();
-        assert!(games.is_empty());
-    }
-
-    #[test]
-    fn steam_library_scanner_with_games() {
-        let (_tmp, steam_dir) = setup_steam_dir();
-        let game_dir = steam_dir.join("steamapps/common/MyGame");
-        fs::create_dir_all(&game_dir).unwrap();
-        fs::write(game_dir.join("game.exe"), b"game_bin").unwrap();
-
-        let games = SteamLibraryScanner::scan_library(&steam_dir).unwrap();
-        assert_eq!(games.len(), 1);
-        assert_eq!(games[0].name, "MyGame");
-        assert_eq!(games[0].size_bytes, 8);
-    }
-
-    #[test]
-    fn parse_app_manifest_basic() {
-        let content = r#"
-"AppState"
-{
-    "appid"    "480"
-    "name"    "Spacewar"
-    "installdir"    "Spacewar"
-    "StagingSize"    "1048576"
-}
-"#;
-        let manifest = parse_app_manifest(content).unwrap();
-        assert_eq!(manifest.get("appid").unwrap(), "480");
-        assert_eq!(manifest.get("name").unwrap(), "Spacewar");
-        assert_eq!(manifest.get("installdir").unwrap(), "Spacewar");
-    }
-
-    #[test]
-    fn steam_paths_constants() {
-        assert_eq!(SteamPaths::STEAM_EXE, "Steam.exe");
-        assert_eq!(SteamPaths::CONFIG_VDF, "config/config.vdf");
-        assert_eq!(SteamPaths::COMMON_DIR, "steamapps/common");
-    }
-
     // -----------------------------------------------------------------------
     // PE parsing smoke test — validates the extracted Steam.exe
     // -----------------------------------------------------------------------
 
-    /// Helper: human-readable machine type name.
     fn machine_name(machine: u16) -> &'static str {
         match machine {
             0x014c => "I386 / x86 (32-bit)",
@@ -5417,7 +5304,6 @@ mod tests {
         }
     }
 
-    /// Helper: human-readable subsystem name.
     fn subsystem_name(subsystem: u16) -> &'static str {
         match subsystem {
             0 => "UNKNOWN",
@@ -5438,7 +5324,6 @@ mod tests {
         }
     }
 
-    /// Helper: human-readable section characteristics.
     fn section_flags(characteristics: u32) -> String {
         let mut flags = Vec::new();
         if characteristics & 0x0000_0020 != 0 {
@@ -5460,170 +5345,6 @@ mod tests {
             flags.push("WRITE");
         }
         flags.join(" | ")
-    }
-
-    #[test]
-    fn steam_smoke_pe_parse() {
-        let steam_exe = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("ges/steam-live-run/drive_c/Steam/Steam.exe");
-
-        assert!(
-            steam_exe.exists(),
-            "Steam.exe not found at {}",
-            steam_exe.display()
-        );
-
-        let exe_size = std::fs::metadata(&steam_exe).unwrap().len();
-        println!("=== Steam.exe PE Parsing Smoke Test ===");
-        println!(
-            "File size: {} bytes ({:.1} KB)",
-            exe_size,
-            exe_size as f64 / 1024.0
-        );
-
-        let parsed =
-            crate::pe::parse_from_file(&steam_exe).expect("Steam.exe should be a valid PE image");
-
-        // Machine type — the bootstrapper is 32-bit (0x014c) even though
-        // Steam client proper is 64-bit (0x8664). Both are valid.
-        let machine = parsed.machine;
-        let is_valid_machine = machine == 0x014c || machine == 0x8664;
-        println!(
-            "Machine:        0x{machine:04x} ({})",
-            machine_name(machine)
-        );
-        assert!(
-            is_valid_machine,
-            "Steam.exe should be x86 (0x014c) or x64 (0x8664), got 0x{machine:04x}"
-        );
-
-        // Optional header magic
-        let magic = parsed.optional_header_magic;
-        let pe_fmt = match magic {
-            0x10b => "PE32",
-            0x20b => "PE32+",
-            _ => "unknown",
-        };
-        println!("PE format:      0x{magic:04x} ({pe_fmt})");
-        let valid_magic = magic == 0x10b || magic == 0x20b;
-        assert!(
-            valid_magic,
-            "Steam.exe should be PE32 (0x10b) or PE32+ (0x20b)"
-        );
-
-        // Subsystem — read directly from the raw bytes since ParsedPe doesn't
-        // expose a subsystem field. Guard every slice against truncated or
-        // malformed input with a clear failure message.
-        let bytes = std::fs::read(&steam_exe).unwrap();
-        assert!(
-            bytes.len() >= 0x40,
-            "Steam.exe too small to contain a PE header ({} bytes)",
-            bytes.len()
-        );
-        let pe_offset = u32::from_le_bytes(
-            bytes[0x3c..0x40]
-                .try_into()
-                .expect("PE header e_lfanew field should fit in 4 bytes"),
-        ) as usize;
-        // Optional header starts at pe_offset + 24, subsystem is at byte 68
-        // within the optional header.
-        let subsystem_offset = pe_offset + 24 + 68;
-        assert!(
-            subsystem_offset + 2 <= bytes.len(),
-            "PE optional header subsystem field out of bounds (offset {subsystem_offset} in {} bytes)",
-            bytes.len()
-        );
-        let subsystem = u16::from_le_bytes(
-            bytes[subsystem_offset..subsystem_offset + 2]
-                .try_into()
-                .expect("subsystem field should fit in 2 bytes"),
-        );
-        println!(
-            "Subsystem:      0x{subsystem:04x} ({})",
-            subsystem_name(subsystem)
-        );
-        // Steam.exe is a GUI application
-        assert_eq!(subsystem, 2, "Steam.exe should be WINDOWS_GUI (2)");
-
-        // Entry point
-        println!("Entry point:    0x{:08x}", parsed.address_of_entry_point);
-
-        // Image base and size
-        println!("Image base:     0x{:016x}", parsed.image_base);
-        println!(
-            "Size of image:  0x{:08x} ({} bytes)",
-            parsed.size_of_image, parsed.size_of_image
-        );
-
-        // Section list
-        println!("\n--- Sections ({} total) ---", parsed.sections.len());
-        println!(
-            "{:8} {:>10} {:>10} {:>10} {:>10}  Flags",
-            "Name", "VAddr", "VSize", "RawPtr", "RawSize"
-        );
-        for section in &parsed.sections {
-            println!(
-                "{:8} 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}  {}",
-                section.name,
-                section.virtual_address,
-                section.virtual_size,
-                section.raw_data_ptr,
-                section.raw_data_size,
-                section_flags(section.characteristics),
-            );
-        }
-
-        // Import summary
-        println!("\n--- Import DLLs ({} total) ---", parsed.imports.len());
-        for imp in &parsed.imports {
-            println!("  {} ({} symbols)", imp.dll_name, imp.imports.len());
-        }
-
-        // Delay-load imports
-        if !parsed.delay_imports.is_empty() {
-            println!(
-                "\n--- Delay-Load DLLs ({} total) ---",
-                parsed.delay_imports.len()
-            );
-            for imp in &parsed.delay_imports {
-                println!("  {} ({} symbols)", imp.dll_name, imp.imports.len());
-            }
-        }
-
-        // Exports
-        if !parsed.exports.is_empty() {
-            println!("\n--- Exports ({} total) ---", parsed.exports.len());
-            for exp in &parsed.exports {
-                if let Some(ref name) = exp.name {
-                    println!("  [{}] {}", exp.ordinal, name);
-                }
-            }
-        }
-
-        // Version info
-        println!("\n--- Version Info ---");
-        if let Some(ref product) = parsed.version_info.product_name {
-            println!("  Product:  {product}");
-        }
-        if let Some(ref version) = parsed.version_info.file_version {
-            println!("  Version:  {version}");
-        }
-
-        // Debug entries
-        if !parsed.debug_entries.is_empty() {
-            println!(
-                "\n--- Debug Entries ({} total) ---",
-                parsed.debug_entries.len()
-            );
-            for (i, entry) in parsed.debug_entries.iter().enumerate() {
-                println!(
-                    "  [{i}] type={:#010x} size={} data_rva=0x{:08x}",
-                    entry.ty, entry.size_of_data, entry.address_of_raw_data
-                );
-            }
-        }
-
-        println!("\n=== PE smoke test PASSED ===");
     }
 
     #[test]

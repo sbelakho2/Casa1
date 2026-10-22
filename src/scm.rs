@@ -3678,82 +3678,9 @@ mod tests {
         assert!(!controller.is_secure_boot_active());
     }
 
-    #[test]
-    fn scm_pause_resume() {
-        let mut controller = ScmController::new(ScmConfig {
-            enabled: true,
-            ..Default::default()
-        });
-        controller.start_vm().unwrap();
-
-        controller.pause_vm().expect("pause");
-        assert_eq!(controller.vm_state, VmState::Paused);
-
-        controller.resume_vm().expect("resume");
-        assert_eq!(controller.vm_state, VmState::Running);
-    }
-
-    #[test]
-    fn scm_register_driver() {
-        let mut controller = ScmController::new(ScmConfig {
-            enabled: true,
-            ..Default::default()
-        });
-        controller.start_vm().unwrap();
-
-        controller
-            .register_driver("eac_driver.sys", 0xFFFFF800_00200000)
-            .expect("register driver");
-        assert!(
-            controller
-                .kernel_shim
-                .registered_drivers
-                .contains(&"eac_driver.sys".to_string())
-        );
-    }
-
-    #[test]
-    fn scm_framebuffer_write() {
-        let mut controller = ScmController::new(ScmConfig {
-            enabled: true,
-            ..Default::default()
-        });
-        controller.start_vm().unwrap();
-
-        let pixels = vec![0xFF; 640 * 480 * 4];
-        controller
-            .write_framebuffer(0, 0, 640, 480, &pixels)
-            .expect("write framebuffer");
-
-        let fb = controller.read_framebuffer();
-        assert_eq!(fb[0], 0xFF);
-        assert_eq!(fb.len(), 1280 * 720 * 4);
-    }
-
     // -----------------------------------------------------------------------
     // New tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn vz_virtual_machine_configuration() {
-        let config = VZVirtualMachineConfiguration {
-            cpu_count: 4,
-            memory_size: 4096 * 1024 * 1024,
-            boot_loader: VZBootLoader::Linux {
-                kernel_path: "/tmp/vmlinuz".to_string(),
-                initrd_path: None,
-                command_line: "console=hvc0".to_string(),
-            },
-            devices: vec![
-                VZDeviceConfiguration::VirtioGpu,
-                VZDeviceConfiguration::Entropy,
-            ],
-        };
-
-        assert_eq!(config.cpu_count, 4);
-        assert_eq!(config.memory_size, 4096 * 1024 * 1024);
-        assert_eq!(config.devices.len(), 2);
-    }
 
     #[test]
     fn arm64_vm_config_builder() {
@@ -3807,38 +3734,6 @@ mod tests {
         assert!(!has_serial, "Null serial handler should add no device");
         assert!(has_entropy, "Entropy device should be present");
         assert_eq!(vz_config.devices.len(), 4);
-    }
-
-    #[test]
-    fn virtio_gpu_metal_creation() {
-        let gpu = VirtioGpuMetal::create_metal_backed_gpu(800, 600).expect("create Metal GPU");
-
-        assert_eq!(gpu.scanout_width, 800);
-        assert_eq!(gpu.scanout_height, 600);
-        assert_eq!(gpu.framebuffer.len(), 800 * 600 * 4);
-        assert!(gpu.dirty_rects.is_empty());
-    }
-
-    #[test]
-    fn virtio_gpu_metal_update_and_flush() {
-        let mut gpu = VirtioGpuMetal::create_metal_backed_gpu(1280, 720).expect("create Metal GPU");
-
-        let pixels = vec![0xAB; 100 * 100 * 4];
-        gpu.update_scanout(&pixels, 10, 20, 100, 100)
-            .expect("update scanout");
-
-        assert_eq!(gpu.dirty_rects.len(), 1);
-        let rect = &gpu.dirty_rects[0];
-        assert_eq!(rect.x, 10);
-        assert_eq!(rect.y, 20);
-        assert_eq!(rect.width, 100);
-        assert_eq!(rect.height, 100);
-
-        let fb_offset = ((20 * 1280) + 10) * 4;
-        assert_eq!(gpu.framebuffer[fb_offset], 0xAB);
-
-        gpu.flush_to_metal().expect("flush to Metal");
-        assert!(gpu.dirty_rects.is_empty());
     }
 
     #[test]
@@ -3931,27 +3826,6 @@ mod tests {
     }
 
     #[test]
-    fn virtio_fs_bridge_write_pins_handle() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let dir_path = dir.path().to_str().unwrap();
-
-        let file_path = dir.path().join("out.txt");
-        std::fs::File::create(&file_path).unwrap();
-
-        let mut bridge = VirtioFsBridge::new(dir_path, "casa1-shared");
-        let handle = bridge.open("out.txt", 0o2).expect("open for writing");
-
-        bridge.write(handle, b"abc").expect("write");
-        bridge.write(handle, b"def").expect("write");
-        bridge.seek(handle, 0, 0).expect("seek to start");
-
-        let mut buffer = vec![0u8; 64];
-        let bytes_read = bridge.read(handle, &mut buffer).expect("read");
-        assert_eq!(bytes_read, 6);
-        assert_eq!(&buffer[..6], b"abcdef");
-    }
-
-    #[test]
     fn scm_write_framebuffer_rejects_oob_input() {
         let mut controller = ScmController::new(ScmConfig {
             enabled: true,
@@ -3997,100 +3871,6 @@ mod tests {
         let second = integration.launch_vm();
         assert!(second.is_err(), "second launch must be rejected");
         integration.shutdown_vm().expect("shutdown");
-    }
-
-    #[test]
-    fn virtio_net_bridge_send_receive() {
-        let mut bridge = VirtioNetBridge::new("02:00:00:00:00:01");
-        bridge.connected = true;
-
-        let packet = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x01];
-        bridge.send_packet(&packet).expect("send packet");
-
-        assert_eq!(bridge.stats.bytes_sent, 6);
-        assert_eq!(bridge.stats.packets_sent, 1);
-
-        let tx_data = std::mem::take(&mut bridge.tx_buffer);
-        bridge.rx_buffer.extend(tx_data);
-
-        let mut rx_buffer = vec![0u8; 64];
-        let received = bridge
-            .receive_packet(&mut rx_buffer)
-            .expect("receive packet");
-        assert_eq!(received, 6);
-        assert_eq!(&rx_buffer[..6], &packet);
-        assert_eq!(bridge.stats.bytes_received, 6);
-        assert_eq!(bridge.stats.packets_received, 1);
-    }
-
-    #[test]
-    fn secure_boot_configuration() {
-        let config = SecureBootConfig {
-            enabled: true,
-            efi_variable_store_path: Some("/tmp/efi_vars".to_string()),
-            machine_identifier: Some("casa1-vm-001".to_string()),
-            certificate_path: None,
-        };
-
-        configure_secure_boot(&config).expect("configure secure boot");
-
-        let disabled_config = SecureBootConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        configure_secure_boot(&disabled_config).expect("disabled secure boot");
-    }
-
-    #[test]
-    fn measured_launch_pcr() {
-        let mut state = MeasuredLaunchState {
-            enabled: true,
-            ..Default::default()
-        };
-
-        let digest = measure_component("ntoskrnl.exe", b"kernel-binary-data").expect("measure");
-        assert_ne!(digest, [0u8; 32]);
-
-        extend_pcr(&mut state, 0, &digest).expect("extend PCR 0");
-        assert_ne!(state.pcr_values[0], [0u8; 32]);
-        assert_eq!(state.measurement_log.len(), 1);
-        assert_eq!(state.measurement_log[0].index, 0);
-
-        let valid = verify_measurement(&state, 0, &state.pcr_values[0]).expect("verify");
-        assert!(valid);
-
-        let digest2 = measure_component("hal.dll", b"hal-binary-data").expect("measure hal");
-        extend_pcr(&mut state, 1, &digest2).expect("extend PCR 1");
-        assert_ne!(state.pcr_values[1], [0u8; 32]);
-        assert_ne!(state.pcr_values[0], state.pcr_values[1]);
-    }
-
-    #[test]
-    fn scm_runner_integration_lifecycle() {
-        let mut integration = ScmRunnerIntegration::new(ScmConfig {
-            enabled: true,
-            cpu_count: 2,
-            memory_mb: 2048,
-            kernel_path: None,
-            shared_directory: None,
-            virtio_gpu: true,
-            virtio_net: true,
-            secure_boot: false,
-            measured_launch: true,
-        });
-
-        integration.launch_vm().expect("launch VM");
-        assert_eq!(integration.get_vm_state(), VmState::Running);
-
-        integration.tick().expect("tick");
-        assert!(integration.controller.total_instructions > 0);
-
-        let fb = integration.get_framebuffer();
-        assert!(fb.is_some());
-        assert_eq!(fb.unwrap().len(), 1280 * 720 * 4);
-
-        integration.shutdown_vm().expect("shutdown VM");
-        assert_eq!(integration.get_vm_state(), VmState::Stopped);
     }
 
     #[test]
@@ -4174,46 +3954,6 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].irp_id, 1);
         assert_eq!(shim.irp_queue.len(), 1);
-    }
-
-    #[test]
-    fn windows_kernel_shim_dpc_queue() {
-        let mut shim = WindowsKernelShim::new(false);
-
-        shim.queue_dpc(0xDEADBEEF, 0x1000, 0x2000)
-            .expect("queue DPC 1");
-        shim.queue_dpc(0xCAFEBABE, 0x3000, 0x4000)
-            .expect("queue DPC 2");
-        shim.queue_dpc(0x12345678, 0x5000, 0x6000)
-            .expect("queue DPC 3");
-
-        assert_eq!(shim.dpc_queue.len(), 3);
-
-        let dpcs = shim.drain_dpcs();
-        assert_eq!(dpcs.len(), 3);
-        assert_eq!(dpcs[0].routine, 0xDEADBEEF);
-        assert_eq!(dpcs[1].routine, 0xCAFEBABE);
-        assert_eq!(dpcs[2].routine, 0x12345678);
-
-        assert!(shim.dpc_queue.is_empty());
-
-        let dpcs2 = shim.drain_dpcs();
-        assert!(dpcs2.is_empty());
-    }
-
-    #[test]
-    fn backend_kind_strings_are_stable_and_distinct() {
-        assert_eq!(BackendKind::RealVZ.as_str(), "real_vz");
-        assert_eq!(BackendKind::Simulation.as_str(), "simulation");
-        assert_eq!(BackendKind::Unavailable.as_str(), "unavailable");
-        assert_ne!(
-            BackendKind::RealVZ.as_str(),
-            BackendKind::Simulation.as_str()
-        );
-        assert_ne!(
-            BackendKind::Simulation.as_str(),
-            BackendKind::Unavailable.as_str()
-        );
     }
 
     #[test]

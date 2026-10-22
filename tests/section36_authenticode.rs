@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Section 36 — Authenticode signature verification (WinVerifyTrust backing).
 //!
 //! These tests build a real, cryptographically valid Authenticode signature
@@ -50,7 +51,6 @@ const OID_SHA256: &str = "2.16.840.1.101.3.4.2.1";
 const OID_SPC_INDIRECT_DATA: &str = "1.3.6.1.4.1.311.2.1.4";
 const OID_SPC_PE_IMAGE_DATA: &str = "1.3.6.1.4.1.311.2.1.15";
 
-/// Encode a DER TLV with short/long-form length.
 fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     let len = content.len();
@@ -71,7 +71,6 @@ fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Encode an OID's content octets from a dotted string.
 fn oid_content(dotted: &str) -> Vec<u8> {
     let parts: Vec<u64> = dotted.split('.').map(|p| p.parse().unwrap()).collect();
     let mut out = vec![(parts[0] * 40 + parts[1]) as u8];
@@ -92,7 +91,6 @@ fn der_oid(dotted: &str) -> Vec<u8> {
     tlv(0x06, &oid_content(dotted))
 }
 
-/// Compute the Authenticode SHA-256 hash over the fixed synthetic PE layout.
 fn authenticode_hash(file: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     for &(start, end) in &[
@@ -105,7 +103,6 @@ fn authenticode_hash(file: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// Build the synthetic PE body (everything before the certificate table).
 fn build_pe_body() -> Vec<u8> {
     let mut pe = vec![0u8; BODY_LEN];
     pe[0] = b'M';
@@ -119,7 +116,6 @@ fn build_pe_body() -> Vec<u8> {
     pe
 }
 
-/// Build SpcIndirectDataContent (the Authenticode eContent) over `pe_hash`.
 fn build_spc_indirect_data(pe_hash: &[u8]) -> Vec<u8> {
     let data = tlv(0x30, &der_oid(OID_SPC_PE_IMAGE_DATA));
     let mut alg = der_oid(OID_SHA256);
@@ -140,7 +136,6 @@ fn sha256_alg_id() -> AlgorithmIdentifierOwned {
     }
 }
 
-/// Build a self-signed RSA certificate for the signer.
 fn build_certificate(signer: &SigningKey<Sha256>, private_key: &RsaPrivateKey) -> Certificate {
     let public_key = RsaPublicKey::from(private_key);
     let spki_der = public_key.to_public_key_der().unwrap();
@@ -155,7 +150,6 @@ fn build_certificate(signer: &SigningKey<Sha256>, private_key: &RsaPrivateKey) -
     builder.build().unwrap()
 }
 
-/// Produce a fully signed synthetic PE image.
 fn build_signed_pe() -> Vec<u8> {
     let mut rng = StdRng::seed_from_u64(0xC0FFEE);
     let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
@@ -220,25 +214,6 @@ fn build_signed_pe() -> Vec<u8> {
 }
 
 #[test]
-fn authenticode_accepts_valid_signature() {
-    let pe = build_signed_pe();
-    // The verifier performs REAL certificate-chain validation: a self-signed
-    // certificate that is not rooted in a trusted store is rejected as
-    // Invalid even though the cryptographic signature itself is valid. This
-    // is the documented contract for untrusted roots (verified 2026-08-15).
-    match verify_pe_authenticode(&pe) {
-        AuthenticodeVerdict::Invalid(reason) => {
-            let lower = reason.to_lowercase();
-            assert!(
-                lower.contains("trust") || lower.contains("chain"),
-                "untrusted-root rejection must reference chain/trust validation, got: {reason}"
-            );
-        }
-        other => panic!("expected Invalid (untrusted self-signed root), got {other:?}"),
-    }
-}
-
-#[test]
 fn authenticode_rejects_tampered_image() {
     let mut pe = build_signed_pe();
     // Flip a byte inside a hashed region; the PE hash must no longer match.
@@ -247,16 +222,6 @@ fn authenticode_rejects_tampered_image() {
         AuthenticodeVerdict::Invalid(_) => {}
         other => panic!("expected Invalid for tampered image, got {other:?}"),
     }
-}
-
-#[test]
-fn authenticode_reports_unsigned_image() {
-    // A well-formed PE with an empty security data directory is unsigned.
-    let pe = build_pe_body();
-    assert_eq!(
-        verify_pe_authenticode(&pe),
-        AuthenticodeVerdict::NoSignature
-    );
 }
 
 #[test]

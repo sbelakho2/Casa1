@@ -162,6 +162,36 @@ struct QueryHeap {
     resolved: Vec<u64>,
 }
 
+/// Cloneable slot for the DirectStorage completion callback. Clones share the
+/// same callback (Arc), so a cloned runtime observes the same hook.
+#[derive(Clone, Default)]
+struct UploadCompletionHook(
+    Option<std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>>>,
+);
+
+impl std::fmt::Debug for UploadCompletionHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadCompletionHook")
+            .field("registered", &self.0.is_some())
+            .finish()
+    }
+}
+
+impl UploadCompletionHook {
+    fn set(&mut self, callback: Box<dyn FnMut() + Send>) {
+        let slot = self
+            .0
+            .get_or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
+        *slot.lock().expect("upload completion hook poisoned") = Some(callback);
+    }
+
+    /// Shared slot for registration with the DirectStorage completion
+    /// listener, so the hook fires without any caller polling or waiting.
+    fn slot(&self) -> Option<std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>>> {
+        self.0.clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct D3d12Runtime {
     backend: GraphicsBackend,
@@ -212,6 +242,60 @@ pub struct D3d12Runtime {
     cpu_backing_writes: u64,
     /// Present-time uploads through the fallback path.
     fallback_uploads: u64,
+    /// NV12 plane channels for the primary swapchain (empty for pixel paths).
+    primary_nv12: Vec<crate::metal_backend::Nv12PresentChannel>,
+    /// Additional swapchains, each with its own IOSurface channel set.
+    extra_swapchains: BTreeMap<SwapchainId, SwapchainChannelSet>,
+    /// Presents that bound both NV12 planes.
+    nv12_presents: u64,
+    /// Requests for a swapchain format this host could not represent; the
+    /// request fell back to the caller's typed format.
+    swapchain_format_fallbacks: u64,
+    /// Textures created through the DirectStorage / initial-data path, keyed by
+    /// the translated resource id.
+    gpu_textures: BTreeMap<ResourceId, crate::metal_backend::DirectStorageTexture>,
+    /// Bytes delivered by the DirectStorage direct path (file -> MTLBuffer).
+    directstorage_bytes: u64,
+    /// Bytes that transited a host staging buffer (compressed sources and
+    /// CreateResource initial-data uploads).
+    staging_bytes: u64,
+    /// Async DirectStorage pipeline (queued command buffers + MTLSharedEvent).
+    directstorage_queue:
+        Option<std::sync::Arc<std::sync::Mutex<crate::metal_backend::DirectStorageUploadQueue>>>,
+    /// Completion hook fired once each time the async queue drains.
+    directstorage_completion: UploadCompletionHook,
+    /// Resources created by async enqueues that have not completed yet.
+    directstorage_pending_resources: Vec<(ResourceId, u64)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SwapchainChannelSet {
+    pixel: Vec<crate::metal_backend::IoSurfacePresentChannel>,
+    nv12: Vec<crate::metal_backend::Nv12PresentChannel>,
+}
+
+impl SwapchainChannelSet {
+    fn is_empty(&self) -> bool {
+        self.pixel.is_empty() && self.nv12.is_empty()
+    }
+}
+
+/// Handle returned by an asynchronous DirectStorage enqueue. `fence_value` is
+/// the MTLSharedEvent value signaled by this upload's real command buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12UploadTicket {
+    pub resource: ResourceId,
+    pub fence_value: u64,
+}
+
+/// D3D12 `CreateResource` initial texture data (width/height/format plus the
+/// tightly packed texel bytes).
+#[derive(Debug, Clone)]
+pub struct D3d12InitialTextureData {
+    pub width: u32,
+    pub height: u32,
+    pub format: metal::MTLPixelFormat,
+    pub data: Vec<u8>,
 }
 
 /// Allocate one IOSurface-backed present channel per swapchain backbuffer.
@@ -231,6 +315,24 @@ fn build_iosurface_channels(
         }
     }
     channels
+}
+
+/// Allocate one NV12 IOSurface channel (two Metal planes) per backbuffer.
+/// Returns `None` when the host cannot provide the two-plane surface, so the
+/// caller can count the fallback and use the pixel path.
+fn build_nv12_channels(
+    width: u32,
+    height: u32,
+    count: u32,
+) -> Option<Vec<crate::metal_backend::Nv12PresentChannel>> {
+    let mut channels = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        match crate::metal_backend::Nv12PresentChannel::new(width, height) {
+            Ok(channel) => channels.push(channel),
+            Err(_) => return None,
+        }
+    }
+    Some(channels)
 }
 
 impl Default for D3d12Runtime {
@@ -260,6 +362,16 @@ impl Default for D3d12Runtime {
             surface_writes: 0,
             cpu_backing_writes: 0,
             fallback_uploads: 0,
+            primary_nv12: Vec::new(),
+            extra_swapchains: BTreeMap::new(),
+            nv12_presents: 0,
+            swapchain_format_fallbacks: 0,
+            gpu_textures: BTreeMap::new(),
+            directstorage_bytes: 0,
+            staging_bytes: 0,
+            directstorage_queue: None,
+            directstorage_completion: UploadCompletionHook::default(),
+            directstorage_pending_resources: Vec::new(),
         }
     }
 }
@@ -295,6 +407,16 @@ impl D3d12Runtime {
             surface_writes: 0,
             cpu_backing_writes: 0,
             fallback_uploads: 0,
+            primary_nv12: Vec::new(),
+            extra_swapchains: BTreeMap::new(),
+            nv12_presents: 0,
+            swapchain_format_fallbacks: 0,
+            gpu_textures: BTreeMap::new(),
+            directstorage_bytes: 0,
+            staging_bytes: 0,
+            directstorage_queue: None,
+            directstorage_completion: UploadCompletionHook::default(),
+            directstorage_pending_resources: Vec::new(),
         }
     }
 
@@ -577,8 +699,93 @@ impl D3d12Runtime {
             crate::metal_backend::dxgi_to_metal_format(desc.format),
             desc.buffer_count.max(1),
         );
+        self.primary_nv12.clear();
         self.present_swapchain = Some(swapchain);
         Ok(swapchain)
+    }
+
+    /// Create the primary swapchain with DXGI_FORMAT_NV12 (raw value 103).
+    /// Backed by an NV12 IOSurface with a luma and an interleaved chroma Metal
+    /// plane. If the host cannot allocate the NV12 channel, the request is
+    /// counted in `swapchain_format_fallbacks` and a normal pixel swapchain is
+    /// created instead.
+    pub fn create_nv12_swapchain(&mut self, desc: SwapchainDesc) -> AppResult<SwapchainId> {
+        let count = desc.buffer_count.max(1);
+        if let Some(channels) = build_nv12_channels(desc.width, desc.height, count) {
+            let swapchain = self.backend.create_nv12_swapchain(desc.clone())?;
+            self.iosurface_channels.clear();
+            self.primary_nv12 = channels;
+            self.present_swapchain = Some(swapchain);
+            return Ok(swapchain);
+        }
+        self.swapchain_format_fallbacks += 1;
+        self.create_swapchain(desc)
+    }
+
+    /// Create an additional swapchain on the same device. Each swapchain owns
+    /// an independent IOSurface channel set; presenting one never rebinds the
+    /// other's channels.
+    pub fn create_additional_swapchain(&mut self, desc: SwapchainDesc) -> AppResult<SwapchainId> {
+        let swapchain = self.backend.create_swapchain(desc.clone())?;
+        let channels = build_iosurface_channels(
+            desc.width,
+            desc.height,
+            crate::metal_backend::dxgi_to_metal_format(desc.format),
+            desc.buffer_count.max(1),
+        );
+        self.extra_swapchains.insert(
+            swapchain,
+            SwapchainChannelSet {
+                pixel: channels,
+                nv12: Vec::new(),
+            },
+        );
+        Ok(swapchain)
+    }
+
+    /// Create an additional NV12 swapchain (independent from the primary).
+    pub fn create_additional_nv12_swapchain(
+        &mut self,
+        desc: SwapchainDesc,
+    ) -> AppResult<SwapchainId> {
+        let count = desc.buffer_count.max(1);
+        let channels = match build_nv12_channels(desc.width, desc.height, count) {
+            Some(channels) => channels,
+            None => {
+                self.swapchain_format_fallbacks += 1;
+                return self.create_additional_swapchain(desc);
+            }
+        };
+        let swapchain = self.backend.create_nv12_swapchain(desc)?;
+        self.extra_swapchains.insert(
+            swapchain,
+            SwapchainChannelSet {
+                pixel: Vec::new(),
+                nv12: channels,
+            },
+        );
+        Ok(swapchain)
+    }
+
+    /// DXGI-format-keyed swapchain creation. Raw value 103 selects the real
+    /// NV12 two-plane path; any other raw format must match `desc.format`.
+    /// Unknown values are counted as fallbacks and the typed `desc.format` is
+    /// used, so the caller can observe that the raw request was not honoured.
+    pub fn create_swapchain_for_format(
+        &mut self,
+        desc: SwapchainDesc,
+        raw_format: u32,
+    ) -> AppResult<SwapchainId> {
+        if raw_format == 103 {
+            return self.create_nv12_swapchain(desc);
+        }
+        match DxgiFormat::from_u32_checked(raw_format) {
+            Ok(format) if format == desc.format => self.create_swapchain(desc),
+            Ok(_) | Err(_) => {
+                self.swapchain_format_fallbacks += 1;
+                self.create_swapchain(desc)
+            }
+        }
     }
 
     pub fn set_maximum_frame_latency(
@@ -603,15 +810,37 @@ impl D3d12Runtime {
     ) -> AppResult<()> {
         self.backend
             .resize_buffers(swapchain, buffer_count, width, height, format)?;
-        // Resize invalidates the old surface dimensions; rebuild the channels
-        // (the previous surfaces/textures are released with their wrappers).
-        self.iosurface_channels = build_iosurface_channels(
-            width,
-            height,
-            crate::metal_backend::dxgi_to_metal_format(format),
-            buffer_count.max(1),
-        );
-        self.present_swapchain = Some(swapchain);
+        // Resize invalidates only this swapchain's surfaces; every other
+        // swapchain keeps its own channel set and IOSurface allocation.
+        let is_nv12 = self.backend.swapchain_is_nv12(swapchain).unwrap_or(false);
+        let count = buffer_count.max(1);
+        if self.present_swapchain == Some(swapchain) {
+            if is_nv12 {
+                self.primary_nv12 = build_nv12_channels(width, height, count).unwrap_or_default();
+                self.iosurface_channels.clear();
+            } else {
+                self.iosurface_channels = build_iosurface_channels(
+                    width,
+                    height,
+                    crate::metal_backend::dxgi_to_metal_format(format),
+                    count,
+                );
+                self.primary_nv12.clear();
+            }
+        } else if let Some(set) = self.extra_swapchains.get_mut(&swapchain) {
+            if is_nv12 {
+                set.nv12 = build_nv12_channels(width, height, count).unwrap_or_default();
+                set.pixel.clear();
+            } else {
+                set.pixel = build_iosurface_channels(
+                    width,
+                    height,
+                    crate::metal_backend::dxgi_to_metal_format(format),
+                    count,
+                );
+                set.nv12.clear();
+            }
+        }
         Ok(())
     }
 
@@ -623,27 +852,90 @@ impl D3d12Runtime {
     ) -> AppResult<PresentResult> {
         let state = self.backend.swapchain_state(swapchain)?;
         let backbuffer_ids = state.backbuffers.clone();
-        let present_swapchain = self.present_swapchain;
-        let Self {
-            backend,
-            iosurface_channels,
-            iosurface_presents,
-            fallback_uploads,
-            ..
-        } = self;
-        let zero_copy = present_swapchain == Some(swapchain) && !iosurface_channels.is_empty();
-        if zero_copy {
-            if iosurface_channels.len() != backbuffer_ids.len() {
+        let is_primary = self.present_swapchain == Some(swapchain);
+        let nv12_len = if is_primary {
+            self.primary_nv12.len()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .map(|set| set.nv12.len())
+                .unwrap_or(0)
+        };
+        let pixel_len = if is_primary {
+            self.iosurface_channels.len()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .map(|set| set.pixel.len())
+                .unwrap_or(0)
+        };
+
+        if nv12_len > 0 {
+            if nv12_len != backbuffer_ids.len() {
                 return Err(AppError::new(
                     ReasonCode::RcD3dInvalidState,
                     format!(
-                        "IOSurface present: {} channels for {} backbuffers",
-                        iosurface_channels.len(),
+                        "NV12 present: {nv12_len} channels for {} backbuffers",
                         backbuffer_ids.len()
                     ),
                 ));
             }
-            for (index, channel) in iosurface_channels.iter_mut().enumerate() {
+            let channels: &[crate::metal_backend::Nv12PresentChannel] = if is_primary {
+                &self.primary_nv12
+            } else {
+                &self
+                    .extra_swapchains
+                    .get(&swapchain)
+                    .expect("channel set checked above")
+                    .nv12
+            };
+            for (index, channel) in channels.iter().enumerate() {
+                if channel.width() != state.desc.width || channel.height() != state.desc.height {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        format!(
+                            "NV12 present: swapchain {}x{} does not match channel {} at {index} ({}x{})",
+                            state.desc.width,
+                            state.desc.height,
+                            index,
+                            channel.width(),
+                            channel.height()
+                        ),
+                    ));
+                }
+            }
+            // Both plane textures are built eagerly; binding them here proves
+            // present targets the luma and chroma planes of this channel. The
+            // real composite compute pass converts the planes into the RGBA
+            // drawable texture that present binds.
+            let presented = channels[0].clone();
+            presented.composite_to_drawable()?;
+            presented.bind_drawable();
+            let _ = presented.plane_texture_ptrs();
+            self.nv12_presents += 1;
+            self.iosurface_presents += 1;
+            self.backend.set_presented_nv12_surface(Some(presented));
+        } else if pixel_len > 0 {
+            if pixel_len != backbuffer_ids.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "IOSurface present: {pixel_len} channels for {} backbuffers",
+                        backbuffer_ids.len()
+                    ),
+                ));
+            }
+            let channels: &mut [crate::metal_backend::IoSurfacePresentChannel] = if is_primary {
+                &mut self.iosurface_channels
+            } else {
+                &mut self
+                    .extra_swapchains
+                    .get_mut(&swapchain)
+                    .expect("channel set checked above")
+                    .pixel
+            };
+            let expected_format = crate::metal_backend::dxgi_to_metal_format(state.desc.format);
+            for (index, channel) in channels.iter_mut().enumerate() {
                 if channel.width() != state.desc.width || channel.height() != state.desc.height {
                     return Err(AppError::new(
                         ReasonCode::RcD3dInvalidState,
@@ -657,7 +949,6 @@ impl D3d12Runtime {
                         ),
                     ));
                 }
-                let expected_format = crate::metal_backend::dxgi_to_metal_format(state.desc.format);
                 if channel.pixel_format() != expected_format {
                     return Err(AppError::new(
                         ReasonCode::RcD3dInvalidState,
@@ -669,23 +960,35 @@ impl D3d12Runtime {
                         ),
                     ));
                 }
-                // The surface is authoritative: backbuffer writes and clears
-                // already landed there, so present must not copy the CPU
-                // backing bytes over them.
             }
-            iosurface_channels[0].metal_texture()?;
-            *iosurface_presents += 1;
-            let presented_surface = iosurface_channels[0].clone();
-            backend.set_presented_surface(Some(presented_surface));
+            channels[0].metal_texture()?;
+            let presented = channels[0].clone();
+            self.iosurface_presents += 1;
+            self.backend.set_presented_surface(Some(presented));
         } else {
-            backend.set_presented_surface(None);
-            *fallback_uploads += backbuffer_ids.len() as u64;
+            self.backend.set_presented_surface(None);
+            self.backend.set_presented_nv12_surface(None);
+            self.fallback_uploads += backbuffer_ids.len() as u64;
         }
-        backend.present(swapchain, sync_interval, allow_tearing)
+        self.backend
+            .present(swapchain, sync_interval, allow_tearing)
     }
 
     pub fn presented_frame(&self, swapchain: SwapchainId) -> AppResult<PresentedFrame> {
-        if self.present_swapchain == Some(swapchain) {
+        let is_primary = self.present_swapchain == Some(swapchain);
+        if is_primary {
+            if let Some(channel) = self.primary_nv12.first() {
+                return Ok(PresentedFrame {
+                    width: channel.width(),
+                    height: channel.height(),
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                    bytes: channel.to_rgba8()?,
+                    source: crate::gfx::FrameSource::DxgiD3D12,
+                    stride: channel.width() as usize * 4,
+                    sequence: self.iosurface_presents,
+                    timestamp: std::time::Instant::now(),
+                });
+            }
             if let Some(channel) = self.iosurface_channels.first() {
                 let state = self.backend.swapchain_state(swapchain)?;
                 return Ok(PresentedFrame {
@@ -699,8 +1002,136 @@ impl D3d12Runtime {
                     timestamp: std::time::Instant::now(),
                 });
             }
+        } else if let Some(set) = self.extra_swapchains.get(&swapchain) {
+            let state = self.backend.swapchain_state(swapchain)?;
+            if let Some(channel) = set.nv12.first() {
+                return Ok(PresentedFrame {
+                    width: channel.width(),
+                    height: channel.height(),
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                    bytes: channel.to_rgba8()?,
+                    source: crate::gfx::FrameSource::DxgiD3D12,
+                    stride: channel.width() as usize * 4,
+                    sequence: self.iosurface_presents,
+                    timestamp: std::time::Instant::now(),
+                });
+            }
+            if let Some(channel) = set.pixel.first() {
+                return Ok(PresentedFrame {
+                    width: channel.width(),
+                    height: channel.height(),
+                    format: state.desc.format,
+                    bytes: channel.read_pixels()?,
+                    source: crate::gfx::FrameSource::DxgiD3D12,
+                    stride: channel.width() as usize * 4,
+                    sequence: self.iosurface_presents,
+                    timestamp: std::time::Instant::now(),
+                });
+            }
         }
         self.backend.presented_frame(swapchain)
+    }
+
+    /// Read both NV12 planes of `swapchain` (0 = Y, 1 = interleaved UV).
+    pub fn presented_nv12_plane_bytes(
+        &self,
+        swapchain: SwapchainId,
+    ) -> AppResult<(Vec<u8>, Vec<u8>)> {
+        let channel = if self.present_swapchain == Some(swapchain) {
+            self.primary_nv12.first()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .and_then(|set| set.nv12.first())
+        }
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("swapchain {swapchain} has no NV12 present channel"),
+            )
+        })?;
+        Ok((channel.read_plane(0)?, channel.read_plane(1)?))
+    }
+
+    /// Read the two NV12 planes through their Metal textures using real GPU
+    /// blits (not the CPU surface mapping).
+    pub fn presented_nv12_plane_bytes_gpu(
+        &self,
+        swapchain: SwapchainId,
+    ) -> AppResult<(Vec<u8>, Vec<u8>)> {
+        let channel = if self.present_swapchain == Some(swapchain) {
+            self.primary_nv12.first()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .and_then(|set| set.nv12.first())
+        }
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("swapchain {swapchain} has no NV12 present channel"),
+            )
+        })?;
+        Ok((
+            channel.read_plane_via_metal(0)?,
+            channel.read_plane_via_metal(1)?,
+        ))
+    }
+
+    /// GPU readback of the RGBA drawable written by the NV12 composite pass.
+    pub fn presented_nv12_composite_rgba(&self, swapchain: SwapchainId) -> AppResult<Vec<u8>> {
+        let channel = self.nv12_channel(swapchain)?;
+        channel.read_drawable_rgba()
+    }
+
+    /// Number of real GPU composite passes run for a swapchain's NV12 channel.
+    pub fn nv12_composite_passes(&self, swapchain: SwapchainId) -> u64 {
+        self.nv12_channel(swapchain)
+            .map(|channel| channel.composite_passes())
+            .unwrap_or(0)
+    }
+
+    /// Number of presents that bound the composited RGBA drawable texture.
+    pub fn nv12_drawable_binds(&self, swapchain: SwapchainId) -> u64 {
+        self.nv12_channel(swapchain)
+            .map(|channel| channel.drawable_binds())
+            .unwrap_or(0)
+    }
+
+    /// Raw pointer of the drawable texture bound by the last NV12 present.
+    pub fn presented_nv12_drawable_ptr(&self, swapchain: SwapchainId) -> Option<usize> {
+        self.nv12_channel(swapchain)
+            .ok()
+            .map(|channel| channel.drawable_texture_ptr())
+    }
+
+    fn nv12_channel(
+        &self,
+        swapchain: SwapchainId,
+    ) -> AppResult<&crate::metal_backend::Nv12PresentChannel> {
+        if self.present_swapchain == Some(swapchain) {
+            self.primary_nv12.first()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .and_then(|set| set.nv12.first())
+        }
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("swapchain {swapchain} has no NV12 present channel"),
+            )
+        })
+    }
+
+    /// Presents that bound both NV12 planes.
+    pub fn nv12_present_count(&self) -> u64 {
+        self.nv12_presents
+    }
+
+    /// Number of swapchain format requests that used the counted fallback.
+    pub fn swapchain_format_fallback_count(&self) -> u64 {
+        self.swapchain_format_fallbacks
     }
 
     /// Presents that bound an IOSurface-backed Metal texture.
@@ -751,7 +1182,8 @@ impl D3d12Runtime {
 
     /// True when presents bind the IOSurface-backed Metal texture.
     pub fn iosurface_zero_copy_active(&self) -> bool {
-        !self.iosurface_channels.is_empty() && self.present_swapchain.is_some()
+        (!self.iosurface_channels.is_empty() || !self.primary_nv12.is_empty())
+            && self.present_swapchain.is_some()
     }
 
     /// MTLTextures built by the presented channel (stable across presents).
@@ -759,20 +1191,50 @@ impl D3d12Runtime {
         self.iosurface_channels
             .first()
             .map(|channel| channel.texture_builds())
+            .or_else(|| {
+                self.primary_nv12
+                    .first()
+                    .map(|channel| channel.texture_builds())
+            })
             .unwrap_or(0)
     }
 
-    /// Index of `resource` when it is a backbuffer of the swapchain whose
-    /// IOSurface channels are current.
-    fn present_backbuffer_index(&self, resource: ResourceId) -> Option<usize> {
-        if self.iosurface_channels.is_empty() {
-            return None;
+    /// Plane MTLTextures built for an NV12 present channel (2 when healthy).
+    pub fn nv12_texture_builds(&self, swapchain: SwapchainId) -> u32 {
+        let channel = if self.present_swapchain == Some(swapchain) {
+            self.primary_nv12.first()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .and_then(|set| set.nv12.first())
+        };
+        channel.map(|channel| channel.texture_builds()).unwrap_or(0)
+    }
+
+    /// Swapchain and backbuffer index when `resource` belongs to any swapchain
+    /// with an attached IOSurface channel set.
+    fn present_backbuffer_index(&self, resource: ResourceId) -> Option<(SwapchainId, usize)> {
+        let primary = self.present_swapchain?;
+        let mut candidates = vec![primary];
+        candidates.extend(self.extra_swapchains.keys().copied());
+        for swapchain in candidates {
+            if let Ok(state) = self.backend.swapchain_state(swapchain) {
+                if let Some(index) = state.backbuffers.iter().position(|id| *id == resource) {
+                    let has_channels = if swapchain == primary {
+                        !self.iosurface_channels.is_empty() || !self.primary_nv12.is_empty()
+                    } else {
+                        self.extra_swapchains
+                            .get(&swapchain)
+                            .map(|set| !set.is_empty())
+                            .unwrap_or(false)
+                    };
+                    if has_channels {
+                        return Some((swapchain, index));
+                    }
+                }
+            }
         }
-        let swapchain = self.present_swapchain?;
-        self.backend
-            .swapchain_state(swapchain)
-            .ok()
-            .and_then(|state| state.backbuffers.iter().position(|id| *id == resource))
+        None
     }
 
     /// Write `bytes` at `offset` into the IOSurface when `resource` is a
@@ -784,12 +1246,59 @@ impl D3d12Runtime {
         offset: usize,
         bytes: &[u8],
     ) -> AppResult<bool> {
-        let Some(index) = self.present_backbuffer_index(resource) else {
+        let Some((swapchain, index)) = self.present_backbuffer_index(resource) else {
             return Ok(false);
         };
-        let channel = match self.iosurface_channels.get_mut(index) {
-            Some(channel) => channel,
-            None => return Ok(false),
+        let is_primary = self.present_swapchain == Some(swapchain);
+        let format = self.backend.swapchain_state(swapchain)?.desc.format;
+        let is_nv12 = if is_primary {
+            !self.primary_nv12.is_empty()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .map(|set| !set.nv12.is_empty())
+                .unwrap_or(false)
+        };
+        if is_nv12 {
+            let channel = if is_primary {
+                self.primary_nv12.get(index)
+            } else {
+                self.extra_swapchains
+                    .get(&swapchain)
+                    .and_then(|set| set.nv12.get(index))
+            }
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "NV12 present: backbuffer channel is missing",
+                )
+            })?;
+            let expected = channel.width() as usize * channel.height() as usize * 4;
+            let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "surface write range overflow",
+                )
+            })?;
+            if offset != 0 || end != expected {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "NV12 present surface requires full-frame writes",
+                ));
+            }
+            channel.write_dxgi_pixels(bytes, format)?;
+            self.surface_writes += 1;
+            return Ok(true);
+        }
+        let channel = if is_primary {
+            self.iosurface_channels.get_mut(index)
+        } else {
+            self.extra_swapchains
+                .get_mut(&swapchain)
+                .and_then(|set| set.pixel.get_mut(index))
+        };
+        let Some(channel) = channel else {
+            return Ok(false);
         };
         let expected = channel.width() as usize * channel.height() as usize * 4;
         let end = offset.checked_add(bytes.len()).ok_or_else(|| {
@@ -823,7 +1332,503 @@ impl D3d12Runtime {
         self.backend.create_resource(desc)
     }
 
+    /// D3D12 `CreateResource` with `pInitialData`: the translated resource is
+    /// created and, when initial texture data is supplied, the bytes are
+    /// uploaded into a real private Metal texture through one blit. The GPU
+    /// texture is retained for `readback_gpu_texture`.
+    pub fn create_committed_resource_with_initial_data(
+        &mut self,
+        desc: ResourceDesc,
+        initial_data: Option<D3d12InitialTextureData>,
+    ) -> AppResult<ResourceId> {
+        let resource = self.backend.create_resource(desc)?;
+        if let Some(initial) = initial_data {
+            let upload = match crate::metal_backend::upload_texture_from_bytes(
+                &initial.data,
+                initial.width,
+                initial.height,
+                initial.format,
+            ) {
+                Ok(upload) => upload,
+                Err(error) => {
+                    let _ = self.backend.destroy_resource(resource);
+                    return Err(error);
+                }
+            };
+            self.staging_bytes += initial.data.len() as u64;
+            self.gpu_textures.insert(resource, upload);
+        }
+        Ok(resource)
+    }
+
+    /// Open a guest path through the game environment's file table and return
+    /// the host descriptor plus the normalized guest path.
+    fn open_directstorage_file(
+        ge: &crate::ge::GameEnvironment,
+        windows_path: &str,
+    ) -> AppResult<(std::fs::File, String)> {
+        let handle = ge.open_file(
+            windows_path,
+            crate::ge::FileAccess::read_only(),
+            crate::ge::ShareMode::read_only(),
+        )?;
+        let normalized = handle.normalized_path.clone();
+        let host_path = ge.host_path_for_windows_path(&normalized)?;
+        let file = std::fs::File::open(&host_path).map_err(|error| {
+            let _ = ge.close_file_handle(&handle);
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("DirectStorage: failed to open {}", host_path.display()),
+                &error,
+            )
+        })?;
+        // The file-table handle is released as soon as the host file is open;
+        // reads work on the descriptor, not on guest-visible data.
+        let _ = ge.close_file_handle(&handle);
+        Ok((file, normalized))
+    }
+
+    /// DirectStorage-style upload: open the file through the game environment's
+    /// file table, read the requested region straight into a Metal buffer, and
+    /// blit it into a private MTLTexture. Uncompressed sources never build a
+    /// guest-visible staging Vec (`staging_bytes` stays 0).
+    ///
+    /// The resource descriptor's format is the upload's real DXGI format,
+    /// derived from `desc.format`: there is no RGBA shadow descriptor.
+    pub fn upload_file_to_texture(
+        &mut self,
+        ge: &crate::ge::GameEnvironment,
+        windows_path: &str,
+        desc: crate::metal_backend::DirectStorageUploadDesc,
+    ) -> AppResult<ResourceId> {
+        let (mut file, normalized_path) = Self::open_directstorage_file(ge, windows_path)?;
+        let upload = crate::metal_backend::upload_texture_from_file(&mut file, desc)?;
+        let stats = upload.stats();
+        let format = upload.dxgi_format().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dFeatureUnsupported,
+                format!(
+                    "DirectStorage: upload texture format {:?} has no DXGI resource format",
+                    upload.format()
+                ),
+            )
+        })?;
+        self.directstorage_bytes += stats.directstorage_bytes;
+        self.staging_bytes += stats.staging_bytes;
+        let resource = self.backend.create_resource(ResourceDesc {
+            name: format!("directstorage-{normalized_path}"),
+            format,
+            heap: HeapType::Default,
+            size: stats.directstorage_bytes as usize,
+            subresources: 1,
+            initial_state: ResourceState::CopyDest,
+            usage_hint: ResourceUsageHint::Texture {
+                sampled: true,
+                render_target: true,
+                depth_stencil: false,
+                cpu_write_frequent: false,
+            },
+        })?;
+        self.gpu_textures.insert(resource, upload);
+        Ok(resource)
+    }
+
+    /// GPU readback of a texture created through
+    /// [`create_committed_resource_with_initial_data`] or
+    /// [`upload_file_to_texture`]. Uses a real texture -> buffer blit.
+    pub fn readback_gpu_texture(&self, resource: ResourceId) -> AppResult<Vec<u8>> {
+        self.gpu_textures
+            .get(&resource)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("resource {resource} has no GPU texture upload"),
+                )
+            })?
+            .read_back()
+    }
+
+    /// Bytes delivered by the DirectStorage direct path.
+    pub fn directstorage_bytes(&self) -> u64 {
+        self.directstorage_bytes
+    }
+
+    /// Bytes that transited a host staging buffer (compressed sources and
+    /// CreateResource initial-data uploads).
+    pub fn staging_bytes(&self) -> u64 {
+        self.staging_bytes
+    }
+
+    /// DXGI format of the real upload texture backing `resource`. This is the
+    /// format authority for DirectStorage resources (RGBA8, BGRA8, R8, …);
+    /// there is no RGBA shadow descriptor.
+    pub fn directstorage_texture_format(&self, resource: ResourceId) -> AppResult<DxgiFormat> {
+        self.gpu_textures
+            .get(&resource)
+            .and_then(|texture| texture.dxgi_format())
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("resource {resource} has no DirectStorage texture format"),
+                )
+            })
+    }
+
+    /// Number of GPU upload textures currently owned by the runtime.
+    pub fn directstorage_live_texture_count(&self) -> usize {
+        self.gpu_textures.len()
+    }
+
+    /// Format recorded in the backend resource descriptor.
+    pub fn resource_format(&self, resource: ResourceId) -> AppResult<DxgiFormat> {
+        self.backend.resource_format(resource)
+    }
+
+    fn ensure_directstorage_queue(
+        &mut self,
+    ) -> AppResult<std::sync::Arc<std::sync::Mutex<crate::metal_backend::DirectStorageUploadQueue>>>
+    {
+        if let Some(queue) = &self.directstorage_queue {
+            return Ok(queue.clone());
+        }
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::metal_backend::DirectStorageUploadQueue::new()?,
+        ));
+        if let Some(slot) = self.directstorage_completion.slot() {
+            queue
+                .lock()
+                .expect("DirectStorage queue poisoned")
+                .register_drain_callback(slot);
+        }
+        self.directstorage_queue = Some(queue.clone());
+        Ok(queue)
+    }
+
+    /// Enqueue an asynchronous DirectStorage upload. The source is read into
+    /// a Metal buffer immediately, then a blit command buffer is committed and
+    /// signals the queue's MTLSharedEvent. Uploads execute in enqueue order on
+    /// one MTLCommandQueue.
+    pub fn enqueue_file_to_texture(
+        &mut self,
+        ge: &crate::ge::GameEnvironment,
+        windows_path: &str,
+        desc: crate::metal_backend::DirectStorageUploadDesc,
+    ) -> AppResult<D3D12UploadTicket> {
+        let (mut file, normalized_path) = Self::open_directstorage_file(ge, windows_path)?;
+        let queue = self.ensure_directstorage_queue()?;
+        let (fence_value, upload) = queue
+            .lock()
+            .expect("DirectStorage queue poisoned")
+            .enqueue_file(&mut file, desc)?;
+        let format = upload.dxgi_format().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dFeatureUnsupported,
+                format!(
+                    "DirectStorage async: upload texture format {:?} has no DXGI resource format",
+                    upload.format()
+                ),
+            )
+        })?;
+        let stats = upload.stats();
+        let resource = self
+            .backend
+            .create_resource(ResourceDesc {
+                name: format!("directstorage-async-{normalized_path}"),
+                format,
+                heap: HeapType::Default,
+                size: stats.directstorage_bytes as usize,
+                subresources: 1,
+                initial_state: ResourceState::CopyDest,
+                usage_hint: ResourceUsageHint::Texture {
+                    sampled: true,
+                    render_target: true,
+                    depth_stencil: false,
+                    cpu_write_frequent: false,
+                },
+            })
+            .expect("gfx resource creation is infallible");
+        self.directstorage_bytes += stats.directstorage_bytes;
+        self.staging_bytes += stats.staging_bytes;
+        self.gpu_textures.insert(resource, upload);
+        self.directstorage_pending_resources
+            .push((resource, fence_value));
+        Ok(D3D12UploadTicket {
+            resource,
+            fence_value,
+        })
+    }
+
+    /// Alias for [`enqueue_file_to_texture`](Self::enqueue_file_to_texture).
+    pub fn upload_file_to_texture_async(
+        &mut self,
+        ge: &crate::ge::GameEnvironment,
+        windows_path: &str,
+        desc: crate::metal_backend::DirectStorageUploadDesc,
+    ) -> AppResult<D3D12UploadTicket> {
+        self.enqueue_file_to_texture(ge, windows_path, desc)
+    }
+
+    /// Enqueue one logical two-plane NV12 upload. The single ticket covers both
+    /// planes (one shared-event signal); [`readback_gpu_texture`] returns the
+    /// NV12 byte layout (luma then interleaved UV), and
+    /// [`readback_gpu_texture_plane`] reads one plane.
+    ///
+    /// The resource descriptor uses `R8_UNORM` for the luma plane. The chroma
+    /// plane is `RG8_UNORM`, which has no DXGI_FORMAT enum; the plane-typed
+    /// DirectStorage descriptor is its format authority.
+    pub fn enqueue_nv12_file_to_texture(
+        &mut self,
+        ge: &crate::ge::GameEnvironment,
+        windows_path: &str,
+        desc: crate::metal_backend::DirectStorageNv12UploadDesc,
+    ) -> AppResult<D3D12UploadTicket> {
+        let (mut file, normalized_path) = Self::open_directstorage_file(ge, windows_path)?;
+        let queue = self.ensure_directstorage_queue()?;
+        let (fence_value, upload) = queue
+            .lock()
+            .expect("DirectStorage queue poisoned")
+            .enqueue_nv12_file(&mut file, desc)?;
+        let format = upload
+            .dxgi_format()
+            .expect("NV12 luma uploads always map to R8Unorm");
+        let stats = upload.stats();
+        let resource = self.backend.create_resource(ResourceDesc {
+            name: format!("directstorage-nv12-{normalized_path}"),
+            format,
+            heap: HeapType::Default,
+            size: stats.directstorage_bytes as usize,
+            subresources: 2,
+            initial_state: ResourceState::CopyDest,
+            usage_hint: ResourceUsageHint::Texture {
+                sampled: true,
+                render_target: true,
+                depth_stencil: false,
+                cpu_write_frequent: false,
+            },
+        })?;
+        self.directstorage_bytes += stats.directstorage_bytes;
+        self.staging_bytes += stats.staging_bytes;
+        self.gpu_textures.insert(resource, upload);
+        self.directstorage_pending_resources
+            .push((resource, fence_value));
+        Ok(D3D12UploadTicket {
+            resource,
+            fence_value,
+        })
+    }
+
+    /// Read one plane of a DirectStorage upload through a real GPU blit.
+    /// Plane 0 is luma; plane 1 is the NV12 interleaved UV plane.
+    pub fn readback_gpu_texture_plane(
+        &self,
+        resource: ResourceId,
+        plane: usize,
+    ) -> AppResult<Vec<u8>> {
+        self.gpu_textures
+            .get(&resource)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("resource {resource} has no GPU texture upload"),
+                )
+            })?
+            .read_back_plane(plane)
+    }
+
+    fn completed_directstorage_resources(&mut self, fence_value: u64) {
+        self.directstorage_pending_resources
+            .retain(|(_, value)| *value > fence_value);
+    }
+
+    /// Non-blocking async upload poll. Updates completion counters and fires
+    /// the completion hook once when the queue transitions to empty.
+    pub fn poll_directstorage_uploads(
+        &mut self,
+    ) -> AppResult<crate::metal_backend::DirectStorageQueueStats> {
+        let Some(queue) = self.directstorage_queue.clone() else {
+            return Ok(crate::metal_backend::DirectStorageQueueStats::default());
+        };
+        let stats = queue.lock().expect("DirectStorage queue poisoned").poll();
+        self.completed_directstorage_resources(stats.fence_value);
+        Ok(stats)
+    }
+
+    /// Wait for every queued async upload. Returns the GPU-observed fence
+    /// value. A timeout is a real error, never a silent false.
+    pub fn wait_for_directstorage_uploads(&mut self, timeout_ns: u64) -> AppResult<u64> {
+        let Some(queue) = self.directstorage_queue.clone() else {
+            return Ok(0);
+        };
+        let fence_value = queue
+            .lock()
+            .expect("DirectStorage queue poisoned")
+            .wait_for_all(timeout_ns)?;
+        self.completed_directstorage_resources(fence_value);
+        Ok(fence_value)
+    }
+
+    /// Wait for a specific shared-event value (used by adversarial timeout
+    /// tests and multi-upload ordering checks).
+    pub fn wait_for_directstorage_fence(&mut self, value: u64, timeout_ns: u64) -> AppResult<()> {
+        let Some(queue) = self.directstorage_queue.clone() else {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("DirectStorage: no upload queue exists to wait for value {value}"),
+            ));
+        };
+        let stats = {
+            let mut queue = queue.lock().expect("DirectStorage queue poisoned");
+            queue.wait_for_value(value, timeout_ns)?;
+            queue.stats()
+        };
+        self.completed_directstorage_resources(stats.fence_value);
+        Ok(())
+    }
+
+    /// Snapshot of queued/completed/in-flight counters.
+    pub fn directstorage_upload_stats(&self) -> crate::metal_backend::DirectStorageQueueStats {
+        self.directstorage_queue
+            .as_ref()
+            .map(|queue| queue.lock().expect("DirectStorage queue poisoned").stats())
+            .unwrap_or_default()
+    }
+
+    /// Cumulative uploads accepted into the async queue.
+    pub fn directstorage_queued_uploads(&self) -> u64 {
+        self.directstorage_upload_stats().queued
+    }
+
+    /// Uploads whose GPU completion the shared event has observed.
+    pub fn directstorage_completed_uploads(&self) -> u64 {
+        self.directstorage_upload_stats().completed
+    }
+
+    /// Uploads currently retained by the pipeline (staging buffer + texture).
+    pub fn directstorage_in_flight_uploads(&self) -> u64 {
+        self.directstorage_upload_stats().in_flight
+    }
+
+    /// Short alias for [`poll_directstorage_uploads`](Self::poll_directstorage_uploads).
+    pub fn poll_upload_completion(
+        &mut self,
+    ) -> AppResult<crate::metal_backend::DirectStorageQueueStats> {
+        self.poll_directstorage_uploads()
+    }
+
+    /// Short alias for
+    /// [`wait_for_directstorage_uploads`](Self::wait_for_directstorage_uploads).
+    pub fn wait_for_upload_completion(&mut self, timeout_ns: u64) -> AppResult<u64> {
+        self.wait_for_directstorage_uploads(timeout_ns)
+    }
+
+    /// Short alias for
+    /// [`set_directstorage_completion_callback`](Self::set_directstorage_completion_callback).
+    pub fn set_upload_completion_callback(&mut self, callback: impl FnMut() + Send + 'static) {
+        self.set_directstorage_completion_callback(callback);
+    }
+
+    /// Current GPU-observed shared-event value.
+    pub fn directstorage_fence_value(&self) -> u64 {
+        self.directstorage_queue
+            .as_ref()
+            .map(|queue| {
+                queue
+                    .lock()
+                    .expect("DirectStorage queue poisoned")
+                    .fence_value()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Register a completion hook fired once each time the async upload queue
+    /// drains (not once per upload).
+    pub fn set_directstorage_completion_callback(
+        &mut self,
+        callback: impl FnMut() + Send + 'static,
+    ) {
+        self.directstorage_completion.set(Box::new(callback));
+        if let (Some(queue), Some(slot)) = (
+            &self.directstorage_queue,
+            self.directstorage_completion.slot(),
+        ) {
+            queue
+                .lock()
+                .expect("DirectStorage queue poisoned")
+                .register_drain_callback(slot);
+        }
+    }
+
+    /// Cancel/drain in-flight async uploads, releasing their staging buffers,
+    /// queue-held textures and the resources they created.
+    pub fn cancel_directstorage_uploads(&mut self) -> AppResult<()> {
+        let Some(queue) = self.directstorage_queue.clone() else {
+            return Ok(());
+        };
+        queue
+            .lock()
+            .expect("DirectStorage queue poisoned")
+            .cancel_in_flight();
+        let pending = std::mem::take(&mut self.directstorage_pending_resources);
+        for (resource, _) in pending {
+            self.gpu_textures.remove(&resource);
+            let _ = self.backend.destroy_resource(resource);
+        }
+        Ok(())
+    }
+
+    /// Cancel only uploads that have not reached the GPU queue yet. Committed
+    /// uploads are never affected and still complete. Returns the number of
+    /// uncommitted uploads removed.
+    pub fn cancel_pending_directstorage_uploads(&mut self) -> u64 {
+        let Some(queue) = self.directstorage_queue.clone() else {
+            return 0;
+        };
+        let cancelled = {
+            let mut queue = queue.lock().expect("DirectStorage queue poisoned");
+            let cancelled = queue.cancel_pending();
+            (cancelled, queue.cancelled_fences())
+        };
+        let (count, fences) = cancelled;
+        if count > 0 {
+            let pending = std::mem::take(&mut self.directstorage_pending_resources);
+            for (resource, value) in pending {
+                if fences.contains(&value) {
+                    self.gpu_textures.remove(&resource);
+                    let _ = self.backend.destroy_resource(resource);
+                } else {
+                    self.directstorage_pending_resources.push((resource, value));
+                }
+            }
+        }
+        count
+    }
+
+    /// Report uploads that are already committed to the GPU queue and therefore
+    /// cannot be cancelled. They keep running and complete normally.
+    pub fn cancel_committed_directstorage_uploads(&self) -> u64 {
+        self.directstorage_queue
+            .as_ref()
+            .map(|queue| {
+                queue
+                    .lock()
+                    .expect("DirectStorage queue poisoned")
+                    .cancel_committed()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Reset the async pipeline: drains in-flight work, releases every
+    /// retained resource and clears the pending-resource set.
+    pub fn reset_directstorage_uploads(&mut self) -> AppResult<()> {
+        self.cancel_directstorage_uploads()
+    }
+
     pub fn destroy_resource(&mut self, resource: ResourceId) -> AppResult<()> {
+        // Drop any GPU upload texture first so resource destruction releases
+        // the real MTLTexture (no shadow entries left behind).
+        self.gpu_textures.remove(&resource);
+        self.directstorage_pending_resources
+            .retain(|(pending, _)| *pending != resource);
         self.backend.destroy_resource(resource)
     }
 
@@ -880,6 +1885,18 @@ impl D3d12Runtime {
         fence: FenceId,
         required_value: u64,
     ) -> AppResult<Vec<u8>> {
+        // DirectStorage resources live in a real private MTLTexture, not in
+        // the backend's CPU shadow bytes; read the actual texture once the
+        // caller's fence is satisfied.
+        if let Some(texture) = self.gpu_textures.get(&resource) {
+            if self.backend.fence_value(fence)? < required_value {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "readback requires a completed fence",
+                ));
+            }
+            return texture.read_back();
+        }
         self.backend.readback(resource, fence, required_value)
     }
 
@@ -1149,13 +2166,9 @@ impl D3d12Runtime {
                 _ => None,
             });
         if let Some(resource) = resource {
-            if let Some(channel_index) = self.present_backbuffer_index(resource) {
-                let pixels = vec![
-                    0u8;
-                    self.iosurface_channels[channel_index].width() as usize
-                        * self.iosurface_channels[channel_index].height() as usize
-                        * 4
-                ];
+            if let Some((swapchain, _channel_index)) = self.present_backbuffer_index(resource) {
+                let state = self.backend.swapchain_state(swapchain)?;
+                let pixels = vec![0u8; state.desc.width as usize * state.desc.height as usize * 4];
                 self.write_present_backbuffer_bytes(resource, 0, &pixels)?;
             }
         }
@@ -2143,77 +3156,6 @@ mod tests {
     use crate::gfx::host_gpu_profile_from_name;
 
     #[test]
-    fn d3d12_runtime_submits_and_presents_through_backend() {
-        let mut runtime = D3d12Runtime::new();
-        let swapchain = runtime
-            .create_swapchain(SwapchainDesc {
-                width: 1280,
-                height: 720,
-                format: DxgiFormat::R8G8B8A8Unorm,
-                buffer_count: 2,
-            })
-            .expect("create swapchain");
-        let backbuffer = runtime
-            .swapchain_state(swapchain)
-            .expect("swapchain state")
-            .backbuffers[0];
-        let rtv_heap = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
-        runtime
-            .write_descriptor(
-                rtv_heap,
-                0,
-                ViewDescriptor::Rtv {
-                    resource: backbuffer,
-                    format: DxgiFormat::R8G8B8A8Unorm,
-                },
-            )
-            .expect("write rtv descriptor");
-        let root_signature = runtime.create_root_signature(RootSignatureDesc {
-            descriptor_tables: vec![1],
-            root_constants: 4,
-            ..Default::default()
-        });
-        let pipeline_state = runtime.create_pipeline_state(
-            root_signature,
-            PipelineStateDesc {
-                label: "smoke".to_string(),
-                compute: false,
-                render_target_formats: vec![DxgiFormat::R8G8B8A8Unorm],
-                depth_format: None,
-            },
-        );
-        let queue = runtime.create_command_queue();
-        let allocator = runtime.create_command_allocator();
-        let list = runtime.create_graphics_command_list(allocator, pipeline_state, false);
-        runtime
-            .record_begin_render_pass(
-                list,
-                vec![DxgiFormat::R8G8B8A8Unorm],
-                None,
-                "clear",
-                "store",
-            )
-            .expect("begin render pass");
-        runtime
-            .record_clear_rtv(list, rtv_heap, 0)
-            .expect("clear rtv");
-        runtime.record_draw(list, 3).expect("draw");
-        let stream = runtime.close_command_list(list).expect("close list");
-        let fence = runtime.create_fence(0);
-        let plan = runtime
-            .execute_command_lists(queue, &[stream], Some((fence, 1)))
-            .expect("execute command lists");
-
-        assert_eq!(plan.render_passes.len(), 1);
-        assert_eq!(plan.render_passes[0].draw_calls, 1);
-        assert_eq!(runtime.fence_value(fence).expect("fence value"), 1);
-
-        let present = runtime.present(swapchain, 1, false).expect("present");
-        assert_eq!(present.effective_sync_interval, 1);
-        assert_eq!(present.queued_frames, 1);
-    }
-
-    #[test]
     fn d3d12_present_falls_back_when_iosurface_is_unavailable() {
         let mut runtime = D3d12Runtime::new();
         let swapchain = runtime
@@ -2256,126 +3198,6 @@ mod tests {
     }
 
     #[test]
-    fn d3d12_iosurface_present_zero_copy_roundtrip() {
-        let mut runtime = D3d12Runtime::new();
-        let swapchain = runtime
-            .create_swapchain(SwapchainDesc {
-                width: 4,
-                height: 2,
-                format: DxgiFormat::R8G8B8A8Unorm,
-                buffer_count: 2,
-            })
-            .expect("create swapchain");
-        if !runtime.iosurface_zero_copy_active() {
-            // Capability gate: fallback is the verified host-visible path.
-            return;
-        }
-        let backbuffer = runtime
-            .swapchain_state(swapchain)
-            .expect("swapchain state")
-            .backbuffers[0];
-        let pixels: Vec<u8> = (0..4 * 2 * 4).map(|index| (index * 9) as u8).collect();
-        runtime
-            .overwrite_resource_bytes(backbuffer, &pixels)
-            .expect("upload backbuffer pixels");
-        runtime.present(swapchain, 1, false).expect("present");
-
-        assert_eq!(
-            runtime.fallback_upload_count(),
-            0,
-            "swapchain present must not use the fallback upload path"
-        );
-        assert_eq!(runtime.iosurface_present_count(), 1);
-        assert!(
-            runtime.zero_copy_upload_count() >= 1,
-            "backbuffer pixels must be written directly into the IOSurface"
-        );
-        let frame = runtime.presented_frame(swapchain).expect("presented frame");
-        assert_eq!(
-            frame.bytes, pixels,
-            "pixels must round-trip through surface"
-        );
-
-        for _ in 0..6 {
-            runtime
-                .present(swapchain, 1, false)
-                .expect("repeat present");
-        }
-        assert_eq!(
-            runtime.iosurface_texture_builds(),
-            1,
-            "aliasing texture is reused (no per-frame texture leak)"
-        );
-        assert_eq!(runtime.fallback_upload_count(), 0);
-        assert_eq!(
-            runtime.surface_writes(),
-            1,
-            "present must not rewrite the authoritative surface"
-        );
-        assert_eq!(runtime.iosurface_channels.len(), 2);
-        assert_eq!(
-            runtime.presented_surface_handle(),
-            Some(runtime.iosurface_channels[0].surface_ptr())
-        );
-    }
-
-    #[test]
-    fn d3d12_surface_is_authoritative_for_backbuffer_writes() {
-        let mut runtime = D3d12Runtime::new();
-        let swapchain = runtime
-            .create_swapchain(SwapchainDesc {
-                width: 4,
-                height: 2,
-                format: DxgiFormat::R8G8B8A8Unorm,
-                buffer_count: 2,
-            })
-            .expect("create swapchain");
-        if !runtime.iosurface_zero_copy_active() {
-            return;
-        }
-        let backbuffer = runtime
-            .swapchain_state(swapchain)
-            .expect("swapchain state")
-            .backbuffers[0];
-        let initial_backing = runtime
-            .backend()
-            .resource_bytes(backbuffer)
-            .expect("backing bytes")
-            .to_vec();
-        let pixels: Vec<u8> = (0..4 * 2 * 4).map(|index| (index * 5) as u8).collect();
-        runtime
-            .overwrite_resource_bytes(backbuffer, &pixels)
-            .expect("write through surface");
-
-        assert_eq!(
-            runtime
-                .backend()
-                .resource_bytes(backbuffer)
-                .expect("backing bytes"),
-            initial_backing.as_slice(),
-            "the CPU backing must stay untouched on the zero-copy path"
-        );
-        assert_eq!(runtime.surface_writes(), 1);
-        assert_eq!(runtime.cpu_backing_writes(), 0);
-
-        runtime.present(swapchain, 1, false).expect("present");
-        assert_eq!(
-            runtime.presented_surface_handle(),
-            Some(runtime.iosurface_channels[0].surface_ptr())
-        );
-        let frame = runtime.presented_frame(swapchain).expect("presented frame");
-        assert_eq!(frame.bytes, pixels);
-        assert_eq!(
-            runtime
-                .presented_frame_rgba(swapchain)
-                .expect("rgba consumer"),
-            pixels
-        );
-        assert_eq!(runtime.surface_writes(), 1);
-        assert_eq!(runtime.cpu_backing_writes(), 0);
-    }
-
-    #[test]
     fn d3d12_present_rejects_mismatched_channel_format() {
         let mut runtime = D3d12Runtime::new();
         let swapchain = runtime
@@ -2402,136 +3224,6 @@ mod tests {
             error.to_string().contains("format"),
             "unexpected error: {error}"
         );
-    }
-
-    #[test]
-    fn d3d12_clear_writes_the_present_surface_not_cpu_backing() {
-        let mut runtime = D3d12Runtime::new();
-        let swapchain = runtime
-            .create_swapchain(SwapchainDesc {
-                width: 4,
-                height: 2,
-                format: DxgiFormat::R8G8B8A8Unorm,
-                buffer_count: 2,
-            })
-            .expect("create swapchain");
-        if !runtime.iosurface_zero_copy_active() {
-            return;
-        }
-        let backbuffer = runtime
-            .swapchain_state(swapchain)
-            .expect("swapchain state")
-            .backbuffers[0];
-        let heap = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
-        runtime
-            .write_descriptor(
-                heap,
-                0,
-                ViewDescriptor::Rtv {
-                    resource: backbuffer,
-                    format: DxgiFormat::R8G8B8A8Unorm,
-                },
-            )
-            .expect("rtv");
-        let initial_backing = runtime
-            .backend()
-            .resource_bytes(backbuffer)
-            .expect("backing bytes")
-            .to_vec();
-
-        let stale = vec![0x5au8; 4 * 2 * 4];
-        runtime
-            .overwrite_resource_bytes(backbuffer, &stale)
-            .expect("write stale pixels");
-        let allocator = runtime.create_command_allocator();
-        let root_signature = runtime.create_root_signature(RootSignatureDesc::default());
-        let pipeline = runtime.create_pipeline_state(
-            root_signature,
-            PipelineStateDesc {
-                label: "d3d12-clear".to_string(),
-                compute: false,
-                render_target_formats: vec![DxgiFormat::R8G8B8A8Unorm],
-                depth_format: None,
-            },
-        );
-        let list = runtime.create_graphics_command_list(allocator, pipeline, false);
-        runtime.record_clear_rtv(list, heap, 0).expect("clear rtv");
-
-        assert_eq!(runtime.surface_writes(), 2);
-        assert_eq!(runtime.cpu_backing_writes(), 0);
-        assert_eq!(
-            runtime
-                .backend()
-                .resource_bytes(backbuffer)
-                .expect("backing bytes"),
-            initial_backing.as_slice()
-        );
-        runtime.present(swapchain, 1, false).expect("present");
-        let frame = runtime.presented_frame(swapchain).expect("presented frame");
-        assert!(
-            frame.bytes.iter().all(|byte| *byte == 0),
-            "clear must publish surface pixels"
-        );
-    }
-
-    #[test]
-    fn d3d12_resize_recreates_surfaces_and_publishes_new_frame() {
-        let mut runtime = D3d12Runtime::new();
-        let swapchain = runtime
-            .create_swapchain(SwapchainDesc {
-                width: 4,
-                height: 2,
-                format: DxgiFormat::R8G8B8A8Unorm,
-                buffer_count: 2,
-            })
-            .expect("create swapchain");
-        if !runtime.iosurface_zero_copy_active() {
-            return;
-        }
-        let old_backbuffer = runtime
-            .swapchain_state(swapchain)
-            .expect("swapchain state")
-            .backbuffers[0];
-        let old_pixels = vec![0x33u8; 4 * 2 * 4];
-        runtime
-            .overwrite_resource_bytes(old_backbuffer, &old_pixels)
-            .expect("write old surface");
-        runtime.present(swapchain, 1, false).expect("present old");
-        assert_eq!(runtime.iosurface_texture_builds(), 1);
-
-        runtime
-            .resize_buffers(swapchain, 2, 8, 4, DxgiFormat::R8G8B8A8Unorm)
-            .expect("resize");
-        assert_eq!(runtime.iosurface_channels.len(), 2);
-        assert!(
-            runtime
-                .iosurface_channels
-                .iter()
-                .all(|channel| { channel.width() == 8 && channel.height() == 4 })
-        );
-        assert_eq!(
-            runtime.iosurface_texture_builds(),
-            0,
-            "resize must build fresh surfaces, not leak the old textures"
-        );
-
-        let new_backbuffer = runtime
-            .swapchain_state(swapchain)
-            .expect("resized state")
-            .backbuffers[0];
-        let new_pixels: Vec<u8> = (0..8 * 4 * 4).map(|index| (index * 3) as u8).collect();
-        runtime
-            .overwrite_resource_bytes(new_backbuffer, &new_pixels)
-            .expect("write resized surface");
-        runtime
-            .present(swapchain, 1, false)
-            .expect("present resized");
-
-        let frame = runtime.presented_frame(swapchain).expect("presented frame");
-        assert_eq!((frame.width, frame.height), (8, 4));
-        assert_eq!(frame.bytes, new_pixels);
-        assert_eq!(runtime.cpu_backing_writes(), 0);
-        assert_eq!(runtime.iosurface_texture_builds(), 1);
     }
 
     #[test]
@@ -2597,390 +3289,11 @@ mod tests {
         assert_eq!(accel.gpu_address, 0x1000);
     }
 
-    #[test]
-    fn d3d12_build_top_level_acceleration_structure() {
-        let mut runtime = D3d12Runtime::new();
-
-        // First create a BLAS to reference
-        let blas_desc = D3D12BuildAccelerationStructureDesc {
-            dest_address: 0x1000,
-            inputs: D3D12BuildRaytracingInputs {
-                ty: 0,
-                flags: 0,
-                num_descs: 1,
-                geometries: vec![D3D12RaytracingGeometryDesc {
-                    ty: 0,
-                    flags: 0,
-                    vertex_buffer: 0x2000,
-                    vertex_format: 80,
-                    vertex_stride: 12,
-                    vertex_count: 36,
-                    index_buffer: 0x3000,
-                    index_format: 57,
-                    index_count: 36,
-                }],
-            },
-            source_address: 0,
-            scratch_address: 0x4000,
-        };
-
-        let allocator = runtime.create_command_allocator();
-        let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
-
-        runtime
-            .build_raytracing_acceleration_structure(list, &blas_desc)
-            .expect("build BLAS");
-
-        // Now build a TLAS referencing it
-        let tlas_desc = D3D12BuildAccelerationStructureDesc {
-            dest_address: 0x5000,
-            inputs: D3D12BuildRaytracingInputs {
-                ty: 1, // TOP_LEVEL
-                flags: 0,
-                num_descs: 1,
-                geometries: vec![], // TLAS uses instances, not geometries
-            },
-            source_address: 0,
-            scratch_address: 0x6000,
-        };
-
-        let result = runtime.build_raytracing_acceleration_structure(list, &tlas_desc);
-        assert!(result.is_ok(), "build TLAS should succeed");
-
-        let accel = runtime.acceleration_structure(0x5000);
-        assert!(accel.is_some(), "TLAS should exist");
-        let accel = accel.unwrap();
-        assert!(accel.is_top_level, "should be top-level");
-        assert_eq!(accel.gpu_address, 0x5000);
-    }
-
-    #[test]
-    fn d3d12_copy_acceleration_structure() {
-        let mut runtime = D3d12Runtime::new();
-
-        let allocator = runtime.create_command_allocator();
-        let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
-
-        // Build a BLAS first
-        let desc = D3D12BuildAccelerationStructureDesc {
-            dest_address: 0x1000,
-            inputs: D3D12BuildRaytracingInputs {
-                ty: 0,
-                flags: 0,
-                num_descs: 1,
-                geometries: vec![D3D12RaytracingGeometryDesc {
-                    ty: 0,
-                    flags: 0,
-                    vertex_buffer: 0x2000,
-                    vertex_format: 80,
-                    vertex_stride: 12,
-                    vertex_count: 3,
-                    index_buffer: 0,
-                    index_format: 0,
-                    index_count: 0,
-                }],
-            },
-            source_address: 0,
-            scratch_address: 0x4000,
-        };
-        runtime
-            .build_raytracing_acceleration_structure(list, &desc)
-            .expect("build");
-
-        // COPY mode
-        runtime
-            .copy_raytracing_acceleration_structure(list, 0x2000, 0x1000, 0)
-            .expect("copy AS");
-        assert!(
-            runtime.acceleration_structure(0x2000).is_some(),
-            "copy should exist"
-        );
-
-        // COMPACT mode
-        runtime
-            .copy_raytracing_acceleration_structure(list, 0x3000, 0x1000, 1)
-            .expect("compact AS");
-        assert!(
-            runtime.acceleration_structure(0x3000).is_some(),
-            "compact should exist"
-        );
-    }
-
-    #[test]
-    fn d3d12_set_pipeline_state1_and_dispatch_rays() {
-        let mut runtime = D3d12Runtime::new();
-
-        let allocator = runtime.create_command_allocator();
-        let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
-
-        // Set a raytracing pipeline state
-        let dxil = vec![0u8; 128]; // dummy DXIL
-        runtime
-            .set_pipeline_state1(list, 0xABCD, dxil)
-            .expect("set pipeline state1");
-
-        let pso = runtime.get_raytracing_pipeline_state(0xABCD);
-        assert!(pso.is_some(), "PSO should be stored");
-        assert_eq!(pso.unwrap().dxil_bytecode.len(), 128);
-
-        // Dispatch rays with valid parameters
-        let dispatch_desc = D3D12DispatchRaysDesc {
-            raygen_shader_start_address: 0x5000,
-            raygen_shader_size: 64,
-            miss_shader_start_address: 0x6000,
-            miss_shader_size: 64,
-            miss_shader_stride: 64,
-            hit_group_start_address: 0x7000,
-            hit_group_size: 64,
-            hit_group_stride: 64,
-            callable_shader_start_address: 0,
-            callable_shader_size: 0,
-            callable_shader_stride: 0,
-            width: 16,
-            height: 16,
-            depth: 1,
-        };
-
-        let result = runtime.dispatch_rays(list, &dispatch_desc);
-        assert!(result.is_ok(), "dispatch rays should succeed");
-
-        // Dispatch with zero dimensions should be a no-op
-        let zero_desc = D3D12DispatchRaysDesc {
-            raygen_shader_start_address: 0x5000,
-            raygen_shader_size: 64,
-            miss_shader_start_address: 0x6000,
-            miss_shader_size: 64,
-            miss_shader_stride: 64,
-            hit_group_start_address: 0x7000,
-            hit_group_size: 64,
-            hit_group_stride: 64,
-            callable_shader_start_address: 0,
-            callable_shader_size: 0,
-            callable_shader_stride: 0,
-            width: 0,
-            height: 0,
-            depth: 0,
-        };
-        assert!(
-            runtime.dispatch_rays(list, &zero_desc).is_ok(),
-            "zero dispatch should be no-op"
-        );
-    }
-
-    #[test]
-    fn d3d12_emit_postbuild_info() {
-        let mut runtime = D3d12Runtime::new();
-
-        let allocator = runtime.create_command_allocator();
-        let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
-
-        // Build an AS first
-        let desc = D3D12BuildAccelerationStructureDesc {
-            dest_address: 0x1000,
-            inputs: D3D12BuildRaytracingInputs {
-                ty: 0,
-                flags: 0,
-                num_descs: 1,
-                geometries: vec![D3D12RaytracingGeometryDesc {
-                    ty: 0,
-                    flags: 0,
-                    vertex_buffer: 0x2000,
-                    vertex_format: 80,
-                    vertex_stride: 12,
-                    vertex_count: 3,
-                    index_buffer: 0,
-                    index_format: 0,
-                    index_count: 0,
-                }],
-            },
-            source_address: 0,
-            scratch_address: 0x4000,
-        };
-        runtime
-            .build_raytracing_acceleration_structure(list, &desc)
-            .expect("build");
-
-        // Test COMPACTED_SIZE postbuild info
-        let mut output = vec![0u8; 8];
-        runtime
-            .emit_raytracing_acceleration_structure_postbuild_info(list, 1, &[0x1000], &mut output)
-            .expect("emit compacted size");
-        let compacted_size = u64::from_le_bytes(output[..8].try_into().unwrap());
-        assert!(compacted_size > 0, "compacted size should be non-zero");
-
-        // Test TOOLS_VISUALIZATION
-        let mut vis_output = vec![0u8; 8];
-        runtime
-            .emit_raytracing_acceleration_structure_postbuild_info(
-                list,
-                2,
-                &[0x1000],
-                &mut vis_output,
-            )
-            .expect("emit visualization size");
-        let vis_size = u64::from_le_bytes(vis_output[..8].try_into().unwrap());
-        assert!(vis_size > 0, "visualization size should be non-zero");
-
-        // Test SERIALIZATION
-        let mut ser_output = vec![0u8; 16];
-        runtime
-            .emit_raytracing_acceleration_structure_postbuild_info(
-                list,
-                3,
-                &[0x1000],
-                &mut ser_output,
-            )
-            .expect("emit serialization info");
-    }
-
-    #[test]
-    fn d3d12_raytracing_feature_options() {
-        // With Apple GPU family >= 7, raytracing should be enabled
-        let runtime = D3d12Runtime::from_backend(GraphicsBackend::with_host_profile(
-            host_gpu_profile_from_name("Apple M1"),
-        ));
-        let info = runtime.device_info();
-        assert!(
-            info.features.raytracing,
-            "Apple M1 should support raytracing"
-        );
-
-        // With older GPU, raytracing may not be supported
-        // Simulate older GPU by using a generic profile
-        let runtime2 = D3d12Runtime::new();
-        let info2 = runtime2.device_info();
-        // The default backend uses detected host GPU, so just verify the field exists
-        let _ = info2.features.raytracing;
-    }
-
     // ── Descriptor heap tests ──────────────────────────────────────────
-
-    #[test]
-    fn d3d12_create_rtv_descriptor_heap() {
-        let mut runtime = D3d12Runtime::new();
-        let heap = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 4);
-        assert_ne!(heap, 0, "descriptor heap ID should be non-zero");
-    }
-
-    #[test]
-    fn d3d12_create_cbv_srv_uav_descriptor_heap() {
-        let mut runtime = D3d12Runtime::new();
-        let heap = runtime.create_descriptor_heap(DescriptorHeapType::CbvSrvUav, 8);
-        assert_ne!(heap, 0, "descriptor heap ID should be non-zero");
-    }
-
-    #[test]
-    fn d3d12_create_sampler_descriptor_heap() {
-        let mut runtime = D3d12Runtime::new();
-        let heap = runtime.create_descriptor_heap(DescriptorHeapType::Sampler, 4);
-        assert_ne!(heap, 0, "descriptor heap ID should be non-zero");
-    }
-
-    #[test]
-    fn d3d12_write_rtv_descriptor_to_heap() {
-        let mut runtime = D3d12Runtime::new();
-        let swapchain = runtime
-            .create_swapchain(SwapchainDesc {
-                width: 64,
-                height: 64,
-                format: DxgiFormat::R8G8B8A8Unorm,
-                buffer_count: 2,
-            })
-            .expect("create swapchain");
-        let backbuffer = runtime.swapchain_state(swapchain).unwrap().backbuffers[0];
-        let heap = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
-        runtime
-            .write_descriptor(
-                heap,
-                0,
-                ViewDescriptor::Rtv {
-                    resource: backbuffer,
-                    format: DxgiFormat::R8G8B8A8Unorm,
-                },
-            )
-            .expect("write RTV descriptor");
-    }
 
     // ── Root signature tests ───────────────────────────────────────────
 
-    #[test]
-    fn d3d12_create_root_signature_default() {
-        let mut runtime = D3d12Runtime::new();
-        let rs = runtime.create_root_signature(RootSignatureDesc::default());
-        assert_ne!(rs, 0, "root signature ID should be non-zero");
-    }
-
-    #[test]
-    fn d3d12_create_root_signature_with_tables() {
-        let mut runtime = D3d12Runtime::new();
-        let rs = runtime.create_root_signature(RootSignatureDesc {
-            descriptor_tables: vec![4, 8],
-            root_constants: 2,
-            ..Default::default()
-        });
-        assert_ne!(rs, 0);
-    }
-
-    #[test]
-    fn d3d12_create_root_signature_with_static_samplers() {
-        let mut runtime = D3d12Runtime::new();
-        let rs = runtime.create_root_signature(RootSignatureDesc {
-            descriptor_tables: vec![2],
-            root_constants: 0,
-            static_samplers: vec![D3D12StaticSamplerDesc {
-                shader_register: 0,
-                register_space: 0,
-                filter: 2, // linear
-                address_u: 1,
-                address_v: 1,
-                address_w: 1,
-                mip_lod_bias: 0.0,
-                max_anisotropy: 16,
-                comparison_func: 0,
-                border_color: 0,
-                min_lod: 0.0,
-                max_lod: 1000.0,
-                shader_visibility: D3D12ShaderVisibility::All,
-            }],
-            ..Default::default()
-        });
-        assert_ne!(rs, 0);
-    }
-
     // ── Command list creation tests ────────────────────────────────────
-
-    #[test]
-    fn d3d12_create_command_list() {
-        let mut runtime = D3d12Runtime::new();
-        let allocator = runtime.create_command_allocator();
-        let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
-        assert_ne!(list, 0, "command list ID should be non-zero");
-    }
-
-    #[test]
-    fn d3d12_create_bundle_command_list() {
-        let mut runtime = D3d12Runtime::new();
-        let allocator = runtime.create_command_allocator();
-        let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig, true);
-        assert_ne!(list, 0, "bundle command list ID should be non-zero");
-    }
-
-    #[test]
-    fn d3d12_multiple_command_allocators() {
-        let mut runtime = D3d12Runtime::new();
-        let alloc1 = runtime.create_command_allocator();
-        let alloc2 = runtime.create_command_allocator();
-        assert_ne!(
-            alloc1, alloc2,
-            "different allocators should have distinct IDs"
-        );
-    }
 
     // ── Enum translation tables ────────────────────────────────────────────
 
@@ -3040,42 +3353,9 @@ mod tests {
     }
 
     /// D3D12_COMPARISON_FUNC: 1=NEVER .. 8=ALWAYS (per d3d12.h).
-    #[test]
-    fn map_d3d12_comparison_func_full_table() {
-        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(1), "never");
-        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(2), "less");
-        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(3), "equal");
-        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(4), "less_equal");
-        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(5), "greater");
-        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(6), "not_equal");
-        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(7), "greater_equal");
-        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(8), "always");
-        // Unknown values: documented default (D3D12_COMPARISON_FUNC_NEVER).
-        for unknown in [0, 9, 99, u32::MAX] {
-            assert_eq!(
-                D3d12Runtime::map_d3d12_comparison_func(unknown),
-                "never",
-                "unknown comparison func {unknown} must map to the documented default"
-            );
-        }
-    }
 
     /// D3D12_STATIC_BORDER_COLOR: 0=TRANSPARENT_BLACK, 1=OPAQUE_BLACK,
     /// 2=OPAQUE_WHITE (per d3d12.h).
-    #[test]
-    fn map_d3d12_border_color_full_table() {
-        assert_eq!(D3d12Runtime::map_d3d12_border_color(0), "transparent_black");
-        assert_eq!(D3d12Runtime::map_d3d12_border_color(1), "opaque_black");
-        assert_eq!(D3d12Runtime::map_d3d12_border_color(2), "opaque_white");
-        // Unknown values: documented default (TRANSPARENT_BLACK).
-        for unknown in [3, 4, 99, u32::MAX] {
-            assert_eq!(
-                D3d12Runtime::map_d3d12_border_color(unknown),
-                "transparent_black",
-                "unknown border color {unknown} must map to the documented default"
-            );
-        }
-    }
 
     /// D3D12_FILTER bit encoding (per d3d12.h): bits 0-1 mip, 2-3 mag, 4-5
     /// min, bit 6 anisotropic, bits 7-8 reduction type. Named constants are
@@ -3236,28 +3516,6 @@ mod tests {
     /// D3D12_FILTER_REDUCTION_TYPE: 0=STANDARD, 1=COMPARISON, 2=MINIMUM,
     /// 3=MAXIMUM (per d3d12.h). Values outside 0..=3 are undefined — a
     /// validation error on Windows.
-    #[test]
-    fn d3d12_filter_reduction_full_table() {
-        use D3D12FilterReduction::*;
-        let cases: [(u32, (D3D12FilterReduction, &str)); 4] = [
-            (0, (Standard, "STANDARD")),
-            (1, (Comparison, "COMPARISON")),
-            (2, (Minimum, "MINIMUM")),
-            (3, (Maximum, "MAXIMUM")),
-        ];
-        for (value, (reduction, name)) in cases {
-            assert_eq!(D3D12FilterReduction::from_u32(value), Some(reduction));
-            assert_eq!(reduction.d3d12_name(), name);
-            assert_eq!(reduction.as_u32(), value);
-        }
-        for value in 4..=8 {
-            assert_eq!(
-                D3D12FilterReduction::from_u32(value),
-                None,
-                "reduction type {value} is undefined per d3d12.h"
-            );
-        }
-    }
 
     /// Out-of-range address modes are rejected by both the validator and the
     /// descriptor builder — exactly the Windows validation behavior.
@@ -3375,147 +3633,1717 @@ mod tests {
         (runtime, streams)
     }
 
+    fn test_game_environment(name: &str) -> (crate::ge::GameEnvironment, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "casa1-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(root.join("drive_c")).expect("create GE drive");
+        std::fs::create_dir_all(root.join("tmp")).expect("create GE tmp");
+        let config = crate::ge::GeConfig {
+            schema_version: 1,
+            name: name.to_string(),
+            arch: crate::ge::GeArch::X64,
+            winver: "win10".to_string(),
+            user_name: "tester".to_string(),
+            long_paths_enabled: false,
+            drive_mappings: vec![crate::ge::DriveMapping {
+                drive: "C".to_string(),
+                target: "<GE>/drive_c".to_string(),
+                read_only: false,
+                enabled: true,
+                requires_permission: false,
+            }],
+            override_profiles: Vec::new(),
+            fs_state: Default::default(),
+        };
+        (
+            crate::ge::GameEnvironment {
+                root: root.clone(),
+                config,
+            },
+            root,
+        )
+    }
+
     #[test]
-    fn d3d12_parallel_execution_matches_serial_and_counts_batches() {
-        let (mut runtime, streams) = d3d12_two_independent_lists();
-        let queue = runtime.create_command_queue();
-        let mut parallel_runtime = runtime.clone();
-        let serial_fence = runtime.create_fence(0);
-        let parallel_fence = parallel_runtime.create_fence(0);
+    fn directstorage_short_file_surfaces_real_error() {
+        let (ge, root) = test_game_environment("d3d12-ds-short");
+        std::fs::write(root.join("drive_c").join("tiny.bin"), [1u8, 2, 3, 4])
+            .expect("write tiny file");
+        let mut runtime = D3d12Runtime::new();
+        let error = runtime
+            .upload_file_to_texture(
+                &ge,
+                "C:\\tiny.bin",
+                crate::metal_backend::DirectStorageUploadDesc {
+                    file_offset: 0,
+                    source_len: 64,
+                    output_len: 64,
+                    width: 4,
+                    height: 4,
+                    format: metal::MTLPixelFormat::RGBA8Unorm,
+                    compression: crate::metal_backend::DirectStorageCompression::None,
+                },
+            )
+            .expect_err("short file must fail");
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert!(error.message.contains("too short"), "unexpected: {error}");
+        assert_eq!(runtime.directstorage_bytes(), 0);
+        assert_eq!(runtime.staging_bytes(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
-        let serial_plan = runtime
-            .backend_mut()
-            .execute_command_lists(queue, &streams, Some((serial_fence, 1)))
-            .expect("serial execution");
-        let parallel_plan = parallel_runtime
-            .execute_command_lists(queue, &streams, Some((parallel_fence, 1)))
-            .expect("parallel execution");
+    #[test]
+    fn directstorage_resource_format_comes_from_upload_format() {
+        let (ge, root) = test_game_environment("d3d12-ds-formats");
+        let mut runtime = D3d12Runtime::new();
 
+        let rgba: Vec<u8> = (0..4 * 2 * 4).map(|index| (index * 7) as u8).collect();
+        std::fs::write(root.join("drive_c").join("rgba.bin"), &rgba).expect("write rgba");
+        let rgba_resource = runtime
+            .upload_file_to_texture(
+                &ge,
+                "C:\\rgba.bin",
+                crate::metal_backend::DirectStorageUploadDesc {
+                    file_offset: 0,
+                    source_len: rgba.len() as u64,
+                    output_len: rgba.len() as u64,
+                    width: 4,
+                    height: 2,
+                    format: metal::MTLPixelFormat::RGBA8Unorm,
+                    compression: crate::metal_backend::DirectStorageCompression::None,
+                },
+            )
+            .expect("RGBA upload");
         assert_eq!(
-            serial_plan, parallel_plan,
-            "parallel translation must produce the serial plan"
+            runtime
+                .resource_format(rgba_resource)
+                .expect("resource format"),
+            DxgiFormat::R8G8B8A8Unorm,
+            "RGBA upload must not be described as a BGRA shadow"
         );
-        assert_eq!(serial_plan.render_passes.len(), 2);
-        let serial_stats = runtime.backend().translation_stats();
-        assert_eq!(serial_stats.parallel_translation_batches, 0);
-        assert_eq!(serial_stats.streams_translated_in_parallel, 0);
-        let parallel_stats = parallel_runtime.backend().translation_stats();
-        assert_eq!(parallel_stats.parallel_translation_batches, 1);
-        assert_eq!(parallel_stats.streams_translated_in_parallel, 2);
-        assert_eq!(parallel_stats.streams_translated_serially, 0);
-        assert_eq!(runtime.fence_value(serial_fence).expect("fence"), 1);
         assert_eq!(
-            parallel_runtime.fence_value(parallel_fence).expect("fence"),
-            1
+            runtime
+                .directstorage_texture_format(rgba_resource)
+                .expect("texture format"),
+            DxgiFormat::R8G8B8A8Unorm
+        );
+        assert_eq!(
+            runtime
+                .readback_gpu_texture(rgba_resource)
+                .expect("RGBA readback"),
+            rgba
+        );
+        let fence = runtime.create_fence(0);
+        assert!(
+            runtime.readback(rgba_resource, fence, 1).is_err(),
+            "readback must require a completed fence"
+        );
+        runtime
+            .signal_fence(fence, 1)
+            .expect("signal readback fence");
+        assert_eq!(
+            runtime
+                .readback(rgba_resource, fence, 1)
+                .expect("fenced DirectStorage readback"),
+            rgba,
+            "fenced readback must use the actual upload texture"
+        );
+
+        let bgra: Vec<u8> = (0..4 * 2 * 4).map(|index| (255 - index) as u8).collect();
+        std::fs::write(root.join("drive_c").join("bgra.bin"), &bgra).expect("write bgra");
+        let bgra_resource = runtime
+            .upload_file_to_texture(
+                &ge,
+                "C:\\bgra.bin",
+                crate::metal_backend::DirectStorageUploadDesc {
+                    file_offset: 0,
+                    source_len: bgra.len() as u64,
+                    output_len: bgra.len() as u64,
+                    width: 4,
+                    height: 2,
+                    format: metal::MTLPixelFormat::BGRA8Unorm,
+                    compression: crate::metal_backend::DirectStorageCompression::None,
+                },
+            )
+            .expect("BGRA upload");
+        assert_eq!(
+            runtime
+                .resource_format(bgra_resource)
+                .expect("resource format"),
+            DxgiFormat::B8G8R8A8Unorm,
+            "BGRA upload resource must use the real BGRA format"
+        );
+        assert_eq!(
+            runtime
+                .readback_gpu_texture(bgra_resource)
+                .expect("BGRA readback"),
+            bgra,
+            "readback uses the actual BGRA texture (no RGBA shadow conversion)"
+        );
+
+        // NV12 luma plane upload (the Y plane of an NV12 target is R8_UNORM).
+        let luma: Vec<u8> = (0..8 * 4).map(|index| (index * 3) as u8).collect();
+        std::fs::write(root.join("drive_c").join("nv12-y.bin"), &luma).expect("write luma");
+        let luma_resource = runtime
+            .upload_file_to_texture(
+                &ge,
+                "C:\\nv12-y.bin",
+                crate::metal_backend::DirectStorageUploadDesc {
+                    file_offset: 0,
+                    source_len: luma.len() as u64,
+                    output_len: luma.len() as u64,
+                    width: 8,
+                    height: 4,
+                    format: metal::MTLPixelFormat::R8Unorm,
+                    compression: crate::metal_backend::DirectStorageCompression::None,
+                },
+            )
+            .expect("NV12 luma upload");
+        assert_eq!(
+            runtime
+                .resource_format(luma_resource)
+                .expect("resource format"),
+            DxgiFormat::R8Unorm,
+            "NV12 luma targets must keep their real R8 format"
+        );
+        assert_eq!(
+            runtime
+                .readback_gpu_texture(luma_resource)
+                .expect("luma readback"),
+            luma
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directstorage_format_mismatches_are_real_errors() {
+        let (ge, root) = test_game_environment("d3d12-ds-mismatch");
+        let mut runtime = D3d12Runtime::new();
+        let pixels = vec![7u8; 4 * 2 * 4];
+        std::fs::write(root.join("drive_c").join("mismatch.bin"), &pixels).expect("write");
+        let error = runtime
+            .upload_file_to_texture(
+                &ge,
+                "C:\\mismatch.bin",
+                crate::metal_backend::DirectStorageUploadDesc {
+                    file_offset: 0,
+                    source_len: pixels.len() as u64,
+                    output_len: pixels.len() as u64 + 4,
+                    width: 4,
+                    height: 2,
+                    format: metal::MTLPixelFormat::BGRA8Unorm,
+                    compression: crate::metal_backend::DirectStorageCompression::None,
+                },
+            )
+            .expect_err("output_len mismatch must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert!(
+            error.message.contains("does not match"),
+            "unexpected: {error}"
+        );
+
+        let error = runtime
+            .upload_file_to_texture(
+                &ge,
+                "C:\\mismatch.bin",
+                crate::metal_backend::DirectStorageUploadDesc {
+                    file_offset: 0,
+                    source_len: pixels.len() as u64,
+                    output_len: (4 * 2 * 2) as u64,
+                    width: 4,
+                    height: 2,
+                    format: metal::MTLPixelFormat::RG8Unorm,
+                    compression: crate::metal_backend::DirectStorageCompression::None,
+                },
+            )
+            .expect_err("format without a DXGI resource representation must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dFeatureUnsupported);
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directstorage_async_reset_releases_in_flight_resources() {
+        let (ge, root) = test_game_environment("d3d12-ds-reset");
+        let pixels: Vec<u8> = (0..4 * 2 * 4).map(|index| (index * 11) as u8).collect();
+        std::fs::write(root.join("drive_c").join("reset.bin"), &pixels).expect("write reset");
+        let mut runtime = D3d12Runtime::new();
+        let ticket = runtime
+            .enqueue_file_to_texture(
+                &ge,
+                "C:\\reset.bin",
+                crate::metal_backend::DirectStorageUploadDesc {
+                    file_offset: 0,
+                    source_len: pixels.len() as u64,
+                    output_len: pixels.len() as u64,
+                    width: 4,
+                    height: 2,
+                    format: metal::MTLPixelFormat::RGBA8Unorm,
+                    compression: crate::metal_backend::DirectStorageCompression::None,
+                },
+            )
+            .expect("enqueue");
+        assert_eq!(runtime.directstorage_upload_stats().in_flight, 1);
+        runtime
+            .reset_directstorage_uploads()
+            .expect("reset async uploads");
+        let stats = runtime.directstorage_upload_stats();
+        assert_eq!(stats.in_flight, 0);
+        assert_eq!(stats.retained_buffers, 0);
+        assert_eq!(stats.retained_textures, 0);
+        assert!(
+            stats.cancelled >= 1,
+            "reset must count the cancelled upload"
+        );
+        assert_eq!(
+            runtime.directstorage_live_texture_count(),
+            0,
+            "reset must drop the upload texture and its resource"
+        );
+        assert!(
+            runtime.readback_gpu_texture(ticket.resource).is_err(),
+            "cancelled resource must no longer be readable"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directstorage_cancel_distinguishes_pending_from_committed() {
+        let (ge, root) = test_game_environment("d3d12-ds-cancel-split");
+        let pixels: Vec<u8> = (0..1024 * 1024 * 4)
+            .map(|index| (index % 249) as u8)
+            .collect();
+        std::fs::write(root.join("drive_c").join("split.bin"), &pixels).expect("write split");
+        let mut runtime = D3d12Runtime::new();
+        let pending = runtime
+            .enqueue_file_to_texture(
+                &ge,
+                "C:\\split.bin",
+                crate::metal_backend::DirectStorageUploadDesc {
+                    file_offset: 0,
+                    source_len: pixels.len() as u64,
+                    output_len: pixels.len() as u64,
+                    width: 1024,
+                    height: 1024,
+                    format: metal::MTLPixelFormat::RGBA8Unorm,
+                    compression: crate::metal_backend::DirectStorageCompression::None,
+                },
+            )
+            .expect("enqueue pending upload");
+        let cancelled = runtime.cancel_pending_directstorage_uploads();
+        if cancelled > 0 {
+            assert_eq!(cancelled, 1);
+            let stats = runtime.directstorage_upload_stats();
+            assert_eq!(stats.pending_io, 0);
+            assert_eq!(stats.in_flight, 0);
+            assert_eq!(stats.cancelled, 1);
+            assert!(
+                runtime.readback_gpu_texture(pending.resource).is_err(),
+                "cancelled pending upload must release its resource"
+            );
+        }
+        runtime
+            .wait_for_directstorage_uploads(20_000_000_000)
+            .expect("cancelled or committed upload completes");
+
+        let committed = runtime
+            .enqueue_file_to_texture(
+                &ge,
+                "C:\\split.bin",
+                crate::metal_backend::DirectStorageUploadDesc {
+                    file_offset: 0,
+                    source_len: 4 * 2 * 4,
+                    output_len: 4 * 2 * 4,
+                    width: 4,
+                    height: 2,
+                    format: metal::MTLPixelFormat::RGBA8Unorm,
+                    compression: crate::metal_backend::DirectStorageCompression::None,
+                },
+            )
+            .expect("enqueue committed upload");
+        runtime
+            .wait_for_directstorage_fence(committed.fence_value, 20_000_000_000)
+            .expect("committed upload reaches the GPU");
+        assert!(
+            runtime.directstorage_upload_stats().committed >= 1,
+            "committed upload must be observed as committed"
+        );
+        assert_eq!(
+            runtime.cancel_pending_directstorage_uploads(),
+            0,
+            "committed uploads are not cancellable"
+        );
+        assert!(
+            runtime.cancel_committed_directstorage_uploads() >= 1,
+            "committed upload must be reported as already committed"
+        );
+        runtime
+            .wait_for_directstorage_fence(committed.fence_value, 20_000_000_000)
+            .expect("committed work still completes");
+        assert_eq!(
+            runtime
+                .readback_gpu_texture(committed.resource)
+                .expect("committed readback"),
+            pixels[..4 * 2 * 4].to_vec(),
+            "committed upload still delivers its bytes"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nv12_resize_rejects_mismatched_odd_dimensions() {
+        let mut runtime = D3d12Runtime::new();
+        let swapchain = runtime
+            .create_nv12_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("NV12 swapchain");
+        if runtime.nv12_texture_builds(swapchain) == 0 {
+            return;
+        }
+        let error = runtime
+            .resize_buffers(swapchain, 2, 5, 2, DxgiFormat::B8G8R8A8Unorm)
+            .expect_err("odd NV12 width must be rejected");
+        assert!(
+            error.message.contains("must be even"),
+            "unexpected: {error}"
+        );
+        assert_eq!(runtime.swapchain_state(swapchain).unwrap().desc.width, 4);
+    }
+
+    #[test]
+    fn unsupported_swapchain_format_uses_counted_fallback() {
+        let mut runtime = D3d12Runtime::new();
+        let swapchain = runtime
+            .create_swapchain_for_format(
+                SwapchainDesc {
+                    width: 4,
+                    height: 2,
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                    buffer_count: 2,
+                },
+                9999,
+            )
+            .expect("fallback swapchain");
+        assert_eq!(runtime.swapchain_format_fallback_count(), 1);
+        assert_eq!(
+            runtime.swapchain_state(swapchain).unwrap().desc.format,
+            DxgiFormat::R8G8B8A8Unorm,
+            "fallback uses the caller's typed format"
+        );
+    }
+
+    fn directstorage_upload_desc(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        format: metal::MTLPixelFormat,
+    ) -> crate::metal_backend::DirectStorageUploadDesc {
+        crate::metal_backend::DirectStorageUploadDesc {
+            file_offset: 0,
+            source_len: pixels.len() as u64,
+            output_len: pixels.len() as u64,
+            width,
+            height,
+            format,
+            compression: crate::metal_backend::DirectStorageCompression::None,
+        }
+    }
+
+    #[test]
+    fn swapchain_fallback_paths_and_resize_reject_short_counts() {
+        let mut runtime = D3d12Runtime::new();
+        let matching = runtime
+            .create_swapchain_for_format(
+                SwapchainDesc {
+                    width: 4,
+                    height: 2,
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                    buffer_count: 2,
+                },
+                28,
+            )
+            .expect("matching raw format creates a pixel swapchain");
+        assert_eq!(runtime.swapchain_format_fallback_count(), 0);
+        assert_eq!(
+            runtime.swapchain_state(matching).unwrap().desc.format,
+            DxgiFormat::R8G8B8A8Unorm
+        );
+
+        let extra = runtime
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("additional pixel swapchain");
+        assert!(
+            runtime
+                .extra_swapchains
+                .get(&extra)
+                .unwrap()
+                .nv12
+                .is_empty()
+        );
+
+        runtime
+            .resize_buffers(matching, 3, 8, 4, DxgiFormat::B8G8R8A8Unorm)
+            .expect("resize primary");
+        assert_eq!(runtime.iosurface_channels.len(), 3);
+        assert_eq!(runtime.iosurface_channels[0].width(), 8);
+        assert_eq!(runtime.iosurface_channels[0].height(), 4);
+        runtime
+            .resize_buffers(extra, 2, 16, 8, DxgiFormat::B8G8R8A8Unorm)
+            .expect("resize additional");
+        let resized = runtime.extra_swapchains.get(&extra).unwrap();
+        assert_eq!(resized.pixel[0].width(), 16);
+        assert_eq!(resized.pixel[0].height(), 8);
+        assert_eq!(runtime.iosurface_channels[0].width(), 8);
+
+        let error = runtime
+            .resize_buffers(matching, 1, 8, 4, DxgiFormat::B8G8R8A8Unorm)
+            .expect_err("buffer count below two must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "swapchain buffer count must be at least 2");
+        assert_eq!(runtime.swapchain_state(matching).unwrap().desc.width, 8);
+
+        let zero = runtime
+            .create_nv12_swapchain(SwapchainDesc {
+                width: 0,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("zero-dimension NV12 falls back");
+        assert_eq!(runtime.swapchain_format_fallback_count(), 1);
+        assert!(runtime.primary_nv12.is_empty());
+        assert!(runtime.iosurface_channels.is_empty());
+        assert_eq!(
+            runtime.swapchain_state(zero).unwrap().desc.format,
+            DxgiFormat::B8G8R8A8Unorm
+        );
+
+        let fallback = runtime
+            .create_additional_nv12_swapchain(SwapchainDesc {
+                width: 0,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("additional NV12 falls back");
+        assert_eq!(runtime.swapchain_format_fallback_count(), 2);
+        assert!(runtime.extra_swapchains.get(&fallback).unwrap().is_empty());
+
+        let empty = runtime
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Uint,
+                buffer_count: 2,
+            })
+            .expect("unsupported channel format still creates a swapchain");
+        assert!(runtime.extra_swapchains.get(&empty).unwrap().is_empty());
+        let empty_backbuffer = runtime.swapchain_state(empty).unwrap().backbuffers[0];
+        let before = runtime.cpu_backing_writes();
+        runtime
+            .overwrite_resource_bytes(empty_backbuffer, &[3u8; 32])
+            .expect("empty channel set writes CPU backing");
+        assert_eq!(runtime.cpu_backing_writes(), before + 1);
+    }
+
+    #[test]
+    fn present_rejects_pixel_channel_count_dimension_and_format_mismatches() {
+        let mut runtime = D3d12Runtime::new();
+        let swapchain = runtime
+            .create_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create swapchain");
+        assert_eq!(runtime.iosurface_channels.len(), 2);
+        assert!(runtime.iosurface_zero_copy_active());
+
+        runtime.iosurface_channels[0] = crate::metal_backend::IoSurfacePresentChannel::new(
+            2,
+            2,
+            metal::MTLPixelFormat::RGBA8Unorm,
+        )
+        .expect("mismatched dimensions");
+        let error = runtime
+            .present(swapchain, 1, false)
+            .expect_err("dimension mismatch must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "IOSurface present: swapchain 4x2 does not match channel 0 at 0 (2x2)"
+        );
+
+        runtime.iosurface_channels[0] = crate::metal_backend::IoSurfacePresentChannel::new(
+            4,
+            2,
+            metal::MTLPixelFormat::BGRA8Unorm,
+        )
+        .expect("mismatched format");
+        let error = runtime
+            .present(swapchain, 1, false)
+            .expect_err("format mismatch must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "IOSurface present: swapchain format R8G8B8A8Unorm (RGBA8Unorm) does not match channel 0 BGRA8Unorm"
+        );
+
+        runtime.iosurface_channels[0] = crate::metal_backend::IoSurfacePresentChannel::new(
+            4,
+            2,
+            metal::MTLPixelFormat::RGBA8Unorm,
+        )
+        .expect("restore channel");
+        runtime
+            .present(swapchain, 1, false)
+            .expect("present primary");
+        assert_eq!(runtime.iosurface_present_count(), 1);
+
+        let extra = runtime
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("additional pixel swapchain");
+        runtime.present(extra, 1, false).expect("present extra");
+        let frame = runtime.presented_frame(extra).expect("extra frame");
+        assert_eq!(frame.width, 4);
+        assert_eq!(frame.height, 2);
+        assert_eq!(frame.format, DxgiFormat::B8G8R8A8Unorm);
+        assert_eq!(runtime.iosurface_present_count(), 2);
+
+        runtime.extra_swapchains.get_mut(&extra).unwrap().pixel[0] =
+            crate::metal_backend::IoSurfacePresentChannel::new(
+                4,
+                2,
+                metal::MTLPixelFormat::RGBA8Unorm,
+            )
+            .expect("mismatched extra format");
+        let error = runtime
+            .present(extra, 1, false)
+            .expect_err("extra format mismatch must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "IOSurface present: swapchain format B8G8R8A8Unorm (BGRA8Unorm) does not match channel 0 RGBA8Unorm"
+        );
+
+        runtime
+            .extra_swapchains
+            .get_mut(&extra)
+            .unwrap()
+            .pixel
+            .pop();
+        let error = runtime
+            .present(extra, 1, false)
+            .expect_err("extra channel count mismatch must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "IOSurface present: 1 channels for 2 backbuffers"
+        );
+
+        runtime.iosurface_channels.pop();
+        let error = runtime
+            .present(swapchain, 1, false)
+            .expect_err("primary channel count mismatch must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "IOSurface present: 1 channels for 2 backbuffers"
         );
     }
 
     #[test]
-    fn d3d12_noop_transition_is_elided_and_counted() {
+    fn nv12_present_rejects_channel_count_and_dimension_mismatches() {
         let mut runtime = D3d12Runtime::new();
-        let format = DxgiFormat::R8G8B8A8Unorm;
+        let swapchain = runtime
+            .create_swapchain_for_format(
+                SwapchainDesc {
+                    width: 4,
+                    height: 2,
+                    format: DxgiFormat::B8G8R8A8Unorm,
+                    buffer_count: 2,
+                },
+                103,
+            )
+            .expect("create NV12 swapchain");
+        assert_eq!(runtime.swapchain_format_fallback_count(), 0);
+        assert_eq!(runtime.nv12_texture_builds(swapchain), 2);
+        assert_eq!(runtime.iosurface_texture_builds(), 2);
+        runtime.present(swapchain, 1, false).expect("present NV12");
+        assert_eq!(runtime.nv12_present_count(), 1);
+        assert_eq!(runtime.nv12_composite_passes(swapchain), 1);
+        assert_eq!(runtime.nv12_drawable_binds(swapchain), 1);
+        assert!(runtime.presented_nv12_drawable_ptr(swapchain).is_some());
+        let (y, uv) = runtime
+            .presented_nv12_plane_bytes(swapchain)
+            .expect("NV12 plane readback");
+        assert_eq!(y.len(), 8);
+        assert_eq!(uv.len(), 4);
+        let (gpu_y, gpu_uv) = runtime
+            .presented_nv12_plane_bytes_gpu(swapchain)
+            .expect("GPU NV12 plane readback");
+        assert_eq!(gpu_y, y);
+        assert_eq!(gpu_uv, uv);
+        assert_eq!(
+            runtime
+                .presented_nv12_composite_rgba(swapchain)
+                .expect("composite RGBA")
+                .len(),
+            32
+        );
+        let frame = runtime.presented_frame(swapchain).expect("NV12 frame");
+        assert_eq!(frame.width, 4);
+        assert_eq!(frame.format, DxgiFormat::R8G8B8A8Unorm);
+
+        let extra = runtime
+            .create_additional_nv12_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("additional NV12 swapchain");
+        assert_eq!(runtime.nv12_texture_builds(extra), 2);
+        runtime
+            .present(extra, 1, false)
+            .expect("present extra NV12");
+        assert_eq!(runtime.nv12_present_count(), 2);
+        assert_eq!(runtime.nv12_composite_passes(extra), 1);
+        assert_eq!(runtime.presented_frame(extra).unwrap().width, 4);
+        let (extra_y, extra_uv) = runtime
+            .presented_nv12_plane_bytes(extra)
+            .expect("extra NV12 planes");
+        assert_eq!((extra_y.len(), extra_uv.len()), (8, 4));
+        let (extra_gpu_y, extra_gpu_uv) = runtime
+            .presented_nv12_plane_bytes_gpu(extra)
+            .expect("extra GPU NV12 planes");
+        assert_eq!((extra_gpu_y.len(), extra_gpu_uv.len()), (8, 4));
+
+        let pixel = runtime
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("additional pixel swapchain");
+        assert_eq!(runtime.nv12_texture_builds(pixel), 0);
+        let error = runtime
+            .presented_nv12_plane_bytes(pixel)
+            .expect_err("pixel swapchain has no NV12 plane");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("swapchain {pixel} has no NV12 present channel")
+        );
+        let error = runtime
+            .presented_nv12_plane_bytes_gpu(pixel)
+            .expect_err("pixel swapchain has no GPU NV12 plane");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("swapchain {pixel} has no NV12 present channel")
+        );
+
+        runtime.extra_swapchains.get_mut(&extra).unwrap().nv12.pop();
+        let error = runtime
+            .present(extra, 1, false)
+            .expect_err("extra NV12 count mismatch must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "NV12 present: 1 channels for 2 backbuffers");
+
+        runtime.primary_nv12[0] =
+            crate::metal_backend::Nv12PresentChannel::new(2, 2).expect("mismatched channel");
+        let error = runtime
+            .present(swapchain, 1, false)
+            .expect_err("NV12 dimension mismatch must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "NV12 present: swapchain 4x2 does not match channel 0 at 0 (2x2)"
+        );
+
+        runtime
+            .resize_buffers(swapchain, 2, 8, 4, DxgiFormat::B8G8R8A8Unorm)
+            .expect("resize primary NV12");
+        assert_eq!(runtime.primary_nv12.len(), 2);
+        assert_eq!(runtime.primary_nv12[0].width(), 8);
+        assert!(runtime.iosurface_channels.is_empty());
+        runtime
+            .resize_buffers(extra, 2, 16, 8, DxgiFormat::B8G8R8A8Unorm)
+            .expect("resize extra NV12");
+        let resized = runtime.extra_swapchains.get(&extra).unwrap();
+        assert_eq!(resized.nv12.len(), 2);
+        assert_eq!(resized.nv12[0].width(), 16);
+        assert!(resized.pixel.is_empty());
+        assert_eq!(runtime.primary_nv12[0].width(), 8);
+    }
+
+    #[test]
+    fn surface_writes_reject_overflow_and_missing_channels() {
+        let mut runtime = D3d12Runtime::new();
+        let swapchain = runtime
+            .create_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create swapchain");
+        assert_eq!(runtime.iosurface_channels.len(), 2);
+        let backbuffer = runtime.swapchain_state(swapchain).unwrap().backbuffers[0];
+        runtime
+            .overwrite_resource_bytes(backbuffer, &[9u8; 32])
+            .expect("full-frame write");
+        assert_eq!(runtime.surface_writes(), 1);
+        assert_eq!(runtime.cpu_backing_writes(), 0);
+
+        runtime
+            .upload_write(backbuffer, 4, &[1u8; 4])
+            .expect("partial surface write");
+        assert_eq!(runtime.surface_writes(), 2);
+        let frame = runtime.presented_frame(swapchain).expect("presented frame");
+        assert_eq!(&frame.bytes[4..8], &[1u8; 4]);
+
+        let error = runtime
+            .upload_write(backbuffer, 0, &[0u8; 33])
+            .expect_err("oversized surface write must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "surface write exceeds present backbuffer");
+        let error = runtime
+            .upload_write(backbuffer, usize::MAX, &[0u8])
+            .expect_err("surface write offset overflow must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "surface write range overflow");
+
+        let extra = runtime
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("additional pixel swapchain");
+        let extra_backbuffers = runtime.swapchain_state(extra).unwrap().backbuffers;
+        runtime
+            .overwrite_resource_bytes(extra_backbuffers[0], &[4u8; 32])
+            .expect("extra surface write");
+        assert_eq!(runtime.surface_writes(), 3);
+        runtime
+            .extra_swapchains
+            .get_mut(&extra)
+            .unwrap()
+            .pixel
+            .pop();
+        let before = runtime.cpu_backing_writes();
+        runtime
+            .overwrite_resource_bytes(extra_backbuffers[1], &[4u8; 32])
+            .expect("missing extra channel writes CPU backing");
+        assert_eq!(runtime.cpu_backing_writes(), before + 1);
+
+        let nv12 = runtime
+            .create_nv12_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("NV12 swapchain");
+        assert_eq!(runtime.swapchain_format_fallback_count(), 0);
+        let nv12_backbuffer = runtime.swapchain_state(nv12).unwrap().backbuffers[0];
+        let writes_before = runtime.surface_writes();
+        runtime
+            .overwrite_resource_bytes(nv12_backbuffer, &[7u8; 32])
+            .expect("full NV12 write");
+        assert_eq!(runtime.surface_writes(), writes_before + 1);
+        let error = runtime
+            .upload_write(nv12_backbuffer, 0, &[7u8; 31])
+            .expect_err("NV12 partial write must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "NV12 present surface requires full-frame writes"
+        );
+        let error = runtime
+            .upload_write(nv12_backbuffer, usize::MAX, &[7u8])
+            .expect_err("NV12 write offset overflow must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "surface write range overflow");
+        runtime.primary_nv12.pop();
+        let nv12_backbuffers = runtime.swapchain_state(nv12).unwrap().backbuffers;
+        let error = runtime
+            .upload_write(nv12_backbuffers[1], 0, &[7u8; 32])
+            .expect_err("missing NV12 backbuffer channel must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "NV12 present: backbuffer channel is missing");
+
+        let extra_nv12 = runtime
+            .create_additional_nv12_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("additional NV12 swapchain");
+        let extra_nv12_backbuffer = runtime.swapchain_state(extra_nv12).unwrap().backbuffers[0];
+        runtime
+            .overwrite_resource_bytes(extra_nv12_backbuffer, &[6u8; 32])
+            .expect("extra NV12 write");
+        assert_eq!(runtime.surface_writes(), writes_before + 2);
+    }
+
+    #[test]
+    fn initial_data_failure_rolls_back_resource_and_counts_staging() {
+        let mut runtime = D3d12Runtime::new();
+        let desc = ResourceDesc {
+            name: "initial-data".to_string(),
+            format: DxgiFormat::R8G8B8A8Unorm,
+            heap: HeapType::Default,
+            size: 32,
+            subresources: 1,
+            initial_state: ResourceState::CopyDest,
+            usage_hint: ResourceUsageHint::Texture {
+                sampled: true,
+                render_target: false,
+                depth_stencil: false,
+                cpu_write_frequent: false,
+            },
+        };
+        let error = runtime
+            .create_committed_resource_with_initial_data(
+                desc.clone(),
+                Some(D3d12InitialTextureData {
+                    width: 4,
+                    height: 2,
+                    format: metal::MTLPixelFormat::RGBA8Unorm,
+                    data: vec![0u8; 31],
+                }),
+            )
+            .expect_err("initial data length mismatch must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert!(
+            error.message.starts_with("initial data:"),
+            "unexpected: {error}"
+        );
+        assert_eq!(runtime.staging_bytes(), 0);
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
+
+        let data: Vec<u8> = (0..32).map(|index| (index * 7) as u8).collect();
+        let resource = runtime
+            .create_committed_resource_with_initial_data(
+                desc,
+                Some(D3d12InitialTextureData {
+                    width: 4,
+                    height: 2,
+                    format: metal::MTLPixelFormat::RGBA8Unorm,
+                    data: data.clone(),
+                }),
+            )
+            .expect("valid initial data");
+        assert_eq!(runtime.staging_bytes(), 32);
+        assert_eq!(runtime.directstorage_live_texture_count(), 1);
+        assert_eq!(
+            runtime
+                .readback_gpu_texture(resource)
+                .expect("GPU readback"),
+            data
+        );
+        runtime
+            .destroy_resource(resource)
+            .expect("destroy initial-data resource");
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
+        let error = runtime
+            .destroy_resource(resource)
+            .expect_err("double destroy must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "unknown resource");
+    }
+
+    #[test]
+    fn directstorage_rejects_unopenable_host_file_and_unknown_resources() {
+        let (ge, root) = test_game_environment("d3d12-ds-denied");
+        let host = root.join("drive_c").join("locked.bin");
+        let pixels = vec![5u8; 32];
+        std::fs::write(&host, &pixels).expect("write locked file");
+        let mut permissions = std::fs::metadata(&host).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o000);
+        std::fs::set_permissions(&host, permissions).expect("chmod");
+        let mut runtime = D3d12Runtime::new();
+        let error = runtime
+            .upload_file_to_texture(
+                &ge,
+                "C:\\locked.bin",
+                directstorage_upload_desc(&pixels, 4, 2, metal::MTLPixelFormat::RGBA8Unorm),
+            )
+            .expect_err("unreadable host file must fail");
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message,
+            format!("DirectStorage: failed to open {}", host.display())
+        );
+        assert_eq!(runtime.directstorage_bytes(), 0);
+        assert_eq!(runtime.staging_bytes(), 0);
+
+        let unknown = 999_999u64;
+        let error = runtime
+            .directstorage_texture_format(unknown)
+            .expect_err("unknown resource has no DirectStorage format");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("resource {unknown} has no DirectStorage texture format")
+        );
+        let error = runtime
+            .readback_gpu_texture(unknown)
+            .expect_err("unknown resource has no GPU texture");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("resource {unknown} has no GPU texture upload")
+        );
+        let error = runtime
+            .readback_gpu_texture_plane(unknown, 0)
+            .expect_err("unknown resource plane must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("resource {unknown} has no GPU texture upload")
+        );
+
+        assert_eq!(
+            runtime
+                .poll_directstorage_uploads()
+                .expect("poll without queue"),
+            crate::metal_backend::DirectStorageQueueStats::default()
+        );
+        assert_eq!(
+            runtime
+                .wait_for_directstorage_uploads(1)
+                .expect("wait without queue"),
+            0
+        );
+        let error = runtime
+            .wait_for_directstorage_fence(7, 1)
+            .expect_err("fence wait without queue must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "DirectStorage: no upload queue exists to wait for value 7"
+        );
+        assert_eq!(runtime.directstorage_fence_value(), 0);
+        assert_eq!(runtime.directstorage_queued_uploads(), 0);
+        assert_eq!(runtime.directstorage_completed_uploads(), 0);
+        assert_eq!(runtime.directstorage_in_flight_uploads(), 0);
+        assert_eq!(runtime.cancel_pending_directstorage_uploads(), 0);
+        assert_eq!(runtime.cancel_committed_directstorage_uploads(), 0);
+        runtime
+            .cancel_directstorage_uploads()
+            .expect("cancel without queue");
+        runtime
+            .reset_directstorage_uploads()
+            .expect("reset without queue");
+
+        let mut permissions = std::fs::metadata(&host).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o600);
+        std::fs::set_permissions(&host, permissions).expect("restore chmod");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directstorage_async_rejects_format_without_dxgi_and_cancels_cleanly() {
+        let (ge, root) = test_game_environment("d3d12-ds-format");
+        let pixels = vec![1u8; 16];
+        std::fs::write(root.join("drive_c").join("rg8.bin"), &pixels).expect("write");
+        let mut runtime = D3d12Runtime::new();
+        let error = runtime
+            .enqueue_file_to_texture(
+                &ge,
+                "C:\\rg8.bin",
+                directstorage_upload_desc(&pixels, 4, 2, metal::MTLPixelFormat::RG8Unorm),
+            )
+            .expect_err("RG8 has no DXGI resource format");
+        assert_eq!(error.code, ReasonCode::RcD3dFeatureUnsupported);
+        assert_eq!(
+            error.message,
+            "DirectStorage async: upload texture format RG8Unorm has no DXGI resource format"
+        );
+        assert_eq!(runtime.directstorage_queued_uploads(), 1);
+        runtime
+            .cancel_directstorage_uploads()
+            .expect("cancel queued upload");
+        assert_eq!(runtime.directstorage_in_flight_uploads(), 0);
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directstorage_nv12_enqueue_reads_both_planes_and_rejects_plane_overrun() {
+        let (ge, root) = test_game_environment("d3d12-ds-nv12");
+        let luma = vec![12u8; 8];
+        let chroma = vec![34u8, 56, 78, 90];
+        let mut contents = luma.clone();
+        contents.extend_from_slice(&chroma);
+        std::fs::write(root.join("drive_c").join("planes.bin"), &contents).expect("write");
+        let mut runtime = D3d12Runtime::new();
+        let ticket = runtime
+            .enqueue_nv12_file_to_texture(
+                &ge,
+                "C:\\planes.bin",
+                crate::metal_backend::DirectStorageNv12UploadDesc::new(
+                    4,
+                    2,
+                    0,
+                    luma.len() as u64,
+                    luma.len() as u64,
+                    chroma.len() as u64,
+                ),
+            )
+            .expect("enqueue NV12");
+        runtime
+            .wait_for_directstorage_fence(ticket.fence_value, 20_000_000_000)
+            .expect("NV12 completion");
+        assert_eq!(
+            runtime
+                .readback_gpu_texture_plane(ticket.resource, 0)
+                .expect("luma"),
+            luma
+        );
+        assert_eq!(
+            runtime
+                .readback_gpu_texture_plane(ticket.resource, 1)
+                .expect("chroma"),
+            chroma
+        );
+        assert_eq!(
+            runtime
+                .readback_gpu_texture(ticket.resource)
+                .expect("NV12 layout"),
+            contents
+        );
+        assert_eq!(
+            runtime
+                .directstorage_texture_format(ticket.resource)
+                .expect("luma format"),
+            DxgiFormat::R8Unorm
+        );
+        assert_eq!(runtime.directstorage_bytes(), 12);
+        assert_eq!(runtime.directstorage_live_texture_count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directstorage_cancel_pending_retains_unobserved_resource() {
+        use std::io::Write;
+        let (ge, root) = test_game_environment("d3d12-ds-pending-fifo");
+        let host = root.join("drive_c").join("blocked.bin");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&host)
+                .status()
+                .expect("run mkfifo")
+                .success()
+        );
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let writer_path = host.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open FIFO writer");
+            let _ = released.recv();
+            let _ = file.write_all(&[0u8; 32]);
+        });
+        let mut runtime = D3d12Runtime::new();
+        let ticket = runtime
+            .enqueue_file_to_texture(
+                &ge,
+                "C:\\blocked.bin",
+                directstorage_upload_desc(&[0u8; 32], 4, 2, metal::MTLPixelFormat::RGBA8Unorm),
+            )
+            .expect("enqueue blocked upload");
+        assert_eq!(runtime.directstorage_upload_stats().pending_io, 1);
+        let fake = 999_998u64;
+        runtime
+            .directstorage_pending_resources
+            .push((fake, u64::MAX));
+        let cancelled = runtime.cancel_pending_directstorage_uploads();
+        assert_eq!(cancelled, 1);
+        assert!(
+            runtime
+                .directstorage_pending_resources
+                .iter()
+                .any(|(resource, value)| *resource == fake && *value == u64::MAX),
+            "the unobserved resource must remain tracked"
+        );
+        release.send(()).expect("release FIFO writer");
+        writer.join().expect("join FIFO writer");
+        runtime
+            .cancel_directstorage_uploads()
+            .expect("drain cancelled upload");
+        assert_eq!(runtime.directstorage_in_flight_uploads(), 0);
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
+        assert!(runtime.readback_gpu_texture(ticket.resource).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directstorage_async_alias_completion_hooks_cancel_cleanly() {
+        let (ge, root) = test_game_environment("d3d12-ds-alias-adversarial");
+        let pixels: Vec<u8> = (0..32).map(|index| (index * 5) as u8).collect();
+        std::fs::write(root.join("drive_c").join("alias.bin"), &pixels).expect("write alias");
+        let mut runtime = D3d12Runtime::new();
+        let callback_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = callback_count.clone();
+        runtime.set_upload_completion_callback(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(
+            format!("{:?}", runtime.directstorage_completion),
+            "UploadCompletionHook { registered: true }"
+        );
+        assert_eq!(
+            runtime
+                .wait_for_upload_completion(0)
+                .expect("alias wait without a queue"),
+            0
+        );
+        assert_eq!(
+            runtime
+                .poll_upload_completion()
+                .expect("alias poll without a queue")
+                .queued,
+            0
+        );
+
+        let ticket = runtime
+            .upload_file_to_texture_async(
+                &ge,
+                "C:\\alias.bin",
+                directstorage_upload_desc(&pixels, 4, 2, metal::MTLPixelFormat::RGBA8Unorm),
+            )
+            .expect("alias enqueue");
+        assert_eq!(runtime.directstorage_queued_uploads(), 1);
+        assert_eq!(runtime.directstorage_in_flight_uploads(), 1);
+        assert_ne!(ticket.fence_value, 0);
+        assert_eq!(
+            runtime.directstorage_fence_value(),
+            0,
+            "the GPU has not observed the enqueued fence yet"
+        );
+
+        let observed_fence = runtime
+            .wait_for_upload_completion(5_000_000_000)
+            .expect("alias wait for the async upload");
+        assert_eq!(observed_fence, ticket.fence_value);
+        assert_eq!(runtime.directstorage_fence_value(), ticket.fence_value);
+        assert_eq!(runtime.directstorage_completed_uploads(), 1);
+        assert_eq!(runtime.directstorage_in_flight_uploads(), 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while callback_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the completion hook never fired"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            callback_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the completion hook must fire exactly once"
+        );
+        runtime.set_upload_completion_callback(|| {});
+        assert_eq!(
+            runtime
+                .poll_upload_completion()
+                .expect("alias poll after drain")
+                .queued,
+            1
+        );
+        assert_eq!(
+            callback_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an already-drained queue must not re-fire the hook"
+        );
+
+        let fence = runtime.create_fence(ticket.fence_value);
+        assert_eq!(
+            runtime
+                .readback(ticket.resource, fence, ticket.fence_value)
+                .expect("fenced alias upload readback"),
+            pixels
+        );
+        assert_eq!(runtime.directstorage_live_texture_count(), 1);
+        runtime
+            .destroy_resource(ticket.resource)
+            .expect("destroy alias upload");
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
+        assert_eq!(runtime.cancel_pending_directstorage_uploads(), 0);
+        assert_eq!(runtime.cancel_committed_directstorage_uploads(), 1);
+        runtime
+            .cancel_directstorage_uploads()
+            .expect("cancel clean async queue");
+        runtime
+            .reset_directstorage_uploads()
+            .expect("reset clean async queue");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directstorage_fence_timeout_and_cancel_counters_are_exact() {
+        let (ge, root) = test_game_environment("d3d12-ds-timeout-adversarial");
+        let pixels: Vec<u8> = (0..32).map(|index| (index * 3) as u8).collect();
+        std::fs::write(root.join("drive_c").join("timeout.bin"), &pixels).expect("write");
+        let mut runtime = D3d12Runtime::new();
+        let ticket = runtime
+            .upload_file_to_texture_async(
+                &ge,
+                "C:\\timeout.bin",
+                directstorage_upload_desc(&pixels, 4, 2, metal::MTLPixelFormat::RGBA8Unorm),
+            )
+            .expect("enqueue timed upload");
+        assert_eq!(
+            runtime
+                .wait_for_upload_completion(5_000_000_000)
+                .expect("wait for the upload"),
+            ticket.fence_value
+        );
+
+        let error = runtime
+            .wait_for_directstorage_fence(ticket.fence_value + 1, 0)
+            .expect_err("an unsignaled fence must hit the zero timeout");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!(
+                "DirectStorage: fence wait timed out after 0 ns (wanted {}, signaled {})",
+                ticket.fence_value + 1,
+                ticket.fence_value
+            )
+        );
+        assert_eq!(
+            runtime
+                .wait_for_directstorage_fence(ticket.fence_value, 0)
+                .expect("already-signaled fence value"),
+            ()
+        );
+        assert_eq!(runtime.cancel_pending_directstorage_uploads(), 0);
+        assert_eq!(runtime.cancel_committed_directstorage_uploads(), 1);
+        assert_eq!(runtime.directstorage_completed_uploads(), 1);
+        assert_eq!(runtime.directstorage_in_flight_uploads(), 0);
+        runtime
+            .cancel_directstorage_uploads()
+            .expect("cancel drained upload queue");
+        assert_eq!(runtime.directstorage_upload_stats().cancelled, 1);
+        assert_eq!(runtime.directstorage_live_texture_count(), 1);
+        runtime
+            .destroy_resource(ticket.resource)
+            .expect("destroy timed upload");
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initial_data_none_failure_and_leak_invariant_are_exact() {
+        let mut runtime = D3d12Runtime::new();
+        let desc = ResourceDesc {
+            name: "initial-data-adversarial".to_string(),
+            format: DxgiFormat::R8G8B8A8Unorm,
+            heap: HeapType::Default,
+            size: 32,
+            subresources: 1,
+            initial_state: ResourceState::CopyDest,
+            usage_hint: ResourceUsageHint::Texture {
+                sampled: true,
+                render_target: false,
+                depth_stencil: false,
+                cpu_write_frequent: false,
+            },
+        };
+        let plain = runtime
+            .create_committed_resource_with_initial_data(desc.clone(), None)
+            .expect("resource without initial data");
+        assert_eq!(runtime.staging_bytes(), 0);
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
+        runtime
+            .destroy_resource(plain)
+            .expect("destroy plain resource");
+
+        let error = runtime
+            .create_committed_resource_with_initial_data(
+                desc.clone(),
+                Some(D3d12InitialTextureData {
+                    width: 4,
+                    height: 2,
+                    format: metal::MTLPixelFormat::RGBA8Unorm,
+                    data: vec![0u8; 31],
+                }),
+            )
+            .expect_err("initial data length mismatch must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "initial data: 31 bytes do not match 4x2 RGBA8Unorm (32 bytes)"
+        );
+        assert_eq!(runtime.staging_bytes(), 0);
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
+
+        let data: Vec<u8> = (0..32).map(|index| (index * 7) as u8).collect();
+        let resource = runtime
+            .create_committed_resource_with_initial_data(
+                desc,
+                Some(D3d12InitialTextureData {
+                    width: 4,
+                    height: 2,
+                    format: metal::MTLPixelFormat::RGBA8Unorm,
+                    data: data.clone(),
+                }),
+            )
+            .expect("valid initial data");
+        assert_eq!(runtime.staging_bytes(), 32);
+        assert_eq!(runtime.directstorage_live_texture_count(), 1);
+        assert_eq!(
+            runtime
+                .readback_gpu_texture(resource)
+                .expect("initial data GPU readback"),
+            data
+        );
+        runtime
+            .destroy_resource(resource)
+            .expect("destroy initial-data resource");
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
+        let error = runtime
+            .destroy_resource(resource)
+            .expect_err("double destroy must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "unknown resource");
+    }
+
+    #[test]
+    fn resource_usage_wrappers_reject_unknown_handles_and_upload_fallback() {
+        let mut runtime = D3d12Runtime::new();
+        let _swapchain = runtime
+            .create_swapchain(SwapchainDesc {
+                width: 2,
+                height: 1,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create swapchain");
         let resource = runtime
             .create_committed_resource(ResourceDesc {
-                name: "d3d12-elide".to_string(),
-                format,
-                heap: HeapType::Default,
-                size: 64,
+                name: "wrapper-target".to_string(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                heap: HeapType::Upload,
+                size: 32,
                 subresources: 1,
-                initial_state: ResourceState::PixelShaderResource,
+                initial_state: ResourceState::CopyDest,
                 usage_hint: ResourceUsageHint::Generic,
             })
-            .expect("create resource");
+            .expect("create wrapper resource");
+        assert_eq!(
+            runtime.resource_state(resource, 0).expect("resource state"),
+            ResourceState::CopyDest
+        );
+        assert_eq!(
+            runtime
+                .resource_storage_mode(resource)
+                .expect("storage mode"),
+            MetalStorageMode::Shared
+        );
+        runtime
+            .set_resource_usage_hint(resource, ResourceUsageHint::Generic)
+            .expect("set usage hint");
+        assert_eq!(
+            runtime
+                .resource_storage_mode(resource)
+                .expect("storage mode after hint"),
+            MetalStorageMode::Shared
+        );
+
+        let before = runtime.cpu_backing_writes();
+        runtime
+            .upload_write(resource, 0, &[7u8; 8])
+            .expect("non-present upload fallback");
+        assert_eq!(runtime.cpu_backing_writes(), before + 1);
+        let mut expected = [0u8; 32];
+        expected[..8].fill(7);
+        assert_eq!(
+            runtime
+                .backend()
+                .resource_bytes(resource)
+                .expect("resource bytes"),
+            &expected
+        );
+
+        let error = runtime
+            .resource_state(resource, 1)
+            .expect_err("out-of-range subresource must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "invalid subresource index");
+
+        let unknown = 999_999u64;
+        let error = runtime
+            .resource_state(unknown, 0)
+            .expect_err("unknown resource state must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, format!("unknown resource {unknown}"));
+        let error = runtime
+            .resource_storage_mode(unknown)
+            .expect_err("unknown storage mode must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, format!("unknown resource {unknown}"));
+        let error = runtime
+            .set_resource_usage_hint(unknown, ResourceUsageHint::Generic)
+            .expect_err("unknown usage hint must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, format!("unknown resource {unknown}"));
+    }
+
+    #[test]
+    fn pixel_resize_and_empty_present_fallbacks_are_exact() {
+        let mut runtime = D3d12Runtime::new();
+        let primary = runtime
+            .create_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create primary swapchain");
+        assert_eq!(runtime.iosurface_channels.len(), 2);
+        let extra = runtime
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create additional pixel swapchain");
+        assert_eq!(runtime.extra_swapchains.get(&extra).unwrap().pixel.len(), 2);
+        runtime
+            .resize_buffers(extra, 3, 8, 4, DxgiFormat::R8G8B8A8Unorm)
+            .expect("resize additional pixel swapchain");
+        let resized = runtime.extra_swapchains.get(&extra).expect("channel set");
+        assert_eq!(resized.pixel.len(), 3);
+        assert_eq!(resized.pixel[0].width(), 8);
+        assert_eq!(resized.pixel[0].height(), 4);
+        assert_eq!(resized.nv12.len(), 0);
+        assert_eq!(runtime.iosurface_channels[0].width(), 4);
+        runtime
+            .present(extra, 1, false)
+            .expect("present resized extra swapchain");
+        assert_eq!(runtime.iosurface_present_count(), 1);
+        let extra_frame = runtime
+            .presented_frame(extra)
+            .expect("resized extra presented frame");
+        assert_eq!(extra_frame.width, 8);
+        assert_eq!(extra_frame.height, 4);
+
+        let empty = runtime
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Uint,
+                buffer_count: 2,
+            })
+            .expect("create empty-channel swapchain");
+        assert_eq!(runtime.extra_swapchains.get(&empty).unwrap().pixel.len(), 0);
+        let fallbacks = runtime.fallback_upload_count();
+        runtime
+            .present(empty, 1, false)
+            .expect("present empty-channel swapchain");
+        assert_eq!(runtime.fallback_upload_count(), fallbacks + 2);
+        let frame = runtime
+            .presented_frame(empty)
+            .expect("presented empty-channel frame");
+        assert_eq!(frame.width, 4);
+        assert_eq!(frame.height, 2);
+        assert_eq!(frame.bytes.len(), 32);
+        assert_eq!(runtime.iosurface_present_count(), 1);
+        assert_eq!(runtime.iosurface_channels.len(), 2);
+        assert_eq!(runtime.swapchain_state(primary).unwrap().desc.width, 4);
+    }
+
+    #[test]
+    fn nv12_channel_errors_and_clear_backbuffer_surface_writes_are_exact() {
+        let mut runtime = D3d12Runtime::new();
+        let swapchain = runtime
+            .create_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create pixel swapchain");
+        let error = runtime
+            .presented_nv12_plane_bytes(swapchain)
+            .expect_err("pixel swapchain has no NV12 planes");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("swapchain {swapchain} has no NV12 present channel")
+        );
+        let error = runtime
+            .presented_nv12_plane_bytes_gpu(swapchain)
+            .expect_err("pixel swapchain has no GPU NV12 planes");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("swapchain {swapchain} has no NV12 present channel")
+        );
+        let error = runtime
+            .presented_nv12_composite_rgba(swapchain)
+            .expect_err("pixel swapchain has no NV12 drawable");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("swapchain {swapchain} has no NV12 present channel")
+        );
+        assert_eq!(runtime.nv12_composite_passes(swapchain), 0);
+
+        let backbuffer = runtime
+            .swapchain_state(swapchain)
+            .expect("swapchain state")
+            .backbuffers[0];
         let heap = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
         runtime
-            .write_descriptor(heap, 0, ViewDescriptor::Rtv { resource, format })
-            .expect("rtv");
+            .write_descriptor(
+                heap,
+                0,
+                ViewDescriptor::Rtv {
+                    resource: backbuffer,
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                },
+            )
+            .expect("RTV descriptor");
+        let allocator = runtime.create_command_allocator();
         let root_signature = runtime.create_root_signature(RootSignatureDesc::default());
-        let pipeline_state = runtime.create_pipeline_state(
+        let pipeline = runtime.create_pipeline_state(
             root_signature,
             PipelineStateDesc {
-                label: "d3d12-elide".to_string(),
+                label: "clear-error-path".to_string(),
                 compute: false,
-                render_target_formats: vec![format],
+                render_target_formats: vec![DxgiFormat::R8G8B8A8Unorm],
                 depth_format: None,
             },
         );
-        let allocator = runtime.create_command_allocator();
-        let list = runtime.create_graphics_command_list(allocator, pipeline_state, false);
+        let list = runtime.create_graphics_command_list(allocator, pipeline, false);
         runtime
-            .record_begin_render_pass(list, vec![format], None, "clear", "store")
-            .expect("begin pass");
-        runtime.record_clear_rtv(list, heap, 0).expect("clear rtv");
-        runtime
-            .record_transition(
-                list,
-                resource,
-                0,
-                ResourceState::PixelShaderResource,
-                ResourceState::PixelShaderResource,
-            )
-            .expect("no-op transition");
-        runtime.record_draw(list, 3).expect("draw");
-        let stream = runtime.close_command_list(list).expect("close");
-
-        let analysis = runtime
-            .analyze_barriers(&[stream.clone()])
-            .expect("barrier analysis");
-        assert_eq!(analysis.transitions_considered, 1);
-        assert_eq!(analysis.transitions_elided, 1);
-        assert_eq!(analysis.transitions_required, 0);
-
-        let queue = runtime.create_command_queue();
-        let plan = runtime
-            .execute_command_lists(queue, &[stream], None)
-            .expect("execute");
+            .record_clear_rtv(list, heap, 0)
+            .expect("clear present backbuffer");
+        assert_eq!(runtime.surface_writes(), 1);
+        assert_eq!(runtime.cpu_backing_writes(), 0);
         assert_eq!(
-            plan.render_passes.len(),
-            1,
-            "elided barrier must not split the render pass"
+            runtime
+                .backend()
+                .resource_bytes(backbuffer)
+                .expect("backing bytes"),
+            &[0u8; 32]
         );
-        assert_eq!(plan.render_passes[0].draw_calls, 1);
-        let stats = runtime.backend().translation_stats();
-        assert_eq!(stats.barriers_elided, 1);
-        assert_eq!(stats.barriers_required, 0);
     }
 
     #[test]
-    fn d3d12_descriptor_table_batches_reuse_unchanged_heaps() {
+    fn resize_and_present_index_reject_stale_extra_state() {
         let mut runtime = D3d12Runtime::new();
-        let format = DxgiFormat::R8G8B8A8Unorm;
+        let primary = runtime
+            .create_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create primary");
+        let extra = runtime
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create extra");
+        runtime.extra_swapchains.remove(&extra);
+        runtime
+            .resize_buffers(extra, 2, 8, 4, DxgiFormat::R8G8B8A8Unorm)
+            .expect("stale extra resize updates only the backend");
+        assert_eq!(runtime.extra_swapchains.contains_key(&extra), false);
+        assert_eq!(
+            runtime
+                .swapchain_state(extra)
+                .expect("backend state")
+                .desc
+                .width,
+            8
+        );
+
+        runtime.extra_swapchains.insert(
+            u64::MAX,
+            SwapchainChannelSet {
+                pixel: Vec::new(),
+                nv12: Vec::new(),
+            },
+        );
+        assert_eq!(runtime.present_backbuffer_index(999_999), None);
+        assert_eq!(runtime.present_swapchain, Some(primary));
+    }
+
+    #[test]
+    fn directstorage_and_readback_reject_missing_path_and_nonreadback_heap() {
+        let (ge, root) = test_game_environment("d3d12-ds-missing-and-readback");
+        let mut runtime = D3d12Runtime::new();
+        let error = runtime
+            .upload_file_to_texture(
+                &ge,
+                "C:\\absent.bin",
+                directstorage_upload_desc(&[0u8; 32], 4, 2, metal::MTLPixelFormat::RGBA8Unorm),
+            )
+            .expect_err("missing guest file must fail before any host file opens");
+        assert_eq!(error.code, ReasonCode::RcFsNotFound);
+        assert_eq!(error.message, "C:\\absent.bin was not found");
+        assert_eq!(runtime.directstorage_bytes(), 0);
+        assert_eq!(runtime.staging_bytes(), 0);
+
         let resource = runtime
             .create_committed_resource(ResourceDesc {
-                name: "d3d12-table".to_string(),
-                format,
+                name: "plain-default-heap".to_string(),
+                format: DxgiFormat::R8G8B8A8Unorm,
                 heap: HeapType::Default,
-                size: 64,
+                size: 32,
                 subresources: 1,
                 initial_state: ResourceState::Common,
-                usage_hint: ResourceUsageHint::Generic,
+                usage_hint: ResourceUsageHint::Texture {
+                    sampled: true,
+                    render_target: false,
+                    depth_stencil: false,
+                    cpu_write_frequent: false,
+                },
             })
-            .expect("create resource");
-        let heap = runtime.create_descriptor_heap(DescriptorHeapType::CbvSrvUav, 1);
-        runtime
-            .write_descriptor(heap, 0, ViewDescriptor::Srv { resource, format })
-            .expect("srv");
-
-        let first = runtime
-            .translate_descriptor_tables(&[heap])
-            .expect("first batch");
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].len(), 1);
-        let stats = runtime.backend().translation_stats();
-        assert_eq!(stats.descriptor_table_batches, 1);
-        assert_eq!(stats.descriptor_table_uploads, 1);
-        assert_eq!(stats.descriptor_table_reuses, 0);
-
-        let second = runtime
-            .translate_descriptor_tables(&[heap])
-            .expect("second batch");
-        assert_eq!(second, first);
-        let stats = runtime.backend().translation_stats();
-        assert_eq!(stats.descriptor_table_batches, 2);
-        assert_eq!(stats.descriptor_table_uploads, 1);
-        assert_eq!(stats.descriptor_table_reuses, 1);
+            .expect("create non-readback resource");
+        let error = runtime
+            .readback(resource, 0, 1)
+            .expect_err("a default-heap resource must not read back");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "resource is not in a readback heap");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

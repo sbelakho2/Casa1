@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Stage 4 — the Ldr loader chain: the NTDLL-native surface ABOVE the
 //! loader machinery.
 //!
@@ -34,16 +35,12 @@ fn setup_session() -> (TempDir, NtThunkSession) {
     (temp_dir, session)
 }
 
-/// The scratch data arena addresses (mapped by the session).
 const ARENA: u64 = 0x30_000;
 const ARENA2: u64 = 0x40_000;
 const ARENA3: u64 = 0x50_000;
 
-/// Guest directory the Ldr tests stage their real DLL fixtures into.
 const FIXTURE_DIR: &str = r"C:\Casa1LdrFixtures";
 
-/// Write a real PE DLL into the GE so `LdrLoadDll` can resolve it through
-/// the loader's dll-path machinery.
 fn write_guest_pe(session: &NtThunkSession, guest_path: &str, bytes: &[u8]) {
     let host_path = session
         .win32()
@@ -55,8 +52,6 @@ fn write_guest_pe(session: &NtThunkSession, guest_path: &str, bytes: &[u8]) {
     fs::write(&host_path, bytes).expect("write guest PE");
 }
 
-/// Place a UNICODE_STRING header + wide buffer in guest memory; returns
-/// the header address.
 fn map_unicode_string(session: &mut NtThunkSession, header: u64, buffer: u64, value: &str) {
     let wide: Vec<u8> = value.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     session.map_guest(buffer, &wide);
@@ -66,8 +61,6 @@ fn map_unicode_string(session: &mut NtThunkSession, header: u64, buffer: u64, va
     session.map_guest(header + 8, &buffer.to_le_bytes());
 }
 
-/// Place an ANSI_STRING header + buffer in guest memory; returns the
-/// header address.
 fn map_ansi_string(session: &mut NtThunkSession, header: u64, buffer: u64, value: &str) {
     session.map_guest(buffer, value.as_bytes());
     session.map_guest(header, &[0_u8; 16]);
@@ -85,12 +78,8 @@ fn map_ansi_string(session: &mut NtThunkSession, header: u64, buffer: u64, value
 // code) so the callbacks execute as guest code during the DllMain drain.
 
 const IMAGE_BASE: u64 = 0x1_4000_0000;
-/// DllMain entry-point RVA.
 const EP_RVA: u32 = 0x1000;
-/// The named export's code RVA.
 const EXPORT_FN_RVA: u32 = 0x1050;
-/// The TLS callback's code RVA (kept clear of the 42-byte DllMain
-/// appender the tests map at EP_RVA).
 const TLS_CB_RVA: u32 = 0x1100;
 
 fn build_minimal_dll(export_name: &str, dll_name: &str) -> Vec<u8> {
@@ -169,19 +158,6 @@ fn build_minimal_dll(export_name: &str, dll_name: &str) -> Vec<u8> {
     buf
 }
 
-/// Guest code that appends its `marker` byte to the record buffer:
-///
-/// ```text
-/// mov rax, [len_slot]      ; current record length
-/// mov rcx, rax             ; index (the marker index)
-/// mov r8d, marker          ; the marker byte (kept OUT of rax so the
-///                          ; length can be incremented below)
-/// mov rdx, buf
-/// mov [rdx+rcx], r8b       ; append the marker
-/// inc rax
-/// mov [len_slot], rax      ; update the length
-/// ret
-/// ```
 fn record_marker_code(marker: u8, len_slot: u64, buf: u64) -> Vec<u8> {
     let mut code = Vec::new();
     code.extend_from_slice(&[0x48, 0xA1]); // mov rax, moffs64
@@ -198,9 +174,6 @@ fn record_marker_code(marker: u8, len_slot: u64, buf: u64) -> Vec<u8> {
     code
 }
 
-/// PeHostRuntime is very large; every test runs on a thread with a bigger
-/// stack so the scratch runtime never overflows the default test-thread
-/// stack (the same pattern the runtime's own unit tests use).
 fn run_on_big_stack(test: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)

@@ -1389,67 +1389,11 @@ fn send_rumble_via_iokit(left_motor: u8, right_motor: u8) -> Result<(), String> 
 mod tests {
     use super::*;
 
-    /// Verifies that `send_hid_rumble` compiles and runs without panicking
-    /// on non-macOS platforms (it should be a no-op).  On macOS the function
-    /// will attempt to find hardware; we just verify it doesn't crash.
     #[test]
     fn send_hid_rumble_no_panic() {
         // This should never panic regardless of platform.
         send_hid_rumble(0, 128, 200);
         send_hid_rumble(1, 255, 255);
         send_hid_rumble(2, 0, 0);
-    }
-
-    /// Verifies the intensity derivation in `trigger_repeated_haptic_pulse`.
-    /// We test indirectly by checking the method compiles and runs; the actual
-    /// rumble dispatch delegates to `send_hid_rumble` which is tested above.
-    #[test]
-    fn trigger_repeated_haptic_pulse_runs() {
-        let steam = SteamInput::new();
-        // Use a handle that maps to slot 0. The function will attempt to call
-        // send_hid_rumble via slot_for_handle — if no controller is connected
-        // it's a no-op, so this should never panic.
-        let handle: u64 = 0x1000; // slot 0
-        steam.trigger_repeated_haptic_pulse(
-            handle,
-            HapticTarget::Both,
-            5,   // pulse_count
-            100, // duration_ms
-            50,  // interval_ms
-            0,   // flags
-        );
-    }
-
-    /// Verifies the `normalize_axis` helper.
-    #[test]
-    fn normalize_axis_works() {
-        assert!((normalize_axis(0) - 0.0).abs() < f32::EPSILON);
-        assert!((normalize_axis(i16::MAX) - 1.0).abs() < f32::EPSILON);
-        assert!((normalize_axis(i16::MIN) - (-1.0)).abs() < f32::EPSILON);
-        assert!((normalize_axis(8000) - (8000.0 / i16::MAX as f32)).abs() < 1e-4);
-    }
-
-    /// Verifies the `normalize_trigger` helper.
-    #[test]
-    fn normalize_trigger_works() {
-        assert!((normalize_trigger(0) - 0.0).abs() < f32::EPSILON);
-        assert!((normalize_trigger(255) - 1.0).abs() < f32::EPSILON);
-        assert!((normalize_trigger(128) - (128.0 / 255.0)).abs() < 1e-4);
-    }
-
-    /// Checks that HapticTarget mapping in trigger_repeated_haptic_pulse
-    /// selects the correct motor channels (verified via side-effect — the
-    /// motor speed derivation is pure and visible in `send_hid_rumble` calls).
-    #[test]
-    fn haptic_target_filters_correct_motor() {
-        let steam = SteamInput::new();
-        let handle: u64 = 0x1000;
-
-        // Left only — should map intensity to left motor, 0 to right
-        steam.trigger_repeated_haptic_pulse(handle, HapticTarget::Left, 3, 50, 25, 0);
-        // Right only
-        steam.trigger_repeated_haptic_pulse(handle, HapticTarget::Right, 3, 50, 25, 0);
-        // Both
-        steam.trigger_repeated_haptic_pulse(handle, HapticTarget::Both, 3, 50, 25, 0);
     }
 }

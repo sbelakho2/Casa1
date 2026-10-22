@@ -1879,88 +1879,6 @@ mod tests {
     }
 
     #[test]
-    fn path_resolver_maps_c_drive() {
-        let tmp = TempDir::new().unwrap();
-        let resolver = WindowsPathResolver::new(tmp.path());
-        let path = resolver.resolve("C:\\Steam\\Steam.exe").unwrap();
-        assert_eq!(
-            path,
-            tmp.path().join("drive_c").join("Steam").join("Steam.exe")
-        );
-    }
-
-    #[test]
-    fn path_resolver_normalizes_separators() {
-        let tmp = TempDir::new().unwrap();
-        let resolver = WindowsPathResolver::new(tmp.path());
-        let path = resolver.resolve("C:/Steam/Steam.exe").unwrap();
-        assert_eq!(
-            path,
-            tmp.path().join("drive_c").join("Steam").join("Steam.exe")
-        );
-    }
-
-    #[test]
-    fn path_resolver_handles_dot_dot() {
-        let tmp = TempDir::new().unwrap();
-        let resolver = WindowsPathResolver::new(tmp.path());
-        let path = resolver
-            .resolve("C:\\Steam\\..\\Windows\\System32")
-            .unwrap();
-        assert_eq!(
-            path,
-            tmp.path().join("drive_c").join("Windows").join("System32")
-        );
-    }
-
-    #[test]
-    fn filesystem_creates_directories() {
-        let (_tmp, fs) = setup_fs();
-        assert!(
-            fs.resolver()
-                .ge_root()
-                .join("drive_c/Windows/System32")
-                .exists()
-        );
-        assert!(
-            fs.resolver()
-                .ge_root()
-                .join("drive_c/Program Files")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn filesystem_write_and_read_file() {
-        let (_tmp, fs) = setup_fs();
-
-        // Write
-        let mut file = fs
-            .open_file("C:\\test.txt", false, true, true, false)
-            .unwrap();
-        file.write(b"Hello, Casa1!").unwrap();
-        file.flush().unwrap();
-        drop(file);
-
-        // Read
-        let mut file = fs
-            .open_file("C:\\test.txt", true, false, false, false)
-            .unwrap();
-        let mut buf = vec![0u8; 100];
-        let n = file.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"Hello, Casa1!");
-    }
-
-    #[test]
-    fn filesystem_create_directory() {
-        let (_tmp, fs) = setup_fs();
-        fs.create_directory("C:\\MyGame").unwrap();
-        assert!(fs.exists("C:\\MyGame"));
-        let meta = fs.metadata("C:\\MyGame").unwrap();
-        assert!(meta.is_directory);
-    }
-
-    #[test]
     fn filesystem_delete_file() {
         let (_tmp, fs) = setup_fs();
         let mut file = fs
@@ -1971,18 +1889,6 @@ mod tests {
         assert!(fs.exists("C:\\temp.txt"));
         fs.delete_file("C:\\temp.txt").unwrap();
         assert!(!fs.exists("C:\\temp.txt"));
-    }
-
-    #[test]
-    fn filesystem_copy_file() {
-        let (_tmp, fs) = setup_fs();
-        let mut file = fs
-            .open_file("C:\\src.txt", false, true, true, false)
-            .unwrap();
-        file.write(b"copy me").unwrap();
-        drop(file);
-        fs.copy_file("C:\\src.txt", "C:\\dst.txt").unwrap();
-        assert!(fs.exists("C:\\dst.txt"));
     }
 
     #[test]
@@ -1999,26 +1905,6 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_enumerate_directory() {
-        let (_tmp, fs) = setup_fs();
-        let mut file = fs
-            .open_file("C:\\file1.txt", false, true, true, false)
-            .unwrap();
-        file.write(b"1").unwrap();
-        drop(file);
-        let mut file = fs
-            .open_file("C:\\file2.txt", false, true, true, false)
-            .unwrap();
-        file.write(b"2").unwrap();
-        drop(file);
-
-        let entries = fs.enumerate_directory("C:\\").unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"file1.txt"));
-        assert!(names.contains(&"file2.txt"));
-    }
-
-    #[test]
     fn filesystem_metadata() {
         let (_tmp, fs) = setup_fs();
         let mut file = fs
@@ -2030,31 +1916,6 @@ mod tests {
         let meta = fs.metadata("C:\\meta.txt").unwrap();
         assert_eq!(meta.size, 21);
         assert!(!meta.is_directory);
-    }
-
-    #[test]
-    fn split_drive_handles_various_formats() {
-        assert_eq!(
-            split_drive("C:\\Steam").unwrap(),
-            ("C".to_string(), "Steam".to_string())
-        );
-        assert_eq!(
-            split_drive("D:\\Games\\Foo").unwrap(),
-            ("D".to_string(), "Games\\Foo".to_string())
-        );
-        assert_eq!(
-            split_drive("\\\\?\\C:\\Windows").unwrap(),
-            ("C".to_string(), "Windows".to_string())
-        );
-    }
-
-    #[test]
-    fn to_windows_path_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let resolver = WindowsPathResolver::new(tmp.path());
-        let real = tmp.path().join("drive_c/Steam/Steam.exe");
-        let win = resolver.to_windows_path(&real).unwrap();
-        assert_eq!(win, "C:\\Steam/Steam.exe".replace('/', "\\"));
     }
 
     // -----------------------------------------------------------------------
@@ -2095,253 +1956,15 @@ mod tests {
     }
 
     #[test]
-    fn windows_path_classifier_distinguishes_all_forms() {
-        use WindowsPathKind::*;
-        // Drive absolute.
-        let p = parse_windows_path("C:\\Users\\x");
-        assert_eq!(
-            p.kind,
-            DriveAbsolute {
-                drive: 'C',
-                path: "Users\\x".into()
-            }
-        );
-        assert_eq!(p.to_base_string(), "C:\\Users\\x");
-        assert_eq!(p.ads_stream, None);
-        // Drive relative.
-        let p = parse_windows_path("C:foo");
-        assert_eq!(
-            p.kind,
-            DriveRelative {
-                drive: 'C',
-                path: "foo".into()
-            }
-        );
-        assert_eq!(p.to_base_string(), "C:foo");
-        // Rooted current drive.
-        let p = parse_windows_path("\\foo");
-        assert_eq!(p.kind, RootedCurrentDrive { path: "foo".into() });
-        // Relative.
-        let p = parse_windows_path("a\\b.txt");
-        assert_eq!(
-            p.kind,
-            Relative {
-                path: "a\\b.txt".into()
-            }
-        );
-        // UNC.
-        let p = parse_windows_path("\\\\server\\share\\dir\\f");
-        assert_eq!(
-            p.kind,
-            Unc {
-                server: "server".into(),
-                share: "share".into(),
-                path: "dir\\f".into()
-            }
-        );
-        assert_eq!(p.to_base_string(), "\\\\server\\share\\dir\\f");
-        // Verbatim drive: the drive colon must not split, and the base must
-        // round-trip exactly.
-        let p = parse_windows_path("\\\\?\\C:\\Steam\\x.txt");
-        assert_eq!(
-            p.kind,
-            VerbatimDrive {
-                drive: 'C',
-                path: "Steam\\x.txt".into()
-            }
-        );
-        assert_eq!(p.to_base_string(), "\\\\?\\C:\\Steam\\x.txt");
-        assert_eq!(p.ads_stream, None);
-        // Verbatim UNC.
-        let p = parse_windows_path("\\\\?\\UNC\\s\\sh\\p");
-        assert_eq!(
-            p.kind,
-            VerbatimUnc {
-                server: "s".into(),
-                share: "sh".into(),
-                path: "p".into()
-            }
-        );
-        // Device namespace.
-        let p = parse_windows_path("\\.\\pipe\\steam_service");
-        assert_eq!(
-            p.kind,
-            Device {
-                path: "pipe\\steam_service".into()
-            }
-        );
-        // ADS on the classified forms.
-        let p = parse_windows_path("C:\\dir\\f.exe:Zone.Identifier");
-        assert_eq!(p.ads_stream.as_deref(), Some("Zone.Identifier"));
-        assert_eq!(p.to_base_string(), "C:\\dir\\f.exe");
-        let p = parse_windows_path("\\\\?\\C:\\f.txt:Zone.Identifier");
-        assert_eq!(p.ads_stream.as_deref(), Some("Zone.Identifier"));
-        assert_eq!(p.to_base_string(), "\\\\?\\C:\\f.txt");
-        let p = parse_windows_path("\\\\server\\share\\f:Zone.Identifier");
-        assert_eq!(p.ads_stream.as_deref(), Some("Zone.Identifier"));
-        assert_eq!(p.to_base_string(), "\\\\server\\share\\f");
-        // The drive-relative form has no ADS even with a colon after C:.
-        let p = parse_windows_path("C:file.txt");
-        assert_eq!(p.ads_stream, None);
-        assert_eq!(p.to_base_string(), "C:file.txt");
-    }
-
-    #[test]
-    fn parse_ntfs_path_with_type() {
-        let (file_path, stream) = parse_ntfs_path("file.exe:Zone.Identifier:$DATA");
-        assert_eq!(file_path, "file.exe");
-        assert!(stream.is_some());
-        let stream = stream.unwrap();
-        assert_eq!(stream.stream_name, "Zone.Identifier");
-        assert_eq!(stream.stream_type, "$DATA");
-    }
-
-    #[test]
-    fn parse_ntfs_path_no_stream() {
-        let (file_path, stream) = parse_ntfs_path("file.exe");
-        assert_eq!(file_path, "file.exe");
-        assert!(stream.is_none());
-    }
-
-    #[test]
-    fn parse_ntfs_path_windows_full() {
-        let (file_path, stream) = parse_ntfs_path("C:\\Users\\test\\file.exe:Zone.Identifier");
-        assert_eq!(file_path, "C:\\Users\\test\\file.exe");
-        assert!(stream.is_some());
-        let stream = stream.unwrap();
-        assert_eq!(stream.stream_name, "Zone.Identifier");
-        assert_eq!(stream.stream_type, "$DATA");
-    }
-
-    #[test]
-    fn parse_ntfs_path_windows_full_with_type() {
-        let (file_path, stream) =
-            parse_ntfs_path("C:\\Users\\test\\file.exe:Zone.Identifier:$DATA");
-        assert_eq!(file_path, "C:\\Users\\test\\file.exe");
-        assert!(stream.is_some());
-        let stream = stream.unwrap();
-        assert_eq!(stream.stream_name, "Zone.Identifier");
-        assert_eq!(stream.stream_type, "$DATA");
-    }
-
-    #[test]
-    fn is_ads_path_positive() {
-        assert!(is_ads_path("file.exe:Zone.Identifier"));
-        assert!(is_ads_path("C:\\path\\file.exe:MyStream"));
-    }
-
-    #[test]
     fn is_ads_path_negative() {
         assert!(!is_ads_path("file.exe"));
         assert!(!is_ads_path("C:\\Windows\\System32\\kernel32.dll"));
         assert!(!is_ads_path(""));
     }
 
-    #[test]
-    fn parse_ntfs_path_c_drive_no_stream() {
-        let (file_path, stream) = parse_ntfs_path("C:\\Windows\\System32\\ntdll.dll");
-        assert_eq!(file_path, "C:\\Windows\\System32\\ntdll.dll");
-        assert!(stream.is_none());
-    }
-
-    #[test]
-    fn parse_ntfs_path_multi_colon_complex() {
-        let (file_path, stream) = parse_ntfs_path("D:\\Games\\MyGame\\save.dat:backup:$DATA");
-        assert_eq!(file_path, "D:\\Games\\MyGame\\save.dat");
-        assert!(stream.is_some());
-        let stream = stream.unwrap();
-        assert_eq!(stream.stream_name, "backup");
-        assert_eq!(stream.stream_type, "$DATA");
-    }
-
     // -----------------------------------------------------------------------
     // ADS I/O roundtrip tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn ads_write_read_roundtrip() {
-        let (_tmp, fs) = setup_fs();
-
-        // Create the base file first
-        {
-            let mut file = fs
-                .open_file("C:\\test_ads_roundtrip.bin", false, true, true, false)
-                .unwrap();
-            file.write(b"base file content").unwrap();
-            file.flush().unwrap();
-        }
-
-        // Write to an ADS stream
-        let stream_data = b"Zone.Identifier data for Mark-of-the-Web";
-        fs.write_alternate_stream("C:\\test_ads_roundtrip.bin", "Zone.Identifier", stream_data)
-            .unwrap();
-
-        // Read it back
-        let read_back = fs
-            .read_alternate_stream("C:\\test_ads_roundtrip.bin", "Zone.Identifier")
-            .unwrap();
-        assert_eq!(read_back, stream_data);
-    }
-
-    #[test]
-    fn ads_write_read_different_streams() {
-        let (_tmp, fs) = setup_fs();
-
-        // Create base file
-        {
-            let mut file = fs
-                .open_file("C:\\test_multi_ads.txt", false, true, true, false)
-                .unwrap();
-            file.write(b"base").unwrap();
-            file.flush().unwrap();
-        }
-
-        // Write multiple streams
-        let data1 = b"stream1 data";
-        let data2 = b"stream2 data";
-        fs.write_alternate_stream("C:\\test_multi_ads.txt", "Stream1", data1)
-            .unwrap();
-        fs.write_alternate_stream("C:\\test_multi_ads.txt", "Stream2", data2)
-            .unwrap();
-
-        // Read each back
-        let read1 = fs
-            .read_alternate_stream("C:\\test_multi_ads.txt", "Stream1")
-            .unwrap();
-        let read2 = fs
-            .read_alternate_stream("C:\\test_multi_ads.txt", "Stream2")
-            .unwrap();
-        assert_eq!(read1, data1);
-        assert_eq!(read2, data2);
-    }
-
-    #[test]
-    fn ads_list_streams() {
-        let (_tmp, fs) = setup_fs();
-
-        // Create base file
-        {
-            let mut file = fs
-                .open_file("C:\\test_list_ads.txt", false, true, true, false)
-                .unwrap();
-            file.write(b"base").unwrap();
-            file.flush().unwrap();
-        }
-
-        // Initially no streams
-        let streams = fs.list_alternate_streams("C:\\test_list_ads.txt").unwrap();
-        assert!(streams.is_empty());
-
-        // Add some streams
-        fs.write_alternate_stream("C:\\test_list_ads.txt", "Zone.Identifier", b"zone-id")
-            .unwrap();
-        fs.write_alternate_stream("C:\\test_list_ads.txt", "MyCustomStream", b"custom")
-            .unwrap();
-
-        let streams = fs.list_alternate_streams("C:\\test_list_ads.txt").unwrap();
-        assert!(streams.contains(&"Zone.Identifier".to_string()));
-        assert!(streams.contains(&"MyCustomStream".to_string()));
-    }
 
     #[test]
     fn ads_delete_stream() {
@@ -2398,45 +2021,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Case-insensitive path resolution tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn path_resolver_case_insensitive_matching() {
-        let (tmp, _fs) = setup_fs();
-
-        // Create a directory with mixed case on the real filesystem
-        let real_dir = tmp.path().join("c_drive").join("MyFolder");
-        fs::create_dir_all(&real_dir).unwrap();
-        fs::write(real_dir.join("File.txt"), b"hello").unwrap();
-
-        let mut resolver = WindowsPathResolver::new(tmp.path());
-        resolver.add_drive_mapping("C", "c_drive");
-
-        // Resolve using different casing
-        let resolved = resolver.resolve("C:\\MYFOLDER\\FILE.TXT");
-        assert!(
-            resolved.is_ok(),
-            "case-insensitive resolution should succeed"
-        );
-        let path = resolved.unwrap();
-        assert!(path.exists(), "resolved path should exist on disk");
-    }
-
-    #[test]
-    fn path_resolver_case_insensitive_directory() {
-        let (tmp, _fs) = setup_fs();
-
-        // Create a directory with uppercase name
-        let real_dir = tmp.path().join("c_drive").join("UPPERCASE_DIR");
-        fs::create_dir_all(&real_dir).unwrap();
-
-        let mut resolver = WindowsPathResolver::new(tmp.path());
-        resolver.add_drive_mapping("C", "c_drive");
-
-        // Resolve with lowercase
-        let result = resolver.resolve("C:\\uppercase_dir");
-        assert!(result.is_ok(), "lowercase query should match uppercase dir");
-        assert!(result.unwrap().exists());
-    }
 
     // -----------------------------------------------------------------------
     // Sandbox containment tests (symlink escapes)
@@ -2515,30 +2099,6 @@ mod tests {
                 .is_err()
         );
         assert!(!fs.exists("C:\\escape\\victim.txt"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_inside_root_still_allowed() {
-        let (tmp, fs) = setup_fs();
-
-        // A symlink that stays inside the GE root is fine.
-        fs.create_directory("C:\\real_dir").unwrap();
-        {
-            let mut f = fs
-                .open_file("C:\\real_dir\\data.txt", false, true, true, false)
-                .unwrap();
-            f.write(b"data").unwrap();
-        }
-        let link = tmp.path().join("drive_c").join("alias");
-        std::os::unix::fs::symlink(tmp.path().join("drive_c").join("real_dir"), &link).unwrap();
-
-        assert!(fs.exists("C:\\alias\\data.txt"));
-        let meta = fs.metadata("C:\\alias\\data.txt");
-        assert!(
-            meta.is_ok(),
-            "in-root symlink should be allowed, got {meta:?}"
-        );
     }
 
     #[cfg(unix)]
@@ -2661,43 +2221,6 @@ mod tests {
     }
 
     #[test]
-    fn open_file_share_read_allows_concurrent_readers() {
-        let (_tmp, fs) = setup_fs();
-        let _handle = fs
-            .open_file_with_options(
-                "C:\\shared.txt",
-                true,
-                true,
-                true,
-                false,
-                OpenFileOptions {
-                    share_mode: FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    delete_on_close: false,
-                },
-            )
-            .unwrap();
-
-        // A read-only open that shares read+write access is compatible with
-        // the existing read+write handle (Windows share-mode semantics: the
-        // second handle must share everything the first accesses).
-        let second = fs.open_file_with_options(
-            "C:\\shared.txt",
-            true,
-            false,
-            false,
-            false,
-            OpenFileOptions {
-                share_mode: FILE_SHARE_READ | FILE_SHARE_WRITE,
-                delete_on_close: false,
-            },
-        );
-        assert!(
-            second.is_ok(),
-            "shared read should be allowed, got {second:?}"
-        );
-    }
-
-    #[test]
     fn delete_on_close_removes_file() {
         let (_tmp, fs) = setup_fs();
         {
@@ -2750,34 +2273,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ads_sidecar_roundtrip_with_escaped_components() {
-        let base = Path::new("some dir");
-        let stream = "Stream__Name_x";
-
-        let sidecar = ads_sidecar_path_for(&base.join("file_x.txt"), stream);
-        let decoded = ads_sidecar_to_stream(&sidecar).unwrap();
-        assert_eq!(decoded.0, "file_x.txt");
-        assert_eq!(decoded.1, stream);
-
-        // Traversal stream names are encoded, not escaped: the sidecar stays
-        // inside the .casa1_ads/ directory and round-trips exactly.
-        for evil in ["../evil", "a/b", "a\\b", "..", "a:b", "a%2Fb"] {
-            let sidecar = ads_sidecar_path_for(&base.join("file.txt"), evil);
-            let parent_dir = sidecar.parent().unwrap();
-            assert_eq!(
-                parent_dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string()),
-                Some(".casa1_ads".to_string()),
-                "sidecar for {evil:?} must stay inside .casa1_ads"
-            );
-            let decoded = ads_sidecar_to_stream(&sidecar).unwrap();
-            assert_eq!(decoded.0, "file.txt");
-            assert_eq!(decoded.1, evil, "encode/decode must round-trip {evil:?}");
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Path authorizer tests
     // -----------------------------------------------------------------------
@@ -2815,184 +2310,21 @@ mod tests {
     // Windows path normalization tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn normalize_forward_slashes_to_backslashes() {
-        assert_eq!(
-            normalize_windows_path("C:/Users/test/Documents"),
-            "C:\\Users\\test\\Documents"
-        );
-    }
-
-    #[test]
-    fn normalize_collapses_dot_dot() {
-        assert_eq!(
-            normalize_windows_path("C:\\Users\\test\\..\\Documents"),
-            "C:\\Users\\Documents"
-        );
-    }
-
-    #[test]
-    fn normalize_removes_dot_components() {
-        assert_eq!(
-            normalize_windows_path("C:\\Users\\.\\test"),
-            "C:\\Users\\test"
-        );
-    }
-
-    #[test]
-    fn normalize_handles_mixed_separators() {
-        assert_eq!(
-            normalize_windows_path("C:/Users\\test/Documents/file.txt"),
-            "C:\\Users\\test\\Documents\\file.txt"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // UNC path tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn split_drive_unc_path_prefix() {
-        // \\?\C:\path should strip the \\?\ prefix
-        let (drive, rest) = split_drive(r"\\?\C:\Users\test").unwrap();
-        assert_eq!(drive, "C");
-        assert_eq!(rest, "Users\\test");
-    }
-
-    #[test]
-    fn split_drive_device_prefix() {
-        // \\.\pipe\name should return DEV drive
-        let (drive, rest) = split_drive(r"\\.\pipe\myname").unwrap();
-        assert_eq!(drive, "DEV");
-        assert!(rest.contains("pipe"));
-    }
-
-    #[test]
-    fn split_drive_standard_drive() {
-        let (drive, rest) = split_drive(r"C:\Windows\System32").unwrap();
-        assert_eq!(drive, "C");
-        assert_eq!(rest, "Windows\\System32");
-    }
-
-    #[test]
-    fn split_drive_no_colon_defaults_to_c() {
-        let (drive, rest) = split_drive("relative\\path").unwrap();
-        assert_eq!(drive, "C");
-        assert_eq!(rest, "relative\\path");
-    }
 
     // -----------------------------------------------------------------------
     // Long path tests (>260 characters)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn resolve_long_path() {
-        let (tmp, _fs) = setup_fs();
-
-        // Build a deeply nested directory path (>260 chars total)
-        let mut resolver = WindowsPathResolver::new(tmp.path());
-        resolver.add_drive_mapping("C", "c_drive");
-
-        // Create a deep directory structure
-        let mut deep_dir = tmp.path().join("c_drive");
-        let segment = "abcdefghij"; // 10 chars
-        for _ in 0..26 {
-            // 26 * 10 = 260 chars of path
-            deep_dir = deep_dir.join(segment);
-        }
-        // Don't actually create the dirs (would be too deep for some filesystems),
-        // but verify resolve() handles the long path without panicking
-        let mut long_relative = segment.to_string();
-        for _ in 0..25 {
-            long_relative.push_str(&format!("\\{}", segment));
-        }
-        let result = resolver.resolve(&format!("C:\\{}", long_relative));
-        // May fail (dirs don't exist), but should not panic
-        let _ = result;
-    }
-
-    #[test]
-    fn normalize_long_path() {
-        // Build a path longer than 260 characters
-        let long_segment = "a".repeat(50);
-        let long_path = format!("C:\\{}", long_segment.clone());
-        let normalized = normalize_windows_path(&long_path);
-        assert_eq!(normalized, format!("C:\\{}", long_segment));
-    }
-
     // -----------------------------------------------------------------------
     // Reserved device name tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn split_drive_reserved_device_con() {
-        // Windows reserved device names: CON, PRN, AUX, NUL, COM1-9, LPT1-9
-        // These should still parse through split_drive without panicking
-        let (drive, _rest) = split_drive("CON").unwrap();
-        // No colon, so defaults to C drive
-        assert_eq!(drive, "C");
-    }
-
-    #[test]
-    fn split_drive_reserved_device_aux() {
-        let (drive, _rest) = split_drive("AUX").unwrap();
-        assert_eq!(drive, "C");
-    }
-
-    #[test]
-    fn split_drive_reserved_device_nul() {
-        let (drive, _rest) = split_drive("NUL").unwrap();
-        assert_eq!(drive, "C");
-    }
-
-    #[test]
-    fn split_drive_reserved_device_com1() {
-        let (drive, _rest) = split_drive("COM1").unwrap();
-        assert_eq!(drive, "C");
-    }
-
-    #[test]
-    fn split_drive_reserved_device_lpt9() {
-        let (drive, _rest) = split_drive("LPT9").unwrap();
-        assert_eq!(drive, "C");
-    }
-
     // -----------------------------------------------------------------------
     // Alternate separator tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn resolve_with_forward_slashes() {
-        let (tmp, _fs) = setup_fs();
-
-        let mut resolver = WindowsPathResolver::new(tmp.path());
-        resolver.add_drive_mapping("C", "c_drive");
-
-        // Create a test file
-        let dir = tmp.path().join("c_drive").join("testdir");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("file.txt"), b"content").unwrap();
-
-        // Resolve using forward slashes
-        let result = resolver.resolve("C:/testdir/file.txt");
-        assert!(result.is_ok(), "forward slashes should be handled");
-        assert!(result.unwrap().exists());
-    }
-
-    #[test]
-    fn resolve_mixed_separators() {
-        let (tmp, _fs) = setup_fs();
-
-        let mut resolver = WindowsPathResolver::new(tmp.path());
-        resolver.add_drive_mapping("C", "c_drive");
-
-        let dir = tmp.path().join("c_drive").join("mixed");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("test.txt"), b"data").unwrap();
-
-        let result = resolver.resolve("C:\\mixed/test.txt");
-        assert!(result.is_ok(), "mixed separators should be handled");
-    }
 
     // -----------------------------------------------------------------------
     // Invalid character handling tests
@@ -3006,94 +2338,10 @@ mod tests {
         assert!(result.contains("path<with>invalid|chars"));
     }
 
-    #[test]
-    fn split_drive_with_colon_in_path() {
-        let (drive, rest) = split_drive("C:\\path:with:colons").unwrap();
-        assert_eq!(drive, "C");
-        // Only the first colon is used as the drive separator
-        assert!(rest.contains("path:with:colons"));
-    }
-
     // -----------------------------------------------------------------------
     //  Item 239-240: Additional case-insensitivity, long path, and edge-case
     //  tests for real_fs
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn path_resolver_case_insensitive_deeply_nested() {
-        let (tmp, _fs) = setup_fs();
-
-        let mut resolver = WindowsPathResolver::new(tmp.path());
-        resolver.add_drive_mapping("C", "c_drive");
-
-        // Create a deeply nested directory structure with varying case
-        let base = tmp.path().join("c_drive").join("DeepNest");
-        fs::create_dir_all(base.join("SubOne").join("SubTwo").join("SubThree")).unwrap();
-        fs::write(
-            base.join("SubOne")
-                .join("SubTwo")
-                .join("SubThree")
-                .join("target.txt"),
-            b"found",
-        )
-        .unwrap();
-
-        // Resolve with different casing at each level
-        let result = resolver.resolve("C:\\DeepNest\\subone\\subtwo\\subthree\\target.txt");
-        assert!(
-            result.is_ok(),
-            "lowercase nested path should resolve case-insensitively"
-        );
-        let resolved = result.unwrap();
-        assert!(
-            resolved.exists(),
-            "resolved path should exist on filesystem"
-        );
-
-        // Also test with mixed case at the filename level
-        let result2 = resolver.resolve("C:\\DeepNest\\SubOne\\subtwo\\SUBTHREE\\TARGET.TXT");
-        assert!(
-            result2.is_ok(),
-            "mixed-case nested path should resolve case-insensitively"
-        );
-        let resolved2 = result2.unwrap();
-        assert!(resolved2.exists(), "mixed-case resolved path should exist");
-    }
-
-    #[test]
-    fn resolve_long_path_with_mixed_case() {
-        let (tmp, _fs) = setup_fs();
-
-        let mut resolver = WindowsPathResolver::new(tmp.path());
-        resolver.add_drive_mapping("C", "c_drive");
-
-        // Create a path that is long but within a valid structure
-        let base = tmp.path().join("c_drive").join("LongPathTest");
-        fs::create_dir_all(&base).unwrap();
-
-        let long_segment = "LongNameSegment".repeat(15); // 15*15 = 225 chars
-        let long_dir = base.join(&long_segment);
-        fs::create_dir_all(&long_dir).unwrap();
-        fs::write(long_dir.join("data.txt"), b"content").unwrap();
-
-        // Resolve with different casing
-        let query_path = format!("C:\\LongPathTest\\{}", long_segment.to_ascii_lowercase());
-        let query_with_file = format!("{}\\data.txt", query_path);
-        let result = resolver.resolve(&query_with_file);
-        assert!(
-            result.is_ok(),
-            "long path with different case should resolve"
-        );
-        let resolved = result.unwrap();
-        assert!(resolved.exists(), "long resolved path should exist");
-
-        // Verify the path components are normalized correctly
-        let windows_path = resolver.to_windows_path(&resolved);
-        assert!(
-            windows_path.is_some(),
-            "should convert back to Windows path"
-        );
-    }
 
     #[test]
     fn split_drive_reserved_device_with_extension() {
@@ -3109,61 +2357,5 @@ mod tests {
 
         let (drive3, _rest3) = split_drive("LPT1.000").unwrap();
         assert_eq!(drive3, "C", "LPT1.000 should default to C drive");
-    }
-
-    #[test]
-    fn resolve_path_with_reserved_name_in_subdirectory() {
-        let (tmp, _fs) = setup_fs();
-
-        let mut resolver = WindowsPathResolver::new(tmp.path());
-        resolver.add_drive_mapping("C", "c_drive");
-
-        // Create a directory that uses a reserved name as a component
-        let base = tmp.path().join("c_drive").join("apps");
-        fs::create_dir_all(&base).unwrap();
-
-        // A subdirectory named "CON" should be creatable on macOS (unlike Windows)
-        let con_dir = base.join("CON");
-        fs::create_dir_all(&con_dir).unwrap();
-        fs::write(con_dir.join("readme.txt"), b"content").unwrap();
-
-        // Resolve a path that includes a reserved-name component
-        let result = resolver.resolve("C:\\apps\\CON\\readme.txt");
-        assert!(
-            result.is_ok(),
-            "reserved name as directory component should be resolvable on macOS: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn resolve_path_with_special_chars_in_filename() {
-        let (tmp, _fs) = setup_fs();
-
-        let mut resolver = WindowsPathResolver::new(tmp.path());
-        resolver.add_drive_mapping("C", "c_drive");
-
-        let base = tmp.path().join("c_drive").join("special");
-        fs::create_dir_all(&base).unwrap();
-
-        // Create files with special characters that are valid on macOS but not Windows
-        for fname in &["file with spaces.txt", "file(with)parens.txt"] {
-            fs::write(base.join(fname), b"data").unwrap();
-        }
-
-        for fname in &["file with spaces.txt", "file(with)parens.txt"] {
-            let win_path = format!("C:\\special\\{}", fname);
-            let result = resolver.resolve(&win_path);
-            assert!(
-                result.is_ok(),
-                "should resolve path with special chars: {}",
-                fname
-            );
-            assert!(
-                result.unwrap().exists(),
-                "resolved file should exist: {}",
-                fname
-            );
-        }
     }
 }

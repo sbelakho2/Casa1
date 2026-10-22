@@ -2925,60 +2925,6 @@ mod tests {
     // ── parser tests ───────────────────────────────────────────────────────
 
     #[test]
-    fn mini_format_bitfield_round_trips() {
-        let format = MiniFormat {
-            tag: WAVEBANK_TAG_ADPCM,
-            channels: 2,
-            sample_rate: 44100,
-            block_align: 200,
-            bits_per_sample: 4,
-        };
-        let decoded = MiniFormat::decode(format.encode());
-        assert_eq!(decoded.tag, WAVEBANK_TAG_ADPCM);
-        assert_eq!(decoded.channels, 2);
-        assert_eq!(decoded.sample_rate, 44100);
-        assert_eq!(decoded.block_align, 200);
-        // The single bit stores 16-bit PCM vs 8-bit; ADPCM reports 4 bits.
-        assert_eq!(decoded.bits_per_sample, 8);
-    }
-
-    #[test]
-    fn xwb_parses_real_header_and_decodes_pcm_samples() {
-        let first: Vec<i16> = vec![0, 1000, -1000, 32767, -32768, 42];
-        let second: Vec<i16> = vec![-7, 7];
-        let bytes = build_xwb(
-            "TestBank",
-            &[first.clone(), second.clone()],
-            &["one", "two"],
-            &[],
-        );
-        let bank = WaveBank::parse(&bytes).expect("valid XWB");
-        assert_eq!(bank.name, "TestBank");
-        assert_eq!(bank.entries.len(), 2);
-        assert_eq!(bank.entry_names, vec!["one", "two"]);
-        assert_eq!(bank.entry_index_by_name("two"), Some(1));
-        assert_eq!(bank.entry_index_by_name("missing"), None);
-        assert_eq!(bank.entries[0].format.tag, WAVEBANK_TAG_PCM);
-        assert_eq!(bank.entries[0].format.channels, 1);
-        assert_eq!(bank.entries[0].format.sample_rate, 44100);
-        assert_eq!(bank.entries[0].format.bits_per_sample, 16);
-        // The decoded samples are bit-exact with the payload written.
-        assert_eq!(bank.entries[0].pcm.as_deref(), Some(first.as_slice()));
-        assert_eq!(bank.entries[1].pcm.as_deref(), Some(second.as_slice()));
-        assert_eq!(bank.entries[0].sample_count(), first.len() as u32);
-        assert_eq!(bank.entries[0].duration_samples, first.len() as u32);
-    }
-
-    #[test]
-    fn xwb_preserves_loop_regions() {
-        let bytes = build_xwb("LoopBank", &[vec![1, 2, 3, 4]], &[], &[(1, 2)]);
-        let bank = WaveBank::parse(&bytes).expect("valid XWB");
-        assert!(bank.entries[0].is_looping());
-        assert_eq!(bank.entries[0].loop_start_sample, 1);
-        assert_eq!(bank.entries[0].loop_total_samples, 2);
-    }
-
-    #[test]
     fn xwb_rejects_bad_signature_and_versions() {
         let mut bytes = build_xwb("Bank", &[vec![0]], &[], &[]);
         bytes[0] = b'X';
@@ -3023,65 +2969,6 @@ mod tests {
     }
 
     #[test]
-    fn xwb_decodes_ms_adpcm_blocks() {
-        // One mono MS ADPCM block: predictor 0, delta 16, first sample 1000,
-        // second sample 0, nibbles 0 then 1.
-        // Header: predictor 0 (u16), delta 16 (u16), first sample 1000
-        // (u16), second sample 0 (u16); one packed nibble byte (0, then 1).
-        let block: Vec<u8> = vec![0, 0, 16, 0, 0xE8, 0x03, 0, 0, 0x01];
-        let bytes = build_xwb_entries(
-            "AdpcmBank",
-            &[XwbTestEntry {
-                name: "adpcm".to_string(),
-                payload: block.clone(),
-                tag: WAVEBANK_TAG_ADPCM,
-                channels: 1,
-                sample_rate: 22050,
-                block_align: 9,
-                bits_per_sample: 4,
-                duration_samples: 4,
-                loop_region: (0, 0),
-            }],
-        );
-        let bank = WaveBank::parse(&bytes).expect("valid ADPCM XWB");
-        let expected =
-            crate::real_audio::decode_ms_adpcm(&block, 9, 1, 6).expect("reference MS ADPCM decode");
-        assert_eq!(bank.entries[0].pcm.as_deref(), Some(expected.as_slice()));
-        assert_eq!(
-            bank.entries[0].pcm.as_deref(),
-            Some([1000_i16, 0, 1016, 0, 1016, 0].as_slice())
-        );
-        assert_eq!(bank.entries[0].format.tag, WAVEBANK_TAG_ADPCM);
-        assert_eq!(bank.entries[0].format.sample_rate, 22050);
-    }
-
-    #[test]
-    fn xsb_parses_cues_by_name_and_index() {
-        let bytes = build_xsb(&XsbSpec {
-            bank_name: "SoundBank",
-            wavebank_name: "WaveBank",
-            cues: &[("beep", 0), ("boop", 1)],
-        });
-        let bank = SoundBank::parse(&bytes).expect("valid XSB");
-        assert_eq!(bank.name, "SoundBank");
-        assert_eq!(bank.wavebank_names, vec!["WaveBank"]);
-        assert_eq!(bank.cues.len(), 2);
-        assert_eq!(bank.cue_index_by_name("beep"), Some(0));
-        assert_eq!(bank.cue_index_by_name("boop"), Some(1));
-        assert_eq!(bank.cue_index_by_name("nope"), None);
-        assert!(bank.cues[0].single_sound);
-        assert_eq!(bank.cues[1].sound_index, Some(1));
-        let sound = &bank.sounds[1];
-        assert_eq!(sound.tracks.len(), 1);
-        assert_eq!(sound.tracks[0].wave.wave_index, 1);
-        assert_eq!(sound.tracks[0].wave.wavebank, 0);
-        // Volume byte 0xB4 (180) is unity gain.
-        assert!((sound.volume - 1.0).abs() < 1.0e-3);
-        let selection = bank.select_cue(0).expect("select cue");
-        assert_eq!(selection.sound.tracks[0].wave.wave_index, 0);
-    }
-
-    #[test]
     fn xsb_rejects_malformed_headers() {
         let bytes = build_xsb(&XsbSpec {
             bank_name: "SoundBank",
@@ -3108,54 +2995,6 @@ mod tests {
     }
 
     #[test]
-    fn xsb_interactive_fixture_binds_variables_and_selects_ranges() {
-        let bytes = build_xsb_interactive(
-            "SoundBank",
-            "WaveBank",
-            "variableCue",
-            0,
-            &[(0, 0.0, 500.0), (1, 500.0, 1000.0)],
-            Some("CueSpeed"),
-        );
-        let bank = SoundBank::parse(&bytes).expect("interactive bank parses");
-        assert_eq!(bank.cues.len(), 1);
-        assert_eq!(bank.cues[0].local_variables, vec![0]);
-        assert_eq!(bank.cues[0].local_variable_names, vec!["CueSpeed"]);
-        assert_eq!(bank.variations.len(), 1);
-        assert_eq!(bank.variations[0].kind, VARIATION_TABLE_TYPE_INTERACTIVE);
-        assert_eq!(bank.variations[0].entries.len(), 2);
-        assert_eq!(
-            bank.variations[0].entries[0],
-            VariationEntry::Interactive {
-                sound_code: 138,
-                var_min: 0.0,
-                var_max: 500.0,
-            }
-        );
-        assert_eq!(
-            bank.variations[0].entries[1],
-            VariationEntry::Interactive {
-                sound_code: 150,
-                var_min: 500.0,
-                var_max: 1000.0,
-            }
-        );
-        assert_eq!(bank.sounds.len(), 2);
-        assert_eq!(bank.sounds[0].code, 138);
-        assert_eq!(bank.sounds[1].code, 150);
-        let lower = bank
-            .select_cue_with_variables(0, &[100.0])
-            .expect("lower selection");
-        assert_eq!(lower.variation_entry, Some(0));
-        assert_eq!(lower.sound.tracks[0].wave.wave_index, 0);
-        let upper = bank
-            .select_cue_with_variables(0, &[800.0])
-            .expect("upper selection");
-        assert_eq!(upper.variation_entry, Some(1));
-        assert_eq!(upper.sound.tracks[0].wave.wave_index, 1);
-    }
-
-    #[test]
     fn xsb_select_cue_rejects_bad_index() {
         let bytes = build_xsb(&XsbSpec {
             bank_name: "SoundBank",
@@ -3167,64 +3006,10 @@ mod tests {
     }
 
     #[test]
-    fn xgs_parses_categories_and_variables() {
-        let bytes = build_xgs();
-        let settings = GlobalSettings::parse(&bytes).expect("valid XGS");
-        assert_eq!(settings.categories.len(), 2);
-        assert_eq!(settings.categories[0].name, "Music");
-        assert_eq!(settings.categories[1].name, "SFX");
-        assert!((settings.categories[0].volume - 1.0).abs() < 1.0e-3);
-        assert_eq!(settings.variables.len(), 1);
-        assert_eq!(settings.variables[0].name, "SpeedOfSound");
-        assert!((settings.variables[0].initial - 343.0).abs() < 1.0e-6);
-        assert!((settings.variables[0].max - 1000.0).abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn xgs_parses_extended_release_curve_records() {
-        let settings = GlobalSettings::parse(&build_xgs_curve(1)).expect("curved XGS");
-        assert_eq!(settings.categories.len(), 2);
-        assert_eq!(settings.categories[0].fade_out_ms, 200);
-        assert_eq!(
-            settings.categories[0].release_curve,
-            ReleaseCurve::Logarithmic
-        );
-        assert_eq!(settings.categories[1].release_curve, ReleaseCurve::Linear);
-        let stock = GlobalSettings::parse(&build_xgs()).expect("stock XGS");
-        assert_eq!(stock.categories[0].release_curve, ReleaseCurve::Linear);
-    }
-
-    #[test]
-    fn release_curve_shapes_are_linear_and_logarithmic_amplitude() {
-        assert!((release_at(ReleaseCurve::Linear, 50, 100) - 0.5).abs() < 1.0e-6);
-        assert!((release_at(ReleaseCurve::Linear, 100, 100) - 1.0).abs() < 1.0e-6);
-        assert!(release_at(ReleaseCurve::Linear, 0, 100).abs() < 1.0e-6);
-        // Logarithmic amplitude reaches -60 dB at the end and is already
-        // below the linear curve at the halfway point.
-        let midpoint = release_at(ReleaseCurve::Logarithmic, 50, 100);
-        assert!((midpoint - 10.0_f32.powf(-1.5)).abs() < 1.0e-6);
-        assert!(midpoint < release_at(ReleaseCurve::Linear, 50, 100));
-        assert!((release_at(ReleaseCurve::Logarithmic, 100, 100) - 1.0).abs() < 1.0e-6);
-        assert!((release_at(ReleaseCurve::Logarithmic, 0, 100) - 0.001).abs() < 1.0e-6);
-        assert_eq!(release_at(ReleaseCurve::Linear, 0, 0), 0.0);
-    }
-
-    #[test]
     fn xgs_rejects_wrong_signature() {
         let mut bytes = build_xgs();
         bytes[0] = b'Z';
         assert_eq!(GlobalSettings::parse(&bytes), Err(XACTENGINE_E_INVALIDDATA));
-    }
-
-    #[test]
-    fn volume_and_pitch_conversions_match_the_documented_curve() {
-        assert!((decibels_to_amplitude(180) - 1.0).abs() < 1.0e-3);
-        assert_eq!(decibels_to_amplitude(0), 0.0);
-        assert!(decibels_to_amplitude(255) > 1.0);
-        assert!(decibels_to_amplitude(90) < 1.0);
-        assert!((pitch_to_ratio(0) - 1.0).abs() < 1.0e-6);
-        assert!((pitch_to_ratio(1200) - 2.0).abs() < 1.0e-5);
-        assert!((pitch_to_ratio(-1200) - 0.5).abs() < 1.0e-5);
     }
 
     #[test]

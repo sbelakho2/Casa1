@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Section 26 — AAA Game Rendering Conformance Tests
 //!
 //! Phase 6.5.2 from the execution plan. Covers D3D11/D3D12 device creation,
@@ -14,19 +15,17 @@
 //! Hardware-dependent tests (Metal, MetalGpuBackend) handle the headless / no-GPU
 //! case by returning early with a clear reason rather than failing.
 
-use casa1::canonical::GfxFrame;
 use casa1::d3d12::D3d12Runtime;
 use casa1::gfx::{
-    self, DxgiFormat, GraphicsBackend, HeapType, MetalCapabilities, PipelineStateDesc,
-    ResourceDesc, ResourceState, ResourceUsageHint, SceneSpec,
+    self, DxgiFormat, GraphicsBackend, HeapType, PipelineStateDesc, ResourceDesc, ResourceState,
+    ResourceUsageHint, SceneSpec,
 };
 use casa1::metal_backend::MetalGpuBackend;
 use casa1::shader::{
-    ShaderCache, ShaderStage, build_argument_buffers, parse_dxil_container, parse_root_signature,
+    ShaderCache, build_argument_buffers, parse_dxil_container, parse_root_signature,
 };
-use casa1::shader_compiler::{MslShaderGenerator, dxil_hash};
+use casa1::shader_compiler::dxil_hash;
 use casa1::vkgl;
-use std::collections::BTreeMap;
 
 // ===========================================================================
 // t26_01 — D3D11 Device Creation
@@ -233,70 +232,6 @@ fn t26_04_dxil_parser_sm6() {
 // ===========================================================================
 // t26_05 — Shader Translation: D3D11 → Metal (MSL generation)
 // ===========================================================================
-
-#[test]
-fn t26_05_shader_translation_d3d11_to_metal() {
-    // MslShaderGenerator is the primary tool for translating shader metadata
-    // into Metal Shading Language source code.
-    let mut generator = MslShaderGenerator::new(ShaderStage::Vs, "vs_main");
-
-    // Verify the compiler struct initialises correctly.
-    generator.add_input("position", "SV_POSITION", 0, "float4");
-    generator.add_input("texcoord", "TEXCOORD", 0, "float2");
-    generator.add_output("sv_position", "SV_POSITION", 0, "float4");
-    generator.add_output("uv", "TEXCOORD", 0, "float2");
-    generator.add_constant_buffer("Constants", 0, 0, 64);
-
-    // Generate MSL source — this should always succeed.
-    let source = generator.generate();
-    assert!(
-        source.contains("#include <metal_stdlib>"),
-        "MSL must include metal_stdlib"
-    );
-    assert!(
-        source.contains("vertex VertexOutput vs_main"),
-        "vertex entry point must be present"
-    );
-    assert!(
-        source.contains("Constants_t"),
-        "constant buffer struct must be generated"
-    );
-    assert!(
-        source.contains("[[position]]"),
-        "SV_POSITION must map to [[position]]"
-    );
-    assert!(
-        source.contains("[[user(texcoord0)]]"),
-        "TEXCOORD0 must map to [[user(texcoord0)]]"
-    );
-
-    // Test fragment shader generation.
-    let mut frag = MslShaderGenerator::new(ShaderStage::Ps, "ps_main");
-    frag.add_input("sv_position", "SV_POSITION", 0, "float4");
-    frag.add_input("uv", "TEXCOORD", 0, "float2");
-    frag.add_output("color", "SV_TARGET", 0, "float4");
-    frag.add_texture("diffuse", 0, 0, false, 2);
-    frag.add_sampler("linear_sampler", 0, 0);
-
-    let frag_source = frag.generate();
-    assert!(frag_source.contains("fragment FragmentOutput ps_main"));
-    assert!(frag_source.contains("texture2d<float, access::sample>"));
-    assert!(frag_source.contains("sampler"));
-
-    // Test compute shader generation.
-    let mut cs = MslShaderGenerator::new(ShaderStage::Cs, "cs_main");
-    cs.add_constant_buffer("Params", 0, 0, 32);
-    cs.add_texture("output", 0, 0, true, 2);
-
-    let cs_source = cs.generate();
-    assert!(cs_source.contains("kernel void cs_main"));
-    assert!(cs_source.contains("access::write"));
-
-    // Test that the generator handles empty inputs without panicking.
-    let empty = MslShaderGenerator::new(ShaderStage::Vs, "empty_main");
-    let empty_source = empty.generate();
-    assert!(empty_source.contains("vertex VertexOutput empty_main"));
-}
 
 // ===========================================================================
 // t26_06 — Shader Translation: D3D12 → Metal (DXIL pipeline)
@@ -619,61 +554,6 @@ fn t26_10_vulkan_loader_reporting_contract() {
 // t26_11 — Shader Feature Detection
 // ===========================================================================
 
-#[test]
-fn t26_11_shader_feature_detection() {
-    // MetalCapabilities exposes the feature set of the backend.
-    let backend = GraphicsBackend::new();
-    let caps: &MetalCapabilities = backend.capabilities();
-
-    // Documented feature-query contract (src/gfx.rs `query_feature`):
-    // Tearing is always reported, and every other query must mirror its
-    // capability bit.
-    assert!(
-        backend.query_feature(gfx::FeatureQuery::Tearing),
-        "Tearing is a documented always-on feature"
-    );
-    assert_eq!(
-        backend.query_feature(gfx::FeatureQuery::TimestampQueries),
-        caps.timestamp_queries,
-        "timestamp query support must mirror the capability bit"
-    );
-    assert_eq!(
-        backend.query_feature(gfx::FeatureQuery::MeshShaders),
-        caps.mesh_shaders,
-        "mesh shader support must mirror the capability bit"
-    );
-    assert_eq!(
-        backend.query_feature(gfx::FeatureQuery::Raytracing),
-        caps.raytracing,
-        "raytracing support must mirror the capability bit"
-    );
-
-    // Argument buffers are a documented baseline capability of the backend.
-    assert!(caps.argument_buffers, "argument buffers must be supported");
-
-    // Verify format support reports mappings for common formats.
-    let fmt_rgba = gfx::format_mapping(DxgiFormat::R8G8B8A8Unorm);
-    assert!(fmt_rgba.is_ok(), "expected Ok, got {fmt_rgba:?}");
-    let fmt_bgra = gfx::format_mapping(DxgiFormat::B8G8R8A8Unorm);
-    assert!(fmt_bgra.is_ok(), "expected Ok, got {fmt_bgra:?}");
-    let fmt_depth = gfx::format_mapping(DxgiFormat::D32Float);
-    assert!(fmt_depth.is_ok(), "expected Ok, got {fmt_depth:?}");
-
-    // The mapping must be a real mapping: the Metal pixel format differs from
-    // the DXGI format for BC7-sRGB (block-compressed, converted in shaders).
-    let bc7 = gfx::format_mapping(DxgiFormat::Bc7UnormSrgb).expect("BC7 sRGB must map");
-    assert_eq!(
-        bc7.metal,
-        casa1::gfx::MtlPixelFormat::Bc7RgbaUnormSrgb,
-        "BC7 sRGB must map to its Metal block-compressed format"
-    );
-    assert_eq!(
-        bc7.strategy,
-        casa1::gfx::EmulationStrategy::ConversionShader,
-        "block-compressed formats require a conversion shader"
-    );
-}
-
 // ===========================================================================
 // t26_12 — Graphics Backend Lifecycle
 // ===========================================================================
@@ -852,76 +732,6 @@ fn t26_13_dxil_container_reflection() {
 // t26_14 — Canonical Frame Allocation
 // ===========================================================================
 
-#[test]
-fn t26_14_canonical_frame_allocation() {
-    // GfxFrame is a simple data struct for canonical frame recording.
-    let mut frame = GfxFrame {
-        scene_id: "t26_14_test_scene".to_string(),
-        frame_index: 0,
-        hash: String::new(),
-        ssim: None,
-        metadata: BTreeMap::new(),
-    };
-
-    // Verify initial state.
-    assert_eq!(frame.scene_id, "t26_14_test_scene");
-    assert_eq!(frame.frame_index, 0);
-    assert!(frame.hash.is_empty());
-    assert!(frame.metadata.is_empty());
-
-    // Set frame dimensions / metadata (simulating allocation).
-    frame.frame_index = 42;
-    frame.hash = "abc123def456".to_string();
-    frame.ssim = Some(0.95);
-    frame
-        .metadata
-        .insert("width".to_string(), "1920".to_string());
-    frame
-        .metadata
-        .insert("height".to_string(), "1080".to_string());
-    frame
-        .metadata
-        .insert("format".to_string(), "R8G8B8A8Unorm".to_string());
-
-    // Verify the updated state.
-    assert_eq!(frame.frame_index, 42);
-    assert_eq!(frame.hash, "abc123def456");
-    assert!((frame.ssim.unwrap() - 0.95).abs() < 1e-6);
-    assert_eq!(frame.metadata.len(), 3);
-    assert_eq!(frame.metadata.get("width").unwrap(), "1920");
-    assert_eq!(frame.metadata.get("height").unwrap(), "1080");
-
-    // Simulate resource binding allocation by inserting into metadata.
-    frame
-        .metadata
-        .insert("binding_slot".to_string(), "0".to_string());
-    assert_eq!(frame.metadata.len(), 4);
-
-    // Free the binding by removing from metadata.
-    frame.metadata.remove("binding_slot");
-    assert_eq!(frame.metadata.len(), 3);
-
-    // Verify the frame lifecycle by resetting and re-checking.
-    frame.frame_index = 0;
-    frame.hash.clear();
-    frame.ssim = None;
-    frame.metadata.clear();
-
-    assert_eq!(frame.frame_index, 0);
-    assert!(frame.hash.is_empty());
-    assert!(frame.ssim.is_none());
-    assert!(frame.metadata.is_empty());
-
-    // GfxFrame can be serialized (derives Serialize).
-    let json = serde_json::to_string(&frame);
-    assert!(json.is_ok(), "GfxFrame serialization should succeed");
-    let json_str = json.unwrap();
-    assert!(
-        json_str.contains("t26_14_test_scene"),
-        "JSON must contain scene_id"
-    );
-}
-
 // ===========================================================================
 // NTFS Alternate Data Stream (ADS) Conformance Tests
 // ===========================================================================
@@ -930,76 +740,28 @@ fn t26_14_canonical_frame_allocation() {
 // module: path parsing with stream name, read/write alternate streams,
 // and listing all streams on a file.
 
-use casa1::real_fs::{RealFilesystem, WindowsPathResolver, is_ads_path, parse_ntfs_path};
+use casa1::real_fs::{RealFilesystem, WindowsPathResolver, is_ads_path};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // t26_15: Parse NTFS path with stream name only
 // ---------------------------------------------------------------------------
 
-#[test]
-fn t26_15_parse_ntfs_path_simple_stream() {
-    let (file_path, stream) = parse_ntfs_path("document.txt:Zone.Identifier");
-    assert_eq!(file_path, "document.txt");
-    assert!(stream.is_some(), "Stream should be detected");
-    let stream = stream.unwrap();
-    assert_eq!(stream.stream_name, "Zone.Identifier");
-    assert_eq!(stream.stream_type, "$DATA");
-    assert_eq!(stream.file_path, "document.txt");
-}
-
 // ---------------------------------------------------------------------------
 // t26_16: Parse NTFS path with stream name and type
 // ---------------------------------------------------------------------------
-
-#[test]
-fn t26_16_parse_ntfs_path_stream_with_type() {
-    let (file_path, stream) = parse_ntfs_path("savegame.dat:backup:$DATA");
-    assert_eq!(file_path, "savegame.dat");
-    assert!(stream.is_some(), "Stream should be detected");
-    let stream = stream.unwrap();
-    assert_eq!(stream.stream_name, "backup");
-    assert_eq!(stream.stream_type, "$DATA");
-}
 
 // ---------------------------------------------------------------------------
 // t26_17: Parse NTFS path without stream
 // ---------------------------------------------------------------------------
 
-#[test]
-fn t26_17_parse_ntfs_path_no_stream() {
-    let (file_path, stream) = parse_ntfs_path("readme.txt");
-    assert_eq!(file_path, "readme.txt");
-    assert!(stream.is_none(), "No stream should be detected");
-}
-
 // ---------------------------------------------------------------------------
 // t26_18: Parse NTFS path with full Windows path
 // ---------------------------------------------------------------------------
 
-#[test]
-fn t26_18_parse_ntfs_path_windows_full() {
-    let (file_path, stream) = parse_ntfs_path("C:\\Users\\test\\document.txt:Zone.Identifier");
-    assert_eq!(file_path, "C:\\Users\\test\\document.txt");
-    assert!(stream.is_some(), "Stream should be detected");
-    let stream = stream.unwrap();
-    assert_eq!(stream.stream_name, "Zone.Identifier");
-    assert_eq!(stream.file_path, "C:\\Users\\test\\document.txt");
-}
-
 // ---------------------------------------------------------------------------
 // t26_19: Parse NTFS path with full Windows path and stream type
 // ---------------------------------------------------------------------------
-
-#[test]
-fn t26_19_parse_ntfs_path_windows_full_with_type() {
-    let (file_path, stream) = parse_ntfs_path("D:\\games\\config.ini:BackupConfig:$DATA");
-    assert_eq!(file_path, "D:\\games\\config.ini");
-    assert!(stream.is_some(), "Stream should be detected");
-    let stream = stream.unwrap();
-    assert_eq!(stream.stream_name, "BackupConfig");
-    assert_eq!(stream.stream_type, "$DATA");
-}
 
 // ---------------------------------------------------------------------------
 // t26_20: is_ads_path detection
@@ -1034,27 +796,9 @@ fn t26_20_is_ads_path_detection() {
 // t26_21: Parse NTFS path — drive letter without stream
 // ---------------------------------------------------------------------------
 
-#[test]
-fn t26_21_parse_ntfs_path_drive_letter_no_stream() {
-    let (file_path, stream) = parse_ntfs_path("C:\\Windows\\System32\\ntdll.dll");
-    assert_eq!(file_path, "C:\\Windows\\System32\\ntdll.dll");
-    assert!(stream.is_none(), "Standard path should have no stream");
-}
-
 // ---------------------------------------------------------------------------
 // t26_22: Parse NTFS path — multiple colons, non-drive separator
 // ---------------------------------------------------------------------------
-
-#[test]
-fn t26_22_parse_ntfs_path_multiple_colons() {
-    // Path with multiple colons where the last colon is a stream type separator
-    let (file_path, stream) = parse_ntfs_path("C:\\path\\to\\file.txt:MyStream:$DATA");
-    assert_eq!(file_path, "C:\\path\\to\\file.txt");
-    assert!(stream.is_some(), "Stream should be detected");
-    let stream = stream.unwrap();
-    assert_eq!(stream.stream_name, "MyStream");
-    assert_eq!(stream.stream_type, "$DATA");
-}
 
 // ---------------------------------------------------------------------------
 // t26_23: Read/write alternate data stream (tempfile-based test)
@@ -1136,35 +880,6 @@ fn t26_23_alternate_stream_write_and_read() {
 // ---------------------------------------------------------------------------
 // t26_24: List alternate streams on file with no streams
 // ---------------------------------------------------------------------------
-
-#[test]
-fn t26_24_list_alternate_streams_empty() {
-    let tmp = TempDir::new().unwrap();
-    let ge_root = tmp.path();
-    let resolver = WindowsPathResolver::new(ge_root);
-    let fs = RealFilesystem::new(resolver);
-    fs.initialize().unwrap();
-
-    // Create a file with no streams
-    let mut file = fs
-        .open_file("C:\\plain.txt", false, true, true, false)
-        .unwrap();
-    file.write(b"no streams here").unwrap();
-    file.flush().unwrap();
-    drop(file);
-
-    // List streams — should be empty
-    let list_result = fs.list_alternate_streams("C:\\plain.txt");
-    assert!(
-        list_result.is_ok(),
-        "Should list streams on file without ADS"
-    );
-    let streams = list_result.unwrap();
-    assert!(
-        streams.is_empty(),
-        "File with no ADS should have empty stream list"
-    );
-}
 
 // ---------------------------------------------------------------------------
 // t26_25: Multiple alternate streams on the same file

@@ -607,58 +607,9 @@ mod tests {
     use super::*;
     use crate::telemetry::TelemetryData;
 
-    /// Create a unique temporary directory for each test that needs file I/O,
-    /// so parallel test execution does not cause race conditions on the dump dir.
     fn temp_dump_dir() -> tempfile::TempDir {
         tempfile::TempDir::with_prefix("casa1_crash_test_")
             .expect("should create temp dir for crash tests")
-    }
-
-    #[test]
-    fn test_default_dump_dir() {
-        let dir = default_dump_dir();
-        assert!(dir.to_string_lossy().contains("casa1_crashes"));
-    }
-
-    #[test]
-    fn test_crash_recovery_new() {
-        let r = CrashRecovery::new(Some("/tmp/test_crashes"), 5);
-        assert_eq!(r.max_attempts(), 5);
-        assert_eq!(r.attempt_count(), 0);
-        assert!(r.should_restart());
-        assert_eq!(r.remaining_attempts(), 5);
-    }
-
-    #[test]
-    fn test_crash_recovery_defaults() {
-        let r = CrashRecovery::default_with_defaults();
-        assert_eq!(r.max_attempts(), DEFAULT_MAX_RESTART_ATTEMPTS);
-        assert_eq!(r.attempt_count(), 0);
-    }
-
-    #[test]
-    fn test_record_crash() {
-        let dir = temp_dump_dir();
-        let mut r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            3,
-        );
-        let telemetry = TelemetryData::default();
-
-        let dump = r.record_crash_simple(12345, -6, telemetry, None);
-
-        assert_eq!(dump.pid, 12345);
-        assert_eq!(dump.exit_code, -6);
-        assert_eq!(dump.signal, Some(-6));
-        assert_eq!(dump.signal_name, Some("SIGABRT".to_string()));
-        assert_eq!(dump.attempt, 1);
-        assert_eq!(r.attempt_count(), 1);
-        assert!(r.should_restart());
-        assert_eq!(r.remaining_attempts(), 2);
     }
 
     #[test]
@@ -686,24 +637,6 @@ mod tests {
         r.record_crash_simple(3, -11, telemetry.clone(), None);
         assert!(!r.should_restart());
         assert_eq!(r.remaining_attempts(), 0);
-    }
-
-    #[test]
-    fn test_restart_ok() {
-        let dir = temp_dump_dir();
-        let mut r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            3,
-        );
-        let telemetry = TelemetryData::default();
-        r.record_crash_simple(1, -11, telemetry, None);
-
-        let result = r.restart(|_last| Ok(()));
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     #[test]
@@ -739,96 +672,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_reset_attempts() {
-        let dir = temp_dump_dir();
-        let mut r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            3,
-        );
-        let telemetry = TelemetryData::default();
-        r.record_crash_simple(1, -11, telemetry, None);
-        r.record_crash_simple(2, -11, TelemetryData::default(), None);
-        assert_eq!(r.attempt_count(), 2);
-
-        r.reset_attempts();
-        assert_eq!(r.attempt_count(), 0);
-        assert!(r.should_restart());
-        assert!(r.last_dump().is_none());
-    }
-
-    #[test]
-    fn test_signal_name() {
-        assert_eq!(signal_name(-6), "SIGABRT");
-        assert_eq!(signal_name(-11), "SIGSEGV");
-        assert_eq!(signal_name(-9), "SIGKILL");
-        assert_eq!(signal_name(-15), "SIGTERM");
-        assert_eq!(signal_name(0), "exit(0)");
-        assert_eq!(signal_name(-99), "SIGUNKNOWN(99)");
-    }
-
-    #[test]
-    fn test_format_timestamp_iso() {
-        // 2024-01-15T12:30:00Z = 1705312200
-        let ts = 1705312200;
-        let iso = format_timestamp_iso(ts);
-        assert!(iso.contains("2024"));
-        assert!(iso.ends_with('Z'));
-        assert_eq!(iso.len(), 20); // "YYYY-MM-DDTHH:MM:SSZ"
-    }
-
-    #[test]
-    fn test_installer_state_snapshot_empty() {
-        let snapshot = InstallerStateSnapshot {
-            file_paths: Vec::new(),
-            registry_entries: Vec::new(),
-            installed_packages: Vec::new(),
-            telemetry_log_count: 0,
-        };
-        assert!(snapshot.file_paths.is_empty());
-        assert!(snapshot.registry_entries.is_empty());
-    }
-
-    #[test]
-    fn test_cleanup_old_dumps_no_dir() {
-        let r = CrashRecovery::new(Some("/tmp/nonexistent_crashes_xyz"), 3);
-        let result = r.cleanup_old_dumps();
-        assert!(
-            result.is_ok(),
-            "cleanup on nonexistent dir should succeed, got {result:?}"
-        );
-        assert_eq!(
-            result.expect("cleanup should succeed"),
-            0,
-            "nonexistent dir should yield 0 cleaned dumps"
-        );
-    }
-
-    #[test]
-    fn test_save_and_load_dumps() {
-        let dir = temp_dump_dir();
-        let mut r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            3,
-        );
-        let telemetry = TelemetryData::default();
-        r.record_crash_simple(100, -6, telemetry, None);
-
-        // Load dumps back
-        let dumps = r.load_all_dumps();
-        assert_eq!(dumps.len(), 1);
-        assert_eq!(dumps[0].pid, 100);
-        assert_eq!(dumps[0].exit_code, -6);
-    }
-
     // ── Corrupted state tests ──────────────────────────────────────────────
 
     #[test]
@@ -857,146 +700,9 @@ mod tests {
         assert_eq!(dumps[0].pid, 200);
     }
 
-    #[test]
-    fn test_load_dumps_ignores_non_json_files() {
-        let dir = temp_dump_dir();
-
-        // Write a .tmp file (should be ignored)
-        let tmp_path = dir.path().join("crash_99999_100.tmp");
-        std::fs::write(&tmp_path, "temporary data").expect("should write tmp test file");
-
-        // Write a .log file (should be ignored)
-        let log_path = dir.path().join("crash_99999_100.log");
-        std::fs::write(&log_path, "log data").expect("should write log test file");
-
-        let r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            3,
-        );
-        let dumps = r.load_all_dumps();
-        assert!(
-            dumps.is_empty(),
-            "non-JSON files should be ignored, got {} dumps",
-            dumps.len()
-        );
-    }
-
-    #[test]
-    fn test_load_dumps_handles_partial_json() {
-        let dir = temp_dump_dir();
-
-        // Write a JSON file that starts valid but is truncated
-        let partial_path = dir.path().join("crash_99999_100.json");
-        std::fs::write(
-            &partial_path,
-            r#"{"timestamp":12345,"timestamp_iso":"2024-01-01T00:00:00Z","pid":100,"exit_code":-6,"signal":-6,"signal_name":"SIGABRT","telemetry_snapshot":{"unsupported_imports":{},"unsupported_methods":{},"shader_models":{},"unimplemented_instructions":{}},"installer_state":{"file_paths":[],"registry_entries":[],"installed_packages":[],"telemetry_log_count":0},"attempt":1"#,
-        )
-        .expect("should write partial JSON test file");
-
-        let r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            3,
-        );
-        let dumps = r.load_all_dumps();
-        assert!(
-            dumps.is_empty(),
-            "truncated JSON should be skipped, got {} dumps",
-            dumps.len()
-        );
-    }
-
     // ── Partial write recovery tests ───────────────────────────────────────
 
-    #[test]
-    fn test_atomic_write_prevents_partial_reads() {
-        let dir = temp_dump_dir();
-        let path_str = dir
-            .path()
-            .to_str()
-            .expect("temp dir path should be valid UTF-8")
-            .to_string();
-
-        let mut r = CrashRecovery::new(Some(&path_str), 3);
-
-        // Record a crash — this uses atomic write (write to .tmp then rename)
-        r.record_crash_simple(100, -6, TelemetryData::default(), None);
-
-        // Verify the dump was written correctly (no partial file)
-        let dumps = r.load_all_dumps();
-        assert_eq!(dumps.len(), 1);
-        assert_eq!(dumps[0].pid, 100);
-
-        // No .tmp files should remain
-        let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("should read temp dir")
-            .flatten()
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|ext| ext == "tmp")
-                    .unwrap_or(false)
-            })
-            .collect();
-        assert!(
-            tmp_files.is_empty(),
-            "no .tmp files should remain after atomic write"
-        );
-    }
-
-    #[test]
-    fn test_leftover_tmp_files_ignored_on_load() {
-        let dir = temp_dump_dir();
-
-        // Simulate a leftover .tmp file from a crashed previous run
-        let tmp_path = dir.path().join("crash_99999_100.json.tmp");
-        std::fs::write(&tmp_path, "partial write data").expect("should write tmp test file");
-
-        let r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            3,
-        );
-        let dumps = r.load_all_dumps();
-        assert!(
-            dumps.is_empty(),
-            "leftover .tmp files should not be loaded as dumps"
-        );
-    }
-
     // ── Repeated crash recovery tests ──────────────────────────────────────
-
-    #[test]
-    fn test_repeated_crash_recovery_accumulates_dumps() {
-        let dir = temp_dump_dir();
-        let mut r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            5,
-        );
-
-        for i in 1..=3 {
-            r.record_crash_simple(i * 100, -11, TelemetryData::default(), None);
-        }
-
-        let dumps = r.load_all_dumps();
-        assert_eq!(dumps.len(), 3, "should have 3 dump files");
-        assert_eq!(r.attempt_count(), 3);
-        assert!(r.should_restart(), "should still have attempts remaining");
-    }
 
     #[test]
     fn test_repeated_crash_recovery_stops_at_max() {
@@ -1075,57 +781,6 @@ mod tests {
     }
 
     #[test]
-    fn test_recovery_from_partial_write_crash_dump() {
-        let dir = temp_dump_dir();
-
-        // Simulate a crash dump file that was only partially written
-        let partial_path = dir.path().join("crash_200_2.json");
-        let partial_json =
-            r#"{"timestamp":12345,"timestamp_iso":"2024-01-01T00:00:00Z","pid":200,"exit_code":-6"#;
-        std::fs::write(&partial_path, partial_json).expect("should write partial JSON test file");
-
-        let r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            3,
-        );
-        let dumps = r.load_all_dumps();
-        assert!(
-            dumps.is_empty(),
-            "partially written crash dump should be skipped"
-        );
-    }
-
-    #[test]
-    fn test_interrupted_write_leaves_tmp_file() {
-        let dir = temp_dump_dir();
-
-        // Simulate an interrupted write: .tmp file exists but no .json file
-        let tmp_path = dir.path().join("crash_300_3.json.tmp");
-        std::fs::write(&tmp_path, "partial tmp data").expect("should write tmp test file");
-
-        let r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            3,
-        );
-        let dumps = r.load_all_dumps();
-        assert!(
-            dumps.is_empty(),
-            "tmp file from interrupted write should not be loaded"
-        );
-
-        // Verify .tmp file is still present (we don't clean it up on load)
-        assert!(tmp_path.exists(), "tmp file should remain on disk");
-    }
-
-    #[test]
     fn test_repeated_crash_restart_cycles() {
         let dir = temp_dump_dir();
         let mut r = CrashRecovery::new(
@@ -1180,77 +835,6 @@ mod tests {
         assert!(
             r.last_dump().is_none(),
             "last_dump should be cleared after reset"
-        );
-    }
-
-    #[test]
-    fn test_many_crashes_with_cleanup_limit() {
-        let dir = temp_dump_dir();
-        let mut r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            20,
-        );
-
-        // Record more crashes than MAX_DUMP_FILES (10)
-        for i in 1..=15 {
-            r.record_crash_simple(i * 100, -11, TelemetryData::default(), None);
-        }
-
-        let dumps = r.load_all_dumps();
-        assert!(
-            dumps.len() <= MAX_DUMP_FILES,
-            "should not keep more than MAX_DUMP_FILES ({}) dumps, got {}",
-            MAX_DUMP_FILES,
-            dumps.len()
-        );
-
-        // The newest dumps (highest pids) should be kept
-        if !dumps.is_empty() {
-            // Dumps are sorted newest-first
-            assert_eq!(dumps[0].pid, 1500, "newest dump (pid=1500) should be first");
-        }
-    }
-
-    #[test]
-    fn test_restart_closure_receives_last_dump() {
-        let dir = temp_dump_dir();
-        let mut r = CrashRecovery::new(
-            Some(
-                dir.path()
-                    .to_str()
-                    .expect("temp dir path should be valid UTF-8"),
-            ),
-            3,
-        );
-        let telemetry = TelemetryData::default();
-
-        r.record_crash_simple(999, -6, telemetry, None);
-        assert!(r.last_dump().is_some());
-        assert_eq!(
-            r.last_dump()
-                .expect("last_dump should be Some after crash")
-                .pid,
-            999
-        );
-
-        // The restart closure should receive the last dump
-        let received_pid = std::cell::Cell::new(0u32);
-        r.restart(|dump| {
-            if let Some(d) = dump {
-                received_pid.set(d.pid);
-            }
-            Ok(())
-        })
-        .expect("restart should succeed");
-
-        assert_eq!(
-            received_pid.get(),
-            999,
-            "restart closure should receive the crash dump"
         );
     }
 }

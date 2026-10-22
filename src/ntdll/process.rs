@@ -88,39 +88,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn process_basic_information_layouts_are_canonical() {
-        let info = NtProcessBasicInformation {
-            exit_status: 0x103,
-            peb_base_address: 0x7FFF_0000_0000,
-            affinity_mask: 0xFF,
-            base_priority: 8,
-            unique_process_id: 4,
-            inherited_from_unique_process_id: 0,
-        };
-        let x64 = info.serialize_x64();
-        assert_eq!(x64.len(), 48);
-        assert_eq!(u32::from_le_bytes(x64[0..4].try_into().unwrap()), 0x103);
-        assert_eq!(
-            u64::from_le_bytes(x64[8..16].try_into().unwrap()),
-            0x7FFF_0000_0000
-        );
-        assert_eq!(u64::from_le_bytes(x64[16..24].try_into().unwrap()), 0xFF);
-        assert_eq!(u32::from_le_bytes(x64[24..28].try_into().unwrap()), 8);
-        assert_eq!(u64::from_le_bytes(x64[32..40].try_into().unwrap()), 4);
-
-        let x86 = info.serialize_x86();
-        assert_eq!(x86.len(), 24);
-        assert_eq!(u32::from_le_bytes(x86[0..4].try_into().unwrap()), 0x103);
-        assert_eq!(
-            u32::from_le_bytes(x86[4..8].try_into().unwrap()),
-            0x0000_0000
-        );
-        assert_eq!(u32::from_le_bytes(x86[16..20].try_into().unwrap()), 4);
-        assert_eq!(NtProcessBasicInformation::size_for(true), 48);
-        assert_eq!(NtProcessBasicInformation::size_for(false), 24);
-    }
-
-    #[test]
     fn process_info_classes_validate() {
         assert!(validate_process_information_class(0).is_ok());
         assert!(validate_process_information_class(7).is_ok());

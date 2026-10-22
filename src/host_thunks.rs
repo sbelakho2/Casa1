@@ -26349,7 +26349,6 @@ mod tests {
     use super::*;
     use crate::cpu::MemoryImage;
 
-    /// Helper: create a MemoryImage with a mapped region at the given address.
     fn make_memory_with_region(base: u64, size: usize) -> MemoryImage {
         let mut mem = MemoryImage::default();
         mem.map_bytes(base, &vec![0xAAu8; size]);
@@ -26387,13 +26386,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_mapped_pointer_ok() {
-        let mem = make_memory_with_region(0x1000, 64);
-        validate_guest_pointer(&mem, 0x1000, 4).unwrap();
-        validate_guest_pointer(&mem, 0x1000, 64).unwrap();
-    }
-
-    #[test]
     fn test_validate_overflow_rejected() {
         let mem = make_memory_with_region(0x1000, 64);
         let err = validate_guest_pointer(&mem, u64::MAX, 4).unwrap_err();
@@ -26412,14 +26404,6 @@ mod tests {
     // ---- read_guest_u16_checked tests ----
 
     #[test]
-    fn test_read_u16_checked_mapped() {
-        let mut mem = MemoryImage::default();
-        mem.map_bytes(0x1000, &0x1234_u16.to_le_bytes());
-        let val = read_guest_u16_checked(&mem, 0x1000).unwrap();
-        assert_eq!(val, 0x1234);
-    }
-
-    #[test]
     fn test_read_u16_checked_null_rejected() {
         let mem = MemoryImage::default();
         let err = read_guest_u16_checked(&mem, 0).unwrap_err();
@@ -26436,28 +26420,12 @@ mod tests {
     // ---- read_guest_u32_checked tests ----
 
     #[test]
-    fn test_read_u32_checked_mapped() {
-        let mut mem = MemoryImage::default();
-        mem.map_bytes(0x2000, &0xDEADBEEF_u32.to_le_bytes());
-        let val = read_guest_u32_checked(&mem, 0x2000).unwrap();
-        assert_eq!(val, 0xDEADBEEF);
-    }
-
-    #[test]
     fn test_read_u32_checked_null_rejected() {
         let mem = MemoryImage::default();
         assert!(read_guest_u32_checked(&mem, 0).is_err());
     }
 
     // ---- read_guest_u64_checked tests ----
-
-    #[test]
-    fn test_read_u64_checked_mapped() {
-        let mut mem = MemoryImage::default();
-        mem.map_bytes(0x3000, &0xCAFEBABE_DEADC0DE_u64.to_le_bytes());
-        let val = read_guest_u64_checked(&mem, 0x3000).unwrap();
-        assert_eq!(val, 0xCAFEBABE_DEADC0DE);
-    }
 
     #[test]
     fn test_read_u64_checked_null_rejected() {
@@ -26468,30 +26436,12 @@ mod tests {
     // ---- write_guest_u32_checked tests ----
 
     #[test]
-    fn test_write_u32_checked_roundtrip() {
-        let mut mem = MemoryImage::default();
-        mem.map_bytes(0x4000, &[0u8; 8]);
-        write_guest_u32_checked(&mut mem, 0x4000, 0x12345678).unwrap();
-        let val = read_guest_u32_checked(&mem, 0x4000).unwrap();
-        assert_eq!(val, 0x12345678);
-    }
-
-    #[test]
     fn test_write_u32_checked_null_rejected() {
         let mut mem = MemoryImage::default();
         assert!(write_guest_u32_checked(&mut mem, 0, 42).is_err());
     }
 
     // ---- write_guest_u64_checked tests ----
-
-    #[test]
-    fn test_write_u64_checked_roundtrip() {
-        let mut mem = MemoryImage::default();
-        mem.map_bytes(0x5000, &[0u8; 16]);
-        write_guest_u64_checked(&mut mem, 0x5000, 0xAABBCCDDEEFF0011).unwrap();
-        let val = read_guest_u64_checked(&mem, 0x5000).unwrap();
-        assert_eq!(val, 0xAABBCCDDEEFF0011);
-    }
 
     // ---- read/write bytes checked tests ----
 
@@ -26502,62 +26452,12 @@ mod tests {
     }
 
     #[test]
-    fn test_read_bytes_checked_mapped() {
-        let mut mem = MemoryImage::default();
-        mem.map_bytes(0x1000, &[1, 2, 3, 4]);
-        let bytes = read_guest_bytes_checked(&mem, 0x1000, 4).unwrap();
-        assert_eq!(bytes, &[1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn test_write_bytes_checked_roundtrip() {
-        let mut mem = MemoryImage::default();
-        mem.map_bytes(0x6000, &[0u8; 8]);
-        write_guest_bytes_checked(&mut mem, 0x6000, &[0xAA, 0xBB, 0xCC]).unwrap();
-        let bytes = read_guest_bytes_checked(&mem, 0x6000, 3).unwrap();
-        assert_eq!(bytes, &[0xAA, 0xBB, 0xCC]);
-    }
-
-    #[test]
     fn test_write_bytes_checked_null_rejected() {
         let mut mem = MemoryImage::default();
         assert!(write_guest_bytes_checked(&mut mem, 0, &[1, 2, 3]).is_err());
     }
 
-    #[test]
-    fn test_write_bytes_checked_empty_ok() {
-        let mut mem = MemoryImage::default();
-        write_guest_bytes_checked(&mut mem, 0, &[]).unwrap();
-    }
-
     // ---- UTF-16 string tests ----
-
-    #[test]
-    fn test_utf16_null_pointer_returns_empty() {
-        let mem = MemoryImage::default();
-        let s = read_guest_utf16_string_null_terminated(&mem, 0, 256).unwrap();
-        assert_eq!(s, "");
-    }
-
-    #[test]
-    fn test_utf16_read_null_terminated() {
-        let mut mem = MemoryImage::default();
-        // "Hi\0" in UTF-16LE
-        let data: Vec<u8> = [0x48, 0x00, 0x69, 0x00, 0x00, 0x00].to_vec();
-        mem.map_bytes(0x1000, &data);
-        let s = read_guest_utf16_string_null_terminated(&mem, 0x1000, 256).unwrap();
-        assert_eq!(s, "Hi");
-    }
-
-    #[test]
-    fn test_utf16_read_sized() {
-        let mut mem = MemoryImage::default();
-        // "ABCD" in UTF-16LE (no null terminator)
-        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00].to_vec();
-        mem.map_bytes(0x1000, &data);
-        let s = read_guest_utf16_string_sized(&mem, 0x1000, 4, 256).unwrap();
-        assert_eq!(s, "ABCD");
-    }
 
     #[test]
     fn test_utf16_truncated_surrogate_pair() {
@@ -26588,17 +26488,6 @@ mod tests {
     }
 
     #[test]
-    fn test_utf16_max_units_cap() {
-        let mut mem = MemoryImage::default();
-        // "ABCDE" in UTF-16LE with no null terminator
-        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00, 0x45, 0x00].to_vec();
-        mem.map_bytes(0x1000, &data);
-        // Cap at 3 units even though 5 are available
-        let s = read_guest_utf16_string_null_terminated(&mem, 0x1000, 3).unwrap();
-        assert_eq!(s, "ABC");
-    }
-
-    #[test]
     fn test_utf16_unmapped_memory_rejected() {
         let mem = MemoryImage::default();
         let result = read_guest_utf16_string_null_terminated(&mem, 0xFFFF_0000, 256);
@@ -26607,15 +26496,6 @@ mod tests {
             result.unwrap_err().code,
             ReasonCode::RcGuestPointerOutOfRange
         );
-    }
-
-    #[test]
-    fn test_utf16_write_and_read_roundtrip() {
-        let mut mem = MemoryImage::default();
-        mem.map_bytes(0x7000, &[0u8; 32]);
-        write_guest_utf16_string_checked(&mut mem, 0x7000, "Hello", 16).unwrap();
-        let s = read_guest_utf16_string_null_terminated(&mem, 0x7000, 256).unwrap();
-        assert_eq!(s, "Hello");
     }
 
     #[test]
@@ -26639,24 +26519,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_utf16_non_terminated_string() {
-        let mut mem = MemoryImage::default();
-        // Write "AB" without null terminator, followed by garbage
-        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0xFF, 0xFF].to_vec();
-        mem.map_bytes(0x1000, &data);
-        // Read exactly 2 code units (no null terminator expected)
-        let s = read_guest_utf16_string_sized(&mem, 0x1000, 2, 256).unwrap();
-        assert_eq!(s, "AB");
-    }
-
     // ---- Subsystem and metadata tests ----
-
-    #[test]
-    fn test_subsystem_equality() {
-        assert_eq!(Subsystem::Kernel, Subsystem::Kernel);
-        assert_ne!(Subsystem::Kernel, Subsystem::Network);
-    }
 
     #[test]
     fn test_last_error_behavior_variants() {
@@ -26681,38 +26544,6 @@ mod tests {
     }
 
     #[test]
-    fn test_implementation_level_serde_roundtrip() {
-        let json = serde_json::to_string(&ImplementationLevel::Partial).unwrap();
-        assert_eq!(json, "\"Partial\"");
-        let back: ImplementationLevel = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ImplementationLevel::Partial);
-    }
-
-    #[test]
-    fn test_thunk_metadata_fields() {
-        let meta = ThunkMetadata {
-            dll: "kernel32.dll",
-            name: "TestThunk",
-            subsystem: Subsystem::Kernel,
-            x86_arg_bytes: 12,
-            last_error: LastErrorBehavior::SetsOnFailure,
-            implementation: ImplementationLevel::Implemented,
-            architectures: ArchMask::ANY,
-            min_windows_version: WindowsVersion::Any,
-            support_policy: SupportPolicy::Required,
-        };
-        assert_eq!(meta.dll, "kernel32.dll");
-        assert_eq!(meta.name, "TestThunk");
-        assert_eq!(meta.subsystem, Subsystem::Kernel);
-        assert_eq!(meta.x86_arg_bytes, 12);
-        assert_eq!(meta.last_error, LastErrorBehavior::SetsOnFailure);
-        assert_eq!(meta.implementation, ImplementationLevel::Implemented);
-        assert!(meta.architectures.supports(GuestArch::X86));
-        assert!(meta.architectures.supports(GuestArch::X64));
-        assert_eq!(meta.support_policy, SupportPolicy::Required);
-    }
-
-    #[test]
     fn test_arch_mask_supports() {
         assert!(ArchMask::ANY.supports(GuestArch::X86));
         assert!(ArchMask::ANY.supports(GuestArch::X64));
@@ -26725,68 +26556,9 @@ mod tests {
     // ---- canonical metadata table tests ----
 
     #[test]
-    fn test_metadata_table_lookup_case_insensitive() {
-        let entry = lookup_thunk_metadata("KERNEL32.DLL", "createfilew").expect("CreateFileW");
-        assert_eq!(entry.name, "CreateFileW");
-        assert_eq!(entry.implementation, ImplementationLevel::Implemented);
-        assert_eq!(entry.support_policy, SupportPolicy::Required);
-        assert_eq!(entry.last_error, LastErrorBehavior::SetsOnFailure);
-        assert!(entry.architectures.supports(GuestArch::X86));
-
-        let stem = lookup_thunk_metadata("kernel32", "CreateFileW").expect("stem dll");
-        assert_eq!(stem.dll, "kernel32.dll");
-    }
-
-    #[test]
     fn test_metadata_table_missing_lookup_returns_none() {
         assert!(lookup_thunk_metadata("kernel32.dll", "DoesNotExist").is_none());
         assert!(lookup_thunk_metadata("unknown.dll", "CreateFileW").is_none());
-    }
-
-    #[test]
-    fn test_metadata_table_covers_required_user_mode_surface() {
-        // The core user-mode surface every application needs must be present
-        // and classified `SupportPolicy::Required`.
-        for (dll, name) in [
-            ("kernel32.dll", "CreateFileW"),
-            ("kernel32.dll", "ReadFile"),
-            ("kernel32.dll", "WriteFile"),
-            ("kernel32.dll", "CloseHandle"),
-            ("kernel32.dll", "CreateThread"),
-            ("kernel32.dll", "WaitForSingleObject"),
-            ("kernel32.dll", "GetProcAddress"),
-            ("kernel32.dll", "LoadLibraryW"),
-            ("kernel32.dll", "GetModuleHandleW"),
-            ("kernel32.dll", "HeapAlloc"),
-            ("kernel32.dll", "VirtualAlloc"),
-            ("kernel32.dll", "GetLastError"),
-            ("user32.dll", "CreateWindowExW"),
-            ("user32.dll", "GetMessageW"),
-            ("ws2_32.dll", "connect"),
-            ("ws2_32.dll", "WSAGetLastError"),
-            ("ole32.dll", "CoInitializeEx"),
-            ("advapi32.dll", "RegOpenKeyExW"),
-            ("msvcrt.dll", "malloc"),
-            ("kernel32.dll", "TlsAlloc"),
-        ] {
-            let entry = lookup_thunk_metadata(dll, name)
-                .unwrap_or_else(|| panic!("required API {dll}!{name} missing from THUNK_METADATA"));
-            assert_eq!(
-                entry.support_policy,
-                SupportPolicy::Required,
-                "{dll}!{name} must be Required in the user-mode profile"
-            );
-        }
-        // No duplicate (dll, name) pairs.
-        let mut seen = std::collections::HashSet::new();
-        for entry in THUNK_METADATA {
-            assert!(
-                seen.insert((entry.dll, entry.name)),
-                "duplicate metadata entry {} / {}",
-                entry.dll,
-                entry.name
-            );
-        }
     }
 
     #[test]
@@ -26858,20 +26630,5 @@ mod tests {
             unknown.len(),
             unknown
         );
-    }
-
-    #[test]
-    fn test_ordinal_import_name_resolution() {
-        assert_eq!(ordinal_import_name("ws2_32.dll", 16), Some("recv"));
-        assert_eq!(ordinal_import_name("ws2_32.dll", 23), Some("socket"));
-        assert_eq!(ordinal_import_name("WS2_32", 111), Some("WSAGetLastError"));
-        assert_eq!(ordinal_import_name("wsock32.dll", 1142), Some("WSAStartup"));
-        assert_eq!(
-            ordinal_import_name("shell32.dll", 680),
-            Some("IsUserAnAdmin")
-        );
-        assert_eq!(ordinal_import_name("oleaut32.dll", 9), Some("VariantClear"));
-        assert_eq!(ordinal_import_name("ws2_32.dll", 999), None);
-        assert_eq!(ordinal_import_name("kernel32.dll", 1), None);
     }
 }

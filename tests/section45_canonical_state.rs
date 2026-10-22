@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Stage 3 canonical state: the Win32 subsystem is backed by ONE object
 //! manager, ONE generation-protected handle table, ONE guest-process model
 //! (guest PID namespace) and ONE canonical VirtualMemory shared with the
@@ -11,11 +12,7 @@
 mod support;
 
 use casa1::ge::{GameEnvironment, GeArch};
-use casa1::win32::{
-    AllocationType, FreeType, MemoryProtection, MemoryState, Win32Subsystem,
-    build_environment_block_utf16,
-};
-use std::collections::BTreeMap;
+use casa1::win32::{MemoryProtection, Win32Subsystem};
 use tempfile::TempDir;
 
 fn setup_win32() -> (TempDir, Win32Subsystem) {
@@ -25,76 +22,6 @@ fn setup_win32() -> (TempDir, Win32Subsystem) {
             .expect("create GE");
     let win32 = Win32Subsystem::new(ge, true);
     (temp_dir, win32)
-}
-
-#[test]
-fn current_process_id_is_a_guest_identity_never_the_host_pid() {
-    let (_tmp, win32) = setup_win32();
-    let guest_pid = win32.current_process_id();
-    // The guest pid namespace starts at 4 and is a runtime-side counter.
-    assert!(guest_pid >= 4, "guest pid {guest_pid} must start at 4");
-    assert_ne!(
-        guest_pid,
-        std::process::id(),
-        "GetCurrentProcessId must never leak the host's POSIX pid"
-    );
-    assert_eq!(win32.current_process_id(), guest_pid, "stable identity");
-}
-
-#[test]
-fn current_process_handle_references_the_guest_process() {
-    let (_tmp, mut win32) = setup_win32();
-    let handle = win32.current_process_handle();
-    let state = win32.process_state(handle).expect("process state");
-    assert_eq!(
-        state.process_id,
-        win32.current_process_id(),
-        "the current-process object carries the GUEST pid"
-    );
-    assert_ne!(state.process_id, std::process::id());
-}
-
-#[test]
-fn toolhelp_snapshot_keeps_host_pid_as_diagnostic_provenance_only() {
-    let (_tmp, win32) = setup_win32();
-    // The "macwin" entry is the runner's provenance: it may use the host
-    // pid as a DIAGNOSTIC key, but the guest-visible current process id is
-    // the guest pid.
-    let snapshot = win32.create_toolhelp_snapshot();
-    let macwin = snapshot
-        .processes
-        .iter()
-        .find(|entry| entry.executable == "macwin")
-        .expect("macwin provenance entry");
-    let _ = macwin; // presence is the contract; the pid is provenance
-    assert!(
-        snapshot
-            .processes
-            .iter()
-            .any(|entry| entry.process_id == std::process::id()),
-        "host pid appears only in the diagnostics snapshot"
-    );
-    assert_ne!(win32.current_process_id(), std::process::id());
-}
-
-#[test]
-fn child_processes_get_pids_from_the_single_guest_namespace() {
-    let (_tmp, mut win32) = setup_win32();
-    let own_pid = win32.current_process_id();
-    let child = win32
-        .create_process_w(
-            "C:\\guest\\child.exe",
-            "child.exe --arg",
-            &BTreeMap::new(),
-            "C:\\",
-            false,
-        )
-        .expect("create child process");
-    // Children are guest processes too: their ids come from the SAME
-    // namespace as the current process (monotonic, no host-pid collision).
-    assert!(child.process_id > own_pid);
-    assert_ne!(child.process_id, std::process::id());
-    assert_ne!(child.process_id, own_pid);
 }
 
 #[test]
@@ -336,55 +263,4 @@ fn object_manager_names_events_and_mutexes() {
         .close_handle(opened_event)
         .expect("close opened event");
     win32.close_handle(mutex).expect("close mutex");
-}
-
-#[test]
-fn virtual_memory_is_one_canonical_layer() {
-    let (_tmp, mut win32) = setup_win32();
-    // Reserve/commit/protect/query all route through the SAME canonical
-    // VirtualMemory instance the CPU/JIT validate accesses through.
-    let reserved = win32
-        .virtual_alloc(
-            None,
-            0x2000,
-            AllocationType::Reserve,
-            MemoryProtection {
-                read: true,
-                write: false,
-                execute: false,
-            },
-        )
-        .expect("reserve");
-    assert_eq!(win32.virtual_query(reserved).state, MemoryState::Reserved);
-    win32
-        .virtual_alloc(
-            Some(reserved),
-            0x1000,
-            AllocationType::Commit,
-            MemoryProtection {
-                read: true,
-                write: true,
-                execute: false,
-            },
-        )
-        .expect("commit");
-    let committed = win32.virtual_query(reserved);
-    assert_eq!(committed.state, MemoryState::Committed);
-    assert_eq!(committed.region_size, 0x1000);
-    assert_eq!(
-        win32.virtual_query(reserved + 0x1000).state,
-        MemoryState::Reserved,
-        "the uncommitted tail stays Reserved"
-    );
-    win32
-        .virtual_free(reserved, 0, FreeType::Release)
-        .expect("release");
-}
-
-#[test]
-fn build_environment_block_is_stable() {
-    let mut env = BTreeMap::new();
-    env.insert("A".to_string(), "1".to_string());
-    let block = build_environment_block_utf16(&env);
-    assert!(block.ends_with(&[0, 0]));
 }

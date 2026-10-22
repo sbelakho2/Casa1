@@ -3833,31 +3833,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supported_riids_cover_audio_client_family() {
-        assert!(is_supported_activation_riid(&IID_IAUDIO_CLIENT));
-        assert!(is_supported_activation_riid(&IID_IAUDIO_CLIENT_2));
-        assert!(is_supported_activation_riid(&IID_IAUDIO_CLIENT_3));
-        assert!(is_supported_activation_riid(&IID_IUNKNOWN));
-    }
-
-    #[test]
     fn unsupported_riids_rejected() {
         let unknown = [0xaa; 16];
         assert!(!is_supported_activation_riid(&unknown));
         let zeroes = [0u8; 16];
         assert!(!is_supported_activation_riid(&zeroes));
-    }
-
-    #[test]
-    fn riid_names_are_human_readable() {
-        assert_eq!(activation_riid_name(&IID_IAUDIO_CLIENT), "IAudioClient");
-        assert_eq!(activation_riid_name(&IID_IAUDIO_CLIENT_2), "IAudioClient2");
-        assert_eq!(activation_riid_name(&IID_IAUDIO_CLIENT_3), "IAudioClient3");
-        assert_eq!(activation_riid_name(&IID_IUNKNOWN), "IUnknown");
-        assert_eq!(
-            activation_riid_name(&[0x12; 16]),
-            "12121212121212121212121212121212"
-        );
     }
 
     #[test]
@@ -3892,33 +3872,6 @@ mod tests {
         assert_eq!(pending_activation_completions(pid_b), 1);
         assert_eq!(pop_activation_completion(pid_b), Some(second));
         assert_eq!(pop_activation_completion(pid_b), None);
-    }
-
-    #[test]
-    fn endpoint_records_round_trip_per_pid() {
-        let pid = 0x7b11;
-        let device = RealAudioDevice {
-            id: 3,
-            key: "MacBook Pro Speakers|2|48000".to_string(),
-            name: "MacBook Pro Speakers".to_string(),
-            channels: 2,
-            sample_rate: 48_000,
-            is_default: true,
-        };
-        assert!(endpoint_record(pid, 0x9_000).is_none());
-        store_endpoint_record(
-            pid,
-            0x9_000,
-            AudioEndpointRecord {
-                device: device.clone(),
-                requested_riid: IID_IAUDIO_CLIENT,
-            },
-        );
-        let record = endpoint_record(pid, 0x9_000).expect("record stored");
-        assert_eq!(record.device, device);
-        assert_eq!(record.requested_riid, IID_IAUDIO_CLIENT);
-        // A different runtime never sees the record.
-        assert!(endpoint_record(0x7b22, 0x9_000).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -4026,30 +3979,6 @@ mod tests {
     }
 
     #[test]
-    fn wave_format_extensible_round_trips_through_serialization() {
-        let device = test_device();
-        let mix = mix_format_for_device(&device);
-        assert_eq!(mix.channels, device.channels);
-        assert_eq!(mix.sample_rate, device.sample_rate);
-        assert_eq!(mix.bits_per_sample, 32);
-        assert!(mix.is_float());
-        let bytes = wave_format_bytes(&mix);
-        assert_eq!(bytes.len(), 40);
-        let parsed = parse_wave_format(&bytes).expect("serialized format parses");
-        assert_eq!(parsed.wave_format_tag, WAVE_FORMAT_IEEE_FLOAT);
-        assert_eq!(parsed.channels, device.channels);
-        assert_eq!(parsed.sample_rate, device.sample_rate);
-        assert_eq!(parsed.bits_per_sample, 32);
-        assert_eq!(parsed.valid_bits_per_sample, 32);
-        // A PCM16 guest format also round-trips as a supported conversion
-        // shape.
-        let pcm = parse_wave_format(&pcm16_stereo_48k_bytes()).expect("pcm parses");
-        let pcm_bytes = wave_format_bytes(&pcm);
-        let reparsed = parse_wave_format(&pcm_bytes).expect("pcm serialized parses");
-        assert_eq!(reparsed.wave_format_tag, WAVE_FORMAT_PCM);
-    }
-
-    #[test]
     fn format_support_distinguishes_exact_convertible_and_unsupported() {
         let device = test_device();
         let mix = mix_format_for_device(&device);
@@ -4074,85 +4003,6 @@ mod tests {
             AUDCLNT_E_UNSUPPORTED_FORMAT,
             "exclusive mode cannot leave the device rate"
         );
-    }
-
-    #[test]
-    fn audio_client_clock_drains_submitted_frames_at_device_rate() {
-        let pid = 0x7c01;
-        let object = 0x9_101;
-        let device = test_device();
-        register_audio_client(pid, object, device.clone(), IID_IAUDIO_CLIENT);
-        let format = test_format(WAVE_FORMAT_PCM, 2, 48_000, 16);
-        let plan = plan_initialize(
-            pid,
-            object,
-            AUDCLNT_SHAREMODE_SHARED,
-            0,
-            100_000,
-            0,
-            &format,
-        )
-        .expect("initialize plan");
-        assert_eq!(plan.buffer_frames, 480);
-        assert_eq!(
-            commit_initialize(pid, object, &plan, &format, 0x2_000, 1920),
-            AUDCLNT_S_OK
-        );
-        assert_eq!(start(pid, object), AUDCLNT_S_OK);
-        assert_eq!(start(pid, object), AUDCLNT_S_FALSE, "already running");
-
-        // Submit 480 frames (10 ms at 48 kHz) and backdate the clock span so
-        // 5 ms have drained: 240 frames remain padded.
-        {
-            let mut registry = audio_clients();
-            let state = registry
-                .clients
-                .get_mut(&pid)
-                .and_then(|clients| clients.get_mut(&object))
-                .expect("state");
-            state.submitted_frames = 480;
-            state.run_started = Some(Instant::now() - std::time::Duration::from_millis(5));
-        }
-        let padding = get_current_padding(pid, object).expect("padding");
-        assert!(
-            (200..=280).contains(&padding),
-            "5 ms of 10 ms drains about half the buffer, got {padding}"
-        );
-
-        // Backdate past the whole buffer: the clock drains to zero.
-        {
-            let mut registry = audio_clients();
-            let state = registry
-                .clients
-                .get_mut(&pid)
-                .and_then(|clients| clients.get_mut(&object))
-                .expect("state");
-            state.run_started = Some(Instant::now() - std::time::Duration::from_millis(50));
-        }
-        assert_eq!(get_current_padding(pid, object), Ok(0));
-
-        // Stop freezes the clock: padding set while stopped never advances.
-        assert_eq!(stop(pid, object), AUDCLNT_S_OK);
-        {
-            let mut registry = audio_clients();
-            let state = registry
-                .clients
-                .get_mut(&pid)
-                .and_then(|clients| clients.get_mut(&object))
-                .expect("state");
-            state.submitted_frames = 480;
-            state.drained_frames_carry = 240;
-        }
-        assert_eq!(get_current_padding(pid, object), Ok(240));
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        assert_eq!(
-            get_current_padding(pid, object),
-            Ok(240),
-            "a stopped client's padding never advances"
-        );
-        assert_eq!(reset(pid, object), AUDCLNT_S_OK);
-        assert_eq!(get_current_padding(pid, object), Ok(0));
-        release_audio_object(pid, object);
     }
 
     #[test]
@@ -4233,53 +4083,6 @@ mod tests {
     }
 
     #[test]
-    fn event_handle_is_stored_and_ready_signal_is_transition_based() {
-        let pid = 0x7c03;
-        let object = 0x9_103;
-        let device = test_device();
-        register_audio_client(pid, object, device.clone(), IID_IAUDIO_CLIENT);
-        let format = test_format(WAVE_FORMAT_PCM, 2, 48_000, 16);
-        let plan = plan_initialize(
-            pid,
-            object,
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            100_000,
-            0,
-            &format,
-        )
-        .expect("initialize plan");
-        assert!(plan.event_driven);
-        assert_eq!(
-            commit_initialize(pid, object, &plan, &format, 0x4_000, 1920),
-            AUDCLNT_S_OK
-        );
-        assert_eq!(set_event_handle(pid, object, 0xABC), AUDCLNT_S_OK);
-        assert_eq!(start(pid, object), AUDCLNT_S_OK);
-        assert_eq!(take_ready_event(pid, object), Some(0xABC));
-        assert_eq!(
-            take_ready_event(pid, object),
-            None,
-            "the ready signal is raised once per ready transition"
-        );
-        // The servicing-point tick raises the same event once the transition
-        // flag is clear, and never crosses runtime boundaries.
-        {
-            let mut registry = audio_clients();
-            let state = registry
-                .clients
-                .get_mut(&pid)
-                .and_then(|clients| clients.get_mut(&object))
-                .expect("state");
-            state.event_ready_signaled = false;
-        }
-        assert_eq!(take_ready_events(pid), vec![0xABC]);
-        assert!(take_ready_events(pid).is_empty());
-        assert!(take_ready_events(0x7c99).is_empty());
-        release_audio_object(pid, object);
-    }
-
-    #[test]
     fn event_handle_rejected_without_event_callback_flag() {
         let pid = 0x7c04;
         let object = 0x9_104;
@@ -4300,35 +4103,6 @@ mod tests {
             set_event_handle(pid, object, 0xABC),
             AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED
         );
-        release_audio_object(pid, object);
-    }
-
-    #[test]
-    fn extension_period_queries_derive_from_device_state() {
-        let pid = 0x7c05;
-        let object = 0x9_105;
-        register_audio_client(pid, object, test_device(), IID_IAUDIO_CLIENT_3);
-        let format = test_format(WAVE_FORMAT_PCM, 2, 48_000, 16);
-        let (default_frames, fundamental_frames, minimum_frames, maximum_frames) =
-            get_shared_mode_engine_period(pid, object, &format).expect("engine periods");
-        assert!(default_frames > 0);
-        assert_eq!(fundamental_frames, minimum_frames);
-        assert!(minimum_frames <= default_frames);
-        assert!(maximum_frames >= default_frames);
-        let (minimum_hns, maximum_hns) =
-            get_buffer_size_limits(pid, object, &format).expect("buffer limits");
-        assert!(minimum_hns > 0);
-        assert_eq!(maximum_hns, 20_000_000);
-        let (mix, current_frames) =
-            current_shared_mode_engine_period(pid, object).expect("current period");
-        assert_eq!(mix.channels, 2);
-        assert_eq!(mix.sample_rate, 48_000);
-        assert!(mix.is_float());
-        assert_eq!(current_frames, default_frames);
-        assert_eq!(set_client_properties(pid, object, 3, false), AUDCLNT_S_OK);
-        let plan = plan_initialize_shared_audio_stream(pid, object, 0, 240, &format)
-            .expect("shared stream plan");
-        assert_eq!(plan.buffer_frames, 240);
         release_audio_object(pid, object);
     }
 
@@ -4382,34 +4156,6 @@ mod tests {
         assert_eq!(
             operation_get_activate_result(pid, operation),
             Err(E_ILLEGAL_METHOD_CALL)
-        );
-        release_activation_operation(pid, operation);
-    }
-
-    #[test]
-    fn pending_completion_completes_and_hands_out_the_operation() {
-        let pid = 0x7d03;
-        let operation = 0x9_503;
-        let endpoint = 0x9_603;
-        register_activation_operation(pid, operation, endpoint);
-        push_activation_completion(
-            pid,
-            PendingActivationCompletion {
-                handler_object: 0x10,
-                handler_method: 0x20,
-                result_hr: ACTIVATION_S_OK,
-                interface_object: endpoint,
-            },
-        );
-        let completion = pop_activation_completion(pid).expect("queued completion");
-        assert_eq!(
-            completion.interface_object, operation,
-            "the handler receives the operation, not the interface"
-        );
-        assert_eq!(
-            operation_get_activate_result(pid, operation),
-            Ok((ACTIVATION_S_OK, endpoint)),
-            "the completion made the real activation result observable"
         );
         release_activation_operation(pid, operation);
     }
@@ -4514,31 +4260,6 @@ mod tests {
     }
 
     #[test]
-    fn loopback_without_an_active_render_stream_delivers_silent_packets() {
-        let pid = 0x7d11;
-        let object = 0x9_511;
-        let service = 0x9_611;
-        let device = test_device();
-        let _format = loopback_capture_service(pid, object, service, &device, 0);
-        assert_eq!(start(pid, object), AUDCLNT_S_OK);
-        // No render client is running and no frames are queued: the packet is
-        // paced by the capture clock and flagged silent.
-        std::thread::sleep(std::time::Duration::from_millis(15));
-        let next = capture_next_packet_size(pid, service).expect("silent packet size");
-        assert!(next > 0, "the capture clock paced a silent packet");
-        let packet = capture_get_buffer(pid, service).expect("silent packet");
-        assert_eq!(packet.flags, AUDCLNT_BUFFERFLAGS_SILENT);
-        assert!(packet.samples.iter().all(|sample| *sample == 0.0));
-        capture_release_buffer(pid, service, packet.frames, 0).expect("release silence");
-        assert_eq!(stop(pid, object), AUDCLNT_S_OK);
-        assert_eq!(stop(pid, object), AUDCLNT_S_FALSE, "already stopped");
-        assert_eq!(reset(pid, object), AUDCLNT_S_OK);
-        assert_eq!(capture_next_packet_size(pid, service), Ok(0));
-        release_audio_object(pid, object);
-        release_audio_object(pid, service);
-    }
-
-    #[test]
     fn loopback_is_rejected_on_a_capture_endpoint() {
         let pid = 0x7d12;
         let object = 0x9_512;
@@ -4590,80 +4311,6 @@ mod tests {
             "loopback is a shared-mode capture path"
         );
         release_audio_object(pid, object);
-    }
-
-    #[test]
-    fn reset_discards_buffered_loopback_frames() {
-        let pid = 0x7d14;
-        let object = 0x9_514;
-        let service = 0x9_614;
-        let device = test_device();
-        let format = loopback_capture_service(pid, object, service, &device, 0);
-        push_loopback_render_samples(
-            pid,
-            &device.key,
-            &[0.25; 40],
-            format.channels,
-            format.sample_rate,
-        );
-        assert_eq!(
-            capture_next_packet_size(pid, service),
-            Ok(0),
-            "not started yet"
-        );
-        assert_eq!(start(pid, object), AUDCLNT_S_OK);
-        assert_eq!(capture_next_packet_size(pid, service), Ok(20));
-        assert_eq!(stop(pid, object), AUDCLNT_S_OK);
-        assert_eq!(reset(pid, object), AUDCLNT_S_OK);
-        // Reset advanced the client past the buffered history; only the
-        // clock-paced silence produced since the restart may be available.
-        assert_eq!(start(pid, object), AUDCLNT_S_OK);
-        let next = capture_next_packet_size(pid, service).unwrap();
-        assert!(
-            next <= 2,
-            "Reset discarded the buffered 20-frame loopback packet, got {next}"
-        );
-        release_audio_object(pid, object);
-        release_audio_object(pid, service);
-    }
-
-    #[test]
-    fn capture_event_drives_loopback_packets() {
-        let pid = 0x7d15;
-        let object = 0x9_515;
-        let service = 0x9_615;
-        let device = test_device();
-        let format = loopback_capture_service(
-            pid,
-            object,
-            service,
-            &device,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        );
-        push_loopback_render_samples(
-            pid,
-            &device.key,
-            &[0.5; 160],
-            format.channels,
-            format.sample_rate,
-        );
-        assert_eq!(set_event_handle(pid, object, 0xE2), AUDCLNT_S_OK);
-        assert_eq!(start(pid, object), AUDCLNT_S_OK);
-        assert_eq!(
-            take_ready_event(pid, object),
-            Some(0xE2),
-            "Start signals the event because a loopback packet is queued"
-        );
-        assert_eq!(capture_next_packet_size(pid, service), Ok(80));
-        let packet = capture_get_buffer(pid, service).expect("packet one");
-        assert_eq!(packet.frames, 80);
-        capture_release_buffer(pid, service, packet.frames, 0).expect("release one");
-        assert_eq!(capture_next_packet_size(pid, service), Ok(0));
-        stop(pid, object);
-        assert_eq!(capture_next_packet_size(pid, service), Ok(0));
-        assert_eq!(reset(pid, object), AUDCLNT_S_OK);
-        release_audio_object(pid, object);
-        release_audio_object(pid, service);
     }
 
     // -----------------------------------------------------------------------

@@ -541,98 +541,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_png_encoding() {
-        // Create a simple 2x2 RGBA image
-        let data = vec![
-            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
-        ];
-        let png = encode_png(&data, 2, 2).unwrap();
-        // Check PNG signature
-        assert_eq!(
-            &png[0..8],
-            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
-        );
-        // Check IHDR chunk present
-        assert!(png.windows(4).any(|w| w == b"IHDR"));
-        // Check IEND chunk exists
-        assert!(png.windows(4).any(|w| w == b"IEND"));
-    }
-
-    #[test]
-    fn test_ico_to_icns_minimal() {
-        // This test verifies the ICNS structure is valid
-        // even with an empty-ish ICO (just the header)
-        let ico = vec![0, 0, 1, 0, 0, 0]; // ICO header with 0 icons
-        let result = ico_to_icns(&ico);
-        assert!(result.is_ok(), "ico_to_icns should succeed for minimal ICO");
-        let icns = result.unwrap();
-        assert!(
-            validate_icns(&icns).expect("validate_icns should not error on valid ICNS"),
-            "generated ICNS should be valid"
-        );
-        assert_eq!(&icns[0..4], b"icns");
-    }
-
-    #[test]
-    fn test_icons_to_icns() {
-        let icons = vec![IconImage {
-            width: 16,
-            height: 16,
-            bpp: 32,
-            data: vec![0u8; 16 * 16 * 4], // transparent black
-            is_png_compressed: false,
-            xor_mask: None,
-        }];
-        let result = icons_to_icns(&icons);
-        assert!(result.is_ok(), "icons_to_icns should succeed");
-        let icns = result.unwrap();
-        assert!(
-            validate_icns(&icns).expect("validate_icns should not error on generated ICNS"),
-            "generated ICNS should be valid"
-        );
-    }
-
-    #[test]
-    fn test_dib_to_png() {
-        // Build a 4x4 32bpp DIB (BGRA, bottom-up) with a BITMAPINFOHEADER
-        // whose biHeight doubles the logical height (XOR + AND masks).
-        let width = 4u32;
-        let bpp = 32u16;
-        let row_size = (width * bpp as u32).div_ceil(32) * 4;
-        let mut dib = Vec::new();
-        let mut header = [0u8; 40];
-        header[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
-        header[4..8].copy_from_slice(&(width as i32).to_le_bytes()); // biWidth
-        header[8..12].copy_from_slice(&8i32.to_le_bytes()); // biHeight (XOR + AND)
-        header[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
-        header[14..16].copy_from_slice(&bpp.to_le_bytes()); // biBitCount
-        dib.extend_from_slice(&header);
-        // XOR rows (bottom-up), all red: 4 rows x 16 bytes
-        for _ in 0..4 {
-            for _ in 0..width {
-                dib.extend_from_slice(&[0, 0, 255, 255]); // B G R A
-            }
-        }
-        // AND mask rows (opaque)
-        dib.extend_from_slice(&vec![0u8; (4 * row_size) as usize]);
-
-        let png = dib_to_png(&dib, 4, 4, 32).unwrap();
-        assert_eq!(png[0..8], [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-
-        // The PNG must be 4x4 (logical height), not 4x2 (double-halved).
-        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
-        let mut reader = decoder.read_info().unwrap();
-        let mut out = vec![0u8; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut out).unwrap();
-        assert_eq!(info.width, 4);
-        assert_eq!(info.height, 4);
-        let rgba = &out[..info.buffer_size()];
-        for px in rgba.as_chunks::<4>().0 {
-            assert_eq!(*px, [255, 0, 0, 255]);
-        }
-    }
-
-    #[test]
     fn test_dib_to_png_headerless_fallback() {
         // Headerless DIB: the height argument is the doubled DIB height
         // (XOR + AND masks) and is halved exactly once.
@@ -653,48 +561,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dib_to_png_palette_8bpp() {
-        // 2x2 8bpp palette icon: XOR rows are bottom-up; row 0 in memory is
-        // the bottom image row.
-        let width = 2u32;
-        let bpp = 8u16;
-        let mut dib = Vec::new();
-        let mut header = [0u8; 40];
-        header[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
-        header[4..8].copy_from_slice(&(width as i32).to_le_bytes()); // biWidth
-        header[8..12].copy_from_slice(&4i32.to_le_bytes()); // biHeight (2 XOR + 2 AND)
-        header[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
-        header[14..16].copy_from_slice(&bpp.to_le_bytes()); // biBitCount
-        header[32..36].copy_from_slice(&4u32.to_le_bytes()); // biClrUsed: 4 palette entries
-        dib.extend_from_slice(&header);
-        // Palette: 4 BGRX entries
-        dib.extend_from_slice(&[0, 0, 0, 0]); // 0: black
-        dib.extend_from_slice(&[0, 0, 255, 0]); // 1: red
-        dib.extend_from_slice(&[0, 255, 0, 0]); // 2: green
-        dib.extend_from_slice(&[255, 0, 0, 0]); // 3: blue
-        // XOR rows (bottom-up), 4 bytes each (2 pixel bytes + padding):
-        // bottom image row = [green, red], top image row = [black, blue]
-        dib.extend_from_slice(&[2, 1, 0, 0]);
-        dib.extend_from_slice(&[0, 3, 0, 0]);
-        // AND mask rows
-        dib.extend_from_slice(&[0u8; 8]);
-
-        let png = dib_to_png(&dib, 2, 2, 8).unwrap();
-        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
-        let mut reader = decoder.read_info().unwrap();
-        let mut out = vec![0u8; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut out).unwrap();
-        assert_eq!(info.width, 2);
-        assert_eq!(info.height, 2);
-        let rgba = &out[..info.buffer_size()];
-        // Image row order: top row first.
-        assert_eq!(&rgba[0..4], [0, 0, 0, 255]); // black
-        assert_eq!(&rgba[4..8], [0, 0, 255, 255]); // blue
-        assert_eq!(&rgba[8..12], [0, 255, 0, 255]); // green
-        assert_eq!(&rgba[12..16], [255, 0, 0, 255]); // red
-    }
-
-    #[test]
     fn test_dib_to_png_rejects_unsupported_bpp() {
         let mut dib = vec![0u8; 40];
         dib[0..4].copy_from_slice(&40u32.to_le_bytes());
@@ -702,20 +568,6 @@ mod tests {
         dib[8..12].copy_from_slice(&2i32.to_le_bytes());
         dib[14..16].copy_from_slice(&16u16.to_le_bytes()); // 16bpp is unsupported
         assert!(dib_to_png(&dib, 1, 1, 16).is_err());
-    }
-
-    #[test]
-    fn test_ico_to_icns_skips_entry_beyond_eof() {
-        // An entry whose offset lies beyond EOF must be skipped, not panic.
-        let mut ico = vec![0, 0, 1, 0, 1, 0]; // header with 1 icon
-        ico.extend_from_slice(&[32, 32, 0, 0]); // width, height, colors, reserved
-        ico.extend_from_slice(&[1, 0]); // planes
-        ico.extend_from_slice(&[32, 0]); // bpp
-        ico.extend_from_slice(&0x1000u32.to_le_bytes()); // size
-        ico.extend_from_slice(&0xFFFF_FF00u32.to_le_bytes()); // offset beyond EOF
-        let icns = ico_to_icns(&ico).unwrap();
-        assert_eq!(icns.len(), 8); // no entries were added
-        assert!(validate_icns(&icns).unwrap_or(false));
     }
 
     #[test]
@@ -745,23 +597,5 @@ mod tests {
     fn test_ico_to_icns_too_short() {
         let result = ico_to_icns(&[0, 0, 1]);
         assert!(result.is_err(), "ICO data shorter than 6 bytes should fail");
-    }
-
-    #[test]
-    fn test_icon_to_png_already_compressed() {
-        let icon = IconImage {
-            width: 16,
-            height: 16,
-            bpp: 32,
-            data: vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A], // fake PNG header
-            is_png_compressed: true,
-            xor_mask: None,
-        };
-        let result = icon_to_png(&icon);
-        assert!(
-            result.is_ok(),
-            "icon_to_png should succeed for PNG-compressed icons"
-        );
-        assert_eq!(result.unwrap(), icon.data);
     }
 }

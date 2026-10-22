@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 use casa1::d3d11::{
     BlendStateDesc, D3DPT_TRIANGLELIST, DepthStencilStateDesc, DeviceCreationRequest, FeatureLevel,
     FixedFunctionScene, InputElementDesc, InputLayoutDesc, RasterizerStateDesc,

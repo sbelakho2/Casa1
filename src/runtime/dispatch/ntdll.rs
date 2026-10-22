@@ -566,6 +566,11 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let handle = guest_call_arg_u32(state, memory, 0)?;
+        if crate::driver_island::close_island_device_handle(self, handle) {
+            state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
         self.ads_handles.remove(&handle);
         let status = nt::object::nt_close(&mut self.win32, handle);
         state.set(Register::Rax, u64::from(status.raw()));

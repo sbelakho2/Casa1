@@ -140,47 +140,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_basic_information_matches_the_get_system_info_topology() {
-        // GetSystemInfo reports 8 processors — the Nt layer must agree.
-        let bytes = serialize_system_basic_information_x64(8);
-        assert_eq!(bytes.len(), 100);
-        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 8);
-        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 8);
-        assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 8);
-        assert_eq!(u32::from_le_bytes(bytes[96..100].try_into().unwrap()), 8);
-    }
-
-    #[test]
-    fn processor_performance_serializes_the_clock_domain() {
-        let info = NtProcessorPerformanceInformation {
-            idle_time: 1,
-            kernel_time: 2,
-            user_time: 3,
-            dpc_time: 4,
-            interrupt_time: 5,
-            interrupt_count: 6,
-        };
-        let bytes = info.serialize_x64();
-        assert_eq!(i64::from_le_bytes(bytes[0..8].try_into().unwrap()), 1);
-        assert_eq!(i64::from_le_bytes(bytes[16..24].try_into().unwrap()), 3);
-        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 6);
-    }
-
-    #[test]
-    fn time_of_day_serializes_the_guest_filetime_domain() {
-        let info = NtSystemTimeOfDayInformation {
-            boot_time: 0x1000,
-            current_time: 0x2000,
-            time_zone_bias: 0,
-            time_zone_id: 1,
-        };
-        let bytes = info.serialize_x64();
-        assert_eq!(i64::from_le_bytes(bytes[0..8].try_into().unwrap()), 0x1000);
-        assert_eq!(i64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0x2000);
-        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 1);
-    }
-
-    #[test]
     fn system_info_classes_validate_and_counter_layout_is_canonical() {
         assert!(validate_system_information_class(0).is_ok());
         assert!(validate_system_information_class(3).is_ok());

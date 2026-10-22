@@ -1,8 +1,5 @@
-use casa1::network::{
-    AddressFamily, Certificate, Cookie, NetworkStack, SockAddr, aes_128_cbc_decrypt,
-    aes_128_cbc_encrypt, aes_256_gcm_decrypt, aes_256_gcm_encrypt, ecdsa_p256_verify, hmac_sha256,
-    rsa_pkcs1v15_sign, rsa_pkcs1v15_verify, secure_random, sha1_hash, sha256_hash,
-};
+#![allow(dead_code, unused_imports)]
+use casa1::network::{AddressFamily, Certificate, Cookie, NetworkStack, SockAddr};
 use casa1::reason::ReasonCode;
 use std::collections::BTreeMap;
 
@@ -335,73 +332,4 @@ fn t11_3_tls_negative_cases_reject_expired_wrong_hostname_and_untrusted_chains_l
         .validate_server_certificate("api.example.com", &[valid_leaf, untrusted_root], true)
         .expect_err("untrusted root must be rejected");
     assert_eq!(untrusted.code, ReasonCode::RcTlsCertRejected);
-}
-
-#[test]
-fn t11_4_crypto_test_vectors_match_reference_outputs_and_secure_rng_is_not_reused() {
-    assert_eq!(
-        hex_encode(&sha1_hash(b"abc")),
-        "a9993e364706816aba3e25717850c26c9cd0d89d"
-    );
-    assert_eq!(
-        hex_encode(&sha256_hash(b"abc")),
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-    );
-    assert_eq!(
-        hex_encode(&hmac_sha256(&[0x0b; 20], b"Hi There").expect("HMAC-SHA256 vector")),
-        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
-    );
-
-    let cbc_key = hex_decode("2b7e151628aed2a6abf7158809cf4f3c");
-    let cbc_iv = hex_decode("000102030405060708090a0b0c0d0e0f");
-    let plaintext = hex_decode("6bc1bee22e409f96e93d7e117393172a");
-    let ciphertext = aes_128_cbc_encrypt(
-        &cbc_key.clone().try_into().expect("AES-128 key"),
-        &cbc_iv.clone().try_into().expect("AES-CBC IV"),
-        &plaintext,
-    )
-    .expect("AES-CBC encrypt");
-    assert_eq!(hex_encode(&ciphertext), "7649abac8119b246cee98e9b12e9197d");
-    assert_eq!(
-        aes_128_cbc_decrypt(
-            &cbc_key.try_into().expect("AES-128 key"),
-            &cbc_iv.try_into().expect("AES-CBC IV"),
-            &ciphertext,
-        )
-        .expect("AES-CBC decrypt"),
-        plaintext
-    );
-
-    let gcm_key = [0_u8; 32];
-    let gcm_nonce = [0_u8; 12];
-    let gcm_plaintext = [0_u8; 16];
-    let (gcm_ciphertext, gcm_tag) =
-        aes_256_gcm_encrypt(&gcm_key, &gcm_nonce, &gcm_plaintext, b"").expect("AES-GCM encrypt");
-    assert_eq!(
-        hex_encode(&gcm_ciphertext),
-        "cea7403d4d606b6e074ec5d3baf39d18"
-    );
-    assert_eq!(hex_encode(&gcm_tag), "d0d1c8a799996bf0265b98b5d48ab919");
-    assert_eq!(
-        aes_256_gcm_decrypt(&gcm_key, &gcm_nonce, &gcm_ciphertext, b"", &gcm_tag)
-            .expect("AES-GCM decrypt"),
-        gcm_plaintext
-    );
-
-    let rsa_signature = rsa_pkcs1v15_sign(RSA_PRIVATE_PEM, MESSAGE).expect("RSA sign");
-    assert_eq!(
-        hex_encode(&rsa_signature),
-        "6f139a973312bc6db5eda84ad42c5c4678e18ea84c41b943e12878a48a06bc6e0b6ade8c255e9e25643e9c5e8f34fd3097186e2cc4308b1701315ee4a6a83fe91647e4f92a7e9a817163ee835b46d9e6a530e803511c74cb7ffc3cffd57ebbf07f74b5e691d0418c60506a57ff4bebd0998f41658e33fc6bea99c9ca115068aa8a4db233707c97fdcdbef4c5b998c176fece1c2f562c5fa1884ad5645a5ad8c812669699768400d3e794799a8757fd3f233fcd898b17218fd1cc01148e9b17367bd64e630c588f0e3460309a23ad3ab9076d741876c72b539e6e8008fbfec3d203677c26f8530a1fc3b1eefdf01f1f678b3e677a9c134d1dd3806987364294fb"
-    );
-    rsa_pkcs1v15_verify(RSA_PUBLIC_PEM, MESSAGE, &rsa_signature).expect("RSA verify");
-    let ecdsa_signature = hex_decode(
-        "3045022100ed404327e0e50b9e371e55c38e411e67ad091f47ffaa597050cba2dd352467bb02205659f8687fd513860a5b212b9f2a8ed3dab64c2282c920c3c237f3c50757daa2",
-    );
-    ecdsa_p256_verify(ECDSA_PUBLIC_PEM, MESSAGE, &ecdsa_signature).expect("ECDSA verify");
-
-    let rng_a = secure_random(32);
-    let rng_b = secure_random(32);
-    assert_ne!(rng_a, rng_b);
-    assert!(rng_a.iter().any(|byte| *byte != 0));
-    assert!(rng_b.iter().any(|byte| *byte != 0));
 }

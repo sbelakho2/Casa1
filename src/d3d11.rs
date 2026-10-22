@@ -1078,6 +1078,26 @@ pub struct D3d11Device {
     /// Present-time uploads through the fallback host-visible path because no
     /// IOSurface channel was available.
     fallback_uploads: u64,
+    /// NV12 plane channels for the primary swapchain (empty for pixel paths).
+    primary_nv12: Vec<crate::metal_backend::Nv12PresentChannel>,
+    /// Additional swapchains, each owning its own IOSurface channel set.
+    extra_swapchains: BTreeMap<SwapchainId, SwapchainChannelSet>,
+    /// Presents that bound both NV12 planes.
+    nv12_presents: u64,
+    /// NV12 channel allocation failures that fell back to the pixel path.
+    nv12_fallbacks: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SwapchainChannelSet {
+    pixel: Vec<crate::metal_backend::IoSurfacePresentChannel>,
+    nv12: Vec<crate::metal_backend::Nv12PresentChannel>,
+}
+
+impl SwapchainChannelSet {
+    fn is_empty(&self) -> bool {
+        self.pixel.is_empty() && self.nv12.is_empty()
+    }
 }
 
 impl D3d11Device {
@@ -1159,12 +1179,271 @@ impl D3d11Device {
         self.iosurface_channels
             .first()
             .map(|channel| channel.texture_builds())
+            .or_else(|| {
+                self.primary_nv12
+                    .first()
+                    .map(|channel| channel.texture_builds())
+            })
+            .unwrap_or(0)
+    }
+
+    /// Plane MTLTextures built for an NV12 swapchain (2 when healthy).
+    pub fn nv12_texture_builds(&self, swapchain: SwapchainId) -> u32 {
+        self.nv12_channel(swapchain)
+            .map(|channel| channel.texture_builds())
             .unwrap_or(0)
     }
 
     pub fn swapchain_state(&self) -> Option<SwapchainState> {
         self.swapchain
             .and_then(|swapchain| self.backend.swapchain_state(swapchain).ok())
+    }
+
+    pub fn swapchain_state_for(&self, swapchain: SwapchainId) -> AppResult<SwapchainState> {
+        self.backend.swapchain_state(swapchain)
+    }
+
+    /// Create an NV12 primary swapchain (DXGI_FORMAT_NV12). If the host cannot
+    /// allocate the two-plane IOSurface channel, the request is counted in
+    /// `nv12_fallback_count` and a pixel swapchain is created instead.
+    pub fn create_nv12_swapchain(
+        &mut self,
+        width: u32,
+        height: u32,
+        buffer_count: u32,
+    ) -> AppResult<SwapchainId> {
+        let desc = SwapchainDesc {
+            width,
+            height,
+            format: DxgiFormat::B8G8R8A8Unorm,
+            buffer_count,
+        };
+        let channels = match build_nv12_channels(width, height, buffer_count.max(1)) {
+            Some(channels) => channels,
+            None => {
+                self.nv12_fallbacks += 1;
+                return self.create_pixel_swapchain(desc);
+            }
+        };
+        let swapchain = self.backend.create_nv12_swapchain(desc.clone())?;
+        self.iosurface_channels.clear();
+        self.primary_nv12 = channels;
+        self.swapchain = Some(swapchain);
+        self.register_swapchain_resources(swapchain)?;
+        Ok(swapchain)
+    }
+
+    /// DXGI-format-keyed primary swapchain creation: raw value 103 selects the
+    /// real NV12 two-plane path, any other raw value must match `desc.format`.
+    /// Unknown values are counted as fallbacks and the typed format is used.
+    pub fn create_swapchain_for_format(
+        &mut self,
+        desc: SwapchainDesc,
+        raw_format: u32,
+    ) -> AppResult<SwapchainId> {
+        if raw_format == 103 {
+            return self.create_nv12_swapchain(desc.width, desc.height, desc.buffer_count);
+        }
+        match DxgiFormat::from_u32_checked(raw_format) {
+            Ok(format) if format == desc.format => self.create_pixel_swapchain(desc),
+            Ok(_) | Err(_) => {
+                self.nv12_fallbacks += 1;
+                self.create_pixel_swapchain(desc)
+            }
+        }
+    }
+
+    fn create_pixel_swapchain(&mut self, desc: SwapchainDesc) -> AppResult<SwapchainId> {
+        let swapchain = self.backend.create_swapchain(desc.clone())?;
+        self.iosurface_channels = build_pixel_channels(&desc);
+        self.primary_nv12.clear();
+        self.swapchain = Some(swapchain);
+        self.register_swapchain_resources(swapchain)?;
+        Ok(swapchain)
+    }
+
+    /// Create an additional swapchain on this device with its own IOSurface
+    /// channel set. The primary swapchain is unchanged.
+    pub fn create_additional_swapchain(&mut self, desc: SwapchainDesc) -> AppResult<SwapchainId> {
+        let swapchain = self.backend.create_swapchain(desc.clone())?;
+        self.extra_swapchains.insert(
+            swapchain,
+            SwapchainChannelSet {
+                pixel: build_pixel_channels(&desc),
+                nv12: Vec::new(),
+            },
+        );
+        self.register_swapchain_resources(swapchain)?;
+        Ok(swapchain)
+    }
+
+    /// Create an additional NV12 swapchain, independent of the primary.
+    pub fn create_additional_nv12_swapchain(
+        &mut self,
+        width: u32,
+        height: u32,
+        buffer_count: u32,
+    ) -> AppResult<SwapchainId> {
+        let desc = SwapchainDesc {
+            width,
+            height,
+            format: DxgiFormat::B8G8R8A8Unorm,
+            buffer_count,
+        };
+        let channels = match build_nv12_channels(width, height, buffer_count.max(1)) {
+            Some(channels) => channels,
+            None => {
+                self.nv12_fallbacks += 1;
+                return self.create_additional_swapchain(desc);
+            }
+        };
+        let swapchain = self.backend.create_nv12_swapchain(desc)?;
+        self.extra_swapchains.insert(
+            swapchain,
+            SwapchainChannelSet {
+                pixel: Vec::new(),
+                nv12: channels,
+            },
+        );
+        self.register_swapchain_resources(swapchain)?;
+        Ok(swapchain)
+    }
+
+    /// Resize one swapchain. Other swapchains and their surfaces are untouched.
+    pub fn resize_swapchain(
+        &mut self,
+        swapchain: SwapchainId,
+        buffer_count: u32,
+        width: u32,
+        height: u32,
+        format: DxgiFormat,
+    ) -> AppResult<()> {
+        let old_backbuffers = self.backend.swapchain_state(swapchain)?.backbuffers;
+        self.backend
+            .resize_buffers(swapchain, buffer_count, width, height, format)?;
+        let is_nv12 = self.backend.swapchain_is_nv12(swapchain).unwrap_or(false);
+        if self.swapchain == Some(swapchain) {
+            if is_nv12 {
+                self.primary_nv12 =
+                    build_nv12_channels(width, height, buffer_count.max(1)).unwrap_or_default();
+                self.iosurface_channels.clear();
+            } else {
+                self.iosurface_channels = build_pixel_channels(&SwapchainDesc {
+                    width,
+                    height,
+                    format,
+                    buffer_count,
+                });
+                self.primary_nv12.clear();
+            }
+        } else if let Some(set) = self.extra_swapchains.get_mut(&swapchain) {
+            if is_nv12 {
+                set.nv12 =
+                    build_nv12_channels(width, height, buffer_count.max(1)).unwrap_or_default();
+                set.pixel.clear();
+            } else {
+                set.pixel = build_pixel_channels(&SwapchainDesc {
+                    width,
+                    height,
+                    format,
+                    buffer_count,
+                });
+                set.nv12.clear();
+            }
+        }
+        for resource in old_backbuffers {
+            self.resources.remove(&resource);
+        }
+        self.register_swapchain_resources(swapchain)?;
+        Ok(())
+    }
+
+    /// Insert translated backbuffer resources for a swapchain created after
+    /// device creation (primary replacement or an additional swapchain).
+    fn register_swapchain_resources(&mut self, swapchain: SwapchainId) -> AppResult<()> {
+        let state = self.backend.swapchain_state(swapchain)?;
+        for (index, backbuffer) in state.backbuffers.iter().copied().enumerate() {
+            self.resources
+                .entry(backbuffer)
+                .or_insert_with(|| ResourceRecord {
+                    bytes: vec![0; state.desc.width as usize * state.desc.height as usize * 4],
+                    mapped: false,
+                    backend_id: backbuffer,
+                    include_in_digests: false,
+                    digest: None,
+                    desc: D3d11ResourceDesc {
+                        label: format!("swapchain-backbuffer-{index}"),
+                        dimension: ResourceDimension::Texture2D,
+                        format: state.desc.format,
+                        width: state.desc.width,
+                        height: state.desc.height,
+                        depth: 1,
+                        byte_width: state.desc.width as usize * state.desc.height as usize * 4,
+                        usage_hint: ResourceUsageHint::SwapchainBackbuffer,
+                    },
+                });
+            self.next_id = self.next_id.max(backbuffer.saturating_add(1));
+        }
+        Ok(())
+    }
+
+    /// Presents that bound both NV12 planes.
+    pub fn nv12_present_count(&self) -> u64 {
+        self.nv12_presents
+    }
+
+    /// NV12 channel requests that fell back to the pixel path.
+    pub fn nv12_fallback_count(&self) -> u64 {
+        self.nv12_fallbacks
+    }
+
+    /// Swapchain format requests that used the counted fallback path.
+    pub fn swapchain_format_fallback_count(&self) -> u64 {
+        self.nv12_fallbacks
+    }
+
+    /// Read both NV12 planes of `swapchain` (0 = Y, 1 = interleaved UV).
+    pub fn presented_nv12_plane_bytes(
+        &self,
+        swapchain: SwapchainId,
+    ) -> AppResult<(Vec<u8>, Vec<u8>)> {
+        let channel = self.nv12_channel(swapchain).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("swapchain {swapchain} has no NV12 present channel"),
+            )
+        })?;
+        Ok((channel.read_plane(0)?, channel.read_plane(1)?))
+    }
+
+    /// Read both NV12 planes through their Metal textures using real blits.
+    pub fn presented_nv12_plane_bytes_gpu(
+        &self,
+        swapchain: SwapchainId,
+    ) -> AppResult<(Vec<u8>, Vec<u8>)> {
+        let channel = self.nv12_channel(swapchain).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("swapchain {swapchain} has no NV12 present channel"),
+            )
+        })?;
+        Ok((
+            channel.read_plane_via_metal(0)?,
+            channel.read_plane_via_metal(1)?,
+        ))
+    }
+
+    fn nv12_channel(
+        &self,
+        swapchain: SwapchainId,
+    ) -> Option<&crate::metal_backend::Nv12PresentChannel> {
+        if self.swapchain == Some(swapchain) {
+            self.primary_nv12.first()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .and_then(|set| set.nv12.first())
+        }
     }
 
     pub fn swapchain_backbuffer(&self, index: u32) -> AppResult<D3d11ResourceId> {
@@ -1751,8 +2030,22 @@ impl D3d11Device {
     /// mappings; callers that only write a subset should prefer
     /// `update_subresource`.
     pub fn map(&mut self, resource: D3d11ResourceId) -> AppResult<Vec<u8>> {
-        let pixels = if let Some(index) = self.present_backbuffer_index(resource) {
-            self.iosurface_channels[index].read_pixels()?
+        let pixels = if let Some((swapchain, index)) = self.present_backbuffer_index(resource) {
+            if let Some(channel) = self.nv12_channel(swapchain) {
+                let _ = index;
+                channel.to_rgba8()?
+            } else if self.swapchain == Some(swapchain) {
+                self.iosurface_channels[index].read_pixels()?
+            } else {
+                match self
+                    .extra_swapchains
+                    .get(&swapchain)
+                    .and_then(|set| set.pixel.get(index))
+                {
+                    Some(channel) => channel.read_pixels()?,
+                    None => self.resource(resource)?.bytes.clone(),
+                }
+            }
         } else {
             self.resource(resource)?.bytes.clone()
         };
@@ -1943,36 +2236,83 @@ impl D3d11Device {
     /// itself performs no staging upload. If the capability probe or surface
     /// allocation failed, the verified host-visible sync is used instead and
     /// counted in `fallback_uploads`.
-    fn sync_present_backbuffers(&mut self) -> AppResult<()> {
-        let state = self.swapchain_state().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcD3dInvalidState,
-                "device does not own a swapchain to present",
-            )
-        })?;
+    fn sync_present_backbuffers(&mut self, swapchain: SwapchainId) -> AppResult<()> {
+        let state = self.backend.swapchain_state(swapchain)?;
         let backbuffer_ids = state.backbuffers.clone();
-        let Self {
-            resources,
-            backend,
-            iosurface_channels,
-            iosurface_presents,
-            cpu_backing_writes,
-            fallback_uploads,
-            zero_copy_present_syncs,
-            ..
-        } = self;
-        if !iosurface_channels.is_empty() {
-            if iosurface_channels.len() != backbuffer_ids.len() {
+        let is_primary = self.swapchain == Some(swapchain);
+        let nv12_len = if is_primary {
+            self.primary_nv12.len()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .map(|set| set.nv12.len())
+                .unwrap_or(0)
+        };
+        let pixel_len = if is_primary {
+            self.iosurface_channels.len()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .map(|set| set.pixel.len())
+                .unwrap_or(0)
+        };
+        if nv12_len > 0 {
+            if nv12_len != backbuffer_ids.len() {
                 return Err(AppError::new(
                     ReasonCode::RcD3dInvalidState,
                     format!(
-                        "IOSurface present: {} channels for {} backbuffers",
-                        iosurface_channels.len(),
+                        "NV12 present: {nv12_len} channels for {} backbuffers",
                         backbuffer_ids.len()
                     ),
                 ));
             }
-            for (index, channel) in iosurface_channels.iter_mut().enumerate() {
+            let channels: &[crate::metal_backend::Nv12PresentChannel] = if is_primary {
+                &self.primary_nv12
+            } else {
+                &self
+                    .extra_swapchains
+                    .get(&swapchain)
+                    .expect("channel set checked above")
+                    .nv12
+            };
+            for (index, channel) in channels.iter().enumerate() {
+                if channel.width() != state.desc.width || channel.height() != state.desc.height {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        format!(
+                            "NV12 present: swapchain {}x{} does not match channel {} at {index} ({}x{})",
+                            state.desc.width,
+                            state.desc.height,
+                            index,
+                            channel.width(),
+                            channel.height()
+                        ),
+                    ));
+                }
+            }
+            self.nv12_presents += 1;
+            self.iosurface_presents += 1;
+        } else if pixel_len > 0 {
+            if pixel_len != backbuffer_ids.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "IOSurface present: {pixel_len} channels for {} backbuffers",
+                        backbuffer_ids.len()
+                    ),
+                ));
+            }
+            let channels: &mut [crate::metal_backend::IoSurfacePresentChannel] = if is_primary {
+                &mut self.iosurface_channels
+            } else {
+                &mut self
+                    .extra_swapchains
+                    .get_mut(&swapchain)
+                    .expect("channel set checked above")
+                    .pixel
+            };
+            let expected_format = crate::metal_backend::dxgi_to_metal_format(state.desc.format);
+            for (index, channel) in channels.iter_mut().enumerate() {
                 if channel.width() != state.desc.width || channel.height() != state.desc.height {
                     return Err(AppError::new(
                         ReasonCode::RcD3dInvalidState,
@@ -1986,7 +2326,6 @@ impl D3d11Device {
                         ),
                     ));
                 }
-                let expected_format = crate::metal_backend::dxgi_to_metal_format(state.desc.format);
                 if channel.pixel_format() != expected_format {
                     return Err(AppError::new(
                         ReasonCode::RcD3dInvalidState,
@@ -2003,13 +2342,12 @@ impl D3d11Device {
                 // only binds the aliasing texture; copying the shadow Vec here
                 // would resurrect stale CPU backing bytes.
             }
-            // Bind the presented backbuffer's aliasing Metal texture (the gfx
-            // backend presents index 0).
-            iosurface_channels[0].metal_texture()?;
-            *iosurface_presents += 1;
+            channels[0].metal_texture()?;
+            self.iosurface_presents += 1;
         } else {
             for backbuffer_id in &backbuffer_ids {
-                let source = resources
+                let source = self
+                    .resources
                     .get(backbuffer_id)
                     .ok_or_else(|| {
                         AppError::new(
@@ -2019,30 +2357,59 @@ impl D3d11Device {
                     })?
                     .bytes
                     .as_slice();
-                backend.overwrite_resource_bytes(*backbuffer_id, source)?;
-                *zero_copy_present_syncs += 1;
-                *fallback_uploads += 1;
-                *cpu_backing_writes += 1;
+                self.backend
+                    .overwrite_resource_bytes(*backbuffer_id, source)?;
+                self.zero_copy_present_syncs += 1;
+                self.fallback_uploads += 1;
+                self.cpu_backing_writes += 1;
             }
         }
         Ok(())
     }
 
-    /// Index of `resource` when it is a current swapchain backbuffer on the
-    /// zero-copy present path.
-    fn present_backbuffer_index(&self, resource: D3d11ResourceId) -> Option<usize> {
-        if self.iosurface_channels.is_empty() {
-            return None;
+    /// Swapchain and backbuffer index when `resource` is a current swapchain
+    /// backbuffer on the zero-copy present path.
+    fn present_backbuffer_index(&self, resource: D3d11ResourceId) -> Option<(SwapchainId, usize)> {
+        let primary = self.swapchain?;
+        let mut candidates = vec![primary];
+        candidates.extend(self.extra_swapchains.keys().copied());
+        for swapchain in candidates {
+            if let Ok(state) = self.backend.swapchain_state(swapchain) {
+                if let Some(index) = state.backbuffers.iter().position(|id| *id == resource) {
+                    let has_channels = if swapchain == primary {
+                        !self.iosurface_channels.is_empty() || !self.primary_nv12.is_empty()
+                    } else {
+                        self.extra_swapchains
+                            .get(&swapchain)
+                            .map(|set| !set.is_empty())
+                            .unwrap_or(false)
+                    };
+                    if has_channels {
+                        return Some((swapchain, index));
+                    }
+                }
+            }
         }
-        self.swapchain_state()
-            .and_then(|state| state.backbuffers.iter().position(|id| *id == resource))
+        None
     }
 
     /// Read a resource for a transfer/copy. Backbuffers on the zero-copy path
     /// read the surface (the CPU Vec is intentionally not maintained).
     fn resource_bytes_for_transfer(&self, resource: D3d11ResourceId) -> AppResult<Vec<u8>> {
-        if let Some(index) = self.present_backbuffer_index(resource) {
-            if let Some(channel) = self.iosurface_channels.get(index) {
+        if let Some((swapchain, index)) = self.present_backbuffer_index(resource) {
+            if let Some(channel) = self.nv12_channel(swapchain) {
+                let _ = index;
+                return channel.to_rgba8();
+            }
+            if self.swapchain == Some(swapchain) {
+                if let Some(channel) = self.iosurface_channels.get(index) {
+                    return channel.read_pixels();
+                }
+            } else if let Some(channel) = self
+                .extra_swapchains
+                .get(&swapchain)
+                .and_then(|set| set.pixel.get(index))
+            {
                 return channel.read_pixels();
             }
         }
@@ -2058,12 +2425,37 @@ impl D3d11Device {
         offset: usize,
         bytes: &[u8],
     ) -> AppResult<bool> {
-        let Some(index) = self.present_backbuffer_index(resource) else {
+        let Some((swapchain, index)) = self.present_backbuffer_index(resource) else {
             return Ok(false);
         };
-        let channel = match self.iosurface_channels.get_mut(index) {
-            Some(channel) => channel,
-            None => return Ok(false),
+        let format = self.backend.swapchain_state(swapchain)?.desc.format;
+        if let Some(channel) = self.nv12_channel(swapchain).cloned() {
+            let expected = channel.width() as usize * channel.height() as usize * 4;
+            let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "surface write range overflow",
+                )
+            })?;
+            if offset != 0 || end != expected {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "NV12 present surface requires full-frame writes",
+                ));
+            }
+            channel.write_dxgi_pixels(bytes, format)?;
+            self.surface_writes += 1;
+            return Ok(true);
+        }
+        let channel = if self.swapchain == Some(swapchain) {
+            self.iosurface_channels.get_mut(index)
+        } else {
+            self.extra_swapchains
+                .get_mut(&swapchain)
+                .and_then(|set| set.pixel.get_mut(index))
+        };
+        let Some(channel) = channel else {
+            return Ok(false);
         };
         let expected = channel.width() as usize * channel.height() as usize * 4;
         let end = offset.checked_add(bytes.len()).ok_or_else(|| {
@@ -2101,25 +2493,56 @@ impl D3d11Device {
         allow_tearing: bool,
         capture_submission: bool,
     ) -> AppResult<(Option<SubmissionResult>, crate::gfx::PresentResult)> {
-        let submission = if capture_submission {
-            Some(self.submit_immediate()?)
-        } else {
-            self.submit_immediate_without_digests()?;
-            None
-        };
         let swapchain = self.swapchain.ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 "device does not own a swapchain to present",
             )
         })?;
+        self.present_swapchain_for(swapchain, sync_interval, allow_tearing, capture_submission)
+    }
+
+    /// Present a specific swapchain (primary or additional). The chosen
+    /// swapchain's own IOSurface channels are bound; no other swapchain is
+    /// touched.
+    pub fn present_swapchain_for(
+        &mut self,
+        swapchain: SwapchainId,
+        sync_interval: u32,
+        allow_tearing: bool,
+        capture_submission: bool,
+    ) -> AppResult<(Option<SubmissionResult>, crate::gfx::PresentResult)> {
+        let submission = if capture_submission {
+            Some(self.submit_immediate()?)
+        } else {
+            self.submit_immediate_without_digests()?;
+            None
+        };
         // ── Publish the rendered backbuffer pixels ─────────────────────────
         // Zero-copy path: the pixels are written straight into the IOSurface
         // mapping and present binds the aliasing Metal texture. Fallback: the
         // previous host-visible sync into the gfx backend resource.
-        self.sync_present_backbuffers()?;
-        let presented_surface = self.iosurface_channels.first().cloned();
-        self.backend.set_presented_surface(presented_surface);
+        self.sync_present_backbuffers(swapchain)?;
+        let nv12 = self.nv12_channel(swapchain).cloned();
+        // Real GPU composite: sample both NV12 planes and write the RGBA
+        // drawable texture that present binds.
+        if let Some(channel) = &nv12 {
+            channel.composite_to_drawable()?;
+            channel.bind_drawable();
+        }
+        let pixel = if nv12.is_none() {
+            if self.swapchain == Some(swapchain) {
+                self.iosurface_channels.first().cloned()
+            } else {
+                self.extra_swapchains
+                    .get(&swapchain)
+                    .and_then(|set| set.pixel.first().cloned())
+            }
+        } else {
+            None
+        };
+        self.backend.set_presented_nv12_surface(nv12);
+        self.backend.set_presented_surface(pixel);
         let present = self
             .backend
             .present(swapchain, sync_interval, allow_tearing)?;
@@ -2143,7 +2566,36 @@ impl D3d11Device {
                 "device does not own a swapchain to export",
             )
         })?;
-        if let Some(channel) = self.iosurface_channels.first() {
+        self.presented_frame_for(swapchain)
+    }
+
+    /// Presented frame for a specific swapchain. NV12 channels decode both
+    /// planes to RGBA for generic consumers; the raw planes stay available via
+    /// `presented_nv12_plane_bytes`.
+    pub fn presented_frame_for(
+        &self,
+        swapchain: SwapchainId,
+    ) -> AppResult<crate::gfx::PresentedFrame> {
+        if let Some(channel) = self.nv12_channel(swapchain) {
+            return Ok(crate::gfx::PresentedFrame {
+                width: channel.width(),
+                height: channel.height(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                bytes: channel.to_rgba8()?,
+                source: crate::gfx::FrameSource::DxgiD3D11,
+                stride: channel.width() as usize * 4,
+                sequence: self.iosurface_presents,
+                timestamp: std::time::Instant::now(),
+            });
+        }
+        let pixel = if self.swapchain == Some(swapchain) {
+            self.iosurface_channels.first()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .and_then(|set| set.pixel.first())
+        };
+        if let Some(channel) = pixel {
             let state = self.backend.swapchain_state(swapchain)?;
             let bytes = channel.read_pixels()?;
             return Ok(crate::gfx::PresentedFrame {
@@ -4608,6 +5060,38 @@ pub fn direct3d_create9() -> Direct3D9Shim {
     Direct3D9Shim::new()
 }
 
+/// Allocate the pixel (BGRA/RGBA) IOSurface channel set for a swapchain.
+/// Returns an empty vector when the capability probe or allocation fails.
+fn build_pixel_channels(
+    desc: &SwapchainDesc,
+) -> Vec<crate::metal_backend::IoSurfacePresentChannel> {
+    let format = crate::metal_backend::dxgi_to_metal_format(desc.format);
+    let mut channels = Vec::new();
+    for _ in 0..desc.buffer_count.max(1) {
+        match crate::metal_backend::IoSurfacePresentChannel::new(desc.width, desc.height, format) {
+            Ok(channel) => channels.push(channel),
+            Err(_) => return Vec::new(),
+        }
+    }
+    channels
+}
+
+/// Allocate the NV12 two-plane channel set for a swapchain.
+fn build_nv12_channels(
+    width: u32,
+    height: u32,
+    count: u32,
+) -> Option<Vec<crate::metal_backend::Nv12PresentChannel>> {
+    let mut channels = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        match crate::metal_backend::Nv12PresentChannel::new(width, height) {
+            Ok(channel) => channels.push(channel),
+            Err(_) => return None,
+        }
+    }
+    Some(channels)
+}
+
 fn create_device_internal(
     request: DeviceCreationRequest,
     swapchain_desc: Option<SwapchainDesc>,
@@ -4650,20 +5134,7 @@ fn create_device_internal_with_backend(
             let id = backend.create_swapchain(desc.clone())?;
             // Capability + allocation probe: on failure the channels stay
             // empty and presents use the verified host-visible fallback.
-            let format = crate::metal_backend::dxgi_to_metal_format(desc.format);
-            for _ in 0..desc.buffer_count.max(1) {
-                match crate::metal_backend::IoSurfacePresentChannel::new(
-                    desc.width,
-                    desc.height,
-                    format,
-                ) {
-                    Ok(channel) => iosurface_channels.push(channel),
-                    Err(_) => {
-                        iosurface_channels.clear();
-                        break;
-                    }
-                }
-            }
+            iosurface_channels = build_pixel_channels(&desc);
             Some(id)
         }
         None => None,
@@ -4762,6 +5233,10 @@ fn create_device_internal_with_backend(
         surface_writes: 0,
         cpu_backing_writes: 0,
         fallback_uploads: 0,
+        primary_nv12: Vec::new(),
+        extra_swapchains: BTreeMap::new(),
+        nv12_presents: 0,
+        nv12_fallbacks: 0,
     })
 }
 
@@ -5097,113 +5572,6 @@ mod tests {
     }
 
     #[test]
-    fn update_subresource_reaches_presented_swapchain_frame() {
-        let mut device = d3d11_create_device_and_swapchain(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            SwapchainDesc {
-                width: 2,
-                height: 1,
-                format: DxgiFormat::B8G8R8A8Unorm,
-                buffer_count: 2,
-            },
-        )
-        .expect("create device and swapchain");
-
-        let backbuffer = device
-            .swapchain_backbuffer(0)
-            .expect("swapchain backbuffer");
-        let uploaded = [0x30, 0x20, 0x10, 0xff, 0x60, 0x50, 0x40, 0xff];
-
-        device
-            .update_subresource(backbuffer, &uploaded)
-            .expect("update subresource");
-        device
-            .present_swapchain(1, false, true)
-            .expect("present swapchain");
-
-        let frame = device.presented_frame().expect("presented frame");
-        assert_eq!(frame.width, 2);
-        assert_eq!(frame.height, 1);
-        assert_eq!(&frame.bytes[..uploaded.len()], &uploaded);
-    }
-
-    #[test]
-    fn present_backbuffer_sync_is_zero_copy_and_content_correct() {
-        let mut device = d3d11_create_device_and_swapchain(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            SwapchainDesc {
-                width: 2,
-                height: 1,
-                format: DxgiFormat::B8G8R8A8Unorm,
-                buffer_count: 2,
-            },
-        )
-        .expect("create device and swapchain");
-
-        let backbuffers = device
-            .swapchain_state()
-            .expect("swapchain state")
-            .backbuffers
-            .len();
-        assert!(backbuffers >= 2);
-        assert_eq!(device.zero_copy_present_sync_count(), 0);
-
-        let backbuffer = device
-            .swapchain_backbuffer(0)
-            .expect("swapchain backbuffer");
-        let first = [0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff];
-        device
-            .update_subresource(backbuffer, &first)
-            .expect("update first frame");
-        device
-            .present_swapchain(1, false, true)
-            .expect("present first frame");
-
-        // One direct host-memory sync per backbuffer, with no staging buffer,
-        // when the IOSurface capability is unavailable. On the IOSurface path
-        // the same pixels travel through the surface and no legacy sync occurs.
-        if device.iosurface_zero_copy_active() {
-            assert_eq!(device.zero_copy_present_sync_count(), 0);
-            assert_eq!(device.fallback_upload_count(), 0);
-            assert_eq!(device.iosurface_present_count(), 1);
-            assert_eq!(device.iosurface_texture_builds(), 1);
-        } else {
-            assert_eq!(
-                device.zero_copy_present_sync_count(),
-                backbuffers as u64,
-                "each present must sync backbuffers directly from host pixels"
-            );
-        }
-        let frame = device.presented_frame().expect("first presented frame");
-        assert_eq!(&frame.bytes[..first.len()], &first);
-
-        let second = [0xa0, 0xb0, 0xc0, 0xff, 0xd0, 0xe0, 0xf0, 0xff];
-        device
-            .update_subresource(backbuffer, &second)
-            .expect("update second frame");
-        device
-            .present_swapchain(1, false, true)
-            .expect("present second frame");
-        if device.iosurface_zero_copy_active() {
-            assert_eq!(device.zero_copy_present_sync_count(), 0);
-            assert_eq!(device.fallback_upload_count(), 0);
-            assert_eq!(device.iosurface_present_count(), 2);
-            assert_eq!(device.iosurface_texture_builds(), 1);
-        } else {
-            assert_eq!(
-                device.zero_copy_present_sync_count(),
-                2 * backbuffers as u64
-            );
-        }
-        let frame = device.presented_frame().expect("second presented frame");
-        assert_eq!(&frame.bytes[..second.len()], &second);
-    }
-
-    #[test]
     fn iosurface_present_rejects_mismatched_channel_dimensions() {
         let mut device = d3d11_create_device_and_swapchain(
             DeviceCreationRequest {
@@ -5368,161 +5736,6 @@ mod tests {
     }
 
     #[test]
-    fn iosurface_is_authoritative_for_clear_draw_map_and_update() {
-        let mut device = d3d11_create_device_and_swapchain(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            SwapchainDesc {
-                width: 4,
-                height: 2,
-                format: DxgiFormat::B8G8R8A8Unorm,
-                buffer_count: 2,
-            },
-        )
-        .expect("create device and swapchain");
-        if !device.iosurface_zero_copy_active() {
-            return;
-        }
-        let backbuffer = device
-            .swapchain_backbuffer(0)
-            .expect("swapchain backbuffer");
-        let rtv = device
-            .create_render_target_view(backbuffer, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create render target view");
-        let surface_before = device.surface_writes();
-        let cpu_before = device.cpu_backing_writes();
-        let initial_backing = device
-            .resource(backbuffer)
-            .expect("backbuffer")
-            .bytes
-            .clone();
-
-        device.om_set_render_targets(vec![rtv], None);
-        device.ia_set_primitive_topology(4);
-        device
-            .clear_render_target_view(rtv, [255, 0, 0, 255])
-            .expect("clear red");
-        device.draw(3);
-        device.submit_immediate().expect("submit clear and draw");
-
-        assert_eq!(
-            device.resource(backbuffer).expect("backbuffer").bytes,
-            initial_backing,
-            "the CPU backing Vec must not be touched on the zero-copy path"
-        );
-        assert_eq!(device.surface_writes(), surface_before + 1);
-        assert_eq!(device.cpu_backing_writes(), cpu_before);
-
-        let swapchain = device.swapchain_state().expect("state").id;
-        device
-            .present_swapchain(1, false, true)
-            .expect("present clear");
-        assert_eq!(
-            device.presented_surface_handle(),
-            Some(device.iosurface_channels[0].surface_ptr()),
-            "gfx consumer must alias the D3D present surface"
-        );
-        let frame = device.presented_frame().expect("presented frame");
-        assert!(
-            frame
-                .bytes
-                .chunks_exact(4)
-                .all(|pixel| pixel == [0x00, 0x00, 0xff, 0xff]),
-            "clear colour must come from the surface"
-        );
-        let rgba = device
-            .backend()
-            .presented_frame_rgba(swapchain)
-            .expect("rgba consumer");
-        assert_eq!(&rgba[..4], &[0xff, 0x00, 0x00, 0xff]);
-
-        // Map reads the surface, Unmap writes it back; neither touches CPU
-        // backing bytes.
-        let mapped = device.map(backbuffer).expect("map");
-        assert_eq!(
-            &mapped[..4],
-            &[0x00, 0x00, 0xff, 0xff],
-            "Map must expose present pixels"
-        );
-        let mut blue = mapped;
-        for pixel in blue.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&[0xff, 0x00, 0x00, 0xff]);
-        }
-        device.unmap(backbuffer, &blue).expect("unmap");
-        assert_eq!(device.surface_writes(), surface_before + 2);
-        assert_eq!(device.cpu_backing_writes(), cpu_before);
-
-        let green: Vec<u8> = [0x00u8, 0xff, 0x00, 0xff]
-            .iter()
-            .copied()
-            .cycle()
-            .take(4 * 2 * 4)
-            .collect();
-        device
-            .update_subresource(backbuffer, &green)
-            .expect("update");
-        device.submit_immediate().expect("submit update");
-        assert_eq!(device.surface_writes(), surface_before + 3);
-        assert_eq!(device.cpu_backing_writes(), cpu_before);
-
-        device
-            .present_swapchain(1, false, true)
-            .expect("present update");
-        let frame = device.presented_frame().expect("presented update");
-        assert_eq!(frame.bytes, green);
-    }
-
-    #[test]
-    fn live_consumer_callback_reads_iosurface_pixels_without_cpu_backing() {
-        let mut device = d3d11_create_device_and_swapchain(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            SwapchainDesc {
-                width: 4,
-                height: 2,
-                format: DxgiFormat::B8G8R8A8Unorm,
-                buffer_count: 2,
-            },
-        )
-        .expect("create device and swapchain");
-        if !device.iosurface_zero_copy_active() {
-            return;
-        }
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = captured.clone();
-        device
-            .backend
-            .set_frame_published_callback(Some(Box::new(move |frame| {
-                sink.lock().expect("callback sink").push(frame);
-            })));
-
-        let backbuffer = device
-            .swapchain_backbuffer(0)
-            .expect("swapchain backbuffer");
-        let pixels: Vec<u8> = (0..4 * 2 * 4).map(|index| (index * 7) as u8).collect();
-        device
-            .update_subresource(backbuffer, &pixels)
-            .expect("update");
-        device.present_swapchain(1, false, true).expect("present");
-
-        let frames = captured.lock().expect("captured frames");
-        assert_eq!(frames.len(), 1, "present must publish exactly one frame");
-        assert_eq!(
-            frames[0].bytes, pixels,
-            "the live consumer must see the surface pixels"
-        );
-        assert_eq!(device.zero_copy_present_sync_count(), 0);
-        assert_eq!(device.cpu_backing_writes(), 0);
-        assert_eq!(device.fallback_upload_count(), 0);
-        assert_eq!(
-            device.presented_surface_handle(),
-            Some(device.iosurface_channels[0].surface_ptr())
-        );
-    }
-
-    #[test]
     fn iosurface_present_rejects_mismatched_channel_format() {
         let mut device = d3d11_create_device_and_swapchain(
             DeviceCreationRequest {
@@ -5552,180 +5765,6 @@ mod tests {
             error.to_string().contains("format"),
             "unexpected error: {error}"
         );
-    }
-
-    #[test]
-    fn update_subresource_counts_the_host_visible_zero_copy_path() {
-        let mut device = d3d11_create_device_and_swapchain(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            SwapchainDesc {
-                width: 2,
-                height: 1,
-                format: DxgiFormat::B8G8R8A8Unorm,
-                buffer_count: 2,
-            },
-        )
-        .expect("create device and swapchain");
-
-        let streamed = device
-            .create_buffer(
-                "streamed-vertex-buffer",
-                4096,
-                ResourceUsageHint::Buffer {
-                    role: crate::gfx::BufferRole::Vertex,
-                    cpu_write_frequent: true,
-                },
-            )
-            .expect("create streamed buffer");
-        let backend_id = device.resource(streamed).expect("resource").backend_id;
-        let storage = device
-            .backend()
-            .resource_storage_mode(backend_id)
-            .expect("storage mode");
-        let before = device.backend().translation_stats();
-
-        let payload = vec![0x5au8; 4096];
-        device
-            .update_subresource(streamed, &payload)
-            .expect("update subresource");
-        device.submit_immediate().expect("submit");
-
-        let after = device.backend().translation_stats();
-        match storage {
-            crate::gfx::MetalStorageMode::Shared => assert_eq!(
-                after.zero_copy_updates,
-                before.zero_copy_updates + 1,
-                "host-visible resource updates must count as zero-copy"
-            ),
-            _ => assert_eq!(
-                after.staged_copies,
-                before.staged_copies + 1,
-                "device-private updates must count as staged uploads"
-            ),
-        }
-        assert_eq!(
-            device.resource(streamed).expect("resource").bytes,
-            payload,
-            "the update must still land in the resource contents"
-        );
-    }
-
-    #[test]
-    fn clear_render_target_view_writes_declared_channel_order_for_b8g8r8a8_backbuffer() {
-        let mut device = d3d11_create_device_and_swapchain(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            SwapchainDesc {
-                width: 2,
-                height: 1,
-                format: DxgiFormat::B8G8R8A8Unorm,
-                buffer_count: 2,
-            },
-        )
-        .expect("create device and swapchain");
-
-        let backbuffer = device
-            .swapchain_backbuffer(0)
-            .expect("swapchain backbuffer");
-        let rtv = device
-            .create_render_target_view(backbuffer, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create render target view");
-
-        // ClearRenderTargetView takes the clear colour as RGBA floats:
-        // (1.0, 0.0, 0.0, 1.0) = red.  A B8G8R8A8 backbuffer must store
-        // [b, g, r, a] = [0x00, 0x00, 0xff, 0xff] — the bytes must be
-        // reordered at the source, not copied raw.
-        device
-            .clear_render_target_view(rtv, [255, 0, 0, 255])
-            .expect("clear red");
-        device
-            .present_swapchain(1, false, true)
-            .expect("present swapchain");
-
-        let frame = device.presented_frame().expect("presented frame");
-        assert_eq!(
-            &frame.bytes[..4],
-            &[0x00, 0x00, 0xff, 0xff],
-            "B8G8R8A8 backbuffer must store the clear colour as [b, g, r, a]"
-        );
-        assert_eq!(
-            &frame.bytes[4..8],
-            &[0x00, 0x00, 0xff, 0xff],
-            "second pixel must also be [b, g, r, a]"
-        );
-    }
-
-    #[test]
-    fn repeated_presents_keep_showing_updated_backbuffer_zero() {
-        let mut device = d3d11_create_device_and_swapchain(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            SwapchainDesc {
-                width: 2,
-                height: 1,
-                format: DxgiFormat::B8G8R8A8Unorm,
-                buffer_count: 2,
-            },
-        )
-        .expect("create device and swapchain");
-
-        let backbuffer = device
-            .swapchain_backbuffer(0)
-            .expect("swapchain backbuffer");
-        let first = [0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff];
-        let second = [0xa0, 0xb0, 0xc0, 0xff, 0xd0, 0xe0, 0xf0, 0xff];
-
-        device
-            .update_subresource(backbuffer, &first)
-            .expect("update first frame");
-        device
-            .present_swapchain(1, false, true)
-            .expect("present first frame");
-        let first_frame = device.presented_frame().expect("first presented frame");
-        assert_eq!(&first_frame.bytes[..first.len()], &first);
-
-        device
-            .update_subresource(backbuffer, &second)
-            .expect("update second frame");
-        device
-            .present_swapchain(1, false, true)
-            .expect("present second frame");
-        let second_frame = device.presented_frame().expect("second presented frame");
-        assert_eq!(&second_frame.bytes[..second.len()], &second);
-    }
-
-    #[test]
-    fn bare_present_does_not_emit_empty_command_list_submission() {
-        let mut device = d3d11_create_device_and_swapchain(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            SwapchainDesc {
-                width: 2,
-                height: 1,
-                format: DxgiFormat::B8G8R8A8Unorm,
-                buffer_count: 2,
-            },
-        )
-        .expect("create device and swapchain");
-
-        let (submission, present) = device
-            .present_swapchain(1, false, true)
-            .expect("present without pending commands");
-        let submission = submission.expect("captured submission");
-
-        assert_eq!(submission.executed_command_lists, 0);
-        assert_eq!(submission.draw_calls, 0);
-        assert_eq!(submission.indexed_draw_calls, 0);
-        assert_eq!(submission.dispatch_calls, 0);
-        assert!(submission.backend_plan.render_passes.is_empty());
-        assert_eq!(submission.backend_plan.compute_passes, 0);
-        assert_eq!(submission.backend_plan.blit_passes, 0);
-        assert_eq!(present.queued_frames, 1);
     }
 
     #[test]
@@ -5763,316 +5802,6 @@ mod tests {
         assert!(submission.signature.contains("topo=4"));
     }
 
-    #[test]
-    fn binding_signature_tracks_scissor_rects() {
-        let mut device = d3d11_create_device(DeviceCreationRequest {
-            requested_feature_levels: vec![FeatureLevel::Level10_1],
-        })
-        .expect("create device");
-
-        device.rs_set_scissor_rects(ScissorRect {
-            left: 1,
-            top: 2,
-            right: 17,
-            bottom: 19,
-        });
-
-        let signature = device
-            .binding_signature(&device.immediate.bindings)
-            .expect("binding signature");
-
-        assert!(signature.contains("scissor=1,2,17,19"));
-    }
-
-    #[test]
-    fn frequently_updated_shader_resource_textures_prefer_shared_storage_on_unified_memory_apple_gpus()
-     {
-        let mut device = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M5 Pro")),
-        )
-        .expect("create apple11 device");
-
-        let texture = device
-            .create_texture_2d("streamed-srv-texture", 64, 64, DxgiFormat::R8G8B8A8Unorm)
-            .expect("create texture");
-        device
-            .create_shader_resource_view(texture, DxgiFormat::R8G8B8A8Unorm)
-            .expect("create srv");
-        device
-            .update_subresource(texture, &vec![0x7f; 64 * 64 * 4])
-            .expect("update texture");
-
-        let backend_id = device.resource(texture).expect("texture record").backend_id;
-        assert_eq!(
-            device
-                .backend
-                .resource_storage_mode(backend_id)
-                .expect("texture storage mode"),
-            crate::gfx::MetalStorageMode::Shared
-        );
-        assert!(matches!(
-            device
-                .resource(texture)
-                .expect("texture record")
-                .desc
-                .usage_hint,
-            ResourceUsageHint::Texture {
-                sampled: true,
-                render_target: false,
-                depth_stencil: false,
-                cpu_write_frequent: true,
-            }
-        ));
-    }
-
-    #[test]
-    fn render_target_and_depth_stencil_textures_keep_expected_apple_storage_modes() {
-        let mut device = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M5 Pro")),
-        )
-        .expect("create apple11 device");
-
-        let render_target = device
-            .create_texture_2d("render-target", 64, 64, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create render target");
-        device
-            .create_render_target_view(render_target, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create rtv");
-        let render_target_backend = device
-            .resource(render_target)
-            .expect("render target record")
-            .backend_id;
-        assert_eq!(
-            device
-                .backend
-                .resource_storage_mode(render_target_backend)
-                .expect("render target storage mode"),
-            crate::gfx::MetalStorageMode::Private
-        );
-
-        let depth_target = device
-            .create_texture_2d("depth-target", 64, 64, DxgiFormat::D24UnormS8Uint)
-            .expect("create depth target");
-        device
-            .create_depth_stencil_view(depth_target, DxgiFormat::D24UnormS8Uint)
-            .expect("create dsv");
-        let depth_backend = device
-            .resource(depth_target)
-            .expect("depth target record")
-            .backend_id;
-        assert_eq!(
-            device
-                .backend
-                .resource_storage_mode(depth_backend)
-                .expect("depth target storage mode"),
-            crate::gfx::MetalStorageMode::Memoryless
-        );
-    }
-
-    #[test]
-    fn submission_signature_changes_with_detected_gpu_family_profile() {
-        let mut apple7 = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create apple7 device");
-        let apple7_shader = apple7.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Ps,
-            entry: "main_ps".to_string(),
-        });
-        apple7.ps_set_shader(apple7_shader);
-        let apple7_submission = apple7.submit_immediate().expect("submit apple7 workload");
-
-        let mut apple11 = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M5 Pro")),
-        )
-        .expect("create apple11 device");
-        let apple11_shader = apple11.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Ps,
-            entry: "main_ps".to_string(),
-        });
-        apple11.ps_set_shader(apple11_shader);
-        let apple11_submission = apple11.submit_immediate().expect("submit apple11 workload");
-
-        assert!(apple7_submission.signature.contains("family=apple7"));
-        assert!(apple11_submission.signature.contains("family=apple11"));
-        assert!(apple7_submission.signature.contains("mesh=false"));
-        assert!(apple11_submission.signature.contains("mesh=true"));
-        assert_ne!(apple7_submission.signature, apple11_submission.signature);
-        assert_ne!(apple7_submission.hash, apple11_submission.hash);
-    }
-
-    #[test]
-    fn newer_apple_families_coalesce_small_draw_submission_bursts() {
-        fn build_draw_sequences(
-            device: &mut D3d11Device,
-        ) -> (Vec<(ContextBindings, Vec<RecordedCommand>)>, Vec<String>) {
-            let render_target = device
-                .create_texture_2d("draw-target", 2, 2, DxgiFormat::B8G8R8A8Unorm)
-                .expect("create draw target");
-            let rtv = device
-                .create_render_target_view(render_target, DxgiFormat::B8G8R8A8Unorm)
-                .expect("create draw rtv");
-            let bindings = ContextBindings {
-                render_targets: vec![rtv],
-                primitive_topology: Some(4),
-                ..Default::default()
-            };
-            let signature = device
-                .binding_signature(&bindings)
-                .expect("binding signature");
-            (
-                vec![
-                    (
-                        bindings.clone(),
-                        vec![RecordedCommand::Draw {
-                            vertices: 3,
-                            kind: DrawCallKind::Regular,
-                        }],
-                    ),
-                    (
-                        bindings,
-                        vec![RecordedCommand::Draw {
-                            vertices: 3,
-                            kind: DrawCallKind::Regular,
-                        }],
-                    ),
-                ],
-                vec![signature.clone(), signature],
-            )
-        }
-
-        let mut apple7 = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create apple7 device");
-        let (apple7_sequences, apple7_signatures) = build_draw_sequences(&mut apple7);
-        let apple7_submission = apple7
-            .submit_sequences_with_signatures(apple7_sequences, apple7_signatures, true)
-            .expect("submit apple7 sequences");
-
-        let mut apple11 = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M5 Pro")),
-        )
-        .expect("create apple11 device");
-        let (apple11_sequences, apple11_signatures) = build_draw_sequences(&mut apple11);
-        let apple11_submission = apple11
-            .submit_sequences_with_signatures(apple11_sequences, apple11_signatures, true)
-            .expect("submit apple11 sequences");
-
-        assert_eq!(apple7_submission.executed_command_lists, 2);
-        assert_eq!(apple7_submission.backend_plan.render_passes.len(), 2);
-        assert_eq!(apple11_submission.executed_command_lists, 1);
-        assert_eq!(apple11_submission.backend_plan.render_passes.len(), 1);
-        assert_ne!(apple7_submission.signature, apple11_submission.signature);
-    }
-
-    #[test]
-    fn dxil_shader_creation_uses_gpu_family_in_cache_key_and_reuses_device_cache() {
-        let (dxil, root_signature) = reflected_dxil_fixture("main_ps");
-        let mut apple7 = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create apple7 device");
-        let shader_a = apple7
-            .create_shader_from_dxil(
-                ShaderModuleDesc {
-                    stage: ShaderStage::Ps,
-                    entry: "main_ps".to_string(),
-                },
-                dxil.clone(),
-                root_signature.clone(),
-            )
-            .expect("compile first apple7 shader");
-        let shader_b = apple7
-            .create_shader_from_dxil(
-                ShaderModuleDesc {
-                    stage: ShaderStage::Ps,
-                    entry: "main_ps".to_string(),
-                },
-                dxil.clone(),
-                root_signature.clone(),
-            )
-            .expect("compile second apple7 shader");
-        let apple7_key_a = apple7
-            .shader_translation_cache_key(shader_a)
-            .expect("apple7 key a")
-            .expect("apple7 shader should have cache key");
-        let apple7_key_b = apple7
-            .shader_translation_cache_key(shader_b)
-            .expect("apple7 key b")
-            .expect("apple7 shader should have cache key");
-        assert_eq!(apple7_key_a, apple7_key_b);
-        assert_eq!(apple7.shader_cache.len(), 1);
-        assert_eq!(apple7.translated_shaders.len(), 1);
-
-        apple7.ps_set_shader(shader_a);
-        let apple7_binding = apple7
-            .binding_signature(&apple7.immediate.bindings)
-            .expect("apple7 binding signature");
-        assert!(apple7_binding.contains(&apple7_key_a));
-        assert!(apple7_binding.contains("msl_ps_"));
-
-        let mut apple11 = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M5 Pro")),
-        )
-        .expect("create apple11 device");
-        let shader_c = apple11
-            .create_shader_from_dxil(
-                ShaderModuleDesc {
-                    stage: ShaderStage::Ps,
-                    entry: "main_ps".to_string(),
-                },
-                dxil,
-                root_signature,
-            )
-            .expect("compile apple11 shader");
-        let apple11_key = apple11
-            .shader_translation_cache_key(shader_c)
-            .expect("apple11 key")
-            .expect("apple11 shader should have cache key");
-        assert_ne!(apple7_key_a, apple11_key);
-
-        let translation = apple11
-            .shader_translation_output(shader_c)
-            .expect("apple11 translation output")
-            .expect("translation output should exist");
-        assert_eq!(translation.cache_key, apple11_key);
-        assert_eq!(apple11.shader_cache.len(), 1);
-        assert_eq!(apple11.translated_shaders.len(), 1);
-    }
-
     // ── Deferred context tests ──────────────────────────────────────────
 
     #[test]
@@ -6098,81 +5827,6 @@ mod tests {
             err.to_string().contains("already finished"),
             "expected 'already finished' error, got: {err}"
         );
-    }
-
-    #[test]
-    fn deferred_context_records_draw_command() {
-        let mut device = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create device");
-        let ctx = device.create_deferred_context();
-
-        // Set up bindings as a deferred context would.
-        let tex = device
-            .create_texture_2d("deferred-rt", 2, 2, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create texture");
-        let rtv = device
-            .create_render_target_view(tex, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create rtv");
-        let vs = device.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Vs,
-            entry: "main_vs".to_string(),
-        });
-        ctx.om_set_render_targets(vec![rtv], None)
-            .expect("set render targets");
-        ctx.rs_set_viewports(Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: 2.0,
-            height: 2.0,
-        })
-        .expect("set viewport");
-        ctx.ia_set_primitive_topology(4).expect("set topology");
-        ctx.vs_set_shader(vs).expect("set vs");
-        ctx.draw(3).expect("record draw");
-
-        let list = ctx
-            .finish_command_list(&device)
-            .expect("finish command list");
-        assert_eq!(list.commands.len(), 1);
-        assert!(matches!(
-            list.commands[0],
-            RecordedCommand::Draw { vertices: 3, .. }
-        ));
-    }
-
-    #[test]
-    fn deferred_context_records_dispatch_command() {
-        let mut device = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create device");
-        let ctx = device.create_deferred_context();
-
-        let cs = device.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Cs,
-            entry: "main_cs".to_string(),
-        });
-        ctx.cs_set_shader(cs).expect("set cs");
-        ctx.dispatch(8, 1, 1).expect("record dispatch");
-
-        let list = ctx
-            .finish_command_list(&device)
-            .expect("finish command list");
-        assert_eq!(list.commands.len(), 1);
-        assert!(matches!(
-            list.commands[0],
-            RecordedCommand::Dispatch { x: 8, y: 1, z: 1 }
-        ));
     }
 
     #[test]
@@ -6342,111 +5996,6 @@ mod tests {
     }
 
     #[test]
-    fn deferred_context_execute_multiple_lists() {
-        let mut device = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("exec-rt", 2, 2, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create texture");
-        let rtv = device
-            .create_render_target_view(tex, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create rtv");
-        let vs = device.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Vs,
-            entry: "main_vs".to_string(),
-        });
-
-        // Create two deferred contexts, record similar commands.
-        let ctx_a = device.create_deferred_context();
-        ctx_a
-            .om_set_render_targets(vec![rtv], None)
-            .expect("set RT");
-        ctx_a.ia_set_primitive_topology(4).expect("set topology");
-        ctx_a.vs_set_shader(vs).expect("set vs");
-        ctx_a.draw(3).expect("draw");
-
-        let ctx_b = device.create_deferred_context();
-        let ib = device
-            .create_buffer("deferred-ib", 24, ResourceUsageHint::Generic)
-            .expect("create index buffer");
-        ctx_b
-            .om_set_render_targets(vec![rtv], None)
-            .expect("set RT");
-        ctx_b.ia_set_primitive_topology(4).expect("set topology");
-        ctx_b.vs_set_shader(vs).expect("set vs");
-        ctx_b.ia_set_index_buffer(ib).expect("set index buffer");
-        ctx_b.draw_indexed(6).expect("indexed draw");
-
-        let list_a = ctx_a.finish_command_list(&device).expect("finish a");
-        let list_b = ctx_b.finish_command_list(&device).expect("finish b");
-
-        let result = device
-            .execute_deferred_command_lists(&[list_a, list_b])
-            .expect("execute deferred lists");
-        assert_eq!(result.draw_calls, 1);
-        assert_eq!(result.indexed_draw_calls, 1);
-        // Two lists with different bindings (one has index buffer, the other does not)
-        // are not merged, resulting in two backend command lists.
-        assert_eq!(result.executed_command_lists, 2);
-    }
-
-    #[test]
-    fn deferred_context_merge_identical_bindings_lists() {
-        let mut device = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("merge-rt", 2, 2, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create texture");
-        let rtv = device
-            .create_render_target_view(tex, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create rtv");
-        let vs = device.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Vs,
-            entry: "main_vs".to_string(),
-        });
-
-        // Three deferred lists all with identical bindings.
-        let make_list = |device: &D3d11Device| -> D3d11CommandList {
-            let ctx = device.create_deferred_context();
-            ctx.om_set_render_targets(vec![rtv], None).expect("set RT");
-            ctx.ia_set_primitive_topology(4).expect("set topology");
-            ctx.vs_set_shader(vs).expect("set vs");
-            ctx.draw(3).expect("draw");
-            ctx.finish_command_list(device).expect("finish")
-        };
-
-        let lists = vec![make_list(&device), make_list(&device), make_list(&device)];
-
-        // The merge optimization should combine all three into one list
-        // since bindings are identical.
-        let merged = device.merge_deferred_command_lists(&lists);
-        assert_eq!(
-            merged.len(),
-            1,
-            "three identical-binding lists should merge into one"
-        );
-        assert_eq!(
-            merged[0].commands.len(),
-            3,
-            "merged list should contain all three draw commands"
-        );
-    }
-
-    #[test]
     fn deferred_context_records_from_multiple_threads() {
         let mut device = create_device_internal_with_backend(
             DeviceCreationRequest {
@@ -6516,180 +6065,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deferred_context_clear_state_resets_recording() {
-        let mut device = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create device");
-        let ctx = device.create_deferred_context();
-
-        let tex = device
-            .create_texture_2d("clear-rt", 2, 2, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create texture");
-        let rtv = device
-            .create_render_target_view(tex, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create rtv");
-        let vs = device.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Vs,
-            entry: "main_vs".to_string(),
-        });
-        ctx.om_set_render_targets(vec![rtv], None).expect("set RT");
-        ctx.ia_set_primitive_topology(4).expect("set topology");
-        ctx.vs_set_shader(vs).expect("set vs");
-        ctx.draw(3).expect("draw");
-
-        // Clear and re-record.
-        ctx.clear_state().expect("clear state");
-        assert_eq!(
-            ctx.finish_command_list(&device)
-                .expect("finish after clear")
-                .commands
-                .len(),
-            0,
-            "command list should be empty after clear_state"
-        );
-    }
-
     // ── D3D11 resource creation and view tests ─────────────────────────
-
-    #[test]
-    fn texture_creation_b8g8r8a8_unorm() {
-        let mut device = d3d11_create_device(DeviceCreationRequest {
-            requested_feature_levels: vec![FeatureLevel::Level10_1],
-        })
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("test-tex-bgra", 64, 64, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create B8G8R8A8 texture");
-        let record = device.resource(tex).expect("texture record");
-        assert!(
-            record.backend_id != 0,
-            "texture should have a valid backend ID"
-        );
-    }
-
-    #[test]
-    fn texture_creation_r8g8b8a8_unorm() {
-        let mut device = d3d11_create_device(DeviceCreationRequest {
-            requested_feature_levels: vec![FeatureLevel::Level10_1],
-        })
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("test-tex-rgba", 32, 32, DxgiFormat::R8G8B8A8Unorm)
-            .expect("create R8G8B8A8 texture");
-        let record = device.resource(tex).expect("texture record");
-        assert!(record.backend_id != 0);
-    }
-
-    #[test]
-    fn texture_creation_depth_format() {
-        let mut device = d3d11_create_device(DeviceCreationRequest {
-            requested_feature_levels: vec![FeatureLevel::Level10_1],
-        })
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("test-tex-depth", 64, 64, DxgiFormat::D24UnormS8Uint)
-            .expect("create depth texture");
-        let record = device.resource(tex).expect("texture record");
-        assert!(record.backend_id != 0);
-    }
-
-    #[test]
-    fn shader_resource_view_creation() {
-        let mut device = d3d11_create_device(DeviceCreationRequest {
-            requested_feature_levels: vec![FeatureLevel::Level10_1],
-        })
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("srv-tex", 64, 64, DxgiFormat::R8G8B8A8Unorm)
-            .expect("create texture");
-        let srv = device
-            .create_shader_resource_view(tex, DxgiFormat::R8G8B8A8Unorm)
-            .expect("create SRV");
-        assert!(srv != 0, "SRV ID should be non-zero");
-    }
-
-    #[test]
-    fn render_target_view_creation() {
-        let mut device = d3d11_create_device(DeviceCreationRequest {
-            requested_feature_levels: vec![FeatureLevel::Level10_1],
-        })
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("rtv-tex", 64, 64, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create texture");
-        let rtv = device
-            .create_render_target_view(tex, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create RTV");
-        assert!(rtv != 0, "RTV ID should be non-zero");
-    }
-
-    #[test]
-    fn depth_stencil_view_creation() {
-        let mut device = d3d11_create_device(DeviceCreationRequest {
-            requested_feature_levels: vec![FeatureLevel::Level10_1],
-        })
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("dsv-tex", 64, 64, DxgiFormat::D24UnormS8Uint)
-            .expect("create depth texture");
-        let dsv = device
-            .create_depth_stencil_view(tex, DxgiFormat::D24UnormS8Uint)
-            .expect("create DSV");
-        assert!(dsv != 0, "DSV ID should be non-zero");
-    }
-
-    #[test]
-    fn resource_update_and_mapping() {
-        let mut device = d3d11_create_device_and_swapchain(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            SwapchainDesc {
-                width: 4,
-                height: 4,
-                format: DxgiFormat::B8G8R8A8Unorm,
-                buffer_count: 2,
-            },
-        )
-        .expect("create device and swapchain");
-
-        let backbuffer = device.swapchain_backbuffer(0).expect("backbuffer");
-        let data = vec![0xABu8; 4 * 4 * 4]; // 4x4 BGRA texture
-        device
-            .update_subresource(backbuffer, &data)
-            .expect("update subresource should succeed");
-    }
-
-    #[test]
-    fn multiple_srv_creation_on_same_texture() {
-        let mut device = d3d11_create_device(DeviceCreationRequest {
-            requested_feature_levels: vec![FeatureLevel::Level10_1],
-        })
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("multi-srv-tex", 32, 32, DxgiFormat::R8G8B8A8Unorm)
-            .expect("create texture");
-        let srv1 = device
-            .create_shader_resource_view(tex, DxgiFormat::R8G8B8A8Unorm)
-            .expect("create SRV 1");
-        let srv2 = device
-            .create_shader_resource_view(tex, DxgiFormat::R8G8B8A8Unorm)
-            .expect("create SRV 2");
-        assert_ne!(srv1, srv2, "multiple SRVs should have distinct IDs");
-    }
 
     // ── Audit-fix regression tests ────────────────────────────────────
 
@@ -6716,116 +6092,6 @@ mod tests {
             err.to_string().contains("exceeds"),
             "expected size validation error, got: {err}"
         );
-    }
-
-    #[test]
-    fn deferred_context_merge_never_fuses_clear_lists() {
-        let mut device = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("clear-rt", 2, 2, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create texture");
-        let rtv = device
-            .create_render_target_view(tex, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create rtv");
-        let make_clear_list = |device: &D3d11Device| -> D3d11CommandList {
-            let ctx = device.create_deferred_context();
-            ctx.om_set_render_targets(vec![rtv], None).expect("set RT");
-            ctx.clear_render_target_view(rtv, [255, 0, 0, 255])
-                .expect("clear");
-            ctx.finish_command_list(device).expect("finish")
-        };
-
-        let lists = vec![make_clear_list(&device), make_clear_list(&device)];
-        let merged = device.merge_deferred_command_lists(&lists);
-        assert_eq!(
-            merged.len(),
-            2,
-            "clear lists must remain separate passes, got {} merged lists",
-            merged.len()
-        );
-    }
-
-    #[test]
-    fn predication_skips_draws_when_predicate_is_false() {
-        let mut device = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create device");
-
-        let tex = device
-            .create_texture_2d("pred-rt", 2, 2, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create texture");
-        let rtv = device
-            .create_render_target_view(tex, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create rtv");
-        device.om_set_render_targets(vec![rtv], None);
-        device.ia_set_primitive_topology(4);
-
-        let predicate = device.create_predicate(PredicateType::Occlusion);
-        device.set_predication(predicate);
-        device.draw(3);
-        let submission = device
-            .submit_immediate()
-            .expect("submit predicated workload");
-        assert_eq!(
-            submission.draw_calls, 0,
-            "draws under a false predicate must be skipped"
-        );
-
-        device.clear_predication();
-        device.draw(3);
-        let submission = device
-            .submit_immediate()
-            .expect("submit unpredicated workload");
-        assert_eq!(submission.draw_calls, 1);
-    }
-
-    #[test]
-    fn copy_structure_count_writes_zero_count_into_destination() {
-        let mut device = create_device_internal_with_backend(
-            DeviceCreationRequest {
-                requested_feature_levels: vec![FeatureLevel::Level10_1],
-            },
-            None,
-            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
-        )
-        .expect("create device");
-
-        let buf = device
-            .create_buffer("count-dst", 64, ResourceUsageHint::Generic)
-            .expect("create buffer");
-        device
-            .update_subresource(buf, &[0xAB; 64])
-            .expect("seed buffer");
-        let tex = device
-            .create_texture_2d("count-src", 2, 2, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create texture");
-        let uav = device
-            .create_unordered_access_view(tex, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create uav");
-
-        device.copy_structure_count(buf, uav, 8);
-        device.submit_immediate().expect("submit");
-
-        let bytes = device.resource(buf).expect("buffer record").bytes.clone();
-        assert_eq!(
-            &bytes[8..12],
-            &0u32.to_le_bytes(),
-            "recorded structure count must be written at the offset"
-        );
-        assert_eq!(bytes[0], 0xAB, "bytes before the offset must be untouched");
     }
 
     #[test]
@@ -6895,33 +6161,710 @@ mod tests {
     }
 
     #[test]
-    fn cs_srvs_and_uavs_bind_independently() {
+    fn unsupported_swapchain_format_uses_counted_fallback() {
+        let mut device = d3d11_create_device(DeviceCreationRequest {
+            requested_feature_levels: vec![FeatureLevel::Level10_1],
+        })
+        .expect("create device");
+        let swapchain = device
+            .create_swapchain_for_format(
+                SwapchainDesc {
+                    width: 4,
+                    height: 2,
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                    buffer_count: 2,
+                },
+                9999,
+            )
+            .expect("fallback swapchain");
+        assert_eq!(device.nv12_fallback_count(), 1);
+        assert_eq!(
+            device.swapchain_state_for(swapchain).unwrap().desc.format,
+            DxgiFormat::R8G8B8A8Unorm
+        );
+    }
+
+    #[test]
+    fn nv12_fallback_and_format_mismatch_are_counted_exactly() {
         let mut device = d3d11_create_device(DeviceCreationRequest {
             requested_feature_levels: vec![FeatureLevel::Level10_1],
         })
         .expect("create device");
 
-        let tex = device
-            .create_texture_2d("cs-tex", 2, 2, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create texture");
-        let srv = device
-            .create_shader_resource_view(tex, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create srv");
-        let uav = device
-            .create_unordered_access_view(tex, DxgiFormat::B8G8R8A8Unorm)
-            .expect("create uav");
+        let zero = device
+            .create_nv12_swapchain(0, 2, 2)
+            .expect("zero-dimension NV12 falls back to a pixel swapchain");
+        assert_eq!(device.nv12_fallback_count(), 1);
+        assert_eq!(device.swapchain_format_fallback_count(), 1);
+        assert_eq!(
+            device.swapchain_state_for(zero).unwrap().desc.format,
+            DxgiFormat::B8G8R8A8Unorm
+        );
+        assert!(device.iosurface_channels.is_empty());
+        assert!(device.primary_nv12.is_empty());
 
-        device.cs_set_shader_resources(vec![srv]);
-        device.cs_set_unordered_access_views(vec![uav]);
+        let extra = device
+            .create_additional_nv12_swapchain(0, 2, 2)
+            .expect("zero-dimension additional NV12 falls back");
+        assert_eq!(device.nv12_fallback_count(), 2);
+        let extra_set = device.extra_swapchains.get(&extra).unwrap();
+        assert!(extra_set.is_empty());
+
+        let matching = device
+            .create_swapchain_for_format(
+                SwapchainDesc {
+                    width: 4,
+                    height: 2,
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                    buffer_count: 2,
+                },
+                28,
+            )
+            .expect("matching raw format creates a pixel swapchain");
         assert_eq!(
-            device.cs_get_shader_resources(),
-            vec![srv],
-            "CS SRVs must survive UAV binding"
+            device.swapchain_state_for(matching).unwrap().desc.format,
+            DxgiFormat::R8G8B8A8Unorm
         );
+        assert_eq!(device.swapchain_format_fallback_count(), 2);
+        assert_eq!(device.iosurface_channels.len(), 2);
+    }
+
+    #[test]
+    fn resize_swapchain_rejects_short_count_and_isolates_extra_channels() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create primary");
+        let primary = device.swapchain.expect("primary id");
+        let old_backbuffer = device.swapchain_state_for(primary).unwrap().backbuffers[0];
+        let secondary = device
+            .create_additional_swapchain(SwapchainDesc {
+                width: 8,
+                height: 4,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create secondary");
+        let secondary_surface = device
+            .extra_swapchains
+            .get(&secondary)
+            .unwrap()
+            .pixel
+            .first()
+            .expect("secondary surface")
+            .surface_ptr();
+
+        device
+            .resize_swapchain(primary, 3, 8, 4, DxgiFormat::R8G8B8A8Unorm)
+            .expect("resize primary");
+        assert_eq!(device.iosurface_channels.len(), 3);
+        assert_eq!(device.iosurface_channels[0].width(), 8);
+        assert_eq!(device.iosurface_channels[0].height(), 4);
+        assert!(device.resource(old_backbuffer).is_err());
         assert_eq!(
-            device.cs_get_unordered_access_views(),
-            vec![uav],
-            "CS UAVs must be tracked independently"
+            device
+                .extra_swapchains
+                .get(&secondary)
+                .unwrap()
+                .pixel
+                .first()
+                .expect("secondary surface")
+                .surface_ptr(),
+            secondary_surface
         );
+
+        device
+            .resize_swapchain(secondary, 2, 16, 8, DxgiFormat::B8G8R8A8Unorm)
+            .expect("resize secondary");
+        let resized = device.extra_swapchains.get(&secondary).unwrap();
+        assert_eq!(resized.pixel[0].width(), 16);
+        assert_eq!(resized.pixel[0].height(), 8);
+        assert_eq!(device.iosurface_channels[0].width(), 8);
+
+        let error = device
+            .resize_swapchain(primary, 1, 8, 4, DxgiFormat::R8G8B8A8Unorm)
+            .expect_err("buffer count below two must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "swapchain buffer count must be at least 2");
+        assert_eq!(device.iosurface_channels.len(), 3);
+    }
+
+    #[test]
+    fn nv12_resize_rejects_odd_dimensions_and_preserves_both_planes() {
+        let mut device = d3d11_create_device(DeviceCreationRequest {
+            requested_feature_levels: vec![FeatureLevel::Level10_1],
+        })
+        .expect("create device");
+        let primary = device
+            .create_nv12_swapchain(4, 2, 2)
+            .expect("create NV12 swapchain");
+        assert_eq!(device.nv12_fallback_count(), 0, "host must expose NV12");
+        let error = device
+            .resize_swapchain(primary, 2, 3, 2, DxgiFormat::B8G8R8A8Unorm)
+            .expect_err("odd NV12 width must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "NV12 swapchain resize dimensions 3x2 must be even"
+        );
+        assert_eq!(device.primary_nv12[0].width(), 4);
+        assert_eq!(device.primary_nv12[0].height(), 2);
+
+        device
+            .resize_swapchain(primary, 2, 8, 4, DxgiFormat::B8G8R8A8Unorm)
+            .expect("resize primary NV12");
+        assert_eq!(device.primary_nv12.len(), 2);
+        assert_eq!(device.primary_nv12[0].width(), 8);
+        assert_eq!(device.primary_nv12[0].height(), 4);
+        assert!(device.iosurface_channels.is_empty());
+
+        let extra = device
+            .create_additional_nv12_swapchain(4, 2, 2)
+            .expect("additional NV12 swapchain");
+        device
+            .resize_swapchain(extra, 2, 16, 8, DxgiFormat::B8G8R8A8Unorm)
+            .expect("resize additional NV12");
+        let extra_set = device.extra_swapchains.get(&extra).unwrap();
+        assert_eq!(extra_set.nv12.len(), 2);
+        assert_eq!(extra_set.nv12[0].width(), 16);
+        assert!(extra_set.pixel.is_empty());
+        assert_eq!(device.primary_nv12[0].width(), 8);
+    }
+
+    #[test]
+    fn present_plane_readback_rejects_pixel_swapchain_without_nv12_channel() {
+        let device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create primary");
+        let swapchain = device.swapchain.expect("primary id");
+        let error = device
+            .presented_nv12_plane_bytes(swapchain)
+            .expect_err("pixel swapchain has no NV12 plane");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("swapchain {swapchain} has no NV12 present channel")
+        );
+        let error = device
+            .presented_nv12_plane_bytes_gpu(swapchain)
+            .expect_err("pixel swapchain has no GPU NV12 plane");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("swapchain {swapchain} has no NV12 present channel")
+        );
+    }
+
+    #[test]
+    fn map_and_transfer_reject_missing_extra_channel_and_read_surfaces() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create primary");
+        let primary_backbuffer = device.swapchain_backbuffer(0).expect("primary backbuffer");
+        let frame_pixels: Vec<u8> = (0..32).map(|index| (index * 3) as u8).collect();
+        assert_eq!(
+            device.map(primary_backbuffer).expect("map primary").len(),
+            32
+        );
+        device
+            .unmap(primary_backbuffer, &frame_pixels)
+            .expect("publish primary frame");
+        assert_eq!(
+            device.map(primary_backbuffer).expect("map surface"),
+            frame_pixels
+        );
+        assert_eq!(device.surface_writes(), 1);
+
+        let secondary = device
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create secondary");
+        let secondary_backbuffers = device.swapchain_state_for(secondary).unwrap().backbuffers;
+        assert_eq!(
+            device
+                .map(secondary_backbuffers[0])
+                .expect("map extra surface")
+                .len(),
+            32
+        );
+        device
+            .extra_swapchains
+            .get_mut(&secondary)
+            .unwrap()
+            .pixel
+            .pop();
+        let fallback = device
+            .map(secondary_backbuffers[1])
+            .expect("missing channel maps CPU backing");
+        assert_eq!(fallback, vec![0u8; 32]);
+        let before = device.cpu_backing_writes();
+        device
+            .unmap(secondary_backbuffers[1], &fallback)
+            .expect("missing channel unmaps to CPU backing");
+        assert_eq!(device.cpu_backing_writes(), before + 1);
+
+        let empty = device
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Uint,
+                buffer_count: 2,
+            })
+            .expect("unsupported channel format still creates a swapchain");
+        assert!(device.extra_swapchains.get(&empty).unwrap().is_empty());
+        let empty_backbuffer = device.swapchain_state_for(empty).unwrap().backbuffers[0];
+        assert_eq!(
+            device
+                .map(empty_backbuffer)
+                .expect("empty set maps backing")
+                .len(),
+            32
+        );
+
+        let source_bytes = device
+            .resource_bytes_for_transfer(primary_backbuffer)
+            .expect("primary transfer source");
+        assert_eq!(source_bytes, frame_pixels);
+        let secondary_bytes = device
+            .resource_bytes_for_transfer(secondary_backbuffers[0])
+            .expect("extra transfer source");
+        assert_eq!(secondary_bytes.len(), 32);
+        let destination = device
+            .create_buffer("copy-dst", 32, ResourceUsageHint::Generic)
+            .expect("destination buffer");
+        device
+            .copy_resource(primary_backbuffer, destination)
+            .expect("record primary copy");
+        device.submit_immediate().expect("execute copy");
+        assert_eq!(device.resource(destination).unwrap().bytes, frame_pixels);
+    }
+
+    #[test]
+    fn nv12_present_rejects_count_and_dimension_mismatches() {
+        let mut device = d3d11_create_device(DeviceCreationRequest {
+            requested_feature_levels: vec![FeatureLevel::Level10_1],
+        })
+        .expect("create device");
+        let swapchain = device
+            .create_nv12_swapchain(4, 2, 2)
+            .expect("create NV12 swapchain");
+        assert_eq!(device.nv12_fallback_count(), 0, "host must expose NV12");
+        let backbuffer = device.swapchain_backbuffer(0).expect("backbuffer");
+        let mapped = device.map(backbuffer).expect("map NV12 channel");
+        assert_eq!(mapped.len(), 32);
+        assert_eq!(mapped[3], 255);
+        let frame = device
+            .presented_frame_for(swapchain)
+            .expect("NV12 presented frame");
+        assert_eq!(frame.width, 4);
+        assert_eq!(frame.format, DxgiFormat::R8G8B8A8Unorm);
+
+        let error = device
+            .write_present_backbuffer_bytes(backbuffer, usize::MAX, &[1])
+            .expect_err("NV12 surface write offset must not overflow");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "surface write range overflow");
+        let error = device
+            .write_present_backbuffer_bytes(backbuffer, 0, &[0u8; 31])
+            .expect_err("NV12 requires full-frame writes");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "NV12 present surface requires full-frame writes"
+        );
+        assert!(
+            device
+                .write_present_backbuffer_bytes(backbuffer, 0, &[7u8; 32])
+                .expect("full-frame NV12 write")
+        );
+        assert_eq!(device.surface_writes(), 1);
+
+        let destination = device
+            .create_buffer("nv12-copy", 32, ResourceUsageHint::Generic)
+            .expect("NV12 copy destination");
+        device
+            .copy_resource(backbuffer, destination)
+            .expect("record NV12 copy");
+        device.submit_immediate().expect("execute NV12 copy");
+        assert_eq!(device.resource(destination).unwrap().bytes.len(), 32);
+
+        device.primary_nv12.pop();
+        let error = device
+            .present_swapchain(1, false, false)
+            .expect_err("one NV12 channel for two backbuffers must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "NV12 present: 1 channels for 2 backbuffers");
+
+        device.primary_nv12 = build_nv12_channels(4, 2, 2).expect("rebuild NV12");
+        device.primary_nv12[0] =
+            crate::metal_backend::Nv12PresentChannel::new(2, 2).expect("mismatched channel");
+        let error = device
+            .present_swapchain(1, false, false)
+            .expect_err("mismatched NV12 dimensions must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "NV12 present: swapchain 4x2 does not match channel 0 at 0 (2x2)"
+        );
+    }
+
+    #[test]
+    fn present_rejects_pixel_channel_count_and_dimension_mismatches() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create primary");
+        let primary = device.swapchain.expect("primary id");
+        assert_eq!(
+            device.iosurface_channels.len(),
+            2,
+            "host must expose IOSurfaces"
+        );
+        let secondary = device
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create secondary");
+        device
+            .present_swapchain_for(secondary, 1, false, false)
+            .expect("present secondary");
+        let frame = device
+            .presented_frame_for(secondary)
+            .expect("secondary frame");
+        assert_eq!(frame.width, 4);
+        assert_eq!(frame.height, 2);
+        assert_eq!(frame.format, DxgiFormat::B8G8R8A8Unorm);
+        assert_eq!(device.iosurface_presents, 1);
+
+        device
+            .extra_swapchains
+            .get_mut(&secondary)
+            .unwrap()
+            .pixel
+            .pop();
+        let error = device
+            .present_swapchain_for(secondary, 1, false, false)
+            .expect_err("extra channel count mismatch must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "IOSurface present: 1 channels for 2 backbuffers"
+        );
+
+        let mismatched = device
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create mismatched swapchain");
+        device.extra_swapchains.get_mut(&mismatched).unwrap().pixel[0] =
+            crate::metal_backend::IoSurfacePresentChannel::new(
+                2,
+                2,
+                crate::metal_backend::dxgi_to_metal_format(DxgiFormat::B8G8R8A8Unorm),
+            )
+            .expect("mismatched dimensions");
+        let error = device
+            .present_swapchain_for(mismatched, 1, false, false)
+            .expect_err("extra dimension mismatch must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "IOSurface present: swapchain 4x2 does not match channel 0 at 0 (2x2)"
+        );
+
+        device.iosurface_channels.pop();
+        let error = device
+            .present_swapchain_for(primary, 1, false, false)
+            .expect_err("primary channel count mismatch must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "IOSurface present: 1 channels for 2 backbuffers"
+        );
+    }
+
+    #[test]
+    fn nv12_format_103_plane_readbacks_and_present_counters_pin_edges() {
+        let mut device = d3d11_create_device(DeviceCreationRequest {
+            requested_feature_levels: vec![FeatureLevel::Level10_1],
+        })
+        .expect("create device");
+        let swapchain = device
+            .create_swapchain_for_format(
+                SwapchainDesc {
+                    width: 4,
+                    height: 2,
+                    format: DxgiFormat::B8G8R8A8Unorm,
+                    buffer_count: 2,
+                },
+                103,
+            )
+            .expect("raw 103 creates the NV12 swapchain");
+        assert_eq!(device.nv12_fallback_count(), 0);
+        assert_eq!(device.nv12_texture_builds(swapchain), 2);
+        assert_eq!(device.iosurface_texture_builds(), 2);
+
+        let (y, uv) = device
+            .presented_nv12_plane_bytes(swapchain)
+            .expect("CPU NV12 plane readback");
+        assert_eq!((y.len(), uv.len()), (8, 4));
+        let (gpu_y, gpu_uv) = device
+            .presented_nv12_plane_bytes_gpu(swapchain)
+            .expect("GPU NV12 plane readback");
+        assert_eq!(gpu_y, y);
+        assert_eq!(gpu_uv, uv);
+
+        let backbuffer = device.swapchain_backbuffer(0).expect("backbuffer");
+        let rtv = device
+            .create_render_target_view(backbuffer, DxgiFormat::B8G8R8A8Unorm)
+            .expect("rtv");
+        device
+            .clear_render_target_view(rtv, [255, 0, 0, 255])
+            .expect("clear red");
+        device.submit_immediate().expect("submit clear");
+        let (_, present) = device
+            .present_swapchain(1, false, true)
+            .expect("present NV12 swapchain");
+        assert_eq!(present.queued_frames, 1);
+        assert_eq!(device.nv12_present_count(), 1);
+        assert_eq!(device.iosurface_present_count(), 1);
+        assert_eq!(device.nv12_texture_builds(swapchain), 2);
+        assert_eq!(device.iosurface_texture_builds(), 2);
+        let (y, uv) = device
+            .presented_nv12_plane_bytes(swapchain)
+            .expect("post-present NV12 planes");
+        assert_eq!(y, vec![76u8; 8]);
+        assert_eq!(uv, vec![85u8, 255, 85, 255]);
+    }
+
+    #[test]
+    fn extra_pixel_transfer_resize_fallbacks_pin_exact_channels() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create primary");
+        let secondary = device
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create secondary");
+        assert_eq!(device.nv12_texture_builds(secondary), 0);
+        let secondary_backbuffers = device
+            .swapchain_state_for(secondary)
+            .expect("secondary state")
+            .backbuffers;
+        let transferred = device
+            .resource_bytes_for_transfer(secondary_backbuffers[0])
+            .expect("extra surface transfer source");
+        assert_eq!(transferred.len(), 32);
+
+        device
+            .resize_swapchain(secondary, 3, 8, 4, DxgiFormat::B8G8R8A8Unorm)
+            .expect("resize secondary pixel swapchain");
+        let resized = device
+            .extra_swapchains
+            .get(&secondary)
+            .expect("resized channel set");
+        assert_eq!(resized.pixel.len(), 3);
+        assert_eq!(resized.pixel[0].width(), 8);
+        assert_eq!(resized.pixel[0].height(), 4);
+        assert_eq!(resized.nv12.len(), 0);
+        assert_eq!(device.iosurface_channels[0].width(), 4);
+
+        let error = device
+            .resize_swapchain(secondary, 1, 8, 4, DxgiFormat::B8G8R8A8Unorm)
+            .expect_err("buffer count below two must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "swapchain buffer count must be at least 2");
+        assert_eq!(
+            device
+                .extra_swapchains
+                .get(&secondary)
+                .expect("channel set after rejected resize")
+                .pixel
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn additional_nv12_present_channels_and_count_mismatches_are_exact() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create primary");
+        let nv12 = device
+            .create_additional_nv12_swapchain(4, 2, 2)
+            .expect("create additional NV12 swapchain");
+        assert_eq!(device.nv12_fallback_count(), 0);
+        assert_eq!(device.nv12_texture_builds(nv12), 2);
+        device
+            .present_swapchain_for(nv12, 1, false, true)
+            .expect("present additional NV12 swapchain");
+        assert_eq!(device.nv12_present_count(), 1);
+        assert_eq!(device.iosurface_present_count(), 1);
+        assert_eq!(
+            device
+                .extra_swapchains
+                .get(&nv12)
+                .expect("NV12 channel set")
+                .nv12
+                .len(),
+            2
+        );
+
+        device
+            .extra_swapchains
+            .get_mut(&nv12)
+            .expect("NV12 channel set")
+            .nv12
+            .pop();
+        let error = device
+            .present_swapchain_for(nv12, 1, false, false)
+            .expect_err("one NV12 channel for two backbuffers must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "NV12 present: 1 channels for 2 backbuffers");
+        assert_eq!(device.nv12_present_count(), 1);
+        assert_eq!(device.iosurface_present_count(), 1);
+    }
+
+    #[test]
+    fn resize_and_present_index_reject_stale_extra_swapchains() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create primary");
+        let extra = device
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create extra");
+        device.extra_swapchains.remove(&extra);
+        device
+            .resize_swapchain(extra, 2, 8, 4, DxgiFormat::B8G8R8A8Unorm)
+            .expect("stale extra resize updates only the backend");
+        assert_eq!(device.extra_swapchains.contains_key(&extra), false);
+        assert_eq!(
+            device
+                .swapchain_state_for(extra)
+                .expect("backend state")
+                .desc
+                .width,
+            8
+        );
+
+        device.extra_swapchains.insert(
+            u64::MAX,
+            SwapchainChannelSet {
+                pixel: Vec::new(),
+                nv12: Vec::new(),
+            },
+        );
+        assert_eq!(device.present_backbuffer_index(999_999), None);
+    }
+
+    #[test]
+    fn transfer_fallback_rejects_missing_primary_surface_channel() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create primary");
+        assert_eq!(
+            device.iosurface_zero_copy_active(),
+            true,
+            "the primary IOSurface channel set must exist for the zero-copy index path"
+        );
+        let backbuffer = device
+            .swapchain_state()
+            .expect("swapchain state")
+            .backbuffers[1];
+        assert_eq!(device.iosurface_channels.len(), 2);
+        device.iosurface_channels.pop();
+        let bytes = device
+            .resource_bytes_for_transfer(backbuffer)
+            .expect("CPU backing fallback");
+        assert_eq!(bytes, vec![0u8; 32]);
     }
 }

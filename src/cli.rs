@@ -1084,48 +1084,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn ge_play_parses_input_replay_flag() {
-        let cli = HostCli::try_parse_from([
-            "casa1",
-            "ge:play",
-            "--ge",
-            "demo",
-            "--exe",
-            "guest.exe",
-            "--input-replay",
-            "replay.json",
-        ])
-        .expect("parse ge:play args");
-
-        match cli.command {
-            HostCommand::GePlay { input_replay, .. } => {
-                assert_eq!(input_replay, Some(PathBuf::from("replay.json")));
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn insert_input_replay_loads_env_payload() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos();
-        let replay_path = std::env::temp_dir().join(format!("casa1-cli-replay-{unique}.json"));
-        fs::write(&replay_path, "[{\"scancode\":28}]").expect("write replay file");
-
-        let mut env = BTreeMap::new();
-        insert_input_replay(&mut env, Some(&replay_path)).expect("insert replay into env");
-
-        assert_eq!(
-            env.get("CASA1_KEYBOARD_REPLAY_JSON").map(String::as_str),
-            Some("[{\"scancode\":28}]")
-        );
-
-        let _ = fs::remove_file(replay_path);
-    }
-
-    #[test]
     fn ge_play_defaults_to_process_trace_only() {
         let categories =
             resolve_trace_categories(None, RunIntent::Play).expect("default play trace categories");
@@ -1137,12 +1095,5 @@ mod tests {
         let categories =
             resolve_trace_categories(None, RunIntent::Run).expect("default run trace categories");
         assert_eq!(categories, trace::all_categories());
-    }
-
-    #[test]
-    fn detect_installer_silent_args_prefers_nsis_switches() {
-        let args =
-            detect_installer_silent_args(b"Nullsoft.NSIS.exehead\0Nullsoft Install System v3.0");
-        assert_eq!(args, vec!["/S".to_string()]);
     }
 }

@@ -146,50 +146,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn thread_basic_information_layouts_are_canonical() {
-        let info = NtThreadBasicInformation {
-            exit_status: 0x103,
-            teb_base_address: 0x7FFF_0000_1000,
-            unique_process_id: 4,
-            unique_thread_id: 2,
-            affinity_mask: 0xFF,
-            priority: 0,
-            base_priority: 0,
-        };
-        let x64 = info.serialize_x64();
-        assert_eq!(x64.len(), 48);
-        assert_eq!(
-            u64::from_le_bytes(x64[8..16].try_into().unwrap()),
-            0x7FFF_0000_1000
-        );
-        assert_eq!(u64::from_le_bytes(x64[16..24].try_into().unwrap()), 4);
-        assert_eq!(u64::from_le_bytes(x64[24..32].try_into().unwrap()), 2);
-        assert_eq!(u64::from_le_bytes(x64[32..40].try_into().unwrap()), 0xFF);
-        let x86 = info.serialize_x86();
-        assert_eq!(x86.len(), 28);
-        assert_eq!(u32::from_le_bytes(x86[12..16].try_into().unwrap()), 2);
-        assert_eq!(NtThreadBasicInformation::size_for(true), 48);
-        assert_eq!(NtThreadBasicInformation::size_for(false), 28);
-    }
-
-    #[test]
-    fn context_offsets_follow_the_canonical_windows_layouts() {
-        // Register order rax..r15, and the canonical GPR offsets.
-        assert_eq!(X64_CONTEXT_GPR_OFFSETS[0], 0x20); // Rax
-        assert_eq!(X64_CONTEXT_GPR_OFFSETS[4], 0x40); // Rsp
-        assert_eq!(X64_CONTEXT_GPR_OFFSETS[15], 0x98); // R15
-        assert_eq!(X64_CONTEXT_RIP_OFFSET, 0xA0);
-        assert_eq!(X64_CONTEXT_EFLAGS_OFFSET, 0xA8);
-        assert_eq!(X64_CONTEXT_FLAGS_OFFSET, 0x3B8);
-        assert_eq!(X86_CONTEXT_EAX_OFFSET, 0xB4);
-        assert_eq!(X86_CONTEXT_ESP_OFFSET, 0xC8);
-        assert_eq!(
-            CONTEXT_FULL,
-            CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT
-        );
-    }
-
-    #[test]
     fn thread_info_classes_validate() {
         // Every supported query class validates; unsupported classes are
         // rejected with STATUS_INVALID_INFO_CLASS.

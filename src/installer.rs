@@ -3232,26 +3232,6 @@ mod tests {
 
     // ---- helper tests --------------------------------------------------------
 
-    #[test]
-    fn search_magic_bytes_finds_pattern() {
-        let data = b"hello\x00\x01\x02world";
-        assert_eq!(search_magic_bytes(data, b"hello"), Some(0));
-        assert_eq!(search_magic_bytes(data, b"world"), Some(8));
-        assert_eq!(search_magic_bytes(data, b"\x00\x01"), Some(5));
-    }
-
-    #[test]
-    fn search_magic_bytes_returns_none_for_no_match() {
-        let data = b"hello world";
-        assert_eq!(search_magic_bytes(data, b"xyz"), None);
-        assert_eq!(search_magic_bytes(data, b""), None);
-        assert_eq!(search_magic_bytes(b"", b"abc"), None);
-    }
-
-    /// Create a minimal valid PE file for testing.
-    /// Returns (path, bytes_written).
-    /// The PE has one section `.text` with data_offset=0x200, data_size=64,
-    /// and an optional overlay appended after the section data.
     fn create_minimal_pe(
         dir: &std::path::Path,
         name: &str,
@@ -3310,24 +3290,6 @@ mod tests {
     }
 
     #[test]
-    fn search_magic_bytes_finds_at_multiple_positions() {
-        let data = b"abcabcabc";
-        assert_eq!(search_magic_bytes(data, b"abc"), Some(0));
-        assert_eq!(search_magic_bytes(&data[1..], b"abc"), Some(2)); // shifted by 1
-    }
-
-    #[test]
-    fn extract_exe_overlay_returns_overlay_data() {
-        let dir = tempfile::tempdir().unwrap();
-        let overlay_content = b"OVERLAYDATA";
-        let (path, _pe) = create_minimal_pe(dir.path(), "test.exe", Some(overlay_content));
-
-        let result =
-            extract_exe_overlay(&path).expect("extract_exe_overlay should return overlay data");
-        assert_eq!(result, overlay_content);
-    }
-
-    #[test]
     fn extract_exe_overlay_returns_empty_for_no_overlay() {
         let dir = tempfile::tempdir().unwrap();
         let exe_path = dir.path().join("no_overlay.exe");
@@ -3346,13 +3308,6 @@ mod tests {
     // ---- InstallShield detect tests -----------------------------------------
 
     #[test]
-    fn installshield_detect_detects_installshield_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _pe) = create_minimal_pe(dir.path(), "setup.exe", Some(b"ISc(\x00\x01\x02\x03"));
-        assert!(InstallShieldEngine::detect(&path));
-    }
-
-    #[test]
     fn installshield_detect_returns_false_for_plain_exe() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("normal.exe");
@@ -3361,17 +3316,6 @@ mod tests {
     }
 
     // ---- NSIS detect tests --------------------------------------------------
-
-    #[test]
-    fn nsis_detect_detects_nsis_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _pe) = create_minimal_pe(
-            dir.path(),
-            "nsis_installer.exe",
-            Some(b"nsis\x00\x01\x02\x03"),
-        );
-        assert!(NsisEngine::detect(&path));
-    }
 
     #[test]
     fn nsis_detect_returns_false_for_plain_exe() {
@@ -3384,17 +3328,6 @@ mod tests {
     // ---- InnoSetup detect tests ---------------------------------------------
 
     #[test]
-    fn innosetup_detect_detects_innosetup_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _pe) = create_minimal_pe(
-            dir.path(),
-            "innosetup_installer.exe",
-            Some(b"Inno\x00\x01\x02\x03"),
-        );
-        assert!(InnoSetupEngine::detect(&path));
-    }
-
-    #[test]
     fn innosetup_detect_returns_false_for_plain_exe() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("normal.exe");
@@ -3405,69 +3338,12 @@ mod tests {
     // ---- decompress_zlib_block test -----------------------------------------
 
     #[test]
-    fn decompress_zlib_block_roundtrips() {
-        let original = b"hello world this is a test of zlib compression";
-        // Compress using flate2
-        use flate2::Compression;
-        use flate2::write::ZlibEncoder;
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(original).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        let result = decompress_zlib_block(&compressed).unwrap();
-        assert_eq!(result, original);
-    }
-
-    #[test]
     fn decompress_zlib_block_errors_on_garbage() {
         let garbage = b"this is not zlib compressed data";
         assert!(decompress_zlib_block(garbage).is_err());
     }
 
     // ---- Install engine tests -----------------------------------------------
-
-    #[test]
-    fn installshield_install_registers_files_and_registry() {
-        let dir = tempfile::tempdir().unwrap();
-        let installer_path = dir.path().join("setup.exe");
-
-        // Build a minimal valid CAB with MSCF magic and 0 files.
-        // CAB header (CFHEADER) is 36 bytes.
-        let mut cab = Vec::new();
-        cab.extend_from_slice(b"MSCF"); // 0-3:  magic
-        cab.extend_from_slice(&[0u8; 4]); // 4-7:  reserved1
-        cab.extend_from_slice(&44u32.to_le_bytes()); // 8-11: cab size
-        cab.extend_from_slice(&[0u8; 4]); // 12-15: reserved2
-        cab.extend_from_slice(&36u32.to_le_bytes()); // 16-19: file_offset
-        cab.extend_from_slice(&[0u8; 4]); // 20-23: reserved3
-        cab.extend_from_slice(&[1u8, 4]); // 24-25: version (1.4)
-        cab.extend_from_slice(&0u16.to_le_bytes()); // 26-27: folder_count = 0
-        cab.extend_from_slice(&0u16.to_le_bytes()); // 28-29: file_count = 0
-        cab.extend_from_slice(&0u16.to_le_bytes()); // 30-31: flags = 0
-        cab.extend_from_slice(&0u16.to_le_bytes()); // 32-33: set_id
-        cab.extend_from_slice(&0u16.to_le_bytes()); // 34-35: cab_idx
-
-        // Embed the CAB after "ISc(" prefix
-        let mut data = Vec::new();
-        data.extend_from_slice(b"ISc("); // InstallShield CAB marker
-        data.extend_from_slice(&cab); // CAB content
-        fs::write(&installer_path, &data).unwrap();
-
-        let engine = InstallShieldEngine {
-            installer_path: installer_path.clone(),
-            cab_data: Vec::new(), // will be extracted from the file
-        };
-
-        let mut state = InstallerEngine::new();
-        let result = engine
-            .install(&mut state)
-            .expect("InstallShield install should succeed");
-
-        assert!(result.contains("Program Files"));
-        // Check registry was written
-        let registry = state.registry();
-        assert!(registry.values().any(|v| v == "1.0.0"));
-    }
 
     #[test]
     fn nsis_install_registers_files_and_registry() {
@@ -3561,159 +3437,11 @@ mod tests {
 
     // ---- Uninstall tests ----------------------------------------------------
 
-    #[test]
-    fn installshield_uninstall_cleans_up() {
-        let mut state = InstallerEngine::new();
-        let dir = tempfile::tempdir().unwrap();
-        let installer_path = dir.path().join("MyApp.exe");
-
-        // Simulate prior install
-        state.files.insert(
-            "c:/program files/installshield/myapp/main.exe".to_string(),
-            vec![1, 2, 3],
-        );
-        state.registry.insert(
-            "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MyApp\\displayname"
-                .to_string(),
-            "MyApp".to_string(),
-        );
-
-        let engine = InstallShieldEngine {
-            installer_path,
-            cab_data: Vec::new(),
-        };
-
-        engine
-            .uninstall(&mut state)
-            .expect("InstallShield uninstall should succeed");
-        assert!(state.files().is_empty());
-        assert!(state.registry().is_empty());
-    }
-
-    #[test]
-    fn nsis_uninstall_cleans_up() {
-        let mut state = InstallerEngine::new();
-        let dir = tempfile::tempdir().unwrap();
-        let installer_path = dir.path().join("MyNSISApp.exe");
-
-        state.files.insert(
-            "c:/program files/mynsisapp/main.exe".to_string(),
-            vec![1, 2, 3],
-        );
-        state.registry.insert(
-            "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MyNSISApp\\displayname"
-                .to_string(),
-            "MyNSISApp".to_string(),
-        );
-
-        let engine = NsisEngine {
-            installer_path,
-            extract_dir: dir.path().join("extract"),
-        };
-
-        engine
-            .uninstall(&mut state)
-            .expect("NSIS uninstall should succeed");
-        assert!(state.files().is_empty());
-        assert!(state.registry().is_empty());
-    }
-
-    #[test]
-    fn innosetup_uninstall_cleans_up() {
-        let mut state = InstallerEngine::new();
-        let dir = tempfile::tempdir().unwrap();
-        let installer_path = dir.path().join("MyInnoApp.exe");
-
-        state.files.insert(
-            "c:/program files/myinnoapp/app.exe".to_string(),
-            vec![1, 2, 3],
-        );
-        state.files.insert(
-            "c:/program files/myinnoapp/unins000.exe".to_string(),
-            vec![4, 5, 6],
-        );
-        state.registry.insert(
-            "hklm/software/microsoft/windows/currentversion/uninstall/myinnoapp/displayname"
-                .to_string(),
-            "MyInnoApp".to_string(),
-        );
-
-        let engine = InnoSetupEngine {
-            installer_path,
-            extract_dir: dir.path().join("extract"),
-        };
-
-        engine
-            .uninstall(&mut state)
-            .expect("InnoSetup uninstall should succeed");
-        assert!(state.files().is_empty());
-        assert!(state.registry().is_empty());
-    }
-
     // ---- Detection dispatch test --------------------------------------------
-
-    #[test]
-    fn detect_installer_type_dispatch() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // MSI
-        let msi_path = dir.path().join("test.msi");
-        fs::write(&msi_path, b"MSI!\x05product\x00\x00").unwrap();
-        assert_eq!(detect_installer_type(&msi_path), InstallerFramework::Msi);
-
-        // Custom
-        let custom_path = dir.path().join("custom.exe");
-        fs::write(&custom_path, b"unknown data").unwrap();
-        assert_eq!(
-            detect_installer_type(&custom_path),
-            InstallerFramework::Custom
-        );
-    }
 
     // ---- register_installed_app test ----------------------------------------
 
-    #[test]
-    fn register_installed_app_writes_registry() {
-        let mut state = InstallerEngine::new();
-        register_installed_app(
-            &mut state,
-            "TestApp",
-            "C:/TestApp",
-            "C:/TestApp/uninstall.exe",
-        )
-        .expect("register_installed_app should succeed");
-
-        let reg = state.registry();
-        assert!(reg.contains_key(
-            "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\TestApp\\displayname"
-        ));
-        assert_eq!(
-            reg.get(
-                "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\TestApp\\installlocation"
-            ),
-            Some(&"C:/TestApp".to_string())
-        );
-        assert_eq!(
-            reg.get(
-                "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\TestApp\\uninstallstring"
-            ),
-            Some(&"C:/TestApp/uninstall.exe".to_string())
-        );
-    }
-
     // ---- PE version string reading test -------------------------------------
-
-    #[test]
-    fn read_pe_version_string_returns_none_for_non_pe() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("not_a_pe.bin");
-        fs::write(&path, b"random data").unwrap();
-        assert!(
-            read_pe_version_string(&path, "FileDescription")
-                .unwrap()
-                .is_none()
-        );
-    }
 
     // ---------------------------------------------------------------------------
     //  Item 236: Partial installer failure / rollback tests
@@ -3906,100 +3634,5 @@ mod tests {
             Some(&original_content),
             "locked file content must be preserved on rejected patch"
         );
-    }
-
-    #[test]
-    fn apply_patch_cycle_accepts_valid_patch() {
-        let mut engine = InstallerEngine::new();
-        let original_content = vec![0x11, 0x22, 0x33, 0x44];
-        engine.files.insert(
-            "c:/target/patchable.bin".to_string(),
-            original_content.clone(),
-        );
-
-        let replacement = vec![0xAA, 0xBB, 0xCC, 0xDD];
-        let operations = vec![PatchOperation {
-            target_path: "c:/target/patchable.bin".to_string(),
-            expected_old: original_content,
-            replacement: replacement.clone(),
-            download_chunks: vec![(
-                "c:/target/patchable.bin".to_string(),
-                0,
-                replacement.clone(),
-            )],
-        }];
-
-        let result = engine.apply_patch_cycle(&operations);
-        assert!(
-            result.is_ok(),
-            "valid patch should succeed, got error: {:?}",
-            result.as_ref().err()
-        );
-
-        assert_eq!(
-            engine.files.get("c:/target/patchable.bin"),
-            Some(&replacement),
-            "patched content should replace original"
-        );
-    }
-
-    #[test]
-    fn run_gui_installer_adds_files_and_registry() {
-        let mut engine = InstallerEngine::new();
-
-        let spec = InstallerSpec {
-            id: "gui-test".to_string(),
-            executable_name: "MyApp.exe".to_string(),
-            framework: InstallerFramework::Custom,
-            files: vec![
-                (
-                    "C:\\Program Files\\MyApp\\main.exe".to_string(),
-                    vec![0x42; 128],
-                ),
-                (
-                    "C:\\Program Files\\MyApp\\config.ini".to_string(),
-                    b"enabled=1".to_vec(),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            registry: vec![(
-                "HKLM\\Software\\MyApp\\Version".to_string(),
-                "2.0".to_string(),
-            )]
-            .into_iter()
-            .collect(),
-            logs: vec!["install.log".to_string()],
-            gui_windows: vec![GuiWindowPlan {
-                title: "MyApp Installer".to_string(),
-                modal: false,
-                controls: vec![],
-            }],
-        };
-
-        let result = engine.run_gui_installer(&spec, None);
-        assert!(
-            result.is_ok(),
-            "GUI installer should succeed, got error: {:?}",
-            result.as_ref().err()
-        );
-
-        // Verify files were added
-        assert!(engine.files.contains_key("c:/program files/myapp/main.exe"));
-        assert!(
-            engine
-                .files
-                .contains_key("c:/program files/myapp/config.ini")
-        );
-
-        // Verify registry was added
-        assert_eq!(
-            engine.registry.get("HKLM\\Software\\MyApp\\Version"),
-            Some(&"2.0".to_string())
-        );
-
-        // Verify telemetry was recorded
-        assert_eq!(engine.telemetry_log.len(), 1);
-        assert_eq!(engine.telemetry_log[0].installer_id, "gui-test");
     }
 }

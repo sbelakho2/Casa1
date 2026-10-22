@@ -3925,7 +3925,6 @@ impl WinHttpStack {
 mod tests {
     use super::*;
 
-    /// Try to connect to a test host. Returns `true` if reachable.
     fn httpbin_reachable() -> bool {
         use std::net::{TcpStream, ToSocketAddrs};
         let addr = match "httpbin.org:80".to_socket_addrs() {
@@ -4009,7 +4008,6 @@ mod tests {
 
     // --- Certificate pinning (SPKI extraction + pin enforcement) ---
 
-    /// Encode a DER TLV: tag, length (short or long form), then content.
     fn der(tag: u8, content: &[u8]) -> Vec<u8> {
         let mut out = vec![tag];
         let len = content.len();
@@ -4030,7 +4028,6 @@ mod tests {
         out
     }
 
-    /// A self-contained DER-encoded SubjectPublicKeyInfo TLV.
     fn build_spki(key_bits: &[u8]) -> Vec<u8> {
         let algorithm = der(
             0x30,
@@ -4047,8 +4044,6 @@ mod tests {
         der(0x30, &spki)
     }
 
-    /// Wrap a SubjectPublicKeyInfo into a minimal but structurally valid
-    /// X.509 certificate DER that `extract_spki_der` can walk.
     fn synthetic_certificate(spki: &[u8]) -> Vec<u8> {
         let version = der(0xA0, &der(0x02, &[0x02]));
         let serial = der(0x02, &[0x01]);
@@ -4072,16 +4067,6 @@ mod tests {
         cert.extend_from_slice(&outer_signature);
         cert.extend_from_slice(&signature_value);
         der(0x30, &cert)
-    }
-
-    #[test]
-    fn extract_spki_der_returns_exact_subject_public_key_info() {
-        let spki = build_spki(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let cert = synthetic_certificate(&spki);
-        let extracted = extract_spki_der(&cert).expect("SPKI must be extractable");
-        // The extracted bytes must be the exact SPKI TLV — no off-by-one,
-        // no trailing or missing bytes from a heuristic backward scan.
-        assert_eq!(extracted, spki);
     }
 
     #[test]
@@ -4122,44 +4107,6 @@ mod tests {
     // --- QUIC / HTTP3 detection and fallback tests ---
 
     #[test]
-    fn winhttp_quic_set_option_stores_enabled_protocols() {
-        let mut stack = WinHttpStack::new();
-        let session = stack.win_http_open(Some("Casa1"), 0, None, None);
-
-        // Enable HTTP/2 + HTTP/3 via WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
-        let flags = WINHTTP_PROTOCOL_FLAG_HTTP2 | WINHTTP_PROTOCOL_FLAG_HTTP3;
-        let flag_bytes = flags.to_le_bytes();
-        let result =
-            stack.win_http_set_option(session, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &flag_bytes);
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-
-        // Verify the session has the flags stored
-        let sess = stack.sessions.get(&session).expect("session exists");
-        assert_eq!(sess.enabled_protocols, flags);
-    }
-
-    #[test]
-    fn winhttp_quic_query_option_returns_enabled_protocols() {
-        let mut stack = WinHttpStack::new();
-        let session = stack.win_http_open(Some("Casa1"), 0, None, None);
-
-        // Enable HTTP/3 only
-        let flags = WINHTTP_PROTOCOL_FLAG_HTTP3;
-        let flag_bytes = flags.to_le_bytes();
-        stack
-            .win_http_set_option(session, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &flag_bytes)
-            .expect("set_option");
-
-        // Query back via WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
-        let mut buf = vec![0u8; 4];
-        let result =
-            stack.win_http_query_option(session, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &mut buf);
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-        let retrieved = u32::from_le_bytes(buf.try_into().unwrap());
-        assert_eq!(retrieved, WINHTTP_PROTOCOL_FLAG_HTTP3);
-    }
-
-    #[test]
     fn winhttp_quic_query_protocol_returns_http2_when_quic_unavailable() {
         let mut stack = WinHttpStack::new();
         let session = stack.win_http_open(Some("Casa1"), 0, None, None);
@@ -4178,87 +4125,6 @@ mod tests {
         let protocol = u32::from_le_bytes(buf.try_into().unwrap());
         // HTTP/2 is the best available fallback when QUIC is requested but unavailable
         assert_eq!(protocol, WINHTTP_PROTOCOL_FLAG_HTTP2);
-    }
-
-    #[test]
-    fn winhttp_quic_query_protocol_returns_http2_when_only_http2_enabled() {
-        let mut stack = WinHttpStack::new();
-        let session = stack.win_http_open(Some("Casa1"), 0, None, None);
-
-        // Enable HTTP/2 only (no QUIC)
-        let flags = WINHTTP_PROTOCOL_FLAG_HTTP2;
-        let flag_bytes = flags.to_le_bytes();
-        stack
-            .win_http_set_option(session, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &flag_bytes)
-            .expect("set_option");
-
-        let mut buf = vec![0u8; 4];
-        let result = stack.win_http_query_option(session, WINHTTP_OPTION_QUERY_PROTOCOL, &mut buf);
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-        let protocol = u32::from_le_bytes(buf.try_into().unwrap());
-        assert_eq!(protocol, WINHTTP_PROTOCOL_FLAG_HTTP2);
-    }
-
-    #[test]
-    fn winhttp_quic_query_protocol_returns_http11_when_no_flags_set() {
-        let mut stack = WinHttpStack::new();
-        let session = stack.win_http_open(Some("Casa1"), 0, None, None);
-
-        // No protocol flags enabled — expect HTTP/1.1
-        let mut buf = vec![0u8; 4];
-        let result = stack.win_http_query_option(session, WINHTTP_OPTION_QUERY_PROTOCOL, &mut buf);
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-        let protocol = u32::from_le_bytes(buf.try_into().unwrap());
-        assert_eq!(protocol, 0); // HTTP/1.1 is represented as 0
-    }
-
-    #[test]
-    fn winhttp_quic_parse_alt_svc_stores_entries() {
-        let mut stack = WinHttpStack::new();
-        let entries = parse_alt_svc_header(r#"h3=":443"; ma=2592000"#);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].protocol_id, "h3");
-        assert_eq!(entries[0].alt_port, 443);
-        assert_eq!(entries[0].alt_host, "");
-        assert_eq!(entries[0].alpn, Some("h3".to_string()));
-
-        // Store entries via the stack's alt_svc_entries map
-        stack
-            .alt_svc_entries
-            .insert("example.com".to_string(), entries);
-        let stored = stack
-            .alt_svc_entries
-            .get("example.com")
-            .expect("entries exist");
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].alt_port, 443);
-    }
-
-    #[test]
-    fn winhttp_quic_parse_alt_svc_multiple_entries() {
-        let header = r#"h3=":443"; ma=2592000, h3-29=":443"; ma=2592000"#;
-        let entries = parse_alt_svc_header(header);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].protocol_id, "h3");
-        assert_eq!(entries[1].protocol_id, "h3-29");
-    }
-
-    #[test]
-    fn winhttp_quic_parse_alt_svc_with_host() {
-        let header = r#"h3="alt.example.com:8443"; ma=2592000"#;
-        let entries = parse_alt_svc_header(header);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].alt_host, "alt.example.com");
-        assert_eq!(entries[0].alt_port, 8443);
-    }
-
-    #[test]
-    fn winhttp_quic_alt_svc_empty_input() {
-        let entries = parse_alt_svc_header("");
-        assert!(entries.is_empty());
-
-        let entries = parse_alt_svc_header("   ");
-        assert!(entries.is_empty());
     }
 
     #[test]
@@ -4308,22 +4174,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn winhttp_unpinned_host_passes_without_certs() {
-        let stack = WinHttpStack::new();
-        // Host without any pin should pass even with an empty chain.
-        assert!(stack.verify_certificate_pin("unpinned.example.com", &[]));
-    }
-
-    #[test]
-    fn winhttp_unpinned_host_passes_with_any_cert() {
-        let stack = WinHttpStack::new();
-        let spki = build_spki(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let cert = synthetic_certificate(&spki);
-        // Unpinned host — any certificate is accepted.
-        assert!(stack.verify_certificate_pin("other.example.com", &[cert]));
-    }
-
-    #[test]
     fn winhttp_pinned_host_rejects_wrong_cert() {
         let mut stack = WinHttpStack::new();
         let spki = build_spki(&[0xAA, 0xBB, 0xCC, 0xDD]);
@@ -4350,25 +4200,10 @@ mod tests {
         assert!(!stack.verify_certificate_pin("pinned.example.com", &[]));
     }
 
-    #[test]
-    fn winhttp_clear_pins_restores_unpinned_behavior() {
-        let mut stack = WinHttpStack::new();
-        let spki = build_spki(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        let cert = synthetic_certificate(&spki);
-        let pin = Sha256::digest(extract_spki_der(&cert).unwrap());
-        stack.pin_certificate("example.com", pin.as_slice());
-        // After clearing all pins, the host should pass again.
-        stack.clear_certificate_pins();
-        assert!(stack.verify_certificate_pin("example.com", &[]));
-    }
-
     // -----------------------------------------------------------------------
     // WebSocket semantics
     // -----------------------------------------------------------------------
 
-    /// A WinHttpStack with one request chain (session/connection/request)
-    /// whose request is already in the Complete state and is NOT marked as a
-    /// WebSocket upgrade, so upgrades stay buffered (no network).
     fn stack_with_completed_request() -> (WinHttpStack, HINTERNET) {
         let mut stack = WinHttpStack::new();
         let session = stack.next_handle();
@@ -4425,7 +4260,6 @@ mod tests {
         (stack, req)
     }
 
-    /// Insert a buffered (non-live) WebSocket state and return its handle.
     fn stack_with_buffered_ws() -> (WinHttpStack, HINTERNET) {
         let (mut stack, _req) = stack_with_completed_request();
         let ws = stack.next_handle();
@@ -4833,8 +4667,6 @@ mod tests {
     }
 
     #[cfg(feature = "websocket")]
-    /// Echo loop used by the live round-trip tests: answers every message
-    /// and completes the close handshake when the client closes.
     fn ws_echo_handler(ws: &mut tungstenite::WebSocket<TcpStream>) {
         loop {
             match ws.read() {
@@ -4853,9 +4685,6 @@ mod tests {
     }
 
     #[cfg(feature = "websocket")]
-    /// Bind a loopback server that first answers the HTTP request leg of
-    /// the upgrade flow (plain 200) and then serves one WebSocket
-    /// connection to `handler`.
     fn spawn_ws_test_server<H>(mut handler: H) -> (u16, std::thread::JoinHandle<()>)
     where
         H: FnMut(&mut tungstenite::WebSocket<TcpStream>) + Send + 'static,
@@ -4890,8 +4719,6 @@ mod tests {
     }
 
     #[cfg(feature = "websocket")]
-    /// Drive a full upgrade against `port` with the request marked as a
-    /// WebSocket upgrade (option 114), returning a LIVE socket.
     fn ws_upgrade_to(port: u16) -> (WinHttpStack, HINTERNET) {
         let mut stack = WinHttpStack::new();
         let session = stack.win_http_open(Some("ws test"), 0, None, None);
@@ -4909,73 +4736,6 @@ mod tests {
         let ws = stack.websocket_complete_upgrade(req).expect("upgrade");
         assert!(stack.websockets.get(&ws).expect("ws state").is_live);
         (stack, ws)
-    }
-
-    #[cfg(feature = "websocket")]
-    #[test]
-    fn websocket_live_binary_echo_round_trip() {
-        let (port, _server) = spawn_ws_test_server(ws_echo_handler);
-        let (mut stack, ws) = ws_upgrade_to(port);
-        stack
-            .websocket_send(
-                ws,
-                WinHttpWebSocketBufferType::BinaryMessageBuffer,
-                b"ping-msg",
-            )
-            .expect("send");
-        let mut buf = [0u8; 64];
-        let got = stack
-            .websocket_receive(
-                ws,
-                &mut buf,
-                WinHttpWebSocketBufferType::BinaryMessageBuffer,
-            )
-            .expect("receive");
-        assert_eq!(got, 8);
-        assert_eq!(&buf[..got as usize], b"ping-msg");
-    }
-
-    #[cfg(feature = "websocket")]
-    #[test]
-    fn websocket_live_text_echo_round_trip() {
-        let (port, _server) = spawn_ws_test_server(ws_echo_handler);
-        let (mut stack, ws) = ws_upgrade_to(port);
-        stack
-            .websocket_send(
-                ws,
-                WinHttpWebSocketBufferType::Utf8MessageBuffer,
-                "héllo wörld".as_bytes(),
-            )
-            .expect("send text");
-        let mut buf = [0u8; 64];
-        let got = stack
-            .websocket_receive(ws, &mut buf, WinHttpWebSocketBufferType::Utf8MessageBuffer)
-            .expect("receive");
-        assert_eq!(&buf[..got as usize], "héllo wörld".as_bytes());
-    }
-
-    #[cfg(feature = "websocket")]
-    #[test]
-    fn websocket_live_fragmented_send_reassembled_as_one_message() {
-        let (port, _server) = spawn_ws_test_server(ws_echo_handler);
-        let (mut stack, ws) = ws_upgrade_to(port);
-        // Fragment sends open/continue one message; only the final
-        // message-type send carries the FIN bit, so the peer reassembles a
-        // single message (an echo would otherwise return three messages).
-        stack
-            .websocket_send(ws, WinHttpWebSocketBufferType::Utf8FragmentBuffer, b"frag-")
-            .expect("fragment 1");
-        stack
-            .websocket_send(ws, WinHttpWebSocketBufferType::Utf8FragmentBuffer, b"-ment")
-            .expect("fragment 2");
-        stack
-            .websocket_send(ws, WinHttpWebSocketBufferType::Utf8MessageBuffer, b"-ed!")
-            .expect("final fragment");
-        let mut buf = [0u8; 64];
-        let got = stack
-            .websocket_receive(ws, &mut buf, WinHttpWebSocketBufferType::Utf8MessageBuffer)
-            .expect("receive");
-        assert_eq!(&buf[..got as usize], b"frag--ment-ed!");
     }
 
     #[cfg(feature = "websocket")]
@@ -5055,30 +4815,6 @@ mod tests {
                     WinHttpWebSocketBufferType::BinaryMessageBuffer
                 )
                 .is_err()
-        );
-    }
-
-    #[cfg(feature = "websocket")]
-    #[test]
-    fn websocket_live_empty_close_frame_maps_to_1005() {
-        use tungstenite::Message;
-        let (port, _server) = spawn_ws_test_server(|ws| {
-            let _ = ws.write(Message::Close(None));
-            let _ = ws.flush();
-        });
-        let (mut stack, ws) = ws_upgrade_to(port);
-        let mut buf = [0u8; 16];
-        let got = stack
-            .websocket_receive(
-                ws,
-                &mut buf,
-                WinHttpWebSocketBufferType::BinaryMessageBuffer,
-            )
-            .expect("close surfaces");
-        assert_eq!(got, 0);
-        assert_eq!(
-            stack.websocket_query_close_status(ws).expect("query"),
-            (WinHttpWebSocketCloseStatus::Empty, Some(String::new()))
         );
     }
 

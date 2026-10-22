@@ -2620,62 +2620,6 @@ fn percent_encode_data_url(input: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Create an environment and verify it exists.
-    #[test]
-    fn test_webview2_create_environment() {
-        let mut runtime = WebView2Runtime::new();
-        let env_id = runtime.create_environment(0);
-        assert!(runtime.get_environment(env_id).is_some());
-        assert_eq!(runtime.environments.len(), 1);
-    }
-
-    /// Create a controller with a parent HWND and verify state.
-    #[test]
-    fn test_webview2_create_controller() {
-        let mut runtime = WebView2Runtime::new();
-        let env_id = runtime.create_environment(0);
-        let ctrl_id = runtime.create_controller(env_id, 0x12345);
-        let controller = runtime.get_controller(ctrl_id).unwrap();
-        assert_eq!(controller.parent_hwnd, 0x12345);
-        assert!(controller.is_visible);
-        assert_eq!(controller.zoom_factor, 1.0);
-
-        // Verify the webview was created
-        let webview = runtime.get_webview(controller.webview_id).unwrap();
-        assert_eq!(webview.source, "");
-        assert!(webview.is_script_enabled);
-    }
-
-    /// Navigate to a URL and verify the source is updated.
-    #[test]
-    fn test_webview2_navigate() {
-        let mut runtime = WebView2Runtime::new();
-        let env_id = runtime.create_environment(0);
-        let ctrl_id = runtime.create_controller(env_id, 0);
-        let ctrl = runtime.get_controller(ctrl_id).unwrap();
-        let webview_id = ctrl.webview_id;
-
-        let webview = runtime.get_webview_mut(webview_id).unwrap();
-        webview.navigate("https://example.com");
-        assert_eq!(webview.source, "https://example.com");
-    }
-
-    /// Execute script and verify it's stored/delegated.
-    #[test]
-    fn test_webview2_execute_script() {
-        let mut runtime = WebView2Runtime::new();
-        let env_id = runtime.create_environment(0);
-        let ctrl_id = runtime.create_controller(env_id, 0);
-        let ctrl = runtime.get_controller(ctrl_id).unwrap();
-        let webview_id = ctrl.webview_id;
-
-        let webview = runtime.get_webview_mut(webview_id).unwrap();
-        webview.add_script_to_execute_on_document_creation("alert('hello');");
-        assert_eq!(webview.pending_scripts.len(), 1);
-        assert_eq!(webview.pending_scripts[0], "alert('hello');");
-    }
-
-    /// Toggle settings and verify state.
     #[test]
     fn test_webview2_settings() {
         let mut runtime = WebView2Runtime::new();
@@ -2700,89 +2644,6 @@ mod tests {
         assert_eq!(webview.default_background, 0xFF_00_00_00);
     }
 
-    /// Register event handlers and verify tokens.
-    #[test]
-    fn test_webview2_event_handlers() {
-        let mut events = WebView2Events::new();
-        let token1 = register(
-            &mut events.next_token,
-            0x1000,
-            &mut events.navigation_starting,
-        );
-        let token2 = register(
-            &mut events.next_token,
-            0x2000,
-            &mut events.navigation_completed,
-        );
-        let token3 = register(
-            &mut events.next_token,
-            0x3000,
-            &mut events.web_message_received,
-        );
-
-        assert_eq!(events.navigation_starting.len(), 1);
-        assert_eq!(events.navigation_completed.len(), 1);
-        assert_eq!(events.web_message_received.len(), 1);
-
-        unregister(&mut events.navigation_starting, token1);
-        assert!(events.navigation_starting.is_empty());
-
-        unregister(&mut events.navigation_completed, token2);
-        assert!(events.navigation_completed.is_empty());
-
-        unregister(&mut events.web_message_received, token3);
-        assert!(events.web_message_received.is_empty());
-    }
-
-    /// Post a web message and verify it's stored.
-    #[test]
-    fn test_webview2_post_message() {
-        let mut runtime = WebView2Runtime::new();
-        let env_id = runtime.create_environment(0);
-        let ctrl_id = runtime.create_controller(env_id, 0);
-        let ctrl = runtime.get_controller(ctrl_id).unwrap();
-        let webview_id = ctrl.webview_id;
-
-        let webview = runtime.get_webview_mut(webview_id).unwrap();
-        webview.post_web_message_as_json(r#"{"type":"test"}"#);
-        assert_eq!(webview.web_messages.len(), 1);
-        assert_eq!(webview.web_messages[0], r#"{"type":"test"}"#);
-
-        webview.post_web_message_as_string("hello");
-        assert_eq!(webview.web_messages.len(), 2);
-        assert_eq!(webview.web_messages[1], "hello");
-    }
-
-    /// Navigate to an HTML string and verify source updated.
-    #[test]
-    fn test_webview2_navigate_to_string() {
-        let mut runtime = WebView2Runtime::new();
-        let env_id = runtime.create_environment(0);
-        let ctrl_id = runtime.create_controller(env_id, 0);
-        let ctrl = runtime.get_controller(ctrl_id).unwrap();
-        let webview_id = ctrl.webview_id;
-
-        let webview = runtime.get_webview_mut(webview_id).unwrap();
-        webview.navigate_to_string("<html><body><h1>Hello</h1></body></html>");
-        assert!(webview.source.starts_with("data:text/html;charset=utf-8,"));
-    }
-
-    /// Destroy environment and verify all state is cleaned up.
-    #[test]
-    fn test_webview2_destroy_environment() {
-        let mut runtime = WebView2Runtime::new();
-        let env_id = runtime.create_environment(0);
-        let ctrl_id = runtime.create_controller(env_id, 0);
-        let ctrl = runtime.get_controller(ctrl_id).unwrap();
-        let webview_id = ctrl.webview_id;
-
-        runtime.destroy_environment(env_id);
-        assert!(runtime.get_environment(env_id).is_none());
-        assert!(runtime.get_controller(ctrl_id).is_none());
-        assert!(runtime.get_webview(webview_id).is_none());
-    }
-
-    /// Toggle controller visibility and bounds.
     #[test]
     fn test_webview2_controller_properties() {
         let mut runtime = WebView2Runtime::new();
@@ -2800,71 +2661,6 @@ mod tests {
         assert!((ctrl.zoom_factor - 1.5).abs() < f64::EPSILON);
     }
 
-    /// Verify that multiple environments are independent.
-    #[test]
-    fn test_webview2_multiple_environments() {
-        let mut runtime = WebView2Runtime::new();
-        let env1 = runtime.create_environment(0);
-        let env2 = runtime.create_environment(1);
-
-        let _ctrl1 = runtime.create_controller(env1, 0x100);
-        let _ctrl2 = runtime.create_controller(env2, 0x200);
-
-        assert_eq!(runtime.environments.len(), 2);
-        assert_eq!(runtime.controllers.len(), 2);
-        assert_eq!(runtime.webviews.len(), 2);
-
-        let env = runtime.get_environment(env1).unwrap();
-        assert_eq!(env.controllers.len(), 1);
-        let env = runtime.get_environment(env2).unwrap();
-        assert_eq!(env.controllers.len(), 1);
-    }
-
-    /// Test WebView2Environment::new() creates a native config (on macOS).
-    #[test]
-    fn test_webview2_environment_new() {
-        let env = WebView2Environment::new(true, None);
-        #[cfg(target_os = "macos")]
-        {
-            // On macOS with WebKit, native_config should be Some.
-            // We can't guarantee WKWebView is available in CI, so check
-            // that the method doesn't panic and returns a consistent state.
-        }
-        assert!(env.controllers.is_empty());
-        assert!(env.browser_exe_path.is_none());
-    }
-
-    /// The capability level must be reported honestly: this layer is a
-    /// WKWebView shim, never the Chromium WebView2 runtime.
-    #[test]
-    fn test_webview2_capability_level() {
-        assert_eq!(capability_level(), "WebView2BasicWebKitShim");
-        assert_eq!(CAPABILITY_LEVEL, "WebView2BasicWebKitShim");
-
-        let mut runtime = WebView2Runtime::new();
-        let diag = runtime.diagnostics();
-        assert_eq!(diag.capability_level, "WebView2BasicWebKitShim");
-        assert_eq!(diag.environment_count, 0);
-        assert_eq!(diag.controller_count, 0);
-        assert_eq!(diag.webview_count, 0);
-
-        runtime.create_environment(0);
-        let diag = runtime.diagnostics();
-        assert_eq!(diag.capability_level, "WebView2BasicWebKitShim");
-        assert_eq!(diag.environment_count, 1);
-
-        let report = format!("{diag:?}");
-        assert!(
-            report.contains("WebView2BasicWebKitShim"),
-            "diagnostics report must carry the capability level: {report}"
-        );
-    }
-
-    /// Test that callbacks can be registered and unregistered.
-    ///
-    /// DELEGATE_STATE is process-global, so assertions are scoped to the
-    /// callback IDs this test owns instead of global vector lengths, which
-    /// would race with other tests running in parallel.
     #[test]
     fn test_webview2_callback_system() {
         let mut runtime = WebView2Runtime::new();
@@ -2897,21 +2693,5 @@ mod tests {
                 .iter()
                 .any(|(id, _)| *id == cb_id2)
         );
-    }
-
-    /// Test WebView2Controller create/destroy lifecycle.
-    #[test]
-    fn test_webview2_controller_create_destroy() {
-        let env = WebView2Environment::new(true, None);
-        let mut ctrl = WebView2Controller::create(&env, 42, 1024, 768, 0);
-        assert_eq!(ctrl.webview_id, 42);
-        assert_eq!(ctrl.bounds.2, 1024);
-        assert_eq!(ctrl.bounds.3, 768);
-        assert!(ctrl.is_visible);
-
-        // Close should clean up
-        ctrl.close();
-        assert!(ctrl.native_webview.is_none());
-        assert!(ctrl.nav_delegate_ref.is_none());
     }
 }

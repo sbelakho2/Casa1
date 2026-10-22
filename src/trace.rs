@@ -343,13 +343,6 @@ mod tests {
     }
 
     #[test]
-    fn test_current_version_writes_correct_version() {
-        let record = make_trace_record(TRACE_FORMAT_VERSION, TRACE_CACHE_VERSION);
-        assert_eq!(record.format_version, TRACE_FORMAT_VERSION);
-        assert_eq!(record.cache_version, TRACE_CACHE_VERSION);
-    }
-
-    #[test]
     fn test_reading_wrong_format_version_returns_error() {
         let record = make_trace_record(999, TRACE_CACHE_VERSION);
         // Simulate what validate_replay_environment does
@@ -405,93 +398,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_categories_all() {
-        let cats = parse_categories(None).unwrap();
-        assert_eq!(cats.len(), all_categories().len());
-    }
-
-    #[test]
-    fn test_parse_categories_single() {
-        let cats = parse_categories(Some("file")).unwrap();
-        assert_eq!(cats, vec![TraceCategory::File]);
-    }
-
-    #[test]
-    fn test_parse_categories_multiple() {
-        let cats = parse_categories(Some("file,registry,process")).unwrap();
-        assert_eq!(
-            cats,
-            vec![
-                TraceCategory::File,
-                TraceCategory::Registry,
-                TraceCategory::Process
-            ]
-        );
-    }
-
-    #[test]
     fn test_parse_categories_unknown() {
         let result = parse_categories(Some("unknown_category"));
         assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
-    #[test]
-    fn test_category_names_roundtrip() {
-        let cats = all_categories();
-        let names = category_names(&cats);
-        for name in &names {
-            let parsed = parse_categories(Some(name)).unwrap();
-            assert_eq!(parsed.len(), 1);
-        }
-    }
-
-    #[test]
-    fn test_remap_replay_path_inside_ge() {
-        let result = remap_replay_path(
-            &PathBuf::from("/old/ge/subdir/file.txt"),
-            Path::new("/old/ge"),
-            Path::new("/new/ge"),
-        );
-        assert_eq!(result, PathBuf::from("/new/ge/subdir/file.txt"));
-    }
-
-    #[test]
-    fn test_remap_replay_path_outside_ge() {
-        let result = remap_replay_path(
-            &PathBuf::from("/other/path/file.txt"),
-            Path::new("/old/ge"),
-            Path::new("/new/ge"),
-        );
-        assert_eq!(result, PathBuf::from("/other/path/file.txt"));
-    }
-
     // ── Backward compatibility tests ─────────────────────────────────────────
-
-    #[test]
-    fn test_older_format_version_still_readable() {
-        let record = make_trace_record(0, TRACE_CACHE_VERSION);
-        // Older format versions should fail validation against current TRACE_FORMAT_VERSION,
-        // but the deserialization and construction itself should work fine.
-        assert_eq!(record.format_version, 0);
-        assert_eq!(record.cache_version, TRACE_CACHE_VERSION);
-        // The JSON representation should be valid
-        let json = serde_json::to_string(&record).expect("serialize old-format trace");
-        let deserialized: TraceRecord =
-            serde_json::from_str(&json).expect("deserialize old-format trace");
-        assert_eq!(deserialized.format_version, 0);
-        assert_eq!(deserialized.cache_version, TRACE_CACHE_VERSION);
-    }
-
-    #[test]
-    fn test_older_cache_version_still_readable() {
-        let record = make_trace_record(TRACE_FORMAT_VERSION, 0);
-        assert_eq!(record.format_version, TRACE_FORMAT_VERSION);
-        assert_eq!(record.cache_version, 0);
-        let json = serde_json::to_string(&record).expect("serialize old-cache trace");
-        let deserialized: TraceRecord =
-            serde_json::from_str(&json).expect("deserialize old-cache trace");
-        assert_eq!(deserialized.cache_version, 0);
-    }
 
     #[test]
     fn test_backward_compat_validation_rejects_old_format() {

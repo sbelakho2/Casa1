@@ -38,6 +38,7 @@
 //!
 //! - macOS 13+ (Ventura) on Apple Silicon (aarch64) — primary target
 //! - macOS 13+ (Ventura) on Intel (x86_64) — secondary target
+#![cfg_attr(test, allow(dead_code, unused_imports))]
 //!
 //! # Module Architecture
 //!

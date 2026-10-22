@@ -1,0 +1,4 @@
+evidence_binds_to_compiled_test_manifest
+execute_sqrtpacked_computes_square_root
+is_headless_returns_bool
+reference_executable_on_non_windows_reports_diffs

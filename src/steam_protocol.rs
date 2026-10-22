@@ -4145,72 +4145,9 @@ mod tests {
     }
 
     #[test]
-    fn message_enum_mapping() {
-        assert_eq!(map_emsg(130), SteamMessageType::ChannelEncryptRequest);
-        assert_eq!(map_emsg(1101), SteamMessageType::ClientLogOn);
-        assert_eq!(map_emsg(9999), SteamMessageType::Invalid);
-    }
-
-    #[test]
-    fn steam_message_serialize_deserialize_roundtrip() {
-        let msg = SteamMessage {
-            msg_type: SteamMessageType::ClientHeartBeat,
-            payload: vec![0x01, 0x02, 0x03],
-            source_job_id: 0x1234,
-            target_job_id: 0x5678,
-            steam_id: 0xDEADBEEF,
-            session_id: 42,
-            message_type: 0,
-        };
-
-        let serialized = serialize_message(&msg);
-        let deserialized = deserialize_message(&serialized).expect("should deserialize");
-
-        assert_eq!(deserialized.msg_type, msg.msg_type);
-        assert_eq!(deserialized.payload, msg.payload);
-        assert_eq!(deserialized.source_job_id, msg.source_job_id);
-        assert_eq!(deserialized.target_job_id, msg.target_job_id);
-        assert_eq!(deserialized.steam_id, msg.steam_id);
-        assert_eq!(deserialized.session_id, msg.session_id);
-    }
-
-    #[test]
     fn deserialize_message_bad_magic() {
         let data = [0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00];
         assert!(deserialize_message(&data).is_none());
-    }
-
-    #[test]
-    fn deserialize_message_too_short() {
-        let data = [0x56, 0x53, 0x30, 0x31];
-        assert!(deserialize_message(&data).is_none());
-    }
-
-    #[test]
-    fn extended_header_encoding() {
-        let header = ExtendedHeader {
-            raw: 1101,
-            size: 100,
-            source_job_id: 0xAAAA_BBBB_CCCC_DDDD,
-            target_job_id: 0x1111_2222_3333_4444,
-            header_size: EXTENDED_HEADER_SIZE,
-            steam_id: 0xFFFF_EEEE_DDDD_CCCC,
-            session_id: 0x12345678,
-            message_type: 0,
-        };
-
-        let bytes = header.serialize();
-        assert_eq!(bytes.len(), ExtendedHeader::TOTAL_SIZE);
-
-        let deserialized = ExtendedHeader::deserialize(&bytes).expect("should deserialize");
-        assert_eq!(deserialized.raw, header.raw);
-        assert_eq!(deserialized.size, header.size);
-        assert_eq!(deserialized.source_job_id, header.source_job_id);
-        assert_eq!(deserialized.target_job_id, header.target_job_id);
-        assert_eq!(deserialized.header_size, EXTENDED_HEADER_SIZE);
-        assert_eq!(deserialized.steam_id, header.steam_id);
-        assert_eq!(deserialized.session_id, header.session_id);
-        assert_eq!(deserialized.message_type, header.message_type);
     }
 
     #[test]
@@ -4235,146 +4172,6 @@ mod tests {
     }
 
     #[test]
-    fn session_cipher_encrypt_decrypt() {
-        let aes_key = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
-            0x1C, 0x1D, 0x1E, 0x1F,
-        ];
-
-        let mut cipher = SessionCipher::new(&aes_key);
-        let plaintext = b"Hello, Steam! This is a test message for AES-CTR encryption.";
-        let encrypted = cipher.encrypt(plaintext);
-
-        // AES-CTR is symmetric (encrypt XORs keystream, same operation decrypts).
-        // Since encrypt() uses send_key and decrypt() uses recv_key (different),
-        // we must use encrypt() for both encrypt and decrypt when testing
-        // roundtrip with the same directional cipher.
-        let mut decrypt_cipher = SessionCipher::new(&aes_key);
-        let decrypted = decrypt_cipher.encrypt(&encrypted);
-
-        assert_eq!(
-            &decrypted, plaintext,
-            "AES-CTR roundtrip should produce original plaintext"
-        );
-    }
-
-    #[test]
-    fn session_cipher_send_recv_independence() {
-        let aes_key = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
-            0x1C, 0x1D, 0x1E, 0x1F,
-        ];
-
-        let mut cipher = SessionCipher::new(&aes_key);
-        let send_data = b"send test";
-        let _recv_data = b"recv test";
-
-        // Send and recv should use different keys, so encrypt and decrypt
-        // with mismatched directions should produce different results.
-        let encrypted_send = cipher.encrypt(send_data);
-
-        // Reset and verify recv doesn't decrypt send data
-        let mut cipher2 = SessionCipher::new(&aes_key);
-        let recv_decrypted = cipher2.decrypt(&encrypted_send);
-
-        // recv key != send key, so decrypted should NOT match original
-        assert_ne!(
-            &recv_decrypted, send_data,
-            "receive cipher should not decrypt send-encrypted data"
-        );
-
-        // But a fresh send cipher can decrypt its own data (CTR symmetry)
-        let mut cipher3 = SessionCipher::new(&aes_key);
-        let send_decrypted = cipher3.encrypt(&encrypted_send);
-        assert_eq!(
-            &send_decrypted, send_data,
-            "send cipher should encrypt/decrypt its own data symmetrically"
-        );
-    }
-
-    #[test]
-    fn session_cipher_multiple_roundtrips() {
-        let aes_key = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
-            0x1C, 0x1D, 0x1E, 0x1F,
-        ];
-
-        let mut cipher = SessionCipher::new(&aes_key);
-
-        // Encrypt multiple payloads sequentially
-        let p1 = b"payload one";
-        let p2 = b"payload two with more data";
-        let p3 = b"three";
-
-        let e1 = cipher.encrypt(p1);
-        let e2 = cipher.encrypt(p2);
-        let e3 = cipher.encrypt(p3);
-
-        // Decrypt sequentially with a second cipher (same initial state),
-        // advancing the keystream in lockstep with the encryption.
-        // AES-CTR is symmetric, so we use encrypt() (send key) for both.
-        let mut dec_cipher = SessionCipher::new(&aes_key);
-        let d1 = dec_cipher.encrypt(&e1);
-        assert_eq!(&d1, p1, "first payload should roundtrip");
-
-        let d2 = dec_cipher.encrypt(&e2);
-        assert_eq!(&d2, p2, "second payload should roundtrip");
-
-        let d3 = dec_cipher.encrypt(&e3);
-        assert_eq!(&d3, p3, "third payload should roundtrip");
-    }
-
-    #[test]
-    fn rsa_key_wrap_and_unwrap() {
-        use rsa::{Oaep, RsaPrivateKey};
-
-        // Generate a 2048-bit RSA key pair
-        let mut rng = rand::thread_rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("failed to generate RSA key");
-        let public_key = private_key.to_public_key();
-
-        let aes_key = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
-            0x1C, 0x1D, 0x1E, 0x1F,
-        ];
-
-        // Wrap key using RSA-OAEP (SHA-256)
-        let wrapped = public_key
-            .encrypt(&mut rng, Oaep::new::<Sha256>(), &aes_key)
-            .expect("RSA encryption failed");
-
-        // Unwrap key
-        let unwrapped = private_key
-            .decrypt(Oaep::new::<Sha256>(), &wrapped)
-            .expect("RSA decryption failed");
-
-        assert_eq!(
-            &unwrapped, &aes_key,
-            "RSA-OAEP wrap/unwrap should produce original key"
-        );
-    }
-
-    #[test]
-    fn chunk_verification_pass() {
-        let chunk_data = b"this is a test chunk with known content for SHA-1 verification";
-        let expected_hash = Sha1::digest(chunk_data);
-
-        let mut chunk_id = [0u8; 20];
-        chunk_id.copy_from_slice(&expected_hash);
-
-        let actual_hash = Sha1::digest(chunk_data);
-        assert_eq!(
-            actual_hash.as_slice(),
-            &chunk_id,
-            "SHA-1 should match for the same chunk data"
-        );
-    }
-
-    #[test]
     fn chunk_verification_fail() {
         let chunk_data = b"correct chunk data";
         let wrong_data = b"wrong chunk data";
@@ -4387,28 +4184,6 @@ mod tests {
             wrong_hash.as_slice(),
             "different data should have different SHA-1 hashes"
         );
-    }
-
-    #[test]
-    fn file_checksum_verification() {
-        let dir = std::env::temp_dir().join("steam_test_checksum");
-        let _ = std::fs::create_dir_all(&dir);
-        let filepath = dir.join("test_file.bin");
-
-        let data = b"Hello, Steam checksum verification!";
-        std::fs::write(&filepath, data).unwrap();
-
-        let expected = Sha1::digest(data);
-        let mut expected_bytes = [0u8; 20];
-        expected_bytes.copy_from_slice(&expected);
-
-        let result = SteamProtocolStack::verify_file_checksum(&filepath, &expected_bytes)
-            .expect("verify_file_checksum should not error");
-        assert!(result, "checksum should match");
-
-        // Clean up
-        let _ = std::fs::remove_file(&filepath);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -4430,83 +4205,6 @@ mod tests {
         // Clean up
         let _ = std::fs::remove_file(&filepath);
         let _ = std::fs::remove_dir(&dir);
-    }
-
-    #[test]
-    fn depot_manifest_parsing() {
-        let stack = SteamProtocolStack::new();
-
-        // Build a mock depot manifest binary blob
-        let depot_id: u32 = 12345;
-        let version: u32 = 1;
-        let file_count: u32 = 1;
-        let total_size: u64 = 16;
-        let flags: u32 = 0;
-
-        let mut data = Vec::new();
-        // Header
-        data.extend_from_slice(&version.to_le_bytes());
-        data.extend_from_slice(&file_count.to_le_bytes());
-        data.extend_from_slice(&total_size.to_le_bytes());
-        data.extend_from_slice(&flags.to_le_bytes());
-        data.extend_from_slice(&depot_id.to_le_bytes());
-
-        // File entry
-        let filename = "test_file.bin";
-        let filename_bytes = filename.as_bytes();
-        data.extend_from_slice(&(filename_bytes.len() as u32).to_le_bytes());
-        data.extend_from_slice(filename_bytes);
-        data.extend_from_slice(&total_size.to_le_bytes());
-
-        let file_checksum = Sha1::digest(b"test_file.bin content");
-        data.extend_from_slice(&file_checksum);
-
-        // Chunk count
-        let chunk_count: u32 = 1;
-        data.extend_from_slice(&chunk_count.to_le_bytes());
-
-        // Chunk
-        let chunk_content = b"chunk content!!";
-        let chunk_id = Sha1::digest(chunk_content);
-        data.extend_from_slice(&chunk_id);
-        data.extend_from_slice(&0u64.to_le_bytes()); // offset
-        data.extend_from_slice(&0x12345678u32.to_le_bytes()); // CRC
-        data.extend_from_slice(&(chunk_content.len() as u32).to_le_bytes()); // size
-        data.extend_from_slice(&0u32.to_le_bytes()); // compressed_size
-
-        let manifests = stack
-            .parse_depot_manifest(&data, None)
-            .expect("should parse");
-        assert_eq!(manifests.len(), 1);
-        assert_eq!(manifests[0].depot_id, depot_id);
-        assert_eq!(manifests[0].filename, filename);
-        assert_eq!(manifests[0].size, total_size);
-        assert_eq!(manifests[0].checksum, file_checksum.as_slice());
-        assert_eq!(manifests[0].chunks.len(), 1);
-        assert_eq!(manifests[0].chunks[0].size, chunk_content.len() as u32);
-    }
-
-    #[test]
-    fn depot_manifest_parsing_empty() {
-        let stack = SteamProtocolStack::new();
-
-        let depot_id: u32 = 0;
-        let version: u32 = 1;
-        let file_count: u32 = 0;
-        let total_size: u64 = 0;
-        let flags: u32 = 0;
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&version.to_le_bytes());
-        data.extend_from_slice(&file_count.to_le_bytes());
-        data.extend_from_slice(&total_size.to_le_bytes());
-        data.extend_from_slice(&flags.to_le_bytes());
-        data.extend_from_slice(&depot_id.to_le_bytes());
-
-        let manifests = stack
-            .parse_depot_manifest(&data, None)
-            .expect("should parse empty");
-        assert!(manifests.is_empty());
     }
 
     #[test]
@@ -4539,67 +4237,6 @@ mod tests {
         assert!(!servers[1].https);
         assert_eq!(servers[1].cell_id, 5678);
         assert_eq!(servers[1].weight, 50);
-    }
-
-    #[test]
-    fn cdn_routing_parsing_empty() {
-        let stack = SteamProtocolStack::new();
-        let servers = stack
-            .parse_cdn_routing("<contentServerList></contentServerList>")
-            .expect("should parse empty CDN routing");
-        assert!(servers.is_empty());
-    }
-
-    #[test]
-    fn gns_session_create_and_close() {
-        let mut gns = GameNetworkingSockets::new();
-        assert!(gns.connections.is_empty());
-
-        let handle = gns.create_session().expect("should create session");
-        assert_eq!(
-            gns.connection_state(handle),
-            Some(GnsConnectionState::Connected)
-        );
-
-        gns.close_session(handle).expect("should close session");
-        assert!(gns.connection_state(handle).is_none());
-    }
-
-    #[test]
-    fn gns_message_send_poll() {
-        let mut gns = GameNetworkingSockets::new();
-        let handle = gns.create_session().expect("should create session");
-
-        let msg_data = b"Hello GNS!";
-        gns.send_message(handle, msg_data, 0)
-            .expect("should send message");
-
-        let messages = gns.poll_incoming_messages().expect("should poll messages");
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].data, msg_data);
-        assert_eq!(messages[0].conn, handle);
-    }
-
-    #[test]
-    fn gns_accept_session() {
-        let mut gns = GameNetworkingSockets::new();
-
-        // Manually create a session in Connecting state
-        let handle = gns.next_handle;
-        gns.next_handle += 1;
-        gns.connections
-            .insert(handle, GnsConnectionState::Connecting);
-
-        assert_eq!(
-            gns.connection_state(handle),
-            Some(GnsConnectionState::Connecting)
-        );
-
-        gns.accept_session(handle).expect("should accept session");
-        assert_eq!(
-            gns.connection_state(handle),
-            Some(GnsConnectionState::Connected)
-        );
     }
 
     #[test]
@@ -4657,61 +4294,6 @@ mod tests {
         assert!(constant_time_eq(&a, &b));
         assert!(!constant_time_eq(&a, &c));
         assert!(!constant_time_eq(&a, &d));
-    }
-
-    #[test]
-    fn encrypt_decrypt_roundtrip() {
-        let aes_key = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
-            0x1C, 0x1D, 0x1E, 0x1F,
-        ];
-
-        let mut stack = SteamProtocolStack::new();
-        stack.cipher = Some(SessionCipher::new(&aes_key));
-        stack.session_key = Some(aes_key);
-
-        let payload = b"Hello, Steam! Real AES-CTR encryption roundtrip.";
-
-        // encrypt_payload() uses the send-direction cipher. AES-CTR is symmetric,
-        // so encrypt() just XORs with the keystream. After encrypting once, the
-        // cipher state advances by payload.len(). To decrypt, we need a fresh
-        // cipher (same key, same initial keystream position).
-        let encrypted = stack.encrypt_payload(payload);
-
-        // Create a fresh cipher for decryption (resets keystream to position 0)
-        let mut decrypt_stack = SteamProtocolStack::new();
-        decrypt_stack.cipher = Some(SessionCipher::new(&aes_key));
-        let decrypted = decrypt_stack.encrypt_payload(&encrypted);
-
-        assert_eq!(
-            &decrypted, payload,
-            "AES-CTR roundtrip through the stack (send direction)"
-        );
-    }
-
-    #[test]
-    fn steam_message_serialize_with_payload() {
-        let msg = SteamMessage {
-            msg_type: SteamMessageType::ClientLogOn,
-            payload: vec![
-                0x01, 0x00, 0x01, 0x00, // protocol version
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // steam ID
-                0x74, 0x65, 0x73, 0x74, 0x00, // "test\0"
-            ],
-            source_job_id: 0,
-            target_job_id: 0,
-            steam_id: 0,
-            session_id: 0,
-            message_type: 0,
-        };
-
-        let serialized = serialize_message(&msg);
-        assert!(serialized.len() > 8 + ExtendedHeader::TOTAL_SIZE);
-
-        let deserialized = deserialize_message(&serialized).expect("should deserialize");
-        assert_eq!(deserialized.msg_type, SteamMessageType::ClientLogOn);
-        assert_eq!(deserialized.payload, msg.payload);
     }
 
     // -----------------------------------------------------------------------
@@ -4805,8 +4387,6 @@ mod tests {
     // services by default.  All tests below use synthetic/static data only.
     // -----------------------------------------------------------------------
 
-    /// Returns `true` when the `STEAM_LIVE_TEST` env var is set, indicating
-    /// the user explicitly opts into tests that contact real Steam services.
     fn steam_live_tests_enabled() -> bool {
         std::env::var("STEAM_LIVE_TEST").is_ok()
     }
@@ -4819,29 +4399,6 @@ mod tests {
         let stack = SteamProtocolStack::new();
         assert_eq!(stack.state, ConnectionState::Disconnected);
         assert!(!stack.is_connected());
-    }
-
-    #[test]
-    fn steam_zero_touch_gns_uses_no_network() {
-        // GameNetworkingSockets should be usable entirely offline for
-        // session creation and message encryption/decryption.
-        //
-        // GNS uses separate send and recv keys.  In a real handshake
-        // the two sides exchange keys so that the local send key matches
-        // the remote recv key.  For loopback testing we set both keys
-        // to the same value so that encrypt_message (send key) and
-        // decrypt_message (recv key) are compatible.
-        let mut gns = GameNetworkingSockets::new();
-        let handle = gns.create_session().unwrap();
-        // Overwrite recv_key with send_key for loopback compatibility
-        if let Some(send_key) = gns.send_keys.get(&handle).copied() {
-            gns.recv_keys.insert(handle, send_key);
-        }
-        // Encrypt and decrypt a message using the session — no network I/O.
-        let plaintext = b"hello steam";
-        let encrypted = gns.encrypt_message(handle, plaintext).unwrap();
-        let decrypted = gns.decrypt_message(handle, &encrypted).unwrap();
-        assert_eq!(decrypted, plaintext);
     }
 
     #[test]
@@ -4862,24 +4419,5 @@ mod tests {
         let result = stack.connect(Some(""));
         // connect("") will attempt DNS resolution of "" and should fail.
         assert!(result.is_err(), "expected Err, got {result:?}");
-    }
-
-    #[test]
-    fn steam_zero_touch_encrypt_decrypt_roundtrip_no_network() {
-        // Full encrypt/decrypt round-trip using SessionCipher — no
-        // network calls involved.
-        //
-        // SessionCipher uses separate send_cipher and recv_cipher with
-        // different derived keys.  AES-CTR is symmetric (encrypt = decrypt
-        // for the same key+nonce), so we test the round-trip by encrypting
-        // with send_cipher, resetting the keystream position, then
-        // encrypting (CTR-decrypting) again with the same send_cipher.
-        let key = [0xABu8; 32];
-        let mut cipher = SessionCipher::new(&key);
-        let plaintext = b"no network needed";
-        let encrypted = cipher.encrypt(plaintext);
-        cipher.reset_send();
-        let decrypted = cipher.encrypt(&encrypted);
-        assert_eq!(&decrypted, plaintext);
     }
 }

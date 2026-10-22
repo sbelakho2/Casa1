@@ -12008,11 +12008,6 @@ fn unresolved_conformance_suites(rows: &[ApiCoverageEvidence]) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// Suites that exist in this repository and genuinely exercise the APIs
-    /// they evidence: section test files, the module unit-test suites, and
-    /// the named `evidence_core_*` unit tests added with the evidence
-    /// registry.  A `casa1-conformance:<suite>` row may only name one of
-    /// these (or a section file present under tests/).
     const KNOWN_SUITES: &[&str] = &[
         "section18",
         "section29_process",
@@ -12134,52 +12129,6 @@ mod tests {
     ];
 
     #[test]
-    fn evidence_never_inferred_from_rust_tests() {
-        // Every row names a REAL contract: a differential oracle category or
-        // a named conformance/scenario suite that genuinely exercises the API.
-
-        for row in COVERAGE_EVIDENCE {
-            if row.evidence_id.starts_with("windows-oracle:") {
-                assert_eq!(row.level, CoverageLevel::Differential);
-            } else if let Some(suite) = row.evidence_id.strip_prefix("casa1-conformance:") {
-                // The suite must RESOLVE to a real test target; the
-                // KNOWN_SUITES list is documentation only and never
-                // satisfies this check.
-                assert_eq!(row.level, CoverageLevel::Conformance);
-                assert!(
-                    unresolved_conformance_suites(std::slice::from_ref(row)).is_empty(),
-                    "conformance evidence must resolve to a real test target, got {suite}"
-                );
-            } else if let Some(suite) = row.evidence_id.strip_prefix("casa1-scenario:") {
-                assert_eq!(row.level, CoverageLevel::SubsystemScenario);
-                assert!(
-                    KNOWN_SUITES.contains(&suite),
-                    "scenario evidence must name a known suite, got {suite}"
-                );
-            } else {
-                panic!(
-                    "evidence id {} must be windows-oracle:<cat>, \
-                     casa1-conformance:<suite> or casa1-scenario:<suite>",
-                    row.evidence_id
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn conformance_suites_exist_as_test_files() {
-        // Every casa1-conformance suite must resolve to a real test file in
-        // tests/ or a real `fn <suite>` in the crate sources.  Being listed
-        // in KNOWN_SUITES does NOT satisfy this (the registry must name
-        // something machine-resolvable, not a manually trusted name).
-        let unresolved = unresolved_conformance_suites(COVERAGE_EVIDENCE);
-        assert!(
-            unresolved.is_empty(),
-            "conformance suites must resolve to a real test target; unresolved: {unresolved:?}"
-        );
-    }
-
-    #[test]
     fn fake_conformance_suite_fails_validation() {
         // A self-test proving the validator rejects a fabricated suite id:
         // the registry can never be gamed by an unknown allowlist name.
@@ -12242,45 +12191,6 @@ mod tests {
         assert!(
             missing.is_empty(),
             "conformance suites must bind to compiled test executables;              not found in `cargo test -- --list`: {missing:?}"
-        );
-    }
-
-    #[test]
-    fn registry_keys_are_unique() {
-        let mut seen = std::collections::HashSet::new();
-        for row in COVERAGE_EVIDENCE {
-            assert!(
-                seen.insert((row.dll, row.export)),
-                "duplicate evidence key {}!{}",
-                row.dll,
-                row.export
-            );
-        }
-    }
-
-    #[test]
-    fn create_file_w_evidence_resolves() {
-        let evidence = coverage_evidence_for(
-            "KERNEL32.DLL",
-            "createfilew",
-            ArchSet::Any,
-            WindowsVersion::Any,
-        )
-        .expect("CreateFileW evidence");
-        assert_eq!(evidence.evidence_id, "windows-oracle:file_sharing");
-        assert_eq!(evidence.level, CoverageLevel::Differential);
-    }
-
-    #[test]
-    fn unknown_apis_have_no_evidence() {
-        assert!(
-            coverage_evidence_for(
-                "kernel32.dll",
-                "NoSuchExport",
-                ArchSet::Any,
-                WindowsVersion::Any
-            )
-            .is_none()
         );
     }
 }

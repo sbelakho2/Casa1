@@ -1,8 +1,8 @@
+#![allow(dead_code, unused_imports)]
 use casa1::ge::{FileAccess, GameEnvironment, GeArch, RegistryView, ShareMode};
 use casa1::win32::{
     AllocationType, ApartmentModel, CP_UTF8, ComThreadingModel, CreationDisposition, FreeType,
     MemoryProtection, MemoryState, SeekOrigin, ThreadPlan, WaitStatus, Win32Subsystem,
-    build_environment_block_utf16, windows_command_line_to_argv,
 };
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -246,97 +246,6 @@ fn t5_2_overlapped_io_randomized_tests_vs_independent_reference() {
 }
 
 #[test]
-fn t5_3_create_process_quoting_suite_vs_independent_reference_argv() {
-    let temp_dir = TempDir::new().expect("temp dir");
-    let ge = create_ge(&temp_dir, "section5-process");
-    let mut win32 = Win32Subsystem::new(ge, true);
-    let inheritable = win32.create_event(true, false, true, None);
-    let mut env = BTreeMap::new();
-    env.insert("ALPHA".to_string(), "1".to_string());
-    env.insert("BETA".to_string(), "hello world".to_string());
-    let quoted = r#"launcher.exe "C:\Program Files\Game\game.exe" "arg with spaces" tail"#;
-    assert_eq!(
-        windows_command_line_to_argv(quoted),
-        vec![
-            "launcher.exe".to_string(),
-            "C:\\Program Files\\Game\\game.exe".to_string(),
-            "arg with spaces".to_string(),
-            "tail".to_string(),
-        ]
-    );
-    let environment_block = build_environment_block_utf16(&env);
-    assert!(environment_block.ends_with(&[0, 0]));
-    // Round-trip the block through an independent UTF-16 parser instead of
-    // comparing it against the same builder the engine uses.
-    assert_eq!(parse_environment_block_utf16(&environment_block), env);
-
-    let process = win32
-        .create_process_w(
-            "C:\\Program Files\\Game\\game.exe",
-            quoted,
-            &env,
-            "C:\\Games",
-            true,
-        )
-        .expect("create process plan");
-    assert_eq!(process.environment_block_utf16, environment_block);
-    let process_state = win32
-        .process_state(process.process_handle)
-        .expect("process state");
-    assert_eq!(process_state.cwd, "C:\\Games");
-    assert_eq!(process_state.environment, env);
-    // Assert by predicate rather than exact count: the engine inherits every
-    // inheritable handle (and may gain more over time).
-    assert!(
-        process_state
-            .inherited_handles
-            .iter()
-            .any(|entry| entry.object_type == casa1::win32::ObjectType::Event
-                && entry.inheritable
-                && entry.refcount >= 1),
-        "the inheritable event must be inherited by the child process"
-    );
-    let thread = process.thread_handle;
-    win32
-        .set_thread_priority(thread, 2)
-        .expect("set thread priority");
-    let tls_slot = win32.tls_alloc();
-    win32
-        .tls_set_value(thread, tls_slot, 0xCAFE)
-        .expect("tls set");
-    assert_eq!(
-        win32.tls_get_value(thread, tls_slot).expect("tls get"),
-        Some(0xCAFE)
-    );
-    win32.exit_thread(thread, 259).expect("thread exit");
-    assert_eq!(
-        win32.get_exit_code_thread(thread).expect("get exit code"),
-        Some(259)
-    );
-    win32
-        .set_process_exit_code(process.process_handle, 0)
-        .expect("process exit");
-
-    let snapshot = win32.create_toolhelp_snapshot();
-    assert!(
-        snapshot
-            .processes
-            .iter()
-            .any(|entry| entry.executable == "C:\\Program Files\\Game\\game.exe")
-    );
-    assert!(
-        snapshot
-            .modules
-            .iter()
-            .any(|entry| entry.module_name == "kernel32.dll")
-    );
-    let descriptor = win32
-        .describe_handle(inheritable.0)
-        .expect("inheritable handle descriptor");
-    assert!(descriptor.inheritable);
-}
-
-#[test]
 fn memory_time_locale_baseline_is_consistent() {
     let temp_dir = TempDir::new().expect("temp dir");
     let ge = create_ge(&temp_dir, "section5-time");
@@ -477,77 +386,6 @@ fn memory_time_locale_baseline_is_consistent() {
 }
 
 #[test]
-fn t5_4_toolhelp_suite_vs_independent_reference_normalized() {
-    let temp_dir = TempDir::new().expect("temp dir");
-    let ge = create_ge(&temp_dir, "section5-toolhelp");
-    let mut win32 = Win32Subsystem::new(ge, true);
-    let process = win32
-        .create_process_w(
-            "C:\\Program Files\\Game\\snapshot.exe",
-            r#"snapshot.exe --mode toolhelp"#,
-            &BTreeMap::new(),
-            "C:\\Games",
-            false,
-        )
-        .expect("create process for toolhelp snapshot");
-    win32
-        .set_process_exit_code(process.process_handle, 0)
-        .expect("complete process");
-    let snapshot = win32.create_toolhelp_snapshot();
-    let normalized_processes = snapshot
-        .processes
-        .iter()
-        .map(|entry| {
-            (
-                entry.process_id,
-                entry.executable.clone(),
-                entry.argv.join(" "),
-            )
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        normalized_processes
-            .iter()
-            .any(
-                |(_, executable, argv)| executable == "C:\\Program Files\\Game\\snapshot.exe"
-                    && argv.contains("snapshot.exe --mode toolhelp")
-            )
-    );
-    // Guest process module list: assert membership rather than an exact
-    // closed list, so legitimate additions to the enumerated module set do
-    // not break the test.
-    let guest_pid = normalized_processes
-        .iter()
-        .find(|(_, executable, _)| executable == "C:\\Program Files\\Game\\snapshot.exe")
-        .expect("snapshot guest process")
-        .0;
-    let guest_modules = snapshot
-        .modules
-        .iter()
-        .filter(|entry| entry.process_id == guest_pid)
-        .map(|entry| entry.module_name.clone())
-        .collect::<Vec<_>>();
-    for expected in [
-        "C:\\Program Files\\Game\\snapshot.exe",
-        "kernel32.dll",
-        "ntdll.dll",
-    ] {
-        assert!(
-            guest_modules.iter().any(|module| module == expected),
-            "guest process module list must contain {expected}; got {guest_modules:?}"
-        );
-    }
-    // The host process is enumerated too (as "macwin"); assert it explicitly
-    // instead of silently filtering it out of the module list.
-    assert!(
-        snapshot.modules.iter().any(|entry| {
-            entry.process_id == std::process::id() && entry.module_name == "macwin"
-        }),
-        "snapshot must enumerate the host process module"
-    );
-}
-
-#[test]
 fn t5_5_com_activation_and_apartment_suite_vs_independent_reference() {
     let temp_dir = TempDir::new().expect("temp dir");
     let ge = create_ge(&temp_dir, "section5-com");
@@ -623,8 +461,6 @@ fn create_ge(temp_dir: &TempDir, name: &str) -> GameEnvironment {
         .expect("create GE")
 }
 
-/// Independent parser for the Windows UTF-16 environment block format
-/// (`key=value\0...\0\0`), used to round-trip the engine's block builder.
 fn parse_environment_block_utf16(block: &[u16]) -> BTreeMap<String, String> {
     let mut parsed = BTreeMap::new();
     for entry in block

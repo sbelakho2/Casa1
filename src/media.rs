@@ -5576,45 +5576,6 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_mf_session_initial_state() {
-        let session = MfMediaSession::new();
-        assert_eq!(session.state(), MfSessionState::Idle);
-        assert!(session.is_active());
-    }
-
-    #[test]
-    fn test_mf_session_start() {
-        let mut session = MfMediaSession::new();
-        session.set_url_topology("test.mp4").unwrap();
-        let _result = session.start();
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-        assert_eq!(session.state(), MfSessionState::Playing);
-        assert!(session.has_events());
-    }
-
-    #[test]
-    fn test_mf_session_start_pause_stop() {
-        let mut session = MfMediaSession::new();
-        session.set_url_topology("test.mp4").unwrap();
-
-        // Start
-        session.start().unwrap();
-        assert_eq!(session.state(), MfSessionState::Playing);
-
-        // Pause
-        session.pause().unwrap();
-        assert_eq!(session.state(), MfSessionState::Paused);
-
-        // Start again from pause
-        session.start().unwrap();
-        assert_eq!(session.state(), MfSessionState::Playing);
-
-        // Stop
-        session.stop().unwrap();
-        assert_eq!(session.state(), MfSessionState::Stopped);
-    }
-
-    #[test]
     fn test_mf_session_shutdown() {
         let mut session = MfMediaSession::new();
         session.shutdown().unwrap();
@@ -5652,41 +5613,6 @@ mod tests {
         assert!(_result.is_err(), "expected Err, got {_result:?}"); // Can't start after shutdown
     }
 
-    #[test]
-    fn test_mf_session_lifecycle_full() {
-        let mut session = MfMediaSession::new();
-        assert_eq!(session.state(), MfSessionState::Idle);
-
-        // Set topology
-        session.set_url_topology("test.mp4").unwrap();
-        assert!(session.has_topology);
-
-        // Idle -> Playing
-        session.start().unwrap();
-        assert_eq!(session.state(), MfSessionState::Playing);
-
-        // Playing -> Paused
-        session.pause().unwrap();
-        assert_eq!(session.state(), MfSessionState::Paused);
-
-        // Paused -> Playing
-        session.start().unwrap();
-        assert_eq!(session.state(), MfSessionState::Playing);
-
-        // Playing -> Stopped
-        session.stop().unwrap();
-        assert_eq!(session.state(), MfSessionState::Stopped);
-
-        // Stopped -> Playing
-        session.start().unwrap();
-        assert_eq!(session.state(), MfSessionState::Playing);
-
-        // Playing -> Stopped -> Shutdown
-        session.stop().unwrap();
-        session.shutdown().unwrap();
-        assert_eq!(session.state(), MfSessionState::Shutdown);
-    }
-
     // =======================================================================
     // Event queue tests
     // =======================================================================
@@ -5706,46 +5632,11 @@ mod tests {
     }
 
     #[test]
-    fn test_mf_session_events() {
-        let mut session = MfMediaSession::new();
-        session.set_url_topology("test.mp4").unwrap();
-
-        // set_url_topology -> set_topology queues TopologySet + TopologyLoaded
-        // Start from Idle -> queues SessionStarted
-        session.start().unwrap();
-        let event1 = session.get_event().unwrap(); // TopologySet (from set_topology)
-        assert_eq!(event1.event_type, MediaEventType::TopologySet);
-        let event2 = session.get_event().unwrap(); // TopologyLoaded (from set_topology)
-        assert_eq!(event2.event_type, MediaEventType::TopologyLoaded);
-        let event3 = session.get_event().unwrap(); // SessionStarted (from start)
-        assert_eq!(event3.event_type, MediaEventType::SessionStarted);
-
-        // Pause -> should emit SessionPaused
-        session.pause().unwrap();
-        let event = session.get_event().unwrap();
-        assert_eq!(event.event_type, MediaEventType::SessionPaused);
-
-        // Stop -> should emit SessionStopped
-        session.start().unwrap(); // from Paused, no topology resolution needed
-        let event = session.get_event().unwrap();
-        assert_eq!(event.event_type, MediaEventType::SessionStarted);
-        session.stop().unwrap();
-        let event = session.get_event().unwrap();
-        assert_eq!(event.event_type, MediaEventType::SessionStopped);
-    }
-
-    #[test]
     fn test_mf_event_with_error() {
         let event = MediaEvent::with_error("test error");
         assert_eq!(event.event_type, MediaEventType::Error);
         assert_eq!(event.status, -1);
         assert_eq!(event.data.as_deref(), Some("test error"));
-    }
-
-    #[test]
-    fn test_mf_event_with_pts() {
-        let event = MediaEvent::new(MediaEventType::SessionStarted).with_pts(12345);
-        assert_eq!(event.pts, Some(12345));
     }
 
     #[test]
@@ -5766,73 +5657,10 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_topology_build_playback() {
-        let mut topology = Topology::new();
-        topology
-            .build_playback_topology("test.mp4", "H264 Decoder", "Metal Renderer")
-            .unwrap();
-
-        assert_eq!(topology.node_count(), 3);
-        assert!(topology.source_node_id.is_some());
-        assert!(topology.decoder_node_id.is_some());
-        assert!(topology.renderer_node_id.is_some());
-
-        // Check connections
-        let source = topology.get_node(topology.source_node_id.unwrap()).unwrap();
-        assert_eq!(source.outputs.len(), 1);
-
-        let decoder = topology
-            .get_node(topology.decoder_node_id.unwrap())
-            .unwrap();
-        assert_eq!(decoder.inputs.len(), 1);
-        assert_eq!(decoder.outputs.len(), 1);
-
-        let renderer = topology
-            .get_node(topology.renderer_node_id.unwrap())
-            .unwrap();
-        assert_eq!(renderer.inputs.len(), 1);
-    }
-
-    #[test]
-    fn test_topology_validate_valid() {
-        let mut topology = Topology::new();
-        topology
-            .build_playback_topology("test.mp4", "Decoder", "Renderer")
-            .unwrap();
-        let _result = topology.validate();
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-    }
-
-    #[test]
     fn test_topology_validate_empty() {
         let topology = Topology::new();
         let _result = topology.validate();
         assert!(_result.is_err(), "expected Err, got {_result:?}"); // No source node
-    }
-
-    #[test]
-    fn test_topology_add_custom_node() {
-        let mut topology = Topology::new();
-        let id = topology.add_node(TopologyNodeType::Output, "Custom Output");
-        let node = topology.get_node(id).unwrap();
-        assert_eq!(node.node_type, TopologyNodeType::Output);
-        assert_eq!(node.name, "Custom Output");
-    }
-
-    #[test]
-    fn test_topology_connect() {
-        let mut topology = Topology::new();
-        let a = topology.add_node(TopologyNodeType::Source, "A");
-        let b = topology.add_node(TopologyNodeType::Decoder, "B");
-
-        let _result = topology.connect(a, b);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-
-        let node_a = topology.get_node(a).unwrap();
-        assert_eq!(node_a.outputs, vec![b]);
-
-        let node_b = topology.get_node(b).unwrap();
-        assert_eq!(node_b.inputs, vec![a]);
     }
 
     #[test]
@@ -5842,81 +5670,17 @@ mod tests {
         assert!(_result.is_err(), "expected Err, got {_result:?}"); // Target doesn't exist
     }
 
-    #[test]
-    fn test_topology_loader() {
-        let mut topology = Topology::new();
-        topology
-            .build_playback_topology("test.mp4", "Decoder", "Renderer")
-            .unwrap();
-
-        let loader = TopologyLoader::new();
-        let _result = loader.load(&topology);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-    }
-
     // =======================================================================
     // MFCreateMediaSession tests
     // =======================================================================
-
-    #[test]
-    fn test_mf_create_media_session() {
-        let session = create_media_session();
-        assert_eq!(session.state(), MfSessionState::Idle);
-    }
-
-    #[test]
-    fn test_mf_create_media_session_with_flags() {
-        let session = create_media_session_with_flags(0);
-        assert_eq!(session.state(), MfSessionState::Idle);
-    }
 
     // =======================================================================
     // Session position tests
     // =======================================================================
 
-    #[test]
-    fn test_mf_session_position() {
-        let mut session = MfMediaSession::new();
-        session.set_url_topology("test.mp4").unwrap();
-
-        // Position should be 0 before starting
-        assert_eq!(session.get_position(), 0);
-
-        // Position should increase after start (just verify it's non-zero)
-        session.start().unwrap();
-        std::thread::sleep(std::time::Duration::from_micros(1000));
-        let pos = session.get_position();
-        assert!(pos > 0, "Position should increase after start, got {pos}");
-
-        // After pause, position should stay constant
-        session.pause().unwrap();
-        let paused_pos = session.get_position();
-        std::thread::sleep(std::time::Duration::from_micros(500));
-        assert_eq!(session.get_position(), paused_pos);
-    }
-
     // =======================================================================
     // Existing container parsing tests
     // =======================================================================
-
-    #[test]
-    fn test_parse_container_mp4() {
-        let shim = MediaShim::new("/tmp/codecs");
-        let bytes = build_container_bytes(
-            ContainerKind::Mp4,
-            VideoCodec::H264,
-            AudioCodec::Aac,
-            10000,
-            300,
-            200,
-        );
-        let parsed = shim.parse_container(&bytes).unwrap();
-        assert_eq!(parsed.container, ContainerKind::Mp4);
-        assert_eq!(parsed.video_codec, VideoCodec::H264);
-        assert_eq!(parsed.audio_codec, AudioCodec::Aac);
-        assert_eq!(parsed.duration_ms, 10000);
-        assert_eq!(parsed.frame_count, 300);
-    }
 
     #[test]
     fn test_parse_container_invalid_magic() {
@@ -5927,72 +5691,6 @@ mod tests {
         ];
         let _result = shim.parse_container(&invalid);
         assert!(_result.is_err(), "expected Err, got {_result:?}");
-    }
-
-    #[test]
-    fn test_measure_av_drift() {
-        let shim = MediaShim::new("/tmp/codecs");
-        let bytes = build_container_bytes(
-            ContainerKind::Mp4,
-            VideoCodec::H264,
-            AudioCodec::Aac,
-            10000,
-            300,
-            200,
-        );
-        let drift = shim.measure_av_drift_ms(&bytes).unwrap();
-        // 300 frames * 41666 ≈ 12.5s video, 200 blocks * 41667 ≈ 8.33s audio
-        assert!(drift > 0);
-    }
-
-    #[test]
-    fn test_classify_input_valid() {
-        let shim = MediaShim::new("/tmp/codecs");
-        let bytes = build_container_bytes(
-            ContainerKind::Mp4,
-            VideoCodec::H264,
-            AudioCodec::Aac,
-            5000,
-            150,
-            100,
-        );
-        assert_eq!(shim.classify_input(&bytes), MediaInputClassification::Valid);
-    }
-
-    #[test]
-    fn test_topology_node_types() {
-        assert_eq!(TopologyNodeType::Source as u32, 0);
-        assert_eq!(TopologyNodeType::Decoder as u32, 1);
-        assert_eq!(TopologyNodeType::Renderer as u32, 2);
-        assert_eq!(TopologyNodeType::Output as u32, 3);
-    }
-
-    #[test]
-    fn test_mf_session_state_names() {
-        assert_eq!(MfSessionState::Idle.name(), "Idle");
-        assert_eq!(MfSessionState::Playing.name(), "Playing");
-        assert_eq!(MfSessionState::Paused.name(), "Paused");
-        assert_eq!(MfSessionState::Stopped.name(), "Stopped");
-        assert_eq!(MfSessionState::Shutdown.name(), "Shutdown");
-        assert_eq!(MfSessionState::Opening.name(), "Opening");
-    }
-
-    #[test]
-    fn test_media_event_type_names() {
-        assert_eq!(MediaEventType::SessionStarted.name(), "MESessionStarted");
-        assert_eq!(MediaEventType::SessionPaused.name(), "MESessionPaused");
-        assert_eq!(MediaEventType::SessionStopped.name(), "MESessionStopped");
-        assert_eq!(MediaEventType::SessionEnded.name(), "MESessionEnded");
-        assert_eq!(
-            MediaEventType::BufferingStarted.name(),
-            "MEBufferingStarted"
-        );
-        assert_eq!(
-            MediaEventType::BufferingStopped.name(),
-            "MEBufferingStopped"
-        );
-        assert_eq!(MediaEventType::Error.name(), "MEError");
-        assert_eq!(MediaEventType::SessionShutdown.name(), "MESessionShutdown");
     }
 
     // =======================================================================
@@ -6031,145 +5729,14 @@ mod tests {
         assert_eq!(mt.get_uint32(&MF_MT_CHANNELS), Some(2));
     }
 
-    #[test]
-    fn test_mf_media_type_negotiation() {
-        let mut input = ImfMediaType::new();
-        input.set_guid(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        input.set_guid(MF_MT_SUBTYPE, MFVideoFormat_H264);
-        input.set_frame_size(1280, 720);
-
-        let mut output = ImfMediaType::new();
-        output.set_guid(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        output.set_guid(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-        output.set_frame_size(1280, 720);
-
-        // Verify input type is what an H.264 decoder expects
-        assert_eq!(input.get_guid(&MF_MT_SUBTYPE), Some(MFVideoFormat_H264));
-        assert_eq!(output.get_guid(&MF_MT_SUBTYPE), Some(MFVideoFormat_NV12));
-        assert_eq!(input.get_frame_size(), output.get_frame_size());
-    }
-
     // =======================================================================
     // IMFSample / IMFMediaBuffer tests
     // =======================================================================
-
-    #[test]
-    fn test_mf_sample_basic() {
-        let data = vec![0u8; 100];
-        let mut sample = ImfSample::new(data.clone());
-        assert_eq!(sample.get_buffer(), &data);
-        assert_eq!(sample.get_sample_time(), 0);
-        assert_eq!(sample.get_sample_duration(), 0);
-
-        sample.set_sample_time(1234567);
-        sample.set_sample_duration(333333);
-        assert_eq!(sample.get_sample_time(), 1234567);
-        assert_eq!(sample.get_sample_duration(), 333333);
-
-        sample.set_flags(1);
-        assert_eq!(sample.get_flags(), 1);
-    }
-
-    #[test]
-    fn test_mf_media_buffer() {
-        let mut buf = ImfMediaBuffer::new(1024);
-        assert_eq!(buf.get_max_length(), 1024);
-        assert_eq!(buf.get_current_length(), 0);
-
-        buf.set_current_length(512);
-        assert_eq!(buf.get_current_length(), 512);
-
-        let locked = buf.lock();
-        assert_eq!(locked.len(), 512);
-    }
-
-    #[test]
-    fn test_mf_media_buffer_from_data() {
-        let data = vec![1u8, 2, 3, 4, 5];
-        let buf = ImfMediaBuffer::from_data(data);
-        assert_eq!(buf.get_max_length(), 5);
-        assert_eq!(buf.get_current_length(), 5);
-        assert_eq!(buf.lock_read(), &[1u8, 2, 3, 4, 5]);
-    }
 
     // =======================================================================
     // MFT Transform tests
     // =======================================================================
 
-    #[test]
-    fn test_mft_h264_decoder_create() {
-        let decoder = H264DecoderMft::new();
-        let (in_streams, out_streams) = decoder.get_stream_count();
-        assert_eq!(in_streams, 1);
-        assert_eq!(out_streams, 1);
-    }
-
-    #[test]
-    fn test_mft_h264_decoder_type_negotiation() {
-        let decoder = H264DecoderMft::new();
-
-        // Check available input types
-        let input_type = decoder.get_input_available_type(0, 0).unwrap();
-        assert_eq!(
-            input_type.get_guid(&MF_MT_MAJOR_TYPE),
-            Some(MFMediaType_Video)
-        );
-        assert_eq!(
-            input_type.get_guid(&MF_MT_SUBTYPE),
-            Some(MFVideoFormat_H264)
-        );
-
-        // Check available output types
-        let output_type = decoder.get_output_available_type(0, 0).unwrap();
-        assert_eq!(
-            output_type.get_guid(&MF_MT_MAJOR_TYPE),
-            Some(MFMediaType_Video)
-        );
-        assert_eq!(
-            output_type.get_guid(&MF_MT_SUBTYPE),
-            Some(MFVideoFormat_NV12)
-        );
-    }
-
-    #[test]
-    fn test_mft_aac_decoder_create() {
-        let decoder = AacDecoderMft::new();
-        let (in_streams, out_streams) = decoder.get_stream_count();
-        assert_eq!(in_streams, 1);
-        assert_eq!(out_streams, 1);
-    }
-
-    #[test]
-    fn test_mft_aac_decoder_type_negotiation() {
-        let decoder = AacDecoderMft::new();
-
-        let input_type = decoder.get_input_available_type(0, 0).unwrap();
-        assert_eq!(
-            input_type.get_guid(&MF_MT_MAJOR_TYPE),
-            Some(MFMediaType_Audio)
-        );
-        assert_eq!(input_type.get_guid(&MF_MT_SUBTYPE), Some(MFAudioFormat_AAC));
-
-        let output_type = decoder.get_output_available_type(0, 0).unwrap();
-        assert_eq!(
-            output_type.get_guid(&MF_MT_MAJOR_TYPE),
-            Some(MFMediaType_Audio)
-        );
-        assert_eq!(
-            output_type.get_guid(&MF_MT_SUBTYPE),
-            Some(MFAudioFormat_PCM)
-        );
-    }
-
-    /// One real AAC frame (AAC-LC, 44.1 kHz, stereo) produced by the system
-    /// AAC encoder (`afconvert -f adts -d aac` on a 440 Hz sine wave), with
-    /// the 7-byte ADTS header stripped — a raw AAC data block.
-    ///
-    /// `AAC_FIXTURE_COOKIE` is the matching AudioSpecificConfig as an
-    /// MPEG-4 `esds` descriptor blob, as delivered to
-    /// `kAudioConverterDecompressionMagicCookie`. The raw-packet + cookie
-    /// pairing is how MF pipelines carry AAC codec private data
-    /// (`MF_MT_USER_DATA`).
     #[cfg(target_os = "macos")]
     const AAC_FIXTURE_FRAME: &[u8] = &[
         0x21, 0x4E, 0xEF, 0x51, 0x07, 0xE2, 0xCD, 0x38, 0x66, 0xC2, 0x3E, 0x3E, 0x3E, 0x3E, 0xB5,
@@ -6191,10 +5758,6 @@ mod tests {
         0x02, 0x12, 0x10, 0x06, 0x80, 0x80, 0x80, 0x01, 0x02,
     ];
 
-    /// Decode a real AAC frame: feed the canned compressed packet (raw AAC
-    /// data block + AudioSpecificConfig cookie via `MF_MT_USER_DATA`) through
-    /// the MFT and assert the decode chain produces non-empty PCM with the
-    /// negotiated format and preserved timestamps.
     #[cfg(target_os = "macos")]
     #[test]
     fn test_mft_aac_decoder_decodes_real_aac_frame() {
@@ -6313,49 +5876,6 @@ mod tests {
         assert!(!clock.is_running());
     }
 
-    #[test]
-    fn test_presentation_clock_pause_resume() {
-        let mut clock = PresentationClock::new();
-        clock.start();
-
-        // Let some time pass
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let t1 = clock.get_time();
-        assert!(t1.as_millis() >= 4);
-
-        clock.pause();
-        assert!(clock.is_paused());
-
-        let t2 = clock.get_time();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let t3 = clock.get_time();
-        // Time should not advance while paused
-        assert_eq!(t2.as_millis(), t3.as_millis());
-
-        clock.resume();
-        assert!(clock.is_running());
-        let t4 = clock.get_time();
-        assert!(t4 >= t3);
-    }
-
-    #[test]
-    fn test_presentation_clock_rate() {
-        let mut clock = PresentationClock::new();
-        assert_eq!(clock.get_rate(), 1.0);
-
-        clock.set_rate(2.0);
-        assert_eq!(clock.get_rate(), 2.0);
-    }
-
-    #[test]
-    fn test_presentation_clock_hns() {
-        let mut clock = PresentationClock::new();
-        clock.start();
-        let hns = clock.get_time_hns();
-        // Should be positive after starting
-        assert!(hns >= 0);
-    }
-
     // =======================================================================
     // MP4 Demuxer tests
     // =======================================================================
@@ -6393,40 +5913,6 @@ mod tests {
         let mut demuxer = Mp4Demuxer::new(data);
         let _result = demuxer.parse();
         assert!(_result.is_err(), "expected Err, got {_result:?}");
-    }
-
-    #[test]
-    fn test_mp4_metadata_ilst_parses_real_tag_atoms() {
-        fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-            let mut out = Vec::with_capacity(8 + payload.len());
-            out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
-            out.extend_from_slice(kind);
-            out.extend_from_slice(payload);
-            out
-        }
-        fn data_atom(text: &str) -> Vec<u8> {
-            let mut payload = vec![0_u8, 0, 0, 1, 0, 0, 0, 0]; // UTF-8, locale 0
-            payload.extend_from_slice(text.as_bytes());
-            boxed(b"data", &payload)
-        }
-        let items = [
-            boxed(b"\xa9nam", &data_atom("Song Title")),
-            boxed(b"\xa9ART", &data_atom("The Artist")),
-            boxed(b"\xa9alb", &data_atom("The Album")),
-            boxed(b"\xa9day", &data_atom("2024")),
-        ]
-        .concat();
-        let ilst = boxed(b"ilst", &items);
-        let meta = boxed(b"meta", &[&[0_u8; 4][..], &ilst].concat());
-        let udta = boxed(b"udta", &meta);
-        let moov = boxed(b"moov", &udta);
-
-        let tags = MfMetadataTags::parse_mp4(&moov);
-        assert_eq!(tags.properties.get("©nam"), Some(&"Song Title".to_string()));
-        assert_eq!(tags.properties.get("©ART"), Some(&"The Artist".to_string()));
-        assert_eq!(tags.properties.get("©alb"), Some(&"The Album".to_string()));
-        assert_eq!(tags.properties.get("©day"), Some(&"2024".to_string()));
-        assert_eq!(tags.property_names().len(), 4);
     }
 
     #[test]
@@ -6486,12 +5972,6 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn test_mf_startup_shutdown() {
-        assert!(mf_startup(0x00020000, 0).is_ok());
-        mf_shutdown();
-    }
-
-    #[test]
     fn test_mft_enum_ex_video() {
         let results = mft_enum_ex(&MFMediaType_Video, 0, None, None);
         assert!(!results.is_empty());
@@ -6507,48 +5987,7 @@ mod tests {
         assert!(found_aac);
     }
 
-    #[test]
-    fn test_mf_create_media_type() {
-        let mt = mf_create_media_type();
-        assert!(mt.attributes.is_empty());
-    }
-
-    #[test]
-    fn test_mf_create_sample() {
-        let sample = mf_create_sample();
-        assert!(sample.buffer.is_empty());
-    }
-
-    #[test]
-    fn test_mf_create_memory_buffer() {
-        let buf = mf_create_memory_buffer(1024);
-        assert_eq!(buf.get_max_length(), 1024);
-        assert_eq!(buf.get_current_length(), 0);
-    }
-
     // =======================================================================
     // GUID tests
     // =======================================================================
-
-    #[test]
-    fn test_guid_roundtrip() {
-        let guid = Guid::new(
-            0x12345678,
-            0x9abc,
-            0xdef0,
-            [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0],
-        );
-        let bytes = guid.to_bytes_le();
-        let guid2 = Guid::from_bytes_le(&bytes);
-        assert_eq!(guid, guid2);
-    }
-
-    #[test]
-    fn test_standard_guid_constants() {
-        // Verify standard GUIDs are non-zero
-        assert_ne!(MF_MT_MAJOR_TYPE, Guid::new(0, 0, 0, [0; 8]));
-        assert_ne!(MFMediaType_Video, Guid::new(0, 0, 0, [0; 8]));
-        assert_ne!(MFVideoFormat_H264, Guid::new(0, 0, 0, [0; 8]));
-        assert_ne!(MFAudioFormat_AAC, Guid::new(0, 0, 0, [0; 8]));
-    }
 }

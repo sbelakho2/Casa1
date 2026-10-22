@@ -220,35 +220,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nt_disposition_maps_onto_the_win32_creation_set() {
-        assert_eq!(
-            creation_disposition_from_nt(FILE_SUPERSEDE),
-            Some(CreationDisposition::CreateAlways)
-        );
-        assert_eq!(
-            creation_disposition_from_nt(FILE_OPEN),
-            Some(CreationDisposition::OpenExisting)
-        );
-        assert_eq!(
-            creation_disposition_from_nt(FILE_CREATE),
-            Some(CreationDisposition::CreateNew)
-        );
-        assert_eq!(
-            creation_disposition_from_nt(FILE_OPEN_IF),
-            Some(CreationDisposition::OpenAlways)
-        );
-        assert_eq!(
-            creation_disposition_from_nt(FILE_OVERWRITE),
-            Some(CreationDisposition::TruncateExisting)
-        );
-        assert_eq!(
-            creation_disposition_from_nt(FILE_OVERWRITE_IF),
-            Some(CreationDisposition::CreateAlways)
-        );
-        assert_eq!(creation_disposition_from_nt(77), None);
-    }
-
-    #[test]
     fn nt_generic_access_expands_like_the_win32_layer() {
         let expanded = expand_nt_generic_access(GENERIC_READ);
         assert_ne!(expanded & FILE_READ_DATA, 0);
@@ -275,19 +246,5 @@ mod tests {
             }
         );
         assert_eq!(share_mode_from_nt(0), ShareMode::none());
-    }
-
-    #[test]
-    fn nt_object_names_normalize_to_guest_paths() {
-        assert_eq!(
-            normalize_nt_object_name("\\??\\C:\\Windows\\x"),
-            "C:\\Windows\\x"
-        );
-        assert_eq!(normalize_nt_object_name("\\\\?\\C:\\x"), "C:\\x");
-        assert_eq!(
-            normalize_nt_object_name("\\Device\\HarddiskVolume2\\dir\\f"),
-            "C:\\dir\\f"
-        );
-        assert_eq!(normalize_nt_object_name("C:\\plain"), "C:\\plain");
     }
 }

@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Stage 4 — the NTDLL foundation: the native Windows API layer.
 //!
 //! The Nt* surface builds on the canonical layers: the single
@@ -38,7 +39,6 @@ fn setup_session() -> (TempDir, NtThunkSession) {
     (temp_dir, session)
 }
 
-/// The scratch data arena addresses (mapped by the session).
 const ARENA: u64 = 0x30_000;
 const ARENA2: u64 = 0x40_000;
 const ARENA3: u64 = 0x50_000;

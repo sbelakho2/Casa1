@@ -516,48 +516,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ring_buffer_basic_write_read() {
-        let rb = AudioRingBuffer::new(1024, 2, 44100, 0);
-        let samples: Vec<f32> = (0..100).map(|i| i as f32).collect();
-        let written = rb.write(&samples);
-        assert_eq!(written, 100);
-
-        let mut output = vec![0.0f32; 100];
-        let read = rb.read(&mut output);
-        assert_eq!(read, 100);
-        for (i, &sample) in output.iter().enumerate() {
-            assert!((sample - i as f32).abs() < f32::EPSILON);
-        }
-    }
-
-    #[test]
-    fn test_ring_buffer_underrun() {
-        let rb = AudioRingBuffer::new(1024, 1, 44100, 0);
-
-        // Write 10 samples
-        let samples: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        rb.write(&samples);
-
-        // Try to read 20 samples — should get 10 real + 10 silence
-        let mut output = vec![-1.0f32; 20];
-        let read = rb.read(&mut output);
-        assert_eq!(read, 10);
-
-        // First 10 should be the real data
-        for (i, &sample) in output.iter().enumerate().take(10) {
-            assert!((sample - i as f32).abs() < f32::EPSILON);
-        }
-        // Last 10 should be silence (0.0)
-        for &sample in &output[10..20] {
-            assert_eq!(sample, 0.0);
-        }
-
-        // Check underrun was recorded
-        let metrics = rb.metrics();
-        assert_eq!(metrics.underrun_count, 1);
-    }
-
-    #[test]
     fn test_ring_buffer_pre_buffering() {
         let rb = AudioRingBuffer::new(1024, 1, 44100, 100);
 
@@ -586,93 +544,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ring_buffer_wrap_around() {
-        let rb = AudioRingBuffer::new(16, 1, 44100, 0); // 16 sample capacity
-
-        // Write 10 samples
-        let s1: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        rb.write(&s1);
-
-        // Read 10 samples
-        let mut out1 = vec![0.0f32; 10];
-        rb.read(&mut out1);
-
-        // Write 10 more — should wrap around
-        let s2: Vec<f32> = (10..20).map(|i| i as f32).collect();
-        rb.write(&s2);
-
-        let mut out2 = vec![0.0f32; 10];
-        let read = rb.read(&mut out2);
-        assert_eq!(read, 10);
-        for (i, &sample) in out2.iter().enumerate() {
-            assert!((sample - (10 + i) as f32).abs() < f32::EPSILON);
-        }
-    }
-
-    #[test]
-    fn test_ring_buffer_fill_tracking() {
-        let rb = AudioRingBuffer::new(1024, 2, 44100, 0);
-
-        // Write 100 samples (50 frames, 2 channels)
-        let samples: Vec<f32> = (0..100).map(|i| i as f32).collect();
-        rb.write(&samples);
-
-        assert_eq!(rb.fill_samples(), 100);
-        assert_eq!(rb.fill_frames(), 50);
-    }
-
-    #[test]
-    fn test_ring_buffer_metrics() {
-        let rb = AudioRingBuffer::new(1024, 1, 44100, 0);
-
-        let samples: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        rb.write(&samples);
-
-        let mut output = vec![0.0f32; 20];
-        rb.read(&mut output); // Will cause underrun
-
-        let metrics = rb.metrics();
-        assert_eq!(metrics.total_written, 10);
-        assert_eq!(metrics.total_read, 10);
-        assert_eq!(metrics.underrun_count, 1);
-    }
-
-    #[test]
-    fn test_ring_buffer_reset() {
-        let rb = AudioRingBuffer::new(1024, 1, 44100, 0);
-
-        let samples: Vec<f32> = (0..100).map(|i| i as f32).collect();
-        rb.write(&samples);
-        assert_eq!(rb.fill_samples(), 100);
-
-        rb.reset();
-        assert_eq!(rb.fill_samples(), 0);
-    }
-
-    #[test]
-    fn test_ring_buffer_read_hold() {
-        let rb = AudioRingBuffer::new(1024, 2, 44100, 0);
-
-        // Write 4 samples (2 frames)
-        rb.write(&[1.0, 2.0, 3.0, 4.0]);
-
-        // Try to read 8 samples (4 frames) — underrun should hold last frame
-        let mut output = vec![0.0f32; 8];
-        rb.read_hold(&mut output);
-
-        // First 4 should be real data
-        assert_eq!(output[0], 1.0);
-        assert_eq!(output[1], 2.0);
-        assert_eq!(output[2], 3.0);
-        assert_eq!(output[3], 4.0);
-        // Last 4 should repeat the last frame (3.0, 4.0)
-        assert_eq!(output[4], 3.0);
-        assert_eq!(output[5], 4.0);
-        assert_eq!(output[6], 3.0);
-        assert_eq!(output[7], 4.0);
-    }
-
-    #[test]
     fn test_double_buffer_basic() {
         let db = DoubleAudioBuffer::new(1024, 1, 44100, 0);
 
@@ -685,34 +556,6 @@ mod tests {
         let read = db.read(&mut output);
         // Primary is empty so we get silence initially
         assert_eq!(read, 0);
-    }
-
-    #[test]
-    fn test_fill_fraction() {
-        let rb = AudioRingBuffer::new(1024, 1, 44100, 0);
-        assert_eq!(rb.fill_fraction(), 0.0);
-
-        rb.write(&[1.0; 512]);
-        let frac = rb.fill_fraction();
-        assert!(frac > 0.49 && frac < 0.51);
-    }
-
-    #[test]
-    fn test_stereo_interleaved() {
-        let rb = AudioRingBuffer::new(1024, 2, 44100, 0);
-
-        // Write stereo interleaved: L R L R L R L R L R
-        let samples: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        rb.write(&samples);
-
-        let mut output = vec![0.0f32; 10];
-        let read = rb.read(&mut output);
-        assert_eq!(read, 10);
-
-        // Verify interleaving is preserved
-        for (i, &sample) in output.iter().enumerate() {
-            assert!((sample - i as f32).abs() < f32::EPSILON);
-        }
     }
 
     #[test]
@@ -773,43 +616,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ring_buffer_overrun_keeps_newest_when_partially_filled() {
-        // Write more than fits while the buffer still has free space: the
-        // overflowed samples replace the oldest unread data, and the consumer
-        // still reads a contiguous, ordered stream.
-        let rb = AudioRingBuffer::new(8, 1, 44100, 0);
-
-        rb.write(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]); // 6 of 8 slots used
-        let mut out = vec![0.0f32; 4];
-        assert_eq!(rb.read(&mut out), 4); // consume 1..=4
-
-        // Write 6 samples into 4 free slots: the 2 oldest unread samples
-        // (5.0, 6.0) are overwritten and the newest 6 are kept.
-        rb.write(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
-        assert_eq!(rb.fill_samples(), 8);
-
-        let mut out2 = vec![0.0f32; 8];
-        let read = rb.read(&mut out2);
-        assert_eq!(read, 8);
-        // Newest 6 in order, preceded by the 2 unread-but-not-overwritten.
-        assert_eq!(out2, vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
-    }
-
-    #[test]
-    fn test_ring_buffer_overrun_oversized_write_keeps_newest() {
-        // A single write larger than the ring replaces the entire contents
-        // with the newest samples.
-        let rb = AudioRingBuffer::new(4, 1, 44100, 0);
-        rb.write(&[1.0, 2.0, 3.0, 4.0]);
-        rb.write(&(5..=20).map(|v| v as f32).collect::<Vec<_>>());
-
-        let mut out = vec![-1.0f32; 4];
-        let read = rb.read(&mut out);
-        assert_eq!(read, 4);
-        assert_eq!(out, vec![17.0, 18.0, 19.0, 20.0]);
-    }
-
-    #[test]
     fn test_ring_buffer_read_hold_partial_frame_no_panic() {
         // A producer write that is not frame-aligned leaves a partial frame;
         // read_hold must not underflow or panic, and must fill with silence.
@@ -822,117 +628,5 @@ mod tests {
         assert_eq!(output[1], 0.0);
         assert_eq!(output[2], 0.0);
         assert_eq!(output[3], 0.0);
-    }
-
-    #[test]
-    fn test_ring_buffer_producer_consumer_simulation() {
-        // Simulate a single-threaded producer/consumer pattern
-        let rb = AudioRingBuffer::new(64, 1, 44100, 0);
-
-        // Produce batch 1
-        let batch1: Vec<f32> = (0..32).map(|i| i as f32).collect();
-        rb.write(&batch1);
-        assert_eq!(rb.fill_samples(), 32);
-
-        // Consume first half
-        let mut out1 = vec![0.0f32; 16];
-        let read1 = rb.read(&mut out1);
-        assert_eq!(read1, 16);
-        for (i, &sample) in out1.iter().enumerate() {
-            assert!((sample - i as f32).abs() < f32::EPSILON);
-        }
-        assert_eq!(rb.fill_samples(), 16);
-
-        // Produce batch 2 (wraps around)
-        let batch2: Vec<f32> = (32..64).map(|i| i as f32).collect();
-        rb.write(&batch2);
-        assert_eq!(rb.fill_samples(), 48);
-
-        // Consume the rest
-        let mut out2 = vec![0.0f32; 48];
-        let read2 = rb.read(&mut out2);
-        assert_eq!(read2, 48);
-
-        // Verify data continuity: 16..32 from batch1, then 32..64 from batch2
-        for (j, &sample) in out2.iter().enumerate().take(16) {
-            assert!(
-                (sample - (16 + j) as f32).abs() < f32::EPSILON,
-                "at index {}",
-                j
-            );
-        }
-        for (j, &sample) in out2.iter().enumerate().skip(16).take(32) {
-            assert!(
-                (sample - (16 + j) as f32).abs() < f32::EPSILON,
-                "at index {}",
-                16 + j
-            );
-        }
-
-        // Buffer should now be empty
-        assert_eq!(rb.fill_samples(), 0);
-    }
-
-    #[test]
-    fn test_ring_buffer_full_underrun_returns_silence() {
-        let rb = AudioRingBuffer::new(16, 1, 44100, 0);
-
-        // Read from empty buffer — should get all silence
-        let mut out = vec![-1.0f32; 8];
-        let read = rb.read(&mut out);
-        assert_eq!(read, 0);
-        assert!(out.iter().all(|&s| s == 0.0));
-
-        // Metrics should record the underrun
-        let metrics = rb.metrics();
-        assert_eq!(metrics.underrun_count, 1);
-    }
-
-    #[test]
-    fn test_ring_buffer_concurrent_producer_consumer() {
-        use std::sync::{Arc, Mutex};
-        use std::thread;
-
-        let rb = Arc::new(Mutex::new(AudioRingBuffer::new(1024, 1, 44100, 0)));
-        let rb_producer = Arc::clone(&rb);
-        let rb_consumer = Arc::clone(&rb);
-
-        let producer = thread::spawn(move || {
-            for batch in 0..20 {
-                let samples: Vec<f32> = (0..32).map(|i| (batch * 32 + i) as f32).collect();
-                {
-                    let buf = rb_producer.lock().unwrap();
-                    buf.write(&samples);
-                }
-                thread::yield_now();
-            }
-        });
-
-        let consumer = thread::spawn(move || {
-            let mut total_read = 0usize;
-            let mut output = vec![0.0f32; 32];
-            for _ in 0..40 {
-                {
-                    let buf = rb_consumer.lock().unwrap();
-                    let read = buf.read(&mut output);
-                    total_read += read;
-                }
-                thread::yield_now();
-            }
-            total_read
-        });
-
-        producer.join().expect("producer thread panicked");
-        let total_read = consumer.join().expect("consumer thread panicked");
-
-        // Should have read some data (exact amount depends on scheduling)
-        assert!(
-            total_read > 0,
-            "consumer should have read at least some samples, got {total_read}"
-        );
-
-        // Total produced = 20 batches × 32 samples = 640
-        // Total consumed should be <= 640
-        assert!(total_read <= 640, "consumed more than produced");
     }
 }

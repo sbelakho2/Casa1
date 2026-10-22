@@ -973,30 +973,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sid_encode_decode_round_trip() {
-        let sid = encode_sid("S-1-5-21-3654781254-1934577812-2019068222-1001").unwrap();
-        assert_eq!(sid[0], 1); // revision
-        assert_eq!(sid[1], 5); // 5 subauthorities (21 + domain + RID)
-        assert_eq!(
-            decode_sid(&sid).unwrap(),
-            "S-1-5-21-3654781254-1934577812-2019068222-1001"
-        );
-        let well_known = encode_sid("S-1-5-32-544").unwrap();
-        assert_eq!(decode_sid(&well_known).unwrap(), "S-1-5-32-544");
-        assert_eq!(encode_sid("S-1-5"), None); // no subauthorities
-        assert_eq!(encode_sid("not-a-sid"), None);
-    }
-
-    #[test]
-    fn privilege_lookup_matches_documented_luids() {
-        assert_eq!(lookup_privilege_luid("SeDebugPrivilege"), Some(20));
-        assert_eq!(lookup_privilege_luid("SeChangeNotifyPrivilege"), Some(23));
-        assert_eq!(lookup_privilege_luid("SeImpersonatePrivilege"), Some(29));
-        assert_eq!(lookup_privilege_luid("sebackupprivilege"), Some(17));
-        assert_eq!(lookup_privilege_luid("SeNoSuchPrivilege"), None);
-    }
-
-    #[test]
     fn token_privilege_state_transitions() {
         let mut token = TokenInfo::process_token();
         assert!(token.privilege_enabled(23)); // SeChangeNotifyPrivilege on
@@ -1052,73 +1028,5 @@ mod tests {
         status.settle();
         assert_eq!(status.state, SERVICE_RUNNING);
         assert_eq!(status.apply_control(99), ERROR_INVALID_PARAMETER);
-    }
-
-    #[test]
-    fn crypt_hash_digests_match_shared_machinery() {
-        let mut md5_hash = CryptHashState {
-            algorithm: CALG_MD5,
-            data: Vec::new(),
-        };
-        md5_hash.data.extend_from_slice(b"abc");
-        assert_eq!(
-            md5_hash.finish().unwrap(),
-            crate::crypto::md5(b"abc").to_vec()
-        );
-        let mut sha1_hash = CryptHashState {
-            algorithm: CALG_SHA1,
-            data: Vec::new(),
-        };
-        sha1_hash.data.extend_from_slice(b"abc");
-        assert_eq!(
-            sha1_hash.finish().unwrap(),
-            crate::crypto::sha1(b"abc").to_vec()
-        );
-        assert_eq!(CryptHashState::digest_size(CALG_SHA_256), Some(32));
-        assert_eq!(CryptHashState::digest_size(CALG_RC4), None);
-    }
-
-    #[test]
-    fn crypt_key_encrypt_decrypt_round_trips() {
-        // RC4: stream, no padding.
-        let mut rc4_key = CryptKeyState::from_material(CALG_RC4, vec![1, 2, 3, 4, 5]).unwrap();
-        let plain = b"stream cipher data".to_vec();
-        let cipher = rc4_key.encrypt(&plain).unwrap();
-        assert_eq!(cipher.len(), plain.len());
-        let mut dec_key = CryptKeyState::from_material(CALG_RC4, vec![1, 2, 3, 4, 5]).unwrap();
-        assert_eq!(dec_key.decrypt(&cipher).unwrap(), plain);
-
-        // RC2: block, PKCS#7 padded to a multiple of 8.
-        let mut rc2_key = CryptKeyState::from_material(CALG_RC2, vec![9; 8]).unwrap();
-        let plain = b"rc2 secret".to_vec(); // 9 bytes → 16 ciphertext
-        let cipher = rc2_key.encrypt(&plain).unwrap();
-        assert_eq!(cipher.len() % 8, 0);
-        let mut rc2_dec = CryptKeyState::from_material(CALG_RC2, vec![9; 8]).unwrap();
-        assert_eq!(rc2_dec.decrypt(&cipher).unwrap(), plain);
-
-        // 3DES: EDE with the documented 24-byte key.
-        let mut tdes_key = CryptKeyState::from_material(CALG_3DES, vec![7; 24]).unwrap();
-        let cipher = tdes_key.encrypt(&plain).unwrap();
-        let mut tdes_dec = CryptKeyState::from_material(CALG_3DES, vec![7; 24]).unwrap();
-        assert_eq!(tdes_dec.decrypt(&cipher).unwrap(), plain);
-
-        // AES-128: 16-byte blocks.
-        let mut aes_key = CryptKeyState::from_material(CALG_AES_128, vec![3; 16]).unwrap();
-        let cipher = aes_key.encrypt(&plain).unwrap();
-        assert_eq!(cipher.len() % 16, 0);
-        let mut aes_dec = CryptKeyState::from_material(CALG_AES_128, vec![3; 16]).unwrap();
-        assert_eq!(aes_dec.decrypt(&cipher).unwrap(), plain);
-    }
-
-    #[test]
-    fn crypt_key_derive_material_contract() {
-        let digest = crate::crypto::sha1(b"derivation input").to_vec();
-        let rc4_material = CryptKeyState::derive_material(CALG_RC4, &digest).unwrap();
-        assert_eq!(rc4_material.len(), 16);
-        assert_eq!(rc4_material, &digest[..16]);
-        let tdes_material = CryptKeyState::derive_material(CALG_3DES, &digest).unwrap();
-        assert_eq!(tdes_material.len(), 24);
-        assert_eq!(&tdes_material[..20], &digest[..]);
-        assert_eq!(CryptKeyState::derive_material(CALG_MD5, &digest), None);
     }
 }

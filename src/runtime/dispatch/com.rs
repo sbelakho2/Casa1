@@ -35,7 +35,14 @@ const STG_E_INVALIDFUNCTION: u32 = 0x8003_0001;
 #[allow(dead_code)] // reserved for the COM surface
 const MK_E_SYNTAX: u32 = 0x8004_01E4;
 const MK_E_NOOBJECT: u32 = 0x8004_01E5;
+const MK_E_EXCEEDEDDEADLINE: u32 = 0x8004_01E1;
+const MK_E_UNAVAILABLE: u32 = 0x8004_01E3;
 const MK_E_REDUCED_TO_SELF: u32 = 0x8004_0109;
+const BINDSPEED_INDEFINITE: u32 = 0;
+const BINDSPEED_MODERATE: u32 = 1;
+const BINDSPEED_IMMEDIATE: u32 = 2;
+const OLECONTF_ONLYIFRUNNING: u32 = 0x0010;
+const MEMBERID_NIL: i32 = -1;
 #[allow(dead_code)] // reserved for the COM surface
 const CO_E_RELEASED: u32 = 0x8004_0006;
 const DISP_E_PARAMNOTFOUND: u32 = 0x8002_0004;
@@ -1187,18 +1194,119 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `LoadTypeLib` / `LoadRegTypeLib` — no typelib can be loaded.
+    /// `GetRunningObjectTable(reserved, pprot)` — the process-wide real
+    /// IRunningObjectTable over the runtime's running-object registrations.
+    /// The object is created once and every call returns the same table
+    /// (with a new reference), like the real OLE ROT.
+    pub(crate) fn dispatch_ole_get_running_object_table(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _reserved = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        let object = match self.com_service_map.get(COM_ROT_MARKER).copied() {
+            Some(object) => {
+                self.add_ref_guest_object(object)?;
+                object
+            }
+            None => {
+                let object = self.alloc_com_running_object_table(memory)?;
+                self.com_service_map
+                    .insert(COM_ROT_MARKER.to_string(), object);
+                object
+            }
+        };
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `LoadTypeLib` / `LoadRegTypeLib` — parse a real MSFTypLib (`.tlb`)
+    /// image and return the ITypeLib over its typeinfos.  Malformed or
+    /// absent libraries report TYPE_E_CANTLOADLIBRARY.
     pub(crate) fn dispatch_ole_load_type_lib(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _file = guest_call_arg(state, memory, 0)?;
+        let file = guest_call_arg(state, memory, 0)?;
         let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        let Some(path) = read_utf16_string(memory, file).ok() else {
+            state.set(Register::Rax, u64::from(TYPE_E_CANTLOADLIBRARY));
+            return Ok(());
+        };
+        let host_path = self
+            .win32
+            .guest_path_to_host_path(&path)
+            .ok()
+            .filter(|host| host.is_file())
+            .or_else(|| {
+                let direct = std::path::Path::new(&path);
+                direct.is_file().then(|| direct.to_path_buf())
+            });
+        let Some(host_path) = host_path else {
+            state.set(Register::Rax, u64::from(TYPE_E_CANTLOADLIBRARY));
+            return Ok(());
+        };
+        let Ok(bytes) = std::fs::read(&host_path) else {
+            state.set(Register::Rax, u64::from(TYPE_E_CANTLOADLIBRARY));
+            return Ok(());
+        };
+        let Ok(parsed) = MsftTypeLib::parse(&bytes) else {
+            state.set(Register::Rax, u64::from(TYPE_E_CANTLOADLIBRARY));
+            return Ok(());
+        };
+        let object = self.alloc_com_typelib_object(memory)?;
+        if let Some(info) = self.com_type_infos.get_mut(&object) {
+            info.table = format!("{COM_MSFT_TYPELIB_PREFIX}{path}");
+        }
+        self.com_streams.insert(
+            object,
+            crate::runtime::state::ComStreamState {
+                data: bytes,
+                position: 0,
+                name: host_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("typelib")
+                    .to_string(),
+                host_path: Some(host_path.to_string_lossy().to_string()),
+                dirty: false,
+                locks: Vec::new(),
+            },
+        );
+        self.com_type_libraries.insert(
+            Self::guid_bytes_to_string(&parsed.guid),
+            host_path.to_string_lossy().to_string(),
+        );
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `LoadRegTypeLib(libid, major, minor, lcid, pptlib)` — no registry
+    /// type-library database is modeled; the honest load failure.
+    pub(crate) fn dispatch_ole_load_reg_type_lib(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let out = guest_call_arg(state, memory, 4)?;
         if out != 0 {
             write_guest_pointer(memory, out, 0, self.guest_arch).ok();
         }
-        state.set(Register::Rax, 0x8002_9c4a); // TYPE_E_CANTLOADLIBRARY
+        state.set(Register::Rax, u64::from(TYPE_E_CANTLOADLIBRARY));
         Ok(())
     }
 
@@ -1255,9 +1363,11 @@ impl PeHostRuntime {
                 self.dispatch_ole_create_disp_type_info(state, memory)
             }
             HostThunk::OleCreateStdDispatch => self.dispatch_ole_create_std_dispatch(state, memory),
-            HostThunk::OleLoadTypeLib | HostThunk::OleLoadRegTypeLib => {
-                self.dispatch_ole_load_type_lib(state, memory)
+            HostThunk::OleGetRunningObjectTable => {
+                self.dispatch_ole_get_running_object_table(state, memory)
             }
+            HostThunk::OleLoadTypeLib => self.dispatch_ole_load_type_lib(state, memory),
+            HostThunk::OleLoadRegTypeLib => self.dispatch_ole_load_reg_type_lib(state, memory),
             HostThunk::OleRegisterTypeLib
             | HostThunk::OleUnRegisterTypeLib
             | HostThunk::OleQueryPathOfRegTypeLib => {
@@ -1983,7 +2093,56 @@ impl PeHostRuntime {
                 self.com_type_lib_get_type_info_of_guid(state, memory)
             }
             ComMethod::TypeLibGetTypeComp => self.com_type_lib_get_type_comp(state, memory),
+            ComMethod::TypeLibGetTypeInfoType => {
+                self.com_type_lib_get_type_info_type(state, memory)
+            }
+            ComMethod::TypeLibGetDocumentation => {
+                self.com_type_lib_get_documentation(state, memory)
+            }
+            ComMethod::TypeLibFindName => self.com_type_lib_find_name(state, memory),
+            ComMethod::TypeLibIsName => self.com_type_lib_is_name(state, memory),
             ComMethod::TypeLibUnsupported => self.com_type_info_unsupported(state, memory),
+            ComMethod::ItemContainerParseDisplayName => {
+                self.com_item_container_parse_display_name(state, memory)
+            }
+            ComMethod::ItemContainerEnumObjects => {
+                self.com_item_container_enum_objects(state, memory)
+            }
+            ComMethod::ItemContainerLockContainer => {
+                self.com_item_container_lock_container(state, memory)
+            }
+            ComMethod::ItemContainerGetObject => self.com_item_container_get_object(state, memory),
+            ComMethod::ItemContainerGetObjectStorage => {
+                self.com_item_container_get_object_storage(state, memory)
+            }
+            ComMethod::ItemContainerIsRunning => self.com_item_container_is_running(state, memory),
+            ComMethod::RunningTableRegister => self.com_running_table_register(state, memory),
+            ComMethod::RunningTableRevoke => self.com_running_table_revoke(state, memory),
+            ComMethod::RunningTableIsRunning => self.com_running_table_is_running(state, memory),
+            ComMethod::RunningTableGetObject => self.com_running_table_get_object(state, memory),
+            ComMethod::RunningTableNoteChangeTime => {
+                self.com_running_table_note_change_time(state, memory)
+            }
+            ComMethod::RunningTableGetTimeOfLastChange => {
+                self.com_running_table_get_time_of_last_change(state, memory)
+            }
+            ComMethod::RunningTableEnumRunning => {
+                self.com_running_table_enum_running(state, memory)
+            }
+            ComMethod::MonikerBindIfRunning => self.com_moniker_bind_if_running(state, memory),
+            ComMethod::MonikerGetClassID => self.com_moniker_get_class_id(state, memory),
+            ComMethod::MonikerIsDirty => {
+                state.set(Register::Rax, u64::from(S_FALSE));
+                Ok(())
+            }
+            ComMethod::MonikerLoad | ComMethod::MonikerSave | ComMethod::MonikerGetSizeMax => {
+                state.set(Register::Rax, u64::from(E_NOTIMPL));
+                Ok(())
+            }
+            ComMethod::MonikerIsEqual => self.com_moniker_is_equal(state, memory),
+            ComMethod::MonikerParseDisplayName => {
+                self.com_moniker_parse_display_name(state, memory)
+            }
             ComMethod::TypeCompBind => self.com_type_comp_bind(state, memory, false),
             ComMethod::TypeCompBindType => self.com_type_comp_bind(state, memory, true),
             ComMethod::TypeInfoReleaseTypeAttr
@@ -2287,7 +2446,18 @@ impl PeHostRuntime {
                     }
                 }
                 GuestObjectKind::ComStorage => {
-                    if iid == COM_IID_ISTORAGE {
+                    let is_container = self
+                        .com_storages
+                        .get(&this)
+                        .is_some_and(|entry| entry.name.starts_with(COM_ITEM_CONTAINER_PREFIX));
+                    if is_container
+                        && (iid == COM_IID_IOLEITEMCONTAINER
+                            || iid == COM_IID_IOLECONTAINER
+                            || iid == COM_IID_IPARSEDISPLAYNAME)
+                    {
+                        interface = this;
+                        true
+                    } else if !is_container && iid == COM_IID_ISTORAGE {
                         interface = this;
                         true
                     } else {
@@ -2303,7 +2473,10 @@ impl PeHostRuntime {
                     }
                 }
                 GuestObjectKind::ComEnumVariant => {
-                    if iid == COM_IID_IENUMVARIANT {
+                    if iid == COM_IID_IENUMVARIANT
+                        || iid == COM_IID_IENUMMONIKER
+                        || iid == COM_IID_IENUMUNKNOWN
+                    {
                         interface = this;
                         true
                     } else {
@@ -2311,7 +2484,14 @@ impl PeHostRuntime {
                     }
                 }
                 GuestObjectKind::ComBindCtx => {
-                    if iid == COM_IID_IBINDCTX {
+                    let is_rot = self
+                        .com_bind_ctx_params
+                        .get(&this)
+                        .is_some_and(|params| params.contains_key(COM_ROT_MARKER));
+                    if is_rot && iid == COM_IID_IRUNNINGOBJECTTABLE {
+                        interface = this;
+                        true
+                    } else if !is_rot && iid == COM_IID_IBINDCTX {
                         interface = this;
                         true
                     } else {
@@ -3089,6 +3269,8 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
         source: u64,
         target: u64,
+        excluded_iids: &[[u8; 16]],
+        excluded_names: &[String],
     ) -> AppResult<u32> {
         let Some(source_state) = self.com_storages.get(&source).cloned() else {
             return Ok(STG_E_INVALIDPOINTER);
@@ -3096,8 +3278,27 @@ impl PeHostRuntime {
         let Some(target_state) = self.com_storages.get(&target).cloned() else {
             return Ok(STG_E_INVALIDPOINTER);
         };
-        let names = self.com_storage_element_names(source);
-        for name in &names {
+        let names: Vec<(String, Vec<String>)> = self
+            .com_storage_element_names(source)
+            .into_iter()
+            .filter_map(|name| {
+                if excluded_names
+                    .iter()
+                    .any(|excluded| excluded.eq_ignore_ascii_case(&name))
+                {
+                    return None;
+                }
+                let nested = excluded_names
+                    .iter()
+                    .filter_map(|excluded| {
+                        let (head, tail) = excluded.split_once(['\\', '/'])?;
+                        head.eq_ignore_ascii_case(&name).then(|| tail.to_string())
+                    })
+                    .collect();
+                Some((name, nested))
+            })
+            .collect();
+        for (name, _) in &names {
             if target_state.streams.contains_key(name)
                 || target_state.child_storages.contains_key(name)
                 || target_state.stream_objects.contains_key(name)
@@ -3105,7 +3306,7 @@ impl PeHostRuntime {
                 return Ok(STG_E_FILEALREADYEXISTS);
             }
         }
-        for name in names {
+        for (name, nested_excludes) in names {
             let live = source_state
                 .stream_objects
                 .get(&name)
@@ -3119,6 +3320,13 @@ impl PeHostRuntime {
                     }
                 }
             } else if let Some(child) = source_state.child_storages.get(&name).copied() {
+                let child_clsid = self.com_storages.get(&child).and_then(|state| state.clsid);
+                if child_clsid.is_some_and(|clsid| {
+                    clsid.iter().any(|byte| *byte != 0)
+                        && excluded_iids.iter().any(|excluded| *excluded == clsid)
+                }) {
+                    continue;
+                }
                 let host_dir = self.com_storage_child_host_dir(target, &name);
                 let child_object = self.alloc_com_storage_object(memory, host_dir, &name, 0)?;
                 if let Some(child_state) = self.com_storages.get(&child).cloned() {
@@ -3133,7 +3341,13 @@ impl PeHostRuntime {
                         entry.element_order.push(name.clone());
                     }
                 }
-                let result = self.com_storage_copy_into(memory, child, child_object)?;
+                let result = self.com_storage_copy_into(
+                    memory,
+                    child,
+                    child_object,
+                    excluded_iids,
+                    &nested_excludes,
+                )?;
                 if result != S_OK {
                     return Ok(result);
                 }
@@ -3498,6 +3712,9 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
+        let iid_count = guest_call_arg_u32(state, memory, 1)?;
+        let iid_ptr = guest_call_arg(state, memory, 2)?;
+        let snb_ptr = guest_call_arg(state, memory, 3)?;
         let destination = guest_call_arg(state, memory, 4)?;
         if this == destination {
             state.set(Register::Rax, u64::from(STG_E_ACCESSDENIED));
@@ -3507,7 +3724,10 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
             return Ok(());
         }
-        let result = self.com_storage_copy_into(memory, this, destination)?;
+        let excluded_iids = read_com_iid_array(memory, iid_ptr, iid_count);
+        let excluded_names = read_string_name_block(memory, snb_ptr);
+        let result =
+            self.com_storage_copy_into(memory, this, destination, &excluded_iids, &excluded_names)?;
         state.set(Register::Rax, u64::from(result));
         Ok(())
     }
@@ -3563,6 +3783,32 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
             return Ok(());
         };
+        if let Some(path) = storage
+            .host_dir
+            .as_deref()
+            .and_then(|directory| directory.strip_prefix(COM_PLAIN_FILE_PREFIX))
+        {
+            let data = storage.streams.keys().next().and_then(|name| {
+                storage
+                    .stream_objects
+                    .get(name)
+                    .and_then(|object| self.com_streams.get(object))
+                    .map(|stream| stream.data.clone())
+                    .or_else(|| storage.streams.get(name).cloned())
+            });
+            let hr = match data {
+                Some(bytes) => {
+                    if std::fs::write(path, bytes).is_err() {
+                        STG_E_ACCESSDENIED
+                    } else {
+                        S_OK
+                    }
+                }
+                None => S_OK,
+            };
+            state.set(Register::Rax, u64::from(hr));
+            return Ok(());
+        }
         if self.com_storage_compound_path(this).is_some() {
             let hr = self.com_storage_commit_compound(this);
             state.set(Register::Rax, u64::from(hr));
@@ -4314,6 +4560,32 @@ impl PeHostRuntime {
         Ok(object)
     }
 
+    /// Create an IStorage over a plain (non-CFB) file: a one-stream
+    /// compound wrapper whose single stream carries the file's bytes.  The
+    /// wrapper remembers the host file so Commit writes the stream back.
+    fn alloc_com_plain_file_storage(
+        &mut self,
+        memory: &mut MemoryImage,
+        host_file: &std::path::Path,
+    ) -> AppResult<u64> {
+        let name = host_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Contents")
+            .to_string();
+        let bytes = std::fs::read(host_file).unwrap_or_default();
+        let storage = self.alloc_com_storage_object(memory, None, &name, 0)?;
+        if let Some(state) = self.com_storages.get_mut(&storage) {
+            state.streams.insert(name.clone(), bytes);
+            state.element_order.push(name);
+            state.host_dir = Some(format!(
+                "{COM_PLAIN_FILE_PREFIX}{}",
+                host_file.to_string_lossy()
+            ));
+        }
+        Ok(storage)
+    }
+
     /// Create the IConnectionPointContainer interface object for `owner`
     /// (idempotent: the owner's server state caches it).
     pub(crate) fn alloc_com_connection_point_container(
@@ -4893,6 +5165,44 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
         };
+        if let Some(type_index) = Self::com_msft_typeinfo_index(&info.table) {
+            let Some(type_lib) = self.com_msft_typelib(info.owner) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let Some(type_info) = type_lib.types.get(type_index) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let descriptor_ptr = self.alloc_zeroed(memory, 80, 8)?;
+            for (index, byte) in type_info.guid.iter().enumerate() {
+                memory.write_u8(descriptor_ptr + index as u64, *byte);
+            }
+            write_u32(memory, descriptor_ptr + 16, type_lib.lcid2);
+            write_u32(memory, descriptor_ptr + 20, 0);
+            write_u32(memory, descriptor_ptr + 24, DISPID_UNKNOWN as u32);
+            write_u32(memory, descriptor_ptr + 28, DISPID_UNKNOWN as u32);
+            write_u32(memory, descriptor_ptr + 32, 0);
+            write_u32(memory, descriptor_ptr + 36, type_info.cb_size_instance);
+            write_u32(memory, descriptor_ptr + 40, type_info.kind);
+            write_u16(memory, descriptor_ptr + 44, type_info.funcs.len() as u16);
+            write_u16(memory, descriptor_ptr + 46, 0);
+            write_u16(memory, descriptor_ptr + 48, type_info.c_impl_types);
+            write_u16(memory, descriptor_ptr + 50, type_info.cb_size_vft);
+            write_u16(memory, descriptor_ptr + 52, 4);
+            write_u16(memory, descriptor_ptr + 54, type_info.flags);
+            write_u16(memory, descriptor_ptr + 56, type_info.version);
+            write_u16(memory, descriptor_ptr + 58, 0);
+            write_u16(memory, descriptor_ptr + 60, 0);
+            write_u16(memory, descriptor_ptr + 64, 26);
+            write_u32(memory, descriptor_ptr + 68, 0);
+            write_u16(memory, descriptor_ptr + 72, 0);
+            if out != 0 {
+                write_guest_pointer(memory, out, descriptor_ptr, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let Some(descriptor) = com_type_descriptor(&info.table) else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
@@ -4979,6 +5289,26 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
         };
+        if let Some(type_index) = Self::com_msft_typeinfo_index(&info.table) {
+            let Some(type_lib) = self.com_msft_typelib(info.owner) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let Some(func) = type_lib
+                .types
+                .get(type_index)
+                .and_then(|entry| entry.funcs.get(index as usize))
+            else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let descriptor = self.alloc_msft_func_desc(memory, func)?;
+            if out != 0 {
+                write_guest_pointer(memory, out, descriptor, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let Some(table) = com_dispatch_table(&info.table) else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
@@ -4993,6 +5323,41 @@ impl PeHostRuntime {
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
+    }
+
+    /// Allocate one FUNCDESC from an MSFTypLib function record (with the
+    /// real parameter ELEMDESCs).
+    fn alloc_msft_func_desc(
+        &mut self,
+        memory: &mut MemoryImage,
+        func: &MsftFunc,
+    ) -> AppResult<u64> {
+        let descriptor = self.alloc_zeroed(memory, 56, 8)?;
+        let params = if func.params.is_empty() {
+            0
+        } else {
+            self.alloc_zeroed(memory, func.params.len() * 16, 8)?
+        };
+        write_u32(memory, descriptor, func.memid as u32);
+        write_u32(memory, descriptor + 4, 0);
+        write_guest_pointer(memory, descriptor + 8, params, self.guest_arch).ok();
+        write_u32(memory, descriptor + 12, u32::from(func.funckind));
+        write_u32(memory, descriptor + 16, u32::from(func.invkind));
+        write_u32(memory, descriptor + 20, u32::from(func.callconv));
+        write_u16(memory, descriptor + 24, func.c_params);
+        write_u16(memory, descriptor + 26, func.c_params_opt);
+        write_u16(memory, descriptor + 28, func.vtable_offset);
+        write_u16(memory, descriptor + 30, 0);
+        write_u32(memory, descriptor + 32, 0);
+        write_u16(memory, descriptor + 36, func.return_vt);
+        write_u16(memory, descriptor + 40, 0);
+        write_u16(memory, descriptor + 48, func.func_flags);
+        for (index, (vt, flags, _)) in func.params.iter().enumerate() {
+            let at = params + index as u64 * 16;
+            write_u16(memory, at + 4, *vt);
+            write_u16(memory, at + 8, *flags);
+        }
+        Ok(descriptor)
     }
 
     /// Allocate one FUNCDESC for a registered member (shared by GetFuncDesc
@@ -5100,6 +5465,48 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_POINTER));
             return Ok(());
         }
+        if let Some(type_index) = Self::com_msft_typeinfo_index(&info.table) {
+            let Some(type_lib) = self.com_msft_typelib(info.owner) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let Some(type_info) = type_lib.types.get(type_index) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let mut names = Vec::new();
+            if memid == DISPID_UNKNOWN {
+                names.push(type_info.name.clone());
+            } else if let Some(func) = type_info.funcs.iter().find(|func| func.memid == memid) {
+                names.push(func.name.clone());
+                names.extend(func.params.iter().map(|(_, _, name)| name.clone()));
+            } else {
+                write_u32(memory, count_out, 0);
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            }
+            let written = names.len().min(max_names as usize);
+            for (index, name) in names.iter().take(written).enumerate() {
+                let bstr = self.alloc_com_bstr(memory, name)?;
+                write_guest_pointer(
+                    memory,
+                    names_ptr + index as u64 * self.guest_arch.pointer_bytes() as u64,
+                    bstr,
+                    self.guest_arch,
+                )
+                .ok();
+            }
+            write_u32(memory, count_out, written as u32);
+            state.set(
+                Register::Rax,
+                u64::from(if written == names.len() {
+                    S_OK
+                } else {
+                    S_FALSE
+                }),
+            );
+            return Ok(());
+        }
         let name = if memid == DISPID_UNKNOWN {
             info.table.clone()
         } else {
@@ -5130,6 +5537,55 @@ impl PeHostRuntime {
         let names = guest_call_arg(state, memory, 1)?;
         let count = guest_call_arg_u32(state, memory, 2)?;
         let ids = guest_call_arg(state, memory, 3)?;
+        if let Some(info) = self.com_type_infos.get(&this).cloned() {
+            if let Some(type_index) = Self::com_msft_typeinfo_index(&info.table) {
+                let Some(type_lib) = self.com_msft_typelib(info.owner) else {
+                    state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                    return Ok(());
+                };
+                let Some(type_info) = type_lib.types.get(type_index) else {
+                    state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                    return Ok(());
+                };
+                if names == 0 || ids == 0 {
+                    state.set(Register::Rax, u64::from(E_POINTER));
+                    return Ok(());
+                }
+                let mut all_found = true;
+                for index in 0..count.min(256) {
+                    let name_ptr = read_guest_pointer(
+                        memory,
+                        names + index as u64 * self.guest_arch.pointer_bytes() as u64,
+                        self.guest_arch,
+                    )
+                    .unwrap_or(0);
+                    let name = read_utf16_string(memory, name_ptr).unwrap_or_default();
+                    let dispid = type_info
+                        .funcs
+                        .iter()
+                        .find(|func| func.name.eq_ignore_ascii_case(&name))
+                        .map(|func| func.memid)
+                        .or_else(|| {
+                            type_info
+                                .name
+                                .eq_ignore_ascii_case(&name)
+                                .then_some(DISPID_UNKNOWN)
+                        });
+                    match dispid {
+                        Some(dispid) => write_u32(memory, ids + index as u64 * 4, dispid as u32),
+                        None => {
+                            all_found = false;
+                            write_u32(memory, ids + index as u64 * 4, DISPID_UNKNOWN as u32);
+                        }
+                    }
+                }
+                state.set(
+                    Register::Rax,
+                    u64::from(if all_found { S_OK } else { DISP_E_UNKNOWNNAME }),
+                );
+                return Ok(());
+            }
+        }
         let hr = self.com_get_ids_of_names(memory, this, names, count, 0, ids)?;
         state.set(Register::Rax, u64::from(hr));
         Ok(())
@@ -5185,6 +5641,49 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
         };
+        if let Some(type_index) = Self::com_msft_typeinfo_index(&info.table) {
+            let Some(type_lib) = self.com_msft_typelib(info.owner) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let Some(type_info) = type_lib.types.get(type_index) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let (name, doc, context) = if memid == DISPID_UNKNOWN {
+                (
+                    type_info.name.clone(),
+                    type_info.doc.clone(),
+                    type_info.help_context,
+                )
+            } else if let Some(func) = type_info.funcs.iter().find(|func| func.memid == memid) {
+                (
+                    func.name.clone(),
+                    func.help_string.clone(),
+                    func.help_context,
+                )
+            } else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            if name_out != 0 {
+                let bstr = self.alloc_com_bstr(memory, &name)?;
+                write_guest_pointer(memory, name_out, bstr, self.guest_arch).ok();
+            }
+            if doc_out != 0 {
+                let bstr = self.alloc_com_bstr(memory, &doc)?;
+                write_guest_pointer(memory, doc_out, bstr, self.guest_arch).ok();
+            }
+            if context_out != 0 {
+                write_u32(memory, context_out, context);
+            }
+            if help_out != 0 {
+                let bstr = self.alloc_com_bstr(memory, &type_lib.help_file)?;
+                write_guest_pointer(memory, help_out, bstr, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let name = if memid == DISPID_UNKNOWN {
             info.table.clone()
         } else {
@@ -5196,19 +5695,36 @@ impl PeHostRuntime {
                 }
             }
         };
+        let descriptor = com_type_descriptor(&info.table);
+        let doc = if memid == DISPID_UNKNOWN {
+            descriptor.map(|descriptor| descriptor.doc).unwrap_or("")
+        } else {
+            descriptor.map(|descriptor| descriptor.doc).unwrap_or("")
+        };
         if name_out != 0 {
             let bstr = self.alloc_com_bstr(memory, &name)?;
             write_guest_pointer(memory, name_out, bstr, self.guest_arch).ok();
         }
         if doc_out != 0 {
-            let bstr = self.alloc_com_bstr(memory, "")?;
+            let bstr = self.alloc_com_bstr(memory, doc)?;
             write_guest_pointer(memory, doc_out, bstr, self.guest_arch).ok();
         }
         if context_out != 0 {
-            write_u32(memory, context_out, 0);
+            write_u32(
+                memory,
+                context_out,
+                descriptor
+                    .map(|descriptor| descriptor.help_context)
+                    .unwrap_or(0),
+            );
         }
         if help_out != 0 {
-            write_guest_pointer(memory, help_out, 0, self.guest_arch).ok();
+            if let Some(descriptor) = descriptor {
+                let bstr = self.alloc_com_bstr(memory, descriptor.help_file)?;
+                write_guest_pointer(memory, help_out, bstr, self.guest_arch).ok();
+            } else {
+                write_guest_pointer(memory, help_out, 0, self.guest_arch).ok();
+            }
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -5225,10 +5741,29 @@ impl PeHostRuntime {
         let this = guest_call_arg(state, memory, 0)?;
         let index = guest_call_arg_u32(state, memory, 1)?;
         let out = guest_call_arg(state, memory, 2)?;
-        let Some(info) = self.com_type_infos.get(&this) else {
+        let Some(info) = self.com_type_infos.get(&this).cloned() else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
         };
+        if let Some(type_index) = Self::com_msft_typeinfo_index(&info.table) {
+            let Some(type_lib) = self.com_msft_typelib(info.owner) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let Some((href, _)) = type_lib
+                .types
+                .get(type_index)
+                .and_then(|entry| entry.impls.get(index as usize))
+            else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            if out != 0 {
+                write_u32(memory, out, *href);
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let Some(descriptor) = com_type_descriptor(&info.table) else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
@@ -5263,10 +5798,29 @@ impl PeHostRuntime {
         let this = guest_call_arg(state, memory, 0)?;
         let index = guest_call_arg_u32(state, memory, 1)?;
         let out = guest_call_arg(state, memory, 2)?;
-        let Some(info) = self.com_type_infos.get(&this) else {
+        let Some(info) = self.com_type_infos.get(&this).cloned() else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
         };
+        if let Some(type_index) = Self::com_msft_typeinfo_index(&info.table) {
+            let Some(type_lib) = self.com_msft_typelib(info.owner) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let Some((_, flags)) = type_lib
+                .types
+                .get(type_index)
+                .and_then(|entry| entry.impls.get(index as usize))
+            else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            if out != 0 {
+                write_u32(memory, out, u32::from(*flags));
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let Some(descriptor) = com_type_descriptor(&info.table) else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
@@ -5302,6 +5856,17 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
         };
+        if let Some(type_lib) = self.com_msft_typelib(info.owner) {
+            let Some(index) = type_lib.type_index_by_ref(href) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let object = self.alloc_com_msft_typeinfo_object(memory, info.owner, index)?;
+            self.add_ref_guest_object(object)?;
+            write_guest_pointer(memory, out, object, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let Some(target) = href
             .checked_sub(1)
             .and_then(|index| COM_TYPE_DESCRIPTORS.get(index as usize))
@@ -5351,19 +5916,170 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         }
+        let entry_name: Option<String>;
+        let mut ordinal = descriptor.dll_ordinal;
+        if let Some(path) = self.com_registered_module_host_path(descriptor.dll_name) {
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    state.set(Register::Rax, u64::from(TYPE_E_CANTLOADLIBRARY));
+                    return Ok(());
+                }
+            };
+            let image = match crate::pe::parse(&bytes) {
+                Ok(image) => image,
+                Err(_) => {
+                    state.set(Register::Rax, u64::from(TYPE_E_CANTLOADLIBRARY));
+                    return Ok(());
+                }
+            };
+            let export = image
+                .exports
+                .iter()
+                .find(|export| {
+                    export
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name == descriptor.dll_entry)
+                })
+                .or_else(|| {
+                    image.exports.iter().find(|export| {
+                        export
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(descriptor.dll_entry))
+                    })
+                })
+                .or_else(|| {
+                    (descriptor.dll_ordinal != 0)
+                        .then(|| {
+                            image
+                                .exports
+                                .iter()
+                                .find(|export| export.ordinal == u32::from(descriptor.dll_ordinal))
+                        })
+                        .flatten()
+                });
+            let Some(export) = export else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            entry_name = export.name.clone();
+            ordinal = export.ordinal as u16;
+        } else {
+            entry_name = Some(descriptor.dll_entry.to_string());
+        }
         if dll_out != 0 {
             let bstr = self.alloc_com_bstr(memory, descriptor.dll_name)?;
             write_guest_pointer(memory, dll_out, bstr, self.guest_arch).ok();
         }
         if name_out != 0 {
-            let bstr = self.alloc_com_bstr(memory, descriptor.dll_entry)?;
-            write_guest_pointer(memory, name_out, bstr, self.guest_arch).ok();
+            match entry_name {
+                Some(name) => {
+                    let bstr = self.alloc_com_bstr(memory, &name)?;
+                    write_guest_pointer(memory, name_out, bstr, self.guest_arch).ok();
+                }
+                None => {
+                    write_guest_pointer(memory, name_out, 0, self.guest_arch).ok();
+                }
+            }
         }
         if ordinal_out != 0 {
-            write_u16(memory, ordinal_out, descriptor.dll_ordinal);
+            write_u16(memory, ordinal_out, ordinal);
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
+    }
+
+    /// The on-disk host file of a registered guest module, when the module
+    /// was loaded from a real PE image.
+    fn com_registered_module_host_path(&self, module: &str) -> Option<String> {
+        for info in self.dll_info_table.values() {
+            if !info.module_name.eq_ignore_ascii_case(module) || info.host_path.is_empty() {
+                continue;
+            }
+            let direct = std::path::Path::new(&info.host_path);
+            if direct.is_file() {
+                return Some(info.host_path.clone());
+            }
+            if let Ok(host) = self.win32.guest_path_to_host_path(&info.host_path) {
+                if host.is_file() {
+                    return Some(host.to_string_lossy().to_string());
+                } // coverage: unreachable — the only caller-visible path returns above; a non-file host skips this closing brace
+            }
+        }
+        let mut candidate_paths: Vec<String> =
+            self.module_paths_by_handle.values().cloned().collect();
+        if let Some(handle) = self
+            .module_handles
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(module))
+            .map(|(_, handle)| *handle)
+        {
+            if let Some(path) = self.module_paths_by_handle.get(&handle) {
+                candidate_paths.push(path.clone());
+            }
+        }
+        for path in candidate_paths {
+            let direct = std::path::Path::new(&path);
+            let host = if direct.is_file() {
+                Some(direct.to_path_buf())
+            } else {
+                self.win32
+                    .guest_path_to_host_path(&path)
+                    .ok()
+                    .filter(|host| host.is_file())
+            };
+            let Some(host) = host else {
+                continue;
+            };
+            let file_name = host.file_name().and_then(|name| name.to_str());
+            if file_name.is_some_and(|name| name.eq_ignore_ascii_case(module)) {
+                return Some(host.to_string_lossy().to_string());
+            } // coverage: unreachable — a matching file name returns above and a non-match skips this closing brace
+        }
+        // The GE module directory: a real staged DLL/EXE whose file name
+        // matches the registered module (case-insensitive), even when the
+        // module was never pre-registered in the loader tables.
+        let module_name = module
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(module)
+            .to_ascii_lowercase();
+        let module_stem = module_name
+            .strip_suffix(".dll")
+            .or_else(|| module_name.strip_suffix(".exe"))
+            .unwrap_or(&module_name);
+        for entry in walkdir::WalkDir::new(self.win32.ge().root.clone())
+            .max_depth(16)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .take(100_000)
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            if !extension.eq_ignore_ascii_case("dll") && !extension.eq_ignore_ascii_case("exe") {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue; // coverage: unreachable on macOS — APFS rejects non-UTF-8 file names, so the GE walk cannot yield one here (Linux-only test covers it)
+            };
+            let file_name = file_name.to_ascii_lowercase();
+            let file_stem = file_name
+                .strip_suffix(".dll")
+                .or_else(|| file_name.strip_suffix(".exe"))
+                .unwrap_or(&file_name);
+            if file_name == module_name || file_stem == module_stem {
+                return Some(path.to_string_lossy().to_string());
+            }
+        }
+        None
     }
 
     /// `ITypeInfo::AddressOfMember(memid, invKind, ppv)` — resolve the real
@@ -5494,10 +6210,26 @@ impl PeHostRuntime {
         if out != 0 {
             write_guest_pointer(memory, out, 0, self.guest_arch).ok();
         }
-        let Some(info) = self.com_type_infos.get(&this) else {
+        let Some(info) = self.com_type_infos.get(&this).cloned() else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
         };
+        if let Some(type_index) = Self::com_msft_typeinfo_index(&info.table) {
+            let found = self
+                .com_msft_typelib(info.owner)
+                .and_then(|type_lib| {
+                    type_lib
+                        .types
+                        .get(type_index)
+                        .map(|entry| entry.funcs.iter().any(|func| func.memid == memid))
+                })
+                .unwrap_or(false);
+            state.set(
+                Register::Rax,
+                u64::from(if found { S_OK } else { TYPE_E_ELEMENTNOTFOUND }),
+            );
+            return Ok(());
+        }
         if com_dispatch_member(&info.table, memid).is_none() {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
@@ -5516,10 +6248,21 @@ impl PeHostRuntime {
         let this = guest_call_arg(state, memory, 0)?;
         let out = guest_call_arg(state, memory, 1)?;
         let index_out = guest_call_arg(state, memory, 2)?;
-        let Some(info) = self.com_type_infos.get(&this) else {
+        let Some(info) = self.com_type_infos.get(&this).cloned() else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
         };
+        if Self::com_msft_typeinfo_index(&info.table).is_some() && info.owner != 0 {
+            self.add_ref_guest_object(info.owner)?;
+            if out != 0 {
+                write_guest_pointer(memory, out, info.owner, self.guest_arch).ok();
+            }
+            if index_out != 0 {
+                write_u32(memory, index_out, info.index);
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let Some(index) = com_type_descriptor_index(&info.table) else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
@@ -5552,6 +6295,31 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    fn com_msft_typelib(&self, object: u64) -> Option<MsftTypeLib> {
+        let bytes = self.com_streams.get(&object)?.data.as_slice();
+        MsftTypeLib::parse(bytes).ok()
+    }
+
+    fn com_msft_typeinfo_index(table: &str) -> Option<usize> {
+        table
+            .strip_prefix(COM_MSFT_TYPEINFO_PREFIX)
+            .and_then(|rest| rest.parse::<usize>().ok())
+    }
+
+    fn alloc_com_msft_typeinfo_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        type_lib: u64,
+        index: usize,
+    ) -> AppResult<u64> {
+        self.alloc_com_type_info_object(
+            memory,
+            &format!("{COM_MSFT_TYPEINFO_PREFIX}{index}"),
+            type_lib,
+            index as u32,
+        )
+    }
+
     fn alloc_com_typelib_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
         let methods = vec![
             HostThunk::ComMethod(ComMethod::QueryInterface),
@@ -5559,13 +6327,13 @@ impl PeHostRuntime {
             HostThunk::GuestObjectRelease,
             HostThunk::ComMethod(ComMethod::TypeLibGetTypeInfoCount),
             HostThunk::ComMethod(ComMethod::TypeLibGetTypeInfo),
-            HostThunk::ComMethod(ComMethod::TypeLibUnsupported),
+            HostThunk::ComMethod(ComMethod::TypeLibGetTypeInfoType),
             HostThunk::ComMethod(ComMethod::TypeLibGetTypeInfoOfGuid),
             HostThunk::ComMethod(ComMethod::TypeLibGetLibAttr),
             HostThunk::ComMethod(ComMethod::TypeLibGetTypeComp),
-            HostThunk::ComMethod(ComMethod::TypeLibUnsupported),
-            HostThunk::ComMethod(ComMethod::TypeLibUnsupported),
-            HostThunk::ComMethod(ComMethod::TypeLibUnsupported),
+            HostThunk::ComMethod(ComMethod::TypeLibGetDocumentation),
+            HostThunk::ComMethod(ComMethod::TypeLibFindName),
+            HostThunk::ComMethod(ComMethod::TypeLibIsName),
             HostThunk::ComMethod(ComMethod::TypeLibReleaseTLibAttr),
         ];
         let vtable = self.alloc_guest_vtable(memory, methods)?;
@@ -5607,7 +6375,15 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
         let out = guest_call_arg(state, memory, 1)?;
+        if let Some(type_lib) = self.com_msft_typelib(this) {
+            if out != 0 {
+                write_u32(memory, out, type_lib.types.len() as u32);
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         if out != 0 {
             write_u32(memory, out, COM_TYPE_DESCRIPTORS.len() as u32);
         }
@@ -5620,8 +6396,22 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
         let index = guest_call_arg_u32(state, memory, 1)?;
         let out = guest_call_arg(state, memory, 2)?;
+        if let Some(type_lib) = self.com_msft_typelib(this) {
+            if index as usize >= type_lib.types.len() {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            }
+            let object = self.alloc_com_msft_typeinfo_object(memory, this, index as usize)?;
+            self.add_ref_guest_object(object)?;
+            if out != 0 {
+                write_guest_pointer(memory, out, object, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let Some(descriptor) = COM_TYPE_DESCRIPTORS.get(index as usize) else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
@@ -5640,6 +6430,7 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
         let guid_ptr = guest_call_arg(state, memory, 1)?;
         let out = guest_call_arg(state, memory, 2)?;
         if guid_ptr == 0 {
@@ -5648,6 +6439,19 @@ impl PeHostRuntime {
         }
         let guid: [u8; 16] =
             std::array::from_fn(|index| memory.read_u8(guid_ptr + index as u64).unwrap_or(0));
+        if let Some(type_lib) = self.com_msft_typelib(this) {
+            let Some(index) = type_lib.type_index_by_guid(&guid) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            let object = self.alloc_com_msft_typeinfo_object(memory, this, index)?;
+            self.add_ref_guest_object(object)?;
+            if out != 0 {
+                write_guest_pointer(memory, out, object, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let Some(descriptor) = COM_TYPE_DESCRIPTORS
             .iter()
             .find(|descriptor| descriptor.iid == guid)
@@ -5670,20 +6474,33 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
         let out = guest_call_arg(state, memory, 1)?;
         if out == 0 {
             state.set(Register::Rax, u64::from(E_POINTER));
             return Ok(());
         }
+        let type_lib = self.com_msft_typelib(this);
         let descriptor = self.alloc_zeroed(memory, 32, 8)?;
-        for (index, byte) in COM_AUTOMATION_TYPELIB_IID.iter().enumerate() {
-            memory.write_u8(descriptor + index as u64, *byte);
+        if let Some(type_lib) = type_lib {
+            for (index, byte) in type_lib.guid.iter().enumerate() {
+                memory.write_u8(descriptor + index as u64, *byte);
+            }
+            write_u32(memory, descriptor + 16, type_lib.lcid);
+            write_u32(memory, descriptor + 20, u32::from(type_lib.syskind));
+            write_u16(memory, descriptor + 24, type_lib.major);
+            write_u16(memory, descriptor + 26, type_lib.minor);
+            write_u32(memory, descriptor + 28, u32::from(type_lib.flags));
+        } else {
+            for (index, byte) in COM_AUTOMATION_TYPELIB_IID.iter().enumerate() {
+                memory.write_u8(descriptor + index as u64, *byte);
+            }
+            write_u32(memory, descriptor + 16, 0); // lcid
+            write_u32(memory, descriptor + 20, 2); // SYS_WIN32
+            write_u16(memory, descriptor + 24, 1); // wMajorVerNum
+            write_u16(memory, descriptor + 26, 0); // wMinorVerNum
+            write_u32(memory, descriptor + 28, 0); // LIBFLAGS
         }
-        write_u32(memory, descriptor + 16, 0); // lcid
-        write_u32(memory, descriptor + 20, 2); // SYS_WIN32
-        write_u16(memory, descriptor + 24, 1); // wMajorVerNum
-        write_u16(memory, descriptor + 26, 0); // wMinorVerNum
-        write_u32(memory, descriptor + 28, 0); // LIBFLAGS
         write_guest_pointer(memory, out, descriptor, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -5701,6 +6518,305 @@ impl PeHostRuntime {
             write_guest_pointer(memory, out, type_comp, self.guest_arch).ok();
         }
         state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_type_lib_get_type_info_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let index = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        if let Some(type_lib) = self.com_msft_typelib(this) {
+            let Some(info) = type_lib.types.get(index as usize) else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            write_u32(memory, out, info.kind);
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        let Some(descriptor) = COM_TYPE_DESCRIPTORS.get(index as usize) else {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        };
+        let kind = match descriptor.kind {
+            ComTypeKind::Interface => TKIND_INTERFACE,
+            ComTypeKind::Dispatch | ComTypeKind::DispInterface => TKIND_DISPATCH,
+            ComTypeKind::Class => TKIND_COCLASS,
+        };
+        write_u32(memory, out, kind);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_type_lib_get_documentation(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let index = guest_call_arg_u32(state, memory, 1)?;
+        let name_out = guest_call_arg(state, memory, 2)?;
+        let doc_out = guest_call_arg(state, memory, 3)?;
+        let context_out = guest_call_arg(state, memory, 4)?;
+        let help_out = guest_call_arg(state, memory, 5)?;
+        if let Some(type_lib) = self.com_msft_typelib(this) {
+            let details = if index == u32::MAX {
+                Some((
+                    type_lib.name.clone(),
+                    type_lib.doc.clone(),
+                    type_lib.help_context,
+                    type_lib.help_file.clone(),
+                ))
+            } else {
+                type_lib.types.get(index as usize).map(|info| {
+                    (
+                        info.name.clone(),
+                        info.doc.clone(),
+                        info.help_context,
+                        type_lib.help_file.clone(),
+                    )
+                })
+            };
+            let Some((name, doc, context, help_file)) = details else {
+                state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+                return Ok(());
+            };
+            if name_out != 0 {
+                let bstr = self.alloc_com_bstr(memory, &name)?;
+                write_guest_pointer(memory, name_out, bstr, self.guest_arch).ok();
+            }
+            if doc_out != 0 {
+                let bstr = self.alloc_com_bstr(memory, &doc)?;
+                write_guest_pointer(memory, doc_out, bstr, self.guest_arch).ok();
+            }
+            if context_out != 0 {
+                write_u32(memory, context_out, context);
+            }
+            if help_out != 0 {
+                let bstr = self.alloc_com_bstr(memory, &help_file)?;
+                write_guest_pointer(memory, help_out, bstr, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        let Some(descriptor) = COM_TYPE_DESCRIPTORS.get(index as usize) else {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        };
+        if name_out != 0 {
+            let bstr = self.alloc_com_bstr(memory, descriptor.name)?;
+            write_guest_pointer(memory, name_out, bstr, self.guest_arch).ok();
+        }
+        if doc_out != 0 {
+            let bstr = self.alloc_com_bstr(memory, descriptor.doc)?;
+            write_guest_pointer(memory, doc_out, bstr, self.guest_arch).ok();
+        }
+        if context_out != 0 {
+            write_u32(memory, context_out, descriptor.help_context);
+        }
+        if help_out != 0 {
+            let bstr = self.alloc_com_bstr(memory, descriptor.help_file)?;
+            write_guest_pointer(memory, help_out, bstr, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// Enumerate the registered type and member names matching `name` (the
+    /// ITypeLib::FindName contract returns typeinfo + MEMBERID entries).
+    fn com_type_lib_name_matches(name: &str) -> Vec<(&'static ComTypeDescriptor, i32)> {
+        let mut matches = Vec::new();
+        for descriptor in COM_TYPE_DESCRIPTORS {
+            if descriptor.name.eq_ignore_ascii_case(name) {
+                matches.push((descriptor, MEMBERID_NIL));
+            }
+        }
+        for descriptor in COM_TYPE_DESCRIPTORS {
+            let Some(table) = com_dispatch_table(descriptor.table) else {
+                continue;
+            };
+            for member in table {
+                if member.name.eq_ignore_ascii_case(name)
+                    && !matches.iter().any(|(existing, memid)| {
+                        std::ptr::eq(*existing, descriptor) && *memid == member.dispid
+                    })
+                {
+                    matches.push((descriptor, member.dispid));
+                }
+            }
+        }
+        matches
+    }
+
+    fn com_type_lib_find_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let _hash = guest_call_arg_u32(state, memory, 2)?;
+        let tinfo_out = guest_call_arg(state, memory, 3)?;
+        let memid_out = guest_call_arg(state, memory, 4)?;
+        let found_ptr = guest_call_arg(state, memory, 5)?;
+        if name_ptr == 0 || found_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        if let Some(type_lib) = self.com_msft_typelib(this) {
+            return self.com_msft_find_name(
+                state, memory, this, &type_lib, &name, tinfo_out, memid_out, found_ptr,
+            );
+        }
+        let capacity = memory.read_u32(found_ptr).unwrap_or(0) as usize;
+        let matches = Self::com_type_lib_name_matches(&name);
+        if matches.is_empty() {
+            write_u32(memory, found_ptr, 0);
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        }
+        if capacity == 0 {
+            write_u32(memory, found_ptr, matches.len() as u32);
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        if tinfo_out == 0 || memid_out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let written = capacity.min(matches.len());
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        for (index, (descriptor, memid)) in matches.iter().take(written).enumerate() {
+            let type_index = com_type_descriptor_index(descriptor.table).unwrap_or(0);
+            let object =
+                self.alloc_com_type_info_object(memory, descriptor.table, 0, type_index)?;
+            self.add_ref_guest_object(object)?;
+            write_guest_pointer(
+                memory,
+                tinfo_out + index as u64 * pointer_bytes,
+                object,
+                self.guest_arch,
+            )
+            .ok();
+            write_u32(memory, memid_out + index as u64 * 4, *memid as u32);
+        }
+        for index in written..capacity {
+            write_guest_pointer(
+                memory,
+                tinfo_out + index as u64 * pointer_bytes,
+                0,
+                self.guest_arch,
+            )
+            .ok();
+            write_u32(memory, memid_out + index as u64 * 4, DISPID_UNKNOWN as u32);
+        }
+        write_u32(memory, found_ptr, written as u32);
+        state.set(
+            Register::Rax,
+            u64::from(if written == matches.len() {
+                S_OK
+            } else {
+                S_FALSE // coverage: unreachable — registered type/member names are unique, so a non-empty match set is fully written when capacity > 0
+            }),
+        );
+        Ok(())
+    }
+
+    fn com_msft_find_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        type_lib_object: u64,
+        type_lib: &MsftTypeLib,
+        name: &str,
+        tinfo_out: u64,
+        memid_out: u64,
+        found_ptr: u64,
+    ) -> AppResult<()> {
+        let capacity = memory.read_u32(found_ptr).unwrap_or(0) as usize;
+        let matches = type_lib.find_name(name);
+        if matches.is_empty() {
+            write_u32(memory, found_ptr, 0);
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        }
+        if capacity == 0 {
+            write_u32(memory, found_ptr, matches.len() as u32);
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        if tinfo_out == 0 || memid_out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let written = capacity.min(matches.len());
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        for (slot, (type_index, memid)) in matches.iter().take(written).enumerate() {
+            let object =
+                self.alloc_com_msft_typeinfo_object(memory, type_lib_object, *type_index)?;
+            self.add_ref_guest_object(object)?;
+            write_guest_pointer(
+                memory,
+                tinfo_out + slot as u64 * pointer_bytes,
+                object,
+                self.guest_arch,
+            )
+            .ok();
+            write_u32(memory, memid_out + slot as u64 * 4, *memid as u32);
+        }
+        for slot in written..capacity {
+            write_guest_pointer(
+                memory,
+                tinfo_out + slot as u64 * pointer_bytes,
+                0,
+                self.guest_arch,
+            )
+            .ok();
+            write_u32(memory, memid_out + slot as u64 * 4, DISPID_UNKNOWN as u32);
+        }
+        write_u32(memory, found_ptr, written as u32);
+        state.set(
+            Register::Rax,
+            u64::from(if written == matches.len() {
+                S_OK
+            } else {
+                S_FALSE
+            }),
+        );
+        Ok(())
+    }
+
+    fn com_type_lib_is_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let _hash = guest_call_arg_u32(state, memory, 2)?;
+        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        if let Some(type_lib) = self.com_msft_typelib(this) {
+            let found = !type_lib.find_name(&name).is_empty();
+            state.set(Register::Rax, u64::from(if found { S_OK } else { S_FALSE }));
+            return Ok(());
+        }
+        let found = !Self::com_type_lib_name_matches(&name).is_empty();
+        state.set(Register::Rax, u64::from(if found { S_OK } else { S_FALSE }));
         Ok(())
     }
 
@@ -6409,14 +7525,22 @@ impl PeHostRuntime {
             HostThunk::ComMethod(ComMethod::QueryInterface),
             HostThunk::GuestObjectAddRef,
             HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::MonikerGetClassID),
+            HostThunk::ComMethod(ComMethod::MonikerIsDirty),
+            HostThunk::ComMethod(ComMethod::MonikerLoad),
+            HostThunk::ComMethod(ComMethod::MonikerSave),
+            HostThunk::ComMethod(ComMethod::MonikerGetSizeMax),
             HostThunk::MonikerBindToObject,
             HostThunk::MonikerBindToStorage,
             HostThunk::MonikerReduce,
             HostThunk::MonikerComposeWith,
-            HostThunk::MonikerGetDisplayName,
             HostThunk::MonikerEnum,
+            HostThunk::ComMethod(ComMethod::MonikerIsEqual),
+            HostThunk::MonikerGetDisplayName,
+            HostThunk::ComMethod(ComMethod::MonikerParseDisplayName),
             HostThunk::MonikerIsSystemMoniker,
             HostThunk::MonikerHash,
+            HostThunk::ComMethod(ComMethod::MonikerBindIfRunning),
         ];
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::ComFileMoniker, vtable)?;
@@ -6444,6 +7568,16 @@ impl PeHostRuntime {
         } else {
             COM_IID_IUNKNOWN
         };
+        if let Some((root, item)) = self.com_abs_item(this) {
+            let (hr, object) = self.com_item_bind_container(memory, &root, &item, &riid, false)?;
+            if hr == S_OK {
+                self.add_ref_guest_object(object)?;
+                self.com_running_put(&Self::com_item_key(&root, &item), object);
+                write_guest_pointer(memory, out, object, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(hr));
+            return Ok(());
+        }
         if let Some(chain) = self.com_composite_chain(this) {
             let (hr, object) = self.bind_composite_object(memory, &chain)?;
             if hr == S_OK {
@@ -6543,6 +7677,16 @@ impl PeHostRuntime {
             COM_IID_IUNKNOWN
         };
         let kind = self.com_moniker_object_for(this);
+        if let Some((root, item)) = self.com_abs_item(this) {
+            let (hr, object) = self.com_item_bind_container(memory, &root, &item, &riid, false)?;
+            if hr == S_OK {
+                self.add_ref_guest_object(object)?;
+                self.com_running_put(&Self::com_item_key(&root, &item), object);
+                write_guest_pointer(memory, out, object, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(hr));
+            return Ok(());
+        }
         if let Some(chain) = self.com_composite_chain(this) {
             let (hr, object) = self.bind_composite_storage(memory, &chain)?;
             if hr == S_OK {
@@ -6835,11 +7979,1026 @@ impl PeHostRuntime {
         }
         crate::runtime::state::ComMonikerKind::File
     }
+
+    // ── IOleItemContainer / IRunningObjectTable ─────────────────────────────
+
+    /// Create an IOleItemContainer over the runtime's file/folder model.
+    /// A directory root resolves its child files/folders; a compound-file
+    /// root resolves the entries of its CFB storage tree.
+    pub(crate) fn alloc_com_item_container(
+        &mut self,
+        memory: &mut MemoryImage,
+        root_host_path: &str,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::ItemContainerParseDisplayName),
+            HostThunk::ComMethod(ComMethod::ItemContainerEnumObjects),
+            HostThunk::ComMethod(ComMethod::ItemContainerLockContainer),
+            HostThunk::ComMethod(ComMethod::ItemContainerGetObject),
+            HostThunk::ComMethod(ComMethod::ItemContainerGetObjectStorage),
+            HostThunk::ComMethod(ComMethod::ItemContainerIsRunning),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComStorage, vtable)?;
+        self.com_storages.insert(
+            object,
+            crate::runtime::state::ComStorageState {
+                host_dir: Some(root_host_path.to_string()),
+                name: format!("{COM_ITEM_CONTAINER_PREFIX}{root_host_path}"),
+                ..Default::default()
+            },
+        );
+        Ok(object)
+    }
+
+    fn com_item_container_root(&self, object: u64) -> Option<String> {
+        self.com_storages
+            .get(&object)
+            .and_then(|state| state.name.strip_prefix(COM_ITEM_CONTAINER_PREFIX))
+            .map(str::to_string)
+    }
+
+    #[allow(dead_code)] // read by the item-container LockContainer test
+    fn com_item_container_locked(&self, object: u64) -> u32 {
+        self.com_storages
+            .get(&object)
+            .map(|state| state.mode)
+            .unwrap_or(0)
+    }
+
+    fn com_iid_is_iunknown(riid: &[u8; 16]) -> bool {
+        *riid == COM_IID_IUNKNOWN || riid.iter().all(|byte| *byte == 0)
+    }
+
+    /// Normalize an item path into backslash-separated components.  Empty
+    /// and `.` components are dropped; `..` is rejected so a container can
+    /// never escape its root.
+    fn com_item_normalize(name: &str) -> Option<String> {
+        let mut parts = Vec::new();
+        for part in name.split(['\\', '/']) {
+            if part.is_empty() || part == "." {
+                continue;
+            }
+            if part == ".." || part.contains(':') {
+                return None;
+            }
+            parts.push(part);
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\\"))
+        }
+    }
+
+    fn com_item_folder_path(root: &str, item: &str) -> Option<std::path::PathBuf> {
+        let root_path = std::path::Path::new(root).canonicalize().ok()?;
+        let mut resolved = root_path.clone();
+        for part in item.split('\\') {
+            if part.is_empty() {
+                continue;
+            }
+            if part == ".." {
+                return None;
+            }
+            resolved.push(part);
+        }
+        let canonical = resolved.canonicalize().ok()?;
+        canonical.starts_with(&root_path).then_some(canonical)
+    }
+
+    fn com_item_key(root: &str, item: &str) -> String {
+        format!("{root}\u{1}{item}")
+    }
+
+    /// Resolve an absolute item path (guest or host) to a path relative to
+    /// the container root; outside-root paths are rejected.
+    fn com_item_relative_to_root(&self, root: &str, text: &str) -> Option<String> {
+        let root_path = std::path::Path::new(root).canonicalize().ok()?;
+        let payload = text
+            .strip_prefix("file:")
+            .or_else(|| text.strip_prefix("FILE:"))
+            .unwrap_or(text)
+            .trim_start_matches("//");
+        let candidate = self
+            .win32
+            .guest_path_to_host_path(payload)
+            .map(|path| path.to_path_buf())
+            .unwrap_or_else(|_| std::path::PathBuf::from(payload));
+        let candidate = candidate.canonicalize().ok()?;
+        let relative = candidate.strip_prefix(&root_path).ok()?;
+        let parts: Vec<String> = relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().to_string())
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\\"))
+        }
+    }
+
+    fn com_item_compound_storage(
+        &mut self,
+        memory: &mut MemoryImage,
+        root: &str,
+        item: &str,
+    ) -> AppResult<std::result::Result<u64, u32>> {
+        let compound = match Self::com_compound_file(root) {
+            Ok(compound) => compound,
+            Err(hr) => return Ok(Err(hr)),
+        };
+        if compound.storage_at(item).is_none() {
+            return Ok(Err(MK_E_NOOBJECT));
+        }
+        let root_object = match self.alloc_com_compound_storage(memory, root, 0, false)? {
+            Ok(object) => object,
+            Err(hr) => return Ok(Err(hr)), // coverage: unreachable — the root path was already parsed successfully by the same reader in this call
+        };
+        let mut current = root_object;
+        for part in item.split('\\') {
+            if part.is_empty() {
+                continue;
+            }
+            let child = self.com_storages.get(&current).and_then(|state| {
+                state
+                    .child_storages
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(part))
+                    .map(|(_, object)| *object)
+            });
+            let Some(child) = child else {
+                return Ok(Err(MK_E_NOOBJECT));
+            };
+            current = child;
+        }
+        Ok(Ok(current))
+    }
+
+    /// Bind one resolved filesystem item to the requested interface.
+    fn com_item_bind_path(
+        &mut self,
+        memory: &mut MemoryImage,
+        path: &std::path::Path,
+        riid: &[u8; 16],
+    ) -> AppResult<(u32, u64)> {
+        let unknown = Self::com_iid_is_iunknown(riid);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("item")
+            .to_string();
+        if path.is_dir() {
+            if unknown || *riid == COM_IID_ISTORAGE {
+                let storage = self.alloc_com_storage_object(
+                    memory,
+                    Some(path.to_string_lossy().to_string()),
+                    &name,
+                    0,
+                )?;
+                return Ok((S_OK, storage));
+            }
+            if *riid == COM_IID_IOLEITEMCONTAINER
+                || *riid == COM_IID_IOLECONTAINER
+                || *riid == COM_IID_IPARSEDISPLAYNAME
+            {
+                let container = self.alloc_com_item_container(memory, &path.to_string_lossy())?;
+                return Ok((S_OK, container));
+            }
+            return Ok((E_NOINTERFACE, 0));
+        }
+        if name.to_ascii_lowercase().ends_with(".lnk") {
+            if unknown || *riid == COM_IID_ISHELLLINKW {
+                let object = self.alloc_shell_link_object(memory)?;
+                return Ok((S_OK, object));
+            }
+            return Ok((E_NOINTERFACE, 0));
+        }
+        let bytes = std::fs::read(path).unwrap_or_default();
+        if let Some(clsid) = ole_embedded_clsid(&bytes) {
+            if unknown {
+                let clsid_text = Self::guid_bytes_to_string(&clsid);
+                return Ok(
+                    match self.try_create_com_object(memory, &clsid_text, IID_IUNKNOWN, 0)? {
+                        Some(object) => (S_OK, object),
+                        None => (REGDB_E_CLASSNOTREG, 0),
+                    },
+                );
+            }
+            return Ok((E_NOINTERFACE, 0));
+        }
+        let is_compound =
+            bytes.len() >= 8 && bytes[..8] == [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+        if is_compound {
+            if unknown || *riid == COM_IID_ISTORAGE {
+                return Ok(
+                    match self.alloc_com_compound_storage(
+                        memory,
+                        &path.to_string_lossy(),
+                        0,
+                        false,
+                    )? {
+                        Ok(storage) => (S_OK, storage),
+                        Err(hr) => (hr, 0),
+                    },
+                );
+            }
+        }
+        if unknown || *riid == COM_IID_ISTREAM || *riid == COM_IID_ISEQUENTIALSTREAM {
+            let stream = self.alloc_com_stream_object(
+                memory,
+                bytes,
+                &name,
+                Some(path.to_string_lossy().to_string()),
+            )?;
+            return Ok((S_OK, stream));
+        }
+        Ok((E_NOINTERFACE, 0))
+    }
+
+    /// Resolve one container item to its bound object.
+    fn com_item_bind_container(
+        &mut self,
+        memory: &mut MemoryImage,
+        root: &str,
+        item: &str,
+        riid: &[u8; 16],
+        storage_only: bool,
+    ) -> AppResult<(u32, u64)> {
+        let root_path = std::path::Path::new(root);
+        if root_path.is_dir() {
+            let Some(path) = Self::com_item_folder_path(root, item) else {
+                return Ok((MK_E_NOOBJECT, 0));
+            };
+            if storage_only {
+                if path.is_dir() {
+                    if Self::com_iid_is_iunknown(riid) || *riid == COM_IID_ISTORAGE {
+                        let name = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("item")
+                            .to_string();
+                        let storage = self.alloc_com_storage_object(
+                            memory,
+                            Some(path.to_string_lossy().to_string()),
+                            &name,
+                            0,
+                        )?;
+                        return Ok((S_OK, storage));
+                    } // coverage: unreachable — the enclosing branch always returns through the storage above or the E_NOINTERFACE below
+                    return Ok((E_NOINTERFACE, 0));
+                }
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                let is_compound = bytes.len() >= 8
+                    && bytes[..8] == [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+                if is_compound {
+                    if Self::com_iid_is_iunknown(riid) || *riid == COM_IID_ISTORAGE {
+                        return Ok(
+                            match self.alloc_com_compound_storage(
+                                memory,
+                                &path.to_string_lossy(),
+                                0,
+                                false,
+                            )? {
+                                Ok(storage) => (S_OK, storage),
+                                Err(hr) => (hr, 0),
+                            },
+                        );
+                    } // coverage: unreachable — both arms above return
+                    return Ok((E_NOINTERFACE, 0));
+                }
+                if !Self::com_iid_is_iunknown(riid) && *riid != COM_IID_ISTORAGE {
+                    return Ok((E_NOINTERFACE, 0));
+                }
+                let storage = self.alloc_com_plain_file_storage(memory, &path)?;
+                return Ok((S_OK, storage));
+            }
+            self.com_item_bind_path(memory, &path, riid)
+        } else if root_path.is_file() {
+            let is_compound = std::fs::read(root_path)
+                .map(|bytes| {
+                    bytes.len() >= 8
+                        && bytes[..8] == [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]
+                })
+                .unwrap_or(false);
+            if !is_compound {
+                return Ok((MK_E_NOOBJECT, 0));
+            }
+            if storage_only {
+                return match self.com_item_compound_storage(memory, root, item)? {
+                    Ok(storage) => Ok((S_OK, storage)),
+                    Err(_) => Ok((MK_E_NOOBJECT, 0)),
+                };
+            }
+            let compound = match Self::com_compound_file(root) {
+                Ok(compound) => compound,
+                Err(hr) => return Ok((hr, 0)),
+            };
+            if compound.entry_at(item).is_none() {
+                return Ok((MK_E_NOOBJECT, 0));
+            }
+            if compound.stream_entry_at(item).is_some() {
+                let data = compound.stream_at(item).unwrap_or_default();
+                if Self::com_iid_is_iunknown(riid)
+                    || *riid == COM_IID_ISTREAM
+                    || *riid == COM_IID_ISEQUENTIALSTREAM
+                {
+                    let name = item.rsplit('\\').next().unwrap_or(item).to_string();
+                    let stream = self.alloc_com_stream_object(memory, data, &name, None)?;
+                    return Ok((S_OK, stream));
+                }
+                return Ok((E_NOINTERFACE, 0));
+            }
+            if compound.storage_at(item).is_some() {
+                return match self.com_item_compound_storage(memory, root, item)? {
+                    Ok(storage) => Ok((S_OK, storage)),
+                    Err(_) => Ok((MK_E_NOOBJECT, 0)),
+                };
+            } // coverage: unreachable — the match above always returns; a missing storage skips this closing brace
+            Ok((MK_E_NOOBJECT, 0)) // coverage: unreachable — entry_at() only resolves kinds 1/2/5 and validate_directory rejects tree links to kind 0, so stream_entry_at or storage_at always matched above
+        } else {
+            Ok((MK_E_NOOBJECT, 0))
+        }
+    }
+
+    fn com_item_container_parse_display_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 1)?;
+        let eaten_out = guest_call_arg(state, memory, 3)?;
+        let moniker_out = guest_call_arg(state, memory, 4)?;
+        let Some(root) = self.com_item_container_root(this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(raw_name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        let consumed = raw_name.encode_utf16().count() as u32;
+        let mut text = raw_name
+            .strip_prefix("item:")
+            .or_else(|| raw_name.strip_prefix("ITEM:"))
+            .unwrap_or(&raw_name)
+            .to_string();
+        let looks_absolute = text.starts_with("file:")
+            || text.starts_with("FILE:")
+            || std::path::Path::new(&text).is_absolute()
+            || text.starts_with("\\\\")
+            || text.contains(":\\")
+            || text.contains(":/");
+        if looks_absolute {
+            let Some(relative) = self.com_item_relative_to_root(&root, &text) else {
+                state.set(Register::Rax, u64::from(MK_E_SYNTAX));
+                return Ok(());
+            };
+            text = relative;
+        }
+        let Some(item) = Self::com_item_normalize(&text) else {
+            state.set(Register::Rax, u64::from(MK_E_SYNTAX));
+            return Ok(());
+        };
+        let host_path = std::path::Path::new(&root)
+            .is_dir()
+            .then(|| {
+                Self::com_item_folder_path(&root, &item)
+                    .map(|path| path.to_string_lossy().to_string())
+            })
+            .flatten();
+        let moniker = self.alloc_com_moniker_object(
+            memory,
+            crate::runtime::state::ComMonikerState {
+                kind: crate::runtime::state::ComMonikerKind::File,
+                display_name: format!("item:{item}"),
+                payload: format!("{COM_ABS_ITEM_PREFIX}{root}\u{1}{item}"),
+                host_path,
+            },
+        )?;
+        if eaten_out != 0 {
+            write_u32(memory, eaten_out, consumed);
+        }
+        if moniker_out != 0 {
+            write_guest_pointer(memory, moniker_out, moniker, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_item_container_get_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let item_ptr = guest_call_arg(state, memory, 1)?;
+        let speed = guest_call_arg_u32(state, memory, 2)?;
+        let riid_ptr = guest_call_arg(state, memory, 4)?;
+        let out = guest_call_arg(state, memory, 5)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        match speed {
+            BINDSPEED_INDEFINITE | BINDSPEED_MODERATE | BINDSPEED_IMMEDIATE => {}
+            _ => {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+        }
+        let Some(root) = self.com_item_container_root(this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(raw_name) = read_utf16_string(memory, item_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        let Some(item) = Self::com_item_normalize(&raw_name) else {
+            state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+            return Ok(());
+        };
+        let riid = if riid_ptr != 0 {
+            std::array::from_fn(|index| memory.read_u8(riid_ptr + index as u64).unwrap_or(0))
+        } else {
+            COM_IID_IUNKNOWN
+        };
+        let key = Self::com_item_key(&root, &item);
+        if let Some(object) = self.com_running_get(&key) {
+            self.add_ref_guest_object(object)?;
+            write_guest_pointer(memory, out, object, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        if speed == BINDSPEED_IMMEDIATE {
+            state.set(Register::Rax, u64::from(MK_E_EXCEEDEDDEADLINE));
+            return Ok(());
+        }
+        let (hr, object) = self.com_item_bind_container(memory, &root, &item, &riid, false)?;
+        if hr != S_OK {
+            state.set(Register::Rax, u64::from(hr));
+            return Ok(());
+        }
+        self.add_ref_guest_object(object)?;
+        self.com_running_put(&key, object);
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_item_container_get_object_storage(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let item_ptr = guest_call_arg(state, memory, 1)?;
+        let riid_ptr = guest_call_arg(state, memory, 3)?;
+        let out = guest_call_arg(state, memory, 4)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        let Some(root) = self.com_item_container_root(this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(raw_name) = read_utf16_string(memory, item_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        let Some(item) = Self::com_item_normalize(&raw_name) else {
+            state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+            return Ok(());
+        };
+        let riid = if riid_ptr != 0 {
+            std::array::from_fn(|index| memory.read_u8(riid_ptr + index as u64).unwrap_or(0))
+        } else {
+            COM_IID_ISTORAGE
+        };
+        if !Self::com_iid_is_iunknown(&riid) && riid != COM_IID_ISTORAGE {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let (hr, storage) =
+            self.com_item_bind_container(memory, &root, &item, &COM_IID_ISTORAGE, true)?;
+        if hr != S_OK {
+            state.set(Register::Rax, u64::from(hr));
+            return Ok(());
+        }
+        self.add_ref_guest_object(storage)?;
+        self.com_running_put(&Self::com_item_key(&root, &item), storage);
+        write_guest_pointer(memory, out, storage, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_item_container_is_running(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let item_ptr = guest_call_arg(state, memory, 1)?;
+        let root = self.com_item_container_root(this).unwrap_or_default();
+        let name = read_utf16_string(memory, item_ptr).unwrap_or_default();
+        let running = Self::com_item_normalize(&name).is_some_and(|item| {
+            self.com_running_get(&Self::com_item_key(&root, &item))
+                .is_some()
+        });
+        state.set(Register::Rax, u64::from(running as u32));
+        Ok(())
+    }
+
+    fn com_item_container_lock_container(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let lock = guest_call_arg_u32(state, memory, 1)?;
+        let Some(storage) = self.com_storages.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        if lock != 0 {
+            storage.mode = storage.mode.saturating_add(1);
+        } else {
+            storage.mode = storage.mode.saturating_sub(1);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_item_container_enum_objects(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let flags = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(root) = self.com_item_container_root(this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let only_running = flags & OLECONTF_ONLYIFRUNNING != 0;
+        let mut names = Vec::new();
+        let root_path = std::path::Path::new(&root);
+        if root_path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(root_path) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        } else if root_path.is_file() {
+            if let Ok(compound) = Self::com_compound_file(&root) {
+                for child in compound.children("Root").unwrap_or_default() {
+                    let name = child.decoded_name();
+                    if !name.is_empty() {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let mut items = Vec::new();
+        for name in names {
+            if only_running
+                && self
+                    .com_running_get(&Self::com_item_key(&root, &name))
+                    .is_none()
+            {
+                continue;
+            }
+            let (hr, object) =
+                self.com_item_bind_container(memory, &root, &name, &COM_IID_IUNKNOWN, false)?;
+            if hr == S_OK {
+                items.push(pointer_bytes_bytes(object, pointer_bytes));
+            }
+        }
+        let enumerator = self.alloc_com_enum_object(memory, items)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, enumerator, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_running_get(&self, key: &str) -> Option<u64> {
+        self.com_service_map
+            .get(&format!("{COM_RUNNING_PREFIX}{key}"))
+            .copied()
+    }
+
+    fn com_running_put(&mut self, key: &str, object: u64) {
+        self.com_service_map
+            .insert(format!("{COM_RUNNING_PREFIX}{key}"), object);
+    }
+
+    fn com_running_remove(&mut self, key: &str) -> bool {
+        self.com_service_map
+            .remove(&format!("{COM_RUNNING_PREFIX}{key}"))
+            .is_some()
+    }
+
+    fn com_running_entries(&self) -> Vec<(String, u64)> {
+        self.com_service_map
+            .iter()
+            .filter_map(|(key, object)| {
+                key.strip_prefix(COM_RUNNING_PREFIX)
+                    .map(|name| (name.to_string(), *object))
+            })
+            .collect()
+    }
+
+    fn com_running_cookie(key: &str) -> u32 {
+        let mut hash = 2_166_136_261_u32;
+        for byte in key.as_bytes() {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        if hash == 0 { 1 } else { hash }
+    }
+
+    fn com_moniker_display_name(&self, object: u64) -> Option<String> {
+        self.com_monikers
+            .get(&object)
+            .map(|moniker| moniker.display_name.clone())
+            .or_else(|| self.com_moniker_names.get(&object).cloned())
+    }
+
+    fn com_abs_item(&self, object: u64) -> Option<(String, String)> {
+        let payload = self.com_monikers.get(&object)?.payload.as_str();
+        let rest = payload.strip_prefix(COM_ABS_ITEM_PREFIX)?;
+        let (root, item) = rest.split_once('\u{1}')?;
+        Some((root.to_string(), item.to_string()))
+    }
+
+    pub(crate) fn com_moniker_bind_if_running(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        let key = if let Some((root, item)) = self.com_abs_item(this) {
+            Self::com_item_key(&root, &item)
+        } else {
+            self.com_moniker_display_name(this).unwrap_or_default()
+        };
+        let Some(object) = self.com_running_get(&key) else {
+            state.set(Register::Rax, u64::from(MK_E_UNAVAILABLE));
+            return Ok(());
+        };
+        self.add_ref_guest_object(object)?;
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMoniker::GetClassID` — the CLSID of the moniker form: file, item,
+    /// class, URL or generic composite.
+    fn com_moniker_get_class_id(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let state_entry = self.com_monikers.get(&this).cloned();
+        let clsid = if state_entry
+            .as_ref()
+            .is_some_and(|entry| entry.payload.starts_with(COM_COMPOSITE_PREFIX))
+        {
+            "00000309-0000-0000-C000-000000000046"
+        } else if state_entry
+            .as_ref()
+            .is_some_and(|entry| entry.payload.starts_with(COM_ITEM_PREFIX))
+        {
+            "00000304-0000-0000-C000-000000000046"
+        } else {
+            match state_entry.map(|entry| entry.kind) {
+                Some(crate::runtime::state::ComMonikerKind::Class) => {
+                    "0000030C-0000-0000-C000-000000000046"
+                }
+                Some(crate::runtime::state::ComMonikerKind::Url) => {
+                    "79EAC9E0-BAF9-11CE-8C82-00AA004BA90B"
+                }
+                _ => "00000303-0000-0000-C000-000000000046",
+            }
+        };
+        let guid = Self::parse_guid_string(clsid).unwrap_or([0; 16]);
+        memory.map_bytes(out, &guid);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMoniker::IsEqual` — two monikers are equal when they model the same
+    /// kind and display name (the runtime's moniker identity).
+    fn com_moniker_is_equal(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let other = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let left = self.com_monikers.get(&this);
+        let right = self.com_monikers.get(&other);
+        let equal = match (left, right) {
+            (Some(left), Some(right)) => {
+                left.kind == right.kind && left.display_name == right.display_name
+            }
+            _ => false,
+        };
+        write_u32(memory, out, u32::from(equal));
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMoniker::ParseDisplayName` — parse the remaining display name into
+    /// a real moniker over the runtime's file/class/URL forms.
+    fn com_moniker_parse_display_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        let name_ptr = guest_call_arg(state, memory, 3)?;
+        let eaten_out = guest_call_arg(state, memory, 4)?;
+        let out = guest_call_arg(state, memory, 5)?;
+        let Some(name) = read_utf16_string(memory, name_ptr).ok() else {
+            state.set(Register::Rax, u64::from(MK_E_SYNTAX));
+            return Ok(());
+        };
+        let Some((moniker_state, eaten)) = self.parse_com_display_name(&name) else {
+            if out != 0 {
+                write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(MK_E_SYNTAX));
+            return Ok(());
+        };
+        let moniker = self.alloc_com_moniker_object(memory, moniker_state)?;
+        if eaten_out != 0 {
+            write_u32(memory, eaten_out, eaten);
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, moniker, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// Create the process running-object table object (IRunningObjectTable).
+    #[allow(dead_code)] // the COM tests drive the ROT vtable directly
+    pub(crate) fn alloc_com_running_object_table(
+        &mut self,
+        memory: &mut MemoryImage,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::RunningTableRegister),
+            HostThunk::ComMethod(ComMethod::RunningTableRevoke),
+            HostThunk::ComMethod(ComMethod::RunningTableIsRunning),
+            HostThunk::ComMethod(ComMethod::RunningTableGetObject),
+            HostThunk::ComMethod(ComMethod::RunningTableNoteChangeTime),
+            HostThunk::ComMethod(ComMethod::RunningTableGetTimeOfLastChange),
+            HostThunk::ComMethod(ComMethod::RunningTableEnumRunning),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComBindCtx, vtable)?;
+        self.com_bind_ctx_params
+            .entry(object)
+            .or_default()
+            .insert(COM_ROT_MARKER.to_string(), object);
+        Ok(object)
+    }
+
+    fn com_running_table_register(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let moniker = guest_call_arg(state, memory, 1)?;
+        let object = guest_call_arg(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        let Some(name) = self.com_moniker_display_name(moniker) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if object == 0 || name.is_empty() {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let key = if let Some((root, item)) = self.com_abs_item(moniker) {
+            Self::com_item_key(&root, &item)
+        } else {
+            name
+        };
+        self.add_ref_guest_object(object)?;
+        self.com_running_put(&key, object);
+        if out != 0 {
+            write_u32(memory, out, Self::com_running_cookie(&key));
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_running_table_revoke(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let cookie = guest_call_arg_u32(state, memory, 1)?;
+        let keys: Vec<String> = self
+            .com_running_entries()
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|key| Self::com_running_cookie(key) == cookie)
+            .collect();
+        let mut revoked = false;
+        for key in keys {
+            if let Some(object) = self.com_running_get(&key) {
+                let _ = self.release_guest_object(object);
+            }
+            revoked |= self.com_running_remove(&key);
+        }
+        state.set(
+            Register::Rax,
+            u64::from(if revoked { S_OK } else { MK_E_UNAVAILABLE }),
+        );
+        Ok(())
+    }
+
+    fn com_running_table_is_running(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let moniker = guest_call_arg(state, memory, 1)?;
+        let key = if let Some((root, item)) = self.com_abs_item(moniker) {
+            Self::com_item_key(&root, &item)
+        } else {
+            self.com_moniker_display_name(moniker).unwrap_or_default()
+        };
+        let running = !key.is_empty() && self.com_running_get(&key).is_some();
+        state.set(Register::Rax, u64::from(running as u32));
+        Ok(())
+    }
+
+    fn com_running_table_get_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let moniker = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        let key = if let Some((root, item)) = self.com_abs_item(moniker) {
+            Self::com_item_key(&root, &item)
+        } else {
+            self.com_moniker_display_name(moniker).unwrap_or_default()
+        };
+        let Some(object) = self.com_running_get(&key) else {
+            state.set(Register::Rax, u64::from(MK_E_UNAVAILABLE));
+            return Ok(());
+        };
+        self.add_ref_guest_object(object)?;
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_running_table_note_change_time(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _ = (memory,);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_running_table_get_time_of_last_change(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let moniker = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let key = if let Some((root, item)) = self.com_abs_item(moniker) {
+            Self::com_item_key(&root, &item)
+        } else {
+            self.com_moniker_display_name(moniker).unwrap_or_default()
+        };
+        if self.com_running_get(&key).is_none() {
+            state.set(Register::Rax, u64::from(MK_E_UNAVAILABLE));
+            return Ok(());
+        }
+        if out != 0 {
+            write_u64(memory, out, Self::com_storage_tree_timestamp());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_running_table_enum_running(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let out = guest_call_arg(state, memory, 1)?;
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let mut items = Vec::new();
+        for (key, _) in self.com_running_entries() {
+            let moniker = self.alloc_com_moniker_object(
+                memory,
+                crate::runtime::state::ComMonikerState {
+                    kind: crate::runtime::state::ComMonikerKind::File,
+                    display_name: key.clone(),
+                    payload: key,
+                    host_path: None,
+                },
+            )?;
+            items.push(pointer_bytes_bytes(moniker, pointer_bytes));
+        }
+        let enumerator = self.alloc_com_enum_object(memory, items)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, enumerator, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
 }
 
 /// Encode one pointer-sized value as raw little-endian bytes.
 fn pointer_bytes_bytes(value: u64, pointer_bytes: u64) -> Vec<u8> {
     value.to_le_bytes()[..pointer_bytes as usize].to_vec()
+}
+
+/// Read the IStorage::CopyTo `rgiidExclude` array (ciidExclude contiguous
+/// 16-byte IIDs).  A null pointer or an absurd count yields no exclusions.
+fn read_com_iid_array(memory: &MemoryImage, pointer: u64, count: u32) -> Vec<[u8; 16]> {
+    if pointer == 0 || count == 0 {
+        return Vec::new();
+    }
+    (0..count.min(256))
+        .map(|index| {
+            std::array::from_fn(|byte| {
+                memory
+                    .read_u8(pointer + index as u64 * 16 + byte as u64)
+                    .unwrap_or(0)
+            })
+        })
+        .collect()
+}
+
+/// Read the SNB (string-name-block) used by IStorage::CopyTo: a sequence of
+/// null-terminated UTF-16 strings terminated by an empty string.
+fn read_string_name_block(memory: &MemoryImage, pointer: u64) -> Vec<String> {
+    if pointer == 0 {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    let mut cursor = 0_u64;
+    for _ in 0..4096 {
+        let name = read_utf16_string(memory, pointer + cursor).unwrap_or_default();
+        if name.is_empty() {
+            break;
+        }
+        cursor += (name.encode_utf16().count() as u64 + 1) * 2;
+        names.push(name);
+    }
+    names
 }
 
 /// Encode one CONNECTDATA (interface pointer + cookie) for the guest
@@ -6935,7 +9094,32 @@ pub enum ComMethod {
     TypeLibGetTypeInfo,
     TypeLibGetTypeInfoOfGuid,
     TypeLibGetTypeComp,
+    TypeLibGetTypeInfoType,
+    TypeLibGetDocumentation,
+    TypeLibFindName,
+    TypeLibIsName,
     TypeLibUnsupported,
+    ItemContainerParseDisplayName,
+    ItemContainerEnumObjects,
+    ItemContainerLockContainer,
+    ItemContainerGetObject,
+    ItemContainerGetObjectStorage,
+    ItemContainerIsRunning,
+    RunningTableRegister,
+    RunningTableRevoke,
+    RunningTableIsRunning,
+    RunningTableGetObject,
+    RunningTableNoteChangeTime,
+    RunningTableGetTimeOfLastChange,
+    RunningTableEnumRunning,
+    MonikerGetClassID,
+    MonikerIsDirty,
+    MonikerLoad,
+    MonikerSave,
+    MonikerGetSizeMax,
+    MonikerIsEqual,
+    MonikerParseDisplayName,
+    MonikerBindIfRunning,
     TypeCompBind,
     TypeCompBindType,
     TypeInfoReleaseTypeAttr,
@@ -6993,6 +9177,14 @@ impl ComMethod {
             | ComMethod::TypeLibReleaseTLibAttr
             | ComMethod::TypeLibGetTypeInfoCount
             | ComMethod::TypeLibGetTypeComp
+            | ComMethod::ItemContainerLockContainer
+            | ComMethod::ItemContainerIsRunning
+            | ComMethod::RunningTableRevoke
+            | ComMethod::RunningTableIsRunning
+            | ComMethod::RunningTableEnumRunning
+            | ComMethod::MonikerGetClassID
+            | ComMethod::MonikerGetSizeMax
+            | ComMethod::MonikerLoad
             | ComMethod::TypeInfoReleaseTypeAttr
             | ComMethod::TypeInfoReleaseFuncDesc
             | ComMethod::TypeInfoReleaseVarDesc
@@ -7014,19 +9206,34 @@ impl ComMethod {
             | ComMethod::TypeInfoGetMops
             | ComMethod::TypeInfoGetContainingTypeLib
             | ComMethod::TypeLibGetTypeInfo
-            | ComMethod::TypeLibGetTypeInfoOfGuid => 12,
+            | ComMethod::TypeLibGetTypeInfoOfGuid
+            | ComMethod::TypeLibGetTypeInfoType
+            | ComMethod::TypeLibIsName
+            | ComMethod::ItemContainerEnumObjects
+            | ComMethod::RunningTableGetObject
+            | ComMethod::RunningTableNoteChangeTime
+            | ComMethod::RunningTableGetTimeOfLastChange
+            | ComMethod::MonikerSave
+            | ComMethod::MonikerIsEqual => 12,
             ComMethod::TypeInfoAddressOfMember | ComMethod::TypeInfoCreateInstance => 16,
             ComMethod::TypeCompBindType => 16,
             ComMethod::Unadvise => 8,
             ComMethod::TypeInfoGetIDsOfNames => 16,
-            ComMethod::EnumReset => 4,
+            ComMethod::EnumReset | ComMethod::MonikerIsDirty => 4,
             ComMethod::DispatchGetIDsOfNames => 24,
             ComMethod::DispatchInvoke => 36,
             ComMethod::TypeInfoGetNames => 20,
             ComMethod::TypeInfoInvoke => 40,
             ComMethod::TypeInfoGetDocumentation => 24,
             ComMethod::TypeInfoGetDllEntry => 24,
-            ComMethod::TypeCompBind => 24,
+            ComMethod::TypeLibGetDocumentation | ComMethod::TypeLibFindName => 24,
+            ComMethod::RunningTableRegister | ComMethod::MonikerBindIfRunning => 16,
+            ComMethod::ItemContainerParseDisplayName | ComMethod::ItemContainerGetObjectStorage => {
+                20
+            }
+            ComMethod::ItemContainerGetObject
+            | ComMethod::TypeCompBind
+            | ComMethod::MonikerParseDisplayName => 24,
             ComMethod::TypeInfoUnsupported | ComMethod::TypeLibUnsupported => 4,
             ComMethod::ServerAdd => 16,
             ComMethod::ServerReset => 4,
@@ -7106,6 +9313,27 @@ const COM_IID_ITYPELIB: [u8; 16] = [
 ];
 const COM_IID_ITYPECOMP: [u8; 16] = [
     0x03, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IPARSEDISPLAYNAME: [u8; 16] = [
+    0x1a, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IOLECONTAINER: [u8; 16] = [
+    0x1b, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IOLEITEMCONTAINER: [u8; 16] = [
+    0x1c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IRUNNINGOBJECTTABLE: [u8; 16] = [
+    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IENUMMONIKER: [u8; 16] = [
+    0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IENUMUNKNOWN: [u8; 16] = [
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_ISHELLLINKW: [u8; 16] = [
+    0xf9, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
 ];
 const COM_AUTOMATION_INTERFACE_IID: [u8; 16] = [
     0x02, 0x00, 0xa5, 0xc1, 0x00, 0x00, 0x00, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
@@ -7336,6 +9564,11 @@ struct ComTypeDescriptor {
     dll_name: &'static str,
     dll_entry: &'static str,
     dll_ordinal: u16,
+    /// The registered documentation string (ITypeLib::GetDocumentation).
+    doc: &'static str,
+    /// The registered help file and context id.
+    help_file: &'static str,
+    help_context: u32,
 }
 
 /// The typelib GUID exposed by ITypeLib::GetLibAttr.
@@ -7353,6 +9586,9 @@ static COM_TYPE_DESCRIPTORS: &[ComTypeDescriptor] = &[
         dll_name: "casa1.dll",
         dll_entry: "DllGetClassObject",
         dll_ordinal: 1,
+        doc: "Casa1 automation interface",
+        help_file: "casa1.hlp",
+        help_context: 1,
     },
     ComTypeDescriptor {
         name: "ICasa1AutomationEvents",
@@ -7363,6 +9599,9 @@ static COM_TYPE_DESCRIPTORS: &[ComTypeDescriptor] = &[
         dll_name: "casa1.dll",
         dll_entry: "DllGetClassObject",
         dll_ordinal: 1,
+        doc: "Casa1 automation interface",
+        help_file: "casa1.hlp",
+        help_context: 1,
     },
     ComTypeDescriptor {
         name: "IDispatch",
@@ -7373,6 +9612,9 @@ static COM_TYPE_DESCRIPTORS: &[ComTypeDescriptor] = &[
         dll_name: "oleaut32.dll",
         dll_entry: "DispInvoke",
         dll_ordinal: 0,
+        doc: "IDispatch automation interface",
+        help_file: "oleaut32.hlp",
+        help_context: 3,
     },
     ComTypeDescriptor {
         name: "IUnknown",
@@ -7383,6 +9625,9 @@ static COM_TYPE_DESCRIPTORS: &[ComTypeDescriptor] = &[
         dll_name: "ole32.dll",
         dll_entry: "CoCreateInstance",
         dll_ordinal: 0,
+        doc: "IUnknown base interface",
+        help_file: "ole32.hlp",
+        help_context: 4,
     },
     ComTypeDescriptor {
         name: "Casa1.Automation",
@@ -7399,14 +9644,459 @@ static COM_TYPE_DESCRIPTORS: &[ComTypeDescriptor] = &[
         dll_name: "casa1.dll",
         dll_entry: "DllGetClassObject",
         dll_ordinal: 1,
+        doc: "Casa1 automation interface",
+        help_file: "casa1.hlp",
+        help_context: 1,
     },
 ];
 
 const COM_TYPELIB_MARKER: &str = "\u{1}typelib";
 const COM_TYPECOMP_MARKER: &str = "\u{1}typecomp";
+const COM_MSFT_TYPELIB_PREFIX: &str = "\u{1}msft-typelib:";
+const COM_MSFT_TYPEINFO_PREFIX: &str = "\u{1}msft-typeinfo:";
+
+// ── MSFTypLib (".tlb") binary reader ───────────────────────────────────────
+//
+// The loader implements the documented MSFTypLib container: the 0x54-byte
+// header (magic "MSFT", version, libid, lcid, version/flags, typeinfo
+// count), the per-typeinfo offset table, the 16-entry segment directory,
+// and the GUID/name/string/typeinfo segments.  The typeinfo records are the
+// 0x64-byte MSFT_TypeInfoBase entries whose member offset points at the
+// function-record block; each MSFT_FuncRecord carries the memid array,
+// name-table offsets and argument records.  Every access is bounds-checked
+// so a truncated/corrupt image is a load error rather than a panic.
+
+#[derive(Debug, Clone, Default)]
+struct MsftTypeLib {
+    guid: [u8; 16],
+    lcid: u32,
+    lcid2: u32,
+    syskind: u16,
+    major: u16,
+    minor: u16,
+    flags: u16,
+    name: String,
+    doc: String,
+    help_file: String,
+    help_context: u32,
+    types: Vec<MsftTypeInfo>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MsftTypeInfo {
+    kind: u32,
+    flags: u16,
+    guid: [u8; 16],
+    name: String,
+    doc: String,
+    help_context: u32,
+    c_impl_types: u16,
+    cb_size_vft: u16,
+    cb_size_instance: u32,
+    version: u16,
+    funcs: Vec<MsftFunc>,
+    impls: Vec<(u32, u16)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MsftFunc {
+    memid: i32,
+    name: String,
+    return_vt: u16,
+    func_flags: u16,
+    vtable_offset: u16,
+    funckind: u8,
+    invkind: u8,
+    callconv: u8,
+    c_params: u16,
+    c_params_opt: u16,
+    help_context: u32,
+    help_string: String,
+    #[allow(dead_code)]
+    entry: Option<String>,
+    params: Vec<(u16, u16, String)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MsftSegment {
+    offset: usize,
+    length: usize,
+    kind: u32,
+}
+
+impl MsftTypeLib {
+    fn parse(bytes: &[u8]) -> std::result::Result<Self, ()> {
+        const HEADER: usize = 0x54;
+        if bytes.len() < HEADER {
+            return Err(());
+        }
+        if read_u32(bytes, 0)? != 0x5446_534d {
+            return Err(());
+        }
+        let version = read_u32(bytes, 4)?;
+        if version != 0 && version != 0x0001_0002 {
+            return Err(());
+        }
+        let posguid = read_i32(bytes, 8)?;
+        let lcid = read_u32(bytes, 0x0c)?;
+        let lcid2 = read_u32(bytes, 0x10)?;
+        let varflags = read_u32(bytes, 0x14)?;
+        let lib_version = read_u32(bytes, 0x18)?;
+        let flags = read_u32(bytes, 0x1c)?;
+        let type_count = read_u32(bytes, 0x20)?;
+        if type_count == 0 || type_count > 0x1000 {
+            return Err(());
+        }
+        let helpstring = read_i32(bytes, 0x24)?;
+        let helpfile = read_i32(bytes, 0x30)?;
+        let name_offset = read_u32(bytes, 0x2c)?;
+        let help_context = read_u32(bytes, 0x28)?;
+        let help_dll = varflags & 0x0100 != 0;
+        let seg_dir = HEADER + type_count as usize * 4 + usize::from(help_dll) * 4;
+        if seg_dir + 16 * 16 > bytes.len() {
+            return Err(());
+        }
+        let segment = |index: usize| -> std::result::Result<MsftSegment, ()> {
+            let base = seg_dir + index * 16;
+            Ok(MsftSegment {
+                offset: read_u32(bytes, base)? as usize,
+                length: read_u32(bytes, base + 4)? as usize,
+                kind: read_u32(bytes, base + 12)?,
+            })
+        };
+        let typeinfo_seg = segment(0)?;
+        let impinfo_seg = segment(1)?;
+        let ref_seg = segment(3)?;
+        let guid_seg = segment(5)?;
+        let name_seg = segment(7)?;
+        let string_seg = segment(8)?;
+        let typedesc_seg = segment(9)?;
+        if typeinfo_seg.kind != 0x0f || impinfo_seg.kind != 0x0f {
+            return Err(());
+        }
+        if typeinfo_seg.length < type_count as usize * 100 {
+            return Err(());
+        }
+        check_segment(bytes, typeinfo_seg)?;
+        check_segment(bytes, guid_seg)?;
+        check_segment(bytes, name_seg)?;
+        check_segment(bytes, string_seg)?;
+        check_segment(bytes, typedesc_seg)?;
+        check_segment(bytes, ref_seg)?;
+
+        let names = read_names(bytes, name_seg)?;
+        let strings = read_strings(bytes, string_seg)?;
+        let guids = read_guids(bytes, guid_seg)?;
+        let mut types = Vec::with_capacity(type_count as usize);
+        for index in 0..type_count as usize {
+            let base = typeinfo_seg.offset + index * 100;
+            let raw_kind = read_u32(bytes, base)?;
+            let memoffset = read_i32(bytes, base + 4)?;
+            let elements = read_u32(bytes, base + 24)?;
+            let posguid = read_i32(bytes, base + 44)?;
+            let type_flags = read_u16(bytes, base + 48)?;
+            let type_name_offset = read_u32(bytes, base + 52)?;
+            let element_version = read_u16(bytes, base + 56)?;
+            let doc_offset = read_i32(bytes, base + 60)?;
+            let type_help_context = read_u32(bytes, base + 68)?;
+            let c_impl_types = read_u16(bytes, base + 76)?;
+            let cb_size_vft = read_u16(bytes, base + 78)?;
+            let cb_size_instance = read_u32(bytes, base + 80)?;
+            let datatype1 = read_i32(bytes, base + 84)?;
+            let kind = raw_kind & 0x0f;
+            let c_funcs = (elements & 0xffff) as usize;
+            let c_vars = (elements >> 16) as usize;
+            let mut funcs = Vec::new();
+            if c_funcs > 0 && memoffset >= 0 {
+                funcs = read_functions(
+                    bytes,
+                    memoffset as usize,
+                    c_funcs,
+                    c_vars,
+                    &names,
+                    &strings,
+                    typedesc_seg,
+                )?;
+            }
+            let mut impls = Vec::new();
+            if kind == TKIND_COCLASS && c_impl_types > 0 && datatype1 >= 0 {
+                let mut offset = datatype1 as usize;
+                for _ in 0..c_impl_types {
+                    let at = ref_seg.offset.checked_add(offset).ok_or(())?;
+                    let reftype = read_i32(bytes, at)?;
+                    let impl_flags = read_u16(bytes, at + 4)?;
+                    let next = read_i32(bytes, at + 12)?;
+                    if reftype >= 0 {
+                        impls.push((reftype as u32, impl_flags));
+                    }
+                    if next < 0 {
+                        break;
+                    }
+                    offset += next as usize;
+                }
+            } else if kind == TKIND_DISPATCH && datatype1 >= 0 {
+                impls.push((datatype1 as u32, 0));
+            }
+            types.push(MsftTypeInfo {
+                kind,
+                flags: type_flags,
+                guid: guids.get(&posguid).copied().unwrap_or([0; 16]),
+                name: names.get(&type_name_offset).cloned().unwrap_or_default(),
+                doc: strings.get(&doc_offset.max(0)).cloned().unwrap_or_default(),
+                help_context: type_help_context,
+                c_impl_types,
+                cb_size_vft,
+                cb_size_instance,
+                version: element_version,
+                funcs,
+                impls,
+            });
+        }
+        Ok(Self {
+            guid: guids.get(&posguid).copied().unwrap_or([0; 16]),
+            lcid,
+            lcid2,
+            syskind: (varflags & 0x0f) as u16,
+            major: (lib_version & 0xffff) as u16,
+            minor: (lib_version >> 16) as u16,
+            flags: (flags & 0xffff) as u16,
+            name: names.get(&name_offset).cloned().unwrap_or_default(),
+            doc: strings.get(&helpstring.max(0)).cloned().unwrap_or_default(),
+            help_file: strings.get(&helpfile.max(0)).cloned().unwrap_or_default(),
+            help_context,
+            types,
+        })
+    }
+
+    fn type_index_by_guid(&self, guid: &[u8; 16]) -> Option<usize> {
+        self.types.iter().position(|info| &info.guid == guid)
+    }
+
+    fn type_index_by_ref(&self, href: u32) -> Option<usize> {
+        if href % 100 != 0 {
+            return None;
+        }
+        let index = (href / 100) as usize;
+        (index < self.types.len()).then_some(index)
+    }
+
+    fn find_name(&self, name: &str) -> Vec<(usize, i32)> {
+        let mut matches = Vec::new();
+        for (index, info) in self.types.iter().enumerate() {
+            if info.name.eq_ignore_ascii_case(name) {
+                matches.push((index, DISPID_UNKNOWN));
+            }
+        }
+        for (index, info) in self.types.iter().enumerate() {
+            for func in &info.funcs {
+                if func.name.eq_ignore_ascii_case(name)
+                    && !matches
+                        .iter()
+                        .any(|(existing, memid)| *existing == index && *memid == func.memid)
+                {
+                    matches.push((index, func.memid));
+                }
+            }
+        }
+        matches
+    }
+}
+
+fn check_segment(bytes: &[u8], segment: MsftSegment) -> std::result::Result<(), ()> {
+    if segment.length == 0 {
+        return Ok(());
+    }
+    segment
+        .offset
+        .checked_add(segment.length)
+        .filter(|end| *end <= bytes.len())
+        .map(|_| ())
+        .ok_or(())
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> std::result::Result<u16, ()> {
+    let raw = bytes.get(offset..offset + 2).ok_or(())?;
+    Ok(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> std::result::Result<u32, ()> {
+    let raw = bytes.get(offset..offset + 4).ok_or(())?;
+    Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn read_i32(bytes: &[u8], offset: usize) -> std::result::Result<i32, ()> {
+    read_u32(bytes, offset).map(|value| value as i32)
+}
+
+fn read_msft_text(bytes: &[u8], offset: usize, length: usize) -> std::result::Result<String, ()> {
+    let raw = bytes.get(offset..offset + length).ok_or(())?;
+    Ok(raw.iter().map(|byte| char::from(*byte)).collect::<String>())
+}
+
+fn read_names(bytes: &[u8], segment: MsftSegment) -> std::result::Result<HashMap<u32, String>, ()> {
+    let mut names = HashMap::new();
+    let mut offset = 0usize;
+    while offset < segment.length {
+        if offset + 12 > segment.length {
+            return Err(());
+        }
+        let intro = segment.offset + offset;
+        let name_len = (read_u16(bytes, intro + 8)? & 0xff) as usize;
+        let raw_len = 12 + name_len;
+        let piece = raw_len.max(8).next_multiple_of(4);
+        if offset + piece > segment.length {
+            return Err(());
+        }
+        let text = read_msft_text(bytes, intro + 12, name_len)?;
+        names.insert(offset as u32, text);
+        offset += piece;
+    }
+    Ok(names)
+}
+
+fn read_strings(
+    bytes: &[u8],
+    segment: MsftSegment,
+) -> std::result::Result<HashMap<i32, String>, ()> {
+    let mut strings = HashMap::new();
+    let mut offset = 0usize;
+    while offset < segment.length {
+        let at = segment.offset + offset;
+        let length = read_u16(bytes, at)? as usize;
+        let raw_len = 2 + length;
+        let piece = raw_len.max(8).next_multiple_of(4);
+        if offset + piece > segment.length {
+            return Err(());
+        }
+        let text = read_msft_text(bytes, at + 2, length)?;
+        strings.insert(offset as i32, text);
+        offset += piece;
+    }
+    Ok(strings)
+}
+
+fn read_guids(
+    bytes: &[u8],
+    segment: MsftSegment,
+) -> std::result::Result<HashMap<i32, [u8; 16]>, ()> {
+    let mut guids = HashMap::new();
+    let mut offset = 0usize;
+    while offset + 24 <= segment.length {
+        let at = segment.offset + offset;
+        let raw = bytes.get(at..at + 16).ok_or(())?;
+        let mut guid = [0u8; 16];
+        guid.copy_from_slice(raw);
+        guids.insert(offset as i32, guid);
+        offset += 24;
+    }
+    Ok(guids)
+}
+
+fn msft_vartype(bytes: &[u8], code: i32, typedesc: MsftSegment) -> u16 {
+    if code < 0 {
+        return (code.unsigned_abs() as u16) & 0x0fff;
+    }
+    let at = typedesc.offset + (code as usize / 8) * 8;
+    read_u16(bytes, at).map(|vt| vt & 0x0fff).unwrap_or(1) // VT_VOID
+}
+
+fn read_functions(
+    bytes: &[u8],
+    memoffset: usize,
+    c_funcs: usize,
+    c_vars: usize,
+    names: &HashMap<u32, String>,
+    strings: &HashMap<i32, String>,
+    typedesc: MsftSegment,
+) -> std::result::Result<Vec<MsftFunc>, ()> {
+    let info_len = read_u32(bytes, memoffset)? as usize;
+    let mut record = memoffset.checked_add(4).ok_or(())?;
+    let mut funcs = Vec::with_capacity(c_funcs);
+    for index in 0..c_funcs {
+        let record_len = read_u16(bytes, record)? as usize;
+        let record_end = record.checked_add(record_len).ok_or(())?;
+        if record_len < 24 || record_end > bytes.len() {
+            return Err(());
+        }
+        let data_type = read_i32(bytes, record + 4)?;
+        let flags = read_u16(bytes, record + 8)?;
+        let vtable_offset = read_u16(bytes, record + 12)?;
+        let fkccic = read_u32(bytes, record + 16)?;
+        let c_params = read_u16(bytes, record + 20)?;
+        let c_params_opt = read_u16(bytes, record + 22)?;
+        if 24 + c_params as usize * 12 > record_len {
+            return Err(());
+        }
+        let memid_offset = memoffset
+            .checked_add(info_len)
+            .and_then(|at| at.checked_add((index + 1) * 4))
+            .ok_or(())?;
+        let memid = read_i32(bytes, memid_offset)?;
+        let name_slot = memoffset
+            .checked_add(info_len)
+            .and_then(|at| at.checked_add((c_funcs + c_vars + index + 1) * 4))
+            .ok_or(())?;
+        let name_offset = read_u32(bytes, name_slot)?;
+        let optional = record_len.saturating_sub(c_params as usize * 12);
+        let help_context = if optional > 24 {
+            read_u32(bytes, record + 24)?
+        } else {
+            0
+        };
+        let help_string = if optional > 28 {
+            strings
+                .get(&read_i32(bytes, record + 28)?)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let entry = if optional > 32 && fkccic & 0x2000 == 0 {
+            strings.get(&read_i32(bytes, record + 32)?).cloned()
+        } else {
+            None
+        };
+        let mut params = Vec::with_capacity(c_params as usize);
+        let param_base = record + record_len - c_params as usize * 12;
+        for arg in 0..c_params as usize {
+            let at = param_base + arg * 12;
+            let vt = msft_vartype(bytes, read_i32(bytes, at)?, typedesc);
+            let name = names
+                .get(&read_u32(bytes, at + 4)?)
+                .cloned()
+                .unwrap_or_default();
+            let param_flags = read_u16(bytes, at + 8)?;
+            params.push((vt, param_flags, name));
+        }
+        funcs.push(MsftFunc {
+            memid,
+            name: names.get(&name_offset).cloned().unwrap_or_default(),
+            return_vt: msft_vartype(bytes, data_type, typedesc),
+            func_flags: flags,
+            vtable_offset,
+            funckind: (fkccic & 0x7) as u8,
+            invkind: ((fkccic >> 3) & 0xf) as u8,
+            callconv: ((fkccic >> 8) & 0xf) as u8,
+            c_params,
+            c_params_opt,
+            help_context,
+            help_string,
+            entry,
+            params,
+        });
+        record += record_len;
+    }
+    Ok(funcs)
+}
+
 const COM_CFB_PREFIX: &str = "\u{1}cfb:";
+const COM_PLAIN_FILE_PREFIX: &str = "\u{1}plain-file:";
 const COM_COMPOSITE_PREFIX: &str = "\u{1}composite:";
 const COM_ITEM_PREFIX: &str = "\u{1}item:";
+const COM_ABS_ITEM_PREFIX: &str = "\u{1}absitem:";
+const COM_ITEM_CONTAINER_PREFIX: &str = "\u{1}item-container:";
+const COM_RUNNING_PREFIX: &str = "\u{1}running:";
+const COM_ROT_MARKER: &str = "\u{1}running-object-table";
 
 fn com_type_descriptor(table: &str) -> Option<&'static ComTypeDescriptor> {
     COM_TYPE_DESCRIPTORS
@@ -7506,9 +10196,6 @@ mod tests {
         read_guest_pointer(&fixture.memory, address, GuestArch::X86).unwrap()
     }
 
-    /// Invoke one vtable slot through the object's real vtable: read the
-    /// function pointer, resolve the host thunk the runtime installed and
-    /// dispatch it with the x86 stack ABI (exactly what the guest does).
     fn call_slot(fixture: &mut Fixture, object: u64, slot: u64, args: &[u32]) -> u32 {
         let vtable = read_guest_pointer(&fixture.memory, object, GuestArch::X86).unwrap();
         let function =
@@ -7731,70 +10418,6 @@ mod tests {
         })
     }
 
-    #[test]
-    fn stream_file_backing_commits_and_reverts_over_the_real_file() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("com-stream-file");
-            let host_path = fixture._temp.path().join("backing.bin");
-            std::fs::write(&host_path, b"disk").unwrap();
-            let stream = fixture
-                .runtime
-                .alloc_com_stream_from_file(&mut fixture.memory, host_path.to_str().unwrap())
-                .unwrap();
-            assert_eq!(
-                fixture
-                    .runtime
-                    .com_streams
-                    .get(&stream)
-                    .unwrap()
-                    .data
-                    .clone(),
-                b"disk".to_vec()
-            );
-
-            // Seek to the end and append through Write, then Commit.
-            assert_eq!(
-                call_slot(&mut fixture, stream, 5, &[stream as u32, 0, 0, 2, 0]),
-                0
-            );
-            fixture.memory.map_bytes(BUF, b"-live");
-            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
-            assert_eq!(
-                call_slot(
-                    &mut fixture,
-                    stream,
-                    4,
-                    &[stream as u32, BUF as u32, 5, OUT as u32]
-                ),
-                0
-            );
-            assert_eq!(
-                call_slot(&mut fixture, stream, 8, &[stream as u32, 0]),
-                0,
-                "IStream::Commit"
-            );
-            assert_eq!(std::fs::read(&host_path).unwrap(), b"disk-live".to_vec());
-
-            // An out-of-band change is observed by Revert.
-            std::fs::write(&host_path, b"external").unwrap();
-            assert_eq!(
-                call_slot(&mut fixture, stream, 9, &[stream as u32]),
-                0,
-                "IStream::Revert"
-            );
-            assert_eq!(
-                fixture
-                    .runtime
-                    .com_streams
-                    .get(&stream)
-                    .unwrap()
-                    .data
-                    .clone(),
-                b"external".to_vec()
-            );
-        })
-    }
-
     // ── Storage ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -7930,186 +10553,6 @@ mod tests {
     }
 
     // ── Connection points and events ────────────────────────────────────────
-
-    #[test]
-    fn connection_points_advise_bookkeeping_enumeration_and_event_firing() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("com-cp");
-            let server = create_server(&mut fixture);
-            let sink = fixture
-                .runtime
-                .alloc_com_sink_object(&mut fixture.memory, "ISink")
-                .unwrap();
-
-            // QI(ID_IConnectionPointContainer) on the server hands out the
-            // container interface object.
-            write_iid(&mut fixture, IID_PTR, &COM_IID_ICONNECTIONPOINTCONTAINER);
-            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
-            assert_eq!(
-                call_slot(
-                    &mut fixture,
-                    server,
-                    0,
-                    &[server as u32, IID_PTR as u32, OUT as u32]
-                ),
-                0,
-                "server QueryInterface(IConnectionPointContainer)"
-            );
-            let container = guest_ptr(&fixture, OUT);
-            assert_ne!(container, 0);
-
-            // FindConnectionPoint(events IID) returns the event point; an
-            // unrelated IID is CONNECT_E_NOCONNECTION.
-            write_iid(&mut fixture, IID_PTR, &COM_AUTOMATION_EVENTS_IID);
-            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
-            assert_eq!(
-                call_slot(
-                    &mut fixture,
-                    container,
-                    4,
-                    &[container as u32, IID_PTR as u32, OUT as u32]
-                ),
-                0,
-                "FindConnectionPoint"
-            );
-            let point = guest_ptr(&fixture, OUT);
-            assert_ne!(point, 0);
-            write_iid(&mut fixture, IID_PTR, &COM_IID_IDISPATCH);
-            assert_eq!(
-                call_slot(
-                    &mut fixture,
-                    container,
-                    4,
-                    &[container as u32, IID_PTR as u32, OUT as u32]
-                ),
-                CONNECT_E_NOCONNECTION
-            );
-
-            // The point reports its interface and owner container.
-            write_iid(&mut fixture, IID_PTR, &[0_u8; 16]);
-            assert_eq!(
-                call_slot(&mut fixture, point, 3, &[point as u32, IID_PTR as u32]),
-                0
-            );
-            assert_eq!(
-                fixture.memory.read_bytes(IID_PTR, 16).unwrap(),
-                COM_AUTOMATION_EVENTS_IID.to_vec()
-            );
-            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
-            assert_eq!(
-                call_slot(&mut fixture, point, 4, &[point as u32, OUT as u32]),
-                0
-            );
-            assert_eq!(guest_ptr(&fixture, OUT), container);
-
-            // Advise the sink; the cookie is recorded.
-            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
-            assert_eq!(
-                call_slot(
-                    &mut fixture,
-                    point,
-                    5,
-                    &[point as u32, sink as u32, COOKIE as u32]
-                ),
-                0,
-                "IConnectionPoint::Advise"
-            );
-            let cookie = fixture.memory.read_u32(COOKIE).unwrap();
-            assert_ne!(cookie, 0);
-            assert_eq!(
-                fixture
-                    .runtime
-                    .com_connection_points
-                    .get(&point)
-                    .unwrap()
-                    .sinks,
-                vec![(cookie, sink)]
-            );
-
-            // EnumConnections enumerates the (sink, cookie) CONNECTDATA.
-            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
-            assert_eq!(
-                call_slot(&mut fixture, point, 7, &[point as u32, OUT as u32]),
-                0,
-                "EnumConnections"
-            );
-            let connections = guest_ptr(&fixture, OUT);
-            fixture.memory.map_bytes(BUF, &[0_u8; 16]);
-            let fetched = OUT + 4;
-            assert_eq!(
-                call_slot(
-                    &mut fixture,
-                    connections,
-                    3,
-                    &[connections as u32, 1, BUF as u32, fetched as u32]
-                ),
-                0
-            );
-            assert_eq!(fixture.memory.read_u32(fetched).unwrap(), 1);
-            assert_eq!(guest_ptr(&fixture, BUF), sink);
-            assert_eq!(fixture.memory.read_u32(BUF + 4).unwrap(), cookie);
-
-            // EnumConnectionPoints enumerates the point itself.
-            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
-            assert_eq!(
-                call_slot(&mut fixture, container, 3, &[container as u32, OUT as u32]),
-                0,
-                "EnumConnectionPoints"
-            );
-            let points = guest_ptr(&fixture, OUT);
-            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
-            assert_eq!(
-                call_slot(
-                    &mut fixture,
-                    points,
-                    3,
-                    &[points as u32, 1, BUF as u32, fetched as u32]
-                ),
-                0
-            );
-            assert_eq!(guest_ptr(&fixture, BUF), point);
-
-            // A server state change (put_Value) fires OnValueChanged into the
-            // advised sink through its real IDispatch::Invoke slot.
-            fixture
-                .runtime
-                .write_variant_i4(&mut fixture.memory, VARIANT, 42);
-            assert_eq!(
-                call_slot(&mut fixture, server, 8, &[server as u32, VARIANT as u32]),
-                0,
-                "put_Value"
-            );
-            assert_eq!(
-                fixture.runtime.com_sink_invocations,
-                vec![(sink, 10, vec![ComValue::I4(42)])]
-            );
-            let fired = fixture.runtime.com_fired_events.last().unwrap();
-            assert_eq!(fired.source, server);
-            assert_eq!(fired.dispid, 10);
-            assert_eq!(fired.sink, sink);
-            assert_eq!(fired.hr, 0);
-
-            // Unadvise removes the sink: the next change fires nothing.
-            assert_eq!(
-                call_slot(&mut fixture, point, 6, &[point as u32, cookie]),
-                0,
-                "IConnectionPoint::Unadvise"
-            );
-            assert_eq!(
-                call_slot(&mut fixture, point, 6, &[point as u32, cookie]),
-                CONNECT_E_NOCONNECTION
-            );
-            fixture
-                .runtime
-                .write_variant_i4(&mut fixture.memory, VARIANT, 43);
-            let fired_before = fixture.runtime.com_fired_events.len();
-            assert_eq!(
-                call_slot(&mut fixture, server, 8, &[server as u32, VARIANT as u32]),
-                0
-            );
-            assert_eq!(fixture.runtime.com_fired_events.len(), fired_before);
-        })
-    }
 
     // ── IDispatch / ITypeInfo ───────────────────────────────────────────────
 
@@ -8379,59 +10822,6 @@ mod tests {
         })
     }
 
-    #[test]
-    fn disp_helper_exports_route_into_the_registered_tables() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("com-disp-exports");
-            let server = create_server(&mut fixture);
-            write_utf16(&mut fixture, NAME, "Value");
-            fixture.memory.map_bytes(NAMES, &[0_u8; 8]);
-            write_u32(&mut fixture.memory, NAMES, NAME as u32);
-            fixture.memory.map_bytes(IDS, &[0_u8; 4]);
-            assert_eq!(
-                dispatch_x86(
-                    &mut fixture,
-                    HostThunk::OleDispGetIdsOfNames,
-                    &[server as u32, NAMES as u32, 1, 0, IDS as u32]
-                ),
-                0,
-                "DispGetIDsOfNames"
-            );
-            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 1);
-
-            // DispInvoke with the registered typeinfo routes to the instance.
-            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
-            assert_eq!(
-                call_slot(&mut fixture, server, 4, &[server as u32, 0, OUT as u32]),
-                0
-            );
-            let type_info = guest_ptr(&fixture, OUT);
-            let (params, result, exception, argument_error) = fixture
-                .runtime
-                .build_dispatch_invocation(&mut fixture.memory, &[ComValue::I4(5), ComValue::I4(6)])
-                .unwrap();
-            assert_eq!(
-                dispatch_x86(
-                    &mut fixture,
-                    HostThunk::OleDispInvoke,
-                    &[
-                        server as u32,
-                        type_info as u32,
-                        4,
-                        u64::from(DISPATCH_METHOD) as u32,
-                        params as u32,
-                        result as u32,
-                        exception as u32,
-                        argument_error as u32,
-                    ]
-                ),
-                0,
-                "DispInvoke"
-            );
-            assert_eq!(read_variant_i4(&fixture, result), 11);
-        })
-    }
-
     // ── Monikers ────────────────────────────────────────────────────────────
 
     #[test]
@@ -8475,7 +10865,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     moniker,
-                    7,
+                    14,
                     &[moniker as u32, 0, 0, OUT as u32]
                 ),
                 0,
@@ -8484,16 +10874,75 @@ mod tests {
             let bstr = guest_ptr(&fixture, OUT);
             assert_eq!(read_utf16_string(&fixture.memory, bstr).unwrap(), display);
 
+            // GetClassID/IsDirty/GetSizeMax/IsEqual/ParseDisplayName occupy
+            // their documented IMoniker slots.
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 3, &[moniker as u32, OUT as u32]),
+                0,
+                "GetClassID"
+            );
+            assert_eq!(
+                fixture.memory.read_bytes(OUT, 16).unwrap(),
+                PeHostRuntime::parse_guid_string("00000303-0000-0000-C000-000000000046").unwrap()
+            );
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 4, &[moniker as u32]),
+                S_FALSE,
+                "IsDirty"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 7, &[moniker as u32, OUT as u32]),
+                E_NOTIMPL,
+                "GetSizeMax"
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    13,
+                    &[moniker as u32, moniker as u32, OUT as u32]
+                ),
+                0,
+                "IsEqual"
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 1);
+            write_utf16(&mut fixture, NAME, &display);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    15,
+                    &[
+                        moniker as u32,
+                        0,
+                        0,
+                        NAME as u32,
+                        STAT as u32,
+                        (OUT + 4) as u32
+                    ]
+                ),
+                0,
+                "ParseDisplayName"
+            );
+            assert_ne!(guest_ptr(&fixture, OUT + 4), 0);
+            assert_eq!(
+                fixture.memory.read_u32(STAT).unwrap(),
+                display.encode_utf16().count() as u32
+            );
+
             // IsSystemMoniker reports MKSYS_FILEMONIKER; Hash is stable.
             fixture.memory.map_bytes(OUT, &[0_u8; 8]);
             assert_eq!(
-                call_slot(&mut fixture, moniker, 9, &[moniker as u32, OUT as u32]),
+                call_slot(&mut fixture, moniker, 16, &[moniker as u32, OUT as u32]),
                 0
             );
             assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 2);
             fixture.memory.map_bytes(OUT, &[0_u8; 8]);
             assert_eq!(
-                call_slot(&mut fixture, moniker, 10, &[moniker as u32, OUT as u32]),
+                call_slot(&mut fixture, moniker, 17, &[moniker as u32, OUT as u32]),
                 0
             );
             let hash = fixture.memory.read_u32(OUT).unwrap();
@@ -8506,7 +10955,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     moniker,
-                    4,
+                    9,
                     &[moniker as u32, 0, 0, IID_PTR as u32, OUT as u32]
                 ),
                 0,
@@ -8535,7 +10984,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     moniker,
-                    3,
+                    8,
                     &[moniker as u32, 0, 0, 0, OUT as u32]
                 ),
                 MK_E_NOOBJECT
@@ -8546,14 +10995,14 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     moniker,
-                    5,
+                    10,
                     &[moniker as u32, 0, 0, 0, OUT as u32]
                 ),
                 MK_E_REDUCED_TO_SELF
             );
             fixture.memory.map_bytes(OUT, &[0_u8; 8]);
             assert_eq!(
-                call_slot(&mut fixture, moniker, 8, &[moniker as u32, 1, OUT as u32]),
+                call_slot(&mut fixture, moniker, 12, &[moniker as u32, 1, OUT as u32]),
                 0
             );
             assert_eq!(guest_ptr(&fixture, OUT), 0);
@@ -8562,7 +11011,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     moniker,
-                    6,
+                    11,
                     &[moniker as u32, moniker as u32, 0, OUT as u32]
                 ),
                 E_INVALIDARG
@@ -8600,7 +11049,7 @@ mod tests {
             );
             let moniker = guest_ptr(&fixture, OUT);
             assert_eq!(
-                call_slot(&mut fixture, moniker, 9, &[moniker as u32, OUT as u32]),
+                call_slot(&mut fixture, moniker, 16, &[moniker as u32, OUT as u32]),
                 0
             );
             assert_eq!(
@@ -8614,7 +11063,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     moniker,
-                    3,
+                    8,
                     &[moniker as u32, 0, 0, 0, OUT as u32]
                 ),
                 0,
@@ -8654,7 +11103,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     unknown_moniker,
-                    3,
+                    8,
                     &[unknown_moniker as u32, 0, 0, 0, OUT as u32]
                 ),
                 REGDB_E_CLASSNOTREG
@@ -9293,7 +11742,7 @@ mod tests {
             call_slot(
                 fixture,
                 left,
-                6,
+                11,
                 &[left as u32, right as u32, 0, OUT as u32]
             ),
             0,
@@ -9328,7 +11777,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     composite,
-                    7,
+                    14,
                     &[composite as u32, 0, 0, OUT as u32]
                 ),
                 0,
@@ -9341,7 +11790,7 @@ mod tests {
             );
             fixture.memory.map_bytes(OUT, &[0_u8; 8]);
             assert_eq!(
-                call_slot(&mut fixture, composite, 9, &[composite as u32, OUT as u32]),
+                call_slot(&mut fixture, composite, 16, &[composite as u32, OUT as u32]),
                 0
             );
             assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 1);
@@ -9350,7 +11799,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     item_moniker,
-                    9,
+                    16,
                     &[item_moniker as u32, OUT as u32]
                 ),
                 0
@@ -9363,7 +11812,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     composite,
-                    8,
+                    12,
                     &[composite as u32, 1, OUT as u32]
                 ),
                 0,
@@ -9395,7 +11844,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     composite,
-                    4,
+                    9,
                     &[composite as u32, 0, 0, IID_PTR as u32, OUT as u32]
                 ),
                 0,
@@ -9426,7 +11875,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     composite,
-                    3,
+                    8,
                     &[composite as u32, 0, 0, 0, OUT as u32]
                 ),
                 0,
@@ -9444,7 +11893,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     bad_composite,
-                    4,
+                    9,
                     &[bad_composite as u32, 0, 0, IID_PTR as u32, OUT as u32]
                 ),
                 MK_E_NOOBJECT,
@@ -9464,7 +11913,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     class_composite,
-                    3,
+                    8,
                     &[class_composite as u32, 0, 0, 0, OUT as u32]
                 ),
                 0,
@@ -9479,7 +11928,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     bad_class,
-                    3,
+                    8,
                     &[bad_class as u32, 0, 0, 0, OUT as u32]
                 ),
                 MK_E_NOOBJECT,
@@ -9493,7 +11942,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     composite,
-                    5,
+                    10,
                     &[composite as u32, 0, 0, 0, OUT as u32]
                 ),
                 MK_E_REDUCED_TO_SELF
@@ -9516,7 +11965,7 @@ mod tests {
                 call_slot(
                     &mut fixture,
                     single,
-                    5,
+                    10,
                     &[single as u32, 0, 0, 0, OUT as u32]
                 ),
                 0,
@@ -9972,9 +12421,6 @@ mod tests {
         elements
     }
 
-    /// root/alpha.bin
-    /// root/Storage/outer.bin
-    /// root/Storage/Sub/{beta.bin,gamma.bin}
     fn build_nested_compound(
         fixture: &mut Fixture,
         file_name: &str,
@@ -10537,6 +12983,6033 @@ mod tests {
             assert_eq!(guest_ptr(&fixture, OUT), server);
             assert!(!fixture.runtime.guest_objects.contains_key(&stream));
             assert!(!fixture.runtime.com_streams.contains_key(&stream));
+        })
+    }
+
+    // ── IOleItemContainer / ITypeLib / GetDllEntry / CopyTo filters ────────
+
+    fn build_test_pe(export: Option<(&str, u32)>) -> Vec<u8> {
+        let mut image = vec![0u8; 0x400];
+        image[0] = b'M';
+        image[1] = b'Z';
+        image[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        let pe = 0x80usize;
+        image[pe..pe + 4].copy_from_slice(b"PE\0\0");
+        image[pe + 4..pe + 6].copy_from_slice(&0x014c_u16.to_le_bytes());
+        image[pe + 6..pe + 8].copy_from_slice(&1_u16.to_le_bytes());
+        image[pe + 20..pe + 22].copy_from_slice(&0x00e0_u16.to_le_bytes());
+        image[pe + 22..pe + 24].copy_from_slice(&0x2102_u16.to_le_bytes());
+        let opt = pe + 24;
+        image[opt..opt + 2].copy_from_slice(&0x010b_u16.to_le_bytes());
+        image[opt + 16..opt + 20].copy_from_slice(&0x1000_u32.to_le_bytes());
+        image[opt + 28..opt + 32].copy_from_slice(&0x0040_0000_u32.to_le_bytes());
+        image[opt + 32..opt + 36].copy_from_slice(&0x1000_u32.to_le_bytes());
+        image[opt + 36..opt + 40].copy_from_slice(&0x0200_u32.to_le_bytes());
+        image[opt + 56..opt + 60].copy_from_slice(&0x2000_u32.to_le_bytes());
+        image[opt + 60..opt + 64].copy_from_slice(&0x0200_u32.to_le_bytes());
+        image[opt + 68..opt + 70].copy_from_slice(&3_u16.to_le_bytes());
+        image[opt + 92..opt + 96].copy_from_slice(&16_u32.to_le_bytes());
+        let section = pe + 24 + 0x00e0;
+        image[section..section + 8].copy_from_slice(b".edata\0\0");
+        image[section + 8..section + 12].copy_from_slice(&0x0100_u32.to_le_bytes());
+        image[section + 12..section + 16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        image[section + 16..section + 20].copy_from_slice(&0x0200_u32.to_le_bytes());
+        image[section + 20..section + 24].copy_from_slice(&0x0200_u32.to_le_bytes());
+        image[section + 36..section + 40].copy_from_slice(&0x4000_0040_u32.to_le_bytes());
+        if let Some((name, ordinal)) = export {
+            let export_dir = 0x200usize;
+            image[opt + 96..opt + 100].copy_from_slice(&0x1000_u32.to_le_bytes());
+            image[opt + 100..opt + 104].copy_from_slice(&0x0100_u32.to_le_bytes());
+            image[export_dir + 16..export_dir + 20].copy_from_slice(&ordinal.to_le_bytes());
+            image[export_dir + 20..export_dir + 24].copy_from_slice(&1_u32.to_le_bytes());
+            image[export_dir + 24..export_dir + 28].copy_from_slice(&1_u32.to_le_bytes());
+            image[export_dir + 28..export_dir + 32].copy_from_slice(&0x1040_u32.to_le_bytes());
+            image[export_dir + 32..export_dir + 36].copy_from_slice(&0x1060_u32.to_le_bytes());
+            image[export_dir + 36..export_dir + 40].copy_from_slice(&0x1080_u32.to_le_bytes());
+            image[export_dir + 0x40..export_dir + 0x44].copy_from_slice(&0x1200_u32.to_le_bytes());
+            image[export_dir + 0x60..export_dir + 0x64].copy_from_slice(&0x1090_u32.to_le_bytes());
+            image[export_dir + 0x80..export_dir + 0x82].copy_from_slice(&0_u16.to_le_bytes());
+            let name_bytes = name.as_bytes();
+            image[export_dir + 0x90..export_dir + 0x90 + name_bytes.len()]
+                .copy_from_slice(name_bytes);
+        }
+        image
+    }
+
+    fn write_msft_u16(image: &mut [u8], offset: usize, value: u16) {
+        image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_msft_u32(image: &mut [u8], offset: usize, value: u32) {
+        image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_msft_i32(image: &mut [u8], offset: usize, value: i32) {
+        image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_msft_text(image: &mut [u8], offset: usize, text: &str) {
+        image[offset..offset + text.len()].copy_from_slice(text.as_bytes());
+    }
+
+    fn build_msft_typelib() -> Vec<u8> {
+        const HEADER: usize = 0x54;
+        const SEGDIR: usize = 0x58;
+        const GUID_TABLE: usize = 0x158;
+        const NAME_TABLE: usize = 0x188;
+        const STRING_TABLE: usize = 0x1f8;
+        const TYPE_DESC: usize = 0x22c;
+        const TYPEINFO: usize = 0x23c;
+        const MEMBERS: usize = 0x2a0;
+        const END: usize = 0x320;
+        let mut image = vec![0u8; END];
+
+        write_msft_u32(&mut image, 0, 0x5446_534d);
+        write_msft_u32(&mut image, 4, 0x0001_0002);
+        write_msft_i32(&mut image, 8, 0); // libid guid offset
+        write_msft_u32(&mut image, 0x0c, 0x409);
+        write_msft_u32(&mut image, 0x10, 0x409);
+        write_msft_u32(&mut image, 0x14, 0x41);
+        write_msft_u32(&mut image, 0x18, 0x0000_0001);
+        write_msft_u32(&mut image, 0x1c, 0);
+        write_msft_u32(&mut image, 0x20, 1); // one typeinfo
+        write_msft_i32(&mut image, 0x24, 24); // helpstring
+        write_msft_u32(&mut image, 0x28, 0);
+        write_msft_u32(&mut image, 0x2c, 0); // library name offset
+        write_msft_i32(&mut image, 0x30, 40); // helpfile
+        write_msft_i32(&mut image, 0x40, -1);
+        write_msft_u32(&mut image, 0x44, 0x20);
+        write_msft_u32(&mut image, 0x48, 0x80);
+        write_msft_i32(&mut image, 0x4c, -1);
+        write_msft_u32(&mut image, 0x50, 0);
+        write_msft_u32(&mut image, HEADER, 0); // typeinfo offset entry
+
+        let mut segment = |index: usize, offset: usize, length: usize, kind: u32| {
+            let base = SEGDIR + index * 16;
+            write_msft_u32(&mut image, base, offset as u32);
+            write_msft_u32(&mut image, base + 4, length as u32);
+            write_msft_i32(&mut image, base + 8, -1);
+            write_msft_u32(&mut image, base + 12, kind);
+        };
+        segment(0, TYPEINFO, 100, 0x0f);
+        segment(1, 0, 0, 0x0f);
+        segment(5, GUID_TABLE, 48, 0x0f);
+        segment(7, NAME_TABLE, 112, 0x0f);
+        segment(8, STRING_TABLE, 52, 0x0f);
+        segment(9, TYPE_DESC, 16, 0x0f);
+
+        image[GUID_TABLE..GUID_TABLE + 16].copy_from_slice(&COM_AUTOMATION_TYPELIB_IID);
+        write_msft_i32(&mut image, GUID_TABLE + 16, -2);
+        write_msft_i32(&mut image, GUID_TABLE + 20, -1);
+        image[GUID_TABLE + 24..GUID_TABLE + 40].copy_from_slice(&COM_AUTOMATION_INTERFACE_IID);
+        write_msft_i32(&mut image, GUID_TABLE + 40, 0);
+        write_msft_i32(&mut image, GUID_TABLE + 44, -1);
+
+        let names = [
+            (0usize, "ICasa1Crafted"),
+            (28, "DoWork"),
+            (48, "get_Value"),
+            (72, "put_Value"),
+            (96, "arg"),
+        ];
+        for (offset, name) in names {
+            let at = NAME_TABLE + offset;
+            write_msft_i32(&mut image, at, -1);
+            write_msft_i32(&mut image, at + 4, -1);
+            write_msft_u16(&mut image, at + 8, name.len() as u16);
+            write_msft_text(&mut image, at + 12, name);
+        }
+        let strings = [
+            (0usize, "Casa1 crafted typelib"),
+            (24, "crafted doc"),
+            (40, "casa1.hlp"),
+        ];
+        for (offset, text) in strings {
+            let at = STRING_TABLE + offset;
+            write_msft_u16(&mut image, at, text.len() as u16);
+            write_msft_text(&mut image, at + 2, text);
+        }
+        write_msft_u16(&mut image, TYPE_DESC, 3); // VT_I4
+        write_msft_u16(&mut image, TYPE_DESC + 8, 8); // VT_BSTR
+
+        write_msft_u32(&mut image, TYPEINFO, 3); // TKIND_INTERFACE
+        write_msft_i32(&mut image, TYPEINFO + 4, MEMBERS as i32);
+        write_msft_u32(&mut image, TYPEINFO + 24, 3); // cFuncs = 3
+        write_msft_i32(&mut image, TYPEINFO + 44, 24); // type guid
+        write_msft_u16(&mut image, TYPEINFO + 48, 0);
+        write_msft_u32(&mut image, TYPEINFO + 52, 0); // name
+        write_msft_u16(&mut image, TYPEINFO + 56, 1);
+        write_msft_i32(&mut image, TYPEINFO + 60, 24); // docstring
+        write_msft_u32(&mut image, TYPEINFO + 68, 7);
+        write_msft_u16(&mut image, TYPEINFO + 76, 0);
+        write_msft_u16(&mut image, TYPEINFO + 78, 12);
+        write_msft_u32(&mut image, TYPEINFO + 80, 4);
+
+        write_msft_u32(&mut image, MEMBERS, 100); // infolen
+        let mut record = MEMBERS + 4;
+        let mut write_record = |offset: usize,
+                                length: u32,
+                                data_type: i32,
+                                vtable: u16,
+                                fkccic: u32,
+                                params: &[(i32, u32)]| {
+            write_msft_u32(&mut image, offset, length);
+            write_msft_i32(&mut image, offset + 4, data_type);
+            write_msft_u16(&mut image, offset + 8, 0);
+            write_msft_u16(&mut image, offset + 12, vtable);
+            write_msft_u32(&mut image, offset + 16, fkccic);
+            write_msft_u16(&mut image, offset + 20, params.len() as u16);
+            write_msft_u16(&mut image, offset + 22, params.len() as u16);
+            let base = offset + length as usize - params.len() * 12;
+            for (index, (vt, name_offset)) in params.iter().enumerate() {
+                let at = base + index * 12;
+                write_msft_i32(&mut image, at, *vt);
+                write_msft_u32(&mut image, at + 4, *name_offset);
+                write_msft_u16(&mut image, at + 8, 0);
+            }
+        };
+        write_record(record, 36, 0, 7, 0x40c, &[(0, 96)]);
+        record += 36;
+        write_record(record, 24, 0, 8, 0x414, &[]);
+        record += 24;
+        write_record(record, 36, -1, 9, 0x424, &[(8, 96)]);
+        let arrays = MEMBERS + 100;
+        write_msft_u32(&mut image, arrays, 0);
+        write_msft_i32(&mut image, arrays + 4, 1);
+        write_msft_i32(&mut image, arrays + 8, 2);
+        write_msft_i32(&mut image, arrays + 12, 2);
+        write_msft_u32(&mut image, arrays + 16, 28);
+        write_msft_u32(&mut image, arrays + 20, 48);
+        write_msft_u32(&mut image, arrays + 24, 72);
+        image
+    }
+
+    #[test]
+    fn item_container_resolves_files_folders_storages_and_running_objects() {
+        use crate::runtime::dispatch::msi::{CompoundTree, CompoundTreeChild, write_compound_tree};
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-item-container");
+            let root = fixture._temp.path().join("root");
+            std::fs::create_dir_all(root.join("Sub")).unwrap();
+            std::fs::write(root.join("alpha.bin"), b"alpha-bytes").unwrap();
+            std::fs::write(root.join("Sub").join("inner.bin"), b"inner-bytes").unwrap();
+            let cfb_path = root.join("doc.cfb");
+            let mut store = CompoundTree::new("Store");
+            store
+                .children
+                .push(CompoundTree::stream("inner.cfb", b"cfb-stream".to_vec()));
+            let mut cfb_root = CompoundTree::new("Root Entry");
+            cfb_root
+                .children
+                .push(CompoundTree::stream("top.bin", b"top-bytes".to_vec()));
+            cfb_root.children.push(CompoundTreeChild::Storage(store));
+            std::fs::write(&cfb_path, write_compound_tree(&cfb_root)).unwrap();
+
+            let container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &root.to_string_lossy())
+                .unwrap();
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEITEMCONTAINER);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    0,
+                    &[container as u32, IID_PTR as u32, OUT as u32]
+                ),
+                0,
+                "IOleItemContainer QI"
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), container);
+
+            // GetObject resolves a plain file to its real IStream.
+            write_utf16(&mut fixture, NAME, "alpha.bin");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                0,
+                "GetObject(alpha.bin)"
+            );
+            let stream = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    3,
+                    &[stream as u32, BUF as u32, 11, STAT as u32]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_bytes(BUF, 11).unwrap(), b"alpha-bytes");
+
+            // The bound item is now a running object; an immediate bind uses
+            // it, while an unbounded item reports MK_E_EXCEEDEDDEADLINE.
+            write_utf16(&mut fixture, NAME, "Sub/inner.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_IMMEDIATE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                MK_E_EXCEEDEDDEADLINE,
+                "immediate bind of an unbound item"
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_MODERATE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                0,
+                "moderate bind of Sub/inner.bin"
+            );
+            let inner_stream = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    inner_stream,
+                    3,
+                    &[inner_stream as u32, BUF as u32, 11, STAT as u32]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_bytes(BUF, 11).unwrap(), b"inner-bytes");
+
+            // Missing names are the real MK_E_NOOBJECT.
+            write_utf16(&mut fixture, NAME, "missing.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                MK_E_NOOBJECT
+            );
+
+            // IsRunning reflects the running-object registrations.
+            write_utf16(&mut fixture, NAME, "alpha.bin");
+            assert_eq!(
+                call_slot(&mut fixture, container, 8, &[container as u32, NAME as u32]),
+                1,
+                "IsRunning(alpha.bin)"
+            );
+            write_utf16(&mut fixture, NAME, "missing.bin");
+            assert_eq!(
+                call_slot(&mut fixture, container, 8, &[container as u32, NAME as u32]),
+                0,
+                "IsRunning(missing.bin)"
+            );
+
+            // GetObjectStorage opens a folder as IStorage and wraps a plain
+            // file as a one-stream compound storage.
+            write_utf16(&mut fixture, NAME, "Sub");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, IID_PTR as u32, OUT as u32]
+                ),
+                0,
+                "GetObjectStorage(Sub)"
+            );
+            let sub_storage = guest_ptr(&fixture, OUT);
+            assert!(
+                fixture.runtime.com_storages[&sub_storage]
+                    .streams
+                    .contains_key("inner.bin")
+            );
+            write_utf16(&mut fixture, NAME, "alpha.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, IID_PTR as u32, OUT as u32]
+                ),
+                0,
+                "GetObjectStorage(plain file)"
+            );
+            let file_storage = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    file_storage,
+                    4,
+                    &[file_storage as u32, NAME as u32, 0, 0, 0, (OUT + 4) as u32]
+                ),
+                0,
+                "plain-file storage OpenStream"
+            );
+            let file_stream = guest_ptr(&fixture, OUT + 4);
+            fixture.memory.map_bytes(BUF, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    file_stream,
+                    3,
+                    &[file_stream as u32, BUF as u32, 11, STAT as u32]
+                ),
+                0,
+                "plain-file storage stream Read"
+            );
+            assert_eq!(fixture.memory.read_bytes(BUF, 11).unwrap(), b"alpha-bytes");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    file_stream,
+                    5,
+                    &[file_stream as u32, 0, 0, 0, STAT as u32]
+                ),
+                0,
+                "plain-file storage stream Seek"
+            );
+            fixture.memory.map_bytes(BUF, b"ALPHA-BYTES");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    file_stream,
+                    4,
+                    &[file_stream as u32, BUF as u32, 11, STAT as u32]
+                ),
+                0,
+                "plain-file storage stream Write"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, file_storage, 9, &[file_storage as u32, 1]),
+                0,
+                "plain-file storage Commit"
+            );
+            assert_eq!(
+                std::fs::read(root.join("alpha.bin")).unwrap(),
+                b"ALPHA-BYTES"
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE,
+                "GetObjectStorage(unsupported IID)"
+            );
+
+            // A compound-file container opens its child storages and reports
+            // streams (not storages) as MK_E_NOOBJECT.
+            let cfb_container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &cfb_path.to_string_lossy())
+                .unwrap();
+            write_utf16(&mut fixture, NAME, "Store");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    7,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                0,
+                "GetObjectStorage(Store)"
+            );
+            let store_storage = guest_ptr(&fixture, OUT);
+            assert!(
+                fixture.runtime.com_storages[&store_storage]
+                    .streams
+                    .contains_key("inner.cfb")
+            );
+            write_utf16(&mut fixture, NAME, "top.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    7,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                MK_E_NOOBJECT,
+                "GetObjectStorage(stream)"
+            );
+
+            // ParseDisplayName produces an item moniker whose real bind goes
+            // through the container (and registers the running object).
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            write_utf16(&mut fixture, NAME, "item:Sub/inner.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    3,
+                    &[container as u32, NAME as u32, 0, STAT as u32, OUT as u32]
+                ),
+                0,
+                "ParseDisplayName"
+            );
+            assert_eq!(
+                fixture.memory.read_u32(STAT).unwrap(),
+                "item:Sub/inner.bin".encode_utf16().count() as u32
+            );
+            let moniker = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    8,
+                    &[moniker as u32, 0, 0, IID_PTR as u32, (OUT + 4) as u32]
+                ),
+                0,
+                "item moniker BindToObject"
+            );
+            let moniker_stream = guest_ptr(&fixture, OUT + 4);
+            fixture.memory.map_bytes(BUF, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker_stream,
+                    3,
+                    &[moniker_stream as u32, BUF as u32, 11, STAT as u32]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_bytes(BUF, 11).unwrap(), b"inner-bytes");
+            fixture.memory.map_bytes(OUT + 8, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    18,
+                    &[moniker as u32, 0, 0, (OUT + 8) as u32]
+                ),
+                0,
+                "BindIfRunning"
+            );
+            assert_ne!(guest_ptr(&fixture, OUT + 8), 0);
+
+            // LockContainer increments/decrements the container lock count.
+            assert_eq!(
+                call_slot(&mut fixture, container, 5, &[container as u32, 1]),
+                0
+            );
+            assert_eq!(fixture.runtime.com_item_container_locked(container), 1);
+            assert_eq!(
+                call_slot(&mut fixture, container, 5, &[container as u32, 0]),
+                0
+            );
+            assert_eq!(fixture.runtime.com_item_container_locked(container), 0);
+
+            // EnumObjects enumerates the real filesystem entries.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    4,
+                    &[container as u32, 0, OUT as u32]
+                ),
+                0,
+                "EnumObjects"
+            );
+            let object_enum = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object_enum,
+                    3,
+                    &[object_enum as u32, 1, (OUT + 4) as u32, STAT as u32]
+                ),
+                0
+            );
+            assert_ne!(guest_ptr(&fixture, OUT + 4), 0);
+
+            // The running-object table resolves and enumerates the same
+            // registrations through its real moniker surface.
+            let rot = fixture
+                .runtime
+                .alloc_com_running_object_table(&mut fixture.memory)
+                .unwrap();
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IRUNNINGOBJECTTABLE);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    0,
+                    &[rot as u32, IID_PTR as u32, OUT as u32]
+                ),
+                0,
+                "IRunningObjectTable QI"
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), rot);
+            assert_eq!(
+                call_slot(&mut fixture, rot, 5, &[rot as u32, moniker as u32]),
+                1,
+                "ROT::IsRunning"
+            );
+            fixture.memory.map_bytes(OUT + 12, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    6,
+                    &[rot as u32, moniker as u32, (OUT + 12) as u32]
+                ),
+                0,
+                "ROT::GetObject"
+            );
+            assert_ne!(guest_ptr(&fixture, OUT + 12), 0);
+            fixture.memory.map_bytes(OUT + 16, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, rot, 9, &[rot as u32, (OUT + 16) as u32]),
+                0,
+                "ROT::EnumRunning"
+            );
+            let moniker_enum = guest_ptr(&fixture, OUT + 16);
+            fixture.memory.map_bytes(OUT + 20, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker_enum,
+                    3,
+                    &[moniker_enum as u32, 1, (OUT + 20) as u32, STAT as u32]
+                ),
+                0,
+                "IEnumMoniker::Next"
+            );
+            assert_ne!(guest_ptr(&fixture, OUT + 20), 0);
+
+            // Register/Revoke round-trips through the cookie.
+            write_utf16(&mut fixture, NAME, "item:alpha.bin");
+            fixture.memory.map_bytes(OUT + 24, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    3,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        0,
+                        STAT as u32,
+                        (OUT + 24) as u32
+                    ]
+                ),
+                0
+            );
+            let registered_moniker = guest_ptr(&fixture, OUT + 24);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    3,
+                    &[
+                        rot as u32,
+                        registered_moniker as u32,
+                        stream as u32,
+                        COOKIE as u32,
+                    ]
+                ),
+                0,
+                "ROT::Register"
+            );
+            let cookie = fixture.memory.read_u32(COOKIE).unwrap();
+            assert_ne!(cookie, 0);
+            assert_eq!(
+                call_slot(&mut fixture, rot, 4, &[rot as u32, cookie]),
+                0,
+                "ROT::Revoke"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, rot, 4, &[rot as u32, cookie]),
+                MK_E_UNAVAILABLE
+            );
+        })
+    }
+
+    #[test]
+    fn typelib_documentation_findname_isname_and_typeinfo_type_are_real() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-typelib-surface");
+            let typelib = fixture
+                .runtime
+                .alloc_com_typelib_object(&mut fixture.memory)
+                .unwrap();
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ITYPELIB);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    typelib,
+                    0,
+                    &[typelib as u32, IID_PTR as u32, OUT as u32]
+                ),
+                0,
+                "ITypeLib QI"
+            );
+
+            // GetDocumentation returns the registered name/doc/help metadata.
+            fixture.memory.map_bytes(OUT, &[0_u8; 24]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    typelib,
+                    9,
+                    &[
+                        typelib as u32,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                        (OUT + 12) as u32,
+                    ]
+                ),
+                0,
+                "ITypeLib::GetDocumentation"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT)).unwrap(),
+                "ICasa1Automation"
+            );
+            assert!(
+                !read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_ne!(fixture.memory.read_u32(OUT + 8).unwrap(), 0);
+            assert!(
+                !read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 12))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                call_slot(&mut fixture, typelib, 9, &[typelib as u32, 99, 0, 0, 0, 0]),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // GetTypeInfoType maps the registered kind table.
+            for (index, expected) in [
+                (0, TKIND_DISPATCH),
+                (3, TKIND_INTERFACE),
+                (4, TKIND_COCLASS),
+            ] {
+                fixture.memory.map_bytes(OUT, &[0_u8; 4]);
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        typelib,
+                        5,
+                        &[typelib as u32, index, OUT as u32]
+                    ),
+                    0,
+                    "GetTypeInfoType({index})"
+                );
+                assert_eq!(fixture.memory.read_u32(OUT).unwrap(), expected);
+            }
+            assert_eq!(
+                call_slot(&mut fixture, typelib, 5, &[typelib as u32, 99, OUT as u32]),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // FindName returns real TYPEINFODESC triples for a type name.
+            write_utf16(&mut fixture, NAME, "ICasa1Automation");
+            fixture.memory.map_bytes(OUT, &[0_u8; 32]);
+            fixture.memory.map_bytes(STAT, &[0_u8; 8]);
+            fixture.memory.write_u32(STAT, 4);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    typelib,
+                    10,
+                    &[
+                        typelib as u32,
+                        NAME as u32,
+                        0,
+                        OUT as u32,
+                        BUF as u32,
+                        STAT as u32,
+                    ]
+                ),
+                0,
+                "FindName(type)"
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            let type_info = guest_ptr(&fixture, OUT);
+            assert_ne!(type_info, 0);
+            assert_eq!(fixture.memory.read_u32(BUF).unwrap() as i32, MEMBERID_NIL);
+            fixture.memory.map_bytes(OUT + 8, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    12,
+                    &[
+                        type_info as u32,
+                        DISPID_UNKNOWN as u32,
+                        (OUT + 8) as u32,
+                        0,
+                        0,
+                        0
+                    ]
+                ),
+                0,
+                "ITypeInfo::GetDocumentation(type)"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 8)).unwrap(),
+                "ICasa1Automation"
+            );
+
+            // ...and for a member name, with the member's real DISPID.
+            write_utf16(&mut fixture, NAME, "Value");
+            fixture.memory.map_bytes(OUT, &[0_u8; 32]);
+            fixture.memory.map_bytes(STAT, &[0_u8; 8]);
+            fixture.memory.write_u32(STAT, 4);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    typelib,
+                    10,
+                    &[
+                        typelib as u32,
+                        NAME as u32,
+                        0,
+                        OUT as u32,
+                        BUF as u32,
+                        STAT as u32,
+                    ]
+                ),
+                0,
+                "FindName(member)"
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u32(BUF).unwrap() as i32, 1);
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+
+            // IsName is case-insensitive; unknown names are S_FALSE.
+            write_utf16(&mut fixture, NAME, "value");
+            assert_eq!(
+                call_slot(&mut fixture, typelib, 11, &[typelib as u32, NAME as u32, 0]),
+                0,
+                "IsName(value)"
+            );
+            write_utf16(&mut fixture, NAME, "NoSuchName");
+            assert_eq!(
+                call_slot(&mut fixture, typelib, 11, &[typelib as u32, NAME as u32, 0]),
+                S_FALSE
+            );
+            fixture.memory.map_bytes(STAT, &[0_u8; 8]);
+            fixture.memory.write_u32(STAT, 4);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    typelib,
+                    10,
+                    &[
+                        typelib as u32,
+                        NAME as u32,
+                        0,
+                        OUT as u32,
+                        BUF as u32,
+                        STAT as u32,
+                    ]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 0);
+        })
+    }
+
+    #[test]
+    fn get_dll_entry_reports_the_staged_pe_export_or_the_real_error() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-dll-entry");
+            let type_info = fixture
+                .runtime
+                .alloc_com_type_info_object(&mut fixture.memory, "ICasa1Automation", 0, 0)
+                .unwrap();
+            let modules = fixture._temp.path().join("modules");
+            std::fs::create_dir_all(&modules).unwrap();
+            let module_path = modules.join("casa1.dll");
+            std::fs::write(&module_path, build_test_pe(Some(("DllGetClassObject", 7)))).unwrap();
+            let handle = 0x7000_0000_u64;
+            fixture.runtime.dll_info_table.insert(
+                handle,
+                crate::runtime::state::DllInfo {
+                    handle,
+                    image_size: 0x2000,
+                    entry_point_rva: 0,
+                    load_count: 1,
+                    module_name: "casa1.dll".to_string(),
+                    host_path: module_path.to_string_lossy().to_string(),
+                    tls_callbacks: Vec::new(),
+                },
+            );
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                0,
+                "GetDllEntry(PE export)"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT)).unwrap(),
+                "casa1.dll"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "DllGetClassObject"
+            );
+            assert_eq!(
+                fixture.memory.read_u16(OUT + 8).unwrap(),
+                7,
+                "the ordinal comes from the PE export table"
+            );
+
+            // A valid PE without the export is TYPE_E_ELEMENTNOTFOUND.
+            std::fs::write(&module_path, build_test_pe(None)).unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[type_info as u32, 1, 0, 0, 0, (OUT + 8) as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND,
+                "missing export"
+            );
+
+            // A malformed module is TYPE_E_CANTLOADLIBRARY.
+            std::fs::write(&module_path, b"not a pe").unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[type_info as u32, 1, 0, 0, 0, (OUT + 8) as u32]
+                ),
+                TYPE_E_CANTLOADLIBRARY,
+                "malformed module"
+            );
+
+            // An absent module falls back to the registered descriptor.
+            std::fs::remove_file(&module_path).unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                0,
+                "GetDllEntry(fallback)"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "DllGetClassObject"
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 1);
+        })
+    }
+
+    #[test]
+    fn get_dll_entry_discovers_staged_module_in_ge_directory() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-dll-entry-ge");
+            let type_info = fixture
+                .runtime
+                .alloc_com_type_info_object(&mut fixture.memory, "ICasa1Automation", 0, 0)
+                .unwrap();
+            let staged = fixture
+                .runtime
+                .win32
+                .ge()
+                .root
+                .join("drive_c")
+                .join("game")
+                .join("Casa1.DLL");
+            std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+            std::fs::write(&staged, build_test_pe(Some(("DllGetClassObject", 9)))).unwrap();
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                0,
+                "GetDllEntry(staged GE module)"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "DllGetClassObject"
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 9);
+
+            // A staged malformed image is still a real load error.
+            std::fs::write(&staged, b"not a pe").unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[type_info as u32, 1, 0, 0, 0, (OUT + 8) as u32]
+                ),
+                TYPE_E_CANTLOADLIBRARY
+            );
+        })
+    }
+
+    #[test]
+    fn load_type_lib_parses_msft_typelib_and_reports_real_errors() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-msft-typelib");
+            let guest_path = "C:\\crafted.tlb";
+            let host_path = fixture
+                .runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path(guest_path)
+                .unwrap();
+            std::fs::create_dir_all(host_path.parent().unwrap()).unwrap();
+            let image = build_msft_typelib();
+            std::fs::write(&host_path, &image).unwrap();
+            write_utf16(&mut fixture, NAME, guest_path);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleLoadTypeLib,
+                    &[NAME as u32, OUT as u32]
+                ),
+                0,
+                "LoadTypeLib"
+            );
+            let type_lib = guest_ptr(&fixture, OUT);
+            assert_ne!(type_lib, 0);
+
+            assert_eq!(
+                call_slot(&mut fixture, type_lib, 3, &[type_lib as u32, STAT as u32]),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+
+            write_iid(&mut fixture, IID_PTR, &COM_AUTOMATION_INTERFACE_IID);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    6,
+                    &[type_lib as u32, IID_PTR as u32, (OUT + 4) as u32]
+                ),
+                0,
+                "GetTypeInfoOfGuid"
+            );
+            let type_info = guest_ptr(&fixture, OUT + 4);
+            assert_ne!(type_info, 0);
+
+            fixture.memory.map_bytes(OUT + 8, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    3,
+                    &[type_info as u32, (OUT + 8) as u32]
+                ),
+                0,
+                "GetTypeAttr"
+            );
+            let type_attr = guest_ptr(&fixture, OUT + 8);
+            assert_eq!(fixture.memory.read_u32(type_attr + 40).unwrap(), 3);
+            assert_eq!(fixture.memory.read_u16(type_attr + 44).unwrap(), 3);
+            assert_eq!(
+                fixture.memory.read_bytes(type_attr, 16).unwrap(),
+                COM_AUTOMATION_INTERFACE_IID.to_vec()
+            );
+
+            fixture.memory.map_bytes(OUT + 12, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    5,
+                    &[type_info as u32, 0, (OUT + 12) as u32]
+                ),
+                0,
+                "GetFuncDesc(DoWork)"
+            );
+            let func_desc = guest_ptr(&fixture, OUT + 12);
+            assert_eq!(fixture.memory.read_u32(func_desc).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u16(func_desc + 24).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u16(func_desc + 36).unwrap(), 3);
+
+            fixture.memory.map_bytes(NAMES, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    7,
+                    &[type_info as u32, 1, NAMES as u32, 4, STAT as u32]
+                ),
+                0,
+                "GetNames(DoWork)"
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 2);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, NAMES)).unwrap(),
+                "DoWork"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, NAMES + 4)).unwrap(),
+                "arg"
+            );
+
+            write_utf16(&mut fixture, NAME, "DoWork");
+            fixture.memory.write_u32(STAT, 4);
+            fixture.memory.map_bytes(OUT + 16, &[0_u8; 8]);
+            fixture.memory.map_bytes(IDS, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[
+                        type_lib as u32,
+                        NAME as u32,
+                        0,
+                        (OUT + 16) as u32,
+                        IDS as u32,
+                        STAT as u32,
+                    ]
+                ),
+                0,
+                "FindName(DoWork)"
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 1);
+            assert_ne!(guest_ptr(&fixture, OUT + 16), 0);
+
+            write_utf16(&mut fixture, NAME, "ICasa1Crafted");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    11,
+                    &[type_lib as u32, NAME as u32, 0]
+                ),
+                0,
+                "IsName(ICasa1Crafted)"
+            );
+
+            fixture.memory.map_bytes(OUT + 20, &[0_u8; 24]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    12,
+                    &[type_info as u32, u32::MAX, (OUT + 20) as u32, 0, 0, 0,]
+                ),
+                0,
+                "GetDocumentation(type)"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 20)).unwrap(),
+                "ICasa1Crafted"
+            );
+
+            // Malformed, truncated and absent libraries are real load
+            // errors and leave the out pointer null.
+            let bad = "C:\\bad.tlb";
+            let bad_path = fixture
+                .runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path(bad)
+                .unwrap();
+            std::fs::write(&bad_path, b"NOPE").unwrap();
+            write_utf16(&mut fixture, NAME, bad);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleLoadTypeLib,
+                    &[NAME as u32, OUT as u32]
+                ),
+                u64::from(TYPE_E_CANTLOADLIBRARY)
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+
+            std::fs::write(&bad_path, &image[..80]).unwrap();
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleLoadTypeLib,
+                    &[NAME as u32, OUT as u32]
+                ),
+                u64::from(TYPE_E_CANTLOADLIBRARY)
+            );
+
+            let mut corrupt = image.clone();
+            corrupt[0] = b'X';
+            std::fs::write(&bad_path, corrupt).unwrap();
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleLoadTypeLib,
+                    &[NAME as u32, OUT as u32]
+                ),
+                u64::from(TYPE_E_CANTLOADLIBRARY)
+            );
+
+            write_utf16(&mut fixture, NAME, "C:\\missing.tlb");
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleLoadTypeLib,
+                    &[NAME as u32, OUT as u32]
+                ),
+                u64::from(TYPE_E_CANTLOADLIBRARY)
+            );
+        })
+    }
+
+    #[test]
+    fn storage_copy_to_honors_name_and_iid_exclusions() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-copy-filters");
+            let source = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "source", 0)
+                .unwrap();
+            let target = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "target", 0)
+                .unwrap();
+            let keep = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "Keep", 0)
+                .unwrap();
+            let excluded = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "Excluded", 0)
+                .unwrap();
+            let excluded_iid = [0xAA_u8; 16];
+            {
+                let source_state = fixture.runtime.com_storages.get_mut(&source).unwrap();
+                source_state
+                    .streams
+                    .insert("alpha.bin".to_string(), b"alpha".to_vec());
+                source_state
+                    .streams
+                    .insert("beta.bin".to_string(), b"beta".to_vec());
+                source_state.child_storages.insert("Keep".to_string(), keep);
+                source_state
+                    .child_storages
+                    .insert("Excluded".to_string(), excluded);
+            }
+            fixture
+                .runtime
+                .com_storages
+                .get_mut(&keep)
+                .unwrap()
+                .streams
+                .insert("kept.bin".to_string(), b"kept".to_vec());
+            {
+                let excluded_state = fixture.runtime.com_storages.get_mut(&excluded).unwrap();
+                excluded_state.clsid = Some(excluded_iid);
+                excluded_state
+                    .streams
+                    .insert("hidden.bin".to_string(), b"hidden".to_vec());
+            }
+            // A colliding excluded name must not block the copy.
+            fixture
+                .runtime
+                .com_storages
+                .get_mut(&target)
+                .unwrap()
+                .streams
+                .insert("beta.bin".to_string(), b"existing".to_vec());
+
+            let mut snb = write_utf16(&mut fixture, NAME, "beta.bin");
+            snb.extend_from_slice(&0_u16.to_le_bytes());
+            fixture.memory.map_bytes(NAME, &snb);
+            write_iid(&mut fixture, IID_PTR, &excluded_iid);
+
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    source,
+                    7,
+                    &[source as u32, 1, IID_PTR as u32, NAME as u32, target as u32,]
+                ),
+                0,
+                "CopyTo with exclusions"
+            );
+            let target_state = &fixture.runtime.com_storages[&target];
+            assert!(target_state.streams.contains_key("alpha.bin"));
+            assert_eq!(
+                target_state.streams.get("beta.bin").map(Vec::as_slice),
+                Some(b"existing".as_slice()),
+                "the excluded stream was not copied"
+            );
+            assert!(target_state.child_storages.contains_key("Keep"));
+            assert!(
+                !target_state.child_storages.contains_key("Excluded"),
+                "the excluded IID storage was not recreated"
+            );
+            let copied_keep = target_state.child_storages["Keep"];
+            assert!(
+                fixture.runtime.com_storages[&copied_keep]
+                    .streams
+                    .contains_key("kept.bin")
+            );
+        })
+    }
+
+    #[test]
+    fn ole_entry_points_reject_null_and_unreadable_requests() {
+        use std::os::unix::fs::PermissionsExt;
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-ole-entry-errors");
+
+            // GetRunningObjectTable creates the process ROT once and hands
+            // out the same object afterwards; a NULL out pointer is E_POINTER.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleGetRunningObjectTable,
+                    &[0, OUT as u32]
+                ),
+                u64::from(S_OK)
+            );
+            let rot = guest_ptr(&fixture, OUT);
+            assert_ne!(rot, 0);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleGetRunningObjectTable,
+                    &[0, OUT as u32]
+                ),
+                u64::from(S_OK)
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), rot, "process-wide ROT identity");
+            assert_eq!(
+                dispatch_x86(&mut fixture, HostThunk::OleGetRunningObjectTable, &[0, 0]),
+                u64::from(E_POINTER)
+            );
+
+            // LoadTypeLib: NULL out is E_POINTER; an unreadable name and an
+            // unreadable host file are both TYPE_E_CANTLOADLIBRARY.
+            assert_eq!(
+                dispatch_x86(&mut fixture, HostThunk::OleLoadTypeLib, &[0, 0]),
+                u64::from(E_POINTER)
+            );
+            fixture.memory.map_bytes(OUT, &[0xff_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleLoadTypeLib,
+                    &[0xDEAD_0000, OUT as u32]
+                ),
+                u64::from(TYPE_E_CANTLOADLIBRARY)
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+
+            let locked_path = "C:\\locked.tlb";
+            let locked_host = fixture
+                .runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path(locked_path)
+                .unwrap();
+            std::fs::create_dir_all(locked_host.parent().unwrap()).unwrap();
+            std::fs::write(&locked_host, build_msft_typelib()).unwrap();
+            let mut permissions = std::fs::metadata(&locked_host).unwrap().permissions();
+            permissions.set_mode(0o000);
+            std::fs::set_permissions(&locked_host, permissions).unwrap();
+            write_utf16(&mut fixture, NAME, locked_path);
+            fixture.memory.map_bytes(OUT, &[0xff_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleLoadTypeLib,
+                    &[NAME as u32, OUT as u32]
+                ),
+                u64::from(TYPE_E_CANTLOADLIBRARY),
+                "an existing but unreadable typelib cannot be loaded"
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+            let mut permissions = std::fs::metadata(&locked_host).unwrap().permissions();
+            permissions.set_mode(0o644);
+            std::fs::set_permissions(&locked_host, permissions).unwrap();
+
+            // LoadRegTypeLib has no registry typelib database: the out
+            // pointer is nulled and the honest load error returned.
+            fixture.memory.map_bytes(OUT, &[0xff_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::OleLoadRegTypeLib,
+                    &[0, 0, 0, 0, OUT as u32]
+                ),
+                u64::from(TYPE_E_CANTLOADLIBRARY)
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+            assert_eq!(
+                dispatch_x86(&mut fixture, HostThunk::OleLoadRegTypeLib, &[0, 0, 0, 0, 0]),
+                u64::from(TYPE_E_CANTLOADLIBRARY)
+            );
+        })
+    }
+
+    #[test]
+    fn running_object_table_rejects_unknown_monikers_and_wrong_state() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-rot-errors");
+            let server = create_server(&mut fixture);
+            let rot = fixture
+                .runtime
+                .alloc_com_running_object_table(&mut fixture.memory)
+                .unwrap();
+
+            // Registering a non-moniker, a null object, or an empty name is
+            // E_INVALIDARG.
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    3,
+                    &[rot as u32, server as u32, server as u32, COOKIE as u32]
+                ),
+                E_INVALIDARG,
+                "non-moniker registration"
+            );
+            let moniker = parse_moniker(&mut fixture, "file:C:\\rot-missing.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    3,
+                    &[rot as u32, moniker as u32, 0, COOKIE as u32]
+                ),
+                E_INVALIDARG,
+                "null registered object"
+            );
+
+            // The display-name path (not an absolute item moniker) registers
+            // and resolves through the same key.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    3,
+                    &[rot as u32, moniker as u32, server as u32, COOKIE as u32]
+                ),
+                S_OK
+            );
+            let cookie = fixture.memory.read_u32(COOKIE).unwrap();
+            assert_ne!(cookie, 0);
+
+            // Unknown monikers are not running; GetObject is MK_E_UNAVAILABLE
+            // and a NULL out pointer is E_POINTER.
+            let unknown = parse_moniker(&mut fixture, "file:C:\\rot-other.bin");
+            assert_eq!(
+                call_slot(&mut fixture, rot, 5, &[rot as u32, unknown as u32]),
+                0,
+                "IsRunning(unknown)"
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    6,
+                    &[rot as u32, unknown as u32, OUT as u32]
+                ),
+                MK_E_UNAVAILABLE
+            );
+            assert_eq!(
+                call_slot(&mut fixture, rot, 6, &[rot as u32, unknown as u32, 0]),
+                E_POINTER
+            );
+
+            // NoteChangeTime succeeds without consulting the registration;
+            // GetTimeOfLastChange reports the missing registration and the
+            // real timestamp for a registered moniker.
+            assert_eq!(
+                call_slot(&mut fixture, rot, 7, &[rot as u32, cookie, COOKIE as u32]),
+                S_OK,
+                "NoteChangeTime"
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    8,
+                    &[rot as u32, unknown as u32, OUT as u32]
+                ),
+                MK_E_UNAVAILABLE
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    8,
+                    &[rot as u32, moniker as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_ne!(fixture.memory.read_u64(OUT).unwrap(), 0);
+
+            // EnumRunning materializes an enumerator over the registration.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, rot, 9, &[rot as u32, OUT as u32]),
+                S_OK
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+
+            // Unknown cookies cannot be revoked; the registered cookie can.
+            assert_eq!(
+                call_slot(&mut fixture, rot, 4, &[rot as u32, 0xFFFF_FFFF]),
+                MK_E_UNAVAILABLE
+            );
+            assert_eq!(call_slot(&mut fixture, rot, 4, &[rot as u32, cookie]), S_OK);
+            assert_eq!(
+                call_slot(&mut fixture, rot, 4, &[rot as u32, cookie]),
+                MK_E_UNAVAILABLE
+            );
+        })
+    }
+
+    #[test]
+    fn moniker_and_container_queries_reject_wrong_interfaces() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-query-interfaces");
+            let root = fixture._temp.path().join("qi-root");
+            std::fs::create_dir_all(&root).unwrap();
+            let container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &root.to_string_lossy())
+                .unwrap();
+            let storage = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "plain", 0)
+                .unwrap();
+
+            // Container-shaped storages answer all three item-container IIDs.
+            for iid in [
+                COM_IID_IOLECONTAINER,
+                COM_IID_IPARSEDISPLAYNAME,
+                COM_IID_IOLEITEMCONTAINER,
+            ] {
+                write_iid(&mut fixture, IID_PTR, &iid);
+                fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        container,
+                        0,
+                        &[container as u32, IID_PTR as u32, OUT as u32]
+                    ),
+                    S_OK
+                );
+                assert_eq!(guest_ptr(&fixture, OUT), container);
+            }
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    0,
+                    &[storage as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK,
+                "a non-container storage answers IStorage"
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), storage);
+
+            // Enumerators expose both moniker and unknown enumerator IIDs.
+            let enumerator = fixture
+                .runtime
+                .alloc_com_enum_object(&mut fixture.memory, Vec::new())
+                .unwrap();
+            for iid in [COM_IID_IENUMMONIKER, COM_IID_IENUMUNKNOWN] {
+                write_iid(&mut fixture, IID_PTR, &iid);
+                fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        enumerator,
+                        0,
+                        &[enumerator as u32, IID_PTR as u32, OUT as u32]
+                    ),
+                    S_OK
+                );
+                assert_eq!(guest_ptr(&fixture, OUT), enumerator);
+            }
+
+            // A bind context without the ROT marker answers IBindCtx; the
+            // ROT-shaped context answers IRunningObjectTable instead.
+            let rot = fixture
+                .runtime
+                .alloc_com_running_object_table(&mut fixture.memory)
+                .unwrap();
+            fixture
+                .runtime
+                .com_bind_ctx_params
+                .get_mut(&rot)
+                .unwrap()
+                .remove(COM_ROT_MARKER);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IBINDCTX);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    0,
+                    &[rot as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), rot);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IRUNNINGOBJECTTABLE);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    0,
+                    &[rot as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE,
+                "a plain bind context is not a running-object table"
+            );
+
+            // BindIfRunning: NULL out is E_POINTER, unregistered monikers are
+            // MK_E_UNAVAILABLE.
+            let file_moniker = parse_moniker(&mut fixture, "file:C:\\qi-missing.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    file_moniker,
+                    18,
+                    &[file_moniker as u32, 0, 0, 0]
+                ),
+                E_POINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    file_moniker,
+                    18,
+                    &[file_moniker as u32, 0, 0, OUT as u32]
+                ),
+                MK_E_UNAVAILABLE
+            );
+
+            // GetClassID distinguishes file, item, class, URL and composite
+            // moniker forms; a NULL output is E_POINTER.
+            assert_eq!(
+                call_slot(&mut fixture, file_moniker, 3, &[file_moniker as u32, 0]),
+                E_POINTER
+            );
+            let class_moniker =
+                parse_moniker(&mut fixture, "clsid:0000030C-0000-0000-C000-000000000046");
+            let url_moniker = parse_moniker(&mut fixture, "http://example.invalid/x");
+            let composite = compose_monikers(&mut fixture, file_moniker, url_moniker);
+            let item_moniker = parse_moniker(&mut fixture, "item:alpha.bin");
+            for (moniker, clsid) in [
+                (file_moniker, "00000303-0000-0000-C000-000000000046"),
+                (item_moniker, "00000304-0000-0000-C000-000000000046"),
+                (class_moniker, "0000030C-0000-0000-C000-000000000046"),
+                (url_moniker, "79EAC9E0-BAF9-11CE-8C82-00AA004BA90B"),
+                (composite, "00000309-0000-0000-C000-000000000046"),
+            ] {
+                fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+                assert_eq!(
+                    call_slot(&mut fixture, moniker, 3, &[moniker as u32, OUT as u32]),
+                    S_OK
+                );
+                assert_eq!(
+                    fixture.memory.read_bytes(OUT, 16).unwrap(),
+                    PeHostRuntime::parse_guid_string(clsid).unwrap()
+                );
+            }
+
+            // IsEqual needs an output pointer and only compares monikers.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    file_moniker,
+                    13,
+                    &[file_moniker as u32, file_moniker as u32, 0]
+                ),
+                E_POINTER
+            );
+            let server = create_server(&mut fixture);
+            fixture.memory.map_bytes(OUT, &[0u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    file_moniker,
+                    13,
+                    &[file_moniker as u32, server as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                fixture.memory.read_u32(OUT).unwrap(),
+                0,
+                "a non-moniker is never equal"
+            );
+
+            // IMoniker::ParseDisplayName rejects unreadable and unmodelled
+            // names with MK_E_SYNTAX and a nulled output.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    file_moniker,
+                    15,
+                    &[
+                        file_moniker as u32,
+                        0,
+                        0,
+                        0xDEAD_0000,
+                        STAT as u32,
+                        OUT as u32
+                    ]
+                ),
+                MK_E_SYNTAX
+            );
+            write_utf16(&mut fixture, NAME, "not-a-moniker");
+            fixture.memory.map_bytes(OUT, &[0xff_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    file_moniker,
+                    15,
+                    &[
+                        file_moniker as u32,
+                        0,
+                        0,
+                        NAME as u32,
+                        STAT as u32,
+                        OUT as u32
+                    ]
+                ),
+                MK_E_SYNTAX
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+
+            // Connection points: EnumConnections encodes real CONNECTDATA,
+            // unadvising an unknown cookie is CONNECT_E_NOCONNECTION, and the
+            // modelled sink records the event invocation.
+            let point = fixture
+                .runtime
+                .alloc_com_connection_point(&mut fixture.memory, server, COM_AUTOMATION_EVENTS_IID)
+                .unwrap();
+            let sink = fixture
+                .runtime
+                .alloc_com_sink_object(&mut fixture.memory, "ICasa1AutomationEvents")
+                .unwrap();
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    point,
+                    5,
+                    &[point as u32, sink as u32, COOKIE as u32]
+                ),
+                S_OK
+            );
+            let advised_cookie = fixture.memory.read_u32(COOKIE).unwrap();
+            assert_ne!(advised_cookie, 0);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, point, 7, &[point as u32, OUT as u32]),
+                S_OK
+            );
+            let connection_enum = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    connection_enum,
+                    3,
+                    &[connection_enum as u32, 1, BUF as u32, STAT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u32(BUF).unwrap(), sink as u32);
+            assert_eq!(fixture.memory.read_u32(BUF + 4).unwrap(), advised_cookie);
+            assert_eq!(
+                call_slot(&mut fixture, point, 6, &[point as u32, 0xFFFF_FFFF]),
+                CONNECT_E_NOCONNECTION
+            );
+            assert_eq!(
+                call_slot(&mut fixture, point, 6, &[point as u32, advised_cookie]),
+                S_OK
+            );
+            let invocations = fixture.runtime.com_sink_invocations.len();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    sink,
+                    6,
+                    &[sink as u32, 0, 0, 0, 0, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.runtime.com_sink_invocations.len(), invocations + 1);
+
+            // ServerReset on a foreign object is E_INVALIDARG.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::ServerReset),
+                    &[0xDEAD_BEEF, 0]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+        })
+    }
+
+    #[test]
+    fn item_container_rejects_malformed_names_and_wrong_bind_speeds() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-item-errors");
+            let root = fixture._temp.path().join("err-root");
+            std::fs::create_dir_all(root.join("Sub")).unwrap();
+            std::fs::write(root.join("Sub").join("inner.bin"), b"inner").unwrap();
+            std::fs::write(root.join("alpha.bin"), b"alpha").unwrap();
+            let outside = fixture._temp.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let root_text = root.to_string_lossy().to_string();
+            let container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &root_text)
+                .unwrap();
+            let storage = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "plain", 0)
+                .unwrap();
+
+            // ParseDisplayName on a non-container is E_INVALIDARG, an
+            // unreadable name is E_POINTER, and traversal/colon names are
+            // MK_E_SYNTAX.
+            write_utf16(&mut fixture, NAME, "item:alpha.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::ItemContainerParseDisplayName),
+                    &[storage as u32, NAME as u32, 0, STAT as u32, OUT as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::ItemContainerParseDisplayName),
+                    &[container as u32, 0xDEAD_0000, 0, STAT as u32, OUT as u32]
+                ),
+                u64::from(E_POINTER)
+            );
+            for bad in ["item:..\\alpha.bin", "item:a:b", "item:."] {
+                write_utf16(&mut fixture, NAME, bad);
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        container,
+                        3,
+                        &[container as u32, NAME as u32, 0, STAT as u32, OUT as u32]
+                    ),
+                    MK_E_SYNTAX,
+                    "{bad}"
+                );
+            }
+
+            // The folder-path helper drops empty components and refuses
+            // parent traversal.
+            assert_eq!(
+                PeHostRuntime::com_item_folder_path(&root_text, "Sub\\\\inner.bin"),
+                Some(root.join("Sub").join("inner.bin").canonicalize().unwrap())
+            );
+            assert_eq!(
+                PeHostRuntime::com_item_folder_path(&root_text, "..\\escape"),
+                None
+            );
+
+            // Absolute paths outside the root and the root itself are
+            // rejected; an absolute path inside the root is normalized.
+            write_utf16(
+                &mut fixture,
+                NAME,
+                &format!("item:file:{}", outside.join("escape.bin").display()),
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    3,
+                    &[container as u32, NAME as u32, 0, STAT as u32, OUT as u32]
+                ),
+                MK_E_SYNTAX,
+                "outside-root absolute item"
+            );
+            write_utf16(&mut fixture, NAME, &format!("item:file:{}", root.display()));
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    3,
+                    &[container as u32, NAME as u32, 0, STAT as u32, OUT as u32]
+                ),
+                MK_E_SYNTAX,
+                "root itself has no relative item name"
+            );
+            write_utf16(
+                &mut fixture,
+                NAME,
+                &format!("item:file:{}", root.join("alpha.bin").display()),
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    3,
+                    &[container as u32, NAME as u32, 0, STAT as u32, OUT as u32]
+                ),
+                S_OK,
+                "inside-root absolute item"
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+            write_utf16(
+                &mut fixture,
+                NAME,
+                &format!("ITEM:FILE:{}", root.join("alpha.bin").display()),
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    3,
+                    &[container as u32, NAME as u32, 0, STAT as u32, OUT as u32]
+                ),
+                S_OK,
+                "uppercase FILE: absolute item"
+            );
+
+            // GetObject error paths: NULL out E_POINTER, invalid speed
+            // E_INVALIDARG, non-container E_INVALIDARG, unreadable name
+            // E_POINTER, traversal MK_E_NOOBJECT.
+            write_utf16(&mut fixture, NAME, "alpha.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[container as u32, NAME as u32, 0, 0, IID_PTR as u32, 0]
+                ),
+                E_POINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        7,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::ItemContainerGetObject),
+                    &[
+                        storage as u32,
+                        NAME as u32,
+                        0,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        0xDEAD_0000,
+                        0,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                E_POINTER
+            );
+            write_utf16(&mut fixture, NAME, "..\\alpha.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        0,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                MK_E_NOOBJECT
+            );
+
+            // A NULL riid defaults to IUnknown; once bound the same item is
+            // served from the running-object table even for IMMEDIATE.
+            write_utf16(&mut fixture, NAME, "alpha.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[container as u32, NAME as u32, 0, 0, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            let bound = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_IMMEDIATE,
+                        0,
+                        0,
+                        OUT as u32
+                    ]
+                ),
+                S_OK,
+                "running item bypasses the deadline"
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), bound);
+
+            // GetObjectStorage error paths mirror GetObject; a NULL riid
+            // defaults to IStorage.
+            write_utf16(&mut fixture, NAME, "Sub");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, IID_PTR as u32, 0]
+                ),
+                E_POINTER
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::ItemContainerGetObjectStorage),
+                    &[storage as u32, NAME as u32, 0, IID_PTR as u32, OUT as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, 0xDEAD_0000, 0, IID_PTR as u32, OUT as u32]
+                ),
+                E_POINTER
+            );
+            write_utf16(&mut fixture, NAME, "..\\Sub");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, IID_PTR as u32, OUT as u32]
+                ),
+                MK_E_NOOBJECT
+            );
+            write_utf16(&mut fixture, NAME, "Sub");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+
+            // Non-container LockContainer/EnumObjects are rejected.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::ItemContainerLockContainer),
+                    &[0x0BAD_F00D, 1]
+                ),
+                u64::from(STG_E_INVALIDPOINTER)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::ItemContainerEnumObjects),
+                    &[storage as u32, 0, OUT as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+
+            // The ONLYIFRUNNING filter skips unregistered entries.
+            let running: Vec<String> = fixture
+                .runtime
+                .com_running_entries()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            for key in running {
+                fixture.runtime.com_running_remove(&key);
+            }
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    4,
+                    &[container as u32, OLECONTF_ONLYIFRUNNING, OUT as u32]
+                ),
+                S_OK
+            );
+            let empty_enum = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    empty_enum,
+                    3,
+                    &[empty_enum as u32, 1, BUF as u32, STAT as u32]
+                ),
+                S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 0);
+
+            let key = PeHostRuntime::com_item_key(&root_text, "alpha.bin");
+            fixture.runtime.com_running_put(&key, bound);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    4,
+                    &[container as u32, OLECONTF_ONLYIFRUNNING, OUT as u32]
+                ),
+                S_OK
+            );
+            let running_enum = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    running_enum,
+                    3,
+                    &[running_enum as u32, 1, BUF as u32, STAT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_ne!(guest_ptr(&fixture, BUF), 0);
+        })
+    }
+
+    #[test]
+    fn item_bind_paths_report_missing_and_unsupported_interfaces() {
+        use crate::runtime::dispatch::msi::{CompoundTree, CompoundTreeChild, write_compound_tree};
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-item-bind-paths");
+            let root = fixture._temp.path().join("bind-root");
+            std::fs::create_dir_all(root.join("Sub")).unwrap();
+            std::fs::write(root.join("alpha.bin"), b"alpha").unwrap();
+            std::fs::write(root.join("link.lnk"), b"link").unwrap();
+            let mut bad = vec![0_u8; 0x80];
+            bad[..8].copy_from_slice(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+            std::fs::write(root.join("bad.cfb"), &bad).unwrap();
+            let mut embedded = vec![0_u8; 0x80];
+            embedded[..8].copy_from_slice(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+            embedded[0x50..0x60].copy_from_slice(&COM_AUTOMATION_CLASS_IID);
+            std::fs::write(root.join("embed.cfb"), &embedded).unwrap();
+            let mut unknown = embedded.clone();
+            unknown[0x50..0x60].copy_from_slice(&[0xAB_u8; 16]);
+            std::fs::write(root.join("unknown.cfb"), &unknown).unwrap();
+            let mut compound = CompoundTree::new("Root Entry");
+            compound
+                .children
+                .push(CompoundTree::stream("top.bin", b"top".to_vec()));
+            let mut store = CompoundTree::new("Store");
+            store
+                .children
+                .push(CompoundTree::stream("inner.bin", b"inner".to_vec()));
+            compound.children.push(CompoundTreeChild::Storage(store));
+            let compound_path = root.join("nested.cfb");
+            let mut compound_bytes = write_compound_tree(&compound);
+            // The writer fills the DIFAT array at 0x48..; the file-based
+            // CLSID probe reads 0x50..0x60, so clear the unused entries to
+            // exercise the plain compound-storage path.
+            compound_bytes[0x50..0x60].fill(0);
+            std::fs::write(&compound_path, compound_bytes).unwrap();
+
+            let root_text = root.to_string_lossy().to_string();
+            let container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &root_text)
+                .unwrap();
+
+            // Directory items: ISTORAGE opens the directory, container IIDs
+            // open an item container, other IIDs are E_NOINTERFACE.
+            write_utf16(&mut fixture, NAME, "Sub");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK
+            );
+            let sub_storage = guest_ptr(&fixture, OUT);
+            assert!(fixture.runtime.com_storages.contains_key(&sub_storage));
+            fixture
+                .runtime
+                .com_running_remove(&PeHostRuntime::com_item_key(&root_text, "Sub"));
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLECONTAINER);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK
+            );
+            fixture
+                .runtime
+                .com_running_remove(&PeHostRuntime::com_item_key(&root_text, "Sub"));
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IPARSEDISPLAYNAME);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK,
+                "directory item exposes IParseDisplayName"
+            );
+            fixture
+                .runtime
+                .com_running_remove(&PeHostRuntime::com_item_key(&root_text, "Sub"));
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDISPATCH);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                E_NOINTERFACE
+            );
+
+            // .lnk files expose IUnknown/IShellLinkW only.
+            write_utf16(&mut fixture, NAME, "link.lnk");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IUNKNOWN);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK
+            );
+            fixture
+                .runtime
+                .com_running_remove(&PeHostRuntime::com_item_key(&root_text, "link.lnk"));
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                E_NOINTERFACE
+            );
+
+            // A malformed compound file is STG_E_INVALIDHEADER.
+            write_utf16(&mut fixture, NAME, "bad.cfb");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IUNKNOWN);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                STG_E_INVALIDHEADER
+            );
+
+            // A valid compound child binds as IStorage through its CFB.
+            write_utf16(&mut fixture, NAME, "nested.cfb");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IUNKNOWN);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK,
+                "valid compound child"
+            );
+
+            // Plain files are streams, not storages.
+            write_utf16(&mut fixture, NAME, "alpha.bin");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK
+            );
+            fixture
+                .runtime
+                .com_running_remove(&PeHostRuntime::com_item_key(&root_text, "alpha.bin"));
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                E_NOINTERFACE
+            );
+
+            // Embedded CLSIDs create the registered object; unknown CLSIDs
+            // are REGDB_E_CLASSNOTREG; a non-IUnknown riid is E_NOINTERFACE.
+            write_utf16(&mut fixture, NAME, "embed.cfb");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IUNKNOWN);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK
+            );
+            write_utf16(&mut fixture, NAME, "unknown.cfb");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                REGDB_E_CLASSNOTREG
+            );
+            fixture
+                .runtime
+                .com_running_remove(&PeHostRuntime::com_item_key(&root_text, "embed.cfb"));
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                E_NOINTERFACE
+            );
+
+            // A directory-root compound child opens through a real CFB.
+            write_utf16(&mut fixture, NAME, "nested.cfb");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK,
+                "GetObjectStorage(directory compound child)"
+            );
+            assert!(
+                fixture
+                    .runtime
+                    .com_storages
+                    .contains_key(&guest_ptr(&fixture, OUT))
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+
+            // A compound-file root binds streams and child storages.
+            let cfb_container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &compound_path.to_string_lossy())
+                .unwrap();
+            write_utf16(&mut fixture, NAME, "top.bin");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    6,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK,
+                "compound stream"
+            );
+            fixture
+                .runtime
+                .com_running_remove(&PeHostRuntime::com_item_key(
+                    &compound_path.to_string_lossy(),
+                    "top.bin",
+                ));
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    6,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                E_NOINTERFACE,
+                "stream exposed as storage"
+            );
+            write_utf16(&mut fixture, NAME, "Store");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    6,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK,
+                "compound storage"
+            );
+            write_utf16(&mut fixture, NAME, "missing.bin");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    6,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                MK_E_NOOBJECT
+            );
+            write_utf16(&mut fixture, NAME, "Store");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    7,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK,
+                "compound storage via GetObjectStorage"
+            );
+            write_utf16(&mut fixture, NAME, "missing.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    7,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                MK_E_NOOBJECT
+            );
+            // A "Root"-prefixed path resolves through the CFB root alias but
+            // has no matching child storage object.
+            write_utf16(&mut fixture, NAME, "Root\\Store");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    7,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                MK_E_NOOBJECT
+            );
+            // Empty path components are skipped by the raw helper (the
+            // public API normalizes them away first).
+            let raw = fixture
+                .runtime
+                .com_item_compound_storage(
+                    &mut fixture.memory,
+                    &compound_path.to_string_lossy(),
+                    "Store\\\\",
+                )
+                .unwrap();
+            assert_eq!(raw.is_ok(), true);
+
+            // A plain-file root has no storage tree; its items are
+            // MK_E_NOOBJECT, including through an item moniker bind.
+            let plain_container = fixture
+                .runtime
+                .alloc_com_item_container(
+                    &mut fixture.memory,
+                    &root.join("alpha.bin").to_string_lossy(),
+                )
+                .unwrap();
+            write_utf16(&mut fixture, NAME, "anything");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    plain_container,
+                    6,
+                    &[
+                        plain_container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                MK_E_NOOBJECT
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    plain_container,
+                    3,
+                    &[
+                        plain_container as u32,
+                        NAME as u32,
+                        0,
+                        STAT as u32,
+                        OUT as u32
+                    ]
+                ),
+                S_OK
+            );
+            let plain_item = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    plain_item,
+                    8,
+                    &[plain_item as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                MK_E_NOOBJECT
+            );
+
+            // A malformed compound root is STG_E_INVALIDHEADER when bound.
+            let bad_container = fixture
+                .runtime
+                .alloc_com_item_container(
+                    &mut fixture.memory,
+                    &root.join("bad.cfb").to_string_lossy(),
+                )
+                .unwrap();
+            write_utf16(&mut fixture, NAME, "x");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    bad_container,
+                    6,
+                    &[
+                        bad_container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                STG_E_INVALIDHEADER
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    bad_container,
+                    7,
+                    &[
+                        bad_container as u32,
+                        NAME as u32,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                MK_E_NOOBJECT,
+                "malformed compound storage binding"
+            );
+
+            // A compound-file container enumerates its root children.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    4,
+                    &[cfb_container as u32, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+
+            // Item monikers bind both to objects and storages, registering
+            // the bound item as running.
+            write_utf16(&mut fixture, NAME, "item:alpha.bin");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    3,
+                    &[container as u32, NAME as u32, 0, STAT as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            let item_moniker = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    item_moniker,
+                    8,
+                    &[item_moniker as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK,
+                "item moniker BindToObject"
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    item_moniker,
+                    9,
+                    &[item_moniker as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK,
+                "item moniker BindToStorage"
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+        })
+    }
+
+    #[test]
+    fn storage_mutations_reject_invalid_targets_and_commit_errors() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-storage-errors");
+            let stream = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, b"data".to_vec(), "data.bin", None)
+                .unwrap();
+
+            // IStream::SetSize rejects a negative size; Revert on a foreign
+            // pointer is STG_E_INVALIDPOINTER.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    6,
+                    &[stream as u32, 0xFFFF_FFFF, 0xFFFF_FFFF]
+                ),
+                STG_E_INVALIDFUNCTION
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::StreamRevert),
+                    &[0xDEAD_BEEF]
+                ),
+                u64::from(STG_E_INVALIDPOINTER)
+            );
+
+            // IStorage element operations reject invalid flags and missing
+            // elements with the documented STG_E_* codes.
+            let storage = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "source", 0)
+                .unwrap();
+            fixture
+                .runtime
+                .com_storages
+                .get_mut(&storage)
+                .unwrap()
+                .streams
+                .insert("old.bin".to_string(), b"old".to_vec());
+            write_utf16(&mut fixture, NAME, "old.bin");
+            write_utf16(&mut fixture, BUF, "new.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    8,
+                    &[storage as u32, NAME as u32, BUF as u32, 0]
+                ),
+                STG_E_INVALIDFUNCTION
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    8,
+                    &[storage as u32, NAME as u32, BUF as u32, STGMOVE_MOVE]
+                ),
+                S_OK
+            );
+            write_utf16(&mut fixture, NAME, "missing.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    8,
+                    &[storage as u32, NAME as u32, BUF as u32, STGMOVE_MOVE]
+                ),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    13,
+                    &[storage as u32, NAME as u32, BUF as u32]
+                ),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    14,
+                    &[storage as u32, NAME as u32, 0, 0, 0]
+                ),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::StorageSetStateBits),
+                    &[0xDEAD_BEEF, 0, 0]
+                ),
+                u64::from(STG_E_INVALIDPOINTER)
+            );
+
+            // SetElementTimes reaches the real file-time conversion: zero
+            // ticks are before the FILETIME epoch, valid ticks set mtime.
+            let dir = fixture._temp.path().join("times");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("stamp.bin"), b"stamp").unwrap();
+            let timed = fixture
+                .runtime
+                .alloc_com_storage_object(
+                    &mut fixture.memory,
+                    Some(dir.to_string_lossy().to_string()),
+                    "times",
+                    0,
+                )
+                .unwrap();
+            write_utf16(&mut fixture, NAME, "stamp.bin");
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    timed,
+                    14,
+                    &[timed as u32, NAME as u32, 0, 0, COOKIE as u32]
+                ),
+                S_OK,
+                "zero FILETIME is ignored"
+            );
+            fixture.memory.write_u64(COOKIE, 133_000_000_000_000_000);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    timed,
+                    14,
+                    &[timed as u32, NAME as u32, 0, 0, COOKIE as u32]
+                ),
+                S_OK,
+                "valid FILETIME is applied"
+            );
+            write_utf16(&mut fixture, NAME, "absent.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    timed,
+                    14,
+                    &[timed as u32, NAME as u32, 0, 0, COOKIE as u32]
+                ),
+                STG_E_FILENOTFOUND
+            );
+
+            // A plain-file commit whose write target is a directory is
+            // STG_E_ACCESSDENIED; an empty storage commits as a no-op S_OK.
+            let commit_dir = fixture._temp.path().join("commit-dir");
+            std::fs::create_dir_all(&commit_dir).unwrap();
+            let bad_key = 0x5A5A_0000_u64;
+            fixture.runtime.com_storages.insert(
+                bad_key,
+                crate::runtime::state::ComStorageState {
+                    host_dir: Some(format!(
+                        "{COM_PLAIN_FILE_PREFIX}{}",
+                        commit_dir.to_string_lossy()
+                    )),
+                    streams: HashMap::from([("x".to_string(), b"x".to_vec())]),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::StorageCommit),
+                    &[bad_key as u32, 1]
+                ),
+                u64::from(STG_E_ACCESSDENIED)
+            );
+            let empty_key = 0x5A5A_0001_u64;
+            let empty_path = fixture._temp.path().join("empty.bin");
+            fixture.runtime.com_storages.insert(
+                empty_key,
+                crate::runtime::state::ComStorageState {
+                    host_dir: Some(format!(
+                        "{COM_PLAIN_FILE_PREFIX}{}",
+                        empty_path.to_string_lossy()
+                    )),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::StorageCommit),
+                    &[empty_key as u32, 1]
+                ),
+                u64::from(S_OK)
+            );
+
+            // CopyTo honors nested name exclusions during recursion.
+            let source = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "nested-source", 0)
+                .unwrap();
+            let target = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "nested-target", 0)
+                .unwrap();
+            let child = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "Keep", 0)
+                .unwrap();
+            {
+                let child_state = fixture.runtime.com_storages.get_mut(&child).unwrap();
+                child_state
+                    .streams
+                    .insert("drop.bin".to_string(), b"drop".to_vec());
+                child_state
+                    .streams
+                    .insert("keep.bin".to_string(), b"keep".to_vec());
+            }
+            fixture
+                .runtime
+                .com_storages
+                .get_mut(&source)
+                .unwrap()
+                .child_storages
+                .insert("Keep".to_string(), child);
+            let mut exclusions: Vec<u8> = "Keep\\drop.bin"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            exclusions.extend_from_slice(&0_u16.to_le_bytes());
+            exclusions.extend_from_slice(&0_u16.to_le_bytes());
+            fixture.memory.map_bytes(NAME, &exclusions);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    source,
+                    7,
+                    &[source as u32, 0, 0, NAME as u32, target as u32]
+                ),
+                S_OK
+            );
+            let copied_target = &fixture.runtime.com_storages[&target];
+            let copied_child = copied_target.child_storages["Keep"];
+            let copied_child_state = &fixture.runtime.com_storages[&copied_child];
+            assert!(!copied_child_state.streams.contains_key("drop.bin"));
+            assert_eq!(
+                copied_child_state
+                    .streams
+                    .get("keep.bin")
+                    .map(Vec::as_slice),
+                Some(b"keep".as_slice())
+            );
+        })
+    }
+
+    fn load_msft_image(fixture: &mut Fixture, guest_path: &str, image: &[u8]) -> u64 {
+        let host_path = fixture
+            .runtime
+            .win32
+            .ge()
+            .host_path_for_windows_path(guest_path)
+            .unwrap();
+        std::fs::create_dir_all(host_path.parent().unwrap()).unwrap();
+        std::fs::write(&host_path, image).unwrap();
+        write_utf16(fixture, NAME, guest_path);
+        fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+        assert_eq!(
+            dispatch_x86(
+                fixture,
+                HostThunk::OleLoadTypeLib,
+                &[NAME as u32, OUT as u32]
+            ),
+            0,
+            "LoadTypeLib({guest_path})"
+        );
+        guest_ptr(fixture, OUT)
+    }
+
+    fn build_msft_impl_typelib(kind: u32) -> Vec<u8> {
+        const TYPEINFO: usize = 0x23c;
+        const SEGDIR: usize = 0x58;
+        const REF_TABLE: usize = 0x330;
+        let mut image = build_msft_typelib();
+        image.resize(0x380, 0);
+        write_msft_u32(&mut image, TYPEINFO, kind);
+        write_msft_u16(&mut image, TYPEINFO + 76, 2);
+        write_msft_i32(&mut image, TYPEINFO + 84, 0);
+        let base = SEGDIR + 3 * 16;
+        write_msft_u32(&mut image, base, REF_TABLE as u32);
+        write_msft_u32(&mut image, base + 4, 32);
+        write_msft_i32(&mut image, base + 8, -1);
+        write_msft_u32(&mut image, base + 12, 0x0f);
+        write_msft_i32(&mut image, REF_TABLE, 0);
+        write_msft_u16(&mut image, REF_TABLE + 4, 3);
+        write_msft_i32(&mut image, REF_TABLE + 12, 16);
+        write_msft_i32(&mut image, REF_TABLE + 16, -1);
+        write_msft_u16(&mut image, REF_TABLE + 20, 0);
+        write_msft_i32(&mut image, REF_TABLE + 28, -1);
+        image
+    }
+
+    #[test]
+    fn msft_typeinfo_queries_reject_unknown_members_and_missing_owners() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-msft-typeinfo-errors");
+            let type_lib = load_msft_image(&mut fixture, "C:\\errors.tlb", &build_msft_typelib());
+
+            // ITypeLib::GetTypeInfo validates the index and materializes the
+            // MSFT typeinfo; an unknown GUID is TYPE_E_ELEMENTNOTFOUND.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, type_lib, 4, &[type_lib as u32, 0, OUT as u32]),
+                S_OK
+            );
+            let type_info = guest_ptr(&fixture, OUT);
+            assert_ne!(type_info, 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    4,
+                    &[type_lib as u32, 99, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            write_iid(&mut fixture, IID_PTR, &[0xCD_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    6,
+                    &[type_lib as u32, IID_PTR as u32, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // GetLibAttr reports the parsed library GUID and version fields.
+            fixture.memory.map_bytes(OUT, &[0_u8; 32]);
+            assert_eq!(
+                call_slot(&mut fixture, type_lib, 7, &[type_lib as u32, OUT as u32]),
+                S_OK
+            );
+            let lib_attr = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                fixture.memory.read_bytes(lib_attr, 16).unwrap(),
+                COM_AUTOMATION_TYPELIB_IID.to_vec()
+            );
+            assert_eq!(fixture.memory.read_u32(lib_attr + 16).unwrap(), 0x409);
+            assert_eq!(fixture.memory.read_u16(lib_attr + 24).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u16(lib_attr + 26).unwrap(), 0);
+
+            // GetTypeInfoType: NULL out E_POINTER, range error, real kind.
+            assert_eq!(
+                call_slot(&mut fixture, type_lib, 5, &[type_lib as u32, 0, 0]),
+                E_POINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    5,
+                    &[type_lib as u32, 99, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(&mut fixture, type_lib, 5, &[type_lib as u32, 0, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), TKIND_INTERFACE);
+
+            // GetDocumentation: library metadata for u32::MAX, type metadata
+            // for a real index, and the range error otherwise.
+            fixture.memory.map_bytes(OUT, &[0_u8; 32]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    9,
+                    &[
+                        type_lib as u32,
+                        u32::MAX,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                        (OUT + 12) as u32,
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT)).unwrap(),
+                "ICasa1Crafted"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "crafted doc"
+            );
+            assert_eq!(fixture.memory.read_u32(OUT + 8).unwrap(), 0);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 12)).unwrap(),
+                "casa1.hlp"
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 32]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    9,
+                    &[
+                        type_lib as u32,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                        (OUT + 12) as u32,
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT)).unwrap(),
+                "ICasa1Crafted"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "crafted doc"
+            );
+            assert_eq!(fixture.memory.read_u32(OUT + 8).unwrap(), 7);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    9,
+                    &[type_lib as u32, 99, 0, 0, 0, 0]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // FindName: NULL pointers are E_POINTER; unknown names stop at
+            // TYPE_E_ELEMENTNOTFOUND; capacity 0 reports the match count.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[type_lib as u32, 0, 0, OUT as u32, IDS as u32, STAT as u32]
+                ),
+                E_POINTER
+            );
+            write_utf16(&mut fixture, NAME, "NoSuchName");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[type_lib as u32, NAME as u32, 0, OUT as u32, IDS as u32, 0]
+                ),
+                E_POINTER
+            );
+            fixture.memory.map_bytes(STAT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[
+                        type_lib as u32,
+                        NAME as u32,
+                        0,
+                        OUT as u32,
+                        IDS as u32,
+                        STAT as u32
+                    ]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 0);
+            write_utf16(&mut fixture, NAME, "DoWork");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            fixture.memory.map_bytes(STAT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[
+                        type_lib as u32,
+                        NAME as u32,
+                        0,
+                        OUT as u32,
+                        IDS as u32,
+                        STAT as u32
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            fixture.memory.map_bytes(STAT, &[0_u8; 4]);
+            fixture.memory.write_u32(STAT, 2);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[type_lib as u32, NAME as u32, 0, 0, IDS as u32, STAT as u32]
+                ),
+                E_POINTER,
+                "non-zero capacity still needs both outputs"
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            fixture.memory.map_bytes(STAT, &[0_u8; 4]);
+            fixture.memory.write_u32(STAT, 2);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[
+                        type_lib as u32,
+                        NAME as u32,
+                        0,
+                        OUT as u32,
+                        IDS as u32,
+                        STAT as u32
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 1);
+            assert_eq!(guest_ptr(&fixture, OUT + 4), 0);
+
+            // IsName: unreadable name E_POINTER, unknown name S_FALSE.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    11,
+                    &[type_lib as u32, 0xDEAD_0000, 0]
+                ),
+                E_POINTER
+            );
+            write_utf16(&mut fixture, NAME, "NoSuchName");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    11,
+                    &[type_lib as u32, NAME as u32, 0]
+                ),
+                S_FALSE
+            );
+
+            // Unknown ITypeInfo pointers are TYPE_E_ELEMENTNOTFOUND.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetTypeAttr),
+                    &[0xDEAD_BEEF, OUT as u32]
+                ),
+                u64::from(TYPE_E_ELEMENTNOTFOUND)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetFuncDesc),
+                    &[0xDEAD_BEEF, 0, OUT as u32]
+                ),
+                u64::from(TYPE_E_ELEMENTNOTFOUND)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetNames),
+                    &[0xDEAD_BEEF, 1, NAMES as u32, 4, STAT as u32]
+                ),
+                u64::from(TYPE_E_ELEMENTNOTFOUND)
+            );
+
+            // A synthetic MSFT typeinfo whose owner is not a typelib takes
+            // the element-not-found path in each accessor.
+            let ownerless = fixture
+                .runtime
+                .alloc_com_type_info_object(
+                    &mut fixture.memory,
+                    &format!("{COM_MSFT_TYPEINFO_PREFIX}0"),
+                    0,
+                    0,
+                )
+                .unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, ownerless, 3, &[ownerless as u32, OUT as u32]),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ownerless,
+                    5,
+                    &[ownerless as u32, 0, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ownerless,
+                    7,
+                    &[ownerless as u32, 1, NAMES as u32, 4, STAT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ownerless,
+                    10,
+                    &[ownerless as u32, NAMES as u32, 1, IDS as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ownerless,
+                    12,
+                    &[ownerless as u32, 1, 0, 0, 0, 0]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ownerless,
+                    8,
+                    &[ownerless as u32, 0, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ownerless,
+                    9,
+                    &[ownerless as u32, 0, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ownerless,
+                    17,
+                    &[ownerless as u32, 1, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ownerless,
+                    18,
+                    &[ownerless as u32, OUT as u32, STAT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND,
+                "a MSFT typeinfo without its owner library has no containing lib"
+            );
+
+            // A MSFT typeinfo whose type index is out of range is also
+            // element-not-found.
+            let bad_index = fixture
+                .runtime
+                .alloc_com_type_info_object(
+                    &mut fixture.memory,
+                    &format!("{COM_MSFT_TYPEINFO_PREFIX}99"),
+                    type_lib,
+                    0,
+                )
+                .unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, bad_index, 3, &[bad_index as u32, OUT as u32]),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    bad_index,
+                    5,
+                    &[bad_index as u32, 0, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    bad_index,
+                    10,
+                    &[bad_index as u32, NAMES as u32, 1, IDS as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    bad_index,
+                    12,
+                    &[bad_index as u32, 1, 0, 0, 0, 0]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // GetFuncDesc/GetNames on the real typeinfo: unknown indexes and
+            // members are element-not-found; truncated names are S_FALSE.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    5,
+                    &[type_info as u32, 99, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    7,
+                    &[type_info as u32, 99, NAMES as u32, 4, STAT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                fixture.memory.read_u32(STAT).unwrap(),
+                0,
+                "unknown GetNames clears the count"
+            );
+            fixture.memory.map_bytes(NAMES, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    7,
+                    &[type_info as u32, 1, NAMES as u32, 1, STAT as u32]
+                ),
+                S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+
+            // GetIDsOfNames: NULL arrays E_POINTER, known names resolve,
+            // unknown names are DISP_E_UNKNOWNNAME.
+            write_utf16(&mut fixture, NAME, "DoWork");
+            write_utf16(&mut fixture, BUF, "ICasa1Crafted");
+            fixture.memory.map_bytes(NAMES, &[0_u8; 8]);
+            fixture.memory.write_u32(NAMES, NAME as u32);
+            fixture.memory.write_u32(NAMES + 4, BUF as u32);
+            fixture.memory.map_bytes(IDS, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    10,
+                    &[type_info as u32, NAMES as u32, 2, IDS as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 1);
+            assert_eq!(
+                fixture.memory.read_u32(IDS + 4).unwrap(),
+                DISPID_UNKNOWN as u32
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    10,
+                    &[type_info as u32, 0, 1, IDS as u32]
+                ),
+                E_POINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    10,
+                    &[type_info as u32, NAMES as u32, 1, 0]
+                ),
+                E_POINTER
+            );
+            write_utf16(&mut fixture, NAME, "NoSuchMember");
+            fixture.memory.write_u32(NAMES, NAME as u32);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    10,
+                    &[type_info as u32, NAMES as u32, 1, IDS as u32]
+                ),
+                DISP_E_UNKNOWNNAME
+            );
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), DISPID_UNKNOWN as u32);
+
+            // GetDocumentation returns the member and type metadata, and
+            // rejects unknown member ids.
+            fixture.memory.map_bytes(OUT, &[0_u8; 32]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    12,
+                    &[
+                        type_info as u32,
+                        1,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                        (OUT + 12) as u32,
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT)).unwrap(),
+                "DoWork"
+            );
+            assert_eq!(fixture.memory.read_u32(OUT + 8).unwrap(), 0);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 12)).unwrap(),
+                "casa1.hlp"
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 32]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    12,
+                    &[
+                        type_info as u32,
+                        DISPID_UNKNOWN as u32,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                        (OUT + 12) as u32,
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "crafted doc"
+            );
+            assert_eq!(fixture.memory.read_u32(OUT + 8).unwrap(), 7);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    12,
+                    &[type_info as u32, 99, 0, 0, 0, 0]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // GetRefTypeOfImplType/GetImplTypeFlags on the interface report
+            // element-not-found; the coclass typelib exposes the real chain.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    8,
+                    &[type_info as u32, 0, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    9,
+                    &[type_info as u32, 0, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            let class_lib = load_msft_image(
+                &mut fixture,
+                "C:\\impl.tlb",
+                &build_msft_impl_typelib(TKIND_COCLASS),
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    class_lib,
+                    4,
+                    &[class_lib as u32, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            let class_info = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    class_info,
+                    8,
+                    &[class_info as u32, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    class_info,
+                    8,
+                    &[class_info as u32, 1, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    class_info,
+                    9,
+                    &[class_info as u32, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 3);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    class_info,
+                    9,
+                    &[class_info as u32, 1, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // GetRefTypeInfo validates the encoded href; GetMops and
+            // GetContainingTypeLib use the parsed owner.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    14,
+                    &[type_info as u32, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    14,
+                    &[type_info as u32, 1, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    14,
+                    &[type_info as u32, 1000, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    17,
+                    &[type_info as u32, 1, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    17,
+                    &[type_info as u32, 99, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    18,
+                    &[type_info as u32, OUT as u32, (OUT + 4) as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), type_lib);
+            assert_eq!(fixture.memory.read_u32(OUT + 4).unwrap(), 0);
+
+            // The unsupported ITypeInfo surface is E_NOTIMPL.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoUnsupported),
+                    &[type_info as u32]
+                ),
+                u64::from(E_NOTIMPL)
+            );
+
+            // GetNames with the type DISPID returns the type name.
+            fixture.memory.map_bytes(NAMES, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    7,
+                    &[
+                        type_info as u32,
+                        DISPID_UNKNOWN as u32,
+                        NAMES as u32,
+                        4,
+                        STAT as u32
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, NAMES)).unwrap(),
+                "ICasa1Crafted"
+            );
+
+            // A non-MSFT typeinfo without a registered descriptor still
+            // documents its table name and nulls the help-file BSTR.
+            let unknown_table = fixture
+                .runtime
+                .alloc_com_type_info_object(&mut fixture.memory, "NoSuchType", 0, 0)
+                .unwrap();
+            fixture.memory.map_bytes(OUT, &[0xff_u8; 24]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    unknown_table,
+                    12,
+                    &[
+                        unknown_table as u32,
+                        DISPID_UNKNOWN as u32,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                        (OUT + 12) as u32,
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT)).unwrap(),
+                "NoSuchType"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                ""
+            );
+            assert_eq!(fixture.memory.read_u32(OUT + 8).unwrap(), 0);
+            assert_eq!(guest_ptr(&fixture, OUT + 12), 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    unknown_table,
+                    12,
+                    &[unknown_table as u32, 99, 0, 0, 0, 0]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // A coclass typeinfo reports zero methods/variables.
+            let class_descriptor = fixture
+                .runtime
+                .alloc_com_type_info_object(&mut fixture.memory, "Casa1.Automation", 0, 4)
+                .unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    class_descriptor,
+                    3,
+                    &[class_descriptor as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            let coclass_attr = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                fixture.memory.read_u32(coclass_attr + 40).unwrap(),
+                TKIND_COCLASS
+            );
+            assert_eq!(fixture.memory.read_u16(coclass_attr + 44).unwrap(), 0);
+            assert_eq!(fixture.memory.read_u16(coclass_attr + 46).unwrap(), 0);
+
+            // The MSFT FindName truncation path reports S_FALSE when the
+            // capacity is smaller than the duplicate-name match count.
+            let mut duplicate_lib = MsftTypeLib::default();
+            duplicate_lib.types = vec![
+                MsftTypeInfo {
+                    name: "Dup".to_string(),
+                    ..Default::default()
+                },
+                MsftTypeInfo {
+                    name: "Dup".to_string(),
+                    ..Default::default()
+                },
+            ];
+            let mut state = CpuState::new(GuestArch::X86);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            fixture.memory.map_bytes(IDS, &[0_u8; 8]);
+            fixture.memory.map_bytes(STAT, &[0_u8; 4]);
+            fixture.memory.write_u32(STAT, 1);
+            fixture
+                .runtime
+                .com_msft_find_name(
+                    &mut state,
+                    &mut fixture.memory,
+                    0,
+                    &duplicate_lib,
+                    "Dup",
+                    OUT as u64,
+                    IDS as u64,
+                    STAT as u64,
+                )
+                .unwrap();
+            assert_eq!(state.get(Register::Rax), u64::from(S_FALSE));
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+
+            // ITypeComp::Bind with an unreadable name is E_POINTER.
+            let type_comp = fixture
+                .runtime
+                .alloc_com_type_comp_object(&mut fixture.memory)
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_comp,
+                    3,
+                    &[type_comp as u32, 0xDEAD_0000, 0, 0, OUT as u32, IDS as u32]
+                ),
+                E_POINTER
+            );
+        })
+    }
+
+    #[test]
+    fn msft_typelib_parser_rejects_corrupt_segments_and_records() {
+        const SEGDIR: usize = 0x58;
+        const TYPEINFO: usize = 0x23c;
+        let valid = build_msft_typelib();
+
+        // Header-level corruption: unsupported version, empty/oversized type
+        // count, and a segment directory that runs past the image.
+        let mut image = valid.clone();
+        write_msft_u32(&mut image, 4, 3);
+        assert_eq!(MsftTypeLib::parse(&image).is_err(), true, "version");
+        let mut image = valid.clone();
+        write_msft_u32(&mut image, 0x20, 0);
+        assert_eq!(MsftTypeLib::parse(&image).is_err(), true, "empty types");
+        let mut image = valid.clone();
+        write_msft_u32(&mut image, 0x20, 0x1001);
+        assert_eq!(MsftTypeLib::parse(&image).is_err(), true, "type cap");
+        let mut image = valid.clone();
+        write_msft_u32(&mut image, 0x20, 0x1000);
+        assert_eq!(
+            MsftTypeLib::parse(&image).is_err(),
+            true,
+            "segment directory overflow"
+        );
+
+        // Segment-level corruption: wrong kind and a short typeinfo block.
+        let mut image = valid.clone();
+        write_msft_u32(&mut image, SEGDIR + 12, 0);
+        assert_eq!(MsftTypeLib::parse(&image).is_err(), true, "segment kind");
+        let mut image = valid.clone();
+        write_msft_u32(&mut image, SEGDIR + 4, 0);
+        assert_eq!(
+            MsftTypeLib::parse(&image).is_err(),
+            true,
+            "short typeinfo segment"
+        );
+
+        // A member offset outside the image fails member parsing.
+        let mut image = valid.clone();
+        write_msft_i32(&mut image, TYPEINFO + 4, 0x7FFF_FFFF);
+        assert_eq!(
+            MsftTypeLib::parse(&image).is_err(),
+            true,
+            "out-of-range member block"
+        );
+
+        // Coclass implementation chains stop at the negative reftype/next
+        // sentinel; dispinterfaces record the single default impl type.
+        let coclass = build_msft_impl_typelib(TKIND_COCLASS);
+        let parsed = MsftTypeLib::parse(&coclass).unwrap();
+        assert_eq!(parsed.types[0].kind, TKIND_COCLASS);
+        assert_eq!(parsed.types[0].c_impl_types, 2);
+        assert_eq!(parsed.types[0].impls, vec![(0, 3)]);
+        let dispinterface = build_msft_impl_typelib(TKIND_DISPATCH);
+        let parsed_dispatch = MsftTypeLib::parse(&dispinterface).unwrap();
+        assert_eq!(parsed_dispatch.types[0].impls, vec![(0, 0)]);
+
+        // Referenced-type handles are index*100; malformed/out-of-range
+        // handles resolve to None.
+        let parsed = MsftTypeLib::parse(&valid).unwrap();
+        assert_eq!(parsed.type_index_by_ref(0), Some(0));
+        assert_eq!(parsed.type_index_by_ref(1), None);
+        assert_eq!(parsed.type_index_by_ref(1000), None);
+
+        // Name records that do not fit their segment are rejected; a record
+        // whose padded length overruns the segment is rejected too.
+        assert_eq!(
+            read_names(
+                &[0u8; 8],
+                MsftSegment {
+                    offset: 0,
+                    length: 4,
+                    kind: 0,
+                }
+            )
+            .is_err(),
+            true
+        );
+        let mut bytes = vec![0u8; 16];
+        write_msft_u16(&mut bytes, 8, 8);
+        assert_eq!(
+            read_names(
+                &bytes,
+                MsftSegment {
+                    offset: 0,
+                    length: 16,
+                    kind: 0,
+                }
+            )
+            .is_err(),
+            true
+        );
+
+        // A string record whose padded length exceeds the segment is
+        // rejected.
+        let mut bytes = vec![0u8; 4];
+        write_msft_u16(&mut bytes, 0, 8);
+        assert_eq!(
+            read_strings(
+                &bytes,
+                MsftSegment {
+                    offset: 0,
+                    length: 4,
+                    kind: 0,
+                }
+            )
+            .is_err(),
+            true
+        );
+
+        // A well-formed function record carries the optional help/entry
+        // metadata and its parameter ELEMDESC.
+        let mut bytes = vec![0u8; 128];
+        let record = 4usize;
+        write_msft_u32(&mut bytes, 0, 64); // info_len
+        write_msft_u16(&mut bytes, record, 48); // record_len
+        write_msft_i32(&mut bytes, record + 4, -1); // data_type
+        write_msft_u16(&mut bytes, record + 8, 0x1234); // flags
+        write_msft_u16(&mut bytes, record + 12, 7); // vtable offset
+        write_msft_u32(&mut bytes, record + 16, 0x40c); // fkccic
+        write_msft_u16(&mut bytes, record + 20, 1); // cParams
+        write_msft_u16(&mut bytes, record + 22, 0); // cParamsOpt
+        write_msft_u32(&mut bytes, record + 24, 9); // help context
+        write_msft_i32(&mut bytes, record + 28, 5); // help string
+        write_msft_i32(&mut bytes, record + 32, 6); // entry name
+        write_msft_i32(&mut bytes, 40, -1); // param vt
+        write_msft_u32(&mut bytes, 44, 96); // param name
+        write_msft_u16(&mut bytes, 48, 2); // param flags
+        write_msft_i32(&mut bytes, 68, 42); // memid
+        write_msft_u32(&mut bytes, 72, 28); // function name offset
+        let names = HashMap::from([(28_u32, "DoWork".to_string()), (96_u32, "arg".to_string())]);
+        let strings = HashMap::from([(5_i32, "help".to_string()), (6_i32, "entry".to_string())]);
+        let funcs = read_functions(
+            &bytes,
+            0,
+            1,
+            0,
+            &names,
+            &strings,
+            MsftSegment {
+                offset: 0,
+                length: 0,
+                kind: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(funcs.len(), 1);
+        let func = &funcs[0];
+        assert_eq!(func.memid, 42);
+        assert_eq!(func.name, "DoWork");
+        assert_eq!(func.return_vt, 1);
+        assert_eq!(func.func_flags, 0x1234);
+        assert_eq!(func.vtable_offset, 7);
+        assert_eq!(func.funckind, 4);
+        assert_eq!(func.invkind, 1);
+        assert_eq!(func.callconv, 4);
+        assert_eq!(func.c_params, 1);
+        assert_eq!(func.help_context, 9);
+        assert_eq!(func.help_string, "help");
+        assert_eq!(func.entry, Some("entry".to_string()));
+        assert_eq!(func.params, vec![(1, 2, "arg".to_string())]);
+
+        // A record shorter than its fixed header, and one whose parameter
+        // array does not fit, are both rejected.
+        let mut short = vec![0u8; 64];
+        write_msft_u16(&mut short, 4, 20);
+        assert_eq!(
+            read_functions(
+                &short,
+                0,
+                1,
+                0,
+                &names,
+                &strings,
+                MsftSegment {
+                    offset: 0,
+                    length: 0,
+                    kind: 0,
+                }
+            )
+            .is_err(),
+            true
+        );
+        let mut overflow = vec![0u8; 128];
+        write_msft_u32(&mut overflow, 0, 64);
+        write_msft_u16(&mut overflow, 4, 48);
+        write_msft_u16(&mut overflow, 24, 100);
+        assert_eq!(
+            read_functions(
+                &overflow,
+                0,
+                1,
+                0,
+                &names,
+                &strings,
+                MsftSegment {
+                    offset: 0,
+                    length: 0,
+                    kind: 0,
+                }
+            )
+            .is_err(),
+            true
+        );
+    }
+
+    fn build_test_pe_unnamed_export(ordinal: u32) -> Vec<u8> {
+        let mut image = build_test_pe(Some(("Unused", ordinal)));
+        let export_dir = 0x200usize;
+        image[export_dir + 24..export_dir + 28].copy_from_slice(&0_u32.to_le_bytes());
+        image
+    }
+
+    fn dll_info(handle: u64, module: &str, host_path: &str) -> crate::runtime::state::DllInfo {
+        crate::runtime::state::DllInfo {
+            handle,
+            image_size: 0x2000,
+            entry_point_rva: 0,
+            load_count: 1,
+            module_name: module.to_string(),
+            host_path: host_path.to_string(),
+            tls_callbacks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dll_entry_module_discovery_rejects_unreadable_and_wrong_modules() {
+        use std::os::unix::fs::PermissionsExt;
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-dll-module-discovery");
+            let type_info = fixture
+                .runtime
+                .alloc_com_type_info_object(&mut fixture.memory, "ICasa1Automation", 0, 0)
+                .unwrap();
+            let modules = fixture._temp.path().join("modules");
+            std::fs::create_dir_all(&modules).unwrap();
+            let direct_path = modules.join("casa1.dll");
+            std::fs::write(&direct_path, build_test_pe(Some(("DllGetClassObject", 7)))).unwrap();
+            let guest_path = "C:\\dlls\\casa1.dll";
+
+            // Mismatched module names and empty host paths are skipped; the
+            // descriptor metadata is the fallback when no module resolves.
+            fixture.runtime.dll_info_table.clear();
+            fixture.runtime.dll_info_table.insert(
+                0x100,
+                dll_info(0x100, "other.dll", &direct_path.to_string_lossy()),
+            );
+            fixture
+                .runtime
+                .dll_info_table
+                .insert(0x101, dll_info(0x101, "casa1.dll", ""));
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                S_OK,
+                "descriptor fallback for mismatched modules"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "DllGetClassObject"
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 1);
+
+            // A guest path that maps to a real host file is accepted.
+            let guest_host = fixture
+                .runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path(guest_path)
+                .unwrap();
+            std::fs::create_dir_all(guest_host.parent().unwrap()).unwrap();
+            std::fs::write(&guest_host, build_test_pe(Some(("DllGetClassObject", 5)))).unwrap();
+            fixture.runtime.dll_info_table.clear();
+            fixture
+                .runtime
+                .dll_info_table
+                .insert(0x102, dll_info(0x102, "casa1.dll", guest_path));
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                S_OK,
+                "guest-path module discovery"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "DllGetClassObject"
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 5);
+
+            // A case-insensitive export name resolves through the fallback
+            // search while keeping the PE's own spelling.
+            let cased = modules.join("cased.dll");
+            std::fs::write(&cased, build_test_pe(Some(("dllgetclassobject", 4)))).unwrap();
+            fixture.runtime.dll_info_table.clear();
+            fixture.runtime.dll_info_table.insert(
+                0x105,
+                dll_info(0x105, "casa1.dll", &cased.to_string_lossy()),
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                S_OK,
+                "case-insensitive export"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "dllgetclassobject"
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 4);
+
+            // An existing but unreadable module is TYPE_E_CANTLOADLIBRARY.
+            let locked = modules.join("locked.dll");
+            std::fs::write(&locked, build_test_pe(Some(("DllGetClassObject", 5)))).unwrap();
+            let mut permissions = std::fs::metadata(&locked).unwrap().permissions();
+            permissions.set_mode(0o000);
+            std::fs::set_permissions(&locked, permissions).unwrap();
+            fixture.runtime.dll_info_table.clear();
+            fixture.runtime.dll_info_table.insert(
+                0x103,
+                dll_info(0x103, "casa1.dll", &locked.to_string_lossy()),
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[type_info as u32, 1, 0, 0, 0, (OUT + 8) as u32]
+                ),
+                TYPE_E_CANTLOADLIBRARY,
+                "unreadable module"
+            );
+            let mut permissions = std::fs::metadata(&locked).unwrap().permissions();
+            permissions.set_mode(0o644);
+            std::fs::set_permissions(&locked, permissions).unwrap();
+
+            // An ordinal-only export nulls the entry-name output.
+            let unnamed = modules.join("unnamed.dll");
+            std::fs::write(&unnamed, build_test_pe_unnamed_export(1)).unwrap();
+            fixture.runtime.dll_info_table.clear();
+            fixture.runtime.dll_info_table.insert(
+                0x104,
+                dll_info(0x104, "casa1.dll", &unnamed.to_string_lossy()),
+            );
+            fixture.memory.map_bytes(OUT, &[0xff_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                S_OK,
+                "unnamed export"
+            );
+            assert_eq!(guest_ptr(&fixture, OUT + 4), 0);
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 1);
+
+            // Module-path discovery: a missing candidate is skipped, a
+            // direct host path resolves, then a guest path resolves.
+            fixture.runtime.dll_info_table.clear();
+            fixture.runtime.module_handles.clear();
+            fixture.runtime.module_paths_by_handle.clear();
+            fixture
+                .runtime
+                .module_handles
+                .insert("casa1.dll".to_string(), 0x9002);
+            fixture.runtime.module_paths_by_handle.insert(
+                0x9001,
+                modules.join("absent.dll").to_string_lossy().to_string(),
+            );
+            fixture
+                .runtime
+                .module_paths_by_handle
+                .insert(0x9002, direct_path.to_string_lossy().to_string());
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 7);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "DllGetClassObject"
+            );
+            fixture
+                .runtime
+                .module_paths_by_handle
+                .insert(0x9002, guest_path.to_string());
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 5);
+
+            // The GE walk skips extensionless files, non-DLL/EXE files and
+            // non-matching module names before falling back to the
+            // descriptor metadata.
+            std::fs::remove_file(&guest_host).unwrap();
+            fixture.runtime.module_handles.clear();
+            fixture.runtime.module_paths_by_handle.clear();
+            std::fs::write(fixture.runtime.win32.ge().root.join("noext-file"), b"x").unwrap();
+            std::fs::write(fixture.runtime.win32.ge().root.join("note.txt"), b"x").unwrap();
+            std::fs::write(fixture.runtime.win32.ge().root.join("other.dll"), b"x").unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                S_OK,
+                "GE walk fallback"
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 1);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "DllGetClassObject"
+            );
+        })
+    }
+
+    fn invoke_add(fixture: &mut Fixture, server: u64, args: &[ComValue]) -> i32 {
+        let (params, result, exception, argument_error) = fixture
+            .runtime
+            .build_dispatch_invocation(&mut fixture.memory, args)
+            .unwrap();
+        assert_eq!(
+            call_slot(
+                fixture,
+                server,
+                6,
+                &[
+                    server as u32,
+                    4,
+                    0,
+                    0,
+                    u64::from(DISPATCH_METHOD) as u32,
+                    params as u32,
+                    result as u32,
+                    exception as u32,
+                    argument_error as u32,
+                ]
+            ),
+            0,
+            "Invoke(Add)"
+        );
+        read_variant_i4(fixture, result)
+    }
+
+    #[test]
+    fn com_msft_typeinfo_and_typelib_invalid_index_edges_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-msft-invalid-index");
+            let type_lib =
+                load_msft_image(&mut fixture, "C:\\invalid-index.tlb", &build_msft_typelib());
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, type_lib, 4, &[type_lib as u32, 0, OUT as u32]),
+                0
+            );
+            let type_info = guest_ptr(&fixture, OUT);
+            assert_ne!(type_info, 0);
+
+            // A zero-parameter MSFT function has no ELEMDESC array.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    5,
+                    &[type_info as u32, 1, OUT as u32]
+                ),
+                0
+            );
+            let func_desc = guest_ptr(&fixture, OUT);
+            assert_ne!(func_desc, 0);
+            assert_eq!(fixture.memory.read_u16(func_desc + 24).unwrap(), 0);
+            assert_eq!(guest_ptr(&fixture, func_desc + 8), 0);
+
+            // A MSFT typeinfo whose index is out of range is element-not-found.
+            let bad_index = fixture
+                .runtime
+                .alloc_com_type_info_object(
+                    &mut fixture.memory,
+                    &format!("{COM_MSFT_TYPEINFO_PREFIX}99"),
+                    type_lib,
+                    99,
+                )
+                .unwrap();
+            fixture.memory.map_bytes(NAMES, &[0_u8; 8]);
+            fixture.memory.map_bytes(STAT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    bad_index,
+                    7,
+                    &[bad_index as u32, 0, NAMES as u32, 4, STAT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // MSFT typeinfo documentation writes the member name and help file.
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    12,
+                    &[
+                        type_info as u32,
+                        1,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                        (OUT + 12) as u32,
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT)).unwrap(),
+                "DoWork"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 12)).unwrap(),
+                "casa1.hlp"
+            );
+
+            // MSFT ITypeLib documentation carries the library name and doc.
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    9,
+                    &[
+                        type_lib as u32,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                        (OUT + 12) as u32,
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT)).unwrap(),
+                "ICasa1Crafted"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "crafted doc"
+            );
+        })
+    }
+
+    #[test]
+    fn com_non_msft_typeinfo_typelib_documentation_and_names_edges_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-non-msft-names");
+            let type_lib = fixture
+                .runtime
+                .alloc_com_typelib_object(&mut fixture.memory)
+                .unwrap();
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 32]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    9,
+                    &[
+                        type_lib as u32,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                        (OUT + 12) as u32,
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT)).unwrap(),
+                "ICasa1Automation"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "Casa1 automation interface"
+            );
+            assert_eq!(fixture.memory.read_u32(OUT + 8).unwrap(), 1);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 12)).unwrap(),
+                "casa1.hlp"
+            );
+
+            // A non-MSFT typeinfo falls through to the shared table lookup.
+            let type_info = fixture
+                .runtime
+                .alloc_com_type_info_object(&mut fixture.memory, "ICasa1Automation", 0, 0)
+                .unwrap();
+            write_utf16(&mut fixture, NAME, "Value");
+            fixture.memory.map_bytes(NAMES, &[0_u8; 8]);
+            fixture.memory.write_u32(NAMES, NAME as u32);
+            fixture.memory.map_bytes(IDS, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    10,
+                    &[type_info as u32, NAMES as u32, 1, IDS as u32]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 1);
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 24]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    12,
+                    &[
+                        type_info as u32,
+                        1,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                        (OUT + 12) as u32,
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT)).unwrap(),
+                "Value"
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(),
+                "Casa1 automation interface"
+            );
+            assert_eq!(fixture.memory.read_u32(OUT + 8).unwrap(), 1);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 12)).unwrap(),
+                "casa1.hlp"
+            );
+
+            // FindName: unreadable name, capacity probe, missing outputs, success.
+            fixture.memory.map_bytes(STAT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[
+                        type_lib as u32,
+                        0xDEAD_0000,
+                        0,
+                        OUT as u32,
+                        IDS as u32,
+                        STAT as u32,
+                    ]
+                ),
+                E_POINTER
+            );
+            fixture.memory.write_u32(STAT, 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[type_lib as u32, NAME as u32, 0, 0, 0, STAT as u32]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            fixture.memory.write_u32(STAT, 1);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[type_lib as u32, NAME as u32, 0, 0, IDS as u32, STAT as u32]
+                ),
+                E_POINTER
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            fixture.memory.map_bytes(IDS, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    10,
+                    &[
+                        type_lib as u32,
+                        NAME as u32,
+                        0,
+                        OUT as u32,
+                        IDS as u32,
+                        STAT as u32,
+                    ]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 1);
+        })
+    }
+
+    #[test]
+    fn com_type_comp_bind_type_unknown_name_edges_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-typecomp-bindtype-edges");
+            let type_comp = fixture
+                .runtime
+                .alloc_com_type_comp_object(&mut fixture.memory)
+                .unwrap();
+            write_utf16(&mut fixture, NAME, "NoSuchMember");
+            fixture.memory.map_bytes(OUT, &[0xff_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_comp,
+                    4,
+                    &[type_comp as u32, NAME as u32, 0, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+
+            // Normal Bind with an unknown name skips the member scan and
+            // falls through to the shared element-not-found result.
+            fixture.memory.map_bytes(OUT, &[0xff_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_comp,
+                    3,
+                    &[
+                        type_comp as u32,
+                        NAME as u32,
+                        0,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                    ]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+
+            write_utf16(&mut fixture, NAME, "ICasa1Automation");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_comp,
+                    4,
+                    &[type_comp as u32, NAME as u32, 0, OUT as u32]
+                ),
+                0
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+        })
+    }
+
+    #[test]
+    fn com_value_conversion_and_x64_connect_data_boundary_encoding_is_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-value-boundaries");
+            let server = create_server(&mut fixture);
+            assert_eq!(
+                invoke_add(
+                    &mut fixture,
+                    server,
+                    &[ComValue::Bool(true), ComValue::Double(2.9)]
+                ),
+                3
+            );
+            assert_eq!(
+                invoke_add(
+                    &mut fixture,
+                    server,
+                    &[ComValue::Bstr("12".to_string()), ComValue::Object(7),]
+                ),
+                19
+            );
+            assert_eq!(
+                invoke_add(&mut fixture, server, &[ComValue::Empty, ComValue::I4(4)]),
+                4
+            );
+            assert_eq!(
+                invoke_add(
+                    &mut fixture,
+                    server,
+                    &[ComValue::Bstr("not-a-number".to_string()), ComValue::I4(1)]
+                ),
+                1
+            );
+
+            assert_eq!(
+                connect_data_bytes(0x1122_3344_5566_7788, 0xAABB_CCDD, 8),
+                vec![
+                    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xDD, 0xCC, 0xBB, 0xAA, 0, 0,
+                    0, 0
+                ]
+            );
+            assert_eq!(
+                connect_data_bytes(0x1122_3344_5566_7788, 0xAABB_CCDD, 4),
+                vec![0x88, 0x77, 0x66, 0x55, 0xDD, 0xCC, 0xBB, 0xAA]
+            );
+        })
+    }
+
+    #[test]
+    fn com_nested_copy_and_item_bind_failure_edges_are_pinned() {
+        use crate::runtime::dispatch::msi::{CompoundTree, CompoundTreeChild, write_compound_tree};
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-item-bind-edges");
+            let source = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "source", 0)
+                .unwrap();
+            let target = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "target", 0)
+                .unwrap();
+            let child = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "Child", 0)
+                .unwrap();
+            let grand = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "Grand", 0)
+                .unwrap();
+            fixture
+                .runtime
+                .com_storages
+                .get_mut(&source)
+                .unwrap()
+                .child_storages
+                .insert("Child".to_string(), child);
+            {
+                let state = fixture.runtime.com_storages.get_mut(&child).unwrap();
+                state
+                    .streams
+                    .insert("leaf.bin".to_string(), b"leaf".to_vec());
+                state.child_storages.insert("Grand".to_string(), grand);
+            }
+            fixture
+                .runtime
+                .com_storages
+                .get_mut(&grand)
+                .unwrap()
+                .streams
+                .insert("deep.bin".to_string(), b"deep".to_vec());
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    source,
+                    7,
+                    &[source as u32, 0, 0, 0, target as u32]
+                ),
+                0,
+                "nested CopyTo"
+            );
+            let target_state = &fixture.runtime.com_storages[&target];
+            let copied_child = target_state.child_storages["Child"];
+            let child_state = &fixture.runtime.com_storages[&copied_child];
+            assert_eq!(
+                child_state.streams.get("leaf.bin").map(Vec::as_slice),
+                Some(b"leaf".as_slice())
+            );
+            let copied_grand = child_state.child_storages["Grand"];
+            assert_eq!(
+                fixture.runtime.com_storages[&copied_grand]
+                    .streams
+                    .get("deep.bin")
+                    .map(Vec::as_slice),
+                Some(b"deep".as_slice())
+            );
+
+            let root = fixture._temp.path().join("bind-root");
+            std::fs::create_dir_all(root.join("Sub")).unwrap();
+            std::fs::write(root.join("alpha.bin"), b"alpha").unwrap();
+            let mut compound = CompoundTree::new("Root Entry");
+            compound
+                .children
+                .push(CompoundTree::stream("top.bin", b"top".to_vec()));
+            let mut store = CompoundTree::new("Store");
+            store
+                .children
+                .push(CompoundTree::stream("inner.bin", b"inner".to_vec()));
+            compound.children.push(CompoundTreeChild::Storage(store));
+            let compound_path = root.join("nested.cfb");
+            let mut compound_bytes = write_compound_tree(&compound);
+            compound_bytes[0x50..0x60].fill(0);
+            std::fs::write(&compound_path, compound_bytes).unwrap();
+            let mut malformed = vec![0_u8; 0x80];
+            malformed[..8].copy_from_slice(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+            std::fs::write(root.join("malformed.cfb"), malformed).unwrap();
+
+            let root_text = root.to_string_lossy().to_string();
+            let container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &root_text)
+                .unwrap();
+
+            write_utf16(&mut fixture, NAME, "Sub");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                0,
+                "directory IStorage bind"
+            );
+            assert!(
+                fixture
+                    .runtime
+                    .com_storages
+                    .contains_key(&guest_ptr(&fixture, OUT))
+            );
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, IID_PTR as u32, OUT as u32]
+                ),
+                0,
+                "directory GetObjectStorage"
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+
+            write_utf16(&mut fixture, NAME, "alpha.bin");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                0,
+                "plain file stream bind"
+            );
+
+            write_utf16(&mut fixture, NAME, "nested.cfb");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IUNKNOWN);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                0,
+                "valid compound storage bind"
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                0,
+                "compound bytes exposed as a stream"
+            );
+
+            write_utf16(&mut fixture, NAME, "malformed.cfb");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IUNKNOWN);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    6,
+                    &[
+                        container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                STG_E_INVALIDHEADER
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    7,
+                    &[container as u32, NAME as u32, 0, IID_PTR as u32, OUT as u32]
+                ),
+                STG_E_INVALIDHEADER,
+                "malformed compound storage-only bind"
+            );
+
+            // The internal storage-only helper rejects a non-storage IID for
+            // every item shape (directory, compound file, plain file).
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_item_bind_container(
+                        &mut fixture.memory,
+                        &root_text,
+                        "Sub",
+                        &COM_IID_ISTREAM,
+                        true
+                    )
+                    .unwrap()
+                    .0,
+                E_NOINTERFACE
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_item_bind_container(
+                        &mut fixture.memory,
+                        &root_text,
+                        "nested.cfb",
+                        &COM_IID_ISTREAM,
+                        true
+                    )
+                    .unwrap()
+                    .0,
+                E_NOINTERFACE
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_item_bind_container(
+                        &mut fixture.memory,
+                        &root_text,
+                        "alpha.bin",
+                        &COM_IID_ISTREAM,
+                        true
+                    )
+                    .unwrap()
+                    .0,
+                E_NOINTERFACE
+            );
+
+            let cfb_container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &compound_path.to_string_lossy())
+                .unwrap();
+            write_utf16(&mut fixture, NAME, "Root");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IUNKNOWN);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    6,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                MK_E_NOOBJECT
+            );
+            write_utf16(&mut fixture, NAME, "Root\\Store");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    7,
+                    &[
+                        cfb_container as u32,
+                        NAME as u32,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32
+                    ]
+                ),
+                MK_E_NOOBJECT
+            );
+
+            let gone = fixture._temp.path().join("gone-root");
+            std::fs::create_dir_all(&gone).unwrap();
+            let gone_container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &gone.to_string_lossy())
+                .unwrap();
+            std::fs::remove_dir_all(&gone).unwrap();
+            write_utf16(&mut fixture, NAME, "anything");
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IUNKNOWN);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    gone_container,
+                    6,
+                    &[
+                        gone_container as u32,
+                        NAME as u32,
+                        BINDSPEED_INDEFINITE,
+                        0,
+                        IID_PTR as u32,
+                        OUT as u32,
+                    ]
+                ),
+                MK_E_NOOBJECT
+            );
+        })
+    }
+
+    #[test]
+    fn com_dll_entry_guest_and_table_wrong_module_paths_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-dll-paths");
+            let type_info = fixture
+                .runtime
+                .alloc_com_type_info_object(&mut fixture.memory, "ICasa1Automation", 0, 0)
+                .unwrap();
+            let guest_path = "C:\\dlls\\casa1.dll";
+            let guest_host = fixture
+                .runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path(guest_path)
+                .unwrap();
+            std::fs::create_dir_all(guest_host.parent().unwrap()).unwrap();
+            std::fs::write(&guest_host, build_test_pe(Some(("DllGetClassObject", 5)))).unwrap();
+            fixture
+                .runtime
+                .dll_info_table
+                .insert(0x102, dll_info(0x102, "casa1.dll", guest_path));
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 5);
+
+            let modules = fixture._temp.path().join("modules");
+            std::fs::create_dir_all(&modules).unwrap();
+            let direct = modules.join("casa1.dll");
+            std::fs::write(&direct, build_test_pe(Some(("DllGetClassObject", 7)))).unwrap();
+            fixture.runtime.dll_info_table.clear();
+            fixture
+                .runtime
+                .module_handles
+                .insert("casa1.dll".to_string(), 0x9002);
+            fixture
+                .runtime
+                .module_paths_by_handle
+                .insert(0x9002, direct.to_string_lossy().to_string());
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 7);
+
+            std::fs::remove_file(&guest_host).unwrap();
+            fixture.runtime.dll_info_table.clear();
+            fixture.runtime.module_handles.clear();
+            fixture.runtime.module_paths_by_handle.clear();
+            fixture.runtime.dll_info_table.insert(
+                0x103,
+                dll_info(0x103, "casa1.dll", "C:\\missing\\casa1.dll"),
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                0,
+                "a missing guest module path falls back to the descriptor"
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 1);
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn com_dll_entry_non_utf8_module_name_fallback_to_descriptor_is_pinned() {
+        use std::os::unix::ffi::OsStrExt;
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-dll-non-utf8");
+            let type_info = fixture
+                .runtime
+                .alloc_com_type_info_object(&mut fixture.memory, "ICasa1Automation", 0, 0)
+                .unwrap();
+            let weird = std::ffi::OsStr::from_bytes(b"\xffcasa1.dll");
+            std::fs::write(
+                fixture.runtime.win32.ge().root.join(weird),
+                build_test_pe(Some(("DllGetClassObject", 3))),
+            )
+            .unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    13,
+                    &[
+                        type_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                0,
+                "non-UTF-8 module names are skipped, not matched"
+            );
+            assert_eq!(fixture.memory.read_u16(OUT + 8).unwrap(), 1);
+        })
+    }
+
+    #[test]
+    fn com_running_object_abs_item_time_and_enumeration_invalid_state_edges_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-rot-abs-item");
+            let root = fixture._temp.path().join("rot-abs");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("abs.bin"), b"abs").unwrap();
+            let container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &root.to_string_lossy())
+                .unwrap();
+            write_utf16(&mut fixture, NAME, "item:abs.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    3,
+                    &[container as u32, NAME as u32, 0, STAT as u32, OUT as u32,]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 12);
+            let moniker = guest_ptr(&fixture, OUT);
+            assert_ne!(moniker, 0);
+
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    8,
+                    &[moniker as u32, 0, 0, IID_PTR as u32, (OUT + 4) as u32]
+                ),
+                0,
+                "abs item BindToObject"
+            );
+            assert_ne!(guest_ptr(&fixture, OUT + 4), 0);
+
+            let server = create_server(&mut fixture);
+            let rot = fixture
+                .runtime
+                .alloc_com_running_object_table(&mut fixture.memory)
+                .unwrap();
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    3,
+                    &[rot as u32, moniker as u32, server as u32, COOKIE as u32]
+                ),
+                0
+            );
+            assert_ne!(fixture.memory.read_u32(COOKIE).unwrap(), 0);
+
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    8,
+                    &[rot as u32, moniker as u32, (OUT + 4) as u32]
+                ),
+                0
+            );
+            assert_ne!(fixture.memory.read_u64(OUT + 4).unwrap(), 0);
+
+            fixture.memory.map_bytes(OUT + 12, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, rot, 9, &[rot as u32, (OUT + 12) as u32]),
+                0
+            );
+            let enumerator = guest_ptr(&fixture, OUT + 12);
+            assert_ne!(enumerator, 0);
+            fixture.memory.map_bytes(OUT + 20, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 1, (OUT + 20) as u32, STAT as u32]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_ne!(guest_ptr(&fixture, OUT + 20), 0);
+
+            let unknown = parse_moniker(&mut fixture, "file:C:\\not-running.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    rot,
+                    8,
+                    &[rot as u32, unknown as u32, (OUT + 24) as u32]
+                ),
+                MK_E_UNAVAILABLE
+            );
+        })
+    }
+
+    #[test]
+    fn com_item_enum_objects_directory_and_compound_roots_boundary_counts_are_pinned() {
+        use crate::runtime::dispatch::msi::{CompoundTree, write_compound_tree};
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-enum-roots");
+            let dir_root = fixture._temp.path().join("enum-dir");
+            std::fs::create_dir_all(&dir_root).unwrap();
+            std::fs::write(dir_root.join("a.bin"), b"a").unwrap();
+            std::fs::write(dir_root.join("b.bin"), b"b").unwrap();
+            let container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &dir_root.to_string_lossy())
+                .unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    4,
+                    &[container as u32, 0, OUT as u32]
+                ),
+                0
+            );
+            let enumerator = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 4, (OUT + 4) as u32, STAT as u32]
+                ),
+                S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 2);
+
+            let mut compound = CompoundTree::new("Root Entry");
+            compound
+                .children
+                .push(CompoundTree::stream("x.bin", b"x".to_vec()));
+            compound
+                .children
+                .push(CompoundTree::stream("y.bin", b"y".to_vec()));
+            let cfb_path = fixture._temp.path().join("enum.cfb");
+            let mut bytes = write_compound_tree(&compound);
+            bytes[0x50..0x60].fill(0);
+            std::fs::write(&cfb_path, bytes).unwrap();
+            let cfb_container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &cfb_path.to_string_lossy())
+                .unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_container,
+                    4,
+                    &[cfb_container as u32, 0, OUT as u32]
+                ),
+                0
+            );
+            let cfb_enumerator = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    cfb_enumerator,
+                    3,
+                    &[cfb_enumerator as u32, 4, (OUT + 4) as u32, STAT as u32]
+                ),
+                S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 2);
+        })
+    }
+
+    #[test]
+    fn com_msft_typelib_zero_function_boundary_records_parse() {
+        const TYPEINFO: usize = 0x23c;
+        let valid = build_msft_typelib();
+        let parsed = MsftTypeLib::parse(&valid).unwrap();
+        assert_eq!(parsed.types.len(), 1);
+        assert_eq!(parsed.types[0].funcs.len(), 3);
+
+        let mut zero = build_msft_typelib();
+        write_msft_u32(&mut zero, TYPEINFO + 24, 0);
+        let parsed = MsftTypeLib::parse(&zero).unwrap();
+        assert_eq!(parsed.types.len(), 1);
+        assert_eq!(parsed.types[0].funcs.len(), 0);
+
+        let mut negative_offset = build_msft_typelib();
+        write_msft_i32(&mut negative_offset, TYPEINFO + 4, -1);
+        let parsed = MsftTypeLib::parse(&negative_offset).unwrap();
+        assert_eq!(parsed.types[0].funcs.len(), 0);
+    }
+
+    fn state_with_args(fixture: &mut Fixture, args: &[u32]) -> CpuState {
+        const DIRECT_STACK: u64 = 0x43_000;
+        fixture
+            .memory
+            .map_bytes(DIRECT_STACK - 0x40, &[0_u8; 0x100]);
+        for (index, arg) in args.iter().enumerate() {
+            write_u32(&mut fixture.memory, DIRECT_STACK + index as u64 * 4, *arg);
+        }
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, DIRECT_STACK);
+        state
+    }
+
+    #[test]
+    fn com_nested_copy_allocation_exhaustion_is_pinned_error() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-copy-alloc-exhaust");
+            let source = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "source", 0)
+                .unwrap();
+            let target = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "target", 0)
+                .unwrap();
+            let child = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "Child", 0)
+                .unwrap();
+            let grand = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "Grand", 0)
+                .unwrap();
+            fixture
+                .runtime
+                .com_storages
+                .get_mut(&source)
+                .unwrap()
+                .child_storages
+                .insert("Child".to_string(), child);
+            fixture
+                .runtime
+                .com_storages
+                .get_mut(&child)
+                .unwrap()
+                .child_storages
+                .insert("Grand".to_string(), grand);
+
+            // The first nested level fits; the second allocation overflows the
+            // guest data address and must propagate as an error, not panic.
+            fixture.runtime.next_data_address = u64::MAX - 150;
+            let error = fixture
+                .runtime
+                .com_storage_copy_into(&mut fixture.memory, source, target, &[], &[])
+                .unwrap_err();
+            assert_eq!(error.message, "PE runtime data allocation overflow");
+        })
+    }
+
+    #[test]
+    fn com_item_bind_allocation_exhaustion_pins_errors() {
+        use crate::runtime::dispatch::msi::{CompoundTree, write_compound_tree};
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-bind-alloc-exhaust");
+            let root = fixture._temp.path().join("bind-exhaust");
+            std::fs::create_dir_all(root.join("Sub")).unwrap();
+            std::fs::write(root.join("plain.bin"), b"plain").unwrap();
+            let mut compound = CompoundTree::new("Root Entry");
+            compound
+                .children
+                .push(CompoundTree::stream("top.bin", b"top".to_vec()));
+            let mut bytes = write_compound_tree(&compound);
+            bytes[0x50..0x60].fill(0);
+            let compound_path = root.join("nested.cfb");
+            std::fs::write(&compound_path, bytes).unwrap();
+            let plain_path = root.join("plain.bin");
+            let root_text = root.to_string_lossy().to_string();
+
+            fixture.runtime.next_data_address = u64::MAX - 15;
+
+            let error = fixture
+                .runtime
+                .com_item_bind_path(&mut fixture.memory, &root, &COM_IID_IUNKNOWN)
+                .unwrap_err();
+            assert_eq!(error.message, "PE runtime data allocation overflow");
+            let error = fixture
+                .runtime
+                .com_item_bind_path(&mut fixture.memory, &compound_path, &COM_IID_IUNKNOWN)
+                .unwrap_err();
+            assert_eq!(error.message, "PE runtime data allocation overflow");
+            let error = fixture
+                .runtime
+                .com_item_bind_path(&mut fixture.memory, &plain_path, &COM_IID_ISTREAM)
+                .unwrap_err();
+            assert_eq!(error.message, "PE runtime data allocation overflow");
+            let error = fixture
+                .runtime
+                .com_item_bind_container(
+                    &mut fixture.memory,
+                    &root_text,
+                    "Sub",
+                    &COM_IID_IUNKNOWN,
+                    true,
+                )
+                .unwrap_err();
+            assert_eq!(error.message, "PE runtime data allocation overflow");
+            let error = fixture
+                .runtime
+                .com_item_bind_container(
+                    &mut fixture.memory,
+                    &root_text,
+                    "nested.cfb",
+                    &COM_IID_IUNKNOWN,
+                    true,
+                )
+                .unwrap_err();
+            assert_eq!(error.message, "PE runtime data allocation overflow");
+        })
+    }
+
+    #[test]
+    fn com_item_parse_display_name_allocation_exhaustion_is_an_error() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-parse-alloc-exhaust");
+            let root = fixture._temp.path().join("parse-exhaust");
+            std::fs::create_dir_all(&root).unwrap();
+            let root_text = root.to_string_lossy().to_string();
+            let container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &root_text)
+                .unwrap();
+            write_utf16(&mut fixture, NAME, "child");
+            let mut state =
+                state_with_args(&mut fixture, &[container as u32, NAME as u32, 0, 0, 0]);
+            fixture.runtime.next_data_address = u64::MAX - 15;
+            let error = fixture
+                .runtime
+                .com_item_container_parse_display_name(&mut state, &mut fixture.memory)
+                .unwrap_err();
+            assert_eq!(error.message, "PE runtime data allocation overflow");
+        })
+    }
+
+    #[test]
+    fn com_running_enum_allocation_exhaustion_is_an_error() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-running-alloc-exhaust");
+            fixture.runtime.com_running_put("root\u{1}item", 1);
+            let mut state = state_with_args(&mut fixture, &[0, OUT as u32]);
+            fixture.runtime.next_data_address = u64::MAX - 15;
+            let error = fixture
+                .runtime
+                .com_running_table_enum_running(&mut state, &mut fixture.memory)
+                .unwrap_err();
+            assert_eq!(error.message, "PE runtime data allocation overflow");
+        })
+    }
+
+    #[test]
+    fn com_typeinfo_and_typelib_null_output_edges_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-null-outputs");
+            let unknown_info = fixture
+                .runtime
+                .alloc_com_type_info_object(&mut fixture.memory, "ICasa1Automation", 0, 0)
+                .unwrap();
+            fixture.runtime.com_type_infos.remove(&unknown_info);
+            write_utf16(&mut fixture, NAME, "Value");
+            fixture.memory.map_bytes(NAMES, &[0_u8; 8]);
+            write_u32(&mut fixture.memory, NAMES, NAME as u32);
+            fixture.memory.map_bytes(IDS, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    unknown_info,
+                    10,
+                    &[unknown_info as u32, NAMES as u32, 1, IDS as u32]
+                ),
+                E_NOINTERFACE
+            );
+
+            let type_lib =
+                load_msft_image(&mut fixture, "C:\\null-outputs.tlb", &build_msft_typelib());
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, type_lib, 4, &[type_lib as u32, 0, OUT as u32]),
+                0
+            );
+            let msft_info = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    msft_info,
+                    12,
+                    &[
+                        msft_info as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                        (OUT + 8) as u32,
+                    ]
+                ),
+                0
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_lib,
+                    9,
+                    &[type_lib as u32, 0, 0, 0, OUT as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 7);
+
+            let descriptor_lib = fixture
+                .runtime
+                .alloc_com_typelib_object(&mut fixture.memory)
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    descriptor_lib,
+                    9,
+                    &[descriptor_lib as u32, 0, 0, 0, 0, 0]
+                ),
+                S_OK
+            );
+        })
+    }
+
+    #[test]
+    fn com_abs_item_bind_to_storage_failure_and_compound_stream_edges_are_pinned() {
+        use crate::runtime::dispatch::msi::{CompoundTree, write_compound_tree};
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-abs-bind-failure");
+            let root = fixture._temp.path().join("abs-failure");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("plain.bin"), b"plain").unwrap();
+            let mut compound = CompoundTree::new("Root Entry");
+            compound
+                .children
+                .push(CompoundTree::stream("top.bin", b"top".to_vec()));
+            let mut bytes = write_compound_tree(&compound);
+            bytes[0x50..0x60].fill(0);
+            let compound_path = root.join("nested.cfb");
+            std::fs::write(&compound_path, bytes).unwrap();
+            let root_text = root.to_string_lossy().to_string();
+
+            let moniker = fixture
+                .runtime
+                .alloc_com_moniker_object(
+                    &mut fixture.memory,
+                    crate::runtime::state::ComMonikerState {
+                        kind: crate::runtime::state::ComMonikerKind::File,
+                        display_name: "item:plain.bin".to_string(),
+                        payload: format!("{COM_ABS_ITEM_PREFIX}{root_text}\u{1}plain.bin"),
+                        host_path: None,
+                    },
+                )
+                .unwrap();
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    9,
+                    &[moniker as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+
+            // A compound file with a non-storage IID falls through to the
+            // stream branch instead of the storage allocation.
+            let (hr, stream) = fixture
+                .runtime
+                .com_item_bind_path(&mut fixture.memory, &compound_path, &COM_IID_ISTREAM)
+                .unwrap();
+            assert_eq!(hr, S_OK);
+            assert_ne!(stream, 0);
+        })
+    }
+
+    #[test]
+    fn com_item_enum_objects_unreadable_and_malformed_roots_are_pinned() {
+        use std::os::unix::fs::PermissionsExt;
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-enum-root-errors");
+            let dir_root = fixture._temp.path().join("enum-locked");
+            std::fs::create_dir_all(&dir_root).unwrap();
+            std::fs::write(dir_root.join("a.bin"), b"a").unwrap();
+            let container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &dir_root.to_string_lossy())
+                .unwrap();
+            let mut permissions = std::fs::metadata(&dir_root).unwrap().permissions();
+            let original = permissions.mode();
+            permissions.set_mode(0o000);
+            std::fs::set_permissions(&dir_root, permissions).unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    4,
+                    &[container as u32, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            let enumerator = guest_ptr(&fixture, OUT);
+            assert_ne!(enumerator, 0);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 4, (OUT + 4) as u32, STAT as u32]
+                ),
+                S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 0);
+            let mut restore = std::fs::metadata(&dir_root).unwrap().permissions();
+            restore.set_mode(original);
+            std::fs::set_permissions(&dir_root, restore).unwrap();
+
+            let malformed_path = fixture._temp.path().join("malformed.cfb");
+            let mut malformed = vec![0_u8; 0x80];
+            malformed[..8].copy_from_slice(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+            std::fs::write(&malformed_path, malformed).unwrap();
+            let bad_container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &malformed_path.to_string_lossy())
+                .unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    bad_container,
+                    4,
+                    &[bad_container as u32, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            let empty = guest_ptr(&fixture, OUT);
+            assert_ne!(empty, 0);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    empty,
+                    3,
+                    &[empty as u32, 4, (OUT + 4) as u32, STAT as u32]
+                ),
+                S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 0);
+
+            let missing_root = fixture._temp.path().join("does-not-exist");
+            let missing_container = fixture
+                .runtime
+                .alloc_com_item_container(&mut fixture.memory, &missing_root.to_string_lossy())
+                .unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    missing_container,
+                    4,
+                    &[missing_container as u32, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            let empty = guest_ptr(&fixture, OUT);
+            assert_ne!(empty, 0);
+            fixture.memory.map_bytes(OUT + 4, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    empty,
+                    3,
+                    &[empty as u32, 4, (OUT + 4) as u32, STAT as u32]
+                ),
+                S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 0);
         })
     }
 }

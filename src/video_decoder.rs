@@ -4015,235 +4015,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_h264_annex_b() {
-        // Create minimal H.264 stream with SPS + IDR
-        let sps = vec![
-            0x00, 0x00, 0x00, 0x01, // Start code
-            0x67, // SPS NAL type
-            0x64, 0x00, 0x1E, 0xAC, 0x52,
-        ];
-        let pps = vec![
-            0x00, 0x00, 0x00, 0x01, // Start code
-            0x68, // PPS NAL type
-            0xEE, 0x3C, 0x80,
-        ];
-        let idr = vec![
-            0x00, 0x00, 0x00, 0x01, // Start code
-            0x65, // IDR NAL type
-            0x88, 0x84, 0x00, 0xAD, 0xB7,
-        ];
-
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&sps);
-        stream.extend_from_slice(&pps);
-        stream.extend_from_slice(&idr);
-
-        let nalus = parse_h264_annex_b(&stream);
-        assert_eq!(nalus.len(), 3);
-        assert_eq!(nalus[0][0] & 0x1F, 7); // SPS
-        assert_eq!(nalus[1][0] & 0x1F, 8); // PPS
-        assert_eq!(nalus[2][0] & 0x1F, 5); // IDR
-    }
-
-    #[test]
-    fn test_mf_transform_lifecycle() {
-        let config = VideoDecoderConfig {
-            codec: VideoCodec::H264,
-            width: 640,
-            height: 480,
-            fps: 30.0,
-            bitrate: 1_000_000,
-        };
-        let mut transform = MfTransform::new(config);
-        assert_eq!(transform.input_queued(), 0);
-
-        // Test ProcessMessage
-        let _result = transform.process_message(MftMessageType::Reset);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-        let _result = transform.process_message(MftMessageType::NewStream);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-        let _result = transform.process_message(MftMessageType::Flush);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-        let _result = transform.process_message(MftMessageType::Drain);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-
-        // Test ProcessInput/ProcessOutput
-        let packet = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88];
-        let input_result = transform.process_input(&packet, 0);
-        // May succeed or fail depending on platform/features
-        let _ = input_result;
-
-        let output = transform.process_output().unwrap_or(None);
-        if let Some(frame) = output {
-            assert!(frame.pts > 0 || frame.duration > 0);
-        }
-    }
-
-    #[test]
-    fn test_metal_texture_upload_prepare_rgba() {
-        let frame = VideoFrame {
-            width: 4,
-            height: 4,
-            data: vec![128u8; 4 * 4 * 4], // RGBA gray
-            pts: 0,
-            duration: 33_333,
-            texture_id: None,
-            metal_texture: None,
-            color_space: ColorSpace::Rec709,
-        };
-
-        let upload = prepare_metal_texture_upload(
-            &frame,
-            MetalTextureFormat::RGBA8Unorm,
-            ColorSpace::Rec709,
-        )
-        .unwrap();
-        assert_eq!(upload.format, MetalTextureFormat::RGBA8Unorm);
-        assert_eq!(upload.bytes_per_row, 16);
-        assert_eq!(upload.data.len(), 64);
-    }
-
-    #[test]
-    fn test_metal_texture_upload_prepare_bgra() {
-        let frame = VideoFrame {
-            width: 4,
-            height: 4,
-            data: std::iter::repeat_n([255u8, 0, 0, 255], 16)
-                .flatten()
-                .collect(), // Red RGBA pixels
-            pts: 0,
-            duration: 33_333,
-            texture_id: None,
-            metal_texture: None,
-            color_space: ColorSpace::Rec709,
-        };
-
-        let upload = prepare_metal_texture_upload(
-            &frame,
-            MetalTextureFormat::BGRA8Unorm,
-            ColorSpace::Rec709,
-        )
-        .unwrap();
-        assert_eq!(upload.format, MetalTextureFormat::BGRA8Unorm);
-        // First pixel: RGBA(255,0,0,255) -> BGRA(0,0,255,255)
-        assert_eq!(upload.data[0], 0); // B
-        assert_eq!(upload.data[1], 0); // G
-        assert_eq!(upload.data[2], 255); // R
-        assert_eq!(upload.data[3], 255); // A
-    }
-
-    #[test]
-    fn test_metal_texture_upload_prepare_nv12() {
-        let frame = VideoFrame {
-            width: 4,
-            height: 4,
-            data: vec![128u8; 4 * 4 * 4], // Gray RGBA
-            pts: 0,
-            duration: 33_333,
-            texture_id: None,
-            metal_texture: None,
-            color_space: ColorSpace::Rec709,
-        };
-
-        let upload =
-            prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Rec709)
-                .unwrap();
-        assert_eq!(upload.format, MetalTextureFormat::NV12);
-        // NV12: Y plane (16 bytes) + interleaved UV (8 bytes)
-        assert_eq!(upload.data.len(), 24);
-    }
-
-    #[test]
-    fn test_color_space_conversion() {
-        let frame = VideoFrame {
-            width: 2,
-            height: 2,
-            data: vec![128u8; 2 * 2 * 4],
-            pts: 0,
-            duration: 33_333,
-            texture_id: None,
-            metal_texture: None,
-            color_space: ColorSpace::Rec709,
-        };
-
-        // Test Rec.601
-        let upload_601 =
-            prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Rec601)
-                .unwrap();
-        assert_eq!(upload_601.data.len(), 6); // 4 Y + 2 UV (for 2x2)
-
-        // Test Rec.2020
-        let upload_2020 =
-            prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Rec2020)
-                .unwrap();
-        assert_eq!(upload_2020.data.len(), 6);
-
-        // Test Rec.709 (default)
-        let upload_709 =
-            prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Rec709)
-                .unwrap();
-        assert_eq!(upload_709.data.len(), 6);
-    }
-
-    #[test]
-    fn test_frame_pts_ordering() {
-        let config = VideoDecoderConfig {
-            codec: VideoCodec::H264,
-            width: 320,
-            height: 240,
-            fps: 30.0,
-            bitrate: 500_000,
-        };
-        let mut decoder = VideoDecoder::new(config);
-
-        // Simulate feeding frames at different PTS values
-        let sps = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1E, 0xAC];
-        let _ = decoder.feed_data(&sps);
-        let pps = vec![0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80];
-        let _ = decoder.feed_data(&pps);
-
-        // Feed multiple packets with different PTS
-        for pts_step in 0..3 {
-            let pts = pts_step * 33_333;
-            let idr = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, pts_step as u8];
-            #[cfg(feature = "ffmpeg")]
-            {
-                let _ = decoder.decode_packet(&idr, pts);
-            }
-            #[cfg(not(feature = "ffmpeg"))]
-            {
-                let _ = pts;
-                let _ = decoder.feed_data(&idr);
-            }
-        }
-
-        let frames = decoder.flush();
-        // Verify frames are in PTS order (if any were decoded)
-        for window in frames.windows(2) {
-            assert!(
-                window[0].pts <= window[1].pts,
-                "Frames should be in PTS order"
-            );
-        }
-    }
-
-    #[test]
-    fn test_yuv420p_to_rgba() {
-        let width = 4u32;
-        let height = 4u32;
-        let y_size = (width * height) as usize;
-        let uv_size = y_size / 4;
-        let mut yuv = vec![128u8; y_size + uv_size * 2];
-
-        // Set some Y values
-        yuv[0] = 255; // White pixel
-        yuv[1] = 0; // Black pixel
-
-        let rgba = yuv420p_to_rgba(&yuv, width, height);
-        assert_eq!(rgba.len(), (width * height * 4) as usize);
-    }
-
-    #[test]
     fn test_video_decoder_reset() {
         let config = VideoDecoderConfig::default();
         let mut decoder = VideoDecoder::new(config);
@@ -4251,122 +4022,9 @@ mod tests {
         assert!(!decoder.has_frames());
     }
 
-    #[test]
-    fn test_parse_h264_sps_known_resolution() {
-        // A known SPS for 1920x1080 (common real-world SPS)
-        let sps_1080p: Vec<u8> = vec![
-            0x67, 0x64, 0x00, 0x1e, 0xac, 0xd9, 0x40, 0xb4, 0x2f, 0xf9, 0x61, 0x01, 0x10, 0x10,
-            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
-            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
-        ];
-        let (w, h) = parse_h264_sps(&sps_1080p);
-        assert!(
-            w > 0 && h > 0,
-            "Should extract resolution from SPS, got {}x{}",
-            w,
-            h
-        );
-    }
-
-    #[test]
-    fn test_parse_h264_sps_empty() {
-        let (w, h) = parse_h264_sps(&[]);
-        assert_eq!(w, 0);
-        assert_eq!(h, 0);
-    }
-
-    #[test]
-    fn test_mf_source_reader() {
-        let mut reader = MfSourceReader::new();
-        reader.set_output_size(640, 480);
-        reader.set_frame_rate(30.0);
-        reader.initialize("test.mp4").unwrap();
-
-        // Read a sample
-        let result = reader.read_sample().unwrap();
-        assert!(result.is_none()); // No actual data to decode
-
-        reader.shutdown();
-    }
-
-    #[test]
-    fn test_video_decoder_flush() {
-        let config = VideoDecoderConfig {
-            codec: VideoCodec::H264,
-            width: 640,
-            height: 480,
-            fps: 30.0,
-            bitrate: 1_000_000,
-        };
-        let mut decoder = VideoDecoder::new(config);
-
-        let sps = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1E, 0xAC];
-        let _ = decoder.feed_data(&sps);
-        let pps = vec![0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80];
-        let _ = decoder.feed_data(&pps);
-
-        for _ in 0..3 {
-            let idr = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88];
-            let _ = decoder.feed_data(&idr);
-        }
-
-        let frames = decoder.flush();
-        // Without ffmpeg feature and not on macOS, flush returns 0 frames
-        #[cfg(not(any(target_os = "macos", feature = "ffmpeg")))]
-        assert_eq!(frames.len(), 0);
-        #[cfg(any(target_os = "macos", feature = "ffmpeg"))]
-        let _ = frames;
-    }
-
-    #[test]
-    fn test_video_codec_enum() {
-        assert_eq!(VideoCodec::H264 as u32, 0);
-        assert_eq!(VideoCodec::H265 as u32, 1);
-        assert_eq!(VideoCodec::VP9 as u32, 2);
-        assert_eq!(VideoCodec::Unknown as u32, 3);
-    }
-
-    #[test]
-    fn test_color_space_default() {
-        assert_eq!(ColorSpace::default(), ColorSpace::Rec709);
-    }
-
     // -----------------------------------------------------------------------
     // Malformed container / edge-case video decoder tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_decode_empty_input() {
-        let config = VideoDecoderConfig {
-            codec: VideoCodec::H264,
-            width: 640,
-            height: 480,
-            fps: 30.0,
-            bitrate: 1_000_000,
-        };
-        let mut decoder = VideoDecoder::new(config);
-
-        let result = decoder.decode_packet(&[], 0);
-        // Empty input should either return Ok(0) or an error, but never panic
-        if let Ok(count) = result {
-            assert_eq!(count, 0, "empty input should decode 0 frames");
-        }
-    }
-
-    #[test]
-    fn test_feed_data_empty() {
-        let config = VideoDecoderConfig {
-            codec: VideoCodec::H264,
-            width: 320,
-            height: 240,
-            fps: 30.0,
-            bitrate: 500_000,
-        };
-        let mut decoder = VideoDecoder::new(config);
-        let result = decoder.feed_data(&[]);
-        // Should not panic; may succeed or fail
-        let _ = result;
-    }
 
     #[test]
     fn test_feed_data_truncated_nal_unit() {
@@ -4433,21 +4091,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_h264_annex_b_empty() {
-        let nalus = parse_h264_annex_b(&[]);
-        assert!(nalus.is_empty(), "empty input should yield no NAL units");
-    }
-
-    #[test]
-    fn test_parse_h264_annex_b_no_start_code() {
-        let nalus = parse_h264_annex_b(&[0xAA, 0xBB, 0xCC]);
-        assert!(
-            nalus.is_empty(),
-            "data without start codes should yield no NAL units"
-        );
-    }
-
-    #[test]
     fn test_parse_h264_annex_b_truncated_start_code() {
         // Only 3 bytes of a 4-byte start code
         let nalus = parse_h264_annex_b(&[0x00, 0x00, 0x00]);
@@ -4460,30 +4103,6 @@ mod tests {
         let (w, h) = parse_h264_sps(&[0x67, 0x64]);
         // Should return (0, 0) without panicking
         assert_eq!((w, h), (0, 0), "truncated SPS should yield no dimensions");
-    }
-
-    #[test]
-    fn test_mf_source_reader_empty_data() {
-        let mut reader = MfSourceReader::new();
-        // Initialize with empty data should not panic
-        let result = reader.initialize("");
-        // May fail, but should not panic
-        let _ = result;
-    }
-
-    #[test]
-    fn test_mf_transform_process_empty_input() {
-        let config = VideoDecoderConfig {
-            codec: VideoCodec::H264,
-            width: 640,
-            height: 480,
-            fps: 30.0,
-            bitrate: 1_000_000,
-        };
-        let mut transform = MfTransform::new(config);
-        let result = transform.process_input(&[], 0);
-        // Should not panic
-        let _ = result;
     }
 
     #[test]
@@ -4509,7 +4128,6 @@ mod tests {
     // CoreVideo/IOSurface zero-copy path
     // -----------------------------------------------------------------------
 
-    /// Generate a deterministic RGBA test pattern.
     #[cfg(target_os = "macos")]
     fn test_pattern_rgba(width: u32, height: u32, seed: u32) -> Vec<u8> {
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);
@@ -4522,26 +4140,6 @@ mod tests {
             }
         }
         rgba
-    }
-
-    #[test]
-    fn test_probe_zero_copy_status_reports_metal() {
-        let decoder = VideoDecoder::new(VideoDecoderConfig::default());
-        let probe = probe_zero_copy_status();
-        assert_eq!(
-            decoder.zero_copy_status(),
-            probe,
-            "decoder must report the probed capability"
-        );
-        // This machine has a real Metal device; the CoreVideo cache must be
-        // creatable. If that changes, the CPU fallback remains correct, so
-        // only log rather than fail when the probe is negative.
-        if probe.is_available() {
-            let status = decoder.zero_copy_status();
-            assert!(status.is_available());
-        } else {
-            eprintln!("zero-copy unavailable: {}", probe.reason());
-        }
     }
 
     #[test]
@@ -4732,8 +4330,6 @@ mod tests {
         }
     }
 
-    /// VideoToolbox compression callback: convert each encoded AVCC sample to
-    /// Annex B (SPS/PPS + slice NALs) and append it to the sink.
     #[cfg(target_os = "macos")]
     unsafe extern "C" fn compression_output_callback(
         refcon: *mut c_void,
@@ -4835,8 +4431,6 @@ mod tests {
         }
     }
 
-    /// Encode `frame_count` synthetic frames as a real H.264 Annex B stream
-    /// using VideoToolbox. Returns `None` when no encoder is available.
     #[cfg(target_os = "macos")]
     fn encode_test_h264(width: u32, height: u32, frame_count: usize) -> Option<Vec<Vec<u8>>> {
         use self::vt_ffi::*;
@@ -4952,85 +4546,6 @@ mod tests {
             None
         } else {
             Some(samples)
-        }
-    }
-
-    #[test]
-    fn test_hardware_vt_decode_is_iosurface_backed() {
-        #[cfg(target_os = "macos")]
-        {
-            if !probe_zero_copy_status().is_available() {
-                eprintln!(
-                    "skipping hardware decode test: {}",
-                    probe_zero_copy_status().reason()
-                );
-                return;
-            }
-
-            let (width, height) = (64u32, 64u32);
-            let Some(samples) = encode_test_h264(width, height, 3) else {
-                eprintln!("skipping hardware decode test: VT encoder unavailable");
-                return;
-            };
-
-            let mut decoder = VideoDecoder::new(VideoDecoderConfig {
-                codec: VideoCodec::H264,
-                width,
-                height,
-                fps: 30.0,
-                bitrate: 1_000_000,
-            });
-            assert!(decoder.zero_copy_status().is_available());
-
-            let before = zero_copy_stats();
-            for (index, sample) in samples.iter().enumerate() {
-                let _ = decoder.decode_packet(sample, index as u64 * 33_333);
-            }
-            let frames = decoder.flush();
-            if frames.is_empty() {
-                // Hardware decode is capability-gated: this machine exposes a
-                // Metal device but may not have a hardware H.264 decoder for
-                // the encoded profile. The CPU path remains correct.
-                eprintln!(
-                    "skipping hardware decode assertions: VideoToolbox produced no frames \
-                     (hardware H.264 decode unavailable)"
-                );
-                return;
-            }
-
-            let after = zero_copy_stats();
-            for (index, frame) in frames.iter().enumerate() {
-                assert!(
-                    frame.is_iosurface_backed(),
-                    "hardware frame {index} must be IOSurface-backed"
-                );
-                assert!(
-                    frame.metal_texture.is_some(),
-                    "hardware frame {index} must expose a Metal texture"
-                );
-                assert!(
-                    frame.data.is_empty(),
-                    "hardware frame {index} must be zero-copy (no CPU pixels)"
-                );
-            }
-            assert!(
-                after.iosurface_frames >= before.iosurface_frames + frames.len() as u64,
-                "every hardware frame must count as IOSurface-backed: before={before:?} \
-                 after={after:?} frames={}",
-                frames.len()
-            );
-            assert!(
-                after.cpu_copies_avoided >= before.cpu_copies_avoided + frames.len() as u64,
-                "every hardware frame must count as an avoided CPU copy"
-            );
-            eprintln!(
-                "hardware video decode produced {} IOSurface-backed frames",
-                frames.len()
-            );
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            eprintln!("skipping hardware decode test off macOS");
         }
     }
 }

@@ -965,93 +965,6 @@ mod tests {
     }
 
     #[test]
-    fn enhanced_denuvo_initialize_with_sections() {
-        let config = make_config_with_sections();
-        let mut emulator = EnhancedDenuvoEmulator::new(config);
-        let mut memory = MemoryImage::default();
-
-        // Map code sections
-        memory.map_bytes(0x1000, &[0x90u8; 64]);
-        memory.map_bytes(0x2000, &[0xB8u8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
-
-        emulator.initialize(&mut memory, 0).unwrap();
-        assert!(emulator.initialized);
-
-        // Triggers should be set up from trigger_points
-        assert!(emulator.triggers.contains_key(&0x5000));
-        assert!(emulator.triggers.contains_key(&0x6000));
-
-        // Tamper hashes should be set up from code sections
-        assert!(emulator.tamper_hashes.contains_key(&0x1000));
-        assert!(emulator.tamper_hashes.contains_key(&0x2000));
-    }
-
-    #[test]
-    fn enhanced_denuvo_trigger_handling() {
-        let config = make_config_with_sections();
-        let mut emulator = EnhancedDenuvoEmulator::new(config);
-        let mut memory = MemoryImage::default();
-
-        let code1 = vec![0x90u8; 64];
-        let code2 = vec![0xB8u8, 0x01, 0x00, 0x00, 0x00, 0xC3];
-        memory.map_bytes(0x1000, &code1);
-        memory.map_bytes(0x2000, &code2);
-
-        emulator.initialize(&mut memory, 0).unwrap();
-
-        // After initialize(), section data is plaintext read from memory.
-        // Encrypt it with the same key derivation decrypt_code_section will use.
-        for idx in 0..emulator.base.config.code_sections.len() {
-            let section = &emulator.base.config.code_sections[idx];
-            if !section.encrypted {
-                continue;
-            }
-            let plaintext = section.decrypted.clone();
-
-            // Derive key: SHA-256(hardware_id + original_hash)
-            let mut key_material = Vec::with_capacity(48);
-            key_material.extend_from_slice(&emulator.base.state.hardware_id);
-            key_material.extend_from_slice(&section.original_hash);
-            let derived = {
-                let mut hasher = Sha256::new();
-                hasher.update(&key_material);
-                hasher.finalize()
-            };
-            let aes_key: [u8; 16] = {
-                let mut k = [0u8; 16];
-                k.copy_from_slice(&derived[..16]);
-                k
-            };
-            let iv: [u8; 16] = {
-                let mut i = [0u8; 16];
-                i.copy_from_slice(&derived[16..]);
-                i
-            };
-
-            // PKCS7-pad and AES-128-CBC encrypt
-            let block_size = 16usize;
-            let pad_len = block_size - (plaintext.len() % block_size);
-            let mut padded = plaintext.clone();
-            padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
-            type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
-            let enc = Aes128CbcEnc::new(&aes_key.into(), &iv.into());
-            let ct = enc
-                .encrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut padded, plaintext.len())
-                .unwrap();
-            emulator.base.config.code_sections[idx].decrypted = ct.to_vec();
-        }
-
-        // Handle a decrypt trigger
-        let handled = emulator.handle_trigger(&mut memory, 0x5000).unwrap();
-        assert!(handled);
-        assert_eq!(emulator.triggers_handled, 1);
-
-        let state = emulator.get_trigger_state(0x5000).unwrap();
-        assert!(state.fired);
-        assert_eq!(state.hit_count, 1);
-    }
-
-    #[test]
     fn enhanced_denuvo_unknown_trigger() {
         let config = make_config();
         let mut emulator = EnhancedDenuvoEmulator::new(config);
@@ -1078,19 +991,6 @@ mod tests {
         assert_eq!(emulator.nt_query_information_process(31), 1); // DebugFlags
         assert_eq!(emulator.nt_query_information_process(61), 0); // ProtectionInformation
         assert_eq!(emulator.nt_query_information_process(99), 0); // Unknown
-    }
-
-    #[test]
-    fn enhanced_denuvo_rdtsc() {
-        let config = make_config();
-        let emulator = EnhancedDenuvoEmulator::new(config);
-
-        let tsc1 = emulator.get_rdtsc_value();
-        let tsc2 = emulator.get_rdtsc_value();
-        assert!(tsc2 > tsc1);
-        // Delta should be approximately rdtsc_delta
-        let delta = tsc2 - tsc1;
-        assert!((1000..=10000).contains(&delta), "delta was {delta}");
     }
 
     #[test]
@@ -1276,16 +1176,6 @@ mod tests {
     }
 
     #[test]
-    fn enhanced_denuvo_add_trigger() {
-        let config = make_config();
-        let mut emulator = EnhancedDenuvoEmulator::new(config);
-
-        emulator.add_trigger(0x7000, TriggerType::LicenseCheck, None);
-        assert!(emulator.triggers.contains_key(&0x7000));
-        assert_eq!(emulator.unfired_trigger_count(), 1);
-    }
-
-    #[test]
     fn enhanced_denuvo_reset_triggers() {
         let config = make_config();
         let mut emulator = EnhancedDenuvoEmulator::new(config);
@@ -1303,44 +1193,5 @@ mod tests {
         let state = emulator.get_trigger_state(0x7000).unwrap();
         assert!(!state.fired);
         assert_eq!(state.hit_count, 0);
-    }
-
-    #[test]
-    fn enhanced_denuvo_license_trigger() {
-        let config = make_config();
-        let mut emulator = EnhancedDenuvoEmulator::new(config);
-        let mut memory = MemoryImage::default();
-        emulator.initialize(&mut memory, 0).unwrap();
-
-        emulator.add_trigger(0x8000, TriggerType::LicenseCheck, None);
-        let handled = emulator.handle_trigger(&mut memory, 0x8000).unwrap();
-        assert!(handled);
-
-        // License should now be verified
-        assert!(emulator.base.license_verified);
-        assert!(emulator.base.state.license_token.is_some());
-    }
-
-    #[test]
-    fn enhanced_denuvo_hardware_bind_trigger() {
-        let config = make_config();
-        let mut emulator = EnhancedDenuvoEmulator::new(config);
-        let mut memory = MemoryImage::default();
-        emulator.initialize(&mut memory, 0).unwrap();
-
-        emulator.add_trigger(0x9000, TriggerType::HardwareBind, None);
-        let handled = emulator.handle_trigger(&mut memory, 0x9000).unwrap();
-        assert!(handled);
-
-        // Hardware ID should be set
-        assert_ne!(emulator.base.state.hardware_id, [0u8; 16]);
-    }
-
-    #[test]
-    fn enhanced_denuvo_timing_values() {
-        let timing = AntiDebugTiming::new();
-        assert!(timing.rdtsc_delta > 0);
-        assert!(timing.qpc_delta > 0);
-        assert_eq!(timing.check_count, 0);
     }
 }

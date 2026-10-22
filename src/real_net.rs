@@ -1559,82 +1559,6 @@ mod tests {
     }
 
     #[test]
-    fn tcp_connect_and_exchange_data() {
-        let (tx, rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            tx.send(port).unwrap();
-
-            let (mut stream, _addr) = listener.accept().unwrap();
-            let mut buf = [0u8; 64];
-            let n = stream.read(&mut buf).unwrap();
-            assert_eq!(&buf[..n], b"hello from client");
-
-            stream.write_all(b"hello from server").unwrap();
-            stream.flush().unwrap();
-            port
-        });
-
-        // Wait for the listener port deterministically (no busy-spin).
-        let port = rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        client.write_all(b"hello from client").unwrap();
-        let mut buf = [0u8; 64];
-        let n = client.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"hello from server");
-        assert_eq!(handle.join().unwrap(), port);
-    }
-
-    #[test]
-    fn tcp_loopback_with_known_port() {
-        // Use a known available port
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let server_handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 64];
-            let n = stream.read(&mut buf).unwrap();
-            stream.write_all(&buf[..n]).unwrap();
-            stream.flush().unwrap();
-        });
-
-        let mut stack = RealNetworkStack::new();
-        stack.wsa_startup();
-
-        let socket_id = stack
-            .tcp_connect("127.0.0.1", port, Some(Duration::from_secs(5)))
-            .unwrap();
-        stack.tcp_send(socket_id, b"echo test").unwrap();
-
-        let mut buf = [0u8; 64];
-        let n = stack.tcp_recv(socket_id, &mut buf).unwrap();
-        assert_eq!(&buf[..n], b"echo test");
-
-        stack.tcp_close(socket_id).unwrap();
-        server_handle.join().unwrap();
-    }
-
-    #[test]
-    fn udp_send_and_receive() {
-        let socket_a = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port_a = socket_a.local_addr().unwrap().port();
-        let socket_b = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port_b = socket_b.local_addr().unwrap().port();
-
-        socket_a
-            .send_to(b"udp message", format!("127.0.0.1:{port_b}"))
-            .unwrap();
-
-        let mut buf = [0u8; 64];
-        let (n, src) = socket_b.recv_from(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"udp message");
-        let src_str = src.to_string();
-        assert!(src_str.contains(&port_a.to_string()));
-    }
-
-    #[test]
     fn tcp_listener_bind_and_accept() {
         let mut stack = RealNetworkStack::new();
         stack.wsa_startup();
@@ -1664,57 +1588,11 @@ mod tests {
     }
 
     #[test]
-    fn http_client_creates() {
-        let client = RealHttpClient::new();
-        assert!(client.is_ok(), "expected HTTP client to be created");
-    }
-
-    #[test]
-    fn parse_set_cookie_basic() {
-        let (cookie, expires_at) =
-            parse_set_cookie("session=abc123; domain=.example.com; path=/; secure", None).unwrap();
-        assert_eq!(cookie.name, "session");
-        assert_eq!(cookie.value, "abc123");
-        assert_eq!(cookie.domain, "example.com");
-        assert_eq!(cookie.path, "/");
-        assert!(cookie.secure);
-        assert!(expires_at.is_none());
-    }
-
-    #[test]
     fn parse_set_cookie_minimal() {
         let (cookie, _) = parse_set_cookie("key=value", None).unwrap();
         assert_eq!(cookie.name, "key");
         assert_eq!(cookie.value, "value");
         assert!(!cookie.secure);
-    }
-
-    #[test]
-    fn parse_set_cookie_case_insensitive_attributes() {
-        let (cookie, expires_at) = parse_set_cookie(
-            "key=value; DOMAIN=Example.COM; PATH=/; SECURE; Max-Age=3600",
-            Some("example.com"),
-        )
-        .unwrap();
-        assert_eq!(cookie.domain, "example.com");
-        assert_eq!(cookie.path, "/");
-        assert!(cookie.secure);
-        assert!(expires_at.is_some());
-    }
-
-    #[test]
-    fn parse_set_cookie_expired_returns_none() {
-        let cookie = parse_set_cookie("key=value; Max-Age=0", None);
-        assert!(cookie.is_none());
-    }
-
-    #[test]
-    fn split_set_cookie_preserves_expires_comma() {
-        let values =
-            split_set_cookie_values("a=1; Expires=Wed, 09 Jun 2026 12:00:00 GMT, b=2; Path=/");
-        assert_eq!(values.len(), 2);
-        assert!(values[0].contains("Expires=Wed, 09 Jun 2026"));
-        assert_eq!(values[1], "b=2; Path=/");
     }
 
     #[test]

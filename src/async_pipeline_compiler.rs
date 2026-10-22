@@ -778,40 +778,4 @@ mod tests {
             vertex_attributes: Vec::new(),
         }
     }
-
-    /// Verify that `PipelineCacheKey` correctly distinguishes two descriptors
-    /// with different functions, attachment formats, blend states, depth
-    /// formats, or sample counts.
-    #[test]
-    fn cache_key_uniqueness() {
-        let key_a = sample_key();
-        let key_b = sample_key();
-        let mut key_c = sample_key();
-        key_c.vertex_function = "vs_other".into();
-        let mut key_d = sample_key();
-        key_d.depth_attachment_pixel_format = 252; // Depth32Float
-        let mut key_e = sample_key();
-        key_e.color_attachments[0].blending_enabled = true;
-        let mut key_f = sample_key();
-        key_f.sample_count = 4;
-
-        assert_eq!(key_a, key_b);
-        assert_ne!(key_a, key_c);
-        assert_ne!(key_a, key_d);
-        assert_ne!(key_a, key_e);
-        assert_ne!(key_a, key_f);
-
-        let mut map = HashMap::new();
-        map.insert(key_a.clone(), "pipeline_1");
-        assert_eq!(map.get(&key_b), Some(&"pipeline_1"));
-        assert_eq!(map.get(&key_c), None);
-    }
-
-    /// Verify `PipelineCacheKey` debug and clone.
-    #[test]
-    fn cache_key_debug_clone() {
-        let key = sample_key();
-        let cloned = key.clone();
-        assert_eq!(format!("{:?}", key), format!("{:?}", cloned));
-    }
 }

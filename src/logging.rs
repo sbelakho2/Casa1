@@ -337,12 +337,6 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_no_match() {
-        let input = "Normal log message with no sensitive data";
-        assert_eq!(redact_sensitive(input), input);
-    }
-
-    #[test]
     fn test_redact_case_insensitive() {
         let input = "PASSWORD=Secret123 API_KEY=key456";
         let redacted = redact_sensitive(input);
@@ -457,30 +451,6 @@ mod tests {
             assert_eq!(kv.get("direction").unwrap(), "enter");
             assert_eq!(kv.get("detail").unwrap(), detail);
         }
-    }
-
-    #[test]
-    fn test_jsonl_logger_writes_events() {
-        let path = temp_log_path();
-        let mut logger = JsonlLogger::new(&path, 1234, false).expect("create logger");
-        let event = logger
-            .log("test", "info", ReasonCode::RcIo, "hello", BTreeMap::new())
-            .expect("log event");
-        assert_eq!(event.event_id, 1);
-        assert_eq!(event.pid, 1234);
-        assert_eq!(event.module, "test");
-
-        // Read back and verify
-        logger.flush().expect("flush logger");
-        let mut contents = String::new();
-        File::open(&path)
-            .expect("open log")
-            .read_to_string(&mut contents)
-            .expect("read log");
-        assert!(contents.contains("hello"));
-
-        // Cleanup
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

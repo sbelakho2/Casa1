@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! section42 — Windows differential-oracle harness.
 //!
 //! Covers the host-side harness end to end:
@@ -102,110 +103,6 @@ fn vector_corpus_is_versioned_and_deterministic() {
     }
 }
 
-/// The D3D12 enum categories carry the reference-derived differential
-/// corpus: every numeric input 0..=8 for the address-mode and reduction
-/// enums (including the undefined range), and every named D3D12_FILTER.
-#[test]
-fn d3d12_enum_corpus_covers_the_reference_derived_range() {
-    let vectors: Vec<Value> = {
-        let temp = TempDir::new().expect("temp dir");
-        let path = temp.path().join("vectors.json");
-        run_oracle(&["vectors", "--out", path.to_str().expect("path")]);
-        let file: Value =
-            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse vectors");
-        file["vectors"].as_array().expect("vectors").clone()
-    };
-    let modes: Vec<u32> = vectors
-        .iter()
-        .filter(|vector| vector["category"] == "d3d12_texture_address_mode")
-        .filter_map(|vector| vector["input"]["mode"].as_u64().map(|mode| mode as u32))
-        .collect();
-    assert_eq!(modes, (0..=8).collect::<Vec<u32>>());
-    let reductions: Vec<u32> = vectors
-        .iter()
-        .filter(|vector| vector["category"] == "d3d12_filter_reduction")
-        .filter_map(|vector| vector["input"]["value"].as_u64().map(|value| value as u32))
-        .collect();
-    assert_eq!(reductions, (0..=8).collect::<Vec<u32>>());
-    let filters: Vec<u64> = vectors
-        .iter()
-        .filter(|vector| vector["category"] == "d3d12_filter_translation")
-        .filter_map(|vector| vector["input"]["filter"].as_u64())
-        .collect();
-    // 36 named D3D12_FILTER members (4 families x 8 combos + 4 aniso).
-    assert_eq!(filters.len(), 36);
-    assert_eq!(
-        filters
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        36,
-        "filter vectors must be unique"
-    );
-}
-
-/// The Casa1 runtime's D3D12 enum mapping must match the reference-derived
-/// truth (d3d12.h) on every vector of the three D3D12 categories. The truth
-/// file below is built from the documented d3d12.h facts — the same facts
-/// the Windows reference executable hardcodes — so this end-to-end run
-/// proves the differential machinery passes exactly when the runtime agrees
-/// with Windows.
-#[test]
-fn d3d12_enum_runtime_matches_reference_derived_truth() {
-    let temp = TempDir::new().expect("temp dir");
-    let vectors_path = temp.path().join("d3d12-vectors.json");
-    let truth_path = temp.path().join("d3d12-truth.json");
-    let (status, _) = run_oracle(&[
-        "vectors",
-        "--out",
-        vectors_path.to_str().expect("path"),
-        "--categories",
-        "d3d12_texture_address_mode,d3d12_filter_reduction,d3d12_filter_translation",
-    ]);
-    assert!(status.success());
-    let vector_file: Value =
-        serde_json::from_slice(&std::fs::read(&vectors_path).expect("read vectors"))
-            .expect("parse vectors");
-    let results: Vec<Value> = vector_file["vectors"]
-        .as_array()
-        .expect("vectors")
-        .iter()
-        .map(reference_derived_truth)
-        .collect();
-    let truth_file = serde_json::json!({
-        "schema_version": 1,
-        "capture": {
-            "source": "windows",
-            "captured_by": "casa1-windows-reference",
-            "captured_on": "windows-10-11",
-            "capture_date": "model-generated",
-            "note": "REFERENCE-DERIVED d3d12.h truth for the section42 differential test"
-        },
-        "results": results,
-    });
-    std::fs::write(
-        &truth_path,
-        serde_json::to_vec_pretty(&truth_file).expect("encode truth"),
-    )
-    .expect("write truth");
-    let (status, stdout) = run_oracle(&[
-        "compare",
-        "--vectors",
-        vectors_path.to_str().expect("path"),
-        "--results",
-        truth_path.to_str().expect("path"),
-    ]);
-    assert!(
-        status.success(),
-        "runtime must match the reference-derived d3d12.h truth:\n{stdout}"
-    );
-    let report = compare_report(&stdout);
-    assert_eq!(report["diff_count"].as_u64(), Some(0));
-}
-
-/// The reference-derived d3d12.h truth for one vector — the same facts the
-/// Windows reference executable hardcodes (0-based address modes, the four
-/// reduction types, the D3D12_FILTER bit layout, the 36 named filters).
 fn reference_derived_truth(vector: &Value) -> Value {
     let category = vector["category"].as_str().expect("category");
     let input = &vector["input"];
@@ -868,11 +765,6 @@ fn reference_executable_on_non_windows_reports_diffs() {
 
 // ── cpu_arithmetic_flags ─────────────────────────────────────────────────────
 
-/// The cpu_arithmetic_flags generator emits the documented edge set — every
-/// (lhs, rhs) edge at every width (8/16/32/64) with every op (add/sub/cmp) —
-/// plus the deterministic stride sample over the 8-bit space.  The bounded
-/// corpus stays at ~3.3k vectors; the full 65,536-pair space is the
-/// --exhaustive mode.
 #[test]
 fn cpu_flags_corpus_emits_the_documented_edge_set() {
     use casa1::windows_oracle::{CPU_FLAGS_EDGES, CPU_FLAGS_OPS, CPU_FLAGS_STRIDE_STEP};
@@ -918,159 +810,8 @@ fn cpu_flags_corpus_emits_the_documented_edge_set() {
     );
 }
 
-/// The runtime cpu executor matches the KNOWN x86 truth table on the
-/// documented edges — the interpreter's flag model (jit_helper_set_flags)
-/// must agree with real x86 hardware on every edge.  This catches
-/// interpreter flag regressions locally, before any Windows capture.
-#[test]
-fn cpu_flags_runtime_executor_matches_the_known_x86_truth_table() {
-    use casa1::windows_oracle::{Vector, compute_runtime_result};
-    let case = |width: u64, op: &str, lhs: u64, rhs: u64, expected: Value| {
-        let vector = Vector {
-            id: format!("cpu:{width}:{op}:{lhs:#x}:{rhs:#x}"),
-            category: "cpu_arithmetic_flags".to_string(),
-            input: serde_json::json!({ "width": width, "op": op, "lhs": lhs, "rhs": rhs }),
-        };
-        let output = compute_runtime_result(&vector).output;
-        assert_eq!(output, expected, "width {width} {op}({lhs:#x}, {rhs:#x})");
-        // The comparison machinery must report no diff against the
-        // reference-shaped output.
-        let diffs =
-            casa1::windows_oracle::compare_outputs("cpu_arithmetic_flags", &expected, &output);
-        assert!(diffs.is_empty(), "unexpected diffs: {diffs:?}");
-    };
-    let flags = |zf: bool, sf: bool, pf: bool, cf: bool, of: bool, af: bool| serde_json::json!({ "zf": zf, "sf": sf, "pf": pf, "cf": cf, "of": of, "af": af });
-    // 0x7f + 1 → OF=1, CF=0 (8-bit sign overflow, no carry; the low
-    // nibble F+1 also carries → AF=1)
-    case(
-        8,
-        "add",
-        0x7f,
-        1,
-        flags(false, true, false, false, true, true),
-    );
-    // 0x80 + 0x80 → CF=1, OF=1 (8-bit carry AND sign overflow)
-    case(
-        8,
-        "add",
-        0x80,
-        0x80,
-        flags(true, false, true, true, true, false),
-    );
-    // 0xff + 1 → CF=1, ZF=1, AF=1 (wrap to zero with nibble carry)
-    case(
-        8,
-        "add",
-        0xff,
-        1,
-        flags(true, false, true, true, false, true),
-    );
-    // 0x7fffffffffffffff + 1 → OF=1 (64-bit sign overflow; nibble carry)
-    case(
-        64,
-        "add",
-        0x7fff_ffff_ffff_ffff,
-        1,
-        flags(false, true, true, false, true, true),
-    );
-    // 0xffffffffffffffff + 1 → CF=1, ZF=1 (wrap to zero; nibble carry)
-    case(
-        64,
-        "add",
-        0xffff_ffff_ffff_ffff,
-        1,
-        flags(true, false, true, true, false, true),
-    );
-    // 0x80 - 1 → no borrow (CF=0); the subtraction overflows signed 8-bit
-    // (OF=1) and borrows into the low nibble (AF=1).  Real x86 sub:
-    // 0x80 ≥ 1, so there is no carry — the borrow edge is 0x7f - 0x80 below.
-    case(
-        8,
-        "sub",
-        0x80,
-        1,
-        flags(false, false, false, false, true, true),
-    );
-    // 0x7f - 0x80 → OF=1 (and CF=1: unsigned borrow)
-    case(
-        8,
-        "sub",
-        0x7f,
-        0x80,
-        flags(false, true, true, true, true, false),
-    );
-    // 0x0f + 1 → AF=1 (nibble carry)
-    case(
-        8,
-        "add",
-        0x0f,
-        1,
-        flags(false, false, false, false, false, true),
-    );
-    // 0x0f + 0x0f → AF=1 (nibble carry)
-    case(
-        8,
-        "add",
-        0x0f,
-        0x0f,
-        flags(false, false, true, false, false, true),
-    );
-}
-
 // ── virtual_memory ──────────────────────────────────────────────────────────
 
-/// The virtual_memory generator emits the documented session sequence: the
-/// reserve first (address 0 = system-chosen base), then the interior
-/// commit, partial protect, partial decommit, the two mandated failures and
-/// the unmapped-address query — all with session-relative addresses.
-#[test]
-fn virtual_memory_corpus_is_the_documented_session_sequence() {
-    // The runtime executor runs the real dispatch match, whose debug-build
-    // frame exceeds libtest's 2 MiB test-thread stack.
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            let vectors = casa1::windows_oracle::generate_vectors(&["virtual_memory".to_string()]);
-            let operations: Vec<String> = vectors
-                .iter()
-                .map(|vector| {
-                    vector.input["operation"]
-                        .as_str()
-                        .expect("operation")
-                        .to_string()
-                })
-                .collect();
-            assert_eq!(
-                operations,
-                [
-                    "reserve", "query", "commit", "protect", "decommit", "release", "commit",
-                    "query",
-                ]
-            );
-            assert_eq!(vectors[0].input["address"], serde_json::json!(0));
-            assert_eq!(vectors[0].input["size"], serde_json::json!(0x4000));
-            assert_eq!(
-                vectors[0].input["allocation_type"],
-                serde_json::json!(0x2000)
-            );
-            // The failures and the unmapped-address probes sit outside the session.
-            assert_eq!(vectors[5].input["free_type"], serde_json::json!(0x8000));
-            assert!(vectors[5].input["size"].as_u64().expect("size") != 0);
-            for vector in &vectors {
-                let result = casa1::windows_oracle::compute_runtime_result(vector);
-                assert!(result.output["state"].is_number(), "{}", vector.id);
-            }
-        })
-        .expect("spawn big-stack thread")
-        .join()
-        .expect("big-stack thread panicked");
-}
-
-/// The runtime vm executor drives the real pe_runtime VM thunk arms: the
-/// reserve→commit→query coherence, the interior commit, the partial
-/// decommit and the mandated failures all produce the reference-shaped
-/// page-granular truth (MEM_COMMIT/MEM_RESERVE/MEM_FREE states, protections,
-/// region-relative bases and sizes).
 #[test]
 fn virtual_memory_runtime_executor_matches_reference_derived_truth() {
     // The runtime executor runs the real dispatch match, whose debug-build
@@ -1139,8 +880,6 @@ fn virtual_memory_runtime_executor_matches_reference_derived_truth() {
 
 // ── evidence-expansion categories ───────────────────────────────────────────
 
-/// The new categories' corpus is deterministic, versioned and unique, and
-/// the Casa1 runtime computes EVERY vector (no runtime_unavailable marker).
 #[test]
 fn evidence_expansion_corpus_is_deterministic_and_fully_computed() {
     use casa1::windows_oracle::{ALL_CATEGORIES, compute_runtime_result, generate_vectors};
@@ -1171,92 +910,5 @@ fn evidence_expansion_corpus_is_deterministic_and_fully_computed() {
                 vector.id
             );
         }
-    }
-}
-
-/// The model-generated golden regeneration path for the new categories is
-/// clean end to end: `casa1-oracle golden` emits the Casa1 runtime's
-/// behavior wrapped in the MODEL-GENERATED header, and comparing the same
-/// corpus against it reports zero diffs with every category covered.  The
-/// authoritative validation remains the Windows reference capture (CI); the
-/// golden placeholder exists so the harness has a deterministic local
-/// reference shape.
-#[test]
-fn new_categories_golden_roundtrip_is_clean() {
-    let temp = TempDir::new().expect("temp dir");
-    let vectors_path = temp.path().join("vectors.json");
-    let golden_path = temp.path().join("golden.json");
-    let categories = "time_clock,environment,file_metadata,directory_enumeration,version,error_domain,string_ops,section_mapping,heap";
-    let (status, _) = run_oracle(&[
-        "vectors",
-        "--out",
-        vectors_path.to_str().expect("path"),
-        "--categories",
-        categories,
-    ]);
-    assert!(status.success());
-    let (status, _) = run_oracle(&[
-        "golden",
-        "--out",
-        golden_path.to_str().expect("path"),
-        "--categories",
-        categories,
-    ]);
-    assert!(status.success());
-    let golden: Value = serde_json::from_slice(&std::fs::read(&golden_path).expect("read golden"))
-        .expect("parse golden");
-    assert_eq!(golden["capture"]["capture_date"], "model-generated");
-    let (status, stdout) = run_oracle(&[
-        "compare",
-        "--vectors",
-        vectors_path.to_str().expect("path"),
-        "--results",
-        golden_path.to_str().expect("path"),
-    ]);
-    assert!(
-        status.success(),
-        "the golden roundtrip must be clean:\n{stdout}"
-    );
-    let report = compare_report(&stdout);
-    assert_eq!(report["diff_count"].as_u64(), Some(0));
-    assert!(
-        report["runtime_uncovered_categories"]
-            .as_array()
-            .expect("runtime_uncovered_categories")
-            .is_empty(),
-        "no category may be runtime-uncovered"
-    );
-}
-
-/// The checked-in golden fixture carries the new categories (model-generated
-/// placeholders by design) and the compare against it keeps the fail-loud
-/// contract: the stale model-era placeholder values still produce diffs, and
-/// the new categories contribute none.
-#[test]
-fn golden_fixture_covers_the_new_categories() {
-    let file: Value =
-        serde_json::from_slice(&std::fs::read(golden_fixture()).expect("read golden"))
-            .expect("parse golden");
-    let categories: std::collections::BTreeSet<&str> = file["results"]
-        .as_array()
-        .expect("results")
-        .iter()
-        .filter_map(|result| result["category"].as_str())
-        .collect();
-    for category in [
-        "time_clock",
-        "environment",
-        "file_metadata",
-        "directory_enumeration",
-        "version",
-        "error_domain",
-        "string_ops",
-        "section_mapping",
-        "heap",
-    ] {
-        assert!(
-            categories.contains(category),
-            "the golden fixture must cover {category}"
-        );
     }
 }

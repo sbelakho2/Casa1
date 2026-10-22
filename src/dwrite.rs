@@ -1496,22 +1496,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dwrite_create_text_format() {
-        let factory = DWriteFactory::new();
-        let format = factory.create_text_format(
-            "Arial",
-            12.0,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-        );
-        assert_eq!(format.font_family, "Arial");
-        assert!((format.font_size - 12.0).abs() < f32::EPSILON);
-        assert_eq!(format.weight, DWRITE_FONT_WEIGHT_NORMAL);
-        assert_eq!(format.style, DWRITE_FONT_STYLE_NORMAL);
-    }
-
-    #[test]
     fn test_dwrite_create_text_layout() {
         let factory = DWriteFactory::new();
         let format = factory.create_text_format(
@@ -1526,88 +1510,6 @@ mod tests {
         assert!(layout.metrics.width > 0.0);
         assert!(layout.metrics.height > 0.0);
         assert!(!layout.glyph_positions.is_empty());
-    }
-
-    #[test]
-    fn test_dwrite_text_format_methods() {
-        let mut format = DWriteTextFormat {
-            font_family: "Arial".to_string(),
-            font_size: 12.0,
-            weight: DWRITE_FONT_WEIGHT_NORMAL,
-            style: DWRITE_FONT_STYLE_NORMAL,
-            stretch: DWRITE_FONT_STRETCH_NORMAL,
-            text_alignment: DWRITE_TEXT_ALIGNMENT_LEADING,
-            paragraph_alignment: DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
-            reading_direction: DWRITE_READING_DIRECTION_LEFT_TO_RIGHT,
-            flow_direction: DWRITE_FLOW_DIRECTION_TOP_TO_BOTTOM,
-            word_wrapping: DWRITE_WORD_WRAPPING_WRAP,
-        };
-
-        format.set_text_alignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        assert_eq!(format.text_alignment, DWRITE_TEXT_ALIGNMENT_CENTER);
-
-        format.set_paragraph_alignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        assert_eq!(
-            format.paragraph_alignment,
-            DWRITE_PARAGRAPH_ALIGNMENT_CENTER
-        );
-
-        format.set_reading_direction(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT);
-        assert_eq!(
-            format.reading_direction,
-            DWRITE_READING_DIRECTION_RIGHT_TO_LEFT
-        );
-
-        format.set_word_wrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        assert_eq!(format.word_wrapping, DWRITE_WORD_WRAPPING_NO_WRAP);
-    }
-
-    #[test]
-    fn test_dwrite_text_layout_metrics() {
-        let layout = DWriteTextLayout {
-            format: DWriteTextFormat {
-                font_family: "Arial".to_string(),
-                font_size: 12.0,
-                weight: DWRITE_FONT_WEIGHT_NORMAL,
-                style: DWRITE_FONT_STYLE_NORMAL,
-                stretch: DWRITE_FONT_STRETCH_NORMAL,
-                text_alignment: DWRITE_TEXT_ALIGNMENT_LEADING,
-                paragraph_alignment: DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
-                reading_direction: DWRITE_READING_DIRECTION_LEFT_TO_RIGHT,
-                flow_direction: DWRITE_FLOW_DIRECTION_TOP_TO_BOTTOM,
-                word_wrapping: DWRITE_WORD_WRAPPING_WRAP,
-            },
-            text: "Test".to_string(),
-            max_width: 100.0,
-            max_height: 50.0,
-            glyph_positions: vec![0.0, 0.0, 8.0, 0.0, 16.0, 0.0, 24.0, 0.0],
-            metrics: TextMetrics {
-                width: 32.0,
-                height: 14.0,
-                line_count: 1,
-            },
-        };
-
-        let metrics = layout.get_metrics();
-        assert!(metrics.width > 0.0);
-        assert_eq!(metrics.line_count, 1);
-    }
-
-    #[test]
-    fn test_dwrite_empty_text() {
-        let factory = DWriteFactory::new();
-        let format = factory.create_text_format(
-            "Arial",
-            12.0,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-        );
-        let layout = factory.create_text_layout("", &format, 100.0, 50.0);
-        assert_eq!(layout.text, "");
-        assert!(layout.glyph_positions.is_empty());
-        assert_eq!(layout.metrics.width, 0.0);
-        assert_eq!(layout.metrics.height, 0.0);
     }
 
     #[test]

@@ -178,6 +178,7 @@ struct SqlSelectItem {
 struct SqlTableRef {
     table: String,
     alias: Option<String>,
+    derived: Option<Box<MsiQuery>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,10 +261,51 @@ enum SqlExpr {
         negated: bool,
     },
     ScalarQuery(Box<MsiQuery>),
+    Exists {
+        query: Box<MsiQuery>,
+        negated: bool,
+    },
+    Unary {
+        op: SqlUnaryOp,
+        value: Box<SqlExpr>,
+    },
+    Binary {
+        op: SqlBinaryOp,
+        left: Box<SqlExpr>,
+        right: Box<SqlExpr>,
+    },
+    Function {
+        function: SqlFunction,
+        arguments: Vec<SqlExpr>,
+    },
     Aggregate {
         function: SqlAggregate,
         argument: Option<Box<SqlExpr>>,
+        distinct: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlUnaryOp {
+    Negate,
+    Plus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlBinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlFunction {
+    Upper,
+    Lower,
+    Length,
+    Substring,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +358,8 @@ struct MsiQuery {
 struct ResolvedTable {
     name: String,
     alias: Option<String>,
+    columns: Vec<MsiColumn>,
+    derived: Option<Box<ResolvedQuery>>,
 }
 
 /// One projected output column and its label/type for `MsiViewGetColumnInfo`.
@@ -402,9 +446,33 @@ enum ResolvedExpr {
         negated: bool,
     },
     ScalarQuery(Box<ResolvedQuery>),
+    OuterColumn {
+        level: usize,
+        table: usize,
+        column: usize,
+        kind: SqlColumnKind,
+    },
+    Exists {
+        query: Box<ResolvedQuery>,
+        negated: bool,
+    },
+    Unary {
+        op: SqlUnaryOp,
+        value: Box<ResolvedExpr>,
+    },
+    Binary {
+        op: SqlBinaryOp,
+        left: Box<ResolvedExpr>,
+        right: Box<ResolvedExpr>,
+    },
+    Function {
+        function: SqlFunction,
+        arguments: Vec<ResolvedExpr>,
+    },
     Aggregate {
         function: SqlAggregate,
         argument: Option<Box<ResolvedExpr>>,
+        distinct: bool,
     },
 }
 
@@ -901,6 +969,17 @@ impl CompoundFile {
     pub(crate) fn entry_at(&self, path: &str) -> Option<&CompoundEntry> {
         self.entry_index_at(path)
             .and_then(|index| self.entries.get(index))
+    }
+
+    /// Resolve `path` to a storage entry (the root or a child storage).
+    pub(crate) fn storage_at(&self, path: &str) -> Option<&CompoundEntry> {
+        self.entry_at(path)
+            .filter(|entry| entry.kind == 1 || entry.kind == 5)
+    }
+
+    /// Resolve `path` to a stream entry.
+    pub(crate) fn stream_entry_at(&self, path: &str) -> Option<&CompoundEntry> {
+        self.entry_at(path).filter(|entry| entry.kind == 2)
     }
 
     /// The direct children of a storage (streams and child storages).
@@ -1489,6 +1568,56 @@ impl PeHostRuntime {
         ERROR_SUCCESS
     }
 
+    fn modify_target_index(query: &ResolvedQuery) -> Option<usize> {
+        if query.tables.len() == 1 {
+            return query
+                .tables
+                .first()
+                .filter(|table| table.derived.is_none())
+                .map(|_| 0);
+        }
+        let mut target = None;
+        for column in &query.columns {
+            if column.expression.is_some() {
+                continue;
+            }
+            match target {
+                None => target = Some(column.table),
+                Some(existing) if existing == column.table => {}
+                Some(_) => return None,
+            }
+        }
+        target.filter(|index| {
+            query
+                .tables
+                .get(*index)
+                .is_some_and(|table| table.derived.is_none())
+        })
+    }
+
+    fn remap_modify_record(query: &ResolvedQuery, target: usize, record: &MsiRecord) -> MsiRecord {
+        let width = query
+            .tables
+            .get(target)
+            .map_or(0, |table| table.columns.len());
+        let mut remapped = MsiRecord::new(width);
+        if let Some(selected) = record.fields.first() {
+            remapped.fields[0] = selected.clone();
+        }
+        for (slot, column) in query.columns.iter().enumerate() {
+            if column.expression.is_some() || column.table != target {
+                continue;
+            }
+            let Some(value) = record.fields.get(slot + 1) else {
+                continue;
+            };
+            if let Some(field) = remapped.fields.get_mut(column.column + 1) {
+                *field = value.clone();
+            }
+        }
+        remapped
+    }
+
     fn msi_fetch(&mut self, handle: u64, memory: &mut MemoryImage) -> (u32, u64) {
         let Some(view) = self.msi_views.get(&handle) else {
             return (ERROR_INVALID_HANDLE, 0);
@@ -1499,16 +1628,12 @@ impl PeHostRuntime {
         let query = view.query.clone();
         let row = view.rows[view.next].clone();
         let mut record = MsiRecord::new(query.columns.len());
-        record.fields[0] = MsiValue::Int(if query.tables.len() == 1 {
-            row.source
-                .first()
-                .copied()
-                .flatten()
+        record.fields[0] = MsiValue::Int(
+            Self::modify_target_index(&query)
+                .and_then(|table| row.source.get(table).copied().flatten())
                 .map(|index| index as i32 + 1)
-                .unwrap_or(0)
-        } else {
-            0
-        });
+                .unwrap_or(0),
+        );
         for (slot, value) in row.values.iter().enumerate() {
             record.fields[slot + 1] = value.clone();
         }
@@ -1588,10 +1713,11 @@ impl PeHostRuntime {
         let Some(record) = self.msi_records.get(&record_handle).cloned() else {
             return ERROR_INVALID_HANDLE;
         };
-        let base_table = if view.query.tables.len() == 1 {
-            Some(view.query.tables[0].name.clone())
-        } else {
-            None
+        let target_index = Self::modify_target_index(&view.query);
+        let base_table = target_index.map(|index| view.query.tables[index].name.clone());
+        let record = match target_index {
+            Some(target) => Self::remap_modify_record(&view.query, target, &record),
+            None => record,
         };
         let result = match mode {
             1 => match &base_table {
@@ -1625,13 +1751,20 @@ impl PeHostRuntime {
                 None => ERROR_FUNCTION_FAILED,
             },
             7 => {
-                return self.msi_seek_view(handle, &view, base_table.as_deref(), &record);
+                return self.msi_seek_view(
+                    handle,
+                    &view,
+                    base_table.as_deref(),
+                    target_index,
+                    &record,
+                );
             }
             8 => {
                 return self.msi_refresh_view(
                     handle,
                     &view,
                     base_table.as_deref(),
+                    target_index,
                     record_handle,
                     &record,
                 );
@@ -1656,9 +1789,10 @@ impl PeHostRuntime {
         handle: u64,
         view: &MsiViewState,
         base_table: Option<&str>,
+        target_index: Option<usize>,
         record: &MsiRecord,
     ) -> u32 {
-        let Some(name) = base_table else {
+        let (Some(name), Some(target_index)) = (base_table, target_index) else {
             return ERROR_FUNCTION_FAILED;
         };
         let Some(database) = self.msi_databases.get(&view.db) else {
@@ -1697,7 +1831,7 @@ impl PeHostRuntime {
         let Some(position) = view
             .rows
             .iter()
-            .position(|row| row.source.len() == 1 && row.source[0] == Some(row_index))
+            .position(|row| row.source.get(target_index).copied().flatten() == Some(row_index))
         else {
             return ERROR_NO_MORE_ITEMS;
         };
@@ -1714,10 +1848,11 @@ impl PeHostRuntime {
         handle: u64,
         view: &MsiViewState,
         base_table: Option<&str>,
+        target_index: Option<usize>,
         record_handle: u64,
         record: &MsiRecord,
     ) -> u32 {
-        let Some(name) = base_table else {
+        let (Some(name), Some(target_index)) = (base_table, target_index) else {
             return ERROR_FUNCTION_FAILED;
         };
         let Some(row_number) = record_int(record, 0) else {
@@ -1736,19 +1871,45 @@ impl PeHostRuntime {
         if row_index >= table.rows.len() {
             return ERROR_FUNCTION_FAILED;
         }
-        let source = vec![Some(row_index)];
-        if let Some(filter) = &view.query.filter {
-            if !eval_expr(database, &view.query, &source, &view.bound, None, filter) {
-                return ERROR_NO_MORE_ITEMS;
-            }
-        }
-        let values = project_row(database, &view.query, &source, &view.bound, None);
         let Some(position) = view
             .rows
             .iter()
-            .position(|row| row.source.len() == 1 && row.source[0] == Some(row_index))
+            .position(|row| row.source.get(target_index).copied().flatten() == Some(row_index))
         else {
             return ERROR_NO_MORE_ITEMS;
+        };
+        let source = view.rows[position].source.clone();
+        let derived = match materialize_derived(database, &view.query, &view.bound) {
+            Ok(derived) => derived,
+            Err(code) => return code,
+        };
+        if let Some(filter) = &view.query.filter {
+            match eval_expr(
+                database,
+                &view.query,
+                &source,
+                &view.bound,
+                None,
+                filter,
+                &derived,
+                &[],
+            ) {
+                Ok(true) => {}
+                Ok(false) => return ERROR_NO_MORE_ITEMS,
+                Err(code) => return code,
+            }
+        }
+        let values = match project_row(
+            database,
+            &view.query,
+            &source,
+            &view.bound,
+            None,
+            &derived,
+            &[],
+        ) {
+            Ok(values) => values,
+            Err(code) => return code,
         };
         if let Some(view) = self.msi_views.get_mut(&handle) {
             view.rows[position].values = values.clone();
@@ -1944,21 +2105,19 @@ fn sql_lower(ch: char) -> char {
     if ch.is_ascii() {
         ch.to_ascii_lowercase()
     } else {
-        ch
+        ch.to_lowercase().next().unwrap_or(ch)
     }
 }
 
 fn sql_string_cmp(left: &str, right: &str) -> std::cmp::Ordering {
-    left.chars()
-        .map(sql_lower)
-        .cmp(right.chars().map(sql_lower))
+    left.to_lowercase().cmp(&right.to_lowercase())
 }
 
 fn msi_value_equal(left: &MsiValue, right: &MsiValue) -> bool {
     match (left, right) {
         (MsiValue::Null, MsiValue::Null) => true,
         (MsiValue::Int(left), MsiValue::Int(right)) => left == right,
-        (MsiValue::Str(left), MsiValue::Str(right)) => left.eq_ignore_ascii_case(right),
+        (MsiValue::Str(left), MsiValue::Str(right)) => sql_string_cmp(left, right).is_eq(),
         (MsiValue::Stream(left), MsiValue::Stream(right)) => left == right,
         _ => false,
     }
@@ -1981,9 +2140,17 @@ fn compare_msi_values(left: &MsiValue, op: SqlCompareOp, right: &MsiValue) -> bo
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OuterFrame<'a> {
+    tables: &'a [ResolvedTable],
+    derived: &'a [Option<Vec<Vec<MsiValue>>>],
+    source: &'a [Option<usize>],
+}
+
 fn source_value(
     database: &MsiDatabaseState,
     tables: &[ResolvedTable],
+    derived: &[Option<Vec<Vec<MsiValue>>>],
     source: &[Option<usize>],
     table: usize,
     column: usize,
@@ -1994,6 +2161,15 @@ fn source_value(
     let Some(meta) = tables.get(table) else {
         return MsiValue::Null;
     };
+    if meta.derived.is_some() {
+        return derived
+            .get(table)
+            .and_then(|rows| rows.as_ref())
+            .and_then(|rows| rows.get(*row_index))
+            .and_then(|row| row.get(column))
+            .cloned()
+            .unwrap_or(MsiValue::Null);
+    }
     let Some(table) = database.table(&meta.name) else {
         return MsiValue::Null;
     };
@@ -2005,6 +2181,25 @@ fn source_value(
         .unwrap_or(MsiValue::Null)
 }
 
+fn table_row_count(
+    database: &MsiDatabaseState,
+    query: &ResolvedQuery,
+    derived: &[Option<Vec<Vec<MsiValue>>>],
+    table: usize,
+) -> Result<usize, u32> {
+    let meta = query.tables.get(table).ok_or(ERROR_BAD_QUERY_SYNTAX)?;
+    if meta.derived.is_some() {
+        return Ok(derived
+            .get(table)
+            .and_then(|rows| rows.as_ref())
+            .map_or(0, Vec::len));
+    }
+    database
+        .table(&meta.name)
+        .map(|table| table.rows.len())
+        .ok_or(ERROR_INVALID_TABLE)
+}
+
 fn eval_aggregate(
     database: &MsiDatabaseState,
     query: &ResolvedQuery,
@@ -2012,55 +2207,87 @@ fn eval_aggregate(
     group: Option<&[Vec<Option<usize>>]>,
     function: SqlAggregate,
     argument: Option<&ResolvedExpr>,
-) -> MsiValue {
+    distinct: bool,
+    derived: &[Option<Vec<Vec<MsiValue>>>],
+    outer: &[OuterFrame<'_>],
+) -> Result<MsiValue, u32> {
     let Some(group) = group else {
-        return MsiValue::Null;
+        return Ok(MsiValue::Null);
     };
     match function {
         SqlAggregate::Count => {
             let Some(argument) = argument else {
-                return MsiValue::Int(group.len() as i32);
+                return Ok(MsiValue::Int(group.len() as i32));
             };
-            let count = group
-                .iter()
-                .filter(|source| {
-                    !matches!(
-                        eval_value(database, query, source, parameters, None, argument),
-                        MsiValue::Null
-                    )
-                })
-                .count();
-            MsiValue::Int(count as i32)
+            let mut count = 0i64;
+            let mut seen: Vec<MsiValue> = Vec::new();
+            for source in group {
+                let value = eval_value(
+                    database, query, source, parameters, None, argument, derived, outer,
+                )?;
+                if matches!(value, MsiValue::Null) {
+                    continue;
+                }
+                if distinct
+                    && seen
+                        .iter()
+                        .any(|existing| msi_value_equal(existing, &value))
+                {
+                    continue;
+                }
+                if distinct {
+                    seen.push(value);
+                }
+                count += 1;
+            }
+            Ok(MsiValue::Int(count as i32))
         }
         SqlAggregate::Sum | SqlAggregate::Average => {
             let Some(argument) = argument else {
-                return MsiValue::Null;
+                return Ok(MsiValue::Null);
             };
             let mut total = 0i64;
             let mut count = 0i64;
+            let mut seen: Vec<MsiValue> = Vec::new();
             for source in group {
-                if let MsiValue::Int(number) =
-                    eval_value(database, query, source, parameters, None, argument)
-                {
-                    total += i64::from(number);
-                    count += 1;
+                let value = eval_value(
+                    database, query, source, parameters, None, argument, derived, outer,
+                )?;
+                let MsiValue::Int(number) = value else {
+                    continue;
+                };
+                if distinct {
+                    let value = MsiValue::Int(number);
+                    if seen
+                        .iter()
+                        .any(|existing| msi_value_equal(existing, &value))
+                    {
+                        continue;
+                    }
+                    seen.push(value);
                 }
+                total += i64::from(number);
+                count += 1;
             }
             if count == 0 {
-                return MsiValue::Null;
+                return Ok(MsiValue::Null);
             }
             if function == SqlAggregate::Average {
                 total /= count;
             }
-            MsiValue::Int(total.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+            Ok(MsiValue::Int(
+                total.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            ))
         }
         SqlAggregate::Min | SqlAggregate::Max => {
             let Some(argument) = argument else {
-                return MsiValue::Null;
+                return Ok(MsiValue::Null);
             };
             let mut best: Option<MsiValue> = None;
             for source in group {
-                let value = eval_value(database, query, source, parameters, None, argument);
+                let value = eval_value(
+                    database, query, source, parameters, None, argument, derived, outer,
+                )?;
                 if matches!(value, MsiValue::Null) {
                     continue;
                 }
@@ -2079,7 +2306,76 @@ fn eval_aggregate(
                     best = Some(value);
                 }
             }
-            best.unwrap_or(MsiValue::Null)
+            Ok(best.unwrap_or(MsiValue::Null))
+        }
+    }
+}
+
+fn eval_binary(op: SqlBinaryOp, left: MsiValue, right: MsiValue) -> Result<MsiValue, u32> {
+    let (MsiValue::Int(left), MsiValue::Int(right)) = (left, right) else {
+        return Ok(MsiValue::Null);
+    };
+    let left = i64::from(left);
+    let right = i64::from(right);
+    let value = match op {
+        SqlBinaryOp::Add => left + right,
+        SqlBinaryOp::Subtract => left - right,
+        SqlBinaryOp::Multiply => left * right,
+        SqlBinaryOp::Divide => {
+            if right == 0 {
+                return Err(ERROR_FUNCTION_FAILED);
+            }
+            left / right
+        }
+        SqlBinaryOp::Modulo => {
+            if right == 0 {
+                return Err(ERROR_FUNCTION_FAILED);
+            }
+            left % right
+        }
+    };
+    Ok(MsiValue::Int(
+        value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+    ))
+}
+
+fn eval_function(function: SqlFunction, arguments: Vec<MsiValue>) -> Result<MsiValue, u32> {
+    match function {
+        SqlFunction::Upper => {
+            let value = arguments.into_iter().next().unwrap_or(MsiValue::Null);
+            let MsiValue::Str(text) = value else {
+                return Ok(MsiValue::Null);
+            };
+            Ok(MsiValue::Str(text.to_uppercase()))
+        }
+        SqlFunction::Lower => {
+            let value = arguments.into_iter().next().unwrap_or(MsiValue::Null);
+            let MsiValue::Str(text) = value else {
+                return Ok(MsiValue::Null);
+            };
+            Ok(MsiValue::Str(text.to_lowercase()))
+        }
+        SqlFunction::Length => {
+            let value = arguments.into_iter().next().unwrap_or(MsiValue::Null);
+            let MsiValue::Str(text) = value else {
+                return Ok(MsiValue::Null);
+            };
+            Ok(MsiValue::Int(text.chars().count() as i32))
+        }
+        SqlFunction::Substring => {
+            if arguments.len() != 3 {
+                return Ok(MsiValue::Null);
+            }
+            let (MsiValue::Str(text), MsiValue::Int(start), MsiValue::Int(length)) =
+                (&arguments[0], &arguments[1], &arguments[2])
+            else {
+                return Ok(MsiValue::Null);
+            };
+            let start = (*start).max(1) as usize - 1;
+            let length = (*length).max(0) as usize;
+            Ok(MsiValue::Str(
+                text.chars().skip(start).take(length).collect(),
+            ))
         }
     }
 }
@@ -2091,27 +2387,127 @@ fn eval_value(
     parameters: &[MsiValue],
     group: Option<&[Vec<Option<usize>>]>,
     expression: &ResolvedExpr,
-) -> MsiValue {
+    derived: &[Option<Vec<Vec<MsiValue>>>],
+    outer: &[OuterFrame<'_>],
+) -> Result<MsiValue, u32> {
     match expression {
-        ResolvedExpr::Column { table, column } => {
-            source_value(database, &query.tables, source, *table, *column)
+        ResolvedExpr::Column { table, column } => Ok(source_value(
+            database,
+            &query.tables,
+            derived,
+            source,
+            *table,
+            *column,
+        )),
+        ResolvedExpr::OuterColumn {
+            level,
+            table,
+            column,
+            ..
+        } => {
+            let Some(frame) = outer.get(level.saturating_sub(1)) else {
+                return Ok(MsiValue::Null);
+            };
+            Ok(source_value(
+                database,
+                frame.tables,
+                frame.derived,
+                frame.source,
+                *table,
+                *column,
+            ))
         }
-        ResolvedExpr::Literal(value) => value.clone(),
-        ResolvedExpr::Parameter(index) => parameters.get(*index).cloned().unwrap_or(MsiValue::Null),
-        ResolvedExpr::Aggregate { function, argument } => eval_aggregate(
+        ResolvedExpr::Literal(value) => Ok(value.clone()),
+        ResolvedExpr::Parameter(index) => {
+            Ok(parameters.get(*index).cloned().unwrap_or(MsiValue::Null))
+        }
+        ResolvedExpr::Aggregate {
+            function,
+            argument,
+            distinct,
+        } => eval_aggregate(
             database,
             query,
             parameters,
             group,
             *function,
             argument.as_deref(),
+            *distinct,
+            derived,
+            outer,
         ),
-        ResolvedExpr::ScalarQuery(subquery) => execute_query(database, subquery, parameters)
-            .ok()
-            .and_then(|rows| rows.into_iter().next())
-            .and_then(|row| row.values.into_iter().next())
-            .unwrap_or(MsiValue::Null),
-        _ => MsiValue::Null,
+        ResolvedExpr::ScalarQuery(subquery) => {
+            let mut nested: Vec<OuterFrame<'_>> = Vec::with_capacity(outer.len() + 1);
+            nested.push(OuterFrame {
+                tables: &query.tables,
+                derived,
+                source,
+            });
+            nested.extend_from_slice(outer);
+            let rows = execute_query_with_outer(database, subquery, parameters, &nested)?;
+            if rows.len() > 1 {
+                return Err(ERROR_FUNCTION_FAILED);
+            }
+            Ok(rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.values.into_iter().next())
+                .unwrap_or(MsiValue::Null))
+        }
+        ResolvedExpr::Exists {
+            query: subquery,
+            negated,
+        } => {
+            let mut nested: Vec<OuterFrame<'_>> = Vec::with_capacity(outer.len() + 1);
+            nested.push(OuterFrame {
+                tables: &query.tables,
+                derived,
+                source,
+            });
+            nested.extend_from_slice(outer);
+            let rows = execute_query_with_outer(database, subquery, parameters, &nested)?;
+            let found = !rows.is_empty();
+            Ok(MsiValue::Int(i32::from(if *negated {
+                !found
+            } else {
+                found
+            })))
+        }
+        ResolvedExpr::Unary { op, value } => {
+            let value = eval_value(
+                database, query, source, parameters, group, value, derived, outer,
+            )?;
+            match (op, value) {
+                (_, MsiValue::Null) => Ok(MsiValue::Null),
+                (SqlUnaryOp::Plus, value @ MsiValue::Int(_)) => Ok(value),
+                (SqlUnaryOp::Negate, MsiValue::Int(number)) => Ok(MsiValue::Int(
+                    (-i64::from(number)).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                )),
+                _ => Ok(MsiValue::Null),
+            }
+        }
+        ResolvedExpr::Binary { op, left, right } => {
+            let left = eval_value(
+                database, query, source, parameters, group, left, derived, outer,
+            )?;
+            let right = eval_value(
+                database, query, source, parameters, group, right, derived, outer,
+            )?;
+            eval_binary(*op, left, right)
+        }
+        ResolvedExpr::Function {
+            function,
+            arguments,
+        } => {
+            let mut values = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                values.push(eval_value(
+                    database, query, source, parameters, group, argument, derived, outer,
+                )?);
+            }
+            eval_function(*function, values)
+        }
+        _ => Ok(MsiValue::Null),
     }
 }
 
@@ -2147,7 +2543,7 @@ fn like_match(text: &str, pattern: &str, escape: Option<char>) -> bool {
             '[' => {
                 let mut index = 0;
                 let mut negated = false;
-                if rest.first() == Some(&'^') {
+                if matches!(rest.first(), Some('^') | Some('!')) {
                     negated = true;
                     index += 1;
                 }
@@ -2201,28 +2597,40 @@ fn eval_expr(
     parameters: &[MsiValue],
     group: Option<&[Vec<Option<usize>>]>,
     expression: &ResolvedExpr,
-) -> bool {
+    derived: &[Option<Vec<Vec<MsiValue>>>],
+    outer: &[OuterFrame<'_>],
+) -> Result<bool, u32> {
     match expression {
-        ResolvedExpr::And(left, right) => {
-            eval_expr(database, query, source, parameters, group, left)
-                && eval_expr(database, query, source, parameters, group, right)
-        }
-        ResolvedExpr::Or(left, right) => {
-            eval_expr(database, query, source, parameters, group, left)
-                || eval_expr(database, query, source, parameters, group, right)
-        }
-        ResolvedExpr::Not(inner) => !eval_expr(database, query, source, parameters, group, inner),
-        ResolvedExpr::Compare { left, op, right } => compare_msi_values(
-            &eval_value(database, query, source, parameters, group, left),
+        ResolvedExpr::And(left, right) => Ok(eval_expr(
+            database, query, source, parameters, group, left, derived, outer,
+        )? && eval_expr(
+            database, query, source, parameters, group, right, derived, outer,
+        )?),
+        ResolvedExpr::Or(left, right) => Ok(eval_expr(
+            database, query, source, parameters, group, left, derived, outer,
+        )? || eval_expr(
+            database, query, source, parameters, group, right, derived, outer,
+        )?),
+        ResolvedExpr::Not(inner) => Ok(!eval_expr(
+            database, query, source, parameters, group, inner, derived, outer,
+        )?),
+        ResolvedExpr::Compare { left, op, right } => Ok(compare_msi_values(
+            &eval_value(
+                database, query, source, parameters, group, left, derived, outer,
+            )?,
             *op,
-            &eval_value(database, query, source, parameters, group, right),
-        ),
+            &eval_value(
+                database, query, source, parameters, group, right, derived, outer,
+            )?,
+        )),
         ResolvedExpr::IsNull { value, negated } => {
             let is_null = matches!(
-                eval_value(database, query, source, parameters, group, value),
+                eval_value(
+                    database, query, source, parameters, group, value, derived, outer,
+                )?,
                 MsiValue::Null
             );
-            if *negated { !is_null } else { is_null }
+            Ok(if *negated { !is_null } else { is_null })
         }
         ResolvedExpr::Like {
             value,
@@ -2230,13 +2638,17 @@ fn eval_expr(
             escape,
             negated,
         } => {
-            let value = eval_value(database, query, source, parameters, group, value);
-            let pattern = eval_value(database, query, source, parameters, group, pattern);
+            let value = eval_value(
+                database, query, source, parameters, group, value, derived, outer,
+            )?;
+            let pattern = eval_value(
+                database, query, source, parameters, group, pattern, derived, outer,
+            )?;
             let (MsiValue::Str(text), MsiValue::Str(pattern)) = (value, pattern) else {
-                return false;
+                return Ok(false);
             };
             let matched = like_match(&text, &pattern, *escape);
-            if *negated { !matched } else { matched }
+            Ok(if *negated { !matched } else { matched })
         }
         ResolvedExpr::Between {
             value,
@@ -2244,52 +2656,69 @@ fn eval_expr(
             high,
             negated,
         } => {
-            let value = eval_value(database, query, source, parameters, group, value);
-            let low = eval_value(database, query, source, parameters, group, low);
-            let high = eval_value(database, query, source, parameters, group, high);
+            let value = eval_value(
+                database, query, source, parameters, group, value, derived, outer,
+            )?;
+            let low = eval_value(
+                database, query, source, parameters, group, low, derived, outer,
+            )?;
+            let high = eval_value(
+                database, query, source, parameters, group, high, derived, outer,
+            )?;
             if matches!(value, MsiValue::Null)
                 || matches!(low, MsiValue::Null)
                 || matches!(high, MsiValue::Null)
             {
-                return false;
+                return Ok(false);
             }
             let matched = compare_msi_values(&value, SqlCompareOp::Ge, &low)
                 && compare_msi_values(&value, SqlCompareOp::Le, &high);
-            if *negated { !matched } else { matched }
+            Ok(if *negated { !matched } else { matched })
         }
         ResolvedExpr::InList {
             value,
             items,
             negated,
         } => {
-            let value = eval_value(database, query, source, parameters, group, value);
+            let value = eval_value(
+                database, query, source, parameters, group, value, derived, outer,
+            )?;
             if matches!(value, MsiValue::Null) {
-                return false;
+                return Ok(false);
             }
             let mut found = false;
             let mut has_null = false;
             for item in items {
-                let item = eval_value(database, query, source, parameters, group, item);
+                let item = eval_value(
+                    database, query, source, parameters, group, item, derived, outer,
+                )?;
                 if matches!(item, MsiValue::Null) {
                     has_null = true;
                 } else if msi_value_equal(&value, &item) {
                     found = true;
                 }
             }
-            if *negated { !found && !has_null } else { found }
+            Ok(if *negated { !found && !has_null } else { found })
         }
         ResolvedExpr::InQuery {
             value,
             query: subquery,
             negated,
         } => {
-            let value = eval_value(database, query, source, parameters, group, value);
+            let value = eval_value(
+                database, query, source, parameters, group, value, derived, outer,
+            )?;
             if matches!(value, MsiValue::Null) {
-                return false;
+                return Ok(false);
             }
-            let Ok(rows) = execute_query(database, subquery, parameters) else {
-                return false;
-            };
+            let mut nested: Vec<OuterFrame<'_>> = Vec::with_capacity(outer.len() + 1);
+            nested.push(OuterFrame {
+                tables: &query.tables,
+                derived,
+                source,
+            });
+            nested.extend_from_slice(outer);
+            let rows = execute_query_with_outer(database, subquery, parameters, &nested)?;
             let mut found = false;
             let mut has_null = false;
             for row in rows {
@@ -2303,9 +2732,24 @@ fn eval_expr(
                     None => {}
                 }
             }
-            if *negated { !found && !has_null } else { found }
+            Ok(if *negated { !found && !has_null } else { found })
         }
-        _ => false,
+        ResolvedExpr::Exists {
+            query: subquery,
+            negated,
+        } => {
+            let mut nested: Vec<OuterFrame<'_>> = Vec::with_capacity(outer.len() + 1);
+            nested.push(OuterFrame {
+                tables: &query.tables,
+                derived,
+                source,
+            });
+            nested.extend_from_slice(outer);
+            let rows = execute_query_with_outer(database, subquery, parameters, &nested)?;
+            let found = !rows.is_empty();
+            Ok(if *negated { !found } else { found })
+        }
+        _ => Ok(false),
     }
 }
 
@@ -2315,13 +2759,24 @@ fn project_row(
     source: &[Option<usize>],
     parameters: &[MsiValue],
     group: Option<&[Vec<Option<usize>>]>,
-) -> Vec<MsiValue> {
+    derived: &[Option<Vec<Vec<MsiValue>>>],
+    outer: &[OuterFrame<'_>],
+) -> Result<Vec<MsiValue>, u32> {
     query
         .columns
         .iter()
         .map(|column| match &column.expression {
-            Some(expression) => eval_value(database, query, source, parameters, group, expression),
-            None => source_value(database, &query.tables, source, column.table, column.column),
+            Some(expression) => eval_value(
+                database, query, source, parameters, group, expression, derived, outer,
+            ),
+            None => Ok(source_value(
+                database,
+                &query.tables,
+                derived,
+                source,
+                column.table,
+                column.column,
+            )),
         })
         .collect()
 }
@@ -2352,15 +2807,22 @@ fn order_value(
     parameters: &[MsiValue],
     group: Option<&[Vec<Option<usize>>]>,
     key: &OrderSource,
-) -> MsiValue {
+    derived: &[Option<Vec<Vec<MsiValue>>>],
+    outer: &[OuterFrame<'_>],
+) -> Result<MsiValue, u32> {
     match key {
-        OrderSource::Output(index) => values.get(*index).cloned().unwrap_or(MsiValue::Null),
-        OrderSource::Column { table, column } => {
-            source_value(database, &query.tables, source, *table, *column)
-        }
-        OrderSource::Expr(expression) => {
-            eval_value(database, query, source, parameters, group, expression)
-        }
+        OrderSource::Output(index) => Ok(values.get(*index).cloned().unwrap_or(MsiValue::Null)),
+        OrderSource::Column { table, column } => Ok(source_value(
+            database,
+            &query.tables,
+            derived,
+            source,
+            *table,
+            *column,
+        )),
+        OrderSource::Expr(expression) => eval_value(
+            database, query, source, parameters, group, expression, derived, outer,
+        ),
     }
 }
 
@@ -2384,7 +2846,10 @@ fn sort_rows(
     query: &ResolvedQuery,
     parameters: &[MsiValue],
     rows: &mut [ViewRow],
-) {
+    derived: &[Option<Vec<Vec<MsiValue>>>],
+    outer: &[OuterFrame<'_>],
+) -> Result<(), u32> {
+    let error = std::cell::Cell::new(None);
     rows.sort_by(|left, right| {
         for order in &query.order {
             let left_value = order_value(
@@ -2395,6 +2860,8 @@ fn sort_rows(
                 parameters,
                 left.group.as_deref(),
                 &order.key,
+                derived,
+                outer,
             );
             let right_value = order_value(
                 database,
@@ -2404,7 +2871,23 @@ fn sort_rows(
                 parameters,
                 right.group.as_deref(),
                 &order.key,
+                derived,
+                outer,
             );
+            let left_value = match left_value {
+                Ok(value) => value,
+                Err(code) => {
+                    error.set(Some(code));
+                    MsiValue::Null
+                }
+            };
+            let right_value = match right_value {
+                Ok(value) => value,
+                Err(code) => {
+                    error.set(Some(code));
+                    MsiValue::Null
+                }
+            };
             let mut ordering = compare_order_values(&left_value, &right_value);
             if order.direction == SqlDirection::Descending {
                 ordering = ordering.reverse();
@@ -2415,6 +2898,10 @@ fn sort_rows(
         }
         std::cmp::Ordering::Equal
     });
+    match error.get() {
+        Some(code) => Err(code),
+        None => Ok(()),
+    }
 }
 
 fn join_matches(
@@ -2423,11 +2910,33 @@ fn join_matches(
     source: &[Option<usize>],
     parameters: &[MsiValue],
     on: &Option<ResolvedExpr>,
-) -> bool {
+    derived: &[Option<Vec<Vec<MsiValue>>>],
+    outer: &[OuterFrame<'_>],
+) -> Result<bool, u32> {
     match on {
-        Some(on) => eval_expr(database, query, source, parameters, None, on),
-        None => true,
+        Some(on) => eval_expr(
+            database, query, source, parameters, None, on, derived, outer,
+        ),
+        None => Ok(true),
     }
+}
+
+fn materialize_derived(
+    database: &MsiDatabaseState,
+    query: &ResolvedQuery,
+    parameters: &[MsiValue],
+) -> Result<Vec<Option<Vec<Vec<MsiValue>>>>, u32> {
+    let mut rows = Vec::with_capacity(query.tables.len());
+    for table in &query.tables {
+        match &table.derived {
+            Some(subquery) => {
+                let result = execute_query(database, subquery, parameters)?;
+                rows.push(Some(result.into_iter().map(|row| row.values).collect()));
+            }
+            None => rows.push(None),
+        }
+    }
+    Ok(rows)
 }
 
 fn execute_query(
@@ -2435,10 +2944,20 @@ fn execute_query(
     query: &ResolvedQuery,
     parameters: &[MsiValue],
 ) -> Result<Vec<ViewRow>, u32> {
-    let mut rows = execute_query_core(database, query, parameters)?;
+    execute_query_with_outer(database, query, parameters, &[])
+}
+
+fn execute_query_with_outer(
+    database: &MsiDatabaseState,
+    query: &ResolvedQuery,
+    parameters: &[MsiValue],
+    outer: &[OuterFrame<'_>],
+) -> Result<Vec<ViewRow>, u32> {
+    let derived = materialize_derived(database, query, parameters)?;
+    let mut rows = execute_query_core(database, query, parameters, &derived, outer)?;
     if !query.unions.is_empty() {
         for union in &query.unions {
-            let mut part = execute_query(database, &union.query, parameters)?;
+            let mut part = execute_query_with_outer(database, &union.query, parameters, outer)?;
             rows.append(&mut part);
         }
         if query.unions.iter().any(|union| !union.all) {
@@ -2446,7 +2965,7 @@ fn execute_query(
         }
     }
     if !query.order.is_empty() {
-        sort_rows(database, query, parameters, &mut rows);
+        sort_rows(database, query, parameters, &mut rows, &derived, outer)?;
     }
     Ok(rows)
 }
@@ -2455,25 +2974,32 @@ fn execute_query_core(
     database: &MsiDatabaseState,
     query: &ResolvedQuery,
     parameters: &[MsiValue],
+    derived: &[Option<Vec<Vec<MsiValue>>>],
+    outer: &[OuterFrame<'_>],
 ) -> Result<Vec<ViewRow>, u32> {
     let Some(base) = query.tables.first() else {
         return Err(ERROR_BAD_QUERY_SYNTAX);
     };
-    let base_table = database.table(&base.name).ok_or(ERROR_INVALID_TABLE)?;
-    let mut partial: Vec<Vec<Option<usize>>> = (0..base_table.rows.len())
-        .map(|index| vec![Some(index)])
-        .collect();
+    if base.derived.is_none() && database.table(&base.name).is_none() {
+        return Err(ERROR_INVALID_TABLE);
+    }
+    let base_rows = table_row_count(database, query, derived, 0)?;
+    let mut partial: Vec<Vec<Option<usize>>> =
+        (0..base_rows).map(|index| vec![Some(index)]).collect();
     for join in &query.joins {
         let Some(meta) = query.tables.get(join.table) else {
             return Err(ERROR_BAD_QUERY_SYNTAX);
         };
-        let table = database.table(&meta.name).ok_or(ERROR_INVALID_TABLE)?;
+        if meta.derived.is_none() && database.table(&meta.name).is_none() {
+            return Err(ERROR_INVALID_TABLE);
+        }
+        let row_count = table_row_count(database, query, derived, join.table)?;
         let width = join.table;
         let mut combined = Vec::new();
         match join.kind {
             SqlJoinKind::Cross => {
                 for source in partial {
-                    for row_index in 0..table.rows.len() {
+                    for row_index in 0..row_count {
                         let mut candidate = source.clone();
                         candidate.push(Some(row_index));
                         combined.push(candidate);
@@ -2483,10 +3009,12 @@ fn execute_query_core(
             SqlJoinKind::Inner | SqlJoinKind::LeftOuter => {
                 for source in partial {
                     let mut matched = false;
-                    for row_index in 0..table.rows.len() {
+                    for row_index in 0..row_count {
                         let mut candidate = source.clone();
                         candidate.push(Some(row_index));
-                        if join_matches(database, query, &candidate, parameters, &join.on) {
+                        if join_matches(
+                            database, query, &candidate, parameters, &join.on, derived, outer,
+                        )? {
                             matched = true;
                             combined.push(candidate);
                         }
@@ -2499,12 +3027,14 @@ fn execute_query_core(
                 }
             }
             SqlJoinKind::RightOuter => {
-                let mut right_matched = vec![false; table.rows.len()];
+                let mut right_matched = vec![false; row_count];
                 for source in &partial {
-                    for row_index in 0..table.rows.len() {
+                    for row_index in 0..row_count {
                         let mut candidate = source.clone();
                         candidate.push(Some(row_index));
-                        if join_matches(database, query, &candidate, parameters, &join.on) {
+                        if join_matches(
+                            database, query, &candidate, parameters, &join.on, derived, outer,
+                        )? {
                             right_matched[row_index] = true;
                             combined.push(candidate);
                         }
@@ -2519,13 +3049,15 @@ fn execute_query_core(
                 }
             }
             SqlJoinKind::FullOuter => {
-                let mut right_matched = vec![false; table.rows.len()];
+                let mut right_matched = vec![false; row_count];
                 for source in partial {
                     let mut matched = false;
-                    for row_index in 0..table.rows.len() {
+                    for row_index in 0..row_count {
                         let mut candidate = source.clone();
                         candidate.push(Some(row_index));
-                        if join_matches(database, query, &candidate, parameters, &join.on) {
+                        if join_matches(
+                            database, query, &candidate, parameters, &join.on, derived, outer,
+                        )? {
                             matched = true;
                             right_matched[row_index] = true;
                             combined.push(candidate);
@@ -2548,24 +3080,28 @@ fn execute_query_core(
         }
         partial = combined;
     }
-    let filtered: Vec<Vec<Option<usize>>> = partial
-        .into_iter()
-        .filter(|source| match &query.filter {
-            Some(filter) => eval_expr(database, query, source, parameters, None, filter),
+    let mut filtered = Vec::with_capacity(partial.len());
+    for source in partial {
+        let keep = match &query.filter {
+            Some(filter) => eval_expr(
+                database, query, &source, parameters, None, filter, derived, outer,
+            )?,
             None => true,
-        })
-        .collect();
+        };
+        if keep {
+            filtered.push(source);
+        }
+    }
     let mut rows = Vec::new();
     if query.grouped {
         let mut groups: Vec<(Vec<MsiValue>, Vec<Vec<Option<usize>>>)> = Vec::new();
         for source in filtered {
-            let key: Vec<MsiValue> = query
-                .group_by
-                .iter()
-                .map(|expression| {
-                    eval_value(database, query, &source, parameters, None, expression)
-                })
-                .collect();
+            let mut key = Vec::with_capacity(query.group_by.len());
+            for expression in &query.group_by {
+                key.push(eval_value(
+                    database, query, &source, parameters, None, expression, derived, outer,
+                )?);
+            }
             if let Some((_, members)) = groups.iter_mut().find(|(existing, _)| {
                 existing.len() == key.len()
                     && existing
@@ -2582,13 +3118,28 @@ fn execute_query_core(
             let members: Vec<Vec<Option<usize>>> = Vec::new();
             let source = vec![None; query.tables.len()];
             let keep = match &query.having {
-                Some(having) => {
-                    eval_expr(database, query, &source, parameters, Some(&members), having)
-                }
+                Some(having) => eval_expr(
+                    database,
+                    query,
+                    &source,
+                    parameters,
+                    Some(&members),
+                    having,
+                    derived,
+                    outer,
+                )?,
                 None => true,
             };
             if keep {
-                let values = project_row(database, query, &source, parameters, Some(&members));
+                let values = project_row(
+                    database,
+                    query,
+                    &source,
+                    parameters,
+                    Some(&members),
+                    derived,
+                    outer,
+                )?;
                 rows.push(ViewRow {
                     values,
                     source,
@@ -2602,11 +3153,28 @@ fn execute_query_core(
                 .cloned()
                 .unwrap_or_else(|| vec![None; query.tables.len()]);
             if let Some(having) = &query.having {
-                if !eval_expr(database, query, &source, parameters, Some(&members), having) {
+                if !eval_expr(
+                    database,
+                    query,
+                    &source,
+                    parameters,
+                    Some(&members),
+                    having,
+                    derived,
+                    outer,
+                )? {
                     continue;
                 }
             }
-            let values = project_row(database, query, &source, parameters, Some(&members));
+            let values = project_row(
+                database,
+                query,
+                &source,
+                parameters,
+                Some(&members),
+                derived,
+                outer,
+            )?;
             rows.push(ViewRow {
                 values,
                 source,
@@ -2615,7 +3183,7 @@ fn execute_query_core(
         }
     } else {
         for source in filtered {
-            let values = project_row(database, query, &source, parameters, None);
+            let values = project_row(database, query, &source, parameters, None, derived, outer)?;
             rows.push(ViewRow {
                 values,
                 source,
@@ -3177,6 +3745,7 @@ impl SqlCursor {
 
     fn select_item(&mut self, parameters: &mut usize) -> Result<SqlSelectItem, ()> {
         self.skip_space();
+        let start = self.position;
         if self.peek() == Some('*') {
             self.position += 1;
             return Ok(SqlSelectItem {
@@ -3186,13 +3755,9 @@ impl SqlCursor {
                 expression: None,
             });
         }
-        let start = self.position;
-        match self.peek() {
-            Some(ch) if ch.is_ascii_alphabetic() || ch == '_' || ch == '`' || ch == '[' => {
+        if let Some(ch) = self.peek() {
+            if ch.is_ascii_alphabetic() || ch == '_' || ch == '`' || ch == '[' {
                 let first = self.ident()?;
-                if first.is_empty() {
-                    return Err(());
-                }
                 if first.ends_with('.') && self.peek() == Some('*') {
                     self.position += 1;
                     return Ok(SqlSelectItem {
@@ -3213,59 +3778,25 @@ impl SqlCursor {
                             expression: None,
                         });
                     }
-                    let second = self.ident()?;
-                    if second.is_empty() || second.contains('.') {
-                        return Err(());
-                    }
-                    return Ok(SqlSelectItem {
-                        table: Some(first),
-                        column: Some(second),
-                        alias: None,
-                        expression: None,
-                    });
                 }
-                self.skip_space();
-                if self.peek() == Some('(') {
-                    self.position = start;
-                    let expression = parse_operand(self, parameters)?;
-                    return Ok(SqlSelectItem {
-                        table: None,
-                        column: None,
-                        alias: None,
-                        expression: Some(expression),
-                    });
-                }
-                match first.split_once('.') {
-                    Some((table, column))
-                        if !table.is_empty() && !column.is_empty() && !column.contains('.') =>
-                    {
-                        Ok(SqlSelectItem {
-                            table: Some(table.to_string()),
-                            column: Some(column.to_string()),
-                            alias: None,
-                            expression: None,
-                        })
-                    }
-                    Some(_) => Err(()),
-                    None => Ok(SqlSelectItem {
-                        table: None,
-                        column: Some(first),
-                        alias: None,
-                        expression: None,
-                    }),
-                }
-            }
-            _ => {
                 self.position = start;
-                let expression = parse_operand(self, parameters)?;
-                Ok(SqlSelectItem {
-                    table: None,
-                    column: None,
-                    alias: None,
-                    expression: Some(expression),
-                })
             }
         }
+        let expression = parse_or(self, parameters)?;
+        if let SqlExpr::Column { table, name } = expression {
+            return Ok(SqlSelectItem {
+                table,
+                column: Some(name),
+                alias: None,
+                expression: None,
+            });
+        }
+        Ok(SqlSelectItem {
+            table: None,
+            column: None,
+            alias: None,
+            expression: Some(expression),
+        })
     }
 
     fn parse_optional_alias(&mut self, stop: &[&str]) -> Result<Option<String>, ()> {
@@ -3433,7 +3964,7 @@ fn parse_select_list(
 fn parse_group_list(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<Vec<SqlExpr>, ()> {
     let mut items = Vec::new();
     loop {
-        items.push(parse_operand(cursor, parameters)?);
+        items.push(parse_arithmetic(cursor, parameters)?);
         cursor.skip_space();
         if cursor.peek() == Some(',') {
             cursor.position += 1;
@@ -3444,7 +3975,27 @@ fn parse_group_list(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<Ve
     Ok(items)
 }
 
-fn parse_table_ref(cursor: &mut SqlCursor) -> Result<SqlTableRef, ()> {
+fn parse_table_ref(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlTableRef, ()> {
+    cursor.skip_space();
+    if cursor.select_follows_paren() {
+        cursor.position += 1;
+        let query = parse_query(cursor, parameters)?;
+        cursor.skip_space();
+        if cursor.bump() != Some(')') {
+            return Err(());
+        }
+        let alias = cursor
+            .parse_optional_alias(&[
+                "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER", "JOIN", "ON", "WHERE", "GROUP",
+                "HAVING", "ORDER", "UNION",
+            ])?
+            .ok_or(())?;
+        return Ok(SqlTableRef {
+            table: alias.clone(),
+            alias: Some(alias),
+            derived: Some(Box::new(query)),
+        });
+    }
     let table = cursor.ident()?;
     if table.is_empty() {
         return Err(());
@@ -3453,11 +4004,15 @@ fn parse_table_ref(cursor: &mut SqlCursor) -> Result<SqlTableRef, ()> {
         "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER", "JOIN", "ON", "WHERE", "GROUP",
         "HAVING", "ORDER", "UNION",
     ])?;
-    Ok(SqlTableRef { table, alias })
+    Ok(SqlTableRef {
+        table,
+        alias,
+        derived: None,
+    })
 }
 
 fn parse_from(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlFrom, ()> {
-    let base = parse_table_ref(cursor)?;
+    let base = parse_table_ref(cursor, parameters)?;
     let mut joins = Vec::new();
     loop {
         let kind = if cursor.consume_word("INNER") {
@@ -3483,7 +4038,7 @@ fn parse_from(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlFrom,
         } else {
             break;
         };
-        let table = parse_table_ref(cursor)?;
+        let table = parse_table_ref(cursor, parameters)?;
         let on = if kind == SqlJoinKind::Cross {
             None
         } else {
@@ -3501,7 +4056,7 @@ fn parse_order_list(
 ) -> Result<Vec<SqlOrderKey>, ()> {
     let mut keys = Vec::new();
     loop {
-        let expr = parse_operand(cursor, parameters)?;
+        let expr = parse_arithmetic(cursor, parameters)?;
         let direction = if cursor.consume_word("DESC") {
             SqlDirection::Descending
         } else {
@@ -3543,23 +4098,45 @@ fn parse_and(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlExpr, 
 
 fn parse_primary(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlExpr, ()> {
     cursor.skip_space();
-    if cursor.peek() == Some('(') && !cursor.select_follows_paren() {
-        cursor.position += 1;
-        let expression = parse_or(cursor, parameters)?;
+    if cursor.consume_word("EXISTS") {
+        cursor.skip_space();
+        if cursor.bump() != Some('(') {
+            return Err(());
+        }
+        let query = parse_query(cursor, parameters)?;
         cursor.skip_space();
         if cursor.bump() != Some(')') {
             return Err(());
         }
-        return Ok(expression);
+        return Ok(SqlExpr::Exists {
+            query: Box::new(query),
+            negated: false,
+        });
     }
     if cursor.consume_word("NOT") {
+        cursor.skip_space();
+        if cursor.consume_word("EXISTS") {
+            cursor.skip_space();
+            if cursor.bump() != Some('(') {
+                return Err(());
+            }
+            let query = parse_query(cursor, parameters)?;
+            cursor.skip_space();
+            if cursor.bump() != Some(')') {
+                return Err(());
+            }
+            return Ok(SqlExpr::Exists {
+                query: Box::new(query),
+                negated: true,
+            });
+        }
         return Ok(SqlExpr::Not(Box::new(parse_primary(cursor, parameters)?)));
     }
     parse_comparison(cursor, parameters)
 }
 
 fn parse_comparison(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlExpr, ()> {
-    let left = parse_operand(cursor, parameters)?;
+    let left = parse_arithmetic(cursor, parameters)?;
     cursor.skip_space();
     if cursor.consume_word("IS") {
         let negated = cursor.consume_word("NOT");
@@ -3604,7 +4181,7 @@ fn parse_comparison(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<Sq
                 cursor.position += 1;
                 break;
             }
-            items.push(parse_operand(cursor, parameters)?);
+            items.push(parse_arithmetic(cursor, parameters)?);
             cursor.skip_space();
             if cursor.peek() == Some(',') {
                 cursor.position += 1;
@@ -3623,7 +4200,7 @@ fn parse_comparison(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<Sq
         });
     }
     if cursor.consume_word("LIKE") {
-        let pattern = parse_operand(cursor, parameters)?;
+        let pattern = parse_arithmetic(cursor, parameters)?;
         let escape = if cursor.consume_word("ESCAPE") {
             match cursor.literal()? {
                 MsiValue::Str(text) if text.chars().count() == 1 => text.chars().next(),
@@ -3640,9 +4217,9 @@ fn parse_comparison(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<Sq
         });
     }
     if cursor.consume_word("BETWEEN") {
-        let low = parse_operand(cursor, parameters)?;
+        let low = parse_arithmetic(cursor, parameters)?;
         cursor.expect_word("AND")?;
-        let high = parse_operand(cursor, parameters)?;
+        let high = parse_arithmetic(cursor, parameters)?;
         return Ok(SqlExpr::Between {
             value: Box::new(left),
             low: Box::new(low),
@@ -3691,14 +4268,73 @@ fn parse_comparison(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<Sq
                 SqlCompareOp::Gt
             }
         }
-        _ => return Err(()),
+        _ => return Ok(left),
     };
-    let right = parse_operand(cursor, parameters)?;
+    let right = parse_arithmetic(cursor, parameters)?;
     Ok(SqlExpr::Compare {
         left: Box::new(left),
         op,
         right: Box::new(right),
     })
+}
+
+fn parse_arithmetic(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlExpr, ()> {
+    let mut left = parse_term(cursor, parameters)?;
+    loop {
+        cursor.skip_space();
+        let op = match cursor.peek() {
+            Some('+') => SqlBinaryOp::Add,
+            Some('-') => SqlBinaryOp::Subtract,
+            _ => break,
+        };
+        cursor.position += 1;
+        let right = parse_term(cursor, parameters)?;
+        left = SqlExpr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+    }
+    Ok(left)
+}
+
+fn parse_term(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlExpr, ()> {
+    let mut left = parse_unary(cursor, parameters)?;
+    loop {
+        cursor.skip_space();
+        let op = match cursor.peek() {
+            Some('*') => SqlBinaryOp::Multiply,
+            Some('/') => SqlBinaryOp::Divide,
+            Some('%') => SqlBinaryOp::Modulo,
+            _ => break,
+        };
+        cursor.position += 1;
+        let right = parse_unary(cursor, parameters)?;
+        left = SqlExpr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+    }
+    Ok(left)
+}
+
+fn parse_unary(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlExpr, ()> {
+    cursor.skip_space();
+    let op = match cursor.peek() {
+        Some('-') => Some(SqlUnaryOp::Negate),
+        Some('+') => Some(SqlUnaryOp::Plus),
+        _ => None,
+    };
+    if let Some(op) = op {
+        cursor.position += 1;
+        let value = parse_unary(cursor, parameters)?;
+        return Ok(SqlExpr::Unary {
+            op,
+            value: Box::new(value),
+        });
+    }
+    parse_operand(cursor, parameters)
 }
 
 fn parse_operand(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlExpr, ()> {
@@ -3713,6 +4349,15 @@ fn parse_operand(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlEx
             }
             Ok(SqlExpr::ScalarQuery(Box::new(query)))
         }
+        Some('(') => {
+            cursor.position += 1;
+            let expression = parse_or(cursor, parameters)?;
+            cursor.skip_space();
+            if cursor.bump() != Some(')') {
+                return Err(());
+            }
+            Ok(expression)
+        }
         Some('?') => {
             cursor.position += 1;
             let index = *parameters;
@@ -3720,27 +4365,13 @@ fn parse_operand(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlEx
             Ok(SqlExpr::Parameter(index))
         }
         Some('\'') | Some('"') => Ok(SqlExpr::Literal(cursor.literal()?)),
-        Some(ch)
-            if ch.is_ascii_digit()
-                || (ch == '-'
-                    && cursor
-                        .chars
-                        .get(cursor.position + 1)
-                        .is_some_and(|next| next.is_ascii_digit()))
-                || (ch == '+'
-                    && cursor
-                        .chars
-                        .get(cursor.position + 1)
-                        .is_some_and(|next| next.is_ascii_digit())) =>
-        {
-            Ok(SqlExpr::Literal(cursor.literal()?))
-        }
+        Some(ch) if ch.is_ascii_digit() => Ok(SqlExpr::Literal(cursor.literal()?)),
         _ => {
             let start = cursor.position;
             let word = cursor.word();
             cursor.skip_space();
             if !word.is_empty() && cursor.peek() == Some('(') {
-                let function = if word.eq_ignore_ascii_case("COUNT") {
+                let aggregate = if word.eq_ignore_ascii_case("COUNT") {
                     Some(SqlAggregate::Count)
                 } else if word.eq_ignore_ascii_case("SUM") {
                     Some(SqlAggregate::Sum)
@@ -3753,22 +4384,75 @@ fn parse_operand(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlEx
                 } else {
                     None
                 };
-                if let Some(function) = function {
+                if let Some(function) = aggregate {
                     cursor.position += 1;
+                    cursor.skip_space();
+                    let distinct = cursor.consume_word("DISTINCT");
                     cursor.skip_space();
                     let argument = if function == SqlAggregate::Count && cursor.peek() == Some('*')
                     {
+                        if distinct {
+                            return Err(());
+                        }
                         cursor.position += 1;
                         None
                     } else {
-                        Some(Box::new(parse_operand(cursor, parameters)?))
+                        Some(Box::new(parse_arithmetic(cursor, parameters)?))
                     };
                     cursor.skip_space();
                     if cursor.bump() != Some(')') {
                         return Err(());
                     }
-                    return Ok(SqlExpr::Aggregate { function, argument });
+                    return Ok(SqlExpr::Aggregate {
+                        function,
+                        argument,
+                        distinct,
+                    });
                 }
+                let function = if word.eq_ignore_ascii_case("UPPER") {
+                    Some(SqlFunction::Upper)
+                } else if word.eq_ignore_ascii_case("LOWER") {
+                    Some(SqlFunction::Lower)
+                } else if word.eq_ignore_ascii_case("LENGTH") {
+                    Some(SqlFunction::Length)
+                } else if word.eq_ignore_ascii_case("SUBSTRING") {
+                    Some(SqlFunction::Substring)
+                } else {
+                    None
+                };
+                if let Some(function) = function {
+                    cursor.position += 1;
+                    let mut arguments = Vec::new();
+                    cursor.skip_space();
+                    if cursor.peek() != Some(')') {
+                        loop {
+                            arguments.push(parse_arithmetic(cursor, parameters)?);
+                            cursor.skip_space();
+                            if cursor.peek() == Some(',') {
+                                cursor.position += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    cursor.skip_space();
+                    if cursor.bump() != Some(')') {
+                        return Err(());
+                    }
+                    let expected = if function == SqlFunction::Substring {
+                        3
+                    } else {
+                        1
+                    };
+                    if arguments.len() != expected {
+                        return Err(());
+                    }
+                    return Ok(SqlExpr::Function {
+                        function,
+                        arguments,
+                    });
+                }
+                return Err(());
             }
             cursor.position = start;
             let (table, name) = cursor.name_ref()?;
@@ -3779,13 +4463,14 @@ fn parse_operand(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlEx
 
 fn resolve_query(database: &MsiDatabaseState, parsed: MsiQuery) -> Result<ResolvedQuery, u32> {
     let mut expectations = vec![ParameterExpectation::Any; parsed.parameter_count];
-    resolve_query_with(database, parsed, &mut expectations)
+    resolve_query_with(database, parsed, &mut expectations, &[])
 }
 
 fn resolve_query_with(
     database: &MsiDatabaseState,
     parsed: MsiQuery,
     expectations: &mut [ParameterExpectation],
+    outer: &[&[ResolvedTable]],
 ) -> Result<ResolvedQuery, u32> {
     let MsiQuery {
         distinct,
@@ -3805,11 +4490,18 @@ fn resolve_query_with(
     }
     let mut tables: Vec<ResolvedTable> = Vec::with_capacity(references.len());
     for reference in references {
-        if database.table(&reference.table).is_none() {
-            // Kept as ERROR_INVALID_TABLE for compatibility with the original
-            // view surface; unknown qualifiers/aliases use ERROR_UNKNOWN_TABLE.
-            return Err(ERROR_INVALID_TABLE);
-        }
+        let (columns, derived) = match &reference.derived {
+            Some(query) => {
+                let resolved = resolve_query_with(database, (**query).clone(), expectations, &[])?;
+                (derived_columns(&resolved.columns), Some(Box::new(resolved)))
+            }
+            None => {
+                let table = database
+                    .table(&reference.table)
+                    .ok_or(ERROR_INVALID_TABLE)?;
+                (table.columns.clone(), None)
+            }
+        };
         // A self-join is legal with distinct aliases; only colliding
         // qualifiers (and an unaliased repeat of the same table) are errors.
         let reference_label = reference
@@ -3830,6 +4522,8 @@ fn resolve_query_with(
         tables.push(ResolvedTable {
             name: reference.table.clone(),
             alias: reference.alias.clone(),
+            columns,
+            derived,
         });
     }
 
@@ -3844,6 +4538,7 @@ fn resolve_query_with(
                 tables.len(),
                 expectations,
                 &[],
+                outer,
             )?;
             if contains_resolved_aggregate(&resolved) && aggregate_contains_aggregate(&resolved) {
                 return Err(ERROR_BAD_QUERY_SYNTAX);
@@ -3871,9 +4566,7 @@ fn resolve_query_with(
                     None => (0..tables.len()).collect(),
                 };
                 for table_index in table_indices {
-                    let table = database
-                        .table(&tables[table_index].name)
-                        .ok_or(ERROR_INVALID_TABLE)?;
+                    let table = tables.get(table_index).ok_or(ERROR_INVALID_TABLE)?;
                     for (column_index, column) in table.columns.iter().enumerate() {
                         columns.push(ResolvedColumn {
                             table: table_index,
@@ -3886,35 +4579,69 @@ fn resolve_query_with(
                 }
             }
             Some(name) => {
-                let (table_index, column_index) = resolve_column(
+                match resolve_column(
                     database,
                     &tables,
                     item.table.as_deref(),
                     name,
                     tables.len(),
                     ColumnScope::Select,
-                )?;
-                let table = database
-                    .table(&tables[table_index].name)
-                    .ok_or(ERROR_INVALID_TABLE)?;
-                let column = table.columns.get(column_index).ok_or(ERROR_BAD_COLUMN)?;
-                let label = item.alias.clone().unwrap_or_else(|| column.name.clone());
-                if let Some(alias) = &item.alias {
-                    aliases.push((
-                        alias.clone(),
-                        ResolvedExpr::Column {
+                ) {
+                    Ok((table_index, column_index)) => {
+                        let table = tables.get(table_index).ok_or(ERROR_INVALID_TABLE)?;
+                        let column = table.columns.get(column_index).ok_or(ERROR_BAD_COLUMN)?;
+                        let label = item.alias.clone().unwrap_or_else(|| column.name.clone());
+                        if let Some(alias) = &item.alias {
+                            aliases.push((
+                                alias.clone(),
+                                ResolvedExpr::Column {
+                                    table: table_index,
+                                    column: column_index,
+                                },
+                            ));
+                        }
+                        columns.push(ResolvedColumn {
                             table: table_index,
                             column: column_index,
-                        },
-                    ));
+                            label,
+                            type_name: column.type_name(),
+                            expression: None,
+                        });
+                    }
+                    Err(code) => {
+                        let outer_expr = SqlExpr::Column {
+                            table: item.table.clone(),
+                            name: name.clone(),
+                        };
+                        let Ok(resolved) = resolve_expr(
+                            database,
+                            &tables,
+                            &outer_expr,
+                            tables.len(),
+                            expectations,
+                            &[],
+                            outer,
+                        ) else {
+                            return Err(code);
+                        };
+                        if !matches!(resolved, ResolvedExpr::OuterColumn { .. }) {
+                            return Err(code); // coverage: unreachable — with no aliases in scope the fallback can only resolve an outer column or fail
+                        }
+                        let label = item.alias.clone().unwrap_or_else(|| name.clone());
+                        let type_name =
+                            resolved_expression_type_name(database, &tables, &resolved)?;
+                        if let Some(alias) = &item.alias {
+                            aliases.push((alias.clone(), resolved.clone()));
+                        }
+                        columns.push(ResolvedColumn {
+                            table: 0,
+                            column: 0,
+                            label,
+                            type_name,
+                            expression: Some(resolved),
+                        });
+                    }
                 }
-                columns.push(ResolvedColumn {
-                    table: table_index,
-                    column: column_index,
-                    label,
-                    type_name: column.type_name(),
-                    expression: None,
-                });
             }
         }
     }
@@ -3924,14 +4651,23 @@ fn resolve_query_with(
 
     let mut group_by = Vec::new();
     for expression in &parsed_group_by {
-        let resolved = resolve_expr(
-            database,
-            &tables,
-            expression,
-            tables.len(),
-            expectations,
-            &aliases,
-        )?;
+        let resolved = match group_ordinal(expression) {
+            Some(ordinal) => {
+                if ordinal == 0 || ordinal > columns.len() {
+                    return Err(ERROR_BAD_COLUMN);
+                }
+                resolved_column_expression(&columns[ordinal - 1])
+            }
+            None => resolve_expr(
+                database,
+                &tables,
+                expression,
+                tables.len(),
+                expectations,
+                &aliases,
+                outer,
+            )?,
+        };
         if contains_resolved_aggregate(&resolved) {
             return Err(ERROR_BAD_QUERY_SYNTAX);
         }
@@ -3945,6 +4681,7 @@ fn resolve_query_with(
             tables.len(),
             expectations,
             &aliases,
+            outer,
         )?),
         None => None,
     };
@@ -3960,6 +4697,7 @@ fn resolve_query_with(
                 table_index + 1,
                 expectations,
                 &[],
+                outer,
             )?),
             None => None,
         };
@@ -3981,6 +4719,7 @@ fn resolve_query_with(
                 tables.len(),
                 expectations,
                 &[],
+                outer,
             )?;
             if contains_resolved_aggregate(&resolved) {
                 return Err(ERROR_BAD_QUERY_SYNTAX);
@@ -4052,6 +4791,7 @@ fn resolve_query_with(
                 tables.len(),
                 expectations,
                 &aliases,
+                outer,
             )?),
         };
         order.push(ResolvedOrder { key, direction });
@@ -4100,7 +4840,7 @@ fn resolve_query_with(
 
     let mut unions = Vec::new();
     for part in parsed_unions {
-        let resolved = resolve_query_with(database, *part.query, expectations)?;
+        let resolved = resolve_query_with(database, *part.query, expectations, outer)?;
         if resolved.columns.len() != columns.len() {
             return Err(ERROR_BAD_QUERY_SYNTAX);
         }
@@ -4137,19 +4877,56 @@ fn resolved_column_expression(column: &ResolvedColumn) -> ResolvedExpr {
     })
 }
 
+fn column_from_type_name(name: &str, type_name: &str) -> MsiColumn {
+    let type_bits = if let Some(width) = type_name.strip_prefix('s') {
+        MSITYPE_VALID | MSITYPE_STRING | width.parse::<u16>().unwrap_or(0)
+    } else if let Some(width) = type_name.strip_prefix('i') {
+        width.parse::<u16>().unwrap_or(4).max(2)
+    } else if type_name.starts_with('v') {
+        MSITYPE_VALID | MSITYPE_STRING
+    } else {
+        MSITYPE_VALID | MSITYPE_STRING
+    };
+    MsiColumn {
+        name: name.to_string(),
+        type_bits,
+    }
+}
+
+fn derived_columns(columns: &[ResolvedColumn]) -> Vec<MsiColumn> {
+    columns
+        .iter()
+        .map(|column| column_from_type_name(&column.label, &column.type_name))
+        .collect()
+}
+
+fn group_ordinal(expression: &SqlExpr) -> Option<usize> {
+    match expression {
+        SqlExpr::Literal(MsiValue::Int(ordinal)) if *ordinal >= 0 => Some(*ordinal as usize),
+        SqlExpr::Column { table: None, name } if name.chars().all(|ch| ch.is_ascii_digit()) => {
+            name.parse::<usize>().ok()
+        }
+        _ => None,
+    }
+}
+
 fn contains_resolved_aggregate(expression: &ResolvedExpr) -> bool {
     match expression {
         ResolvedExpr::Aggregate { .. } => true,
-        ResolvedExpr::IsNull { value, .. } | ResolvedExpr::Not(value) => {
-            contains_resolved_aggregate(value)
-        }
+        ResolvedExpr::IsNull { value, .. }
+        | ResolvedExpr::Not(value)
+        | ResolvedExpr::Unary { value, .. } => contains_resolved_aggregate(value),
         ResolvedExpr::Compare { left, right, .. }
         | ResolvedExpr::And(left, right)
-        | ResolvedExpr::Or(left, right) => {
+        | ResolvedExpr::Or(left, right)
+        | ResolvedExpr::Binary { left, right, .. } => {
             contains_resolved_aggregate(left) || contains_resolved_aggregate(right)
         }
         ResolvedExpr::Like { value, pattern, .. } => {
             contains_resolved_aggregate(value) || contains_resolved_aggregate(pattern)
+        }
+        ResolvedExpr::Function { arguments, .. } => {
+            arguments.iter().any(contains_resolved_aggregate)
         }
         ResolvedExpr::Between {
             value, low, high, ..
@@ -4175,7 +4952,122 @@ fn aggregate_contains_aggregate(expression: &ResolvedExpr) -> bool {
     }
 }
 
+fn resolved_expressions_match(left: &ResolvedExpr, right: &ResolvedExpr) -> bool {
+    match (left, right) {
+        (
+            ResolvedExpr::Column {
+                table: left_table,
+                column: left_column,
+            },
+            ResolvedExpr::Column {
+                table: right_table,
+                column: right_column,
+            },
+        ) => left_table == right_table && left_column == right_column,
+        (
+            ResolvedExpr::OuterColumn {
+                level: left_level,
+                table: left_table,
+                column: left_column,
+                ..
+            },
+            ResolvedExpr::OuterColumn {
+                level: right_level,
+                table: right_table,
+                column: right_column,
+                ..
+            },
+        ) => left_level == right_level && left_table == right_table && left_column == right_column,
+        (ResolvedExpr::Literal(left), ResolvedExpr::Literal(right)) => left == right,
+        (ResolvedExpr::Parameter(left), ResolvedExpr::Parameter(right)) => left == right,
+        (
+            ResolvedExpr::IsNull {
+                value: left,
+                negated: left_negated,
+            },
+            ResolvedExpr::IsNull {
+                value: right,
+                negated: right_negated,
+            },
+        ) => left_negated == right_negated && resolved_expressions_match(left, right),
+        (
+            ResolvedExpr::Compare {
+                left: left_left,
+                op: left_op,
+                right: left_right,
+            },
+            ResolvedExpr::Compare {
+                left: right_left,
+                op: right_op,
+                right: right_right,
+            },
+        ) => {
+            left_op == right_op
+                && resolved_expressions_match(left_left, right_left)
+                && resolved_expressions_match(left_right, right_right)
+        }
+        (ResolvedExpr::And(left_left, left_right), ResolvedExpr::And(right_left, right_right))
+        | (ResolvedExpr::Or(left_left, left_right), ResolvedExpr::Or(right_left, right_right)) => {
+            resolved_expressions_match(left_left, right_left)
+                && resolved_expressions_match(left_right, right_right)
+        }
+        (ResolvedExpr::Not(left), ResolvedExpr::Not(right)) => {
+            resolved_expressions_match(left, right)
+        }
+        (
+            ResolvedExpr::Unary {
+                op: left_op,
+                value: left,
+            },
+            ResolvedExpr::Unary {
+                op: right_op,
+                value: right,
+            },
+        ) => left_op == right_op && resolved_expressions_match(left, right),
+        (
+            ResolvedExpr::Binary {
+                op: left_op,
+                left: left_left,
+                right: left_right,
+            },
+            ResolvedExpr::Binary {
+                op: right_op,
+                left: right_left,
+                right: right_right,
+            },
+        ) => {
+            left_op == right_op
+                && resolved_expressions_match(left_left, right_left)
+                && resolved_expressions_match(left_right, right_right)
+        }
+        (
+            ResolvedExpr::Function {
+                function: left_function,
+                arguments: left_arguments,
+            },
+            ResolvedExpr::Function {
+                function: right_function,
+                arguments: right_arguments,
+            },
+        ) => {
+            left_function == right_function
+                && left_arguments.len() == right_arguments.len()
+                && left_arguments
+                    .iter()
+                    .zip(right_arguments)
+                    .all(|(left, right)| resolved_expressions_match(left, right))
+        }
+        _ => false,
+    }
+}
+
 fn grouped_expression_valid(expression: &ResolvedExpr, group_by: &[ResolvedExpr]) -> bool {
+    if group_by
+        .iter()
+        .any(|key| resolved_expressions_match(key, expression))
+    {
+        return true;
+    }
     match expression {
         ResolvedExpr::Aggregate { .. } => true,
         ResolvedExpr::Column { table, column } => group_by.iter().any(|key| {
@@ -4187,16 +5079,22 @@ fn grouped_expression_valid(expression: &ResolvedExpr, group_by: &[ResolvedExpr]
                 } if key_table == table && key_column == column
             )
         }),
-        ResolvedExpr::Literal(_) | ResolvedExpr::Parameter(_) => true,
-        ResolvedExpr::ScalarQuery(_) => true,
-        ResolvedExpr::IsNull { value, .. } | ResolvedExpr::Not(value) => {
-            grouped_expression_valid(value, group_by)
-        }
+        ResolvedExpr::Literal(_)
+        | ResolvedExpr::Parameter(_)
+        | ResolvedExpr::OuterColumn { .. } => true,
+        ResolvedExpr::ScalarQuery(_) | ResolvedExpr::Exists { .. } => true,
+        ResolvedExpr::IsNull { value, .. }
+        | ResolvedExpr::Not(value)
+        | ResolvedExpr::Unary { value, .. } => grouped_expression_valid(value, group_by),
         ResolvedExpr::Compare { left, right, .. }
         | ResolvedExpr::And(left, right)
-        | ResolvedExpr::Or(left, right) => {
+        | ResolvedExpr::Or(left, right)
+        | ResolvedExpr::Binary { left, right, .. } => {
             grouped_expression_valid(left, group_by) && grouped_expression_valid(right, group_by)
         }
+        ResolvedExpr::Function { arguments, .. } => arguments
+            .iter()
+            .all(|argument| grouped_expression_valid(argument, group_by)),
         ResolvedExpr::Like { value, pattern, .. } => {
             grouped_expression_valid(value, group_by) && grouped_expression_valid(pattern, group_by)
         }
@@ -4267,11 +5165,24 @@ fn resolved_expression_type_name(
                 SqlColumnKind::Int => "i4".to_string(),
             })
         }
+        ResolvedExpr::OuterColumn { kind, .. } => Ok(match kind {
+            SqlColumnKind::Binary => "v0".to_string(),
+            SqlColumnKind::String { width } => format!("s{width}"),
+            SqlColumnKind::Int => "i4".to_string(),
+        }),
+        ResolvedExpr::Unary { .. } | ResolvedExpr::Binary { .. } => Ok("i4".to_string()),
+        ResolvedExpr::Exists { .. } => Ok("i4".to_string()),
+        ResolvedExpr::Function { function, .. } => Ok(match function {
+            SqlFunction::Length => "i4".to_string(),
+            SqlFunction::Upper | SqlFunction::Lower | SqlFunction::Substring => "s0".to_string(),
+        }),
         ResolvedExpr::Literal(MsiValue::Int(_)) => Ok("i4".to_string()),
         ResolvedExpr::Literal(MsiValue::Str(_)) => Ok("s0".to_string()),
         ResolvedExpr::Literal(MsiValue::Stream(_)) => Ok("v0".to_string()),
         ResolvedExpr::Literal(MsiValue::Null) => Ok("s0".to_string()),
-        ResolvedExpr::Aggregate { function, argument } => match function {
+        ResolvedExpr::Aggregate {
+            function, argument, ..
+        } => match function {
             SqlAggregate::Count | SqlAggregate::Sum | SqlAggregate::Average => Ok("i4".to_string()),
             SqlAggregate::Min | SqlAggregate::Max => match argument.as_deref() {
                 Some(argument) => resolved_expression_type_name(database, tables, argument),
@@ -4318,14 +5229,13 @@ fn resolve_column(
     limit: usize,
     scope: ColumnScope,
 ) -> Result<(usize, usize), u32> {
+    let _ = database;
     if let Some(qualifier) = qualifier {
         let table_index = resolve_table_index(qualifier, tables)?;
         if table_index >= limit {
             return Err(ERROR_UNKNOWN_TABLE);
         }
-        let table = database
-            .table(&tables[table_index].name)
-            .ok_or(ERROR_INVALID_TABLE)?;
+        let table = tables.get(table_index).ok_or(ERROR_INVALID_TABLE)?;
         let column_index = table
             .columns
             .iter()
@@ -4335,9 +5245,7 @@ fn resolve_column(
     }
     let mut found = None;
     for table_index in 0..limit.min(tables.len()) {
-        let table = database
-            .table(&tables[table_index].name)
-            .ok_or(ERROR_INVALID_TABLE)?;
+        let table = tables.get(table_index).ok_or(ERROR_INVALID_TABLE)?;
         for (column_index, column) in table.columns.iter().enumerate() {
             if !column.name.eq_ignore_ascii_case(name) {
                 continue;
@@ -4369,9 +5277,9 @@ fn column_kind(
     table: usize,
     column: usize,
 ) -> Result<SqlColumnKind, u32> {
+    let _ = database;
     let meta = tables.get(table).ok_or(ERROR_BAD_QUERY_SYNTAX)?;
-    let table = database.table(&meta.name).ok_or(ERROR_INVALID_TABLE)?;
-    let column = table.columns.get(column).ok_or(ERROR_BAD_COLUMN)?;
+    let column = meta.columns.get(column).ok_or(ERROR_BAD_COLUMN)?;
     if column.is_binary() {
         Ok(SqlColumnKind::Binary)
     } else if column.is_string() {
@@ -4392,10 +5300,21 @@ fn resolved_column_kind(
         ResolvedExpr::Column { table, column } => {
             Ok(Some(column_kind(database, tables, *table, *column)?))
         }
+        ResolvedExpr::OuterColumn { kind, .. } => Ok(Some(*kind)),
+        ResolvedExpr::Unary { .. } | ResolvedExpr::Binary { .. } => Ok(Some(SqlColumnKind::Int)),
+        ResolvedExpr::Exists { .. } => Ok(Some(SqlColumnKind::Int)),
+        ResolvedExpr::Function { function, .. } => Ok(Some(match function {
+            SqlFunction::Length => SqlColumnKind::Int,
+            SqlFunction::Upper | SqlFunction::Lower | SqlFunction::Substring => {
+                SqlColumnKind::String { width: 0 }
+            }
+        })),
         ResolvedExpr::Literal(MsiValue::Int(_)) => Ok(Some(SqlColumnKind::Int)),
         ResolvedExpr::Literal(MsiValue::Str(_)) => Ok(Some(SqlColumnKind::String { width: 0 })),
         ResolvedExpr::Literal(MsiValue::Stream(_)) => Ok(Some(SqlColumnKind::Binary)),
-        ResolvedExpr::Aggregate { function, argument } => match function {
+        ResolvedExpr::Aggregate {
+            function, argument, ..
+        } => match function {
             SqlAggregate::Count | SqlAggregate::Sum | SqlAggregate::Average => {
                 Ok(Some(SqlColumnKind::Int))
             }
@@ -4484,6 +5403,84 @@ fn coerce_operand(
     }
 }
 
+fn resolve_outer_column(
+    outer: &[&[ResolvedTable]],
+    qualifier: Option<&str>,
+    name: &str,
+) -> Result<ResolvedExpr, u32> {
+    for (depth, scope) in outer.iter().enumerate() {
+        let Some((table, column)) = column_candidate(scope, qualifier, name)? else {
+            continue;
+        };
+        let kind = scope
+            .get(table)
+            .and_then(|meta| meta.columns.get(column))
+            .map(msi_column_kind)
+            .ok_or(ERROR_BAD_COLUMN)?;
+        return Ok(ResolvedExpr::OuterColumn {
+            level: depth + 1,
+            table,
+            column,
+            kind,
+        });
+    }
+    Err(if qualifier.is_some() {
+        ERROR_UNKNOWN_TABLE
+    } else {
+        ERROR_BAD_COLUMN
+    })
+}
+
+fn column_candidate(
+    tables: &[ResolvedTable],
+    qualifier: Option<&str>,
+    name: &str,
+) -> Result<Option<(usize, usize)>, u32> {
+    if let Some(qualifier) = qualifier {
+        let Some(table_index) = tables.iter().position(|table| {
+            table.name.eq_ignore_ascii_case(qualifier)
+                || table
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+        }) else {
+            return Ok(None);
+        };
+        let table = tables.get(table_index).ok_or(ERROR_INVALID_TABLE)?;
+        let column = table
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+            .ok_or(ERROR_BAD_COLUMN)?;
+        return Ok(Some((table_index, column)));
+    }
+    let mut found = None;
+    for (table_index, table) in tables.iter().enumerate() {
+        for (column_index, column) in table.columns.iter().enumerate() {
+            if !column.name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            if found.is_some() {
+                return Err(ERROR_BAD_COLUMN);
+            }
+            found = Some((table_index, column_index));
+        }
+    }
+    Ok(found)
+}
+
+fn msi_column_kind(column: &MsiColumn) -> SqlColumnKind {
+    if column.is_binary() {
+        SqlColumnKind::Binary
+    } else if column.is_string() {
+        SqlColumnKind::String {
+            width: column.width(),
+        }
+    } else {
+        SqlColumnKind::Int
+    }
+}
+
 fn resolve_expr(
     database: &MsiDatabaseState,
     tables: &[ResolvedTable],
@@ -4491,6 +5488,7 @@ fn resolve_expr(
     limit: usize,
     expectations: &mut [ParameterExpectation],
     aliases: &[(String, ResolvedExpr)],
+    outer: &[&[ResolvedTable]],
 ) -> Result<ResolvedExpr, u32> {
     match expression {
         SqlExpr::Column { table, name } => {
@@ -4502,15 +5500,10 @@ fn resolve_expr(
                     return Ok(alias.clone());
                 }
             }
-            let (table, column) = resolve_column(
-                database,
-                tables,
-                table.as_deref(),
-                name,
-                limit,
-                ColumnScope::Expression,
-            )?;
-            Ok(ResolvedExpr::Column { table, column })
+            match column_candidate(&tables[..limit.min(tables.len())], table.as_deref(), name)? {
+                Some((table, column)) => Ok(ResolvedExpr::Column { table, column }),
+                None => resolve_outer_column(outer, table.as_deref(), name),
+            }
         }
         SqlExpr::Literal(value) => Ok(ResolvedExpr::Literal(value.clone())),
         SqlExpr::Parameter(index) => {
@@ -4520,18 +5513,17 @@ fn resolve_expr(
             Ok(ResolvedExpr::Parameter(*index))
         }
         SqlExpr::IsNull { value, negated } => {
-            let value = resolve_expr(database, tables, value, limit, expectations, aliases)?;
-            if !matches!(value, ResolvedExpr::Column { .. }) {
-                return Err(ERROR_BAD_QUERY_SYNTAX);
-            }
+            let value = resolve_expr(database, tables, value, limit, expectations, aliases, outer)?;
             Ok(ResolvedExpr::IsNull {
                 value: Box::new(value),
                 negated: *negated,
             })
         }
         SqlExpr::Compare { left, op, right } => {
-            let mut left = resolve_expr(database, tables, left, limit, expectations, aliases)?;
-            let mut right = resolve_expr(database, tables, right, limit, expectations, aliases)?;
+            let mut left =
+                resolve_expr(database, tables, left, limit, expectations, aliases, outer)?;
+            let mut right =
+                resolve_expr(database, tables, right, limit, expectations, aliases, outer)?;
             let left_kind = resolved_column_kind(database, tables, &left)?;
             let right_kind = resolved_column_kind(database, tables, &right)?;
             match (left_kind, right_kind) {
@@ -4567,6 +5559,7 @@ fn resolve_expr(
                 limit,
                 expectations,
                 aliases,
+                outer,
             )?),
             Box::new(resolve_expr(
                 database,
@@ -4575,6 +5568,7 @@ fn resolve_expr(
                 limit,
                 expectations,
                 aliases,
+                outer,
             )?),
         )),
         SqlExpr::Or(left, right) => Ok(ResolvedExpr::Or(
@@ -4585,6 +5579,7 @@ fn resolve_expr(
                 limit,
                 expectations,
                 aliases,
+                outer,
             )?),
             Box::new(resolve_expr(
                 database,
@@ -4593,6 +5588,7 @@ fn resolve_expr(
                 limit,
                 expectations,
                 aliases,
+                outer,
             )?),
         )),
         SqlExpr::Not(inner) => Ok(ResolvedExpr::Not(Box::new(resolve_expr(
@@ -4602,6 +5598,7 @@ fn resolve_expr(
             limit,
             expectations,
             aliases,
+            outer,
         )?))),
         SqlExpr::Like {
             value,
@@ -4609,9 +5606,16 @@ fn resolve_expr(
             escape,
             negated,
         } => {
-            let value = resolve_expr(database, tables, value, limit, expectations, aliases)?;
-            let mut pattern =
-                resolve_expr(database, tables, pattern, limit, expectations, aliases)?;
+            let value = resolve_expr(database, tables, value, limit, expectations, aliases, outer)?;
+            let mut pattern = resolve_expr(
+                database,
+                tables,
+                pattern,
+                limit,
+                expectations,
+                aliases,
+                outer,
+            )?;
             match resolved_column_kind(database, tables, &value)? {
                 Some(SqlColumnKind::String { .. }) | None => {}
                 Some(_) => return Err(ERROR_BAD_QUERY_SYNTAX),
@@ -4640,9 +5644,11 @@ fn resolve_expr(
             high,
             negated,
         } => {
-            let mut value = resolve_expr(database, tables, value, limit, expectations, aliases)?;
-            let mut low = resolve_expr(database, tables, low, limit, expectations, aliases)?;
-            let mut high = resolve_expr(database, tables, high, limit, expectations, aliases)?;
+            let mut value =
+                resolve_expr(database, tables, value, limit, expectations, aliases, outer)?;
+            let mut low = resolve_expr(database, tables, low, limit, expectations, aliases, outer)?;
+            let mut high =
+                resolve_expr(database, tables, high, limit, expectations, aliases, outer)?;
             let kind = resolved_column_kind(database, tables, &value)?
                 .or(resolved_column_kind(database, tables, &low)?)
                 .or(resolved_column_kind(database, tables, &high)?);
@@ -4666,7 +5672,8 @@ fn resolve_expr(
             items,
             negated,
         } => {
-            let mut value = resolve_expr(database, tables, value, limit, expectations, aliases)?;
+            let mut value =
+                resolve_expr(database, tables, value, limit, expectations, aliases, outer)?;
             let mut resolved_items = Vec::with_capacity(items.len());
             for item in items {
                 resolved_items.push(resolve_expr(
@@ -4676,6 +5683,7 @@ fn resolve_expr(
                     limit,
                     expectations,
                     aliases,
+                    outer,
                 )?);
             }
             let mut kind = resolved_column_kind(database, tables, &value)?;
@@ -4707,8 +5715,12 @@ fn resolve_expr(
             query,
             negated,
         } => {
-            let mut value = resolve_expr(database, tables, value, limit, expectations, aliases)?;
-            let resolved = resolve_query_with(database, (**query).clone(), expectations)?;
+            let mut value =
+                resolve_expr(database, tables, value, limit, expectations, aliases, outer)?;
+            let mut nested: Vec<&[ResolvedTable]> = Vec::with_capacity(outer.len() + 1);
+            nested.push(tables);
+            nested.extend_from_slice(outer);
+            let resolved = resolve_query_with(database, (**query).clone(), expectations, &nested)?;
             if resolved.columns.len() != 1 {
                 return Err(ERROR_BAD_QUERY_SYNTAX);
             }
@@ -4732,17 +5744,135 @@ fn resolve_expr(
             })
         }
         SqlExpr::ScalarQuery(query) => {
-            let resolved = resolve_query_with(database, (**query).clone(), expectations)?;
+            let mut nested: Vec<&[ResolvedTable]> = Vec::with_capacity(outer.len() + 1);
+            nested.push(tables);
+            nested.extend_from_slice(outer);
+            let resolved = resolve_query_with(database, (**query).clone(), expectations, &nested)?;
             if resolved.columns.len() != 1 {
                 return Err(ERROR_BAD_QUERY_SYNTAX);
             }
             Ok(ResolvedExpr::ScalarQuery(Box::new(resolved)))
         }
-        SqlExpr::Aggregate { function, argument } => {
+        SqlExpr::Exists { query, negated } => {
+            let mut nested: Vec<&[ResolvedTable]> = Vec::with_capacity(outer.len() + 1);
+            nested.push(tables);
+            nested.extend_from_slice(outer);
+            let resolved = resolve_query_with(database, (**query).clone(), expectations, &nested)?;
+            Ok(ResolvedExpr::Exists {
+                query: Box::new(resolved),
+                negated: *negated,
+            })
+        }
+        SqlExpr::Unary { op, value } => {
+            let mut value =
+                resolve_expr(database, tables, value, limit, expectations, aliases, outer)?;
+            coerce_against(
+                database,
+                tables,
+                &mut value,
+                SqlColumnKind::Int,
+                expectations,
+            )?;
+            Ok(ResolvedExpr::Unary {
+                op: *op,
+                value: Box::new(value),
+            })
+        }
+        SqlExpr::Binary { op, left, right } => {
+            let mut left =
+                resolve_expr(database, tables, left, limit, expectations, aliases, outer)?;
+            let mut right =
+                resolve_expr(database, tables, right, limit, expectations, aliases, outer)?;
+            coerce_against(
+                database,
+                tables,
+                &mut left,
+                SqlColumnKind::Int,
+                expectations,
+            )?;
+            coerce_against(
+                database,
+                tables,
+                &mut right,
+                SqlColumnKind::Int,
+                expectations,
+            )?;
+            Ok(ResolvedExpr::Binary {
+                op: *op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        SqlExpr::Function {
+            function,
+            arguments,
+        } => {
+            let mut resolved = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                resolved.push(resolve_expr(
+                    database,
+                    tables,
+                    argument,
+                    limit,
+                    expectations,
+                    aliases,
+                    outer,
+                )?);
+            }
+            match function {
+                SqlFunction::Upper | SqlFunction::Lower | SqlFunction::Length => {
+                    if let Some(argument) = resolved.first_mut() {
+                        coerce_against(
+                            database,
+                            tables,
+                            argument,
+                            SqlColumnKind::String { width: 0 },
+                            expectations,
+                        )?;
+                    }
+                }
+                SqlFunction::Substring => {
+                    if let Some(argument) = resolved.first_mut() {
+                        coerce_against(
+                            database,
+                            tables,
+                            argument,
+                            SqlColumnKind::String { width: 0 },
+                            expectations,
+                        )?;
+                    }
+                    for argument in resolved.iter_mut().skip(1) {
+                        coerce_against(
+                            database,
+                            tables,
+                            argument,
+                            SqlColumnKind::Int,
+                            expectations,
+                        )?;
+                    }
+                }
+            }
+            Ok(ResolvedExpr::Function {
+                function: *function,
+                arguments: resolved,
+            })
+        }
+        SqlExpr::Aggregate {
+            function,
+            argument,
+            distinct,
+        } => {
             let argument = match argument {
                 Some(argument) => {
-                    let resolved =
-                        resolve_expr(database, tables, argument, limit, expectations, aliases)?;
+                    let resolved = resolve_expr(
+                        database,
+                        tables,
+                        argument,
+                        limit,
+                        expectations,
+                        aliases,
+                        outer,
+                    )?;
                     if contains_resolved_aggregate(&resolved) {
                         return Err(ERROR_BAD_QUERY_SYNTAX);
                     }
@@ -4753,6 +5883,7 @@ fn resolve_expr(
             Ok(ResolvedExpr::Aggregate {
                 function: *function,
                 argument,
+                distinct: *distinct,
             })
         }
     }
@@ -5841,12 +6972,6 @@ mod tests {
         }
     }
 
-    /// Three related tables plus a real `_Validation` table:
-    /// Product 1..N Feature 1..N Component, with a dangling feature/product
-    /// row and nullable Weight/Title columns for outer joins and NULL ordering.
-    /// Product P3 and Feature 4 exercise null extension and Feature.Title is
-    /// the string NULL used by IS NULL / ORDER BY tests (integer NULL cells in
-    /// MSI streams use the i32::MIN sentinel).
     fn relational_compound() -> Vec<u8> {
         let mut database = MsiDatabaseState::empty(String::new());
         database.tables.insert(
@@ -5976,6 +7101,27 @@ mod tests {
             },
         );
         database.tables.insert(
+            "Label".to_string(),
+            MsiTable {
+                name: "Label".to_string(),
+                columns: vec![column("LabelId", S32_KEY), column("Text", S64)],
+                rows: vec![
+                    vec![
+                        MsiValue::Str("L1".to_string()),
+                        MsiValue::Str("Äpfel".to_string()),
+                    ],
+                    vec![
+                        MsiValue::Str("L2".to_string()),
+                        MsiValue::Str("ÉCLAIR".to_string()),
+                    ],
+                    vec![
+                        MsiValue::Str("L3".to_string()),
+                        MsiValue::Str("straße".to_string()),
+                    ],
+                ],
+            },
+        );
+        database.tables.insert(
             "_Validation".to_string(),
             MsiTable {
                 name: "_Validation".to_string(),
@@ -6093,285 +7239,6 @@ mod tests {
             HostThunk::MsiViewModify,
             &[view as u32, mode, record as u32],
         )
-    }
-
-    #[test]
-    fn msi_sql_joins_left_outer_null_extension_and_order() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("msi-sql-join");
-            let (db, _path) = open_fixture(&mut fixture, "join.msi", &relational_compound());
-
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT p.Name, f.Title FROM Product p INNER JOIN Feature f \
-                 ON p.ProductCode = f.ProductCode ORDER BY p.Name ASC, f.FeatureId ASC",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 2),
-                vec![
-                    vec!["Alpha".to_string(), "Fast".to_string()],
-                    vec!["Alpha".to_string(), "Slow".to_string()],
-                    vec!["Beta".to_string(), "Only".to_string()],
-                    vec!["Beta".to_string(), "Fast".to_string()],
-                ]
-            );
-
-            // Two outer joins: Gamma has no Feature and Beta's features have
-            // no Component, so both projections must carry NULL extension.
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT p.Name, f.Title, c.Label FROM Product AS p \
-                 LEFT OUTER JOIN Feature AS f ON p.ProductCode = f.ProductCode \
-                 LEFT JOIN Component c ON f.FeatureId = c.FeatureId \
-                 ORDER BY p.Name, f.FeatureId, c.ComponentId",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 3),
-                vec![
-                    vec!["Alpha".to_string(), "Fast".to_string(), "first".to_string()],
-                    vec![
-                        "Alpha".to_string(),
-                        "Fast".to_string(),
-                        "second".to_string()
-                    ],
-                    vec!["Alpha".to_string(), "Slow".to_string(), "third".to_string()],
-                    vec!["Beta".to_string(), "Only".to_string(), String::new()],
-                    vec!["Beta".to_string(), "Fast".to_string(), String::new()],
-                    vec!["Gamma".to_string(), String::new(), String::new()],
-                ]
-            );
-
-            // INNER JOIN drops the unmatched Product row entirely.
-            let inner = open_view(
-                &mut fixture,
-                db,
-                "SELECT p.Name FROM Product p INNER JOIN Feature f \
-                 ON f.ProductCode = p.ProductCode",
-            );
-            assert_eq!(execute(&mut fixture, inner), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, inner, 1),
-                vec![
-                    vec!["Alpha".to_string()],
-                    vec!["Alpha".to_string()],
-                    vec!["Beta".to_string()],
-                    vec!["Beta".to_string()],
-                ]
-            );
-        });
-    }
-
-    #[test]
-    fn msi_sql_where_groups_is_null_distinct_and_order_keys() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("msi-sql-where");
-            let (db, _path) = open_fixture(&mut fixture, "where.msi", &relational_compound());
-
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT DISTINCT p.ProductCode FROM Product p INNER JOIN Feature f \
-                 ON p.ProductCode = f.ProductCode ORDER BY p.ProductCode DESC",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 1),
-                vec![vec!["P2".to_string()], vec!["P1".to_string()]]
-            );
-
-            for (sql, expected) in [
-                (
-                    "SELECT FeatureId FROM Feature WHERE (Weight >= 5 AND Weight <= 10) OR Title IS NULL ORDER BY FeatureId",
-                    vec![
-                        vec!["1".to_string()],
-                        vec!["2".to_string()],
-                        vec!["4".to_string()],
-                    ],
-                ),
-                (
-                    "SELECT FeatureId FROM Feature WHERE Title IS NOT NULL ORDER BY FeatureId",
-                    vec![
-                        vec!["1".to_string()],
-                        vec!["2".to_string()],
-                        vec!["3".to_string()],
-                        vec!["5".to_string()],
-                    ],
-                ),
-                (
-                    "SELECT Name FROM Product WHERE Price <> 10 ORDER BY Name",
-                    vec![vec!["Beta".to_string()], vec!["Gamma".to_string()]],
-                ),
-                (
-                    "SELECT Name FROM Product WHERE Price != 10 ORDER BY Name",
-                    vec![vec!["Beta".to_string()], vec!["Gamma".to_string()]],
-                ),
-                (
-                    "SELECT Name FROM Product WHERE Price < 20 ORDER BY Name",
-                    vec![vec!["Alpha".to_string()], vec!["Gamma".to_string()]],
-                ),
-                (
-                    "SELECT Name FROM Product WHERE Price <= 10 ORDER BY Name",
-                    vec![vec!["Alpha".to_string()], vec!["Gamma".to_string()]],
-                ),
-                (
-                    "SELECT Name FROM Product WHERE Price > 10 ORDER BY Name",
-                    vec![vec!["Beta".to_string()]],
-                ),
-                (
-                    "SELECT Name FROM Product WHERE Price >= 20 ORDER BY Name",
-                    vec![vec!["Beta".to_string()]],
-                ),
-            ] {
-                let view = open_view(&mut fixture, db, sql);
-                assert_eq!(execute(&mut fixture, view), OK, "{sql}");
-                assert_eq!(collect_rows(&mut fixture, view, 1), expected, "{sql}");
-            }
-
-            // Integer NULL columns use the same msivalue::Null sentinel.
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT FeatureId FROM Feature WHERE Weight IS NULL",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 1),
-                vec![vec!["4".to_string()]]
-            );
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT FeatureId FROM Feature ORDER BY Weight ASC, FeatureId DESC",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 1),
-                vec![
-                    vec!["4".to_string()],
-                    vec!["5".to_string()],
-                    vec!["3".to_string()],
-                    vec!["1".to_string()],
-                    vec!["2".to_string()],
-                ]
-            );
-
-            // NULL sorts first ascending and last descending (MSI/SQL Server).
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT FeatureId FROM Feature ORDER BY Title ASC, FeatureId DESC",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 1),
-                vec![
-                    vec!["4".to_string()],
-                    vec!["5".to_string()],
-                    vec!["1".to_string()],
-                    vec!["3".to_string()],
-                    vec!["2".to_string()],
-                ]
-            );
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT FeatureId FROM Feature ORDER BY Title DESC, FeatureId ASC",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 1),
-                vec![
-                    vec!["2".to_string()],
-                    vec!["3".to_string()],
-                    vec!["1".to_string()],
-                    vec!["5".to_string()],
-                    vec!["4".to_string()],
-                ]
-            );
-        });
-    }
-
-    #[test]
-    fn msi_sql_aliases_resolve_columns_and_labels() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("msi-sql-alias");
-            let (db, _path) = open_fixture(&mut fixture, "alias.msi", &relational_compound());
-
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT p.Name AS Item, f.Title AS Part FROM Product AS p \
-                 INNER JOIN Feature f ON p.ProductCode = f.ProductCode \
-                 WHERE p.Price = 10 ORDER BY Item, Part DESC",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 2),
-                vec![
-                    vec!["Alpha".to_string(), "Slow".to_string()],
-                    vec!["Alpha".to_string(), "Fast".to_string()],
-                ]
-            );
-            assert_eq!(
-                dispatch_x86(
-                    &mut fixture,
-                    HostThunk::MsiViewGetColumnInfo,
-                    &[view as u32, 0, OUT_PTR as u32]
-                ),
-                OK
-            );
-            let names = guest_pointer(&fixture.memory, OUT_PTR);
-            assert_eq!(
-                record_string(&mut fixture, names, 1),
-                (0, "Item".to_string())
-            );
-            assert_eq!(
-                record_string(&mut fixture, names, 2),
-                (0, "Part".to_string())
-            );
-
-            // A table alias does not hide the real table name as a qualifier.
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT Name FROM Product p WHERE Product.Price = 20",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 1),
-                vec![vec!["Beta".to_string()]]
-            );
-
-            // Unqualified names resolve when exactly one FROM table has them.
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT Title FROM Product p INNER JOIN Feature f \
-                 ON p.ProductCode = f.ProductCode WHERE Title = 'Only'",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 1),
-                vec![vec!["Only".to_string()]]
-            );
-
-            // A self-join is legal when both instances have distinct aliases.
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT a.Name, b.Name FROM Product a INNER JOIN Product b \
-                 ON a.ProductCode = b.ProductCode WHERE b.Price = 20",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 2),
-                vec![vec!["Beta".to_string(), "Beta".to_string()]]
-            );
-        });
     }
 
     #[test]
@@ -6705,550 +7572,307 @@ mod tests {
     }
 
     #[test]
-    fn msi_sql_right_full_cross_and_three_way_joins() {
+    fn msi_sql_correlated_subqueries_and_derived_tables() {
         with_big_stack(|| {
-            let mut fixture = x86_fixture("msi-sql-join-kinds");
-            let (db, _path) = open_fixture(&mut fixture, "joinkinds.msi", &relational_compound());
+            let mut fixture = x86_fixture("msi-sql-correlated");
+            let (db, _path) = open_fixture(&mut fixture, "correlated.msi", &relational_compound());
 
-            let right = open_view(
-                &mut fixture,
-                db,
-                "SELECT f.FeatureId, p.Name FROM Product p RIGHT OUTER JOIN Feature f \
-                 ON p.ProductCode = f.ProductCode ORDER BY f.FeatureId",
-            );
-            assert_eq!(execute(&mut fixture, right), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, right, 2),
-                vec![
-                    vec!["1".to_string(), "Alpha".to_string()],
-                    vec!["2".to_string(), "Alpha".to_string()],
-                    vec!["3".to_string(), "Beta".to_string()],
-                    vec!["4".to_string(), String::new()],
-                    vec!["5".to_string(), "Beta".to_string()],
-                ]
-            );
-
-            let full = open_view(
-                &mut fixture,
-                db,
-                "SELECT p.ProductCode, f.FeatureId FROM Product p FULL OUTER JOIN Feature f \
-                 ON p.ProductCode = f.ProductCode ORDER BY p.ProductCode, f.FeatureId",
-            );
-            assert_eq!(execute(&mut fixture, full), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, full, 2),
-                vec![
-                    vec![String::new(), "4".to_string()],
-                    vec!["P1".to_string(), "1".to_string()],
-                    vec!["P1".to_string(), "2".to_string()],
-                    vec!["P2".to_string(), "3".to_string()],
-                    vec!["P2".to_string(), "5".to_string()],
-                    vec!["P3".to_string(), String::new()],
-                ]
-            );
-
-            let cross = open_view(
-                &mut fixture,
-                db,
-                "SELECT COUNT(*) AS Cnt FROM Product CROSS JOIN Component",
-            );
-            assert_eq!(execute(&mut fixture, cross), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, cross, 1),
-                vec![vec!["12".to_string()]]
-            );
-
-            let chain = open_view(
-                &mut fixture,
-                db,
-                "SELECT p.ProductCode, f.FeatureId, c.ComponentId FROM Product p \
-                 INNER JOIN Feature f ON p.ProductCode = f.ProductCode \
-                 INNER JOIN Component c ON f.FeatureId = c.FeatureId \
-                 ORDER BY f.FeatureId, c.ComponentId",
-            );
-            assert_eq!(execute(&mut fixture, chain), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, chain, 3),
-                vec![
-                    vec!["P1".to_string(), "1".to_string(), "C1".to_string()],
-                    vec!["P1".to_string(), "1".to_string(), "C2".to_string()],
-                    vec!["P1".to_string(), "2".to_string(), "C3".to_string()],
-                ]
-            );
-
-            let right_chain = open_view(
-                &mut fixture,
-                db,
-                "SELECT p.ProductCode, f.FeatureId, c.ComponentId FROM Product p \
-                 LEFT JOIN Feature f ON p.ProductCode = f.ProductCode \
-                 RIGHT JOIN Component c ON f.FeatureId = c.FeatureId \
-                 ORDER BY c.ComponentId",
-            );
-            assert_eq!(execute(&mut fixture, right_chain), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, right_chain, 3),
-                vec![
-                    vec!["P1".to_string(), "1".to_string(), "C1".to_string()],
-                    vec!["P1".to_string(), "1".to_string(), "C2".to_string()],
-                    vec!["P1".to_string(), "2".to_string(), "C3".to_string()],
-                    vec![String::new(), String::new(), "C4".to_string()],
-                ]
-            );
-
-            let on_or = open_view(
-                &mut fixture,
-                db,
-                "SELECT COUNT(*) AS Cnt FROM Product p INNER JOIN Feature f \
-                 ON p.ProductCode = f.ProductCode AND (f.Weight = 1 OR f.Weight = 10)",
-            );
-            assert_eq!(execute(&mut fixture, on_or), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, on_or, 1),
-                vec![vec!["3".to_string()]]
-            );
-        });
-    }
-
-    #[test]
-    fn msi_sql_grouping_aggregates_having_and_nulls() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("msi-sql-group");
-            let (db, _path) = open_fixture(&mut fixture, "group.msi", &relational_compound());
-
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT ProductCode, COUNT(*) AS Cnt, COUNT(Weight) AS NonNull, \
-                 SUM(Weight) AS Total, AVG(Weight) AS Mean, MIN(Weight) AS Lo, \
-                 MAX(Weight) AS Hi FROM Feature GROUP BY ProductCode ORDER BY ProductCode",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 7),
-                vec![
+            for (sql, fields, expected) in [
+                (
+                    "SELECT p.Name, (SELECT COUNT(*) FROM Feature f \
+                     WHERE f.ProductCode = p.ProductCode) AS Cnt \
+                     FROM Product p ORDER BY p.Name",
+                    2,
                     vec![
-                        "P1".to_string(),
-                        "2".to_string(),
-                        "2".to_string(),
-                        "15".to_string(),
-                        "7".to_string(),
-                        "5".to_string(),
-                        "10".to_string(),
-                    ],
-                    vec![
-                        "P2".to_string(),
-                        "2".to_string(),
-                        "2".to_string(),
-                        "2".to_string(),
-                        "1".to_string(),
-                        "1".to_string(),
-                        "1".to_string(),
-                    ],
-                    vec![
-                        "P9".to_string(),
-                        "1".to_string(),
-                        "0".to_string(),
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                    ],
-                ]
-            );
-
-            let alias = open_view(
-                &mut fixture,
-                db,
-                "SELECT ProductCode AS Code, COUNT(*) AS Cnt FROM Feature GROUP BY Code \
-                 HAVING Cnt > 1 ORDER BY Code",
-            );
-            assert_eq!(execute(&mut fixture, alias), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, alias, 2),
-                vec![
-                    vec!["P1".to_string(), "2".to_string()],
-                    vec!["P2".to_string(), "2".to_string()],
-                ]
-            );
-
-            let having = open_view(
-                &mut fixture,
-                db,
-                "SELECT ProductCode, SUM(Weight) AS Total FROM Feature GROUP BY ProductCode \
-                 HAVING SUM(Weight) >= 2 ORDER BY ProductCode",
-            );
-            assert_eq!(execute(&mut fixture, having), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, having, 2),
-                vec![
-                    vec!["P1".to_string(), "15".to_string()],
-                    vec!["P2".to_string(), "2".to_string()],
-                ]
-            );
-
-            let grouped_having = open_view(
-                &mut fixture,
-                db,
-                "SELECT ProductCode, COUNT(*) AS Cnt FROM Feature GROUP BY ProductCode \
-                 HAVING ProductCode = 'P1'",
-            );
-            assert_eq!(execute(&mut fixture, grouped_having), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, grouped_having, 2),
-                vec![vec!["P1".to_string(), "2".to_string()]]
-            );
-
-            let global = open_view(
-                &mut fixture,
-                db,
-                "SELECT COUNT(*) AS Cnt, COUNT(Weight) AS W, SUM(Weight) AS S FROM Feature",
-            );
-            assert_eq!(execute(&mut fixture, global), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, global, 3),
-                vec![vec!["5".to_string(), "4".to_string(), "17".to_string()]]
-            );
-
-            let empty = open_view(
-                &mut fixture,
-                db,
-                "SELECT COUNT(*) AS Cnt, SUM(Weight) AS S FROM Feature WHERE FeatureId > 100",
-            );
-            assert_eq!(execute(&mut fixture, empty), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, empty, 2),
-                vec![vec!["0".to_string(), String::new()]]
-            );
-
-            let grouped_by_name = open_view(
-                &mut fixture,
-                db,
-                "SELECT Name, COUNT(*) AS Cnt FROM Product GROUP BY Name ORDER BY Name",
-            );
-            assert_eq!(execute(&mut fixture, grouped_by_name), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, grouped_by_name, 2),
-                vec![
-                    vec!["Alpha".to_string(), "1".to_string()],
-                    vec!["Beta".to_string(), "1".to_string()],
-                    vec!["Gamma".to_string(), "1".to_string()],
-                ]
-            );
-        });
-    }
-
-    #[test]
-    fn msi_sql_like_in_between_not_and_predicates() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("msi-sql-predicates");
-            let (db, _path) = open_fixture(&mut fixture, "predicates.msi", &relational_compound());
-
-            for (sql, expected) in [
-                (
-                    "SELECT FeatureId FROM Feature WHERE Title LIKE 'F%' ORDER BY FeatureId",
-                    vec![vec!["1".to_string()], vec!["5".to_string()]],
-                ),
-                (
-                    "SELECT FeatureId FROM Feature WHERE Title LIKE '_a%' ORDER BY FeatureId",
-                    vec![vec!["1".to_string()], vec!["5".to_string()]],
-                ),
-                (
-                    "SELECT FeatureId FROM Feature WHERE Title LIKE '[F-M]%' ORDER BY FeatureId",
-                    vec![vec!["1".to_string()], vec!["5".to_string()]],
-                ),
-                (
-                    "SELECT FeatureId FROM Feature WHERE Title LIKE '[^F]%' ORDER BY FeatureId",
-                    vec![vec!["2".to_string()], vec!["3".to_string()]],
-                ),
-                (
-                    "SELECT FeatureId FROM Feature WHERE FeatureId IN (1, 3, 5) ORDER BY FeatureId",
-                    vec![
-                        vec!["1".to_string()],
-                        vec!["3".to_string()],
-                        vec!["5".to_string()],
+                        vec!["Alpha".to_string(), "2".to_string()],
+                        vec!["Beta".to_string(), "2".to_string()],
+                        vec!["Gamma".to_string(), "0".to_string()],
                     ],
                 ),
                 (
-                    "SELECT FeatureId FROM Feature WHERE Title IN ('Fast', 'Only') ORDER BY FeatureId",
-                    vec![
-                        vec!["1".to_string()],
-                        vec!["3".to_string()],
-                        vec!["5".to_string()],
-                    ],
-                ),
-                (
-                    "SELECT FeatureId FROM Feature WHERE Weight BETWEEN 1 AND 5 ORDER BY FeatureId",
-                    vec![
-                        vec!["1".to_string()],
-                        vec!["3".to_string()],
-                        vec!["5".to_string()],
-                    ],
-                ),
-                (
-                    "SELECT FeatureId FROM Feature WHERE Weight NOT BETWEEN 1 AND 5 ORDER BY FeatureId",
-                    vec![vec!["2".to_string()]],
-                ),
-                (
-                    "SELECT FeatureId FROM Feature WHERE NOT (FeatureId = 1 OR FeatureId = 2) \
-                     ORDER BY FeatureId",
-                    vec![
-                        vec!["3".to_string()],
-                        vec!["4".to_string()],
-                        vec!["5".to_string()],
-                    ],
-                ),
-                (
-                    "SELECT FeatureId FROM Feature WHERE \
-                     (Weight = 1 OR Weight = 10) AND NOT Title = 'Fast' ORDER BY FeatureId",
-                    vec![vec!["2".to_string()], vec!["3".to_string()]],
-                ),
-                (
-                    "SELECT DocId FROM Doc WHERE Body LIKE '100\\%' ESCAPE '\\'",
-                    vec![vec!["d1".to_string()]],
-                ),
-                (
-                    "SELECT DocId FROM Doc WHERE Body LIKE 'a\\_b' ESCAPE '\\' ORDER BY DocId",
-                    vec![vec!["d2".to_string()]],
-                ),
-                (
-                    "SELECT DocId FROM Doc WHERE Body LIKE 'a_%' ORDER BY DocId",
-                    vec![vec!["d2".to_string()], vec!["d3".to_string()]],
-                ),
-            ] {
-                let view = open_view(&mut fixture, db, sql);
-                assert_eq!(execute(&mut fixture, view), OK, "{sql}");
-                assert_eq!(collect_rows(&mut fixture, view, 1), expected, "{sql}");
-            }
-        });
-    }
-
-    #[test]
-    fn msi_sql_scalar_and_in_subqueries() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("msi-sql-subquery");
-            let (db, _path) = open_fixture(&mut fixture, "subquery.msi", &relational_compound());
-
-            for (sql, expected) in [
-                (
-                    "SELECT Name FROM Product WHERE Price > (SELECT AVG(Weight) FROM Feature) \
-                     ORDER BY Name",
-                    vec![
-                        vec!["Alpha".to_string()],
-                        vec!["Beta".to_string()],
-                        vec!["Gamma".to_string()],
-                    ],
-                ),
-                (
-                    "SELECT Name FROM Product WHERE Price > (SELECT MAX(Weight) FROM Feature) \
-                     ORDER BY Name",
-                    vec![vec!["Beta".to_string()]],
-                ),
-                (
-                    "SELECT Name FROM Product WHERE Price > \
-                     (SELECT AVG(Weight) FROM Feature WHERE ProductCode = 'P1') ORDER BY Name",
+                    "SELECT p.Name FROM Product p WHERE p.Price > \
+                     (SELECT AVG(f.Weight) FROM Feature f \
+                      WHERE f.ProductCode = p.ProductCode) ORDER BY p.Name",
+                    1,
                     vec![vec!["Alpha".to_string()], vec!["Beta".to_string()]],
                 ),
                 (
-                    "SELECT Name FROM Product WHERE Price = (SELECT COUNT(*) FROM Feature) \
-                     ORDER BY Name",
-                    vec![vec!["Gamma".to_string()]],
-                ),
-                (
-                    "SELECT Name FROM Product WHERE ProductCode IN \
-                     (SELECT ProductCode FROM Feature WHERE Weight >= 10) ORDER BY Name",
+                    "SELECT p.Name FROM Product p WHERE EXISTS \
+                     (SELECT 1 FROM Feature f WHERE f.ProductCode = p.ProductCode \
+                      AND f.Weight >= 10) ORDER BY p.Name",
+                    1,
                     vec![vec!["Alpha".to_string()]],
                 ),
                 (
-                    "SELECT Name FROM Product WHERE ProductCode NOT IN \
-                     (SELECT ProductCode FROM Feature WHERE Weight >= 10) ORDER BY Name",
-                    vec![vec!["Beta".to_string()], vec!["Gamma".to_string()]],
+                    "SELECT p.Name FROM Product p WHERE NOT EXISTS \
+                     (SELECT 1 FROM Feature f WHERE f.ProductCode = p.ProductCode) \
+                     ORDER BY p.Name",
+                    1,
+                    vec![vec!["Gamma".to_string()]],
+                ),
+                (
+                    "SELECT p.Name FROM Product p WHERE p.ProductCode IN \
+                     (SELECT f.ProductCode FROM Feature f WHERE f.Weight >= p.Price) \
+                     ORDER BY p.Name",
+                    1,
+                    vec![vec!["Alpha".to_string()]],
+                ),
+                (
+                    "SELECT p.Name FROM Product p WHERE EXISTS \
+                     (SELECT 1 FROM Feature f WHERE f.ProductCode = p.ProductCode \
+                      AND EXISTS (SELECT 1 FROM Component c \
+                                  WHERE c.FeatureId = f.FeatureId AND c.Label = 'third')) \
+                     ORDER BY p.Name",
+                    1,
+                    vec![vec!["Alpha".to_string()]],
+                ),
+                (
+                    "SELECT d.Name, d.Price FROM \
+                     (SELECT Name, Price FROM Product WHERE Price >= 10) AS d \
+                     WHERE d.Price < 20 ORDER BY d.Name",
+                    2,
+                    vec![vec!["Alpha".to_string(), "10".to_string()]],
+                ),
+                (
+                    "SELECT d.Code, COUNT(*) AS Cnt FROM \
+                     (SELECT ProductCode AS Code FROM Feature WHERE Weight IS NOT NULL) d \
+                     GROUP BY d.Code ORDER BY d.Code",
+                    2,
+                    vec![
+                        vec!["P1".to_string(), "2".to_string()],
+                        vec!["P2".to_string(), "2".to_string()],
+                    ],
+                ),
+                (
+                    "SELECT d.Name, f.Title FROM \
+                     (SELECT ProductCode, Name FROM Product) d INNER JOIN Feature f \
+                     ON d.ProductCode = f.ProductCode WHERE f.Weight = 10 \
+                     ORDER BY d.Name",
+                    2,
+                    vec![vec!["Alpha".to_string(), "Slow".to_string()]],
+                ),
+                (
+                    "SELECT d.Name FROM (SELECT * FROM Product WHERE Price = 5) d \
+                     ORDER BY d.Name",
+                    1,
+                    vec![vec!["Gamma".to_string()]],
                 ),
             ] {
                 let view = open_view(&mut fixture, db, sql);
                 assert_eq!(execute(&mut fixture, view), OK, "{sql}");
-                assert_eq!(collect_rows(&mut fixture, view, 1), expected, "{sql}");
+                assert_eq!(collect_rows(&mut fixture, view, fields), expected, "{sql}");
             }
 
-            let select_list = open_view(
-                &mut fixture,
-                db,
-                "SELECT Name, (SELECT COUNT(*) FROM Feature) AS Cnt FROM Product ORDER BY Name",
-            );
-            assert_eq!(execute(&mut fixture, select_list), OK);
             assert_eq!(
-                collect_rows(&mut fixture, select_list, 2),
-                vec![
-                    vec!["Alpha".to_string(), "5".to_string()],
-                    vec!["Beta".to_string(), "5".to_string()],
-                    vec!["Gamma".to_string(), "5".to_string()],
-                ]
+                open_view_error(
+                    &mut fixture,
+                    db,
+                    "SELECT d.Name FROM (SELECT Name FROM Product)"
+                ),
+                u64::from(ERROR_BAD_QUERY_SYNTAX)
+            );
+            assert_eq!(
+                open_view_error(
+                    &mut fixture,
+                    db,
+                    "SELECT p.Name FROM Product p WHERE EXISTS \
+                     (SELECT 1 FROM Feature f WHERE f.Missing = p.ProductCode)"
+                ),
+                u64::from(ERROR_BAD_COLUMN)
             );
         });
     }
 
     #[test]
-    fn msi_sql_union_and_union_all() {
+    fn msi_sql_group_ordinals_distinct_aggregates_and_having_subqueries() {
         with_big_stack(|| {
-            let mut fixture = x86_fixture("msi-sql-union");
-            let (db, _path) = open_fixture(&mut fixture, "union.msi", &relational_compound());
-
-            let view = open_view(
-                &mut fixture,
-                db,
-                "SELECT ProductCode FROM Product UNION SELECT ProductCode FROM Feature \
-                 ORDER BY ProductCode",
-            );
-            assert_eq!(execute(&mut fixture, view), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, view, 1),
-                vec![
-                    vec!["P1".to_string()],
-                    vec!["P2".to_string()],
-                    vec!["P3".to_string()],
-                    vec!["P9".to_string()],
-                ]
-            );
-
-            let all = open_view(
-                &mut fixture,
-                db,
-                "SELECT ProductCode FROM Product UNION ALL SELECT ProductCode FROM Feature \
-                 ORDER BY ProductCode",
-            );
-            assert_eq!(execute(&mut fixture, all), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, all, 1),
-                vec![
-                    vec!["P1".to_string()],
-                    vec!["P1".to_string()],
-                    vec!["P1".to_string()],
-                    vec!["P2".to_string()],
-                    vec!["P2".to_string()],
-                    vec!["P2".to_string()],
-                    vec!["P3".to_string()],
-                    vec!["P9".to_string()],
-                ]
-            );
-
-            let dedup = open_view(
-                &mut fixture,
-                db,
-                "SELECT ProductCode FROM Feature UNION SELECT ProductCode FROM Feature \
-                 ORDER BY ProductCode",
-            );
-            assert_eq!(execute(&mut fixture, dedup), OK);
-            assert_eq!(
-                collect_rows(&mut fixture, dedup, 1),
-                vec![
-                    vec!["P1".to_string()],
-                    vec!["P2".to_string()],
-                    vec!["P9".to_string()],
-                ]
-            );
-        });
-    }
-
-    #[test]
-    fn msi_sql_order_ordinals_aggregate_aliases_and_parameters() {
-        with_big_stack(|| {
-            let mut fixture = x86_fixture("msi-sql-order-ext");
-            let (db, _path) = open_fixture(&mut fixture, "orderext.msi", &relational_compound());
+            let mut fixture = x86_fixture("msi-sql-group-depth");
+            let (db, _path) = open_fixture(&mut fixture, "groupdepth.msi", &relational_compound());
 
             let ordinal = open_view(
                 &mut fixture,
                 db,
-                "SELECT Name, Price FROM Product ORDER BY 2 DESC, 1",
+                "SELECT ProductCode, COUNT(*) AS Cnt, SUM(Weight) AS Total \
+                 FROM Feature GROUP BY 1 ORDER BY 1",
             );
             assert_eq!(execute(&mut fixture, ordinal), OK);
             assert_eq!(
-                collect_rows(&mut fixture, ordinal, 2),
+                collect_rows(&mut fixture, ordinal, 3),
                 vec![
-                    vec!["Beta".to_string(), "20".to_string()],
-                    vec!["Alpha".to_string(), "10".to_string()],
-                    vec!["Gamma".to_string(), "5".to_string()],
+                    vec!["P1".to_string(), "2".to_string(), "15".to_string()],
+                    vec!["P2".to_string(), "2".to_string(), "2".to_string()],
+                    vec!["P9".to_string(), "1".to_string(), String::new()],
                 ]
             );
 
-            let aggregate_alias = open_view(
+            let distinct = open_view(
+                &mut fixture,
+                db,
+                "SELECT COUNT(DISTINCT ProductCode) AS Codes, \
+                 COUNT(DISTINCT Weight) AS Weights, \
+                 SUM(DISTINCT Weight) AS S, AVG(DISTINCT Weight) AS A FROM Feature",
+            );
+            assert_eq!(execute(&mut fixture, distinct), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, distinct, 4),
+                vec![vec![
+                    "3".to_string(),
+                    "3".to_string(),
+                    "16".to_string(),
+                    "5".to_string(),
+                ]]
+            );
+
+            let distinct_group = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode, COUNT(DISTINCT Weight) AS Cnt FROM Feature \
+                 GROUP BY 1 ORDER BY 1",
+            );
+            assert_eq!(execute(&mut fixture, distinct_group), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, distinct_group, 2),
+                vec![
+                    vec!["P1".to_string(), "2".to_string()],
+                    vec!["P2".to_string(), "1".to_string()],
+                    vec!["P9".to_string(), "0".to_string()],
+                ]
+            );
+
+            let having_exists = open_view(
                 &mut fixture,
                 db,
                 "SELECT ProductCode, COUNT(*) AS Cnt FROM Feature GROUP BY ProductCode \
-                 ORDER BY Cnt DESC, ProductCode",
+                 HAVING EXISTS (SELECT 1 FROM Product p \
+                                WHERE p.ProductCode = Feature.ProductCode) \
+                 ORDER BY ProductCode",
             );
-            assert_eq!(execute(&mut fixture, aggregate_alias), OK);
+            assert_eq!(execute(&mut fixture, having_exists), OK);
             assert_eq!(
-                collect_rows(&mut fixture, aggregate_alias, 2),
+                collect_rows(&mut fixture, having_exists, 2),
                 vec![
                     vec!["P1".to_string(), "2".to_string()],
                     vec!["P2".to_string(), "2".to_string()],
-                    vec!["P9".to_string(), "1".to_string()],
                 ]
             );
 
-            let aggregate_expr = open_view(
+            let having_scalar = open_view(
                 &mut fixture,
                 db,
-                "SELECT ProductCode FROM Feature GROUP BY ProductCode \
-                 ORDER BY COUNT(*) DESC, ProductCode",
+                "SELECT ProductCode, COUNT(*) AS Cnt FROM Feature GROUP BY ProductCode \
+                 HAVING COUNT(*) > (SELECT COUNT(*) FROM Product WHERE Price < 10) \
+                 ORDER BY ProductCode",
             );
-            assert_eq!(execute(&mut fixture, aggregate_expr), OK);
+            assert_eq!(execute(&mut fixture, having_scalar), OK);
             assert_eq!(
-                collect_rows(&mut fixture, aggregate_expr, 1),
+                collect_rows(&mut fixture, having_scalar, 2),
                 vec![
-                    vec!["P1".to_string()],
-                    vec!["P2".to_string()],
-                    vec!["P9".to_string()],
+                    vec!["P1".to_string(), "2".to_string()],
+                    vec!["P2".to_string(), "2".to_string()],
                 ]
             );
 
-            let parameter_select = open_view(
+            let aggregate_arithmetic = open_view(
                 &mut fixture,
                 db,
-                "SELECT Name, ? AS Tag FROM Product WHERE Price >= ? ORDER BY 1",
+                "SELECT ProductCode, SUM(Weight) + COUNT(*) AS X FROM Feature \
+                 GROUP BY 1 ORDER BY 1",
             );
-            let record = new_record(&mut fixture, 2);
-            set_record_text(&mut fixture, record, 1, "tag");
-            set_record_int(&mut fixture, record, 2, 5);
+            assert_eq!(execute(&mut fixture, aggregate_arithmetic), OK);
             assert_eq!(
-                dispatch_x86(
+                collect_rows(&mut fixture, aggregate_arithmetic, 2),
+                vec![
+                    vec!["P1".to_string(), "17".to_string()],
+                    vec!["P2".to_string(), "4".to_string()],
+                    vec!["P9".to_string(), String::new()],
+                ]
+            );
+
+            let expression_ordinal = open_view(
+                &mut fixture,
+                db,
+                "SELECT Weight + 1 AS X, COUNT(*) AS Cnt FROM Feature \
+                 WHERE Weight IS NOT NULL GROUP BY 1 ORDER BY 1",
+            );
+            assert_eq!(execute(&mut fixture, expression_ordinal), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, expression_ordinal, 2),
+                vec![
+                    vec!["2".to_string(), "2".to_string()],
+                    vec!["6".to_string(), "1".to_string()],
+                    vec!["11".to_string(), "1".to_string()],
+                ]
+            );
+
+            assert_eq!(
+                open_view_error(
                     &mut fixture,
-                    HostThunk::MsiViewExecute,
-                    &[parameter_select as u32, record as u32]
+                    db,
+                    "SELECT ProductCode, COUNT(*) FROM Feature GROUP BY 2"
                 ),
-                OK
+                u64::from(ERROR_BAD_QUERY_SYNTAX)
             );
             assert_eq!(
-                collect_rows(&mut fixture, parameter_select, 2),
-                vec![
-                    vec!["Alpha".to_string(), "tag".to_string()],
-                    vec!["Beta".to_string(), "tag".to_string()],
-                    vec!["Gamma".to_string(), "tag".to_string()],
-                ]
+                open_view_error(
+                    &mut fixture,
+                    db,
+                    "SELECT ProductCode, COUNT(*) FROM Feature GROUP BY 0"
+                ),
+                u64::from(ERROR_BAD_COLUMN)
             );
+        });
+    }
 
-            let parameter_order = open_view(
+    #[test]
+    fn msi_sql_joined_view_modify_targets_one_table_or_errors() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-joined-modify");
+            let (db, _path) =
+                open_fixture(&mut fixture, "joinedmodify.msi", &relational_compound());
+
+            let view = open_view(
                 &mut fixture,
                 db,
-                "SELECT Name FROM Product ORDER BY ? DESC, Name",
+                "SELECT f.FeatureId, f.Title FROM Feature f INNER JOIN Product p \
+                 ON p.ProductCode = f.ProductCode ORDER BY f.FeatureId",
             );
-            let key = new_record(&mut fixture, 1);
-            set_record_text(&mut fixture, key, 1, "ignored");
+            assert_eq!(execute(&mut fixture, view), OK);
+            let (result, update) = fetch(&mut fixture, view);
+            assert_eq!(result, OK);
+            set_record_text(&mut fixture, update, 2, "Joined");
+            assert_eq!(modify(&mut fixture, view, 2, update), OK);
+
+            let check = open_view(
+                &mut fixture,
+                db,
+                "SELECT Title FROM Feature WHERE FeatureId = 1",
+            );
+            assert_eq!(execute(&mut fixture, check), OK);
             assert_eq!(
-                dispatch_x86(
-                    &mut fixture,
-                    HostThunk::MsiViewExecute,
-                    &[parameter_order as u32, key as u32]
-                ),
-                OK
+                collect_rows(&mut fixture, check, 1),
+                vec![vec!["Joined".to_string()]]
             );
-            assert_eq!(
-                collect_rows(&mut fixture, parameter_order, 1),
-                vec![
-                    vec!["Alpha".to_string()],
-                    vec!["Beta".to_string()],
-                    vec!["Gamma".to_string()],
-                ]
+
+            let ambiguous = open_view(
+                &mut fixture,
+                db,
+                "SELECT p.Name, f.Title FROM Product p INNER JOIN Feature f \
+                 ON p.ProductCode = f.ProductCode",
             );
+            assert_eq!(execute(&mut fixture, ambiguous), OK);
+            let record = new_record(&mut fixture, 1);
+            set_record_int(&mut fixture, record, 0, 1);
+            assert_eq!(modify(&mut fixture, ambiguous, 2, record), FUNCTION_FAILED);
+
+            let derived = open_view(
+                &mut fixture,
+                db,
+                "SELECT d.Name FROM (SELECT Name FROM Product) d",
+            );
+            assert_eq!(execute(&mut fixture, derived), OK);
+            let record = new_record(&mut fixture, 1);
+            set_record_int(&mut fixture, record, 0, 1);
+            assert_eq!(modify(&mut fixture, derived, 2, record), FUNCTION_FAILED);
         });
     }
 
@@ -7571,20 +8195,6 @@ mod tests {
     }
 
     #[test]
-    fn compound_reader_handles_fat_and_difat() {
-        let mut big = vec![0u8; 8_000_000];
-        big[0] = 0x11;
-        big[7_999_999] = 0x22;
-        let bytes = write_compound_file(&[
-            ("Big".to_string(), big.clone()),
-            ("Small".to_string(), b"mini".to_vec()),
-        ]);
-        let compound = CompoundFile::parse(bytes).expect("parse compound file");
-        assert_eq!(compound.stream("Big"), Some(big));
-        assert_eq!(compound.stream("Small"), Some(b"mini".to_vec()));
-    }
-
-    #[test]
     fn msi_adversarial_error_paths() {
         with_big_stack(|| {
             let mut fixture = x86_fixture("msi-adversarial");
@@ -7718,5 +8328,1634 @@ mod tests {
                 6
             );
         });
+    }
+
+    #[test]
+    fn msi_compound_stream_entry_lookup_edges() {
+        let compound = CompoundFile::parse(fixture_compound()).expect("parse fixture compound");
+        assert_eq!(
+            compound
+                .stream_entry_at("TestTable")
+                .map(|entry| entry.kind),
+            Some(2)
+        );
+        assert_eq!(
+            compound
+                .stream_entry_at("TestTable.Alpha")
+                .map(|entry| entry.kind),
+            Some(2)
+        );
+        assert_eq!(
+            compound
+                .stream_entry_at("Root Entry")
+                .map(|entry| entry.kind),
+            None
+        );
+        assert_eq!(
+            compound.stream_entry_at("Missing").map(|entry| entry.kind),
+            None
+        );
+        assert_eq!(
+            column_from_type_name("Data", "v0").type_bits,
+            MSITYPE_VALID | MSITYPE_STRING
+        );
+        assert_eq!(
+            column_from_type_name("Data", "unknown").type_bits,
+            MSITYPE_VALID | MSITYPE_STRING
+        );
+    }
+
+    #[test]
+    fn msi_internal_expression_error_edges() {
+        let mut database = MsiDatabaseState::empty(String::new());
+        database.tables.insert(
+            "T".to_string(),
+            MsiTable {
+                name: "T".to_string(),
+                columns: vec![column("A", I2), column("B", S64)],
+                rows: vec![
+                    vec![MsiValue::Int(1), MsiValue::Str("one".to_string())],
+                    vec![MsiValue::Int(2), MsiValue::Str("two".to_string())],
+                ],
+            },
+        );
+        database.tables.insert(
+            "U".to_string(),
+            MsiTable {
+                name: "U".to_string(),
+                columns: vec![column("A", I2)],
+                rows: vec![vec![MsiValue::Int(1)]],
+            },
+        );
+        let query = resolve_query(&database, parse_select("SELECT A, B FROM T").unwrap()).unwrap();
+        let derived = vec![None; query.tables.len()];
+        let tables = query.tables.clone();
+
+        assert_eq!(
+            eval_value(
+                &database,
+                &query,
+                &[],
+                &[],
+                None,
+                &ResolvedExpr::OuterColumn {
+                    level: 9,
+                    table: 0,
+                    column: 0,
+                    kind: SqlColumnKind::Int,
+                },
+                &derived,
+                &[]
+            ),
+            Ok(MsiValue::Null)
+        );
+        assert_eq!(
+            eval_value(
+                &database,
+                &query,
+                &[],
+                &[],
+                None,
+                &ResolvedExpr::ScalarQuery(Box::new(query.clone())),
+                &derived,
+                &[]
+            ),
+            Err(ERROR_FUNCTION_FAILED)
+        );
+        assert_eq!(
+            eval_value(
+                &database,
+                &query,
+                &[],
+                &[],
+                None,
+                &ResolvedExpr::Unary {
+                    op: SqlUnaryOp::Negate,
+                    value: Box::new(ResolvedExpr::Literal(MsiValue::Int(5))),
+                },
+                &derived,
+                &[]
+            ),
+            Ok(MsiValue::Int(-5))
+        );
+        assert_eq!(
+            eval_value(
+                &database,
+                &query,
+                &[],
+                &[],
+                None,
+                &ResolvedExpr::Unary {
+                    op: SqlUnaryOp::Plus,
+                    value: Box::new(ResolvedExpr::Literal(MsiValue::Int(5))),
+                },
+                &derived,
+                &[]
+            ),
+            Ok(MsiValue::Int(5))
+        );
+        assert_eq!(
+            eval_value(
+                &database,
+                &query,
+                &[],
+                &[],
+                None,
+                &ResolvedExpr::Unary {
+                    op: SqlUnaryOp::Negate,
+                    value: Box::new(ResolvedExpr::Literal(MsiValue::Null)),
+                },
+                &derived,
+                &[]
+            ),
+            Ok(MsiValue::Null)
+        );
+        assert_eq!(
+            eval_value(
+                &database,
+                &query,
+                &[],
+                &[],
+                None,
+                &ResolvedExpr::Unary {
+                    op: SqlUnaryOp::Negate,
+                    value: Box::new(ResolvedExpr::Literal(MsiValue::Str("x".to_string()))),
+                },
+                &derived,
+                &[]
+            ),
+            Ok(MsiValue::Null)
+        );
+
+        assert_eq!(
+            eval_binary(SqlBinaryOp::Subtract, MsiValue::Int(7), MsiValue::Int(4)),
+            Ok(MsiValue::Int(3))
+        );
+        assert_eq!(
+            eval_binary(SqlBinaryOp::Multiply, MsiValue::Int(7), MsiValue::Int(4)),
+            Ok(MsiValue::Int(28))
+        );
+        assert_eq!(
+            eval_binary(SqlBinaryOp::Divide, MsiValue::Int(7), MsiValue::Int(0)),
+            Err(ERROR_FUNCTION_FAILED)
+        );
+        assert_eq!(
+            eval_binary(SqlBinaryOp::Modulo, MsiValue::Int(7), MsiValue::Int(0)),
+            Err(ERROR_FUNCTION_FAILED)
+        );
+        assert_eq!(
+            eval_binary(SqlBinaryOp::Divide, MsiValue::Int(7), MsiValue::Int(2)),
+            Ok(MsiValue::Int(3))
+        );
+        assert_eq!(
+            eval_binary(SqlBinaryOp::Modulo, MsiValue::Int(7), MsiValue::Int(2)),
+            Ok(MsiValue::Int(1))
+        );
+
+        assert_eq!(
+            eval_function(SqlFunction::Upper, vec![MsiValue::Str("ab".to_string())]),
+            Ok(MsiValue::Str("AB".to_string()))
+        );
+        assert_eq!(
+            eval_function(SqlFunction::Lower, vec![MsiValue::Str("AB".to_string())]),
+            Ok(MsiValue::Str("ab".to_string()))
+        );
+        assert_eq!(
+            eval_function(SqlFunction::Length, vec![MsiValue::Str("hé".to_string())]),
+            Ok(MsiValue::Int(2))
+        );
+        assert_eq!(
+            eval_function(SqlFunction::Upper, vec![MsiValue::Int(1)]),
+            Ok(MsiValue::Null)
+        );
+        assert_eq!(
+            eval_function(
+                SqlFunction::Substring,
+                vec![MsiValue::Str("abc".to_string())]
+            ),
+            Ok(MsiValue::Null)
+        );
+        assert_eq!(
+            eval_function(
+                SqlFunction::Substring,
+                vec![
+                    MsiValue::Str("abc".to_string()),
+                    MsiValue::Str("1".to_string()),
+                    MsiValue::Int(1)
+                ]
+            ),
+            Ok(MsiValue::Null)
+        );
+        assert_eq!(
+            eval_function(
+                SqlFunction::Substring,
+                vec![
+                    MsiValue::Str("abcdef".to_string()),
+                    MsiValue::Int(-3),
+                    MsiValue::Int(2)
+                ]
+            ),
+            Ok(MsiValue::Str("ab".to_string()))
+        );
+        assert_eq!(
+            eval_function(
+                SqlFunction::Substring,
+                vec![
+                    MsiValue::Str("abcdef".to_string()),
+                    MsiValue::Int(2),
+                    MsiValue::Int(-1)
+                ]
+            ),
+            Ok(MsiValue::Str(String::new()))
+        );
+
+        assert_eq!(
+            eval_aggregate(
+                &database,
+                &query,
+                &[],
+                None,
+                SqlAggregate::Count,
+                None,
+                false,
+                &derived,
+                &[]
+            ),
+            Ok(MsiValue::Null)
+        );
+        let error_argument = ResolvedExpr::Binary {
+            op: SqlBinaryOp::Divide,
+            left: Box::new(ResolvedExpr::Literal(MsiValue::Int(1))),
+            right: Box::new(ResolvedExpr::Literal(MsiValue::Int(0))),
+        };
+        let group = vec![vec![Some(0)]];
+        assert_eq!(
+            eval_aggregate(
+                &database,
+                &query,
+                &[],
+                Some(&group),
+                SqlAggregate::Count,
+                Some(&error_argument),
+                false,
+                &derived,
+                &[]
+            ),
+            Err(ERROR_FUNCTION_FAILED)
+        );
+        assert_eq!(
+            eval_aggregate(
+                &database,
+                &query,
+                &[],
+                Some(&group),
+                SqlAggregate::Sum,
+                None,
+                false,
+                &derived,
+                &[]
+            ),
+            Ok(MsiValue::Null)
+        );
+        assert_eq!(
+            eval_aggregate(
+                &database,
+                &query,
+                &[],
+                Some(&group),
+                SqlAggregate::Sum,
+                Some(&error_argument),
+                false,
+                &derived,
+                &[]
+            ),
+            Err(ERROR_FUNCTION_FAILED)
+        );
+        assert_eq!(
+            eval_aggregate(
+                &database,
+                &query,
+                &[],
+                Some(&group),
+                SqlAggregate::Min,
+                None,
+                false,
+                &derived,
+                &[]
+            ),
+            Ok(MsiValue::Null)
+        );
+        assert_eq!(
+            eval_aggregate(
+                &database,
+                &query,
+                &[],
+                Some(&group),
+                SqlAggregate::Max,
+                Some(&error_argument),
+                false,
+                &derived,
+                &[]
+            ),
+            Err(ERROR_FUNCTION_FAILED)
+        );
+        assert_eq!(
+            eval_aggregate(
+                &database,
+                &query,
+                &[],
+                Some(&group),
+                SqlAggregate::Min,
+                Some(&ResolvedExpr::Literal(MsiValue::Null)),
+                false,
+                &derived,
+                &[]
+            ),
+            Ok(MsiValue::Null)
+        );
+
+        assert_eq!(
+            resolved_expression_type_name(
+                &database,
+                &tables,
+                &ResolvedExpr::OuterColumn {
+                    level: 1,
+                    table: 0,
+                    column: 0,
+                    kind: SqlColumnKind::Binary,
+                }
+            ),
+            Ok("v0".to_string())
+        );
+        assert_eq!(
+            resolved_expression_type_name(
+                &database,
+                &tables,
+                &ResolvedExpr::OuterColumn {
+                    level: 1,
+                    table: 0,
+                    column: 0,
+                    kind: SqlColumnKind::String { width: 32 },
+                }
+            ),
+            Ok("s32".to_string())
+        );
+        assert_eq!(
+            resolved_expression_type_name(
+                &database,
+                &tables,
+                &ResolvedExpr::OuterColumn {
+                    level: 1,
+                    table: 0,
+                    column: 0,
+                    kind: SqlColumnKind::Int,
+                }
+            ),
+            Ok("i4".to_string())
+        );
+        assert_eq!(
+            resolved_expression_type_name(
+                &database,
+                &tables,
+                &ResolvedExpr::Exists {
+                    query: Box::new(query.clone()),
+                    negated: false,
+                }
+            ),
+            Ok("i4".to_string())
+        );
+        assert_eq!(
+            resolved_expression_type_name(
+                &database,
+                &tables,
+                &ResolvedExpr::Function {
+                    function: SqlFunction::Length,
+                    arguments: Vec::new(),
+                }
+            ),
+            Ok("i4".to_string())
+        );
+        assert_eq!(
+            resolved_expression_type_name(
+                &database,
+                &tables,
+                &ResolvedExpr::Function {
+                    function: SqlFunction::Upper,
+                    arguments: Vec::new(),
+                }
+            ),
+            Ok("s0".to_string())
+        );
+
+        assert_eq!(
+            resolved_column_kind(
+                &database,
+                &tables,
+                &ResolvedExpr::Unary {
+                    op: SqlUnaryOp::Plus,
+                    value: Box::new(ResolvedExpr::Literal(MsiValue::Int(1))),
+                }
+            ),
+            Ok(Some(SqlColumnKind::Int))
+        );
+        assert_eq!(
+            resolved_column_kind(
+                &database,
+                &tables,
+                &ResolvedExpr::Exists {
+                    query: Box::new(query.clone()),
+                    negated: false,
+                }
+            ),
+            Ok(Some(SqlColumnKind::Int))
+        );
+        assert_eq!(
+            resolved_column_kind(
+                &database,
+                &tables,
+                &ResolvedExpr::Function {
+                    function: SqlFunction::Length,
+                    arguments: Vec::new(),
+                }
+            ),
+            Ok(Some(SqlColumnKind::Int))
+        );
+        assert_eq!(
+            resolved_column_kind(
+                &database,
+                &tables,
+                &ResolvedExpr::Function {
+                    function: SqlFunction::Upper,
+                    arguments: Vec::new(),
+                }
+            ),
+            Ok(Some(SqlColumnKind::String { width: 0 }))
+        );
+        assert_eq!(
+            msi_column_kind(&column("Data", MSITYPE_VALID | MSITYPE_STRING)),
+            SqlColumnKind::Binary
+        );
+
+        let aggregate = ResolvedExpr::Aggregate {
+            function: SqlAggregate::Count,
+            argument: None,
+            distinct: false,
+        };
+        assert!(contains_resolved_aggregate(&aggregate));
+        assert!(contains_resolved_aggregate(&ResolvedExpr::Not(Box::new(
+            aggregate.clone()
+        ))));
+        assert!(contains_resolved_aggregate(&ResolvedExpr::Or(
+            Box::new(aggregate.clone()),
+            Box::new(ResolvedExpr::Literal(MsiValue::Int(1))),
+        )));
+        assert!(contains_resolved_aggregate(&ResolvedExpr::Function {
+            function: SqlFunction::Length,
+            arguments: vec![aggregate],
+        }));
+
+        let outer = ResolvedExpr::OuterColumn {
+            level: 1,
+            table: 0,
+            column: 1,
+            kind: SqlColumnKind::Int,
+        };
+        let column_expr = ResolvedExpr::Column {
+            table: 0,
+            column: 0,
+        };
+        assert!(resolved_expressions_match(&column_expr, &column_expr));
+        assert!(resolved_expressions_match(&outer, &outer));
+        assert!(resolved_expressions_match(
+            &ResolvedExpr::Literal(MsiValue::Int(1)),
+            &ResolvedExpr::Literal(MsiValue::Int(1))
+        ));
+        assert!(resolved_expressions_match(
+            &ResolvedExpr::Parameter(0),
+            &ResolvedExpr::Parameter(0)
+        ));
+        assert!(resolved_expressions_match(
+            &ResolvedExpr::IsNull {
+                value: Box::new(column_expr.clone()),
+                negated: true,
+            },
+            &ResolvedExpr::IsNull {
+                value: Box::new(column_expr.clone()),
+                negated: true,
+            }
+        ));
+        assert!(resolved_expressions_match(
+            &ResolvedExpr::Compare {
+                left: Box::new(column_expr.clone()),
+                op: SqlCompareOp::Eq,
+                right: Box::new(ResolvedExpr::Literal(MsiValue::Int(1))),
+            },
+            &ResolvedExpr::Compare {
+                left: Box::new(column_expr.clone()),
+                op: SqlCompareOp::Eq,
+                right: Box::new(ResolvedExpr::Literal(MsiValue::Int(1))),
+            }
+        ));
+        assert!(resolved_expressions_match(
+            &ResolvedExpr::And(Box::new(column_expr.clone()), Box::new(column_expr.clone())),
+            &ResolvedExpr::And(Box::new(column_expr.clone()), Box::new(column_expr.clone()))
+        ));
+        assert!(resolved_expressions_match(
+            &ResolvedExpr::Not(Box::new(column_expr.clone())),
+            &ResolvedExpr::Not(Box::new(column_expr.clone()))
+        ));
+        assert!(resolved_expressions_match(
+            &ResolvedExpr::Unary {
+                op: SqlUnaryOp::Negate,
+                value: Box::new(column_expr.clone()),
+            },
+            &ResolvedExpr::Unary {
+                op: SqlUnaryOp::Negate,
+                value: Box::new(column_expr.clone()),
+            }
+        ));
+        assert!(resolved_expressions_match(
+            &ResolvedExpr::Binary {
+                op: SqlBinaryOp::Add,
+                left: Box::new(column_expr.clone()),
+                right: Box::new(ResolvedExpr::Literal(MsiValue::Int(1))),
+            },
+            &ResolvedExpr::Binary {
+                op: SqlBinaryOp::Add,
+                left: Box::new(column_expr.clone()),
+                right: Box::new(ResolvedExpr::Literal(MsiValue::Int(1))),
+            }
+        ));
+        assert!(resolved_expressions_match(
+            &ResolvedExpr::Function {
+                function: SqlFunction::Upper,
+                arguments: vec![column_expr.clone()],
+            },
+            &ResolvedExpr::Function {
+                function: SqlFunction::Upper,
+                arguments: vec![column_expr.clone()],
+            }
+        ));
+        assert!(!resolved_expressions_match(
+            &column_expr,
+            &ResolvedExpr::Literal(MsiValue::Int(1))
+        ));
+
+        assert!(!grouped_expression_valid(
+            &ResolvedExpr::IsNull {
+                value: Box::new(column_expr.clone()),
+                negated: false,
+            },
+            &[]
+        ));
+        assert!(!grouped_expression_valid(
+            &ResolvedExpr::Not(Box::new(column_expr.clone())),
+            &[]
+        ));
+        assert!(!grouped_expression_valid(
+            &ResolvedExpr::Unary {
+                op: SqlUnaryOp::Plus,
+                value: Box::new(column_expr.clone()),
+            },
+            &[]
+        ));
+        assert!(!grouped_expression_valid(
+            &ResolvedExpr::Or(
+                Box::new(column_expr.clone()),
+                Box::new(ResolvedExpr::Literal(MsiValue::Int(1))),
+            ),
+            &[]
+        ));
+        assert!(!grouped_expression_valid(
+            &ResolvedExpr::Function {
+                function: SqlFunction::Upper,
+                arguments: vec![column_expr.clone()],
+            },
+            &[]
+        ));
+
+        assert_eq!(
+            join_matches(&database, &query, &[Some(0)], &[], &None, &derived, &[]),
+            Ok(true)
+        );
+
+        let mut expectations: Vec<ParameterExpectation> = Vec::new();
+        assert_eq!(
+            resolve_expr(
+                &database,
+                &tables,
+                &SqlExpr::Parameter(0),
+                1,
+                &mut expectations,
+                &[],
+                &[]
+            )
+            .unwrap_err(),
+            ERROR_BAD_QUERY_SYNTAX
+        );
+
+        let base_query =
+            resolve_query(&database, parse_select("SELECT A FROM T").unwrap()).unwrap();
+        let mut without_base = database.clone();
+        without_base.tables.remove("T");
+        assert_eq!(
+            execute_query(&without_base, &base_query, &[]).unwrap_err(),
+            ERROR_INVALID_TABLE
+        );
+        let join_query = resolve_query(
+            &database,
+            parse_select("SELECT T.A FROM T INNER JOIN U ON T.A = U.A").unwrap(),
+        )
+        .unwrap();
+        let mut without_join = database.clone();
+        without_join.tables.remove("U");
+        assert_eq!(
+            execute_query(&without_join, &join_query, &[]).unwrap_err(),
+            ERROR_INVALID_TABLE
+        );
+    }
+
+    #[test]
+    fn msi_sql_predicate_and_equation_edge_paths() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-predicate-edges");
+            let (db, _path) = open_fixture(&mut fixture, "predicates.msi", &relational_compound());
+
+            let arithmetic = open_view(
+                &mut fixture,
+                db,
+                "SELECT Price - 1, Price * 2, Price / 2, Price % 3, -Price, +Price \
+                 FROM Product ORDER BY Price",
+            );
+            assert_eq!(execute(&mut fixture, arithmetic), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, arithmetic, 6),
+                vec![
+                    vec![
+                        "4".to_string(),
+                        "10".to_string(),
+                        "2".to_string(),
+                        "2".to_string(),
+                        "-5".to_string(),
+                        "5".to_string(),
+                    ],
+                    vec![
+                        "9".to_string(),
+                        "20".to_string(),
+                        "5".to_string(),
+                        "1".to_string(),
+                        "-10".to_string(),
+                        "10".to_string(),
+                    ],
+                    vec![
+                        "19".to_string(),
+                        "40".to_string(),
+                        "10".to_string(),
+                        "2".to_string(),
+                        "-20".to_string(),
+                        "20".to_string(),
+                    ],
+                ]
+            );
+
+            let grouped_logic = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product WHERE (Price = 10) AND \
+                 (Name = 'Alpha' OR Name = 'Beta') AND NOT Name = 'Beta' ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, grouped_logic), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, grouped_logic, 1),
+                vec![vec!["Alpha".to_string()]]
+            );
+
+            let not_or = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product WHERE NOT (Price = 10 OR Price = 20) ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, not_or), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, not_or, 1),
+                vec![vec!["Gamma".to_string()]]
+            );
+
+            let like_class = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product WHERE Name LIKE '[!A]%' ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, like_class), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, like_class, 1),
+                vec![vec!["Beta".to_string()], vec!["Gamma".to_string()]]
+            );
+
+            let like_null = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Title LIKE 'F%' ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, like_null), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, like_null, 1),
+                vec![vec!["1".to_string()], vec!["5".to_string()]]
+            );
+
+            let not_like = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product WHERE Name NOT LIKE 'A%' ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, not_like), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, not_like, 1),
+                vec![vec!["Beta".to_string()], vec!["Gamma".to_string()]]
+            );
+
+            let between = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Weight BETWEEN 1 AND 5 ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, between), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, between, 1),
+                vec![
+                    vec!["1".to_string()],
+                    vec!["3".to_string()],
+                    vec!["5".to_string()]
+                ]
+            );
+
+            let between_null = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Title BETWEEN 'A' AND 'Z' \
+                 ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, between_null), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, between_null, 1),
+                vec![
+                    vec!["1".to_string()],
+                    vec!["2".to_string()],
+                    vec!["3".to_string()],
+                    vec!["5".to_string()]
+                ]
+            );
+
+            let not_between = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Weight NOT BETWEEN 1 AND 5 \
+                 ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, not_between), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, not_between, 1),
+                vec![vec!["2".to_string()]]
+            );
+
+            let in_list = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product WHERE Price IN (10, 20) ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, in_list), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, in_list, 1),
+                vec![vec!["Alpha".to_string()], vec!["Beta".to_string()]]
+            );
+
+            let in_list_null = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Title IN ('Fast', 'Slow') \
+                 ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, in_list_null), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, in_list_null, 1),
+                vec![
+                    vec!["1".to_string()],
+                    vec!["2".to_string()],
+                    vec!["5".to_string()]
+                ]
+            );
+
+            let not_in_list = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product WHERE Price NOT IN (10) ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, not_in_list), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, not_in_list, 1),
+                vec![vec!["Beta".to_string()], vec!["Gamma".to_string()]]
+            );
+
+            let in_query = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product WHERE ProductCode IN \
+                 (SELECT ProductCode FROM Feature WHERE Weight >= 5) ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, in_query), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, in_query, 1),
+                vec![vec!["Alpha".to_string()]]
+            );
+
+            let in_query_null = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Title IN \
+                 (SELECT Name FROM Product) ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, in_query_null), OK);
+            assert!(collect_rows(&mut fixture, in_query_null, 1).is_empty());
+
+            let non_boolean = open_view(&mut fixture, db, "SELECT Name FROM Product WHERE Price");
+            assert_eq!(execute(&mut fixture, non_boolean), OK);
+            assert!(collect_rows(&mut fixture, non_boolean, 1).is_empty());
+
+            let is_null = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Title IS NULL ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, is_null), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, is_null, 1),
+                vec![vec!["4".to_string()]]
+            );
+
+            let projected_comparison = open_view(
+                &mut fixture,
+                db,
+                "SELECT Price = 10 FROM Product ORDER BY Price",
+            );
+            assert_eq!(execute(&mut fixture, projected_comparison), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, projected_comparison, 1),
+                vec![
+                    vec![String::new()],
+                    vec![String::new()],
+                    vec![String::new()]
+                ]
+            );
+
+            let alias_group = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode AS Code, COUNT(*) AS Cnt FROM Feature \
+                 GROUP BY Code ORDER BY Code",
+            );
+            assert_eq!(execute(&mut fixture, alias_group), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, alias_group, 2),
+                vec![
+                    vec!["P1".to_string(), "2".to_string()],
+                    vec!["P2".to_string(), "2".to_string()],
+                    vec!["P9".to_string(), "1".to_string()]
+                ]
+            );
+
+            let ordinal_group = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode, COUNT(*) FROM Feature GROUP BY `1` ORDER BY 1",
+            );
+            assert_eq!(execute(&mut fixture, ordinal_group), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, ordinal_group, 2),
+                vec![
+                    vec!["P1".to_string(), "2".to_string()],
+                    vec!["P2".to_string(), "2".to_string()],
+                    vec!["P9".to_string(), "1".to_string()]
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_parser_and_function_error_edges() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-parser-edges");
+            let (db, _path) = open_fixture(&mut fixture, "parseredges.msi", &relational_compound());
+
+            for sql in [
+                "SELECT d.Name FROM (SELECT Name FROM Product d",
+                "SELECT Name FROM Product WHERE EXISTS 1",
+                "SELECT Name FROM Product WHERE NOT EXISTS 1",
+                "SELECT Name FROM Product WHERE NOT EXISTS (SELECT 1 FROM Feature",
+                "SELECT COUNT(DISTINCT *) FROM Product",
+                "SELECT UPPER() FROM Product",
+                "SELECT SUBSTRING(Name, 1) FROM Product",
+                "SELECT FOO(Name) FROM Product",
+                "SELECT UPPER(Price) FROM Product",
+                "SELECT SUBSTRING(Name, 'x', 2) FROM Product",
+            ] {
+                assert_eq!(
+                    open_view_error(&mut fixture, db, sql),
+                    u64::from(ERROR_BAD_QUERY_SYNTAX),
+                    "{sql}"
+                );
+            }
+
+            let not_exists = open_view(
+                &mut fixture,
+                db,
+                "SELECT p.Name FROM Product p WHERE NOT EXISTS \
+                 (SELECT 1 FROM Feature f WHERE f.ProductCode = p.ProductCode) \
+                 ORDER BY p.Name",
+            );
+            assert_eq!(execute(&mut fixture, not_exists), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, not_exists, 1),
+                vec![vec!["Gamma".to_string()]]
+            );
+
+            let functions = open_view(
+                &mut fixture,
+                db,
+                "SELECT UPPER(Name), LOWER(Name), LENGTH(Name), SUBSTRING(Name, 2, 3) \
+                 FROM Product ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, functions), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, functions, 4),
+                vec![
+                    vec![
+                        "ALPHA".to_string(),
+                        "alpha".to_string(),
+                        "5".to_string(),
+                        "lph".to_string()
+                    ],
+                    vec![
+                        "BETA".to_string(),
+                        "beta".to_string(),
+                        "4".to_string(),
+                        "eta".to_string()
+                    ],
+                    vec![
+                        "GAMMA".to_string(),
+                        "gamma".to_string(),
+                        "5".to_string(),
+                        "amm".to_string()
+                    ],
+                ]
+            );
+
+            let substring_clamps = open_view(
+                &mut fixture,
+                db,
+                "SELECT SUBSTRING(Name, -3, 2), SUBSTRING(Name, 2, -1) \
+                 FROM Product ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, substring_clamps), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, substring_clamps, 2),
+                vec![
+                    vec!["Al".to_string(), String::new()],
+                    vec!["Be".to_string(), String::new()],
+                    vec!["Ga".to_string(), String::new()]
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_aggregate_and_join_runtime_error_edges() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-aggregate-edges");
+            let (db, _path) =
+                open_fixture(&mut fixture, "aggregateedges.msi", &relational_compound());
+
+            for sql in [
+                "SELECT COUNT(Weight / 0) FROM Feature",
+                "SELECT SUM(Weight / 0) FROM Feature",
+                "SELECT MAX(Weight / 0) FROM Feature",
+                "SELECT COUNT(*) FROM Product GROUP BY Price / 0",
+                "SELECT ProductCode, COUNT(*) FROM Feature GROUP BY ProductCode \
+                 HAVING COUNT(*) / 0 = 0",
+                "SELECT ProductCode, SUM(Weight) / 0 FROM Feature GROUP BY ProductCode",
+                "SELECT COUNT(*) FROM Product WHERE Price > 100 \
+                 HAVING COUNT(*) / 0 = 0",
+                "SELECT COUNT(*) / 0 FROM Product WHERE Price > 100",
+                "SELECT Name FROM Product ORDER BY Price / 0",
+                "SELECT Name FROM Product WHERE Price = (SELECT Price FROM Product)",
+                "SELECT Name FROM Product WHERE Price = 10 UNION ALL \
+                 SELECT Name FROM Product WHERE Price / 0 = 1",
+                "SELECT p.Name FROM Product p CROSS JOIN Feature f \
+                 WHERE p.Price / 0 = 1",
+                "SELECT p.Name FROM Product p RIGHT JOIN Feature f \
+                 ON p.Price / 0 = f.Weight",
+                "SELECT p.Name FROM Product p FULL JOIN Feature f \
+                 ON p.Price / 0 = f.Weight",
+            ] {
+                let view = open_view(&mut fixture, db, sql);
+                assert_eq!(
+                    execute(&mut fixture, view),
+                    u64::from(ERROR_FUNCTION_FAILED),
+                    "{sql}"
+                );
+            }
+
+            let empty_aggregate = open_view(
+                &mut fixture,
+                db,
+                "SELECT COUNT(*) FROM Product WHERE Price > 100 HAVING COUNT(*) = 0",
+            );
+            assert_eq!(execute(&mut fixture, empty_aggregate), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, empty_aggregate, 1),
+                vec![vec!["0".to_string()]]
+            );
+
+            let sum = open_view(&mut fixture, db, "SELECT SUM(Weight) FROM Feature");
+            assert_eq!(execute(&mut fixture, sum), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, sum, 1),
+                vec![vec!["17".to_string()]]
+            );
+
+            let exists_projection = open_view(
+                &mut fixture,
+                db,
+                "SELECT EXISTS (SELECT 1 FROM Feature) FROM Product",
+            );
+            assert_eq!(execute(&mut fixture, exists_projection), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, exists_projection, 1),
+                vec![
+                    vec!["1".to_string()],
+                    vec!["1".to_string()],
+                    vec!["1".to_string()]
+                ]
+            );
+
+            let order_expression = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product ORDER BY Price % 7",
+            );
+            assert_eq!(execute(&mut fixture, order_expression), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, order_expression, 1),
+                vec![
+                    vec!["Alpha".to_string()],
+                    vec!["Gamma".to_string()],
+                    vec!["Beta".to_string()]
+                ]
+            );
+
+            let outer_select = open_view(
+                &mut fixture,
+                db,
+                "SELECT p.Name FROM Product p WHERE EXISTS \
+                 (SELECT p.Name FROM Feature f WHERE f.ProductCode = p.ProductCode \
+                  AND f.Weight = 10) ORDER BY p.Name",
+            );
+            assert_eq!(execute(&mut fixture, outer_select), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, outer_select, 1),
+                vec![vec!["Alpha".to_string()]]
+            );
+
+            let outer_outer = open_view(
+                &mut fixture,
+                db,
+                "SELECT p.Name FROM Product p WHERE EXISTS \
+                 (SELECT 1 FROM Feature f WHERE EXISTS \
+                  (SELECT 1 FROM Component c WHERE c.FeatureId = f.FeatureId \
+                   AND c.Label = p.Name)) ORDER BY p.Name",
+            );
+            assert_eq!(execute(&mut fixture, outer_outer), OK);
+            assert!(collect_rows(&mut fixture, outer_outer, 1).is_empty());
+
+            let mut binary_fixture = x86_fixture("msi-sql-outer-binary");
+            let (binary_db, _binary_path) =
+                open_fixture(&mut binary_fixture, "outerbinary.msi", &fixture_compound());
+            let outer_binary = open_view(
+                &mut binary_fixture,
+                binary_db,
+                "SELECT t.Name FROM TestTable t WHERE EXISTS \
+                 (SELECT t.Data FROM TestTable x)",
+            );
+            assert_eq!(execute(&mut binary_fixture, outer_binary), OK);
+            let rows = collect_rows(&mut binary_fixture, outer_binary, 1);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0], vec!["Alpha".to_string()]);
+            assert_eq!(rows[1], vec!["Beta".to_string()]);
+
+            let derived_binary = open_view(
+                &mut binary_fixture,
+                binary_db,
+                "SELECT d.Data FROM (SELECT Data FROM TestTable) d",
+            );
+            assert_eq!(execute(&mut binary_fixture, derived_binary), OK);
+        });
+    }
+
+    #[test]
+    fn msi_refresh_view_recompute_error_edges() {
+        with_big_stack(|| {
+            let mut filtered = x86_fixture("msi-refresh-filter");
+            let (db, _path) =
+                open_fixture(&mut filtered, "refreshfilter.msi", &relational_compound());
+            let view = open_view(
+                &mut filtered,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Weight > 5 ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut filtered, view), OK);
+            let (result, record) = fetch(&mut filtered, view);
+            assert_eq!(result, OK);
+            assert_eq!(
+                modify(&mut filtered, view, 8, record),
+                u64::from(ERROR_SUCCESS)
+            );
+            filtered
+                .runtime
+                .msi_databases
+                .get_mut(&db)
+                .and_then(|database| database.table_mut("Feature"))
+                .expect("feature table")
+                .rows[1][3] = MsiValue::Int(0);
+            assert_eq!(modify(&mut filtered, view, 8, record), NO_MORE_ITEMS);
+
+            let mut failing_filter = x86_fixture("msi-refresh-filter-error");
+            let (db, _path) = open_fixture(
+                &mut failing_filter,
+                "refreshfiltererror.msi",
+                &relational_compound(),
+            );
+            let view = open_view(
+                &mut failing_filter,
+                db,
+                "SELECT FeatureId FROM Feature WHERE 100 / Weight > 5 ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut failing_filter, view), OK);
+            let (result, record) = fetch(&mut failing_filter, view);
+            assert_eq!(result, OK);
+            failing_filter
+                .runtime
+                .msi_databases
+                .get_mut(&db)
+                .and_then(|database| database.table_mut("Feature"))
+                .expect("feature table")
+                .rows[0][3] = MsiValue::Int(0);
+            assert_eq!(
+                modify(&mut failing_filter, view, 8, record),
+                u64::from(ERROR_FUNCTION_FAILED)
+            );
+
+            let mut projection = x86_fixture("msi-refresh-projection-error");
+            let (db, _path) = open_fixture(
+                &mut projection,
+                "refreshprojection.msi",
+                &relational_compound(),
+            );
+            let view = open_view(
+                &mut projection,
+                db,
+                "SELECT FeatureId, 100 / Weight FROM Feature ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut projection, view), OK);
+            let (result, record) = fetch(&mut projection, view);
+            assert_eq!(result, OK);
+            projection
+                .runtime
+                .msi_databases
+                .get_mut(&db)
+                .and_then(|database| database.table_mut("Feature"))
+                .expect("feature table")
+                .rows[0][3] = MsiValue::Int(0);
+            assert_eq!(
+                modify(&mut projection, view, 8, record),
+                u64::from(ERROR_FUNCTION_FAILED)
+            );
+
+            let mut derived = x86_fixture("msi-refresh-derived-error");
+            let (db, _path) =
+                open_fixture(&mut derived, "refreshderived.msi", &relational_compound());
+            let view = open_view(
+                &mut derived,
+                db,
+                "SELECT f.FeatureId FROM Feature f INNER JOIN \
+                 (SELECT FeatureId, 100 / Weight AS X FROM Feature) d \
+                 ON d.FeatureId = f.FeatureId ORDER BY f.FeatureId",
+            );
+            assert_eq!(execute(&mut derived, view), OK);
+            let (result, record) = fetch(&mut derived, view);
+            assert_eq!(result, OK);
+            derived
+                .runtime
+                .msi_databases
+                .get_mut(&db)
+                .and_then(|database| database.table_mut("Feature"))
+                .expect("feature table")
+                .rows[0][3] = MsiValue::Int(0);
+            assert_eq!(
+                modify(&mut derived, view, 8, record),
+                u64::from(ERROR_FUNCTION_FAILED)
+            );
+        });
+    }
+
+    #[test]
+    fn msi_join_expression_update_target_edges() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-join-expression-modify");
+            let (db, _path) =
+                open_fixture(&mut fixture, "joinexpression.msi", &relational_compound());
+            let view = open_view(
+                &mut fixture,
+                db,
+                "SELECT f.FeatureId, LENGTH(f.Title) FROM Feature f \
+                 INNER JOIN Product p ON p.ProductCode = f.ProductCode \
+                 ORDER BY f.FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, view), OK);
+            let (result, record) = fetch(&mut fixture, view);
+            assert_eq!(result, OK);
+            assert_eq!(record_integer(&mut fixture, record, 0), 1);
+            assert_eq!(
+                modify(&mut fixture, view, 2, record),
+                u64::from(ERROR_SUCCESS)
+            );
+            assert_eq!(record_string(&mut fixture, record, 2), (0, "4".to_string()));
+        });
+    }
+
+    #[test]
+    fn msi_sql_lower_handles_non_ascii_folding_edges() {
+        assert_eq!(sql_lower('A'), 'a');
+        assert_eq!(sql_lower('Ä'), 'ä');
+        assert_eq!(sql_lower('中'), '中');
+        assert_eq!(
+            sql_string_cmp("Ä", "ä"),
+            std::cmp::Ordering::Equal,
+            "non-ASCII folding must compare case-insensitively"
+        );
+        assert_eq!(
+            sql_string_cmp("中", "ä"),
+            std::cmp::Ordering::Greater,
+            "distinct non-ASCII scalars must order deterministically"
+        );
+    }
+
+    #[test]
+    fn msi_sql_null_function_and_malformed_parser_edges_pin_errors() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-null-function-edges");
+            let (db, _path) = open_fixture(&mut fixture, "nullfn.msi", &relational_compound());
+
+            let view = open_view(
+                &mut fixture,
+                db,
+                "SELECT LOWER(Title), LENGTH(Title) FROM Feature WHERE FeatureId = 4",
+            );
+            assert_eq!(execute(&mut fixture, view), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, view, 2),
+                vec![vec![String::new(), String::new()]],
+                "LOWER/LENGTH of NULL must stay NULL"
+            );
+
+            assert_eq!(
+                open_view_error(&mut fixture, db, "SELECT UPPER(Name FROM Product"),
+                u64::from(ERROR_BAD_QUERY_SYNTAX),
+                "a missing function closing paren is a malformed query"
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_predicate_and_value_evaluation_edges_pin_exact_rows() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-eval-edges");
+            let (db, _path) = open_fixture(&mut fixture, "evals.msi", &relational_compound());
+
+            let scalars = open_view(
+                &mut fixture,
+                db,
+                "SELECT -Price, +Price, Price + 1, Price - 1, Price * 2, Price / 2, Price % 2, \
+                 UPPER(Name), LOWER(Name), LENGTH(Name), SUBSTRING(Name, 2, 1) \
+                 FROM Product WHERE ProductCode = 'P1'",
+            );
+            assert_eq!(execute(&mut fixture, scalars), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, scalars, 11),
+                vec![vec![
+                    "-10".to_string(),
+                    "10".to_string(),
+                    "11".to_string(),
+                    "9".to_string(),
+                    "20".to_string(),
+                    "5".to_string(),
+                    "0".to_string(),
+                    "ALPHA".to_string(),
+                    "alpha".to_string(),
+                    "5".to_string(),
+                    "l".to_string(),
+                ]]
+            );
+
+            let counted = open_view(&mut fixture, db, "SELECT COUNT(Price) FROM Product");
+            assert_eq!(execute(&mut fixture, counted), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, counted, 1),
+                vec![vec!["3".to_string()]]
+            );
+
+            let is_null = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Title IS NULL ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, is_null), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, is_null, 1),
+                vec![vec!["4".to_string()]]
+            );
+
+            let like = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Title LIKE 'F%' ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, like), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, like, 1),
+                vec![vec!["1".to_string()], vec!["5".to_string()]]
+            );
+
+            let between = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Weight BETWEEN 1 AND 5 ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, between), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, between, 1),
+                vec![
+                    vec!["1".to_string()],
+                    vec!["3".to_string()],
+                    vec!["5".to_string()]
+                ]
+            );
+
+            let in_list = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Title IN ('Fast', 'Slow') ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, in_list), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, in_list, 1),
+                vec![
+                    vec!["1".to_string()],
+                    vec!["2".to_string()],
+                    vec!["5".to_string()]
+                ]
+            );
+
+            let in_query = open_view(
+                &mut fixture,
+                db,
+                "SELECT FeatureId FROM Feature WHERE Weight IN \
+                 (SELECT Weight FROM Feature WHERE Weight > 5) ORDER BY FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, in_query), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, in_query, 1),
+                vec![vec!["2".to_string()]]
+            );
+
+            let logic = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product WHERE (Price = 10 AND Name = 'Alpha') OR Name = 'Gamma' \
+                 ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, logic), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, logic, 1),
+                vec![vec!["Alpha".to_string()], vec!["Gamma".to_string()]]
+            );
+
+            let negated = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product WHERE NOT Name = 'Zzz' ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, negated), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, negated, 1),
+                vec![
+                    vec!["Alpha".to_string()],
+                    vec!["Beta".to_string()],
+                    vec!["Gamma".to_string()]
+                ]
+            );
+
+            let not_exists = open_view(
+                &mut fixture,
+                db,
+                "SELECT p.Name FROM Product p WHERE NOT EXISTS \
+                 (SELECT 1 FROM Feature f WHERE f.ProductCode = p.ProductCode) ORDER BY p.Name",
+            );
+            assert_eq!(execute(&mut fixture, not_exists), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, not_exists, 1),
+                vec![vec!["Gamma".to_string()]]
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_outer_alias_and_group_expression_edges_pin_rows() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-outer-group-edges");
+            let (db, _path) = open_fixture(&mut fixture, "outergroup.msi", &relational_compound());
+
+            let correlated = open_view(
+                &mut fixture,
+                db,
+                "SELECT (SELECT p.Name AS O FROM Feature f WHERE f.FeatureId = 1) AS S \
+                 FROM Product p ORDER BY p.ProductCode",
+            );
+            assert_eq!(execute(&mut fixture, correlated), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, correlated, 1),
+                vec![
+                    vec!["Alpha".to_string()],
+                    vec!["Beta".to_string()],
+                    vec!["Gamma".to_string()]
+                ]
+            );
+
+            let grouped = open_view(
+                &mut fixture,
+                db,
+                "SELECT (Price = 10 AND Name = 'Alpha') AS K, COUNT(*) AS C FROM Product \
+                 GROUP BY (Price = 10 AND Name = 'Alpha')",
+            );
+            assert_eq!(execute(&mut fixture, grouped), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, grouped, 2),
+                vec![vec![String::new(), "3".to_string()]],
+                "the projected AND expression groups as one NULL key"
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_scalar_subquery_errors_pin_function_failed_edges() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-scalar-error-edges");
+            let (db, _path) =
+                open_fixture(&mut fixture, "scalar-errors.msi", &relational_compound());
+
+            // A scalar subquery with more than one row is ERROR_FUNCTION_FAILED;
+            // each query pins one error-propagation edge in value/predicate
+            // evaluation (invalid shape: multi-row value where one row is
+            // required).
+            let queries = [
+                "SELECT - (SELECT Price FROM Product) FROM Product",
+                "SELECT (SELECT Price FROM Product) + 1 FROM Product",
+                "SELECT 1 + (SELECT Price FROM Product) FROM Product",
+                "SELECT UPPER((SELECT ProductCode FROM Product)) FROM Product",
+                "SELECT Name FROM Product WHERE 1 = 1 AND 1 = (SELECT Price FROM Product)",
+                "SELECT Name FROM Product WHERE 1 = 0 OR 1 = (SELECT Price FROM Product)",
+                "SELECT Name FROM Product WHERE NOT (1 = (SELECT Price FROM Product))",
+                "SELECT Name FROM Product WHERE (SELECT Price FROM Product) IS NULL",
+                "SELECT Name FROM Product WHERE (SELECT ProductCode FROM Product) LIKE 'A%'",
+                "SELECT Name FROM Product WHERE Name LIKE (SELECT ProductCode FROM Product)",
+                "SELECT Name FROM Product WHERE (SELECT Price FROM Product) BETWEEN 1 AND 5",
+                "SELECT Name FROM Product WHERE Price BETWEEN (SELECT Price FROM Product) AND 5",
+                "SELECT Name FROM Product WHERE Price BETWEEN 1 AND (SELECT Price FROM Product)",
+                "SELECT Name FROM Product WHERE (SELECT Price FROM Product) IN (1, 2)",
+                "SELECT Name FROM Product WHERE Price IN (1, (SELECT Price FROM Product))",
+                "SELECT Name FROM Product WHERE (SELECT Price FROM Product) IN (SELECT Price FROM Product)",
+            ];
+            for sql in queries {
+                let view = open_view(&mut fixture, db, sql);
+                assert_ne!(view, 0, "view must resolve: {sql}");
+                assert_eq!(execute(&mut fixture, view), FUNCTION_FAILED, "{sql}");
+            }
+
+            // NOT EXISTS in a value position takes the negated branch.
+            let exists = open_view(
+                &mut fixture,
+                db,
+                "SELECT NOT EXISTS (SELECT 1 FROM Feature) FROM Product",
+            );
+            assert_eq!(execute(&mut fixture, exists), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, exists, 1),
+                vec![vec!["0".to_string()]; 3]
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_invalid_expression_shapes_pin_bad_column_and_syntax() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-resolve-error-edges");
+            let (db, _path) =
+                open_fixture(&mut fixture, "resolve-errors.msi", &relational_compound());
+
+            assert_eq!(
+                open_view_error(
+                    &mut fixture,
+                    db,
+                    "SELECT Name FROM Product WHERE Name LIKE (SELECT Missing FROM Product)"
+                ),
+                u64::from(ERROR_BAD_QUERY_SYNTAX)
+            );
+            assert_eq!(
+                open_view_error(&mut fixture, db, "SELECT Name FROM Product WHERE -Name = 1"),
+                u64::from(ERROR_BAD_QUERY_SYNTAX)
+            );
+            assert_eq!(
+                open_view_error(&mut fixture, db, "SELECT Name + 1 FROM Product"),
+                u64::from(ERROR_BAD_QUERY_SYNTAX)
+            );
+            assert_eq!(
+                open_view_error(&mut fixture, db, "SELECT Price + Name FROM Product"),
+                u64::from(ERROR_BAD_QUERY_SYNTAX)
+            );
+            assert_eq!(
+                open_view_error(&mut fixture, db, "SELECT UPPER(Missing) FROM Product"),
+                u64::from(ERROR_BAD_COLUMN)
+            );
+            assert_eq!(
+                open_view_error(
+                    &mut fixture,
+                    db,
+                    "SELECT SUBSTRING(Price, 2, 1) FROM Product"
+                ),
+                u64::from(ERROR_BAD_QUERY_SYNTAX)
+            );
+            assert_eq!(
+                open_view_error(&mut fixture, db, "SELECT SUM(Missing) FROM Product"),
+                u64::from(ERROR_BAD_COLUMN)
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_invalid_internal_expression_shapes_hit_defensive_edges() {
+        let database = MsiDatabaseState::empty(String::new());
+        let mut expectations: Vec<ParameterExpectation> = Vec::new();
+
+        // The parser rejects zero-argument UPPER/SUBSTRING, so the defensive
+        // empty-argument branch is only reachable through a malformed internal
+        // AST; it must resolve instead of panicking.
+        let empty_upper = SqlExpr::Function {
+            function: SqlFunction::Upper,
+            arguments: Vec::new(),
+        };
+        let resolved =
+            resolve_expr(&database, &[], &empty_upper, 0, &mut expectations, &[], &[]).unwrap();
+        match resolved {
+            ResolvedExpr::Function { arguments, .. } => assert_eq!(arguments.len(), 0),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let empty_substring = SqlExpr::Function {
+            function: SqlFunction::Substring,
+            arguments: Vec::new(),
+        };
+        let resolved = resolve_expr(
+            &database,
+            &[],
+            &empty_substring,
+            0,
+            &mut expectations,
+            &[],
+            &[],
+        )
+        .unwrap();
+        match resolved {
+            ResolvedExpr::Function { arguments, .. } => assert_eq!(arguments.len(), 0),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let left = ResolvedExpr::Or(
+            Box::new(ResolvedExpr::Literal(MsiValue::Int(1))),
+            Box::new(ResolvedExpr::Literal(MsiValue::Int(2))),
+        );
+        assert_eq!(resolved_expressions_match(&left, &left.clone()), true);
+        let mismatched = ResolvedExpr::Or(
+            Box::new(ResolvedExpr::Literal(MsiValue::Int(1))),
+            Box::new(ResolvedExpr::Literal(MsiValue::Int(3))),
+        );
+        assert_eq!(resolved_expressions_match(&left, &mismatched), false);
     }
 }

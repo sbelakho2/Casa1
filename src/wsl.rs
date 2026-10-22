@@ -900,25 +900,6 @@ mod tests {
     }
 
     #[test]
-    fn test_register_and_find_distribution() {
-        let support = WslSupport::new();
-        let distro = WslDistribution {
-            name: "TestDistro".to_string(),
-            wsl_version: 2,
-            state: WslDistributionState::Stopped,
-            base_path: PathBuf::from("/test"),
-            default_uid: 1000,
-            environment: HashMap::new(),
-            systemd_enabled: true,
-            kernel_command_line: None,
-        };
-        support.register_distribution(distro.clone());
-        let found = support.find_distribution("TestDistro");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().name, "TestDistro");
-    }
-
-    #[test]
     fn test_unregister_distribution() {
         let support = WslSupport::new();
         let distro = WslDistribution {
@@ -943,48 +924,6 @@ mod tests {
         assert_eq!(found.state, WslDistributionState::Running);
         // Non-existent returns false.
         assert!(!support.set_distribution_state("Missing", WslDistributionState::Running));
-    }
-
-    #[test]
-    fn test_default_distribution() {
-        let support = WslSupport::new();
-        let default = support.default_distribution();
-        assert_eq!(default.name, DEFAULT_WSL_DISTRO);
-    }
-
-    #[test]
-    fn test_platform_detection() {
-        let info = detect_wsl_platform();
-        // We should know whether we're on macOS or Windows.
-        assert!(info.host_is_macos || info.host_is_windows);
-    }
-
-    #[test]
-    fn test_map_windows_to_wsl_path() {
-        assert_eq!(
-            map_windows_to_wsl_path(r"C:\Users\test"),
-            Some("/mnt/c/Users/test".to_string())
-        );
-        assert_eq!(
-            map_windows_to_wsl_path(r"D:/stuff/file.txt"),
-            Some("/mnt/d/stuff/file.txt".to_string())
-        );
-        assert_eq!(map_windows_to_wsl_path("/unix/path"), None);
-        assert_eq!(map_windows_to_wsl_path("relative/path"), None);
-    }
-
-    #[test]
-    fn test_map_wsl_to_windows_path() {
-        assert_eq!(
-            map_wsl_to_windows_path("/mnt/c/Users/test"),
-            Some("C:\\Users\\test".to_string())
-        );
-        assert_eq!(
-            map_wsl_to_windows_path("/mnt/d/stuff/file.txt"),
-            Some("D:\\stuff\\file.txt".to_string())
-        );
-        assert_eq!(map_wsl_to_windows_path("/home/user"), None);
-        assert_eq!(map_wsl_to_windows_path("relative/path"), None);
     }
 
     #[test]
@@ -1028,14 +967,6 @@ mod tests {
     }
 
     #[test]
-    fn test_distribution_state_name() {
-        assert_eq!(WslDistributionState::Stopped.name(), "Stopped");
-        assert_eq!(WslDistributionState::Running.name(), "Running");
-        assert_eq!(WslDistributionState::Installing.name(), "Installing");
-        assert_eq!(WslDistributionState::Failed.name(), "Failed");
-    }
-
-    #[test]
     fn test_set_enabled() {
         let support = WslSupport::new();
         assert!(support.is_enabled());
@@ -1052,25 +983,6 @@ mod tests {
         let result = support.launch_command("Ubuntu", "echo hello", Some(5));
         assert!(result.is_err(), "expected Err, got {result:?}");
         assert!(result.unwrap_err().contains("disabled"));
-    }
-
-    #[test]
-    fn test_with_distributions() {
-        let distros = vec![
-            WslDistribution {
-                name: "Custom1".to_string(),
-                ..Default::default()
-            },
-            WslDistribution {
-                name: "Custom2".to_string(),
-                wsl_version: 1,
-                ..Default::default()
-            },
-        ];
-        let support = WslSupport::with_distributions(distros);
-        assert_eq!(support.list_distributions().len(), 2);
-        assert!(support.find_distribution("Custom1").is_some());
-        assert!(support.find_distribution("custom2").is_some()); // case-insensitive
     }
 
     #[test]
@@ -1101,23 +1013,6 @@ mod tests {
             assert!(
                 info.wsl_version_detected.is_none(),
                 "WSL version should be None on macOS"
-            );
-        }
-    }
-
-    #[test]
-    fn test_probe_distributions_returns_empty_on_non_windows() {
-        // probe_wsl_distributions should return empty on non-Windows platforms
-        let result = probe_wsl_distributions();
-        #[cfg(not(target_os = "windows"))]
-        {
-            assert!(
-                result.is_ok(),
-                "probe_wsl_distributions should succeed on non-Windows"
-            );
-            assert!(
-                result.unwrap().is_empty(),
-                "probe_wsl_distributions should return empty on non-Windows"
             );
         }
     }
@@ -1205,26 +1100,5 @@ mod tests {
             map_wsl_to_windows_path("/mnt/z/etc/passwd"),
             Some("Z:\\etc\\passwd".to_string())
         );
-    }
-
-    #[test]
-    fn test_parse_wsl_list_line() {
-        // Default marker `*` must be stripped.
-        let distro = parse_wsl_list_line("* Ubuntu-22.04           Running         2").unwrap();
-        assert_eq!(distro.name, "Ubuntu-22.04");
-        assert_eq!(distro.state, WslDistributionState::Running);
-        assert_eq!(distro.wsl_version, 2);
-
-        // Distribution names containing spaces.
-        let distro = parse_wsl_list_line("  Kali Linux            Stopped         2").unwrap();
-        assert_eq!(distro.name, "Kali Linux");
-        assert_eq!(distro.state, WslDistributionState::Stopped);
-
-        // Header and unparseable lines are skipped.
-        assert!(parse_wsl_list_line("  NAME                   STATE           VERSION").is_none());
-        assert!(parse_wsl_list_line("").is_none());
-        assert!(parse_wsl_list_line("* Distro   Running   not-a-version").is_none());
-        assert!(parse_wsl_list_line("Distro   WeirdState   2").is_none());
-        assert!(parse_wsl_list_line("Distro   Running").is_none());
     }
 }

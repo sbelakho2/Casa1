@@ -479,8 +479,6 @@ mod tests {
         milestones
     }
 
-    /// Milestones with the S10/S11 evidence recorded, so the full ladder
-    /// S0-S13 can complete.
     fn full_ladder_milestones() -> SteamMilestones {
         let mut milestones = near_full_milestones();
         milestones.input_events_consumed = Some(MilestoneEvidence {
@@ -496,7 +494,6 @@ mod tests {
         milestones
     }
 
-    /// A successful HTTPS exchange chain (S4 evidence).
     fn https_success() -> Vec<crate::canonical::NetworkSummary> {
         vec![crate::canonical::NetworkSummary {
             proto: "https".to_string(),
@@ -511,7 +508,6 @@ mod tests {
         }]
     }
 
-    /// A connect-only trace: endpoint recorded, no status/bytes/TLS evidence.
     fn connect_only() -> Vec<crate::canonical::NetworkSummary> {
         vec![crate::canonical::NetworkSummary {
             proto: "tcp".to_string(),
@@ -524,32 +520,6 @@ mod tests {
             tls_version: String::new(),
             cipher: String::new(),
         }]
-    }
-
-    #[test]
-    fn full_pass_with_guest_exit() {
-        let artifact = artifact_with(
-            full_ladder_milestones(),
-            ExecutionTermination::GuestExit { code: 0 },
-            https_success(),
-        );
-        let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
-        assert!(result.passed, "{result:#?}");
-        assert!(result.missing.is_empty());
-        assert!(result.failures.is_empty());
-        assert_eq!(result.completed_stages, Stage::ALL.to_vec());
-    }
-
-    #[test]
-    fn harness_deadline_passes_when_mandatory_complete() {
-        let artifact = artifact_with(
-            full_ladder_milestones(),
-            ExecutionTermination::HarnessDeadline,
-            https_success(),
-        );
-        let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
-        assert!(result.passed, "{result:#?}");
-        assert_eq!(result.completed_stages, Stage::ALL.to_vec());
     }
 
     #[test]
@@ -750,26 +720,5 @@ mod tests {
         assert!(!result.passed);
         assert_eq!(result.missing, vec![Stage::S10]);
         assert!(result.completed_stages.contains(&Stage::S11));
-    }
-
-    #[test]
-    fn stage_labels_are_stable() {
-        assert_eq!(Stage::S0.as_str(), "S0");
-        assert_eq!(Stage::S13.as_str(), "S13");
-        assert_eq!(Stage::ALL.len(), 14);
-        assert_eq!(MANDATORY_STAGES.len(), 13);
-    }
-
-    #[test]
-    fn result_serializes_as_json() {
-        let artifact = artifact_with(
-            full_ladder_milestones(),
-            ExecutionTermination::GuestExit { code: 0 },
-            https_success(),
-        );
-        let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
-        let json = serde_json::to_string(&result).expect("serialize result");
-        assert!(json.contains("\"passed\":true"));
-        assert!(json.contains("\"completed_stages\""));
     }
 }

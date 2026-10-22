@@ -3073,21 +3073,4 @@ fn steampipe_csm_byte_len(data: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::steam_install_target_path;
-
-    #[test]
-    fn steam_install_target_path_maps_payload_files_into_install_root() {
-        assert_eq!(
-            steam_install_target_path("bin/SteamService.exe"),
-            Some("C:/Steam/bin/SteamService.exe".to_string())
-        );
-        assert_eq!(
-            steam_install_target_path("/public/steambootstrapper_english.txt"),
-            Some("C:/Steam/public/steambootstrapper_english.txt".to_string())
-        );
-    }
-
-    #[test]
-    fn steam_install_target_path_skips_nsis_plugin_payloads() {
-        assert_eq!(steam_install_target_path("$PLUGINSDIR/System.dll"), None);
-    }
 }

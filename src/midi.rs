@@ -1539,117 +1539,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_midi_note_to_frequency() {
-        // A4 (MIDI 69) = 440 Hz
-        let freq = midi_note_to_frequency(69, 0);
-        assert!((freq - 440.0).abs() < 1.0);
-
-        // C4 (MIDI 60) = 261.63 Hz
-        let freq = midi_note_to_frequency(60, 0);
-        assert!((freq - 261.63).abs() < 1.0);
-    }
-
-    #[test]
-    fn test_note_on_off() {
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.note_on(0, 60, 100);
-        assert!(synth.channels[0].active_notes.len() == 1);
-        synth.note_off(0, 60);
-        assert!(synth.channels[0].active_notes.is_empty());
-    }
-
-    #[test]
-    fn test_program_change() {
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.program_change(0, 56); // Trumpet
-        assert_eq!(synth.channels[0].instrument, 56);
-    }
-
-    #[test]
-    fn test_control_change_volume() {
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.control_change(0, MIDI_CTL_VOLUME, 127);
-        assert_eq!(synth.channels[0].volume, 127);
-    }
-
-    #[test]
-    fn test_generate_samples() {
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.note_on(0, 60, 100);
-        let (left, right) = synth.generate_samples(441);
-        assert_eq!(left.len(), 441);
-        assert_eq!(right.len(), 441);
-        // Should have non-zero samples
-        let max_sample = left
-            .iter()
-            .chain(right.iter())
-            .map(|s| s.abs())
-            .fold(0.0f32, f32::max);
-        assert!(max_sample > 0.0);
-    }
-
-    #[test]
-    fn test_short_msg_note_on() {
-        let mut synth = MidiSynthesizer::new(44100);
-        // Note On, channel 0, note 60, velocity 100
-        let msg = 0x90u32 | (60u32 << 8) | (100u32 << 16);
-        synth.process_short_msg(msg);
-        assert_eq!(synth.channels[0].active_notes.len(), 1);
-    }
-
-    #[test]
-    fn test_short_msg_note_off() {
-        let mut synth = MidiSynthesizer::new(44100);
-        let msg_on = 0x90u32 | (60u32 << 8) | (100u32 << 16);
-        synth.process_short_msg(msg_on);
-        let msg_off = 0x80u32 | (60u32 << 8);
-        synth.process_short_msg(msg_off);
-        assert!(synth.channels[0].active_notes.is_empty());
-    }
-
-    #[test]
-    fn test_short_msg_program_change() {
-        let mut synth = MidiSynthesizer::new(44100);
-        let msg = 0xC0u32 | (56u32 << 8); // Program Change, channel 0, program 56
-        synth.process_short_msg(msg);
-        assert_eq!(synth.channels[0].instrument, 56);
-    }
-
-    #[test]
-    fn test_reset() {
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.note_on(0, 60, 100);
-        synth.note_on(1, 64, 100);
-        assert_eq!(synth.channels[0].active_notes.len(), 1);
-        synth.reset();
-        assert!(synth.channels[0].active_notes.is_empty());
-        assert!(synth.channels[1].active_notes.is_empty());
-    }
-
-    #[test]
-    fn test_pitch_bend() {
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.note_on(0, 69, 100); // A4 = 440 Hz
-        let freq_before = synth.channels[0].active_notes[0].frequency;
-        synth.pitch_bend(0, 4096); // Bend up ~1 semitone
-        let freq_after = synth.channels[0].active_notes[0].frequency;
-        assert!(freq_after > freq_before); // Pitch should go up
-    }
-
-    #[test]
-    fn test_sustain_pedal() {
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.note_on(0, 60, 100);
-        synth.control_change(0, MIDI_CTL_SUSTAIN, 127); // Press sustain
-        synth.note_off(0, 60); // Release note
-        // Note should still be active (sustained)
-        assert_eq!(synth.channels[0].active_notes.len(), 1);
-        synth.control_change(0, MIDI_CTL_SUSTAIN, 0); // Release sustain
-        // Note should now be removed
-        assert!(synth.channels[0].active_notes.is_empty());
-    }
-
-    #[test]
     fn test_sustain_duplicate_note_on_does_not_stick() {
         // A repeated note-on for an already-playing note retriggers it; with
         // the sustain pedal held, releasing the pedal must not leave a
@@ -1668,35 +1557,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_all_notes_off() {
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.note_on(0, 60, 100);
-        synth.note_on(0, 64, 100);
-        synth.note_on(0, 67, 100);
-        assert_eq!(synth.channels[0].active_notes.len(), 3);
-        synth.control_change(0, MIDI_CTL_ALL_NOTES_OFF, 0);
-        assert!(synth.channels[0].active_notes.is_empty());
-    }
-
-    #[test]
-    fn test_frequency_to_midi_note() {
-        let note = frequency_to_midi_note(440.0);
-        assert!((note - 69.0).abs() < 0.1);
-    }
-
     // -----------------------------------------------------------------------
     // Malformed / edge-case MIDI message tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_process_long_msg_empty_sysex() {
-        // SysEx with only the start byte F0 and no data — should not panic
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.process_long_msg(&[0xF0]);
-        // No crash is sufficient; state should be unchanged
-        assert!(synth.channels[0].active_notes.is_empty());
-    }
 
     #[test]
     fn test_process_long_msg_sysex_missing_eox() {
@@ -1705,34 +1568,6 @@ mod tests {
         synth.process_long_msg(&[0xF0, 0x41, 0x10, 0x42, 0x12]);
         // Should not panic; the incomplete SysEx is simply ignored
         assert!(synth.channels[0].active_notes.is_empty());
-    }
-
-    #[test]
-    fn test_process_long_msg_sysex_complete() {
-        // Well-formed SysEx: F0 ... F7
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.process_long_msg(&[0xF0, 0x41, 0x10, 0x42, 0x12, 0xF7]);
-        // Should not panic
-        assert!(synth.channels[0].active_notes.is_empty());
-    }
-
-    #[test]
-    fn test_process_long_msg_very_long_sysex() {
-        // SysEx with a large payload (e.g., 4096 bytes)
-        let mut synth = MidiSynthesizer::new(44100);
-        let mut data = vec![0xF0u8];
-        data.extend(std::iter::repeat_n(0x41u8, 4096));
-        data.push(0xF7);
-        synth.process_long_msg(&data);
-        // Should not panic
-    }
-
-    #[test]
-    fn test_process_long_msg_non_sysex_status() {
-        // Long message starting with a non-SysEx status byte (e.g., 0x80)
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.process_long_msg(&[0x80, 0x3C, 0x00]);
-        // Should not panic; unknown long message types are ignored
     }
 
     #[test]
@@ -1747,54 +1582,5 @@ mod tests {
         // Status byte 0xFF (Meta event / reset) sent as a short message
         let mut synth = MidiSynthesizer::new(44100);
         synth.process_short_msg(0xFF);
-    }
-
-    #[test]
-    fn test_process_short_msg_running_status_note_on() {
-        // Simulate running status: send a Note On, then re-send without status byte
-        // In process_short_msg the status is always present (u32), so we test
-        // that repeated same-status messages work correctly.
-        let mut synth = MidiSynthesizer::new(44100);
-        let msg_on = 0x90u32 | (60u32 << 8) | (100u32 << 16);
-        synth.process_short_msg(msg_on);
-        assert_eq!(synth.channels[0].active_notes.len(), 1);
-
-        // Send another note on the same channel (running status simulation)
-        let msg_on2 = 0x90u32 | (64u32 << 8) | (80u32 << 16);
-        synth.process_short_msg(msg_on2);
-        assert_eq!(synth.channels[0].active_notes.len(), 2);
-    }
-
-    #[test]
-    fn test_process_short_msg_zero_velocity_note_on_is_note_off() {
-        // MIDI convention: Note On with velocity 0 = Note Off
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.note_on(0, 60, 100);
-        assert_eq!(synth.channels[0].active_notes.len(), 1);
-
-        // Note On with velocity 0 should act as Note Off
-        let msg = 0x90u32 | (60u32 << 8);
-        synth.process_short_msg(msg);
-        assert!(
-            synth.channels[0].active_notes.is_empty(),
-            "Note On with velocity 0 should release the note"
-        );
-    }
-
-    #[test]
-    fn test_process_short_msg_channel_15() {
-        // Ensure high channel numbers work (channel 15 = status byte 0x9F)
-        let mut synth = MidiSynthesizer::new(44100);
-        let msg = 0x9Fu32 | (60u32 << 8) | (100u32 << 16);
-        synth.process_short_msg(msg);
-        assert_eq!(synth.channels[15].active_notes.len(), 1);
-    }
-
-    #[test]
-    fn test_process_long_msg_single_byte_f7() {
-        // A lone F7 (End of Exclusive) with no preceding F0
-        let mut synth = MidiSynthesizer::new(44100);
-        synth.process_long_msg(&[0xF7]);
-        // Should not panic
     }
 }

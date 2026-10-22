@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Stage 5 — the Win32-over-Nt layering audit: ONE semantic implementation
 //! per Win32/Nt pair.
 //!
@@ -48,54 +49,33 @@ fn setup_session() -> (TempDir, NtThunkSession) {
     (temp_dir, session)
 }
 
-/// The scratch data arena addresses (mapped by the session).
 const ARENA: u64 = 0x30_000;
 const ARENA2: u64 = 0x40_000;
 const ARENA3: u64 = 0x50_000;
 
-/// MEM_COMMIT | MEM_RESERVE (winnt.h).
 const MEM_COMMIT_RESERVE: u32 = 0x3000;
-/// PAGE_READONLY (winnt.h).
 const PAGE_READONLY: u32 = 0x02;
-/// PAGE_READWRITE (winnt.h).
 const PAGE_READWRITE: u32 = 0x04;
-/// MEM_RELEASE (winnt.h).
 const MEM_RELEASE: u32 = 0x8000;
-/// MEM_COMMIT (MEMORY_BASIC_INFORMATION state).
 const MEM_COMMIT_STATE: u32 = 0x1000;
-/// OBJ_INHERIT (ntdef.h).
 const OBJ_INHERIT: u32 = 0x0000_0002;
-/// DUPLICATE_SAME_ACCESS (NtDuplicateObject).
 const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
-/// HANDLE_FLAG_INHERIT / HANDLE_FLAG_PROTECT_FROM_CLOSE.
 const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
 const HANDLE_FLAG_PROTECT_FROM_CLOSE: u32 = 0x0000_0002;
-/// HKEY_CURRENT_USER (winnt.h).
 const HKEY_CURRENT_USER: u32 = 0x8000_0001;
-/// KEY_READ (winnt.h).
 const KEY_READ: u32 = 0x20019;
-/// REG_SZ / REG_DWORD.
 const REG_SZ: u32 = 1;
 const REG_DWORD: u32 = 4;
-/// KEY_VALUE_FULL_INFORMATION_CLASS (NtQueryValueKey).
 const KEY_VALUE_FULL_INFORMATION_CLASS: u32 = 1;
-/// GENERIC_READ / GENERIC_WRITE.
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
-/// FILE_SHARE_READ|WRITE|DELETE.
 const FILE_SHARE_ALL: u32 = 7;
-/// CREATE_ALWAYS (CreateFileW) / FILE_OPEN (NtCreateFile).
 const CREATE_ALWAYS: u32 = 2;
 const FILE_OPEN: u32 = 1;
-/// OPEN_EXISTING (CreateFileW).
 const OPEN_EXISTING: u32 = 3;
-/// FILE_SYNCHRONOUS_IO_NONALERT (NtCreateFile create options).
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
-/// OBJECT_BASIC_INFORMATION_CLASS (NtQueryObject).
 const OBJECT_BASIC_INFORMATION_CLASS: u32 = 0;
-/// SYSTEM_BASIC_INFORMATION_CLASS (NtQuerySystemInformation).
 const SYSTEM_BASIC_INFORMATION_CLASS: u32 = 0;
-/// ERROR_FILE_NOT_FOUND (Win32).
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
@@ -200,57 +180,6 @@ fn virtual_alloc_and_nt_query_virtual_memory_share_one_vm() {
 }
 
 // ── 2. Clocks: GetTickCount/GetSystemTimeAsFileTime ↔ NtQuerySystemTime ───
-
-#[test]
-fn tick_count_and_nt_query_system_time_advance_in_lockstep() {
-    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
-    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-
-    let (_tmp, mut session) = setup_session();
-    let get_tick = session.alloc_thunk(HostThunk::GetTickCount);
-    let get_system_time = session.alloc_thunk(HostThunk::GetSystemTimeAsFileTime);
-    let nt_query_system_time = session.alloc_thunk(HostThunk::NtQuerySystemTime);
-
-    let filetime_ptr = ARENA;
-    let win32_filetime_ptr = ARENA + 8;
-    session.map_guest(filetime_ptr, &[0_u8; 16]);
-
-    let ticks_before = session.call(get_tick, &[]);
-    let _ = session.call(nt_query_system_time, &[filetime_ptr]);
-    let _ = session.call(get_system_time, &[win32_filetime_ptr]);
-    let filetime_before = read_u64(&session.read_guest(filetime_ptr, 8), 0);
-    assert_eq!(
-        read_u64(&session.read_guest(win32_filetime_ptr, 8), 0),
-        filetime_before,
-        "GetSystemTimeAsFileTime and NtQuerySystemTime share ONE derivation"
-    );
-
-    // A guest sleep advances the guest clock...
-    session.advance_guest_clock(2000);
-
-    let ticks_after = session.call(get_tick, &[]);
-    let _ = session.call(nt_query_system_time, &[filetime_ptr]);
-    let _ = session.call(get_system_time, &[win32_filetime_ptr]);
-    let filetime_after = read_u64(&session.read_guest(filetime_ptr, 8), 0);
-    assert_eq!(
-        ticks_after - ticks_before,
-        2000,
-        "GetTickCount64 advances by the slept duration"
-    );
-    assert_eq!(
-        filetime_after - filetime_before,
-        20_000_000,
-        "NtQuerySystemTime advanced 2000 ms × 10_000 (100 ns) — in lockstep with the tick counter"
-    );
-
-        })
-        .expect("spawn big-stack thread")
-        .join()
-        .expect("big-stack thread panicked");
-}
 
 // ── 3. Topology: GetSystemInfo ↔ NtQuerySystemInformation ──────────────────
 

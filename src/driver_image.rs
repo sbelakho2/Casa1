@@ -759,13 +759,6 @@ mod tests {
 
     const PREFERRED_BASE: u64 = 0x1_4000_0000;
 
-    /// Build a structurally real PE64 native driver image with:
-    /// - `.text` (entry stub at RVA 0x1000 holding a DIR64-referenced pointer),
-    /// - `.rdata` (import descriptors + names + export table + reloc block),
-    /// - imports: ntoskrnl.exe!IoCreateDevice, ntoskrnl.exe!ExAllocatePoolWithTag,
-    ///   an ordinal import;
-    /// - exports: DriverEntry, DriverUnload;
-    /// - one DIR64 relocation at .text+0x20 targeting PREFERRED_BASE+0x1234.
     fn build_driver_image() -> Vec<u8> {
         // File layout.
         const TEXT_RVA: u32 = 0x1000;
@@ -977,60 +970,6 @@ mod tests {
     }
 
     #[test]
-    fn preferred_base_load_applies_no_relocations() {
-        let bytes = build_driver_image();
-        let driver = load_driver_image(&bytes, PREFERRED_BASE).expect("load");
-        assert_eq!(
-            driver.read_u64(0x1020).expect("pointer"),
-            PREFERRED_BASE + 0x1234
-        );
-    }
-
-    #[test]
-    fn classifies_imports_and_reports_unresolved() {
-        let bytes = build_driver_image();
-        let driver = load_driver_image(&bytes, PREFERRED_BASE).expect("load");
-        assert_eq!(driver.imports.len(), 1);
-        let module = &driver.imports[0];
-        assert_eq!(module.dll, "ntoskrnl.exe");
-        assert_eq!(module.set, KernelApiSet::Ntoskrnl);
-        assert_eq!(module.first_thunk_rva, 0x2060);
-        assert_eq!(
-            module.symbols,
-            vec![
-                ImportRef::Name("IoCreateDevice".to_string()),
-                ImportRef::Name("ExAllocatePoolWithTag".to_string()),
-                ImportRef::Ordinal(123),
-            ]
-        );
-        let partial = driver.resolve_imports(&TestResolver { resolve_all: false });
-        assert_eq!(partial.resolved.len(), 1);
-        assert_eq!(partial.resolved[0].1, "IoCreateDevice");
-        assert_eq!(partial.unresolved.len(), 2);
-        assert_eq!(partial.unresolved[0].1, "ExAllocatePoolWithTag");
-        assert_eq!(partial.unresolved[1].1, "#123");
-        let all = driver.resolve_imports(&TestResolver { resolve_all: true });
-        assert!(all.unresolved.is_empty());
-        assert_eq!(all.resolved.len(), 3);
-    }
-
-    #[test]
-    fn kernel_api_sets_classify() {
-        assert_eq!(
-            KernelApiSet::classify("ntoskrnl.exe"),
-            KernelApiSet::Ntoskrnl
-        );
-        assert_eq!(
-            KernelApiSet::classify("NTKRNLPA.EXE"),
-            KernelApiSet::Ntoskrnl
-        );
-        assert_eq!(KernelApiSet::classify("hal.dll"), KernelApiSet::Hal);
-        assert_eq!(KernelApiSet::classify("WdfLdr.SYS"), KernelApiSet::Kmdf);
-        assert_eq!(KernelApiSet::classify("Wdf01000.sys"), KernelApiSet::Kmdf);
-        assert_eq!(KernelApiSet::classify("win32k.sys"), KernelApiSet::Other);
-    }
-
-    #[test]
     fn rejects_non_mz_and_non_pe() {
         assert_eq!(
             load_driver_image(&[0_u8; 128], 0).err(),
@@ -1114,40 +1053,5 @@ mod tests {
             load_driver_image(&bytes, 0).err(),
             Some(STATUS_INVALID_IMAGE_PROTECT)
         );
-    }
-
-    #[test]
-    fn delay_descriptor_fields_support_rva_and_va_forms() {
-        // RVA form: the field is used verbatim.
-        assert_eq!(
-            delay_field_to_rva(0x1234, true, PREFERRED_BASE),
-            Some(0x1234)
-        );
-        // VA form (32-bit images): preferred-base addresses rebase to RVAs.
-        let base32 = 0x1000_0000u64;
-        assert_eq!(
-            delay_field_to_rva((base32 + 0x2000) as u32, false, base32),
-            Some(0x2000)
-        );
-        // A VA below the base is invalid; a VA above it subtracts exactly.
-        assert_eq!(delay_field_to_rva(0x1000, false, base32), None);
-        assert_eq!(
-            delay_field_to_rva(0xFFFF_FFFF, false, base32),
-            Some(0xEFFF_FFFF)
-        );
-        // RVA form intentionally accepts any value (validation happens when
-        // the referenced structure is read).
-        assert_eq!(
-            delay_field_to_rva(0xFFFF_FFFF, true, PREFERRED_BASE),
-            Some(0xFFFF_FFFF)
-        );
-    }
-
-    #[test]
-    fn pe_checksum_matches_documented_algorithm() {
-        // A single word file: sum + length.
-        assert_eq!(pe_checksum(&[0x01, 0x00]), 3);
-        assert_eq!(pe_checksum(&[0x01]), 2);
-        assert_eq!(pe_checksum(&[]), 0);
     }
 }

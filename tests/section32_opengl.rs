@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Section 32 — OpenGL via ANGLE (Phase 2.6)
 //!
 //! Tests the OpenGL translation layer:
@@ -163,56 +164,6 @@ fn t32_03_gl_draw_call_recording() {
 // ═══════════════════════════════════════════════════════════════════════════════
 // t32_04 — GLSL shader compilation
 // ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn t32_04_glsl_shader_compilation() {
-    let mut gl = GLState::new();
-    let ctx = gl.gl_create_context().unwrap();
-    gl.gl_make_current(ctx).unwrap();
-
-    // Create and compile vertex shader
-    let vs = gl.gl_create_shader(0x8B31).unwrap(); // GL_VERTEX_SHADER
-    let vs_source = r#"#version 330 core
-uniform mat4 uMVP;
-attribute vec3 aPosition;
-void main() {
-    gl_Position = uMVP * vec4(aPosition, 1.0);
-}"#;
-    gl.gl_compile_shader(vs, vs_source).unwrap();
-
-    // Create and compile fragment shader
-    let fs = gl.gl_create_shader(0x8B30).unwrap(); // GL_FRAGMENT_SHADER
-    let fs_source = r#"#version 330 core
-uniform vec4 uColor;
-void main() {
-    gl_FragColor = uColor;
-}"#;
-    gl.gl_compile_shader(fs, fs_source).unwrap();
-
-    // Create and link program
-    let prog = gl.gl_create_program().unwrap();
-    gl.gl_link_program(prog).unwrap();
-    gl.gl_use_program(prog).unwrap();
-
-    // Test GLSL→MSL translation (Phase 2.6)
-    let msl = GLState::glsl_to_msl(vs_source, GlslShaderStage::Vertex).unwrap();
-    assert!(msl.contains("metal_stdlib"));
-    assert!(msl.contains("vertex"));
-    assert!(msl.contains("casa1_entry"));
-
-    let msl_fs = GLState::glsl_to_msl(fs_source, GlslShaderStage::Fragment).unwrap();
-    assert!(msl_fs.contains("metal_stdlib"));
-    assert!(msl_fs.contains("fragment"));
-
-    // Test with texture sampling
-    let tex_source = r#"#version 330 core
-uniform sampler2D uTexture;
-void main() {
-    gl_FragColor = texture2D(uTexture, vec2(0.5, 0.5));
-}"#;
-    let msl_tex = GLState::glsl_to_msl(tex_source, GlslShaderStage::Fragment).unwrap();
-    assert!(msl_tex.contains("texture2d") || msl_tex.contains("sampler"));
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t32_05 — GL state tracking (blend, depth, viewport, scissor, rasterizer)

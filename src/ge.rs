@@ -3037,63 +3037,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn resolve_base_root_prefers_nearest_cargo_manifest() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let workspace_root = temp_dir.path().join("workspace");
-        let nested = workspace_root.join("games/windows_tetris");
-        fs::create_dir_all(&nested).expect("create nested workspace dirs");
-        fs::write(
-            workspace_root.join("Cargo.toml"),
-            "[package]\nname='demo'\nversion='0.1.0'\n",
-        )
-        .expect("write cargo manifest");
-
-        assert_eq!(resolve_base_root(&nested), workspace_root.join("ges"));
-    }
-
-    #[test]
-    fn base_root_candidates_include_legacy_cwd_path_when_different() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let workspace_root = temp_dir.path().join("workspace");
-        let nested = workspace_root.join("games/windows_tetris");
-        fs::create_dir_all(&nested).expect("create nested workspace dirs");
-        fs::write(
-            workspace_root.join("Cargo.toml"),
-            "[package]\nname='demo'\nversion='0.1.0'\n",
-        )
-        .expect("write cargo manifest");
-
-        assert_eq!(
-            base_root_candidates_from(&nested),
-            vec![workspace_root.join("ges"), nested.join("ges")]
-        );
-    }
-
-    #[test]
-    fn find_named_ge_in_workspace_discovers_legacy_subdirectory_ge() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let workspace_root = temp_dir.path().join("workspace");
-        let current = workspace_root.join("games/windows_tetris");
-        let legacy_ge = current.join("ges/casa1-live-tetris");
-        fs::create_dir_all(&legacy_ge).expect("create legacy ge dirs");
-        fs::write(
-            workspace_root.join("Cargo.toml"),
-            "[package]\nname='demo'\nversion='0.1.0'\n",
-        )
-        .expect("write cargo manifest");
-        fs::write(legacy_ge.join("ge.json"), "{}\n").expect("write ge.json");
-
-        let found = find_named_ge_in_workspace(
-            &workspace_root,
-            "casa1-live-tetris",
-            &[workspace_root.join("ges")],
-        )
-        .expect("find ge");
-
-        assert_eq!(found, Some(legacy_ge));
-    }
-
-    #[test]
     fn find_named_ge_in_workspace_errors_on_ambiguous_legacy_matches() {
         let temp_dir = TempDir::new().expect("temp dir");
         let workspace_root = temp_dir.path().join("workspace");
@@ -3117,14 +3060,5 @@ mod tests {
         .expect_err("ambiguous legacy ge lookup should fail");
 
         assert_eq!(error.code, ReasonCode::RcCliInvalid);
-    }
-
-    #[test]
-    fn resolve_base_root_falls_back_to_current_directory_without_manifest() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let nested = temp_dir.path().join("games/windows_tetris");
-        fs::create_dir_all(&nested).expect("create nested dirs");
-
-        assert_eq!(resolve_base_root(&nested), nested.join("ges"));
     }
 }

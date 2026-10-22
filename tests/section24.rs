@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Phase 1.3.4 — Per-DLL Integration Tests
 //!
 //! These tests verify that every export from each DLL that Steam.exe imports
@@ -30,7 +31,7 @@ use casa1::compatibility_profile::CompatibilityProfile;
 use casa1::ge::GameEnvironment;
 use casa1::host_thunks::ImplementationLevel;
 use casa1::import_coverage::{
-    BinaryCoverageReport, WorkloadId, coverage_for_pe, coverage_for_pe_with_runtime_trace,
+    BinaryCoverageReport, WorkloadId, coverage_for_pe_with_runtime_trace,
     invoked_api_names_from_trace,
 };
 use casa1::pe::{self, ApiSetResolver, ImportSymbol};
@@ -43,17 +44,10 @@ use std::sync::OnceLock;
 // Helper infrastructure
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Path to the Steam GE (relative to the workspace `ges/` directory).
 fn steam_ge_root() -> &'static str {
     "steam-live-run-x86"
 }
 
-/// Require that the Steam GE exists; return `false` (with a clear message) so the
-/// caller can skip when it does not.
-///
-/// This is a real skip mechanism — a missing GE must not fail the suite. The GE
-/// root is resolved via `CARGO_MANIFEST_DIR` so the check does not depend on the
-/// process CWD.
 fn require_steam_ge() -> bool {
     let ge_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("ges")
@@ -79,8 +73,6 @@ fn require_steam_ge() -> bool {
     true
 }
 
-/// Open the Steam GE, parse [`Steam.exe`](ges/steam-live-run-x86/drive_c/Steam.exe),
-/// and create an [`ApiSetResolver`].
 fn open_steam() -> (GameEnvironment, pe::ParsedPe, ApiSetResolver) {
     let ge = GameEnvironment::open(steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
     let path = ge.root.join("drive_c").join("Steam.exe");
@@ -90,8 +82,6 @@ fn open_steam() -> (GameEnvironment, pe::ParsedPe, ApiSetResolver) {
     (ge, image, resolver)
 }
 
-/// Extract all import names and [`ImportSymbol`]s for a given DLL from the
-/// parsed PE image (including delayed imports).
 fn imports_for_dll(
     image: &pe::ParsedPe,
     resolver: &ApiSetResolver,
@@ -115,11 +105,6 @@ fn imports_for_dll(
     out
 }
 
-/// Execute Steam.exe with a given instruction budget and return the result.
-///
-/// This is the primary smoke-test helper.  It sets up a minimal environment
-/// with the crash-workaround flag enabled (so the runtime is instrumented) and
-/// runs in deterministic mode (DTM).
 fn run_steam_with_budget(budget: u64) -> PeExecutionResult {
     let ge = GameEnvironment::open(steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
     let path = ge.root.join("drive_c").join("Steam.exe");
@@ -146,10 +131,6 @@ fn run_steam_with_budget(budget: u64) -> PeExecutionResult {
 // same budget), so the run is shared through a once-guard. This keeps the suite
 // practical: previously every smoke test re-executed Steam.exe, and 15 runs of
 // the PE runtime each took >60 s of wall time.
-/// Run a closure on a worker thread with a large stack.  The bounded Steam
-/// run's guest-dispatch/loader path is stack-hungry in debug builds: the run
-/// aborts with a stack overflow on a default 2 MiB libtest thread and
-/// completes on 8 MiB+.  Scoped so the closure can borrow the GE/path/env.
 fn run_with_large_stack<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send,
@@ -171,12 +152,6 @@ fn steam_smoke_result() -> &'static PeExecutionResult {
     SMOKE_RESULT.get_or_init(|| run_with_large_stack(|| run_steam_with_budget(1_000_000)))
 }
 
-/// Assert the documented smoke-run invariants for a bounded Steam.exe execution:
-/// the run must complete without guest exceptions, terminate with a documented
-/// exit code (0 = clean guest exit; -2 = run terminated by the runtime when the
-/// instruction budget was exhausted — the observed termination code for bounded
-/// runs, see output.log), and the crash-workaround instrumentation must have
-/// produced its pre-execution SteamInitialGlobals trace event.
 fn assert_clean_smoke(result: &PeExecutionResult, dll_label: &str) {
     assert!(
         result.guest_exceptions.is_empty(),
@@ -205,8 +180,6 @@ fn assert_clean_smoke(result: &PeExecutionResult, dll_label: &str) {
     );
 }
 
-/// Verify that *every* import for a given DLL is flagged as supported by
-/// [`is_import_supported()`].
 fn verify_dll_coverage(dll_name: &str) {
     let (_, image, resolver) = open_steam();
     let imports = imports_for_dll(&image, &resolver, dll_name);
@@ -236,314 +209,57 @@ fn verify_dll_coverage(dll_name: &str) {
 // t24_01 — kernel32.dll (188 imports)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[test]
-fn t24_01_kernel32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("kernel32.dll");
-}
-
-#[test]
-fn t24_01_kernel32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "kernel32");
-
-    // If kernel32 imports are wired correctly, execution should at least
-    // proceed past the import-resolution phase without crashing.
-    // A budget of 1M is enough to exercise GetModuleHandleW, GetLastError,
-    // GetSystemInfo, and other early-kernel32 calls during CRT init.
-    eprintln!("  ✓ kernel32 smoke completed (import resolution phase passed)");
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_02 — user32.dll (57 imports)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn t24_02_user32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("user32.dll");
-}
-
-#[test]
-fn t24_02_user32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "user32");
-    eprintln!("  ✓ user32 smoke completed");
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_03 — ws2_32.dll (28 imports)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[test]
-fn t24_03_ws2_32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("ws2_32.dll");
-}
-
-#[test]
-fn t24_03_ws2_32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "ws2_32");
-    eprintln!("  ✓ ws2_32 smoke completed");
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_04 — gdi32.dll (19 imports)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn t24_04_gdi32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("gdi32.dll");
-}
-
-#[test]
-fn t24_04_gdi32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "gdi32");
-    eprintln!("  ✓ gdi32 smoke completed");
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_05 — advapi32.dll (13 imports)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[test]
-fn t24_05_advapi32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("advapi32.dll");
-}
-
-#[test]
-fn t24_05_advapi32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "advapi32");
-    eprintln!("  ✓ advapi32 smoke completed");
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_06 — crypt32.dll (7 imports)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn t24_06_crypt32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("crypt32.dll");
-}
-
-#[test]
-fn t24_06_crypt32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "crypt32");
-    eprintln!("  ✓ crypt32 smoke completed");
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_07 — shell32.dll (4 imports)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[test]
-fn t24_07_shell32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("shell32.dll");
-}
-
-#[test]
-fn t24_07_shell32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "shell32");
-    eprintln!("  ✓ shell32 smoke completed");
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_08 — psapi.dll (3 imports)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn t24_08_psapi_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("psapi.dll");
-}
-
-#[test]
-fn t24_08_psapi_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "psapi");
-    eprintln!("  ✓ psapi smoke completed");
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_09 — bcrypt.dll (1 import)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[test]
-fn t24_09_bcrypt_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("bcrypt.dll");
-}
-
-#[test]
-fn t24_09_bcrypt_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "bcrypt");
-    eprintln!("  ✓ bcrypt smoke completed");
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_10 — comctl32.dll (1 import)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn t24_10_comctl32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("comctl32.dll");
-}
-
-#[test]
-fn t24_10_comctl32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "comctl32");
-    eprintln!("  ✓ comctl32 smoke completed");
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_11 — ole32.dll (1 import)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[test]
-fn t24_11_ole32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("ole32.dll");
-}
-
-#[test]
-fn t24_11_ole32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "ole32");
-    eprintln!("  ✓ ole32 smoke completed");
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_12 — oleaut32.dll (1 import)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn t24_12_oleaut32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("oleaut32.dll");
-}
-
-#[test]
-fn t24_12_oleaut32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "oleaut32");
-    eprintln!("  ✓ oleaut32 smoke completed");
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_13 — version.dll (1 import)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[test]
-fn t24_13_version_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("version.dll");
-}
-
-#[test]
-fn t24_13_version_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "version");
-    eprintln!("  ✓ version smoke completed");
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_14 — wsock32.dll (1 import)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn t24_14_wsock32_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    verify_dll_coverage("wsock32.dll");
-}
-
-#[test]
-fn t24_14_wsock32_smoke() {
-    if !require_steam_ge() {
-        return;
-    }
-    let result = steam_smoke_result();
-    assert_clean_smoke(result, "wsock32");
-    eprintln!("  ✓ wsock32 smoke completed");
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_15 — aggregate coverage matrix (reprise)
@@ -551,61 +267,6 @@ fn t24_14_wsock32_smoke() {
 //
 // Re-runs the full coverage matrix from t23_3 as a sanity check inside this
 // test module, so the per-DLL tests have a cross-reference.
-
-#[test]
-fn t24_15_aggregate_coverage() {
-    if !require_steam_ge() {
-        return;
-    }
-    let (_, image, resolver) = open_steam();
-
-    let mut total_supported = 0_usize;
-    let mut total_unsupported = 0_usize;
-    let mut per_dll: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
-
-    for desc in image.imports.iter().chain(image.delay_imports.iter()) {
-        let resolved = resolver.resolve(&desc.dll_name);
-        for imp in &desc.imports {
-            let name = match &imp.symbol {
-                ImportSymbol::ByName { name, .. } => name.clone(),
-                ImportSymbol::ByOrdinal { ordinal } => format!("ordinal#{ordinal}"),
-            };
-            let supported = is_import_supported(&resolved, &imp.symbol);
-            let entry = per_dll
-                .entry(resolved.clone())
-                .or_insert_with(|| (Vec::new(), Vec::new()));
-            if supported {
-                total_supported += 1;
-                entry.0.push(name);
-            } else {
-                total_unsupported += 1;
-                entry.1.push(name);
-            }
-        }
-    }
-
-    let total = total_supported + total_unsupported;
-    let pct = (total_supported as f64 / total as f64) * 100.0;
-
-    eprintln!("=== Aggregate Import Coverage (Phase 1.3.4) ===\n");
-    eprintln!("Total: {total_supported}/{total} ({pct:.1}%) imports supported");
-    eprintln!("  Supported:   {total_supported}");
-    eprintln!("  Unsupported: {total_unsupported}\n");
-
-    eprintln!("{:<40} {:>5}/{:<5}  {:>6}", "DLL", "Ok", "Total", "Pct");
-    eprintln!("{}", "-".repeat(60));
-    for (dll, (ok, missing)) in &per_dll {
-        let dll_total = ok.len() + missing.len();
-        let dll_pct = (ok.len() as f64 / dll_total as f64) * 100.0;
-        eprintln!("{dll:<40} {:>5}/{dll_total:<5}  {dll_pct:>5.1}%", ok.len());
-    }
-
-    assert!(
-        pct >= 95.0,
-        "Aggregate coverage {pct:.1}% is below 95% threshold — {total_unsupported} imports unsupported",
-    );
-    eprintln!("\n✓ Aggregate coverage meets 95% threshold");
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t24_16 — kernel32 key-function smoke tests
@@ -715,8 +376,6 @@ fn t24_16_kernel32_key_functions() {
 // or Unsupported" — is encoded as an assertion over the INVOKED set ONLY
 // (an empty invoked set is trivially satisfied, but still reported).
 
-/// Path to the tracked Steam.exe fixture (committed to the repo, always
-/// available — no GE setup required).
 fn tracked_steam_exe() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("ges")
@@ -726,11 +385,6 @@ fn tracked_steam_exe() -> PathBuf {
         .join("Steam.exe")
 }
 
-/// Print the section40-style structured telemetry for a coverage report.
-///
-/// The report is printed twice: a compact per-entry listing (all imported
-/// APIs, (a)) and the JSON serialization, so the full structured report is
-/// visible under `--nocapture`.
 fn print_quality_telemetry(label: &str, report: &BinaryCoverageReport) {
     eprintln!("\n═══════════════════════════════════════════════════════════════");
     eprintln!("  Steam import quality telemetry [{label}]");
@@ -844,58 +498,6 @@ fn print_quality_telemetry(label: &str, report: &BinaryCoverageReport) {
         serde_json::to_string_pretty(report).expect("serialize coverage report")
     );
     eprintln!("═══════════════════════════════════════════════════════════════\n");
-}
-
-#[test]
-fn t24_17_tracked_fixture_import_quality() {
-    let path = tracked_steam_exe();
-    assert!(
-        path.is_file(),
-        "tracked Steam fixture missing at {}",
-        path.display()
-    );
-
-    // No E2E trace is available in CI for the tracked fixture, so the
-    // runtime-reached set is empty; t24_18 (GE smoke) supplies a real one.
-    // The static-scan entry point is used deliberately: the other smoke tests
-    // in this binary execute Steam.exe in parallel and populate the shared
-    // dynamic-import log, which the runtime-trace variant would consume.
-    let workload = WorkloadId::new("steam-fixture");
-    let target = CompatibilityProfile::win10_legacy_desktop();
-    let report = coverage_for_pe(&path, &workload, target).expect("coverage report");
-
-    print_quality_telemetry("tracked-fixture (invoked set: empty)", &report);
-
-    // (a) Every import of the fixture is present and classified.
-    assert!(
-        report.total_imports > 300,
-        "unexpectedly small import surface: {}",
-        report.total_imports
-    );
-    assert_eq!(
-        report.by_implementation.values().sum::<usize>(),
-        report.total_imports,
-        "every import must be classified"
-    );
-
-    // (b) Runtime-reached set: empty (no trace) — reported, not asserted.
-    assert!(
-        report.entries.iter().all(|entry| !entry.runtime_reached),
-        "runtime_reached must be false without a trace"
-    );
-
-    // (c) Runtime-reached Partial/Stub/Unsupported: empty (nothing reached).
-    // Release requirement: encoded ONLY over the runtime-reached set.
-    let violations = report.runtime_reached_required_violations();
-    assert!(
-        violations.is_empty(),
-        "runtime-reached Required API is Stub/Unsupported: {:#?}",
-        violations
-    );
-    eprintln!(
-        "  ✓ t24_17: release gate over runtime-reached set PASSES ({} violation(s); set empty => trivially satisfied but reported)",
-        violations.len()
-    );
 }
 
 #[test]

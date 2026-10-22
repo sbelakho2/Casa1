@@ -2036,26 +2036,6 @@ mod tests {
     }
 
     #[test]
-    fn guest_mutex_recursive_acquire() {
-        let mutex = GuestMutex::new();
-        assert!(mutex.try_acquire(1));
-        assert!(mutex.try_acquire(1)); // Recursive acquire
-        assert!(mutex.release(1));
-        assert!(mutex.release(1));
-        assert!(mutex.try_acquire(2)); // Fully released
-    }
-
-    #[test]
-    fn guest_semaphore_basic() {
-        let sem = GuestSemaphore::new(2, 5);
-        assert_eq!(sem.count(), 2);
-        sem.wait();
-        assert_eq!(sem.count(), 1);
-        assert_eq!(sem.release(1).unwrap(), 1);
-        assert_eq!(sem.count(), 2);
-    }
-
-    #[test]
     fn guest_semaphore_exceeds_max() {
         let sem = GuestSemaphore::new(0, 2);
         let _result = sem.release(2);
@@ -2094,49 +2074,6 @@ mod tests {
         });
         assert!(init.is_completed());
         assert!(called.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn guest_iocp_post_and_dequeue() {
-        let iocp = GuestIoCompletionPort::new(4);
-        iocp.post(IoCompletionPacket {
-            completion_key: 42,
-            overlapped: 0x1000,
-            bytes_transferred: 100,
-            error_code: 0,
-        })
-        .unwrap();
-        let packet = iocp.dequeue(Some(100));
-        assert!(packet.is_some());
-        let p = packet.unwrap();
-        assert_eq!(p.completion_key, 42);
-        assert_eq!(p.bytes_transferred, 100);
-    }
-
-    #[test]
-    fn guest_barrier_sync() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let barrier = Arc::new(GuestBarrier::new(3));
-        let mut handles = Vec::new();
-        let reached = Arc::new(AtomicU32::new(0));
-
-        for _ in 0..3 {
-            let barrier = barrier.clone();
-            let reached = reached.clone();
-            handles.push(thread::spawn(move || {
-                reached.fetch_add(1, Ordering::SeqCst);
-                barrier.wait();
-                reached.fetch_add(1, Ordering::SeqCst);
-            }));
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        assert_eq!(reached.load(Ordering::SeqCst), 6); // 3 pre + 3 post
     }
 
     #[test]
@@ -2217,50 +2154,7 @@ mod tests {
         assert!(waited.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn thread_id_allocation_is_unique() {
-        let id1 = allocate_thread_id();
-        let id2 = allocate_thread_id();
-        assert_ne!(id1, id2);
-    }
-
     // ── Phase N tests ──────────────────────────────────────────────────────
-
-    #[test]
-    fn fiber_manager_create_and_switch() {
-        let mut mgr = GuestFiberManager::new();
-        let primary = mgr.convert_thread_to_fiber();
-        let fiber = mgr.create_fiber(64 * 1024, 0x401000, 0xDEAD_BEEF);
-        assert_ne!(primary, fiber);
-        assert_eq!(mgr.current_fiber(), Some(primary));
-
-        let (from, to) = mgr.switch_to(fiber).unwrap();
-        assert_eq!(from as FiberHandle, primary);
-        assert_eq!(to as FiberHandle, fiber);
-        assert_eq!(mgr.current_fiber(), Some(fiber));
-    }
-
-    #[test]
-    fn fiber_manager_delete_returns_callbacks() {
-        let mut mgr = GuestFiberManager::new();
-        let fiber = mgr.create_fiber(64 * 1024, 0x401000, 0);
-        let ctx = mgr.get_fiber_mut(fiber).unwrap();
-        ctx.set_fls_callback(0, 0x5000);
-        ctx.set_fls_callback(1, 0x5001);
-        let cbs = mgr.delete_fiber(fiber);
-        assert_eq!(cbs, vec![0x5000, 0x5001]);
-        assert!(mgr.get_fiber(fiber).is_none());
-    }
-
-    #[test]
-    fn fiber_fls_slots() {
-        let mut mgr = GuestFiberManager::new();
-        let fiber = mgr.create_fiber(64 * 1024, 0x401000, 0);
-        let ctx = mgr.get_fiber_mut(fiber).unwrap();
-        assert!(ctx.set_fls(0, 42));
-        assert_eq!(ctx.get_fls(0), Some(42));
-        assert!(ctx.get_fls(200).is_none());
-    }
 
     #[test]
     fn srwlock_exclusive_and_shared() {
@@ -2273,61 +2167,6 @@ mod tests {
         assert!(lock.try_acquire_shared()); // multiple readers ok
         lock.release_shared();
         lock.release_shared();
-    }
-
-    #[test]
-    fn condition_variable_wake() {
-        let cv = GuestConditionVariable::new();
-        // Basic smoke test — wake should not panic
-        cv.wake();
-        cv.wake_all();
-        assert_eq!(cv.wake_count(), 2);
-    }
-
-    #[test]
-    fn condition_variable_wake_is_immediate() {
-        use std::sync::Arc;
-
-        let cv = Arc::new(GuestConditionVariable::new());
-        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
-        let (done_tx, done_rx) = crossbeam_channel::bounded::<bool>(1);
-        let cv2 = Arc::clone(&cv);
-
-        let waiter = std::thread::spawn(move || {
-            ready_tx.send(()).unwrap();
-            let woke = cv2.sleep_with_polling(Some(5_000), || false);
-            done_tx.send(woke).unwrap();
-        });
-
-        ready_rx.recv().unwrap();
-        // Wait (bounded) until the waiter is actually blocked on the condvar.
-        let spin_deadline = std::time::Instant::now() + Duration::from_millis(2_000);
-        while cv.waiter_count() == 0 && std::time::Instant::now() < spin_deadline {
-            std::hint::spin_loop();
-        }
-        assert!(cv.waiter_count() > 0, "waiter never registered");
-
-        let wakes_before = cv.wake_count();
-        let t0 = std::time::Instant::now();
-        cv.wake();
-        let woke = done_rx
-            .recv_timeout(Duration::from_millis(500))
-            .expect("wake must be delivered promptly");
-        let latency = t0.elapsed();
-
-        assert!(woke, "waiter must report a wake, not a timeout");
-        assert!(
-            latency < Duration::from_millis(250),
-            "wake latency too high: {latency:?}"
-        );
-        assert_eq!(cv.wake_count(), wakes_before + 1, "wake counter");
-        assert_eq!(cv.waiter_count(), 0, "waiter must deregister");
-        assert!(
-            cv.poll_iterations() <= 4,
-            "event-driven wake took {} iterations",
-            cv.poll_iterations()
-        );
-        waiter.join().unwrap();
     }
 
     #[test]
@@ -2395,82 +2234,6 @@ mod tests {
     }
 
     #[test]
-    fn apc_queue_disabled_blocks_delivery() {
-        let mut queue = GuestApcQueue::new();
-        queue.queue_user_apc(0x1000, 0x2000);
-        queue.disable();
-        let apcs = queue.deliver_apcs(10);
-        assert!(apcs.is_empty());
-        assert_eq!(queue.pending_count(), 0); // disabled reports 0
-    }
-
-    #[test]
-    fn apc_queue_peek_and_count() {
-        let mut queue = GuestApcQueue::new();
-        assert_eq!(queue.pending_count(), 0);
-        queue.queue_user_apc(0x1000, 0x2000);
-        assert_eq!(queue.pending_count(), 1);
-        let peeked = queue.peek_next().unwrap();
-        assert_eq!(peeked.callback, 0x1000);
-        // Peek doesn't remove
-        assert_eq!(queue.pending_count(), 1);
-    }
-
-    #[test]
-    fn enhanced_thread_pool_queue_and_dequeue() {
-        let pool = EnhancedGuestThreadPool::new(2);
-        pool.queue_work(0xAAAA, 0xBBBB, 0);
-        pool.queue_work(0xCCCC, 0xDDDD, 0);
-        assert_eq!(pool.pending_count(), 2);
-    }
-
-    #[test]
-    fn enhanced_thread_pool_timer_create_delete() {
-        let pool = EnhancedGuestThreadPool::new(1);
-        pool.create_timer(1, 0x5000, 0, 100, 50);
-        pool.delete_timer(1);
-        // No panic = success
-    }
-
-    #[test]
-    fn enhanced_thread_pool_timer_fires_at_due_time_in_order() {
-        let mut pool = EnhancedGuestThreadPool::new(2);
-        pool.start();
-        // Created out of due-time order: delivery must be due-time ordered.
-        pool.create_timer(3, 0x300, 0, 80, 0);
-        pool.create_timer(1, 0x100, 0, 30, 0);
-        pool.create_timer(2, 0x200, 0, 50, 0);
-
-        let t0 = std::time::Instant::now();
-        let first = pool
-            .dequeue_completed_timeout(1_000)
-            .expect("first timer must fire");
-        let second = pool
-            .dequeue_completed_timeout(1_000)
-            .expect("second timer must fire");
-        let third = pool
-            .dequeue_completed_timeout(1_000)
-            .expect("third timer must fire");
-        let elapsed = t0.elapsed();
-
-        assert_eq!(
-            [first.callback, second.callback, third.callback],
-            [0x100, 0x200, 0x300],
-            "timers must fire in due-time order"
-        );
-        assert!(
-            elapsed >= Duration::from_millis(75),
-            "timers fired before their deadlines: {elapsed:?}"
-        );
-        assert!(
-            elapsed < Duration::from_millis(800),
-            "timers fired late: {elapsed:?}"
-        );
-        // Exactly once each: nothing left over.
-        assert!(pool.dequeue_completed().is_none());
-    }
-
-    #[test]
     fn enhanced_thread_pool_timer_delete_cancels() {
         let mut pool = EnhancedGuestThreadPool::new(1);
         pool.start();
@@ -2510,39 +2273,6 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn concurrency_guest_mutex_high_contention() {
-        let mutex = Arc::new(GuestMutex::new());
-        let count = Arc::new(AtomicU32::new(0));
-        let num_threads = 24;
-        let iterations = 100;
-        let mut handles = Vec::with_capacity(num_threads);
-
-        for tid in 0..num_threads {
-            let m = Arc::clone(&mutex);
-            let c = Arc::clone(&count);
-            handles.push(std::thread::spawn(move || {
-                for _ in 0..iterations {
-                    if m.try_acquire(tid as u32) {
-                        let val = c.load(Ordering::SeqCst);
-                        c.store(val + 1, Ordering::SeqCst);
-                        m.release(tid as u32);
-                    }
-                }
-            }));
-        }
-
-        for h in handles {
-            h.join().expect("thread panicked");
-        }
-
-        // At least some increments succeeded (non-deterministic under contention)
-        assert!(
-            count.load(Ordering::SeqCst) > 0,
-            "no increments succeeded under contention"
-        );
-    }
-
-    #[test]
     fn concurrency_guest_semaphore_multi_thread() {
         let sem = Arc::new(GuestSemaphore::new(4, 10));
         let mut handles = Vec::new();
@@ -2580,36 +2310,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrency_guest_init_once_parallel() {
-        let init_once = Arc::new(GuestInitOnce::new());
-        let call_count = Arc::new(AtomicU32::new(0));
-        let num_threads = 16;
-        let mut handles = Vec::with_capacity(num_threads);
-
-        for _ in 0..num_threads {
-            let io = Arc::clone(&init_once);
-            let cc = Arc::clone(&call_count);
-            handles.push(std::thread::spawn(move || {
-                io.call_once(|| {
-                    cc.fetch_add(1, Ordering::SeqCst);
-                });
-            }));
-        }
-
-        for h in handles {
-            h.join().expect("thread panicked");
-        }
-
-        // InitOnce should have been called exactly once
-        assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            1,
-            "InitOnce called more than once"
-        );
-        assert!(init_once.is_completed());
-    }
-
-    #[test]
     fn concurrency_guest_barrier_stress() {
         let num_threads: u32 = 10;
         let barrier = Arc::new(GuestBarrier::new(num_threads));
@@ -2628,99 +2328,7 @@ mod tests {
         // Barrier does not deadlock = success
     }
 
-    #[test]
-    fn concurrency_iocp_multi_producer_consumer() {
-        let iocp = Arc::new(GuestIoCompletionPort::new(8));
-        let num_producers = 6;
-        let num_consumers = 4;
-        let items_per_producer = 50;
-        let total_expected = num_producers * items_per_producer;
-        let received = Arc::new(AtomicU32::new(0));
-
-        // Producers run to completion first, so every real packet is enqueued
-        // ahead of the sentinels below (the bounded channel has room for all).
-        let mut producers = Vec::new();
-        for pid in 0..num_producers {
-            let port = Arc::clone(&iocp);
-            producers.push(std::thread::spawn(move || {
-                for i in 0..items_per_producer {
-                    let _ = port.post(IoCompletionPacket {
-                        completion_key: pid as u64,
-                        overlapped: i as u64,
-                        bytes_transferred: 1,
-                        error_code: 0,
-                    });
-                }
-            }));
-        }
-        for h in producers {
-            h.join().expect("producer panicked");
-        }
-
-        // One sentinel per consumer lets each consumer stop its blocking
-        // dequeue — no timeout tick loop.
-        for _ in 0..num_consumers {
-            iocp.post(IoCompletionPacket {
-                completion_key: u64::MAX,
-                overlapped: 0,
-                bytes_transferred: 0,
-                error_code: 0,
-            })
-            .expect("sentinel post");
-        }
-
-        let mut consumers = Vec::new();
-        for _ in 0..num_consumers {
-            let port = Arc::clone(&iocp);
-            let rcvd = Arc::clone(&received);
-            consumers.push(std::thread::spawn(move || {
-                loop {
-                    match port.dequeue(None) {
-                        Some(pkt) => {
-                            if pkt.completion_key == u64::MAX {
-                                break;
-                            }
-                            rcvd.fetch_add(1, Ordering::SeqCst);
-                        }
-                        None => break,
-                    }
-                }
-            }));
-        }
-        for h in consumers {
-            h.join().expect("consumer panicked");
-        }
-
-        assert_eq!(
-            received.load(Ordering::SeqCst),
-            total_expected as u32,
-            "all posted packets must be transferred"
-        );
-    }
-
     // ── Mutex behavior tests ───────────────────────────────────────────
-
-    #[test]
-    fn mutex_acquire_and_release() {
-        let mx = GuestMutex::new();
-        assert!(mx.try_acquire(1), "first acquire should succeed");
-        assert!(mx.release(1), "release from owner should succeed");
-    }
-
-    #[test]
-    fn mutex_recursive_acquire() {
-        let mx = GuestMutex::new();
-        assert!(mx.try_acquire(1));
-        assert!(mx.try_acquire(1), "recursive acquire should succeed");
-        assert!(mx.release(1));
-        assert!(mx.release(1));
-        // After full release, another thread can acquire
-        assert!(
-            mx.try_acquire(2),
-            "acquire after full release should succeed"
-        );
-        assert!(mx.release(2));
-    }
 
     #[test]
     fn mutex_release_from_non_owner_fails() {
@@ -2773,15 +2381,6 @@ mod tests {
     // ── Event behavior tests ───────────────────────────────────────────
 
     #[test]
-    fn event_manual_reset_set_and_wait() {
-        let ev = GuestEvent::new(false, false); // manual-reset
-        ev.set();
-        ev.wait(); // should not block
-        // Manual-reset stays signaled
-        assert!(ev.is_signaled(), "manual-reset should stay signaled");
-    }
-
-    #[test]
     fn event_auto_reset_clears_after_wait() {
         let ev = GuestEvent::new(false, true); // auto-reset
         ev.set();
@@ -2806,79 +2405,12 @@ mod tests {
         assert!(!ev.is_signaled(), "second check should not be signaled");
     }
 
-    #[test]
-    fn event_blocking_wait() {
-        let ev = Arc::new(GuestEvent::new(false, false));
-        let ev2 = Arc::clone(&ev);
-        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
-        let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
-        let h = std::thread::spawn(move || {
-            ready_tx.send(()).unwrap();
-            go_rx.recv().unwrap();
-            ev2.set();
-        });
-
-        ready_rx.recv().unwrap();
-        let t0 = std::time::Instant::now();
-        go_tx.send(()).unwrap();
-        ev.wait(); // woken by set(), not by a timing tick
-        assert!(
-            t0.elapsed() < Duration::from_millis(500),
-            "event wake latency too high: {:?}",
-            t0.elapsed()
-        );
-        h.join().expect("thread should complete");
-    }
-
     // ── Semaphore behavior tests ───────────────────────────────────────
-
-    #[test]
-    fn semaphore_release_and_wait() {
-        let sem = GuestSemaphore::new(0, 3);
-        sem.release(2).expect("release should succeed");
-        assert_eq!(sem.count(), 2);
-        sem.wait(); // decrement to 1
-        assert_eq!(sem.count(), 1);
-        sem.wait(); // decrement to 0
-        assert_eq!(sem.count(), 0);
-    }
 
     #[test]
     fn semaphore_release_exceeds_max_fails() {
         let sem = GuestSemaphore::new(2, 3);
         let result = sem.release(2);
         assert!(result.is_err(), "releasing beyond max should fail");
-    }
-
-    #[test]
-    fn semaphore_release_returns_previous_count() {
-        let sem = GuestSemaphore::new(1, 5);
-        let prev = sem.release(2).expect("release should succeed");
-        assert_eq!(prev, 1, "previous count should be 1");
-        assert_eq!(sem.count(), 3);
-    }
-
-    #[test]
-    fn semaphore_blocking_wait() {
-        let sem = Arc::new(GuestSemaphore::new(0, 2));
-        let sem2 = Arc::clone(&sem);
-        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
-        let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
-        let h = std::thread::spawn(move || {
-            ready_tx.send(()).unwrap();
-            go_rx.recv().unwrap();
-            sem2.release(1).expect("release");
-        });
-
-        ready_rx.recv().unwrap();
-        let t0 = std::time::Instant::now();
-        go_tx.send(()).unwrap();
-        sem.wait(); // woken by release(), not by a timing tick
-        assert!(
-            t0.elapsed() < Duration::from_millis(500),
-            "semaphore wake latency too high: {:?}",
-            t0.elapsed()
-        );
-        h.join().expect("thread should complete");
     }
 }

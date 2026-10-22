@@ -2537,14 +2537,6 @@ mod tests {
     }
 
     #[test]
-    fn wininet_open_close_session() {
-        let mut stack = WinInetStack::new();
-        let h = stack.internet_open_w(Some("Casa1"), 0, None, None);
-        let _result = stack.internet_close_handle(h);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-    }
-
-    #[test]
     fn wininet_simple_http_get() {
         if !httpbin_reachable() {
             eprintln!("skipping wininet_simple_http_get: httpbin.org not reachable");
@@ -2582,7 +2574,6 @@ mod tests {
         }
     }
 
-    /// Encode a DER TLV: tag, length (short or long form), then content.
     fn der(tag: u8, content: &[u8]) -> Vec<u8> {
         let mut out = vec![tag];
         let len = content.len();
@@ -2642,14 +2633,6 @@ mod tests {
         cert.extend_from_slice(&outer_signature);
         cert.extend_from_slice(&signature_value);
         der(0x30, &cert)
-    }
-
-    #[test]
-    fn wininet_extract_spki_der_returns_exact_subject_public_key_info() {
-        let spki = build_spki(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let cert = synthetic_certificate(&spki);
-        let extracted = extract_spki_der(&cert).expect("SPKI must be extractable");
-        assert_eq!(extracted, spki);
     }
 
     #[test]

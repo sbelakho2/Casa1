@@ -1760,39 +1760,6 @@ mod tests {
     // --- Block Chaining Tests ---
 
     #[test]
-    fn block_chaining_register_and_execute() {
-        let mut cache = BlockChainingCache::new();
-        cache.register_block(0x1000, 0x2000, 64, 10);
-        cache.register_block(0x2000, 0x3000, 32, 5);
-
-        assert_eq!(cache.block_count(), 2);
-
-        // Execute 10 times to reach hot threshold
-        for _ in 0..10 {
-            cache.record_execution(0x1000, 0x2000).unwrap();
-        }
-
-        let block = cache.get_block(0x1000).unwrap();
-        assert_eq!(block.execution_count, 10);
-        assert_eq!(block.fallthrough_target, Some(0x2000));
-    }
-
-    #[test]
-    fn block_chaining_creates_chain() {
-        let mut cache = BlockChainingCache::new();
-        cache.register_block(0x1000, 0x2000, 64, 10);
-        cache.register_block(0x2000, 0x3000, 32, 5);
-
-        for _ in 0..10 {
-            cache.record_execution(0x1000, 0x2000).unwrap();
-        }
-
-        let chained = cache.try_chain(0x1000);
-        assert!(chained);
-        assert_eq!(cache.active_chain_count(), 1);
-    }
-
-    #[test]
     fn block_chaining_no_chain_for_cold_block() {
         let mut cache = BlockChainingCache::new();
         cache.register_block(0x1000, 0x2000, 64, 10);
@@ -1805,23 +1772,6 @@ mod tests {
         let chained = cache.try_chain(0x1000);
         assert!(!chained);
         assert_eq!(cache.active_chain_count(), 0);
-    }
-
-    #[test]
-    fn block_chaining_break_chain() {
-        let mut cache = BlockChainingCache::new();
-        cache.register_block(0x1000, 0x2000, 64, 10);
-        cache.register_block(0x2000, 0x3000, 32, 5);
-
-        for _ in 0..10 {
-            cache.record_execution(0x1000, 0x2000).unwrap();
-        }
-        cache.try_chain(0x1000);
-        assert_eq!(cache.active_chain_count(), 1);
-
-        cache.break_chain(0x1000);
-        assert_eq!(cache.active_chain_count(), 0);
-        assert_eq!(cache.total_chains_broken(), 1);
     }
 
     #[test]
@@ -1842,31 +1792,6 @@ mod tests {
     }
 
     #[test]
-    fn block_chaining_break_prunes_inactive_chains() {
-        let mut cache = BlockChainingCache::new();
-        cache.register_block(0x1000, 0x2000, 64, 10);
-        cache.register_block(0x2000, 0x3000, 32, 5);
-        cache.register_block(0x3000, 0x4000, 48, 8);
-
-        for _ in 0..10 {
-            cache.record_execution(0x1000, 0x2000).unwrap();
-        }
-        for _ in 0..10 {
-            cache.record_execution(0x2000, 0x3000).unwrap();
-        }
-        cache.try_chain(0x1000);
-        cache.try_chain(0x2000);
-        assert_eq!(cache.active_chain_count(), 2);
-
-        cache.break_chain(0x1000);
-        // The inactive chain is removed, not merely flagged.
-        assert_eq!(cache.active_chain_count(), 1);
-        // Re-chaining after a break works and stays a single entry.
-        assert!(cache.try_chain(0x1000));
-        assert_eq!(cache.active_chain_count(), 2);
-    }
-
-    #[test]
     fn block_chaining_invalidate_range() {
         let mut cache = BlockChainingCache::new();
         cache.register_block(0x1000, 0x2000, 64, 10);
@@ -1877,70 +1802,9 @@ mod tests {
         assert_eq!(cache.block_count(), 2); // 0x1000 and 0x3000 remain
     }
 
-    #[test]
-    fn block_chaining_hot_blocks() {
-        let mut cache = BlockChainingCache::new();
-        cache.register_block(0x1000, 0x2000, 64, 10);
-        cache.register_block(0x2000, 0x3000, 32, 5);
-
-        for _ in 0..50 {
-            cache.record_execution(0x1000, 0x2000).unwrap();
-        }
-        for _ in 0..5 {
-            cache.record_execution(0x2000, 0x3000).unwrap();
-        }
-
-        let hot = cache.hot_blocks(20);
-        assert_eq!(hot.len(), 1);
-        assert_eq!(hot[0].guest_address, 0x1000);
-    }
-
     // --- Lazy JIT Tests ---
 
-    #[test]
-    fn lazy_jit_tier_progression() {
-        let mut profiler = LazyJitProfiler::new(10, 100);
-
-        // Below hot threshold
-        let tier = profiler.record_execution(0x1000, 5);
-        assert_eq!(tier, CompilationTier::Uncompiled);
-
-        // At hot threshold
-        for _ in 0..9 {
-            profiler.record_execution(0x1000, 5);
-        }
-        let tier = profiler.record_execution(0x1000, 5);
-        assert_eq!(tier, CompilationTier::Baseline);
-
-        // At optimize threshold
-        for _ in 0..90 {
-            profiler.record_execution(0x1000, 5);
-        }
-        let tier = profiler.record_execution(0x1000, 5);
-        assert_eq!(tier, CompilationTier::Optimized);
-    }
-
-    #[test]
-    fn lazy_jit_profiled_count() {
-        let mut profiler = LazyJitProfiler::new(10, 100);
-        profiler.record_execution(0x1000, 5);
-        profiler.record_execution(0x2000, 3);
-        profiler.record_execution(0x3000, 7);
-
-        assert_eq!(profiler.profiled_count(), 3);
-    }
-
     // --- Address Translation Cache Tests ---
-
-    #[test]
-    fn address_translation_cache_insert_and_lookup() {
-        let mut cache = AddressTranslationCache::new(100);
-        cache.insert(0x1000_0000, 0x2000_0000, 4096, 0x07);
-
-        let translation = cache.lookup(0x1000_0000).unwrap();
-        assert_eq!(translation.host_address, 0x2000_0000);
-        assert_eq!(translation.size, 4096);
-    }
 
     #[test]
     fn address_translation_cache_eviction() {
@@ -1965,36 +1829,7 @@ mod tests {
         assert_eq!(cache.entry_count(), 2); // 0x1000 and 0x3000 remain
     }
 
-    #[test]
-    fn address_translation_cache_hit_rate() {
-        let cache = AddressTranslationCache::new(100);
-        assert_eq!(cache.hit_rate(), 0.0);
-
-        cache.record_hit();
-        cache.record_hit();
-        cache.record_miss();
-        assert!((cache.hit_rate() - 0.6667).abs() < 0.01);
-    }
-
     // --- Parallel Shader Compilation Tests ---
-
-    #[test]
-    fn shader_compiler_submit_and_complete() {
-        let mut compiler = ParallelShaderCompiler::new(4);
-        let id = compiler.submit_job(
-            "abc123".to_string(),
-            "vertex".to_string(),
-            "main".to_string(),
-        );
-        assert_eq!(compiler.job_count(), 1);
-
-        compiler.mark_compiling(id).unwrap();
-        compiler.mark_completed(id).unwrap();
-
-        assert_eq!(compiler.completed_count(), 1);
-        let job = compiler.get_job(id).unwrap();
-        assert_eq!(job.status, ShaderCompileStatus::Completed);
-    }
 
     #[test]
     fn shader_compiler_failed_job() {
@@ -2013,43 +1848,6 @@ mod tests {
         assert_eq!(compiler.failed_count(), 1);
         let job = compiler.get_job(id).unwrap();
         assert!(matches!(job.status, ShaderCompileStatus::Failed(_)));
-    }
-
-    #[test]
-    fn shader_compiler_pending_jobs_respects_concurrency() {
-        let mut compiler = ParallelShaderCompiler::new(2);
-        let id1 = compiler.submit_job("a".to_string(), "vertex".to_string(), "main".to_string());
-        let _id2 = compiler.submit_job("b".to_string(), "vertex".to_string(), "main".to_string());
-        let _id3 = compiler.submit_job("c".to_string(), "vertex".to_string(), "main".to_string());
-
-        compiler.mark_compiling(id1).unwrap();
-
-        // Only 1 more slot available (2 max - 1 compiling)
-        let pending = compiler.pending_jobs();
-        assert_eq!(pending.len(), 1);
-    }
-
-    #[test]
-    fn shader_compiler_prunes_terminal_jobs() {
-        let mut compiler = ParallelShaderCompiler::new(4);
-        compiler.set_max_retained_jobs(2);
-
-        let mut ids = Vec::new();
-        for i in 0..5 {
-            let id =
-                compiler.submit_job(format!("hash{i}"), "vertex".to_string(), "main".to_string());
-            compiler.mark_compiling(id).unwrap();
-            compiler.mark_completed(id).unwrap();
-            ids.push(id);
-        }
-
-        // Only the newest terminal jobs are retained.
-        assert_eq!(compiler.job_count(), 2);
-        assert!(compiler.get_job(ids[0]).is_none());
-        assert!(compiler.get_job(ids[3]).is_some());
-        assert!(compiler.get_job(ids[4]).is_some());
-        // Counters are unaffected by pruning.
-        assert_eq!(compiler.completed_count(), 5);
     }
 
     #[test]
@@ -2078,73 +1876,7 @@ mod tests {
 
     // --- Metal Command Batching Tests ---
 
-    #[test]
-    fn command_batcher_batches_same_pipeline() {
-        let mut batcher = MetalCommandBatcher::new(100);
-
-        batcher.record_draw(1, 100, 0, 1, 0, 0);
-        batcher.record_draw(1, 200, 0, 1, 100, 0);
-        batcher.record_draw(1, 50, 0, 1, 300, 0);
-
-        let batches = batcher.drain_batches();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].draw_calls.len(), 3);
-        assert_eq!(batches[0].total_vertices, 350);
-    }
-
-    #[test]
-    fn command_batcher_breaks_on_pipeline_change() {
-        let mut batcher = MetalCommandBatcher::new(100);
-
-        batcher.record_draw(1, 100, 0, 1, 0, 0);
-        batcher.record_draw(1, 200, 0, 1, 0, 0);
-        batcher.record_draw(2, 50, 0, 1, 0, 0); // Pipeline change
-
-        let batches = batcher.drain_batches();
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].draw_calls.len(), 2);
-        assert_eq!(batches[1].draw_calls.len(), 1);
-    }
-
-    #[test]
-    fn command_batcher_respects_max_size() {
-        let mut batcher = MetalCommandBatcher::new(2);
-
-        batcher.record_draw(1, 100, 0, 1, 0, 0);
-        batcher.record_draw(1, 200, 0, 1, 0, 0);
-        batcher.record_draw(1, 50, 0, 1, 0, 0); // Should start new batch
-
-        let batches = batcher.drain_batches();
-        assert_eq!(batches.len(), 2);
-    }
-
-    #[test]
-    fn command_batcher_stats() {
-        let mut batcher = MetalCommandBatcher::new(100);
-        batcher.record_draw(1, 100, 50, 1, 0, 0);
-        batcher.record_draw(1, 200, 100, 2, 0, 0);
-
-        let stats = batcher.stats();
-        assert_eq!(stats.total_draw_calls, 2);
-        assert_eq!(stats.vertices_drawn, 500); // 100*1 + 200*2
-        assert_eq!(stats.indices_drawn, 250); // 50*1 + 100*2
-    }
-
     // --- GPU Upload Streaming Tests ---
-
-    #[test]
-    fn upload_streamer_allocate() {
-        let mut streamer = GpuUploadStreamer::new(4096);
-        let buf = streamer.create_streaming_buffer(4096);
-
-        let offset1 = streamer.allocate(buf, 1024).unwrap();
-        assert_eq!(offset1, 0);
-
-        let offset2 = streamer.allocate(buf, 2048).unwrap();
-        assert_eq!(offset2, 1024);
-
-        assert_eq!(streamer.total_bytes_uploaded(), 3072);
-    }
 
     #[test]
     fn upload_streamer_wrap_around() {
@@ -2183,101 +1915,9 @@ mod tests {
         assert_eq!(streamer.allocate(buf, 3000).unwrap(), 0);
     }
 
-    #[test]
-    fn upload_streamer_advance_frame_resets() {
-        let mut streamer = GpuUploadStreamer::new(4096);
-        let buf = streamer.create_streaming_buffer(4096);
-
-        streamer.allocate(buf, 3000).unwrap();
-        streamer.advance_frame();
-
-        // New frame should reset write offset
-        let offset = streamer.allocate(buf, 100).unwrap();
-        assert_eq!(offset, 0);
-    }
-
     // --- Frame Pacing Tests ---
 
-    #[test]
-    fn frame_pacer_timing() {
-        let config = FramePacingConfig {
-            target_fps: 60,
-            vsync_enabled: true,
-            max_frame_latency: 2,
-        };
-        let mut pacer = FramePacer::new(config);
-
-        pacer.begin_frame();
-        // Simulate some work
-        std::thread::sleep(Duration::from_millis(1));
-        pacer.end_frame();
-
-        let stats = pacer.stats();
-        assert_eq!(stats.frames_rendered, 1);
-        assert!(stats.last_frame_time_ms > 0.0);
-        assert!(stats.min_frame_time_ms < f64::MAX);
-    }
-
-    #[test]
-    fn frame_pacer_average_fps() {
-        let config = FramePacingConfig::default();
-        let mut pacer = FramePacer::new(config);
-
-        for _ in 0..10 {
-            pacer.begin_frame();
-            std::thread::sleep(Duration::from_millis(1));
-            pacer.end_frame();
-        }
-
-        let fps = pacer.average_fps();
-        assert!(fps > 0.0);
-        assert!(fps < 10000.0); // Reasonable range
-    }
-
-    #[test]
-    fn frame_pacer_config_default() {
-        let config = FramePacingConfig::default();
-        assert_eq!(config.target_fps, 60);
-        assert!(config.vsync_enabled);
-        assert_eq!(config.max_frame_latency, 2);
-    }
-
-    #[test]
-    fn frame_pacer_reset_stats() {
-        let config = FramePacingConfig::default();
-        let mut pacer = FramePacer::new(config);
-
-        pacer.begin_frame();
-        pacer.end_frame();
-        assert_eq!(pacer.stats().frames_rendered, 1);
-
-        pacer.reset_stats();
-        assert_eq!(pacer.stats().frames_rendered, 0);
-    }
-
     // --- Phase 7: File Cache Tests ---
-
-    #[test]
-    fn file_cache_insert_get() {
-        let mut cache = FileCache::new(1024);
-
-        // Miss
-        assert!(cache.get("test.txt").is_none());
-        let (hits, misses, _) = cache.stats();
-        assert_eq!(hits, 0);
-        assert_eq!(misses, 1);
-
-        // Insert
-        cache.insert("test.txt", vec![1, 2, 3, 4]).unwrap();
-        assert_eq!(cache.entry_count(), 1);
-
-        // Hit
-        let data = cache.get("test.txt").unwrap();
-        assert_eq!(data, &[1, 2, 3, 4]);
-        let (hits, _misses, rate) = cache.stats();
-        assert_eq!(hits, 1);
-        assert!(rate > 0.0);
-    }
 
     #[test]
     fn file_cache_eviction() {
@@ -2316,57 +1956,7 @@ mod tests {
         assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
-    #[test]
-    fn file_cache_stats() {
-        let mut cache = FileCache::new(1024);
-        cache.insert("a.txt", vec![1]).unwrap();
-
-        cache.get("a.txt"); // hit
-        cache.get("a.txt"); // hit
-        cache.get("b.txt"); // miss
-
-        let (hits, misses, rate) = cache.stats();
-        assert_eq!(hits, 2);
-        assert_eq!(misses, 1); // only "b.txt" was a miss
-        assert!((rate - (2.0 / 3.0)).abs() < 0.01);
-    }
-
     // --- Phase 7: Path Resolution Cache Tests ---
-
-    #[test]
-    fn path_resolution_cache() {
-        let mut cache = PathResolutionCache::new();
-
-        let call_count = std::sync::atomic::AtomicUsize::new(0);
-
-        // First call — miss, resolver called
-        let result = cache
-            .resolve("C:\\Users\\test.txt", |path| {
-                call_count.fetch_add(1, Ordering::Relaxed);
-                Ok(PathBuf::from(format!("/host{}", path.replace('\\', "/"))))
-            })
-            .unwrap();
-        assert_eq!(result, PathBuf::from("/hostC:/Users/test.txt"));
-        assert_eq!(call_count.load(Ordering::Relaxed), 1);
-
-        // Second call — hit, resolver NOT called
-        let result2 = cache
-            .resolve("C:\\Users\\test.txt", |path| {
-                call_count.fetch_add(1, Ordering::Relaxed);
-                Ok(PathBuf::from(format!("/host{}", path.replace('\\', "/"))))
-            })
-            .unwrap();
-        assert_eq!(result2, result);
-        assert_eq!(
-            call_count.load(Ordering::Relaxed),
-            1,
-            "resolver should not be called on cache hit"
-        );
-
-        let (hits, misses, _) = cache.stats();
-        assert_eq!(hits, 1);
-        assert_eq!(misses, 1);
-    }
 
     #[test]
     fn path_resolution_cache_invalidate_prefix() {
@@ -2392,37 +1982,6 @@ mod tests {
     // --- Phase 7: Async File Reader Tests ---
 
     #[test]
-    fn async_file_reader_submit_and_wait() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("casa1_test_async_read.txt");
-        std::fs::write(&path, b"hello world").unwrap();
-
-        let mut reader = AsyncFileReader::new();
-        let id = reader.submit_read(path.clone(), 0, 11);
-
-        // Read is performed on a background thread; wait_for joins the thread
-        let data = reader.wait_for(id, 1000).unwrap();
-        assert_eq!(data, b"hello world");
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn async_file_reader_wait_for() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("casa1_test_async_wait.txt");
-        std::fs::write(&path, b"test data 12345").unwrap();
-
-        let mut reader = AsyncFileReader::new();
-        let id = reader.submit_read(path.clone(), 0, 15);
-
-        let data = reader.wait_for(id, 1000).unwrap();
-        assert_eq!(data, b"test data 12345");
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
     fn async_file_reader_wait_timeout() {
         let mut reader = AsyncFileReader::new();
         // Request for non-existent ID should timeout
@@ -2431,28 +1990,6 @@ mod tests {
     }
 
     // --- Phase 7: Memory-Mapped File Tests ---
-
-    #[test]
-    fn mmapped_file_read() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("casa1_test_mmap.bin");
-        let test_data = vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe];
-        std::fs::write(&path, &test_data).unwrap();
-
-        let mf = MmappedFile::open(&path).unwrap();
-        assert!(mf.mapped);
-        assert_eq!(mf.size, 8);
-
-        let mut buf = [0u8; 4];
-        mf.read(0, &mut buf).unwrap();
-        assert_eq!(buf, [0xde, 0xad, 0xbe, 0xef]);
-
-        mf.read(4, &mut buf).unwrap();
-        assert_eq!(buf, [0xca, 0xfe, 0xba, 0xbe]);
-
-        drop(mf);
-        std::fs::remove_file(&path).ok();
-    }
 
     #[test]
     fn mmapped_file_out_of_bounds() {

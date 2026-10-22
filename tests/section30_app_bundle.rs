@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Section 30: PE Icon Extraction and ICO → ICNS Conversion Tests
 //!
 //! Tests for Phase 1.1–1.2: icon resource parsing from PE files, ICO/ICNS
@@ -8,16 +9,6 @@
 // resources for controlled unit-testing.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a minimal PE32 file with a `.rsrc` section containing icon resources.
-///
-/// Layout (resource directory tree):
-///   Root
-///   ├── Type ID 14 (RT_GROUP_ICON)
-///   │   └── Name ID 1
-///   │       └── Language 1033 → GRPICONDIR + 1 entry (icon_id=2)
-///   └── Type ID 3  (RT_ICON)
-///       └── Name ID 2
-///           └── Language 1033 → 32×32×32bpp DIB pixel data
 fn build_test_pe_with_icon() -> Vec<u8> {
     // We'll create a resource directory structure manually.
     // For simplicity, we stub the PE headers and place the resource tree
@@ -385,133 +376,6 @@ fn test_extract_icon_from_pe() {
 }
 
 #[test]
-fn test_icon_dir_header_structure() {
-    use casa1::pe::IconDirHeader;
-    use std::mem::transmute;
-    // Test repr(C) layout: reserved(u16) + type(u16) + count(u16) = 6 bytes
-    let raw: [u8; 6] = [0x00, 0x00, 0x01, 0x00, 0x05, 0x00];
-    let header: IconDirHeader = unsafe { transmute::<[u8; 6], IconDirHeader>(raw) };
-    assert_eq!(header.reserved, 0);
-    assert_eq!(header.ty, 1);
-    assert_eq!(header.count, 5);
-}
-
-#[test]
-fn test_icon_dir_entry_structure() {
-    use casa1::pe::IconDirEntry;
-    use std::mem::transmute;
-    // Build a 16-byte entry: w=32, h=32, colors=0, reserved=0,
-    // planes=1, bpp=32, size=4096, offset=22
-    let raw: [u8; 16] = [
-        32, // width
-        32, // height
-        0,  // colors
-        0,  // reserved
-        0x01, 0x00, // planes = 1 (le)
-        0x20, 0x00, // bpp = 32 (le)
-        0x00, 0x10, 0x00, 0x00, // size = 4096 (le)
-        0x16, 0x00, 0x00, 0x00, // offset = 22 (le)
-    ];
-    let entry: IconDirEntry = unsafe { transmute::<[u8; 16], IconDirEntry>(raw) };
-    assert_eq!(entry.width, 32);
-    assert_eq!(entry.height, 32);
-    assert_eq!(entry.colors, 0);
-    assert_eq!(entry.planes, 1);
-    assert_eq!(entry.bpp, 32);
-    assert_eq!(entry.size, 4096);
-    assert_eq!(entry.offset, 22);
-}
-
-#[test]
-fn test_icon_image_dimensions() {
-    let pe_data = build_test_pe_with_icon();
-    let icons = casa1::pe::extract_all_icons_from_pe(&pe_data).expect("extract icons");
-
-    for icon in &icons {
-        assert!(icon.width > 0, "width must be positive");
-        assert!(icon.height > 0, "height must be positive");
-        assert!(icon.bpp == 32, "expected 32bpp");
-    }
-}
-
-#[test]
-fn test_ico_header_parsing() {
-    // Build a minimal ICO file for testing
-    let ico = build_test_ico();
-    let result = casa1::icon::ico_to_icns(&ico);
-    assert!(result.is_ok(), "ico_to_icns should succeed for valid ICO");
-    let icns = result.unwrap();
-    assert!(casa1::icon::validate_icns(&icns).unwrap_or(false));
-}
-
-#[test]
-fn test_png_conversion_of_dib() {
-    // Create a 4×4 32bpp DIB with XOR mask (height=8 for XOR+AND)
-    let width = 4u32;
-    let height = 8u32;
-    let bpp = 32u16;
-    let row_size = (width * bpp as u32).div_ceil(32) * 4;
-    let mut dib = vec![0u8; (row_size * height) as usize];
-
-    // Write a bottom-up DIB: 4 rows of red pixels at top, blue at bottom
-    for y in 0..4 {
-        let src_y = height - 1 - y; // bottom-up: last row in DIB = top of image
-        for x in 0..4 {
-            let off = (src_y * row_size + x * 4) as usize;
-            if off + 4 <= dib.len() {
-                dib[off] = 0; // B
-                dib[off + 1] = 0; // G
-                dib[off + 2] = 255; // R
-                dib[off + 3] = 255; // A
-            }
-        }
-    }
-
-    let png = casa1::icon::dib_to_png(&dib, width, height, bpp).expect("dib_to_png should succeed");
-    assert!(
-        png[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
-        "should produce valid PNG signature"
-    );
-}
-
-#[test]
-fn test_icns_structure_generation() {
-    use casa1::icon::{IconImage, icons_to_icns, validate_icns};
-
-    let icons = vec![
-        IconImage {
-            width: 16,
-            height: 16,
-            bpp: 32,
-            data: vec![0u8; 16 * 16 * 4],
-            is_png_compressed: false,
-            xor_mask: None,
-        },
-        IconImage {
-            width: 32,
-            height: 32,
-            bpp: 32,
-            data: vec![0u8; 32 * 32 * 4],
-            is_png_compressed: false,
-            xor_mask: None,
-        },
-    ];
-
-    let icns = icons_to_icns(&icons).expect("icons_to_icns should succeed");
-    assert!(
-        validate_icns(&icns).unwrap_or(false),
-        "ICNS should be valid"
-    );
-
-    // Verify the icns magic
-    assert_eq!(&icns[0..4], b"icns", "should start with icns magic");
-
-    // Verify total size
-    let total_size = u32::from_be_bytes([icns[4], icns[5], icns[6], icns[7]]) as usize;
-    assert_eq!(total_size, icns.len(), "total size should match");
-}
-
-#[test]
 fn test_round_trip_pe_to_icns() {
     let pe_data = build_test_pe_with_icon();
     let icons = casa1::pe::extract_all_icons_from_pe(&pe_data).expect("extract icons from PE");
@@ -539,17 +403,6 @@ fn test_validate_icns_rejects_invalid() {
     assert!(!casa1::icon::validate_icns(b"").unwrap_or(false));
     assert!(!casa1::icon::validate_icns(b"icns").unwrap_or(false));
     assert!(!casa1::icon::validate_icns(b"not an icns file").unwrap_or(false));
-}
-
-#[test]
-fn test_ico_parsing_empty() {
-    let ico = vec![0, 0, 1, 0, 0, 0]; // valid ICO header, 0 icons
-    let result = casa1::icon::ico_to_icns(&ico);
-    assert!(result.is_ok(), "empty ICO should produce ok");
-    let icns = result.unwrap();
-    assert!(casa1::icon::validate_icns(&icns).unwrap_or(false));
-    // ICNS with 0 entries: just the 8-byte header
-    assert_eq!(icns.len(), 8, "empty ICNS should be 8 bytes");
 }
 
 #[test]

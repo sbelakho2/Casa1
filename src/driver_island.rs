@@ -15,15 +15,17 @@
 //! call is synthesized — the bytes execute.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
 use crate::casak::exec::{PoolBlock, PoolTag, TaggedPool};
 use crate::casak::io::{
     DeviceExtension, DeviceFlags, IoManager, IrpId, IrpMajorFunction, IrpParameterBlock,
-    STATUS_CANCELLED, STATUS_INVALID_PARAMETER,
+    STATUS_CANCELLED, STATUS_INVALID_PARAMETER, StackParameters,
 };
 use crate::casak::object::{
     ObjectId, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_ADDRESS, STATUS_OBJECT_NAME_COLLISION,
@@ -74,6 +76,14 @@ const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
 const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC000_0010u32 as i32;
 /// `STATUS_DEVICE_BUSY`.
 const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
+/// `STATUS_BUFFER_TOO_SMALL`.
+const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
+/// `STATUS_PENDING`.
+const STATUS_PENDING: i32 = 0x0000_0103;
+/// `STATUS_TIMEOUT`.
+const STATUS_TIMEOUT: i32 = 0x0000_0102;
+/// `STATUS_NO_MORE_ENTRIES`.
+const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 /// First handle value minted for an island device namespace open.  This range
 /// is disjoint from the canonical Win32 handle table values.
 const DEVICE_HANDLE_BASE: u32 = 0x7C00_0000;
@@ -95,27 +105,267 @@ const SERVICE_REGISTRY_PREFIX: &str = "system\\currentcontrolset\\services\\";
 /// `\Registry\Machine\` (lowercase), including the trailing separator.
 const MACHINE_REGISTRY_PREFIX: &str = "\\registry\\machine\\";
 
-thread_local! {
-    /// Drivers loaded through `NtLoadDriver`, keyed by (runtime identity,
-    /// lowercased service name).  Guest execution is single-threaded, so the
-    /// registration is per-thread; the runtime identity keeps two runtimes in
-    /// one thread from sharing a service namespace.
-    static LOADED_DRIVER_SERVICES: RefCell<BTreeMap<(usize, String), DriverIsland>> =
-        RefCell::new(BTreeMap::new());
-    /// Handles opened onto an island device namespace path, keyed by
-    /// (runtime identity, handle value).  These handles are owned by the
-    /// island namespace, not the Win32 file table.
-    static DEVICE_HANDLES: RefCell<BTreeMap<(usize, u32), IslandDeviceHandle>> =
-        RefCell::new(BTreeMap::new());
-    /// Next synthetic handle value per runtime.
-    static NEXT_DEVICE_HANDLE: RefCell<BTreeMap<usize, u32>> = RefCell::new(BTreeMap::new());
-}
-
+/// One island device handle.  Handles live in the runtime-level registry so a
+/// device opened by one guest thread context can be closed by another.
 #[derive(Debug, Clone)]
 struct IslandDeviceHandle {
     service_name: String,
     device_guest: u64,
     device_id: ObjectId,
+}
+
+/// The island registry of one runtime.  `Rc`-backed island state is not
+/// `Send`, but a runtime itself is single-host-threaded (the guest "threads"
+/// are emulated contexts), so the mutex serializes registry access and the
+/// wrapper is only ever used from the owning host thread.
+struct SharedIsland(Box<DriverIsland>);
+
+// SAFETY: every access to the registry happens while the owning runtime is
+// mutably borrowed on its single host thread; the mutex only makes the
+// process-global side table usable by the type system and orders access from
+// guest thread contexts.
+unsafe impl Send for SharedIsland {}
+
+#[derive(Default)]
+struct IslandRegistry {
+    services: BTreeMap<usize, BTreeMap<String, SharedIsland>>,
+    device_handles: BTreeMap<usize, BTreeMap<u32, IslandDeviceHandle>>,
+    next_device_handle: BTreeMap<usize, u32>,
+}
+
+fn island_registry() -> &'static Mutex<IslandRegistry> {
+    static REGISTRY: OnceLock<Mutex<IslandRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(IslandRegistry::default()))
+}
+
+fn lock_registry() -> MutexGuard<'static, IslandRegistry> {
+    island_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A guest callback the current shim defers until its `RefCell` borrow ends.
+struct PendingGuestCall {
+    entry: u64,
+    args: Vec<u64>,
+    label: &'static str,
+    purpose: PendingPurpose,
+}
+
+enum PendingPurpose {
+    DriverDeviceAdd,
+    IoDispatch {
+        request: u64,
+    },
+    IoTargetSend {
+        pending: Box<PendingIoTargetSend>,
+    },
+    Callbacks {
+        remaining: Vec<GuestCallback>,
+        dispatch_next: bool,
+    },
+}
+
+struct PendingIoTargetSend {
+    irp: IrpId,
+    irp_guest: u64,
+    entry: u64,
+    device_object: u64,
+    system_buffer: u64,
+    output_ptr: u64,
+    output_len: usize,
+    bytes_returned: u64,
+    request: u64,
+    target: u64,
+    io_control: u32,
+    input_ptr: u64,
+    input_len: u32,
+    saved: (u64, u64, u64, u32, u32, u32, u64),
+}
+
+/// One real (guest-visible) KMDF object.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct KmdfDeviceInit {
+    device_type: u32,
+    io_type: u32,
+    name: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct KmdfDevice {
+    object_guest: u64,
+    casak: ObjectId,
+    name: String,
+    context_guest: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+struct KmdfQueueCallbacks {
+    default: u64,
+    read: u64,
+    write: u64,
+    device_control: u64,
+    internal_device_control: u64,
+    stop: u64,
+    resume: u64,
+    canceled_on_queue: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct KmdfQueue {
+    device: u64,
+    callbacks: KmdfQueueCallbacks,
+    dispatch_type: u32,
+    default_queue: bool,
+    queued: VecDeque<u64>,
+    in_flight: BTreeSet<u64>,
+    stopped: bool,
+    draining: bool,
+    context_guest: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct KmdfRequest {
+    irp: IrpId,
+    device: Option<u64>,
+    io_control: u32,
+    input_len: u32,
+    output_len: u32,
+    input_guest: u64,
+    output_guest: u64,
+    completed: bool,
+    status: i32,
+    information: usize,
+    context_guest: u64,
+    queue: Option<u64>,
+    outer_irp_guest: u64,
+    major: IrpMajorFunction,
+    target: Option<u64>,
+    canceled: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct KmdfIoTarget {
+    device: u64,
+    context_guest: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KmdfObjectKind {
+    Driver,
+    DeviceInit,
+    Device,
+    Queue,
+    Request,
+    WaitLock,
+    IoTarget,
+}
+
+impl KmdfObjectKind {
+    /// Per-kind context layout: the default context bytes allocated when the
+    /// caller asks for none, and the alignment of the context block.
+    const fn layout(self) -> (usize, usize) {
+        match self {
+            Self::Driver => (0x20, 8),
+            Self::DeviceInit => (0x40, 8),
+            Self::Device => (0x80, 16),
+            Self::Queue => (0x80, 16),
+            Self::Request => (0x80, 8),
+            Self::WaitLock => (0x20, 8),
+            Self::IoTarget => (0x80, 8),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct KmdfObjectAttributes {
+    evt_cleanup: u64,
+    evt_destroy: u64,
+    parent: Option<u64>,
+    context_size_override: usize,
+    context_type_info: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct KmdfObject {
+    kind: KmdfObjectKind,
+    parent: Option<u64>,
+    children: BTreeSet<u64>,
+    context_guest: u64,
+    context_size: usize,
+    context_type: u64,
+    extra_contexts: Vec<(u64, u64, usize)>,
+    evt_cleanup: u64,
+    evt_destroy: u64,
+    deleted: bool,
+}
+
+/// A guest callback scheduled by a shim and executed once the island state
+/// borrow is released.
+#[derive(Debug, Clone)]
+struct GuestCallback {
+    entry: u64,
+    args: Vec<u64>,
+    label: &'static str,
+}
+
+/// A real blocking wait lock.  The gate is shared with the waiting path so a
+/// release on another host thread wakes a parked guest callback.
+#[derive(Clone)]
+struct KmdfWaitLock {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+/// The KMDF shim subset's state: a real WDFDRIVER handle, device-init objects,
+/// CasaK-backed WDFDEVICEs, queues, requests, targets and wait locks, plus the
+/// framework dispatch context for the IRP currently being delivered.
+#[allow(dead_code)]
+#[derive(Default)]
+struct KmdfState {
+    driver_handle: u64,
+    driver_object_guest: u64,
+    evt_driver_device_add: u64,
+    evt_driver_unload: u64,
+    driver_pool_tag: u32,
+    driver_init_flags: u32,
+    driver_unload_ran: bool,
+    device_inits: BTreeMap<u64, KmdfDeviceInit>,
+    devices: BTreeMap<u64, KmdfDevice>,
+    devices_by_object: BTreeMap<u64, u64>,
+    queues: BTreeMap<u64, KmdfQueue>,
+    requests: BTreeMap<u64, KmdfRequest>,
+    iotargets: BTreeMap<u64, KmdfIoTarget>,
+    objects: BTreeMap<u64, KmdfObject>,
+    wait_locks: BTreeMap<u64, KmdfWaitLock>,
+    framework_dispatch: u64,
+    framework_dispatches: BTreeMap<u8, u64>,
+    current_irp_guest: u64,
+    current_device_guest: u64,
+    current_system_buffer: u64,
+    current_input_len: u32,
+    current_output_len: u32,
+    current_io_control: u32,
+    current_request: u64,
+    ioctl_dispatches: u64,
+    read_dispatches: u64,
+    write_dispatches: u64,
+    cleanup_dispatches: u64,
+    close_dispatches: u64,
+    queued_dispatches: u64,
+    manual_retrievals: u64,
+    cancel_dispatches: u64,
+    stop_dispatches: u64,
+    resume_dispatches: u64,
+    iotarget_sends: u64,
+    parked_acquires: u64,
+    driver_unload_calls: u64,
 }
 
 #[cfg(test)]
@@ -142,6 +392,85 @@ pub enum DriverShim {
     ExFreePoolWithTag,
     /// Default `MajorFunction` dispatch: refuses unsupported IRPs.
     IrpDispatch,
+    /// KMDF subset: `WdfDriverCreate`.
+    WdfDriverCreate,
+    /// KMDF subset: `WdfDeviceInitSetDeviceType`.
+    WdfDeviceInitSetDeviceType,
+    /// KMDF subset: `WdfDeviceInitSetIoType`.
+    WdfDeviceInitSetIoType,
+    /// KMDF subset: `WdfDeviceInitAssignName`.
+    WdfDeviceInitAssignName,
+    /// KMDF subset: `WdfDeviceCreate`.
+    WdfDeviceCreate,
+    /// KMDF subset: `WdfIoQueueCreate`.
+    WdfIoQueueCreate,
+    /// KMDF subset: `WdfRequestCreate`.
+    WdfRequestCreate,
+    /// KMDF subset: `WdfRequestFormatRequestForIoctl`.
+    WdfRequestFormatRequestForIoctl,
+    /// KMDF subset: `WdfRequestRetrieveInputBuffer`.
+    WdfRequestRetrieveInputBuffer,
+    /// KMDF subset: `WdfRequestRetrieveOutputBuffer`.
+    WdfRequestRetrieveOutputBuffer,
+    /// KMDF subset: `WdfRequestComplete`.
+    WdfRequestComplete,
+    /// KMDF subset: `WdfRequestCompleteWithInformation`.
+    WdfRequestCompleteWithInformation,
+    /// KMDF subset: `WdfDeviceWdmGetDeviceObject`.
+    WdfDeviceWdmGetDeviceObject,
+    /// KMDF subset: `WdfObjectGetTypedContext` (and its Worker form).
+    WdfObjectGetTypedContext,
+    /// KMDF subset: `WdfObjectDelete`.
+    WdfObjectDelete,
+    /// KMDF subset: `WdfWaitLockCreate`.
+    WdfWaitLockCreate,
+    /// KMDF subset: `WdfWaitLockAcquire`.
+    WdfWaitLockAcquire,
+    /// KMDF subset: `WdfWaitLockRelease`.
+    WdfWaitLockRelease,
+    /// KMDF subset: `WdfObjectAllocateContext`.
+    WdfObjectAllocateContext,
+    /// KMDF subset: `WdfDeviceGetIoTarget`.
+    WdfDeviceGetIoTarget,
+    /// KMDF subset: `WdfIoTargetCreate`.
+    WdfIoTargetCreate,
+    /// KMDF subset: `WdfIoTargetSendIoctlSynchronously`.
+    WdfIoTargetSendIoctlSynchronously,
+    /// KMDF subset: `WdfIoTargetFormatRequestForIoctl`.
+    WdfIoTargetFormatRequestForIoctl,
+    /// KMDF subset: `WdfRequestSend`.
+    WdfRequestSend,
+    /// KMDF subset: `WdfRequestCancelQueuedRequest`.
+    WdfRequestCancelQueuedRequest,
+    /// KMDF subset: `WdfIoQueueRetrieveNextRequest`.
+    WdfIoQueueRetrieveNextRequest,
+    /// KMDF subset: `WdfIoQueueRetrieveFoundRequest`.
+    WdfIoQueueRetrieveFoundRequest,
+    /// KMDF subset: `WdfIoQueueStop`.
+    WdfIoQueueStop,
+    /// KMDF subset: `WdfIoQueueStopSynchronously`.
+    WdfIoQueueStopSynchronously,
+    /// KMDF subset: `WdfIoQueueDrain`.
+    WdfIoQueueDrain,
+    /// KMDF subset: `WdfIoQueueDrainSynchronously`.
+    WdfIoQueueDrainSynchronously,
+    /// KMDF subset: `WdfIoQueuePurge`.
+    WdfIoQueuePurge,
+    /// KMDF subset: `WdfIoQueuePurgeSynchronously`.
+    WdfIoQueuePurgeSynchronously,
+    /// KMDF subset: `WdfIoQueueStart`.
+    WdfIoQueueStart,
+    /// Framework-installed `IRP_MJ_READ` dispatch.
+    WdfEvtIoReadDispatch,
+    /// Framework-installed `IRP_MJ_WRITE` dispatch.
+    WdfEvtIoWriteDispatch,
+    /// Framework-installed `IRP_MJ_DEVICE_CONTROL` dispatch that delivers the
+    /// current IRP to the device's queue callback.
+    WdfEvtIoDeviceControlDispatch,
+    /// Framework-installed `IRP_MJ_CLEANUP` dispatch.
+    WdfEvtIoCleanupDispatch,
+    /// Framework-installed `IRP_MJ_CLOSE` dispatch.
+    WdfEvtIoCloseDispatch,
 }
 
 impl DriverShim {
@@ -159,6 +488,42 @@ impl DriverShim {
             "iocompleterequest" => Some(Self::IoCompleteRequest),
             "exallocatepoolwithtag" => Some(Self::ExAllocatePoolWithTag),
             "exfreepoolwithtag" => Some(Self::ExFreePoolWithTag),
+            "wdfdrivercreate" => Some(Self::WdfDriverCreate),
+            "wdfdeviceinitsetdevicetype" => Some(Self::WdfDeviceInitSetDeviceType),
+            "wdfdeviceinitsetiotype" => Some(Self::WdfDeviceInitSetIoType),
+            "wdfdeviceinitassignname" => Some(Self::WdfDeviceInitAssignName),
+            "wdfdevicecreate" => Some(Self::WdfDeviceCreate),
+            "wdfioqueuecreate" => Some(Self::WdfIoQueueCreate),
+            "wdfrequestcreate" => Some(Self::WdfRequestCreate),
+            "wdfrequestformatrequestforioctl" => Some(Self::WdfRequestFormatRequestForIoctl),
+            "wdfrequestretrieveinputbuffer" => Some(Self::WdfRequestRetrieveInputBuffer),
+            "wdfrequestretrieveoutputbuffer" => Some(Self::WdfRequestRetrieveOutputBuffer),
+            "wdfrequestcomplete" => Some(Self::WdfRequestComplete),
+            "wdfrequestcompletewithinformation" => Some(Self::WdfRequestCompleteWithInformation),
+            "wdfdevicewdmgetdeviceobject" => Some(Self::WdfDeviceWdmGetDeviceObject),
+            "wdfobjectgettypedcontext" | "wdfobjectgettypedcontextworker" => {
+                Some(Self::WdfObjectGetTypedContext)
+            }
+            "wdfobjectdelete" => Some(Self::WdfObjectDelete),
+            "wdfwaitlockcreate" => Some(Self::WdfWaitLockCreate),
+            "wdfwaitlockacquire" => Some(Self::WdfWaitLockAcquire),
+            "wdfwaitlockrelease" => Some(Self::WdfWaitLockRelease),
+            "wdfobjectallocatecontext" => Some(Self::WdfObjectAllocateContext),
+            "wdfdevicegetiotarget" => Some(Self::WdfDeviceGetIoTarget),
+            "wdfiotargetcreate" => Some(Self::WdfIoTargetCreate),
+            "wdfiotargetsendioctlsynchronously" => Some(Self::WdfIoTargetSendIoctlSynchronously),
+            "wdfiotargetformatrequestforioctl" => Some(Self::WdfIoTargetFormatRequestForIoctl),
+            "wdfrequestsend" => Some(Self::WdfRequestSend),
+            "wdfrequestcancelqueuedrequest" => Some(Self::WdfRequestCancelQueuedRequest),
+            "wdfioqueueretrievenextrequest" => Some(Self::WdfIoQueueRetrieveNextRequest),
+            "wdfioqueueretrievefoundrequest" => Some(Self::WdfIoQueueRetrieveFoundRequest),
+            "wdfioqueuestop" => Some(Self::WdfIoQueueStop),
+            "wdfioqueuestopsynchronously" => Some(Self::WdfIoQueueStopSynchronously),
+            "wdfioqueuedrain" => Some(Self::WdfIoQueueDrain),
+            "wdfioqueuedrainsynchronously" => Some(Self::WdfIoQueueDrainSynchronously),
+            "wdfioqueuepurge" => Some(Self::WdfIoQueuePurge),
+            "wdfioqueuepurgesynchronously" => Some(Self::WdfIoQueuePurgeSynchronously),
+            "wdfioqueuestart" => Some(Self::WdfIoQueueStart),
             _ => None,
         }
     }
@@ -178,6 +543,40 @@ impl DriverShim {
             Self::ExAllocatePoolWithTag => 12,
             Self::ExFreePoolWithTag => 8,
             Self::IrpDispatch => 8,
+            Self::WdfDriverCreate => 20,
+            Self::WdfDeviceInitSetDeviceType | Self::WdfDeviceInitSetIoType => 8,
+            Self::WdfDeviceInitAssignName => 8,
+            Self::WdfDeviceCreate => 12,
+            Self::WdfIoQueueCreate => 16,
+            Self::WdfRequestCreate => 12,
+            Self::WdfRequestFormatRequestForIoctl => 32,
+            Self::WdfRequestRetrieveInputBuffer | Self::WdfRequestRetrieveOutputBuffer => 16,
+            Self::WdfRequestComplete => 8,
+            Self::WdfRequestCompleteWithInformation => 12,
+            Self::WdfDeviceWdmGetDeviceObject => 4,
+            Self::WdfObjectGetTypedContext => 8,
+            Self::WdfObjectDelete => 4,
+            Self::WdfWaitLockCreate => 8,
+            Self::WdfWaitLockAcquire => 8,
+            Self::WdfWaitLockRelease => 4,
+            Self::WdfObjectAllocateContext => 12,
+            Self::WdfDeviceGetIoTarget => 4,
+            Self::WdfIoTargetCreate => 12,
+            Self::WdfIoTargetSendIoctlSynchronously => 28,
+            Self::WdfIoTargetFormatRequestForIoctl => 28,
+            Self::WdfRequestSend => 12,
+            Self::WdfRequestCancelQueuedRequest => 4,
+            Self::WdfIoQueueRetrieveNextRequest | Self::WdfIoQueueRetrieveFoundRequest => 12,
+            Self::WdfIoQueueStop | Self::WdfIoQueueDrain | Self::WdfIoQueuePurge => 12,
+            Self::WdfIoQueueStopSynchronously
+            | Self::WdfIoQueueDrainSynchronously
+            | Self::WdfIoQueuePurgeSynchronously
+            | Self::WdfIoQueueStart => 4,
+            Self::WdfEvtIoReadDispatch
+            | Self::WdfEvtIoWriteDispatch
+            | Self::WdfEvtIoDeviceControlDispatch
+            | Self::WdfEvtIoCleanupDispatch
+            | Self::WdfEvtIoCloseDispatch => 8,
         }
     }
 }
@@ -226,6 +625,7 @@ struct IslandState {
     irp_ids: BTreeMap<u64, IrpId>,
     irp_guests: BTreeMap<IrpId, u64>,
     symbolic_links: Vec<(String, String)>,
+    kmdf: KmdfState,
     arena: IslandArena,
 }
 
@@ -392,6 +792,7 @@ impl DriverIsland {
             irp_ids: BTreeMap::new(),
             irp_guests: BTreeMap::new(),
             symbolic_links: Vec::new(),
+            kmdf: KmdfState::default(),
             arena: IslandArena {
                 cursor: arena_base,
                 end: arena_base + ARENA_SIZE,
@@ -460,7 +861,7 @@ impl DriverIsland {
         if unloaded {
             return Ok(None);
         }
-        if self.has_open_device_handles() {
+        if self.has_open_device_handles(runtime) {
             return Ok(Some(STATUS_DEVICE_BUSY));
         }
         let arch = inner.borrow().arch;
@@ -480,7 +881,26 @@ impl DriverIsland {
             None
         };
 
+        let mut callbacks = Vec::new();
+        {
+            let mut state = inner.borrow_mut();
+            let driver_handle = state.kmdf.driver_handle;
+            if driver_handle != 0 {
+                state.collect_delete_callbacks(driver_handle, &mut callbacks);
+            }
+        }
+        if !callbacks.is_empty() {
+            let _active = ActiveIsland::install(inner.clone());
+            for call in callbacks {
+                let mut cpu = CpuState::new(arch);
+                cpu.set(Register::Rsp, STACK_BASE + STACK_SIZE - 0x100);
+                runtime
+                    .execute_guest_callback(&mut cpu, memory, call.entry, &call.args, call.label)?;
+            }
+        }
         let mut state = inner.borrow_mut();
+        state.purge_deleted_objects();
+        state.kmdf.driver_handle = 0;
         let live = state
             .io
             .driver_devices(state.casak_driver)
@@ -541,7 +961,11 @@ impl DriverIsland {
             Err(status) => return status,
         };
         let key = loaded_driver_key(runtime, &service_name);
-        if LOADED_DRIVER_SERVICES.with(|map| map.borrow().contains_key(&key)) {
+        if lock_registry()
+            .services
+            .get(&key.0)
+            .is_some_and(|services| services.contains_key(&key.1))
+        {
             return STATUS_IMAGE_ALREADY_LOADED;
         }
         let Some(registry_key) = resolve_service_key(runtime, &service_name) else {
@@ -575,9 +999,11 @@ impl DriverIsland {
         if island.status() < 0 {
             return island.status();
         }
-        LOADED_DRIVER_SERVICES.with(|map| {
-            map.borrow_mut().insert(key, island);
-        });
+        lock_registry()
+            .services
+            .entry(key.0)
+            .or_default()
+            .insert(key.1, SharedIsland(Box::new(island)));
         record_driver_event(
             runtime,
             "NtLoadDriver",
@@ -606,14 +1032,20 @@ impl DriverIsland {
             Err(status) => return status,
         };
         let key = loaded_driver_key(runtime, &service_name);
-        let Some(mut island) = LOADED_DRIVER_SERVICES.with(|map| map.borrow_mut().remove(&key))
-        else {
+        let removed = lock_registry()
+            .services
+            .get_mut(&key.0)
+            .and_then(|services| services.remove(&key.1));
+        let Some(SharedIsland(boxed)) = removed else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        if island.has_open_device_handles() {
-            LOADED_DRIVER_SERVICES.with(|map| {
-                map.borrow_mut().insert(key, island);
-            });
+        let mut island = *boxed;
+        if island.has_open_device_handles(runtime) {
+            lock_registry()
+                .services
+                .entry(key.0)
+                .or_default()
+                .insert(key.1, SharedIsland(Box::new(island)));
             record_driver_event(
                 runtime,
                 "NtUnloadDriver",
@@ -634,9 +1066,11 @@ impl DriverIsland {
                 status
             }
             Err(_) => {
-                LOADED_DRIVER_SERVICES.with(|map| {
-                    map.borrow_mut().insert(key, island);
-                });
+                lock_registry()
+                    .services
+                    .entry(key.0)
+                    .or_default()
+                    .insert(key.1, SharedIsland(Box::new(island)));
                 record_driver_event(
                     runtime,
                     "NtUnloadDriver",
@@ -702,14 +1136,19 @@ impl DriverIsland {
 
     /// Whether any guest handle is still open onto this island's device
     /// namespace (an unload is refused while one is).
-    pub fn has_open_device_handles(&self) -> bool {
+    pub(crate) fn has_open_device_handles(&self, runtime: &PeHostRuntime) -> bool {
         let state = self.inner.borrow();
-        DEVICE_HANDLES.with(|handles| {
-            handles.borrow().values().any(|handle| {
+        let runtime_id = runtime_identity(runtime);
+        let registry = lock_registry();
+        registry
+            .device_handles
+            .get(&runtime_id)
+            .into_iter()
+            .flat_map(|handles| handles.values())
+            .any(|handle| {
                 handle.service_name == state.driver_name
                     && state.device_ids.values().any(|id| *id == handle.device_id)
             })
-        })
     }
 
     /// The number of devices currently owned by the CasaK driver object.
@@ -779,6 +1218,113 @@ impl DriverIsland {
     /// IRPs the driver completed through `IoCompleteRequest`.
     pub fn completed_irp_count(&self) -> u64 {
         self.inner.borrow().io.completed_irp_count()
+    }
+
+    /// Invoke one island shim directly from a test, with arguments placed in
+    /// the guest ABI locations the shim reads.  This exercises the same shim
+    /// path as guest code without needing a hand-assembled caller for every
+    /// operation.
+    #[cfg(test)]
+    pub(crate) fn call_shim_for_test(
+        &self,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        function: DriverShim,
+        args: &[u64],
+    ) -> AppResult<u64> {
+        let inner = self.inner.clone();
+        let _active = ActiveIsland::install(inner.clone());
+        let arch = inner.borrow().arch;
+        let mut cpu = CpuState::new(arch);
+        let rsp = STACK_BASE + STACK_SIZE - 0x300;
+        cpu.set(Register::Rsp, rsp);
+        match arch {
+            GuestArch::X64 => {
+                let registers = [Register::Rcx, Register::Rdx, Register::R8, Register::R9];
+                for (index, value) in args.iter().enumerate() {
+                    if let Some(register) = registers.get(index) {
+                        cpu.set(*register, *value);
+                    } else {
+                        memory.write_u64(rsp + 0x20 + (index as u64 - 4) * 8, *value);
+                    }
+                }
+            }
+            GuestArch::X86 => {
+                for (index, value) in args.iter().enumerate() {
+                    memory.write_u32(rsp + index as u64 * 4, *value as u32);
+                }
+            }
+        }
+        dispatch_shim(runtime, &mut cpu, memory, function)?;
+        Ok(cpu.get(Register::Rax))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kmdf_driver_handle(&self) -> u64 {
+        self.inner.borrow().kmdf.driver_handle
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kmdf_device_handles(&self) -> Vec<u64> {
+        self.inner.borrow().kmdf.devices.keys().copied().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kmdf_wait_lock_handles(&self) -> Vec<u64> {
+        self.inner
+            .borrow()
+            .kmdf
+            .wait_locks
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kmdf_wait_lock_gate(&self, handle: u64) -> Option<Arc<(Mutex<bool>, Condvar)>> {
+        self.inner
+            .borrow()
+            .kmdf
+            .wait_locks
+            .get(&handle)
+            .map(|lock| lock.gate.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kmdf_request_state(&self, handle: u64) -> Option<(bool, i32, usize, u64)> {
+        self.inner
+            .borrow()
+            .kmdf
+            .requests
+            .get(&handle)
+            .map(|request| {
+                (
+                    request.completed,
+                    request.status,
+                    request.information,
+                    request.outer_irp_guest,
+                )
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kmdf_context_size(&self, handle: u64) -> Option<usize> {
+        self.inner
+            .borrow()
+            .kmdf
+            .objects
+            .get(&handle)
+            .map(|object| object.context_size)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kmdf_typed_context(&self, handle: u64) -> Option<u64> {
+        self.inner
+            .borrow()
+            .kmdf
+            .objects
+            .get(&handle)
+            .map(|object| object.context_guest)
     }
 
     /// Build a real CasaK IRP and a guest `_IRP`/`IO_STACK_LOCATION`, then
@@ -918,6 +1464,16 @@ impl DriverIsland {
             output_len,
             byte_offset,
         )?;
+        {
+            let mut state = self.inner.borrow_mut();
+            state.kmdf.current_irp_guest = irp_guest;
+            state.kmdf.current_device_guest = device_guest;
+            state.kmdf.current_system_buffer = system_buffer_guest;
+            state.kmdf.current_input_len = input_len;
+            state.kmdf.current_output_len = output_len;
+            state.kmdf.current_io_control = io_control_code;
+            state.kmdf.current_request = 0;
+        }
 
         let status = {
             let _active = ActiveIsland::install(inner.clone());
@@ -955,6 +1511,13 @@ impl DriverIsland {
             .borrow()
             .io
             .complete_irp(irp, final_status, information);
+        {
+            let mut state = self.inner.borrow_mut();
+            state.kmdf.current_irp_guest = 0;
+            state.kmdf.current_device_guest = 0;
+            state.kmdf.current_system_buffer = 0;
+            state.kmdf.current_request = 0;
+        }
         if output_len > 0 && system_buffer_guest != 0 {
             let mut output = vec![0_u8; output_len as usize];
             if memory.read_into(system_buffer_guest, &mut output).is_ok() {
@@ -1104,25 +1667,459 @@ impl IslandState {
         state: &mut CpuState,
         memory: &mut MemoryImage,
         function: DriverShim,
-    ) -> AppResult<()> {
+    ) -> AppResult<Option<PendingGuestCall>> {
         match function {
-            DriverShim::DbgPrint => self.dbg_print(runtime, state, memory),
-            DriverShim::IoCreateDevice => self.io_create_device(state, memory),
-            DriverShim::IoDeleteDevice => self.io_delete_device(state, memory),
-            DriverShim::IoCreateSymbolicLink => self.io_create_symbolic_link(state, memory),
-            DriverShim::IoDeleteSymbolicLink => self.io_delete_symbolic_link(state, memory),
-            DriverShim::IoAllocateIrp => self.io_allocate_irp(state, memory),
-            DriverShim::IoFreeIrp => self.io_free_irp(state, memory),
-            DriverShim::RtlInitUnicodeString => self.rtl_init_unicode_string(state, memory),
+            DriverShim::DbgPrint => self.dbg_print(runtime, state, memory)?,
+            DriverShim::IoCreateDevice => self.io_create_device(state, memory)?,
+            DriverShim::IoDeleteDevice => self.io_delete_device(state, memory)?,
+            DriverShim::IoCreateSymbolicLink => self.io_create_symbolic_link(state, memory)?,
+            DriverShim::IoDeleteSymbolicLink => self.io_delete_symbolic_link(state, memory)?,
+            DriverShim::IoAllocateIrp => self.io_allocate_irp(state, memory)?,
+            DriverShim::IoFreeIrp => self.io_free_irp(state, memory)?,
+            DriverShim::RtlInitUnicodeString => self.rtl_init_unicode_string(state, memory)?,
             DriverShim::IofCompleteRequest | DriverShim::IoCompleteRequest => {
-                self.io_complete_request(state, memory)
+                self.io_complete_request(state, memory)?
             }
-            DriverShim::ExAllocatePoolWithTag => self.ex_allocate_pool(state, memory),
-            DriverShim::ExFreePoolWithTag => self.ex_free_pool(state, memory),
+            DriverShim::ExAllocatePoolWithTag => self.ex_allocate_pool(state, memory)?,
+            DriverShim::ExFreePoolWithTag => self.ex_free_pool(state, memory)?,
             DriverShim::IrpDispatch => {
                 set_status(state, crate::casak::io::STATUS_INVALID_DEVICE_REQUEST);
-                Ok(())
             }
+            DriverShim::WdfDriverCreate => {
+                return self.wdf_driver_create(runtime, state, memory);
+            }
+            DriverShim::WdfDeviceInitSetDeviceType => {
+                self.wdf_device_init_set_device_type(state, memory)?
+            }
+            DriverShim::WdfDeviceInitSetIoType => {
+                self.wdf_device_init_set_io_type(state, memory)?
+            }
+            DriverShim::WdfDeviceInitAssignName => {
+                self.wdf_device_init_assign_name(state, memory)?
+            }
+            DriverShim::WdfDeviceCreate => self.wdf_device_create(state, memory)?,
+            DriverShim::WdfIoQueueCreate => self.wdf_io_queue_create(state, memory)?,
+            DriverShim::WdfRequestCreate => self.wdf_request_create(state, memory)?,
+            DriverShim::WdfRequestFormatRequestForIoctl => {
+                self.wdf_request_format_for_ioctl(state, memory)?
+            }
+            DriverShim::WdfRequestRetrieveInputBuffer => {
+                self.wdf_request_retrieve_buffer(state, memory, true)?
+            }
+            DriverShim::WdfRequestRetrieveOutputBuffer => {
+                self.wdf_request_retrieve_buffer(state, memory, false)?
+            }
+            DriverShim::WdfRequestComplete => self.wdf_request_complete(state, memory, None)?,
+            DriverShim::WdfRequestCompleteWithInformation => {
+                let information = guest_arg(state, memory, 2)? as usize;
+                self.wdf_request_complete(state, memory, Some(information))?
+            }
+            DriverShim::WdfDeviceWdmGetDeviceObject => {
+                self.wdf_device_wdm_get_device_object(state, memory)?
+            }
+            DriverShim::WdfObjectGetTypedContext => {
+                self.wdf_object_get_typed_context(state, memory)?
+            }
+            DriverShim::WdfObjectDelete => return self.wdf_object_delete(state, memory),
+            DriverShim::WdfWaitLockCreate => self.wdf_wait_lock_create(state, memory)?,
+            DriverShim::WdfWaitLockAcquire => self.wdf_wait_lock_acquire(state, memory)?,
+            DriverShim::WdfWaitLockRelease => self.wdf_wait_lock_release(state, memory)?,
+            DriverShim::WdfObjectAllocateContext => {
+                self.wdf_object_allocate_context(state, memory)?
+            }
+            DriverShim::WdfDeviceGetIoTarget => self.wdf_device_get_iotarget(state, memory)?,
+            DriverShim::WdfIoTargetCreate => self.wdf_iotarget_create(state, memory)?,
+            DriverShim::WdfIoTargetSendIoctlSynchronously => {
+                return self.wdf_iotarget_send_ioctl(runtime, state, memory);
+            }
+            DriverShim::WdfIoTargetFormatRequestForIoctl => {
+                self.wdf_iotarget_format_request(state, memory)?
+            }
+            DriverShim::WdfRequestSend => return self.wdf_request_send(runtime, state, memory),
+            DriverShim::WdfRequestCancelQueuedRequest => {
+                return self.wdf_request_cancel_queued(state, memory);
+            }
+            DriverShim::WdfIoQueueRetrieveNextRequest => {
+                self.wdf_queue_retrieve(state, memory, false)?
+            }
+            DriverShim::WdfIoQueueRetrieveFoundRequest => {
+                self.wdf_queue_retrieve(state, memory, true)?
+            }
+            DriverShim::WdfIoQueueStop => {
+                return self.wdf_queue_stop(state, memory, false, false);
+            }
+            DriverShim::WdfIoQueueStopSynchronously => {
+                return self.wdf_queue_stop(state, memory, false, true);
+            }
+            DriverShim::WdfIoQueueDrain => {
+                return self.wdf_queue_stop(state, memory, true, false);
+            }
+            DriverShim::WdfIoQueueDrainSynchronously => {
+                return self.wdf_queue_stop(state, memory, true, true);
+            }
+            DriverShim::WdfIoQueuePurge | DriverShim::WdfIoQueuePurgeSynchronously => {
+                return self.wdf_queue_purge(state, memory);
+            }
+            DriverShim::WdfIoQueueStart => return self.wdf_queue_start(state, memory),
+            DriverShim::WdfEvtIoReadDispatch => {
+                return self.wdf_dispatch(IrpMajorFunction::Read, state, memory);
+            }
+            DriverShim::WdfEvtIoWriteDispatch => {
+                return self.wdf_dispatch(IrpMajorFunction::Write, state, memory);
+            }
+            DriverShim::WdfEvtIoDeviceControlDispatch => {
+                return self.wdf_dispatch(IrpMajorFunction::DeviceControl, state, memory);
+            }
+            DriverShim::WdfEvtIoCleanupDispatch => {
+                return self.wdf_dispatch(IrpMajorFunction::Cleanup, state, memory);
+            }
+            DriverShim::WdfEvtIoCloseDispatch => {
+                return self.wdf_dispatch(IrpMajorFunction::Close, state, memory);
+            }
+        }
+        Ok(None)
+    }
+
+    fn finish_pending(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        purpose: PendingPurpose,
+        callback_status: i32,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        match purpose {
+            PendingPurpose::DriverDeviceAdd => {
+                set_status(state, callback_status);
+            }
+            PendingPurpose::IoTargetSend { pending } => {
+                let (status, _) = self.finish_ioctl_send(memory, *pending)?;
+                set_status(state, status);
+            }
+            PendingPurpose::IoDispatch { request } => {
+                let (completed, status) = self
+                    .kmdf
+                    .requests
+                    .get(&request)
+                    .map(|request| (request.completed, request.status))
+                    .unwrap_or((false, STATUS_INVALID_DEVICE_REQUEST));
+                let status = if completed {
+                    status
+                } else {
+                    self.write_outer_irp_status(memory, STATUS_PENDING, 0)?;
+                    STATUS_PENDING
+                };
+                self.kmdf.current_request = 0;
+                set_status(state, status);
+                return self.dispatch_next_queued(memory);
+            }
+            PendingPurpose::Callbacks {
+                mut remaining,
+                dispatch_next,
+            } => {
+                if !remaining.is_empty() {
+                    let next = remaining.remove(0);
+                    return Ok(Some(PendingGuestCall {
+                        entry: next.entry,
+                        args: next.args,
+                        label: next.label,
+                        purpose: PendingPurpose::Callbacks {
+                            remaining,
+                            dispatch_next,
+                        },
+                    }));
+                }
+                self.purge_deleted_objects();
+                set_status(state, STATUS_SUCCESS);
+                if dispatch_next {
+                    return self.dispatch_next_queued(memory);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn write_outer_irp_status(
+        &self,
+        memory: &mut MemoryImage,
+        status: i32,
+        information: usize,
+    ) -> AppResult<()> {
+        self.write_irp_status(memory, self.kmdf.current_irp_guest, status, information)
+    }
+
+    fn write_irp_status(
+        &self,
+        memory: &mut MemoryImage,
+        irp: u64,
+        status: i32,
+        information: usize,
+    ) -> AppResult<()> {
+        if irp == 0 {
+            return Ok(());
+        }
+        let (status_offset, information_offset) = match self.arch {
+            GuestArch::X64 => (0x30, 0x40),
+            GuestArch::X86 => (0x18, 0x20),
+        };
+        memory.write_u32(irp + status_offset, status as u32);
+        write_guest_pointer(
+            memory,
+            irp + information_offset,
+            information as u64,
+            self.arch,
+        )
+    }
+
+    /// Parse a `WDF_OBJECT_ATTRIBUTES` block for this architecture.  The
+    /// `Size` field bounds which trailing members are honored, matching KMDF's
+    /// forward-compatible structure sizing.
+    fn parse_object_attributes(
+        &self,
+        memory: &MemoryImage,
+        attributes: u64,
+    ) -> AppResult<KmdfObjectAttributes> {
+        let mut parsed = KmdfObjectAttributes::default();
+        if attributes == 0 {
+            return Ok(parsed);
+        }
+        let pointer_bytes = self.arch.pointer_bytes() as u64;
+        let size = memory.read_u32(attributes)? as u64;
+        let minimum = match self.arch {
+            GuestArch::X64 => 0x38,
+            GuestArch::X86 => 0x20,
+        };
+        if size < 8
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                attributes,
+                size.min(minimum) as usize,
+            )
+            .is_err()
+        {
+            return Ok(parsed);
+        }
+        let (cleanup_offset, destroy_offset, parent_offset, override_offset, type_offset) =
+            match self.arch {
+                GuestArch::X64 => (0x08, 0x10, 0x20, 0x28, 0x30),
+                GuestArch::X86 => (0x04, 0x08, 0x14, 0x18, 0x1C),
+            };
+        if size >= cleanup_offset + pointer_bytes {
+            parsed.evt_cleanup =
+                read_guest_pointer(memory, attributes + cleanup_offset, self.arch)?;
+        }
+        if size >= destroy_offset + pointer_bytes {
+            parsed.evt_destroy =
+                read_guest_pointer(memory, attributes + destroy_offset, self.arch)?;
+        }
+        if size >= parent_offset + pointer_bytes {
+            let parent = read_guest_pointer(memory, attributes + parent_offset, self.arch)?;
+            parsed.parent = (parent != 0).then_some(parent);
+        }
+        if size >= override_offset + pointer_bytes {
+            parsed.context_size_override =
+                read_guest_pointer(memory, attributes + override_offset, self.arch)? as usize;
+        }
+        if size >= type_offset + pointer_bytes {
+            parsed.context_type_info =
+                read_guest_pointer(memory, attributes + type_offset, self.arch)?;
+        }
+        Ok(parsed)
+    }
+
+    /// Read the `ContextSize` member of a `WDF_OBJECT_CONTEXT_TYPE_INFO`.
+    fn context_type_size(&self, memory: &MemoryImage, type_info: u64) -> AppResult<usize> {
+        if type_info == 0 {
+            return Ok(0);
+        }
+        let offset = match self.arch {
+            GuestArch::X64 => 0x10,
+            GuestArch::X86 => 0x08,
+        };
+        let size = read_guest_pointer(memory, type_info + offset, self.arch)? as usize;
+        Ok(size)
+    }
+
+    /// Create one framework object with its per-kind context slot and attach it
+    /// to the requested parent.  The handle block is `0x80` bytes and the
+    /// context follows it, so `WdfObjectGetTypedContext` can return a stable
+    /// guest pointer for the object's lifetime.
+    fn create_kmdf_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        kind: KmdfObjectKind,
+        attributes: u64,
+    ) -> AppResult<u64> {
+        let parsed = self.parse_object_attributes(memory, attributes)?;
+        let (default_size, _align) = kind.layout();
+        let type_size = self.context_type_size(memory, parsed.context_type_info)?;
+        let context_size = if parsed.context_size_override > 0 {
+            parsed.context_size_override
+        } else if type_size > 0 {
+            type_size
+        } else {
+            default_size
+        }
+        .clamp(8, 0x10_000);
+        let handle = self.arena.alloc(memory, 0x80 + context_size, 16)?;
+        let context_guest = handle + 0x80;
+        memory.map_bytes(context_guest, &vec![0_u8; context_size]);
+        let parent = parsed
+            .parent
+            .filter(|parent| self.kmdf.objects.contains_key(parent));
+        let object = KmdfObject {
+            kind,
+            parent,
+            children: BTreeSet::new(),
+            context_guest,
+            context_size,
+            context_type: parsed.context_type_info,
+            extra_contexts: Vec::new(),
+            evt_cleanup: parsed.evt_cleanup,
+            evt_destroy: parsed.evt_destroy,
+            deleted: false,
+        };
+        if let Some(parent) = parent {
+            let parent_object = self
+                .kmdf
+                .objects
+                .get_mut(&parent)
+                .expect("parent object must exist for a validated parent handle");
+            parent_object.children.insert(handle);
+        }
+        self.kmdf.objects.insert(handle, object);
+        Ok(handle)
+    }
+
+    /// Collect the cleanup/destroy callbacks for `handle` and its children in
+    /// post-order, removing each object from its domain maps.  The object
+    /// metadata itself survives until `purge_deleted_objects` so callbacks can
+    /// still resolve their typed context.
+    fn collect_delete_callbacks(&mut self, handle: u64, callbacks: &mut Vec<GuestCallback>) {
+        let Some(object) = self.kmdf.objects.get(&handle) else {
+            return;
+        };
+        if object.deleted {
+            return;
+        }
+        let children = object.children.iter().copied().collect::<Vec<_>>();
+        for child in children {
+            self.collect_delete_callbacks(child, callbacks);
+        }
+        let (kind, parent, evt_cleanup, evt_destroy) = {
+            let object = self.kmdf.objects.get(&handle).expect("object");
+            (
+                object.kind,
+                object.parent,
+                object.evt_cleanup,
+                object.evt_destroy,
+            )
+        };
+        if let Some(parent) = parent {
+            if let Some(parent_object) = self.kmdf.objects.get_mut(&parent) {
+                parent_object.children.remove(&handle);
+            }
+        }
+        if kind == KmdfObjectKind::Driver
+            && self.kmdf.evt_driver_unload != 0
+            && !self.kmdf.driver_unload_ran
+        {
+            self.kmdf.driver_unload_ran = true;
+            self.kmdf.driver_unload_calls += 1;
+            callbacks.push(GuestCallback {
+                entry: self.kmdf.evt_driver_unload,
+                args: vec![handle],
+                label: "EvtDriverUnload",
+            });
+        }
+        if evt_cleanup != 0 {
+            callbacks.push(GuestCallback {
+                entry: evt_cleanup,
+                args: vec![handle],
+                label: "EvtCleanup",
+            });
+        }
+        if evt_destroy != 0 {
+            callbacks.push(GuestCallback {
+                entry: evt_destroy,
+                args: vec![handle],
+                label: "EvtDestroy",
+            });
+        }
+        if let Some(object) = self.kmdf.objects.get_mut(&handle) {
+            object.deleted = true;
+        }
+        self.remove_object_domain(handle);
+    }
+
+    fn remove_object_domain(&mut self, handle: u64) {
+        if let Some(device) = self.kmdf.devices.remove(&handle) {
+            self.kmdf.devices_by_object.remove(&device.object_guest);
+            if let Some(id) = self.device_ids.remove(&device.object_guest) {
+                let _ = self.io.delete_device(id);
+            }
+            if let Some(record) = self
+                .devices
+                .iter_mut()
+                .find(|record| record.guest_pointer == device.object_guest)
+            {
+                record.deleted = true;
+            }
+        }
+        if let Some(queue) = self.kmdf.queues.remove(&handle) {
+            let requests = queue
+                .queued
+                .iter()
+                .chain(queue.in_flight.iter())
+                .copied()
+                .collect::<Vec<_>>();
+            for request in requests {
+                self.force_cancel_request(request);
+            }
+        }
+        if let Some(request) = self.kmdf.requests.remove(&handle) {
+            if !request.completed {
+                let _ = self.io.cancel_irp(request.irp);
+            }
+            if self.kmdf.current_request == handle {
+                self.kmdf.current_request = 0;
+            }
+        }
+        self.kmdf.device_inits.remove(&handle);
+        self.kmdf.iotargets.remove(&handle);
+        if let Some(lock) = self.kmdf.wait_locks.remove(&handle) {
+            let (gate, wake) = &*lock.gate;
+            if let Ok(mut locked) = gate.lock() {
+                *locked = false;
+                wake.notify_all();
+            }
+        }
+    }
+
+    fn force_cancel_request(&mut self, handle: u64) -> bool {
+        let Some(request) = self.kmdf.requests.get_mut(&handle) else {
+            return false;
+        };
+        if request.completed {
+            return false;
+        }
+        request.completed = true;
+        request.canceled = true;
+        request.status = STATUS_CANCELLED;
+        request.information = 0;
+        let irp = request.irp;
+        let _ = self.io.cancel_irp(irp);
+        true
+    }
+
+    fn purge_deleted_objects(&mut self) {
+        let deleted = self
+            .kmdf
+            .objects
+            .iter()
+            .filter_map(|(handle, object)| object.deleted.then_some(*handle))
+            .collect::<Vec<_>>();
+        for handle in deleted {
+            self.kmdf.objects.remove(&handle);
         }
     }
 
@@ -1172,7 +2169,7 @@ impl IslandState {
                 length.saturating_add(2),
                 source,
                 self.arch,
-            )?;
+            )?; // coverage: unreachable — write_unicode_string_header only performs infallible MemoryImage writes
         }
         set_status(state, STATUS_SUCCESS);
         Ok(())
@@ -1211,11 +2208,36 @@ impl IslandState {
         } else {
             String::new()
         };
-        let device_name = if raw_name.is_empty() {
-            None
-        } else {
-            Some(strip_device_prefix(&raw_name).to_string())
-        };
+        let raw_name = (!raw_name.is_empty()).then_some(raw_name);
+        match self.create_device_object(memory, raw_name, extension_size, device_type, exclusive)? {
+            Ok(guest) => {
+                write_guest_pointer(memory, output_pointer, guest, self.arch)?;
+                set_status(state, STATUS_SUCCESS);
+            }
+            Err(status) => set_status(state, status),
+        }
+        Ok(())
+    }
+
+    fn create_device_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        raw_name: Option<String>,
+        extension_size: usize,
+        device_type: u32,
+        exclusive: bool,
+    ) -> AppResult<Result<u64, i32>> {
+        let driver_object = self.driver_object_guest;
+        if driver_object == 0 {
+            return Ok(Err(STATUS_INVALID_PARAMETER));
+        }
+        if extension_size > 0x10_0000 {
+            return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
+        }
+        let device_name = raw_name
+            .as_deref()
+            .map(strip_device_prefix)
+            .map(str::to_string);
         let mut flags = DeviceFlags::NONE;
         if exclusive {
             flags.insert(DeviceFlags::EXCLUSIVE);
@@ -1227,18 +2249,14 @@ impl IslandState {
                 .create_device(self.casak_driver, device_name.as_deref(), extension, flags)
             {
                 Ok(id) => id,
-                Err(status) => {
-                    set_status(state, status);
-                    return Ok(());
-                }
+                Err(status) => return Ok(Err(status)),
             };
 
         let guest = match self.arena.alloc(memory, 0x180, 16) {
             Ok(guest) => guest,
             Err(_) => {
                 let _ = self.io.delete_device(device);
-                set_status(state, STATUS_INSUFFICIENT_RESOURCES);
-                return Ok(());
+                return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
             }
         };
         let extension_guest = if extension_size > 0 {
@@ -1246,8 +2264,7 @@ impl IslandState {
                 Ok(extension_guest) => extension_guest,
                 Err(_) => {
                     let _ = self.io.delete_device(device);
-                    set_status(state, STATUS_INSUFFICIENT_RESOURCES);
-                    return Ok(());
+                    return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
                 }
             }
         } else {
@@ -1256,11 +2273,11 @@ impl IslandState {
         let arch = self.arch;
         match arch {
             GuestArch::X64 => {
-                let previous_head = memory.read_u64(self.driver_object_guest + 0x08)?;
+                let previous_head = memory.read_u64(driver_object + 0x08)?;
                 memory.write_u16(guest, DEVICE_OBJECT_TYPE);
                 memory.write_u16(guest + 0x02, DEVICE_OBJECT_SIZE);
                 memory.write_u32(guest + 0x04, 1);
-                memory.write_u64(guest + 0x08, self.driver_object_guest);
+                memory.write_u64(guest + 0x08, driver_object);
                 memory.write_u64(guest + 0x10, previous_head);
                 memory.write_u64(guest + 0x18, 0);
                 memory.write_u64(guest + 0x20, 0);
@@ -1271,16 +2288,14 @@ impl IslandState {
                 memory.write_u64(guest + 0x40, extension_guest);
                 memory.write_u32(guest + 0x48, device_type);
                 memory.write_u8(guest + 0x4C, 1);
-                memory.write_u64(self.driver_object_guest + 0x08, guest);
-                write_guest_pointer(memory, output_pointer, guest, arch)?;
+                memory.write_u64(driver_object + 0x08, guest);
             }
             GuestArch::X86 => {
-                let previous_head =
-                    read_guest_pointer(memory, self.driver_object_guest + 0x04, arch)?;
+                let previous_head = read_guest_pointer(memory, driver_object + 0x04, arch)?;
                 memory.write_u16(guest, DEVICE_OBJECT_TYPE);
                 memory.write_u16(guest + 0x02, DEVICE_OBJECT_SIZE_X86);
                 memory.write_u32(guest + 0x04, 1);
-                write_guest_pointer(memory, guest + 0x08, self.driver_object_guest, arch)?;
+                write_guest_pointer(memory, guest + 0x08, driver_object, arch)?;
                 write_guest_pointer(memory, guest + 0x0C, previous_head, arch)?;
                 write_guest_pointer(memory, guest + 0x10, 0, arch)?;
                 write_guest_pointer(memory, guest + 0x14, 0, arch)?;
@@ -1291,8 +2306,7 @@ impl IslandState {
                 write_guest_pointer(memory, guest + 0x28, extension_guest, arch)?;
                 memory.write_u32(guest + 0x2C, device_type);
                 memory.write_u8(guest + 0x30, 1);
-                write_guest_pointer(memory, self.driver_object_guest + 0x04, guest, arch)?;
-                write_guest_pointer(memory, output_pointer, guest, arch)?;
+                write_guest_pointer(memory, driver_object + 0x04, guest, arch)?;
             }
         }
 
@@ -1306,8 +2320,7 @@ impl IslandState {
             deleted: false,
         });
         self.device_ids.insert(guest, device);
-        set_status(state, STATUS_SUCCESS);
-        Ok(())
+        Ok(Ok(guest))
     }
 
     fn io_delete_device(
@@ -1515,15 +2528,1905 @@ impl IslandState {
         state.set(Register::Rax, 0);
         Ok(())
     }
+
+    fn wdf_driver_create(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let driver_object = guest_arg(state, memory, 0)?;
+        let _registry_path = guest_arg(state, memory, 1)?;
+        let attributes = guest_arg(state, memory, 2)?;
+        let config = guest_arg(state, memory, 3)?;
+        let driver_out = guest_arg(state, memory, 4)?;
+        if driver_object != self.driver_object_guest
+            || driver_out == 0
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                driver_out,
+                self.arch.pointer_bytes(),
+            )
+            .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(None);
+        }
+        let (size_offset, add_offset, unload_offset, tag_offset, flags_offset, minimum_size) =
+            match self.arch {
+                GuestArch::X64 => (0u64, 8u64, 0x10u64, 0x18u64, 0x1Cu64, 0x20u64),
+                GuestArch::X86 => (0, 4, 8, 0xC, 0x10, 0x14),
+            };
+        let mut evt_device_add = 0;
+        let mut evt_driver_unload = 0;
+        let mut driver_pool_tag = 0;
+        let mut driver_init_flags = 0;
+        if config != 0 {
+            if crate::host_thunks::validate_guest_pointer(memory, config, minimum_size as usize)
+                .is_err()
+            {
+                set_status(state, STATUS_INVALID_PARAMETER);
+                return Ok(None);
+            }
+            let size = memory.read_u32(config + size_offset)? as u64;
+            if size < minimum_size {
+                set_status(state, STATUS_INVALID_PARAMETER);
+                return Ok(None);
+            }
+            evt_device_add = read_guest_pointer(memory, config + add_offset, self.arch)?;
+            if size >= unload_offset + self.arch.pointer_bytes() as u64 {
+                evt_driver_unload = read_guest_pointer(memory, config + unload_offset, self.arch)?;
+            } // coverage: unreachable — size >= minimum_size (0x20/0x14) always covers the 0x18/0x0C unload offset
+            if size >= tag_offset + 4 {
+                driver_pool_tag = memory.read_u32(config + tag_offset)?;
+            } // coverage: unreachable — size >= minimum_size (0x20/0x14) always covers the 0x1C/0x10 tag offset
+            if size >= flags_offset + 4 {
+                driver_init_flags = memory.read_u32(config + flags_offset)?;
+            } // coverage: unreachable — size >= minimum_size equals the 0x20/0x14 flags end, so this condition is always true
+        }
+
+        let dispatches = [
+            (IrpMajorFunction::Read, DriverShim::WdfEvtIoReadDispatch),
+            (IrpMajorFunction::Write, DriverShim::WdfEvtIoWriteDispatch),
+            (
+                IrpMajorFunction::DeviceControl,
+                DriverShim::WdfEvtIoDeviceControlDispatch,
+            ),
+            (
+                IrpMajorFunction::Cleanup,
+                DriverShim::WdfEvtIoCleanupDispatch,
+            ),
+            (IrpMajorFunction::Close, DriverShim::WdfEvtIoCloseDispatch),
+        ];
+        // `WdfDriverInitNoDispatchOverride` leaves the driver's own
+        // MajorFunction table untouched.
+        if driver_init_flags & 0x2 == 0 {
+            for (major, shim) in dispatches {
+                let address = if let Some(address) =
+                    self.kmdf.framework_dispatches.get(&major.code()).copied()
+                {
+                    address
+                } else {
+                    let address = allocate_shim(runtime, shim);
+                    self.kmdf.framework_dispatches.insert(major.code(), address);
+                    address
+                };
+                if major == IrpMajorFunction::DeviceControl {
+                    self.kmdf.framework_dispatch = address;
+                }
+                let major_offset = major_function_offset(self.arch)
+                    + major.code() as u64 * self.arch.pointer_bytes() as u64;
+                write_guest_pointer(memory, driver_object + major_offset, address, self.arch)?;
+            }
+        }
+
+        let driver_handle = self.create_kmdf_object(memory, KmdfObjectKind::Driver, attributes)?;
+        self.kmdf.driver_handle = driver_handle;
+        self.kmdf.driver_object_guest = driver_object;
+        self.kmdf.evt_driver_device_add = evt_device_add;
+        self.kmdf.evt_driver_unload = evt_driver_unload;
+        self.kmdf.driver_pool_tag = driver_pool_tag;
+        self.kmdf.driver_init_flags = driver_init_flags;
+        write_guest_pointer(memory, driver_out, driver_handle, self.arch)?;
+        if evt_device_add == 0 {
+            set_status(state, STATUS_SUCCESS);
+            return Ok(None);
+        }
+        let device_init = self.create_kmdf_object(memory, KmdfObjectKind::DeviceInit, 0)?;
+        if let Some(object) = self.kmdf.objects.get_mut(&device_init) {
+            object.parent = Some(driver_handle);
+        }
+        if let Some(driver) = self.kmdf.objects.get_mut(&driver_handle) {
+            driver.children.insert(device_init);
+        }
+        self.kmdf.device_inits.insert(
+            device_init,
+            KmdfDeviceInit {
+                device_type: 0,
+                io_type: 0,
+                name: None,
+            },
+        );
+        Ok(Some(PendingGuestCall {
+            entry: evt_device_add,
+            args: vec![driver_handle, device_init],
+            label: "EvtDriverDeviceAdd",
+            purpose: PendingPurpose::DriverDeviceAdd,
+        }))
+    }
+
+    fn wdf_device_init_set_device_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let init = guest_arg(state, memory, 0)?;
+        let device_type = guest_arg(state, memory, 1)? as u32;
+        match self.kmdf.device_inits.get_mut(&init) {
+            Some(init) => {
+                init.device_type = device_type;
+                set_status(state, STATUS_SUCCESS);
+            }
+            None => set_status(state, STATUS_INVALID_PARAMETER),
+        }
+        Ok(())
+    }
+
+    fn wdf_device_init_set_io_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let init = guest_arg(state, memory, 0)?;
+        let io_type = guest_arg(state, memory, 1)? as u32;
+        match self.kmdf.device_inits.get_mut(&init) {
+            Some(init) => {
+                init.io_type = io_type;
+                set_status(state, STATUS_SUCCESS);
+            }
+            None => set_status(state, STATUS_INVALID_PARAMETER),
+        }
+        Ok(())
+    }
+
+    fn wdf_device_init_assign_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let init = guest_arg(state, memory, 0)?;
+        let name = guest_arg(state, memory, 1)?;
+        let (text, _, _) = read_unicode_string(memory, name, self.arch)?;
+        match self.kmdf.device_inits.get_mut(&init) {
+            Some(init) => {
+                init.name = (!text.is_empty()).then_some(text);
+                set_status(state, STATUS_SUCCESS);
+            }
+            None => set_status(state, STATUS_INVALID_PARAMETER),
+        }
+        Ok(())
+    }
+
+    fn wdf_device_create(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let init_argument = guest_arg(state, memory, 0)?;
+        let attributes = guest_arg(state, memory, 1)?;
+        let device_out = guest_arg(state, memory, 2)?;
+        if device_out == 0
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                device_out,
+                self.arch.pointer_bytes(),
+            )
+            .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        // Accept both `&DeviceInit` (the documented KMDF form) and the init
+        // handle itself.
+        let mut init_handle = init_argument;
+        if let Ok(value) = read_guest_pointer(memory, init_argument, self.arch) {
+            if self.kmdf.device_inits.contains_key(&value) {
+                init_handle = value;
+            }
+        }
+        let Some(init) = self.kmdf.device_inits.get(&init_handle).cloned() else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        let guest =
+            match self.create_device_object(memory, init.name, 0, init.device_type, false)? {
+                Ok(guest) => guest,
+                Err(status) => {
+                    set_status(state, status);
+                    return Ok(());
+                }
+            };
+        let casak = *self
+            .device_ids
+            .get(&guest)
+            .expect("island device ids are inserted before their guest handle is returned");
+        let name = self
+            .devices
+            .iter()
+            .rev()
+            .find(|device| device.guest_pointer == guest)
+            .map(|device| device.name.clone())
+            .unwrap_or_default();
+        let handle = self.create_kmdf_object(memory, KmdfObjectKind::Device, attributes)?;
+        if self
+            .kmdf
+            .objects
+            .get(&handle)
+            .is_some_and(|object| object.parent.is_none())
+        {
+            let driver = self.kmdf.driver_handle;
+            if let Some(object) = self.kmdf.objects.get_mut(&handle) {
+                object.parent = Some(driver);
+            }
+            if let Some(object) = self.kmdf.objects.get_mut(&driver) {
+                object.children.insert(handle);
+            }
+        }
+        let context_guest = self
+            .kmdf
+            .objects
+            .get(&handle)
+            .map(|object| object.context_guest)
+            .unwrap_or(handle + 0x80);
+        self.kmdf.devices.insert(
+            handle,
+            KmdfDevice {
+                object_guest: guest,
+                casak,
+                name,
+                context_guest,
+            },
+        );
+        self.kmdf.devices_by_object.insert(guest, handle);
+        write_guest_pointer(memory, device_out, handle, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn wdf_io_queue_create(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let device = guest_arg(state, memory, 0)?;
+        let config = guest_arg(state, memory, 1)?;
+        let attributes = guest_arg(state, memory, 2)?;
+        let queue_out = guest_arg(state, memory, 3)?;
+        if !self.kmdf.devices.contains_key(&device)
+            || queue_out == 0
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                queue_out,
+                self.arch.pointer_bytes(),
+            )
+            .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let mut callbacks = KmdfQueueCallbacks::default();
+        let mut dispatch_type = 0;
+        let mut default_queue = false;
+        if config != 0 {
+            let minimum = match self.arch {
+                GuestArch::X86 => 0x10,
+                GuestArch::X64 => 0x18,
+            };
+            if crate::host_thunks::validate_guest_pointer(memory, config, minimum).is_err() {
+                set_status(state, STATUS_INVALID_PARAMETER);
+                return Ok(());
+            }
+            let size = memory.read_u32(config)? as u64;
+            if size < 8 {
+                set_status(state, STATUS_INVALID_PARAMETER);
+                return Ok(());
+            }
+            dispatch_type = memory.read_u32(config + 4)?;
+            let (allow_offset, default_offset, first_callback) = match self.arch {
+                GuestArch::X64 => (0x0Cu64, 0x0Du64, 0x10u64),
+                GuestArch::X86 => (0x0Cu64, 0x0Du64, 0x10u64),
+            };
+            if size > allow_offset {
+                let _allow_zero_length = memory.read_u8(config + allow_offset)? != 0;
+            }
+            if size > default_offset {
+                default_queue = memory.read_u8(config + default_offset)? != 0;
+            }
+            let pointer = self.arch.pointer_bytes() as u64;
+            let callbacks_table = [
+                (0x00u64, &mut callbacks.default),
+                (0x08, &mut callbacks.read),
+                (0x10, &mut callbacks.write),
+                (0x18, &mut callbacks.device_control),
+                (0x20, &mut callbacks.internal_device_control),
+                (0x28, &mut callbacks.stop),
+                (0x30, &mut callbacks.resume),
+                (0x38, &mut callbacks.canceled_on_queue),
+            ];
+            for (index, slot) in callbacks_table {
+                let offset = first_callback + index;
+                if size >= offset + pointer {
+                    *slot = read_guest_pointer(memory, config + offset, self.arch)?;
+                }
+            }
+        }
+        if dispatch_type > 2 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let handle = self.create_kmdf_object(memory, KmdfObjectKind::Queue, attributes)?;
+        if self
+            .kmdf
+            .objects
+            .get(&handle)
+            .is_some_and(|object| object.parent.is_none())
+        {
+            if let Some(object) = self.kmdf.objects.get_mut(&handle) {
+                object.parent = Some(device);
+            }
+            if let Some(object) = self.kmdf.objects.get_mut(&device) {
+                object.children.insert(handle);
+            }
+        }
+        let context_guest = self
+            .kmdf
+            .objects
+            .get(&handle)
+            .map(|object| object.context_guest)
+            .unwrap_or(handle + 0x80);
+        self.kmdf.queues.insert(
+            handle,
+            KmdfQueue {
+                device,
+                callbacks,
+                dispatch_type,
+                default_queue,
+                queued: VecDeque::new(),
+                in_flight: BTreeSet::new(),
+                stopped: false,
+                draining: false,
+                context_guest,
+            },
+        );
+        write_guest_pointer(memory, queue_out, handle, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn wdf_request_create(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let attributes = guest_arg(state, memory, 0)?;
+        let io_target = guest_arg(state, memory, 1)?;
+        let request_out = guest_arg(state, memory, 2)?;
+        if request_out == 0
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                request_out,
+                self.arch.pointer_bytes(),
+            )
+            .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let target_device = self.resolve_target_device(io_target);
+        let Some(target) = target_device else {
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(());
+        };
+        let Some(device) = self.kmdf.devices.get(&target) else {
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(());
+        };
+        let irp = match self.io.allocate_irp(
+            device.casak,
+            IrpParameterBlock::new(IrpMajorFunction::DeviceControl, 0, 0),
+        ) {
+            Ok(irp) => irp,
+            Err(status) => {
+                set_status(state, status);
+                return Ok(());
+            }
+        };
+        let handle = self.create_kmdf_object(memory, KmdfObjectKind::Request, attributes)?;
+        if self
+            .kmdf
+            .objects
+            .get(&handle)
+            .is_some_and(|object| object.parent.is_none())
+        {
+            let parent = if self.kmdf.iotargets.contains_key(&io_target) {
+                io_target
+            } else {
+                target
+            };
+            if let Some(object) = self.kmdf.objects.get_mut(&handle) {
+                object.parent = Some(parent);
+            }
+            if let Some(object) = self.kmdf.objects.get_mut(&parent) {
+                object.children.insert(handle);
+            }
+        }
+        let context_guest = self
+            .kmdf
+            .objects
+            .get(&handle)
+            .map(|object| object.context_guest)
+            .unwrap_or(handle + 0x80);
+        self.kmdf.requests.insert(
+            handle,
+            KmdfRequest {
+                irp,
+                device: Some(target),
+                io_control: 0,
+                input_len: 0,
+                output_len: 0,
+                input_guest: 0,
+                output_guest: 0,
+                completed: false,
+                status: STATUS_SUCCESS,
+                information: 0,
+                context_guest,
+                queue: None,
+                outer_irp_guest: 0,
+                major: IrpMajorFunction::DeviceControl,
+                target: (io_target != 0).then_some(io_target),
+                canceled: false,
+            },
+        );
+        write_guest_pointer(memory, request_out, handle, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn resolve_target_device(&self, target: u64) -> Option<u64> {
+        if self.kmdf.devices.contains_key(&target) {
+            return Some(target);
+        }
+        if let Some(iotarget) = self.kmdf.iotargets.get(&target) {
+            return Some(iotarget.device);
+        }
+        self.kmdf.devices.keys().next().copied()
+    }
+
+    fn wdf_request_format_for_ioctl(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let request = guest_arg(state, memory, 0)?;
+        let target = guest_arg(state, memory, 1)?;
+        let io_control = guest_arg(state, memory, 2)? as u32;
+        let input_guest = guest_arg(state, memory, 3)?;
+        let input_len = guest_arg(state, memory, 4)? as u32;
+        let output_guest = guest_arg(state, memory, 5)?;
+        let output_len = guest_arg(state, memory, 6)? as u32;
+        let _options = guest_arg(state, memory, 7)?;
+        let resolved_device = self.resolve_target_device(target);
+        let Some(request) = self.kmdf.requests.get_mut(&request) else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        request.io_control = io_control;
+        request.input_guest = input_guest;
+        request.input_len = input_len;
+        request.output_guest = output_guest;
+        request.output_len = output_len;
+        request.target = Some(target);
+        if resolved_device.is_some() {
+            request.device = resolved_device;
+        }
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn wdf_request_retrieve_buffer(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        input: bool,
+    ) -> AppResult<()> {
+        let request = guest_arg(state, memory, 0)?;
+        let minimum = guest_arg(state, memory, 1)? as usize;
+        let buffer_out = guest_arg(state, memory, 2)?;
+        let length_out = guest_arg(state, memory, 3)?;
+        let pointer_bytes = self.arch.pointer_bytes();
+        if buffer_out == 0
+            || length_out == 0
+            || crate::host_thunks::validate_guest_pointer(memory, buffer_out, pointer_bytes)
+                .is_err()
+            || crate::host_thunks::validate_guest_pointer(memory, length_out, pointer_bytes)
+                .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let Some(request) = self.kmdf.requests.get(&request) else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        let (buffer, length) = if input {
+            (request.input_guest, request.input_len)
+        } else {
+            (request.output_guest, request.output_len)
+        };
+        if minimum > length as usize || (minimum > 0 && buffer == 0) {
+            set_status(state, STATUS_BUFFER_TOO_SMALL);
+            return Ok(());
+        }
+        write_guest_pointer(memory, buffer_out, buffer, self.arch)?;
+        write_guest_pointer(memory, length_out, u64::from(length), self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn wdf_request_complete(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        information: Option<usize>,
+    ) -> AppResult<()> {
+        let handle = guest_arg(state, memory, 0)?;
+        let status = guest_arg(state, memory, 1)? as u32 as i32;
+        let information = information.unwrap_or(0);
+        let Some(request) = self.kmdf.requests.get(&handle) else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        if request.completed {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        self.complete_kmdf_request(memory, handle, status, information)?;
+        set_status(state, status);
+        Ok(())
+    }
+
+    fn wdf_device_wdm_get_device_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let device = guest_arg(state, memory, 0)?;
+        match self.kmdf.devices.get(&device) {
+            Some(device) => state.set(Register::Rax, device.object_guest),
+            None => set_status(state, STATUS_INVALID_HANDLE),
+        }
+        Ok(())
+    }
+
+    fn wdf_object_get_typed_context(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let handle = guest_arg(state, memory, 0)?;
+        let type_info = guest_arg(state, memory, 1)?;
+        let Some(object) = self.kmdf.objects.get(&handle) else {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        };
+        let extra = object
+            .extra_contexts
+            .iter()
+            .find_map(|(registered_type, context, _)| {
+                (type_info == 0 || *registered_type == type_info).then_some(*context)
+            });
+        let context = extra.unwrap_or(object.context_guest);
+        state.set(Register::Rax, context);
+        Ok(())
+    }
+
+    fn wdf_object_delete(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let handle = guest_arg(state, memory, 0)?;
+        if !self.kmdf.objects.contains_key(&handle) {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(None);
+        }
+        if self
+            .kmdf
+            .objects
+            .get(&handle)
+            .is_some_and(|object| object.deleted)
+        {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(None);
+        }
+        let mut callbacks = Vec::new();
+        self.collect_delete_callbacks(handle, &mut callbacks);
+        if self.driver_object_guest != 0 {
+            self.rebuild_device_chain(memory)?;
+        }
+        set_status(state, STATUS_SUCCESS);
+        if callbacks.is_empty() {
+            self.purge_deleted_objects();
+        }
+        Ok(Self::callbacks_pending(callbacks, false))
+    }
+
+    fn wdf_wait_lock_create(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let attributes = guest_arg(state, memory, 0)?;
+        let lock_out = guest_arg(state, memory, 1)?;
+        if lock_out == 0
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                lock_out,
+                self.arch.pointer_bytes(),
+            )
+            .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let handle = self.create_kmdf_object(memory, KmdfObjectKind::WaitLock, attributes)?;
+        if self
+            .kmdf
+            .objects
+            .get(&handle)
+            .is_some_and(|object| object.parent.is_none())
+        {
+            let driver = self.kmdf.driver_handle;
+            if let Some(object) = self.kmdf.objects.get_mut(&handle) {
+                object.parent = Some(driver);
+            }
+            if let Some(object) = self.kmdf.objects.get_mut(&driver) {
+                object.children.insert(handle);
+            }
+        }
+        self.kmdf.wait_locks.insert(
+            handle,
+            KmdfWaitLock {
+                gate: Arc::new((Mutex::new(false), Condvar::new())),
+            },
+        );
+        write_guest_pointer(memory, lock_out, handle, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    /// Resolve the optional `PLONGLONG` timeout.  A null pointer means
+    /// infinite wait; negative values are relative 100 ns units and
+    /// non-negative values are absolute 100 ns since 1601-01-01 (we treat a
+    /// zero absolute as "try once", matching KMDF's documented behavior).
+    fn wait_lock_timeout(&self, memory: &MemoryImage, pointer: u64) -> AppResult<Option<Duration>> {
+        if pointer == 0 {
+            return Ok(None);
+        }
+        let units = match self.arch {
+            GuestArch::X64 => memory.read_u64(pointer)? as i64,
+            GuestArch::X86 => i64::from(memory.read_u32(pointer)? as i32),
+        };
+        if units == 0 {
+            return Ok(Some(Duration::ZERO));
+        }
+        let relative = if units < 0 {
+            units.saturating_neg()
+        } else {
+            // Absolute deadlines are converted against the guest clock's
+            // current UTC time; tests use relative timeouts.
+            units
+        };
+        Ok(Some(Duration::from_nanos(
+            (relative as u64).saturating_mul(100),
+        )))
+    }
+
+    fn wait_lock_acquire_gate(
+        &self,
+        gate: &Arc<(Mutex<bool>, Condvar)>,
+        timeout: Option<Duration>,
+    ) -> i32 {
+        let started = Instant::now();
+        let (mutex, wake) = &**gate;
+        let mut locked = match mutex.lock() {
+            Ok(locked) => locked,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !*locked {
+            *locked = true;
+            return STATUS_SUCCESS;
+        }
+        let Some(timeout) = timeout else {
+            while *locked {
+                locked = match wake.wait(locked) {
+                    Ok(locked) => locked,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+            *locked = true;
+            return STATUS_SUCCESS;
+        };
+        if timeout.is_zero() {
+            return STATUS_TIMEOUT;
+        }
+        let deadline = started + timeout;
+        while *locked {
+            let now = Instant::now();
+            if now >= deadline {
+                return STATUS_TIMEOUT;
+            }
+            let remaining = deadline - now;
+            locked = match wake.wait_timeout(locked, remaining) {
+                Ok((locked, _)) => locked,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        *locked = true;
+        STATUS_SUCCESS
+    }
+
+    fn wdf_wait_lock_acquire(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let handle = guest_arg(state, memory, 0)?;
+        let timeout_pointer = guest_arg(state, memory, 1)?;
+        let timeout = self.wait_lock_timeout(memory, timeout_pointer)?;
+        let Some(lock) = self.kmdf.wait_locks.get(&handle).cloned() else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        let already_held = lock.gate.0.lock().map(|locked| *locked).unwrap_or(false);
+        let status = self.wait_lock_acquire_gate(&lock.gate, timeout);
+        if already_held && status == STATUS_SUCCESS {
+            self.kmdf.parked_acquires += 1;
+        }
+        set_status(state, status);
+        Ok(())
+    }
+
+    fn wdf_wait_lock_release(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let handle = guest_arg(state, memory, 0)?;
+        let Some(lock) = self.kmdf.wait_locks.get(&handle).cloned() else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        let (mutex, wake) = &*lock.gate;
+        let mut locked = match mutex.lock() {
+            Ok(locked) => locked,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *locked = false;
+        drop(locked);
+        wake.notify_all();
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn choose_queue(&self, device_handle: u64) -> Option<u64> {
+        self.kmdf
+            .queues
+            .iter()
+            .filter(|(_, queue)| queue.device == device_handle)
+            .find(|(_, queue)| queue.default_queue)
+            .or_else(|| {
+                self.kmdf
+                    .queues
+                    .iter()
+                    .find(|(_, queue)| queue.device == device_handle)
+            })
+            .map(|(handle, _)| *handle)
+    }
+
+    fn queue_callback(queue: &KmdfQueue, major: IrpMajorFunction) -> u64 {
+        match major {
+            IrpMajorFunction::Read => {
+                if queue.callbacks.read != 0 {
+                    queue.callbacks.read
+                } else {
+                    queue.callbacks.default
+                }
+            }
+            IrpMajorFunction::Write => {
+                if queue.callbacks.write != 0 {
+                    queue.callbacks.write
+                } else {
+                    queue.callbacks.default
+                }
+            }
+            IrpMajorFunction::DeviceControl => {
+                if queue.callbacks.device_control != 0 {
+                    queue.callbacks.device_control
+                } else {
+                    queue.callbacks.default
+                }
+            }
+            _ => queue.callbacks.default,
+        }
+    }
+
+    fn callback_call(
+        queue_handle: u64,
+        request_handle: u64,
+        request: &KmdfRequest,
+        entry: u64,
+        label: &'static str,
+    ) -> PendingGuestCall {
+        let args = match request.major {
+            IrpMajorFunction::Read | IrpMajorFunction::Write => vec![
+                queue_handle,
+                request_handle,
+                u64::from(request.input_len.max(request.output_len)),
+            ],
+            IrpMajorFunction::DeviceControl => vec![
+                queue_handle,
+                request_handle,
+                u64::from(request.output_len),
+                u64::from(request.input_len),
+                u64::from(request.io_control),
+            ],
+            _ => vec![queue_handle, request_handle],
+        };
+        PendingGuestCall {
+            entry,
+            args,
+            label,
+            purpose: PendingPurpose::IoDispatch {
+                request: request_handle,
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_kmdf_request(
+        &mut self,
+        memory: &mut MemoryImage,
+        device_handle: u64,
+        queue_handle: u64,
+        major: IrpMajorFunction,
+        io_control: u32,
+        input_len: u32,
+        output_len: u32,
+        input_guest: u64,
+        output_guest: u64,
+        outer_irp_guest: u64,
+    ) -> AppResult<Result<u64, i32>> {
+        let Some(device) = self.kmdf.devices.get(&device_handle) else {
+            return Ok(Err(STATUS_INVALID_DEVICE_REQUEST));
+        };
+        let casak = device.casak;
+        let irp = match self.io.allocate_irp(
+            casak,
+            IrpParameterBlock::new(major, 0, input_len.max(output_len) as usize),
+        ) {
+            Ok(irp) => irp,
+            Err(status) => return Ok(Err(status)),
+        };
+        if major == IrpMajorFunction::DeviceControl {
+            let _ = self.io.set_stack_parameters(
+                irp,
+                casak,
+                StackParameters::DeviceControl {
+                    io_control_code: io_control,
+                    input_length: input_len as usize,
+                    output_length: output_len as usize,
+                    output_offset: 0,
+                },
+            );
+        } else if matches!(major, IrpMajorFunction::Read | IrpMajorFunction::Write) {
+            let _ = self.io.set_stack_parameters(
+                irp,
+                casak,
+                StackParameters::ReadWrite {
+                    length: input_len.max(output_len) as usize,
+                    byte_offset: 0,
+                },
+            );
+        }
+        let handle = self.create_kmdf_object(memory, KmdfObjectKind::Request, 0)?;
+        let context_guest = self
+            .kmdf
+            .objects
+            .get(&handle)
+            .map(|object| object.context_guest)
+            .unwrap_or(handle + 0x80);
+        if let Some(object) = self.kmdf.objects.get_mut(&handle) {
+            object.parent = Some(queue_handle);
+        }
+        if let Some(object) = self.kmdf.objects.get_mut(&queue_handle) {
+            object.children.insert(handle);
+        }
+        self.kmdf.requests.insert(
+            handle,
+            KmdfRequest {
+                irp,
+                device: Some(device_handle),
+                io_control,
+                input_len,
+                output_len,
+                input_guest,
+                output_guest,
+                completed: false,
+                status: STATUS_SUCCESS,
+                information: 0,
+                context_guest,
+                queue: Some(queue_handle),
+                outer_irp_guest,
+                major,
+                target: None,
+                canceled: false,
+            },
+        );
+        self.kmdf.current_request = handle;
+        Ok(Ok(handle))
+    }
+
+    fn wdf_dispatch(
+        &mut self,
+        major: IrpMajorFunction,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let irp_guest = guest_arg(state, memory, 0)?;
+        let device_object = guest_arg(state, memory, 1)?;
+        if irp_guest != 0 {
+            self.kmdf.current_irp_guest = irp_guest;
+        }
+        let Some(device_handle) = self.kmdf.devices_by_object.get(&device_object).copied() else {
+            self.write_outer_irp_status(memory, STATUS_INVALID_DEVICE_REQUEST, 0)?;
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        };
+        let Some(queue_handle) = self.choose_queue(device_handle) else {
+            self.write_outer_irp_status(memory, STATUS_INVALID_DEVICE_REQUEST, 0)?;
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        };
+        let input_len = self.kmdf.current_input_len;
+        let output_len = self.kmdf.current_output_len;
+        let io_control = self.kmdf.current_io_control;
+        let system_buffer = self.kmdf.current_system_buffer;
+        let (input_guest, output_guest) = match major {
+            IrpMajorFunction::Read => (0, system_buffer),
+            IrpMajorFunction::Write => (system_buffer, 0),
+            _ => (system_buffer, system_buffer),
+        };
+        let request = match self.new_kmdf_request(
+            memory,
+            device_handle,
+            queue_handle,
+            major,
+            io_control,
+            input_len,
+            output_len,
+            input_guest,
+            output_guest,
+            irp_guest,
+        )? {
+            Ok(request) => request,
+            Err(status) => {
+                self.write_outer_irp_status(memory, status, 0)?;
+                set_status(state, status);
+                return Ok(None);
+            }
+        };
+        let queue = self.kmdf.queues.get(&queue_handle).cloned().expect("queue");
+        let defer = queue.stopped
+            || queue.dispatch_type == 2
+            || (queue.dispatch_type == 0 && !queue.in_flight.is_empty());
+        if defer {
+            if let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) {
+                queue.queued.push_back(request);
+            }
+            self.kmdf.queued_dispatches += 1;
+            self.write_outer_irp_status(memory, STATUS_PENDING, 0)?;
+            set_status(state, STATUS_PENDING);
+            return Ok(None);
+        }
+        let entry = Self::queue_callback(&queue, major);
+        if entry == 0 {
+            let status = if matches!(major, IrpMajorFunction::Cleanup | IrpMajorFunction::Close) {
+                STATUS_SUCCESS
+            } else {
+                STATUS_INVALID_DEVICE_REQUEST
+            };
+            self.complete_kmdf_request(memory, request, status, 0)?;
+            set_status(state, status);
+            return Ok(None);
+        }
+        if let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) {
+            queue.in_flight.insert(request);
+        }
+        match major {
+            IrpMajorFunction::Read => self.kmdf.read_dispatches += 1,
+            IrpMajorFunction::Write => self.kmdf.write_dispatches += 1,
+            IrpMajorFunction::DeviceControl => self.kmdf.ioctl_dispatches += 1,
+            IrpMajorFunction::Cleanup => self.kmdf.cleanup_dispatches += 1,
+            IrpMajorFunction::Close => self.kmdf.close_dispatches += 1,
+            _ => {}
+        }
+        self.kmdf.current_request = request;
+        self.write_outer_irp_status(memory, STATUS_PENDING, 0)?;
+        let request_state = self.kmdf.requests.get(&request).expect("request").clone();
+        let label = match major {
+            IrpMajorFunction::Read => "EvtIoRead",
+            IrpMajorFunction::Write => "EvtIoWrite",
+            IrpMajorFunction::DeviceControl => "EvtIoDeviceControl",
+            _ => "EvtIoDefault",
+        };
+        Ok(Some(Self::callback_call(
+            queue_handle,
+            request,
+            &request_state,
+            entry,
+            label,
+        )))
+    }
+
+    fn dispatch_next_queued(
+        &mut self,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        loop {
+            let candidate = self.kmdf.queues.iter().find_map(|(handle, queue)| {
+                if queue.dispatch_type == 2 {
+                    return None;
+                }
+                if queue.stopped && !queue.draining {
+                    return None;
+                }
+                if queue.dispatch_type == 0 && !queue.in_flight.is_empty() {
+                    return None;
+                }
+                queue
+                    .queued
+                    .front()
+                    .copied()
+                    .map(|request| (*handle, request))
+            });
+            let Some((queue_handle, request_handle)) = candidate else {
+                for queue in self.kmdf.queues.values_mut() {
+                    if queue.draining && queue.queued.is_empty() {
+                        queue.draining = false;
+                        queue.stopped = true;
+                    }
+                }
+                return Ok(None);
+            };
+            let request = match self.kmdf.requests.get(&request_handle) {
+                Some(request) => request.clone(),
+                None => {
+                    if let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) {
+                        queue.queued.pop_front();
+                    }
+                    continue;
+                }
+            };
+            let queue = self
+                .kmdf
+                .queues
+                .get(&queue_handle)
+                .cloned()
+                .expect("queue handle comes from iterating the same map");
+            let entry = Self::queue_callback(&queue, request.major);
+            if entry == 0 {
+                if let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) {
+                    queue.queued.pop_front();
+                }
+                let status = if matches!(
+                    request.major,
+                    IrpMajorFunction::Cleanup | IrpMajorFunction::Close
+                ) {
+                    STATUS_SUCCESS
+                } else {
+                    STATUS_INVALID_DEVICE_REQUEST
+                };
+                self.complete_kmdf_request(memory, request_handle, status, 0)?;
+                continue;
+            }
+            if let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) {
+                queue.queued.pop_front();
+                queue.in_flight.insert(request_handle);
+            }
+            self.kmdf.queued_dispatches += 1;
+            match request.major {
+                IrpMajorFunction::Read => self.kmdf.read_dispatches += 1,
+                IrpMajorFunction::Write => self.kmdf.write_dispatches += 1,
+                IrpMajorFunction::DeviceControl => self.kmdf.ioctl_dispatches += 1,
+                IrpMajorFunction::Cleanup => self.kmdf.cleanup_dispatches += 1,
+                IrpMajorFunction::Close => self.kmdf.close_dispatches += 1,
+                _ => {}
+            }
+            self.kmdf.current_request = request_handle;
+            self.write_irp_status(memory, request.outer_irp_guest, STATUS_PENDING, 0)?;
+            let label = match request.major {
+                IrpMajorFunction::Read => "EvtIoRead",
+                IrpMajorFunction::Write => "EvtIoWrite",
+                IrpMajorFunction::DeviceControl => "EvtIoDeviceControl",
+                _ => "EvtIoDefault",
+            };
+            return Ok(Some(Self::callback_call(
+                queue_handle,
+                request_handle,
+                &request,
+                entry,
+                label,
+            )));
+        }
+    }
+
+    fn complete_kmdf_request(
+        &mut self,
+        memory: &mut MemoryImage,
+        handle: u64,
+        status: i32,
+        information: usize,
+    ) -> AppResult<()> {
+        let Some(request) = self.kmdf.requests.get_mut(&handle) else {
+            return Ok(());
+        };
+        if request.completed {
+            return Ok(());
+        }
+        request.completed = true;
+        request.status = status;
+        request.information = information;
+        let irp = request.irp;
+        let outer = request.outer_irp_guest;
+        let queue = request.queue;
+        let _ = self.io.complete_irp(irp, status, information);
+        if let Some(queue_handle) = queue {
+            if let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) {
+                queue.in_flight.remove(&handle);
+                if queue.draining && queue.queued.is_empty() {
+                    queue.draining = false;
+                    queue.stopped = true;
+                }
+            }
+        }
+        if self.kmdf.current_request == handle {
+            self.kmdf.current_request = 0;
+        }
+        self.write_irp_status(memory, outer, status, information)
+    }
+
+    fn wdf_queue_retrieve(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        found: bool,
+    ) -> AppResult<()> {
+        let queue_handle = guest_arg(state, memory, 0)?;
+        let (found_request, request_out) = if found {
+            (guest_arg(state, memory, 1)?, guest_arg(state, memory, 2)?)
+        } else {
+            (0, guest_arg(state, memory, 1)?)
+        };
+        if request_out == 0
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                request_out,
+                self.arch.pointer_bytes(),
+            )
+            .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        let request = if found {
+            queue
+                .queued
+                .iter()
+                .position(|request| *request == found_request)
+                .and_then(|index| queue.queued.remove(index))
+        } else {
+            queue.queued.pop_front()
+        };
+        let Some(request) = request else {
+            set_status(state, STATUS_NO_MORE_ENTRIES);
+            return Ok(());
+        };
+        if let Some(request) = self.kmdf.requests.get_mut(&request) {
+            request.queue = None;
+        }
+        self.kmdf.manual_retrievals += 1;
+        write_guest_pointer(memory, request_out, request, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn wdf_queue_stop(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        drain: bool,
+        _synchronously: bool,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let queue_handle = guest_arg(state, memory, 0)?;
+        let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(None);
+        };
+        queue.stopped = true;
+        if drain {
+            queue.draining = true;
+        }
+        let stop_callback = queue.callbacks.stop;
+        let in_flight = queue
+            .in_flight
+            .iter()
+            .chain(queue.queued.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        if in_flight.is_empty() && drain && queue.queued.is_empty() {
+            queue.draining = false;
+        }
+        let mut callbacks = Vec::new();
+        if stop_callback != 0 {
+            for request in in_flight {
+                self.kmdf.stop_dispatches += 1;
+                callbacks.push(GuestCallback {
+                    entry: stop_callback,
+                    args: vec![queue_handle, request, 1],
+                    label: "EvtIoStop",
+                });
+            }
+        }
+        set_status(state, STATUS_SUCCESS);
+        Ok(Self::callbacks_pending(callbacks, drain))
+    }
+
+    fn wdf_queue_purge(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let queue_handle = guest_arg(state, memory, 0)?;
+        let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(None);
+        };
+        queue.stopped = true;
+        queue.draining = false;
+        let canceled_callback = queue.callbacks.canceled_on_queue;
+        let queued = queue.queued.drain(..).collect::<Vec<_>>();
+        let in_flight = std::mem::take(&mut queue.in_flight);
+        let mut callbacks = Vec::new();
+        for request in queued {
+            self.kmdf.cancel_dispatches += 1;
+            if canceled_callback != 0 {
+                callbacks.push(GuestCallback {
+                    entry: canceled_callback,
+                    args: vec![queue_handle, request],
+                    label: "EvtIoCanceledOnQueue",
+                });
+            } else {
+                self.force_cancel_request(request);
+                self.write_request_outer_status(memory, request, STATUS_CANCELLED, 0)?;
+            }
+        }
+        for request in in_flight {
+            self.kmdf.cancel_dispatches += 1;
+            if canceled_callback != 0 {
+                callbacks.push(GuestCallback {
+                    entry: canceled_callback,
+                    args: vec![queue_handle, request],
+                    label: "EvtIoCanceledOnQueue",
+                });
+            } else {
+                self.force_cancel_request(request);
+                self.write_request_outer_status(memory, request, STATUS_CANCELLED, 0)?;
+            }
+        }
+        set_status(state, STATUS_SUCCESS);
+        Ok(Self::callbacks_pending(callbacks, false))
+    }
+
+    fn wdf_queue_start(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let queue_handle = guest_arg(state, memory, 0)?;
+        let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(None);
+        };
+        queue.stopped = false;
+        queue.draining = false;
+        let resume_callback = queue.callbacks.resume;
+        let in_flight = queue
+            .in_flight
+            .iter()
+            .chain(queue.queued.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let mut callbacks = Vec::new();
+        if resume_callback != 0 {
+            for request in in_flight {
+                self.kmdf.resume_dispatches += 1;
+                callbacks.push(GuestCallback {
+                    entry: resume_callback,
+                    args: vec![queue_handle, request],
+                    label: "EvtIoResume",
+                });
+            }
+        }
+        set_status(state, STATUS_SUCCESS);
+        Ok(Self::callbacks_pending(callbacks, true))
+    }
+
+    fn callbacks_pending(
+        callbacks: Vec<GuestCallback>,
+        dispatch_next: bool,
+    ) -> Option<PendingGuestCall> {
+        let mut remaining = callbacks;
+        if remaining.is_empty() {
+            return None;
+        }
+        let first = remaining.remove(0);
+        Some(PendingGuestCall {
+            entry: first.entry,
+            args: first.args,
+            label: first.label,
+            purpose: PendingPurpose::Callbacks {
+                remaining,
+                dispatch_next,
+            },
+        })
+    }
+
+    fn write_request_outer_status(
+        &self,
+        memory: &mut MemoryImage,
+        request: u64,
+        status: i32,
+        information: usize,
+    ) -> AppResult<()> {
+        if let Some(request) = self.kmdf.requests.get(&request) {
+            self.write_irp_status(memory, request.outer_irp_guest, status, information)?;
+        }
+        Ok(())
+    }
+
+    fn wdf_request_cancel_queued(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let handle = guest_arg(state, memory, 0)?;
+        let Some(request) = self.kmdf.requests.get(&handle).cloned() else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(None);
+        };
+        let Some(queue_handle) = request.queue else {
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        };
+        let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) else {
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        };
+        let Some(index) = queue.queued.iter().position(|queued| *queued == handle) else {
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        };
+        queue.queued.remove(index);
+        let canceled_callback = queue.callbacks.canceled_on_queue;
+        self.kmdf.cancel_dispatches += 1;
+        if canceled_callback != 0 {
+            set_status(state, STATUS_SUCCESS);
+            return Ok(Self::callbacks_pending(
+                vec![GuestCallback {
+                    entry: canceled_callback,
+                    args: vec![queue_handle, handle],
+                    label: "EvtIoCanceledOnQueue",
+                }],
+                false,
+            ));
+        }
+        self.force_cancel_request(handle);
+        self.write_request_outer_status(memory, handle, STATUS_CANCELLED, 0)?;
+        set_status(state, STATUS_CANCELLED);
+        Ok(None)
+    }
+
+    fn wdf_device_get_iotarget(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let device = guest_arg(state, memory, 0)?;
+        if !self.kmdf.devices.contains_key(&device) {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        }
+        let existing = self
+            .kmdf
+            .iotargets
+            .iter()
+            .find_map(|(handle, target)| (target.device == device).then_some(*handle));
+        let target = if let Some(target) = existing {
+            target
+        } else {
+            let target = self.create_kmdf_object(memory, KmdfObjectKind::IoTarget, 0)?;
+            if let Some(object) = self.kmdf.objects.get_mut(&target) {
+                object.parent = Some(device);
+            }
+            if let Some(object) = self.kmdf.objects.get_mut(&device) {
+                object.children.insert(target);
+            }
+            let context_guest = self
+                .kmdf
+                .objects
+                .get(&target)
+                .map(|object| object.context_guest)
+                .unwrap_or(target + 0x80);
+            self.kmdf.iotargets.insert(
+                target,
+                KmdfIoTarget {
+                    device,
+                    context_guest,
+                },
+            );
+            target
+        };
+        state.set(Register::Rax, target);
+        Ok(())
+    }
+
+    fn wdf_iotarget_create(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let device = guest_arg(state, memory, 0)?;
+        let attributes = guest_arg(state, memory, 1)?;
+        let target_out = guest_arg(state, memory, 2)?;
+        if !self.kmdf.devices.contains_key(&device)
+            || target_out == 0
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                target_out,
+                self.arch.pointer_bytes(),
+            )
+            .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let target = self.create_kmdf_object(memory, KmdfObjectKind::IoTarget, attributes)?;
+        if self
+            .kmdf
+            .objects
+            .get(&target)
+            .is_some_and(|object| object.parent.is_none())
+        {
+            if let Some(object) = self.kmdf.objects.get_mut(&target) {
+                object.parent = Some(device);
+            }
+            if let Some(object) = self.kmdf.objects.get_mut(&device) {
+                object.children.insert(target);
+            }
+        }
+        let context_guest = self
+            .kmdf
+            .objects
+            .get(&target)
+            .map(|object| object.context_guest)
+            .unwrap_or(target + 0x80);
+        self.kmdf.iotargets.insert(
+            target,
+            KmdfIoTarget {
+                device,
+                context_guest,
+            },
+        );
+        write_guest_pointer(memory, target_out, target, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn read_memory_descriptor(
+        &self,
+        memory: &MemoryImage,
+        descriptor: u64,
+    ) -> AppResult<(u64, usize)> {
+        if descriptor == 0 {
+            return Ok((0, 0));
+        }
+        let _kind = memory.read_u32(descriptor)?;
+        let (pointer_offset, length_offset) = match self.arch {
+            GuestArch::X64 => (0x08u64, 0x10u64),
+            GuestArch::X86 => (0x04, 0x08),
+        };
+        let pointer = read_guest_pointer(memory, descriptor + pointer_offset, self.arch)?;
+        let length = read_guest_pointer(memory, descriptor + length_offset, self.arch)? as usize;
+        Ok((pointer, length))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_ioctl_send(
+        &mut self,
+        memory: &mut MemoryImage,
+        target: u64,
+        request: u64,
+        io_control: u32,
+        input: &[u8],
+        input_ptr: u64,
+        output_ptr: u64,
+        output_len: usize,
+    ) -> AppResult<Option<PendingIoTargetSend>> {
+        let Some(device_handle) = self.resolve_target_device(target) else {
+            return Ok(None);
+        };
+        let Some(device) = self.kmdf.devices.get(&device_handle).cloned() else {
+            return Ok(None);
+        };
+        let irp = match self.io.allocate_irp(
+            device.casak,
+            IrpParameterBlock::new(IrpMajorFunction::DeviceControl, 0, input.len()),
+        ) {
+            Ok(irp) => irp,
+            Err(_) => return Ok(None),
+        };
+        let _ = self.io.set_stack_parameters(
+            irp,
+            device.casak,
+            StackParameters::DeviceControl {
+                io_control_code: io_control,
+                input_length: input.len(),
+                output_length: output_len,
+                output_offset: 0,
+            },
+        );
+        let arch = self.arch;
+        let irp_guest = self.arena.alloc(memory, irp_guest_size(arch) as usize, 8)?;
+        let stack_guest = self.arena.alloc(memory, io_stack_location_size(arch), 8)?;
+        let buffer_len = input.len().max(output_len);
+        let system_buffer = if buffer_len > 0 {
+            self.arena.alloc(memory, buffer_len, 8)?
+        } else {
+            0
+        };
+        if !input.is_empty() {
+            memory.map_bytes(system_buffer, input);
+        }
+        build_guest_irp(
+            memory,
+            arch,
+            irp_guest,
+            stack_guest,
+            system_buffer,
+            device.object_guest,
+            output_ptr,
+            IrpMajorFunction::DeviceControl,
+            io_control,
+            input.len() as u32,
+            output_len as u32,
+            0,
+        )?; // coverage: unreachable — build_guest_irp only performs infallible MemoryImage writes
+        let handler = read_guest_pointer(
+            memory,
+            self.driver_object_guest
+                + major_function_offset(arch)
+                + IrpMajorFunction::DeviceControl.code() as u64 * arch.pointer_bytes() as u64,
+            arch,
+        )?;
+        if handler == 0 || handler == self.default_dispatch {
+            let _ = self.io.complete_irp(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
+            return Ok(None);
+        }
+        let saved = (
+            self.kmdf.current_irp_guest,
+            self.kmdf.current_device_guest,
+            self.kmdf.current_system_buffer,
+            self.kmdf.current_input_len,
+            self.kmdf.current_output_len,
+            self.kmdf.current_io_control,
+            self.kmdf.current_request,
+        );
+        self.kmdf.current_irp_guest = irp_guest;
+        self.kmdf.current_device_guest = device.object_guest;
+        self.kmdf.current_system_buffer = system_buffer;
+        self.kmdf.current_input_len = input.len() as u32;
+        self.kmdf.current_output_len = output_len as u32;
+        self.kmdf.current_io_control = io_control;
+        self.kmdf.current_request = 0;
+        self.kmdf.iotarget_sends += 1;
+        Ok(Some(PendingIoTargetSend {
+            irp,
+            irp_guest,
+            entry: handler,
+            device_object: device.object_guest,
+            system_buffer,
+            output_ptr,
+            output_len,
+            bytes_returned: 0,
+            request,
+            target,
+            io_control,
+            input_ptr,
+            input_len: input.len() as u32,
+            saved,
+        }))
+    }
+
+    fn finish_ioctl_send(
+        &mut self,
+        memory: &mut MemoryImage,
+        pending: PendingIoTargetSend,
+    ) -> AppResult<(i32, usize)> {
+        let arch = self.arch;
+        let bytes_returned = pending.bytes_returned;
+        let (guest_status, information) = match arch {
+            GuestArch::X64 => (
+                memory.read_u32(pending.irp_guest + 0x30)? as i32,
+                memory.read_u64(pending.irp_guest + 0x40)? as usize,
+            ),
+            GuestArch::X86 => (
+                memory.read_u32(pending.irp_guest + 0x18)? as i32,
+                memory.read_u32(pending.irp_guest + 0x20)? as usize,
+            ),
+        };
+        let _ = self.io.complete_irp(pending.irp, guest_status, information);
+        if pending.output_len > 0 && pending.output_ptr != 0 && pending.system_buffer != 0 {
+            let mut output = vec![0_u8; pending.output_len];
+            if memory.read_into(pending.system_buffer, &mut output).is_ok() {
+                memory.map_bytes(pending.output_ptr, &output);
+            }
+        }
+        (
+            self.kmdf.current_irp_guest,
+            self.kmdf.current_device_guest,
+            self.kmdf.current_system_buffer,
+            self.kmdf.current_input_len,
+            self.kmdf.current_output_len,
+            self.kmdf.current_io_control,
+            self.kmdf.current_request,
+        ) = pending.saved;
+        if pending.request != 0 {
+            if let Some(request) = self.kmdf.requests.get_mut(&pending.request) {
+                request.target = Some(pending.target);
+                request.io_control = pending.io_control;
+                request.input_guest = pending.input_ptr;
+                request.input_len = pending.input_len;
+                request.output_guest = pending.output_ptr;
+                request.output_len = pending.output_len as u32;
+            }
+            self.apply_iotarget_result(memory, pending.request, guest_status, information)?;
+        }
+        if bytes_returned != 0
+            && crate::host_thunks::validate_guest_pointer(
+                memory,
+                bytes_returned,
+                self.arch.pointer_bytes(),
+            )
+            .is_ok()
+        {
+            write_guest_pointer(memory, bytes_returned, information as u64, self.arch)?;
+        }
+        Ok((guest_status, information))
+    }
+
+    fn apply_iotarget_result(
+        &mut self,
+        memory: &mut MemoryImage,
+        request: u64,
+        status: i32,
+        information: usize,
+    ) -> AppResult<()> {
+        let Some(request_state) = self.kmdf.requests.get_mut(&request) else {
+            return Ok(());
+        };
+        request_state.completed = true;
+        request_state.status = status;
+        request_state.information = information;
+        let outer = request_state.outer_irp_guest;
+        let irp = request_state.irp;
+        let _ = self.io.complete_irp(irp, status, information);
+        self.write_irp_status(memory, outer, status, information)
+    }
+
+    fn wdf_iotarget_send_ioctl(
+        &mut self,
+        _runtime: &mut PeHostRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let target = guest_arg(state, memory, 0)?;
+        let request = guest_arg(state, memory, 1)?;
+        let io_control = guest_arg(state, memory, 2)? as u32;
+        let input_descriptor = guest_arg(state, memory, 3)?;
+        let output_descriptor = guest_arg(state, memory, 4)?;
+        let _options = guest_arg(state, memory, 5)?;
+        let bytes_returned = guest_arg(state, memory, 6)?;
+        let (input_ptr, input_len) = self.read_memory_descriptor(memory, input_descriptor)?;
+        let (output_ptr, output_len) = self.read_memory_descriptor(memory, output_descriptor)?;
+        let mut input = vec![0_u8; input_len];
+        if input_len > 0 && memory.read_into(input_ptr, &mut input).is_err() {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(None);
+        }
+        let Some(mut pending) = self.prepare_ioctl_send(
+            memory, target, request, io_control, &input, input_ptr, output_ptr, output_len,
+        )?
+        else {
+            self.apply_iotarget_result(memory, request, STATUS_INVALID_DEVICE_REQUEST, 0)?;
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        };
+        pending.bytes_returned = bytes_returned;
+        Ok(Some(PendingGuestCall {
+            entry: pending.entry,
+            args: vec![pending.irp_guest, pending.device_object],
+            label: "WdfIoTargetSend",
+            purpose: PendingPurpose::IoTargetSend {
+                pending: Box::new(pending),
+            },
+        }))
+    }
+
+    fn wdf_iotarget_format_request(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let target = guest_arg(state, memory, 0)?;
+        let request = guest_arg(state, memory, 1)?;
+        let io_control = guest_arg(state, memory, 2)? as u32;
+        let input_descriptor = guest_arg(state, memory, 3)?;
+        let input_offset = guest_arg(state, memory, 4)?;
+        let output_descriptor = guest_arg(state, memory, 5)?;
+        let output_offset = guest_arg(state, memory, 6)?;
+        let (input_ptr, input_len) = self.read_memory_descriptor(memory, input_descriptor)?;
+        let (output_ptr, output_len) = self.read_memory_descriptor(memory, output_descriptor)?;
+        let Some(request_state) = self.kmdf.requests.get_mut(&request) else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        request_state.target = Some(target);
+        request_state.io_control = io_control;
+        request_state.input_guest = input_ptr.saturating_add(input_offset);
+        request_state.input_len = input_len.saturating_sub(input_offset as usize) as u32;
+        request_state.output_guest = output_ptr.saturating_add(output_offset);
+        request_state.output_len = output_len.saturating_sub(output_offset as usize) as u32;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn wdf_request_send(
+        &mut self,
+        _runtime: &mut PeHostRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let request = guest_arg(state, memory, 0)?;
+        let target = guest_arg(state, memory, 1)?;
+        let _options = guest_arg(state, memory, 2)?;
+        let Some(request_state) = self.kmdf.requests.get(&request).cloned() else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(None);
+        };
+        let target = if target != 0 {
+            target
+        } else {
+            request_state.target.unwrap_or(0)
+        };
+        let mut input = vec![0_u8; request_state.input_len as usize];
+        if !input.is_empty()
+            && memory
+                .read_into(request_state.input_guest, &mut input)
+                .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(None);
+        }
+        let Some(pending) = self.prepare_ioctl_send(
+            memory,
+            target,
+            request,
+            request_state.io_control,
+            &input,
+            request_state.input_guest,
+            request_state.output_guest,
+            request_state.output_len as usize,
+        )?
+        else {
+            self.apply_iotarget_result(memory, request, STATUS_INVALID_DEVICE_REQUEST, 0)?;
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        };
+        Ok(Some(PendingGuestCall {
+            entry: pending.entry,
+            args: vec![pending.irp_guest, pending.device_object],
+            label: "WdfRequestSend",
+            purpose: PendingPurpose::IoTargetSend {
+                pending: Box::new(pending),
+            },
+        }))
+    }
+
+    fn wdf_object_allocate_context(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let handle = guest_arg(state, memory, 0)?;
+        let type_info = guest_arg(state, memory, 1)?;
+        let context_out = guest_arg(state, memory, 2)?;
+        if context_out == 0
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                context_out,
+                self.arch.pointer_bytes(),
+            )
+            .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let Some(kind) = self.kmdf.objects.get(&handle).map(|object| object.kind) else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        let type_size = self.context_type_size(memory, type_info)?;
+        let size = if type_size > 0 {
+            type_size
+        } else {
+            kind.layout().0
+        }
+        .clamp(8, 0x10_000);
+        let context_guest = self.arena.alloc(memory, size, 8)?;
+        if let Some(object) = self.kmdf.objects.get_mut(&handle) {
+            object.extra_contexts.push((type_info, context_guest, size));
+        }
+        write_guest_pointer(memory, context_out, context_guest, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
 }
 
 /// True when `handle` was minted by an island device-namespace open.
 pub(crate) fn is_island_device_handle(runtime: &PeHostRuntime, handle: u32) -> bool {
-    DEVICE_HANDLES.with(|handles| {
-        handles
-            .borrow()
-            .contains_key(&(runtime_identity(runtime), handle))
-    })
+    let runtime_id = runtime_identity(runtime);
+    lock_registry()
+        .device_handles
+        .get(&runtime_id)
+        .is_some_and(|handles| handles.contains_key(&handle))
+}
+
+/// Close an island device-namespace handle.  Returns `true` when the handle
+/// belonged to the island namespace and was released by this call (a second
+/// close therefore reports `false` and falls through to the invalid-handle
+/// path).
+pub(crate) fn close_island_device_handle(runtime: &PeHostRuntime, handle: u32) -> bool {
+    let runtime_id = runtime_identity(runtime);
+    lock_registry()
+        .device_handles
+        .get_mut(&runtime_id)
+        .and_then(|handles| handles.remove(&handle))
+        .is_some()
 }
 
 /// `NtCreateFile` island hook: when `raw_path` names a loaded island device
@@ -1542,16 +4445,16 @@ pub(crate) fn nt_open_island_device(
         return Some(STATUS_INVALID_PARAMETER);
     }
     let runtime_id = runtime_identity(runtime);
-    let handle = NEXT_DEVICE_HANDLE.with(|next| {
-        let mut next = next.borrow_mut();
-        let counter = next.entry(runtime_id).or_insert(0);
-        let handle = DEVICE_HANDLE_BASE.wrapping_add(*counter);
-        *counter = counter.wrapping_add(1);
-        handle
-    });
-    DEVICE_HANDLES.with(|handles| {
-        handles.borrow_mut().insert((runtime_id, handle), device);
-    });
+    let mut registry = lock_registry();
+    let counter = registry.next_device_handle.entry(runtime_id).or_insert(0);
+    let handle = DEVICE_HANDLE_BASE.wrapping_add(*counter);
+    *counter = counter.wrapping_add(1);
+    registry
+        .device_handles
+        .entry(runtime_id)
+        .or_default()
+        .insert(handle, device);
+    drop(registry);
     memory.write_u32(handle_ptr, handle);
     Some(STATUS_SUCCESS)
 }
@@ -1572,16 +4475,25 @@ pub(crate) fn dispatch_island_device_io(
     byte_offset: u64,
 ) -> AppResult<Option<(i32, usize)>> {
     let runtime_id = runtime_identity(runtime);
-    let Some(device) =
-        DEVICE_HANDLES.with(|handles| handles.borrow().get(&(runtime_id, handle)).cloned())
-    else {
-        return Ok(None);
-    };
-    let key = loaded_driver_key(runtime, &device.service_name);
-    let island = LOADED_DRIVER_SERVICES
-        .with(|map| map.borrow().get(&key).map(|island| island.inner.clone()));
-    let Some(inner) = island else {
-        return Ok(Some((STATUS_INVALID_HANDLE, 0)));
+    let (device, inner) = {
+        let registry = lock_registry();
+        let Some(device) = registry
+            .device_handles
+            .get(&runtime_id)
+            .and_then(|handles| handles.get(&handle))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let service_key = device.service_name.to_ascii_lowercase();
+        let Some(shared) = registry
+            .services
+            .get(&runtime_id)
+            .and_then(|services| services.get(&service_key))
+        else {
+            return Ok(Some((STATUS_INVALID_HANDLE, 0)));
+        };
+        (device, shared.0.inner.clone())
     };
     // A handle opened to a device that has since been deleted is stale.
     let live = inner
@@ -1628,53 +4540,55 @@ fn resolve_island_device(runtime: &PeHostRuntime, raw_path: &str) -> Option<Isla
         return None;
     }
     let runtime_id = runtime_identity(runtime);
-    LOADED_DRIVER_SERVICES.with(|map| {
-        for ((identity, _), island) in map.borrow().iter() {
-            if *identity != runtime_id {
-                continue;
-            }
-            let state = island.inner.borrow();
-            let direct = state
+    let registry = lock_registry();
+    for island in registry
+        .services
+        .get(&runtime_id)
+        .into_iter()
+        .flat_map(|services| services.values())
+    {
+        let state = island.0.inner.borrow();
+        let direct = state
+            .devices
+            .iter()
+            .find(|device| !device.deleted && device.name.eq_ignore_ascii_case(&path));
+        let link_target = state
+            .symbolic_links
+            .iter()
+            .find_map(|(link, target)| link.eq_ignore_ascii_case(&path).then_some(target.as_str()));
+        let linked = link_target.and_then(|target| {
+            state
                 .devices
                 .iter()
-                .find(|device| !device.deleted && device.name.eq_ignore_ascii_case(&path));
-            let link_target = state.symbolic_links.iter().find_map(|(link, target)| {
-                link.eq_ignore_ascii_case(&path).then_some(target.as_str())
-            });
-            let linked = link_target.and_then(|target| {
+                .find(|device| !device.deleted && device.name.eq_ignore_ascii_case(target))
+        });
+        // `\??\Name` is also accepted for a device without an explicit
+        // symbolic link (the NT object-manager DOS-device prefix).
+        let dos_prefixed = {
+            let rest = path
+                .strip_prefix("\\??\\")
+                .or_else(|| path.strip_prefix("\\DosDevices\\"));
+            rest.and_then(|rest| {
+                let target = format!("\\Device\\{rest}");
                 state
                     .devices
                     .iter()
-                    .find(|device| !device.deleted && device.name.eq_ignore_ascii_case(target))
-            });
-            // `\??\Name` is also accepted for a device without an explicit
-            // symbolic link (the NT object-manager DOS-device prefix).
-            let dos_prefixed = {
-                let rest = path
-                    .strip_prefix("\\??\\")
-                    .or_else(|| path.strip_prefix("\\DosDevices\\"));
-                rest.and_then(|rest| {
-                    let target = format!("\\Device\\{rest}");
-                    state
-                        .devices
-                        .iter()
-                        .find(|device| !device.deleted && device.name.eq_ignore_ascii_case(&target))
-                })
-            };
-            let Some(device) = direct.or(linked).or(dos_prefixed) else {
-                continue;
-            };
-            let Some(device_id) = state.device_ids.get(&device.guest_pointer).copied() else {
-                continue;
-            };
-            return Some(IslandDeviceHandle {
-                service_name: state.driver_name.clone(),
-                device_guest: device.guest_pointer,
-                device_id,
-            });
-        }
-        None
-    })
+                    .find(|device| !device.deleted && device.name.eq_ignore_ascii_case(&target))
+            })
+        };
+        let Some(device) = direct.or(linked).or(dos_prefixed) else {
+            continue;
+        };
+        let Some(device_id) = state.device_ids.get(&device.guest_pointer).copied() else {
+            continue;
+        };
+        return Some(IslandDeviceHandle {
+            service_name: state.driver_name.clone(),
+            device_guest: device.guest_pointer,
+            device_id,
+        });
+    }
+    None
 }
 
 /// Dispatches one island shim from the runtime's `HostThunk` match arm.
@@ -1692,8 +4606,29 @@ pub(crate) fn dispatch_shim(
                 format!("driver island shim {function:?} invoked with no active island"),
             )
         })?;
-    let mut island = island.borrow_mut();
-    island.handle_shim(runtime, state, memory, function)
+    let mut pending = {
+        let mut island_state = island.borrow_mut();
+        island_state.handle_shim(runtime, state, memory, function)?
+    };
+    while let Some(call) = pending {
+        let arch = island.borrow().arch;
+        let mut cpu = CpuState::new(arch);
+        // Leave the top frame for the context that invoked the shim: a KMDF
+        // callback runs while DriverEntry (or a MajorFunction handler) is still
+        // live on the same guest stack.
+        cpu.set(Register::Rsp, STACK_BASE + STACK_SIZE - 0x800);
+        let result =
+            runtime.execute_guest_callback(&mut cpu, memory, call.entry, &call.args, call.label);
+        let status = match result {
+            Ok(value) => value as u32 as i32,
+            Err(_) => STATUS_INVALID_PARAMETER,
+        };
+        pending = {
+            let mut island_state = island.borrow_mut();
+            island_state.finish_pending(state, memory, call.purpose, status)?
+        };
+    }
+    Ok(())
 }
 
 thread_local! {
@@ -1845,7 +4780,7 @@ fn build_driver_object(
                 driver_object + 0x34,
                 state.unload_guest.unwrap_or(0),
                 arch,
-            )?;
+            )?; // coverage: unreachable — write_guest_pointer is infallible for a MemoryImage
         }
     }
     let major_offset = major_function_offset(arch);
@@ -1855,7 +4790,7 @@ fn build_driver_object(
             driver_object + major_offset + index as u64 * arch.pointer_bytes() as u64,
             default_dispatch,
             arch,
-        )?;
+        )?; // coverage: unreachable — write_guest_pointer is infallible for a MemoryImage
     }
 
     write_guest_pointer(memory, extension, driver_object, arch)?;
@@ -1966,7 +4901,7 @@ fn allocate_unicode_string(
         ((units.len() + 1) * 2) as u16,
         buffer,
         state.arch,
-    )?;
+    )?; // coverage: unreachable — write_unicode_string_header only performs infallible MemoryImage writes
     Ok(header)
 }
 
@@ -2402,7 +5337,27 @@ pub(crate) fn with_loaded_driver<R>(
     inspect: impl FnOnce(&DriverIsland) -> R,
 ) -> Option<R> {
     let key = loaded_driver_key(runtime, service_name);
-    LOADED_DRIVER_SERVICES.with(|map| map.borrow().get(&key).map(inspect))
+    lock_registry()
+        .services
+        .get(&key.0)
+        .and_then(|services| services.get(&key.1))
+        .map(|island| inspect(&island.0))
+}
+
+/// Drop every island registration and handle owned by `runtime`.  Called by
+/// the runtime's `Drop` so a reused host address never observes a stale
+/// service namespace.
+pub(crate) fn forget_runtime(runtime: &PeHostRuntime) {
+    let runtime_id = runtime_identity(runtime);
+    let mut registry = lock_registry();
+    registry.services.remove(&runtime_id);
+    registry.device_handles.remove(&runtime_id);
+    registry.next_device_handle.remove(&runtime_id);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_runtime_registry(runtime: &PeHostRuntime) {
+    forget_runtime(runtime);
 }
 
 #[cfg(test)]
@@ -2505,9 +5460,6 @@ fn choose_placement(
     let size = size_hint.max(0x1000);
     for index in 0..256_u64 {
         let base = start.wrapping_add(index * 0x40_0000);
-        if base < 0x1_0000 {
-            continue;
-        }
         let arena = align_up(base.saturating_add(size), 0x1_0000);
         if arch == GuestArch::X86
             && (base.saturating_add(size) > X86_ADDRESS_LIMIT
@@ -2520,7 +5472,7 @@ fn choose_placement(
             continue;
         }
         if arena < stack_end && arena.saturating_add(ARENA_SIZE) > STACK_BASE {
-            continue;
+            continue; // coverage: unreachable — arena >= align_up(STACK_BASE + 0x1000, 0x10000) = 0x20000 > stack_end 0x12000
         }
         if range_is_free(runtime, base, size) && range_is_free(runtime, arena, ARENA_SIZE) {
             return Ok((base, arena));
@@ -2604,7 +5556,6 @@ mod tests {
     const IAT_EX_ALLOC: u32 = IAT_RVA + 72;
     const IAT_EX_FREE: u32 = IAT_RVA + 80;
 
-    /// (hint/name entry RVA, symbol name) in import-table order.
     const IMPORT_NAMES: [(&str, u32); 11] = [
         ("DbgPrint", 0x2210),
         ("RtlInitUnicodeString", 0x2230),
@@ -2647,6 +5598,11 @@ mod tests {
 
         fn call_iat(&mut self, target: u32) {
             self.raw(&[0xFF, 0x15]);
+            self.disp(target);
+        }
+
+        fn inc_dword(&mut self, target: u32) {
+            self.raw(&[0xFF, 0x05]);
             self.disp(target);
         }
 
@@ -2893,8 +5849,6 @@ mod tests {
         image[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 
-    /// A native PE32 driver: `IoCreateDevice` through a 4-byte IAT with a
-    /// stdcall shim, plus real DEVICE_CONTROL/READ/WRITE major functions.
     fn build_pe32_driver() -> Vec<u8> {
         const TEXT_RVA: u32 = 0x1000;
         const RDATA_RVA: u32 = 0x2000;
@@ -3053,7 +6007,6 @@ mod tests {
         file
     }
 
-    /// Add one delay-import descriptor (attributes = RVA) to an x64 driver.
     fn with_delay_import(mut image: Vec<u8>, symbol: &str) -> Vec<u8> {
         let directories = 0x98 + 112;
         put_u32(&mut image, directories + 13 * 8, 0x2500);
@@ -3075,8 +6028,6 @@ mod tests {
         image
     }
 
-    /// A PE64 driver whose DEVICE_CONTROL/READ/WRITE major functions write a
-    /// real response and complete with STATUS_SUCCESS.
     fn build_io_driver() -> Vec<u8> {
         const IO_HANDLER_RVA: u32 = 0x3100;
         const IO_MARKER_RVA: u32 = 0x3140;
@@ -3135,6 +6086,1043 @@ mod tests {
         file
     }
 
+    const K_TEXT_RVA: u32 = 0x1000;
+    const K_ENTRY_RVA: u32 = 0x1000;
+    const K_EVT_ADD_RVA: u32 = 0x1100;
+    const K_EVT_IOCTL_RVA: u32 = 0x1300;
+    const K_RDATA_RVA: u32 = 0x2000;
+    const K_DATA_RVA: u32 = 0x3000;
+    const K_IMPORT_RVA: u32 = 0x2100;
+    const K_ILT_RVA: u32 = 0x2140;
+    const K_IAT_RVA: u32 = 0x21D0;
+    const K_DLL_RVA: u32 = 0x2260;
+    const K_HINT_RVA: u32 = 0x2280;
+    const K_US_DEV_RVA: u32 = 0x3010;
+    const K_WIDE_DEV_RVA: u32 = 0x3030;
+    const K_CONFIG_RVA: u32 = 0x3050;
+    const K_DRIVER_OUT_RVA: u32 = 0x3080;
+    const K_DEVICE_OUT_RVA: u32 = 0x3088;
+    const K_QUEUE_OUT_RVA: u32 = 0x3090;
+    const K_REQUEST_OUT_RVA: u32 = 0x3098;
+    const K_LOCK_OUT_RVA: u32 = 0x30A0;
+    const K_INIT_TMP_RVA: u32 = 0x30A8;
+    const K_DEVOBJ_OUT_RVA: u32 = 0x30B0;
+    const K_OUTBUF_PTR_RVA: u32 = 0x30B8;
+    const K_OUTBUF_LEN_RVA: u32 = 0x30C0;
+    const K_MARKER_RVA: u32 = 0x30C8;
+    const K_IOCTL_MARKER_RVA: u32 = 0x30CC;
+    const K_DELETE_MARKER_RVA: u32 = 0x30D0;
+    const K_QCONFIG_RVA: u32 = 0x3100;
+    const K_IMAGE_BASE: u64 = 0x1_4000_0000;
+
+    const KMDF_IMPORTS: [&str; 17] = [
+        "WdfDriverCreate",
+        "WdfDeviceInitSetDeviceType",
+        "WdfDeviceInitSetIoType",
+        "WdfDeviceInitAssignName",
+        "WdfDeviceCreate",
+        "WdfIoQueueCreate",
+        "WdfRequestCreate",
+        "WdfRequestFormatRequestForIoctl",
+        "WdfRequestRetrieveOutputBuffer",
+        "WdfRequestCompleteWithInformation",
+        "WdfDeviceWdmGetDeviceObject",
+        "WdfObjectGetTypedContext",
+        "WdfObjectDelete",
+        "WdfWaitLockCreate",
+        "WdfWaitLockAcquire",
+        "WdfWaitLockRelease",
+        "WdfRequestRetrieveInputBuffer",
+    ];
+
+    fn build_kmdf_driver(with_queue: bool, missing_symbol: bool, bad_callback: bool) -> Vec<u8> {
+        let mut file = vec![0_u8; 0x1000];
+        file[0..2].copy_from_slice(&0x5A4D_u16.to_le_bytes());
+        put_u32(&mut file, 0x3C, 0x80);
+        file[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let coff = 0x84;
+        put_u16(&mut file, coff, 0x8664);
+        put_u16(&mut file, coff + 2, 3);
+        put_u16(&mut file, coff + 16, 0xF0);
+        put_u16(&mut file, coff + 18, 0x0022);
+        let optional = coff + 20;
+        put_u16(&mut file, optional, 0x020B);
+        put_u32(&mut file, optional + 4, 0x400);
+        put_u32(&mut file, optional + 8, 0xC00);
+        put_u32(&mut file, optional + 16, K_ENTRY_RVA);
+        put_u32(&mut file, optional + 20, K_TEXT_RVA);
+        put_u64(&mut file, optional + 24, K_IMAGE_BASE);
+        put_u32(&mut file, optional + 32, 0x1000);
+        put_u32(&mut file, optional + 36, 0x200);
+        put_u16(&mut file, optional + 48, 6);
+        put_u32(&mut file, optional + 56, 0x4000);
+        put_u32(&mut file, optional + 60, 0x200);
+        put_u16(&mut file, optional + 68, 1);
+        put_u32(&mut file, optional + 108, 16);
+        let directories = optional + 112;
+        // No exports; one import descriptor (the terminator stays zero).
+        put_u32(&mut file, directories + 8, K_IMPORT_RVA);
+        put_u32(&mut file, directories + 12, 0x28);
+
+        let section_table = optional + 0xF0;
+        let mut write_section = |index: usize,
+                                 name: &[u8; 8],
+                                 virtual_size: u32,
+                                 rva: u32,
+                                 raw_size: u32,
+                                 raw: u32,
+                                 characteristics: u32| {
+            let entry = section_table + index * 40;
+            file[entry..entry + 8].copy_from_slice(name);
+            put_u32(&mut file, entry + 8, virtual_size);
+            put_u32(&mut file, entry + 12, rva);
+            put_u32(&mut file, entry + 16, raw_size);
+            put_u32(&mut file, entry + 20, raw);
+            put_u32(&mut file, entry + 36, characteristics);
+        };
+        write_section(
+            0,
+            b".text\0\0\0",
+            0x400,
+            K_TEXT_RVA,
+            0x400,
+            0x200,
+            0x6000_0020,
+        );
+        write_section(
+            1,
+            b".rdata\0\0",
+            0x600,
+            K_RDATA_RVA,
+            0x600,
+            0x600,
+            0x4000_0040,
+        );
+        write_section(
+            2,
+            b".data\0\0\0",
+            0x400,
+            K_DATA_RVA,
+            0x400,
+            0xC00,
+            0xC000_0040,
+        );
+
+        let mut entry = CodeBuilder::default();
+        entry.raw(&[0x49, 0x89, 0xD3]); // mov r11,rdx (RegistryPath)
+        entry.raw(&[0x48, 0x8D, 0x05]);
+        entry.disp(K_CONFIG_RVA);
+        entry.raw(&[0xC7, 0x00]);
+        entry.raw(&0x28_u32.to_le_bytes());
+        if bad_callback {
+            entry.raw(&[0xBA]);
+            entry.raw(&0xDEAD_0000_u32.to_le_bytes());
+        } else {
+            entry.raw(&[0x48, 0x8D, 0x15]);
+            entry.disp(K_EVT_ADD_RVA);
+        }
+        entry.raw(&[0x48, 0x89, 0x50, 0x08]); // config.EvtDriverDeviceAdd
+        entry.raw(&[0x4C, 0x89, 0xDA]); // mov rdx,r11
+        entry.raw(&[0x45, 0x31, 0xC0]); // xor r8d,r8d
+        entry.raw(&[0x4C, 0x8D, 0x0D]);
+        entry.disp(K_CONFIG_RVA);
+        entry.raw(&[0x48, 0x83, 0xEC, 0x28]);
+        entry.raw(&[0x4C, 0x8D, 0x15]);
+        entry.disp(K_DRIVER_OUT_RVA);
+        entry.raw(&[0x4C, 0x89, 0x54, 0x24, 0x20]);
+        entry.call_iat(K_IAT_RVA);
+        entry.raw(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        let entry = entry.finish(K_ENTRY_RVA);
+        assert!(entry.len() <= 0x100);
+        file[0x200..0x200 + entry.len()].copy_from_slice(&entry);
+
+        let mut add = CodeBuilder::default();
+        add.raw(&[0x48, 0x89, 0x15]);
+        add.disp(K_INIT_TMP_RVA);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(K_INIT_TMP_RVA);
+        add.raw(&[0xBA, 0x22, 0, 0, 0]);
+        add.call_iat(K_IAT_RVA + 8);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(K_INIT_TMP_RVA);
+        add.raw(&[0xBA, 1, 0, 0, 0]);
+        add.call_iat(K_IAT_RVA + 16);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(K_INIT_TMP_RVA);
+        add.raw(&[0x48, 0x8D, 0x15]);
+        add.disp(K_US_DEV_RVA);
+        add.call_iat(K_IAT_RVA + 24);
+        add.raw(&[0x48, 0x8D, 0x0D]);
+        add.disp(K_INIT_TMP_RVA);
+        add.raw(&[0x31, 0xD2]);
+        add.raw(&[0x4C, 0x8D, 0x05]);
+        add.disp(K_DEVICE_OUT_RVA);
+        add.call_iat(K_IAT_RVA + 32);
+        add.raw(&[0x85, 0xC0, 0x79, 0x01, 0xC3]);
+        if with_queue {
+            add.raw(&[0x48, 0x8D, 0x05]);
+            add.disp(K_QCONFIG_RVA);
+            add.raw(&[0xC7, 0x00]);
+            add.raw(&0x40_u32.to_le_bytes());
+            add.raw(&[0x48, 0x8D, 0x15]);
+            add.disp(K_EVT_IOCTL_RVA);
+            add.raw(&[0x48, 0x89, 0x50, 0x28]);
+            add.raw(&[0x48, 0x8B, 0x0D]);
+            add.disp(K_DEVICE_OUT_RVA);
+            add.raw(&[0x48, 0x89, 0xC2]);
+            add.raw(&[0x45, 0x31, 0xC0]);
+            add.raw(&[0x4C, 0x8D, 0x0D]);
+            add.disp(K_QUEUE_OUT_RVA);
+            add.call_iat(K_IAT_RVA + 40);
+            add.raw(&[0x85, 0xC0, 0x79, 0x01, 0xC3]);
+        }
+        // Exercise WdfRequestCreate + WdfRequestFormatRequestForIoctl.
+        add.raw(&[0x31, 0xC9, 0x31, 0xD2]);
+        add.raw(&[0x4C, 0x8D, 0x05]);
+        add.disp(K_REQUEST_OUT_RVA);
+        add.call_iat(K_IAT_RVA + 48);
+        add.raw(&[0x85, 0xC0, 0x79, 0x01, 0xC3]);
+        add.raw(&[0x48, 0x83, 0xEC, 0x48]);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(K_REQUEST_OUT_RVA);
+        add.raw(&[0x31, 0xD2]);
+        add.raw(&[0x41, 0xB8]);
+        add.raw(&0x0022_0004_u32.to_le_bytes());
+        add.raw(&[0x45, 0x31, 0xC9]);
+        for displacement in [0x20_u8, 0x28, 0x30, 0x38] {
+            add.raw(&[0x48, 0xC7, 0x44, 0x24, displacement, 0, 0, 0, 0]);
+        }
+        add.call_iat(K_IAT_RVA + 56);
+        add.raw(&[0x48, 0x83, 0xC4, 0x48]);
+        // WdfObjectDelete removes the request (and its CasaK IRP).
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(K_REQUEST_OUT_RVA);
+        add.call_iat(K_IAT_RVA + 96);
+        add.raw(&[0xC7, 0x05]);
+        add.disp_imm32(K_DELETE_MARKER_RVA, 0xCA5A_0012);
+        // Typed device context.
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(K_DEVICE_OUT_RVA);
+        add.raw(&[0xBA, 1, 0, 0, 0]);
+        add.call_iat(K_IAT_RVA + 88);
+        add.raw(&[0x48, 0x85, 0xC0, 0x74, 0x06]);
+        add.raw(&[0xC7, 0x00, 0xDE, 0xC0, 0, 0]);
+        // WdfDeviceWdmGetDeviceObject.
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(K_DEVICE_OUT_RVA);
+        add.call_iat(K_IAT_RVA + 80);
+        add.raw(&[0x48, 0x89, 0x05]);
+        add.disp(K_DEVOBJ_OUT_RVA);
+        // Wait lock create/acquire/release.
+        add.raw(&[0x31, 0xC9]);
+        add.raw(&[0x48, 0x8D, 0x15]);
+        add.disp(K_LOCK_OUT_RVA);
+        add.call_iat(K_IAT_RVA + 104);
+        add.raw(&[0x85, 0xC0, 0x79, 0x01, 0xC3]);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(K_LOCK_OUT_RVA);
+        add.raw(&[0x31, 0xD2]);
+        add.call_iat(K_IAT_RVA + 112);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(K_LOCK_OUT_RVA);
+        add.call_iat(K_IAT_RVA + 120);
+        add.raw(&[0xC7, 0x05]);
+        add.disp_imm32(K_MARKER_RVA, 0xCA5A_0010);
+        add.raw(&[0x31, 0xC0, 0xC3]);
+        let add = add.finish(K_EVT_ADD_RVA);
+        assert!(
+            add.len() <= 0x200,
+            "device-add callback is {} bytes",
+            add.len()
+        );
+        let add_offset = 0x200 + (K_EVT_ADD_RVA - K_TEXT_RVA) as usize;
+        file[add_offset..add_offset + add.len()].copy_from_slice(&add);
+
+        let mut ioctl = CodeBuilder::default();
+        ioctl.raw(&[0x44, 0x8B, 0x54, 0x24, 0x28]); // ioctl code
+        ioctl.raw(&[0x49, 0x89, 0xD3]); // request
+        ioctl.raw(&[0x48, 0x83, 0xEC, 0x28]);
+        ioctl.raw(&[0x4C, 0x89, 0xD9]);
+        ioctl.raw(&[0xBA, 4, 0, 0, 0]);
+        ioctl.raw(&[0x4C, 0x8D, 0x05]);
+        ioctl.disp(K_OUTBUF_PTR_RVA);
+        ioctl.raw(&[0x4C, 0x8D, 0x0D]);
+        ioctl.disp(K_OUTBUF_LEN_RVA);
+        ioctl.call_iat(K_IAT_RVA + 64);
+        ioctl.raw(&[0x85, 0xC0]);
+        ioctl.raw(&[0x0F, 0x88]);
+        ioctl.disp(K_EVT_IOCTL_RVA + 0x60);
+        ioctl.raw(&[0x48, 0x8B, 0x05]);
+        ioctl.disp(K_OUTBUF_PTR_RVA);
+        ioctl.raw(&[0x48, 0x85, 0xC0]);
+        ioctl.raw(&[0x0F, 0x84]);
+        ioctl.disp(K_EVT_IOCTL_RVA + 0x60);
+        ioctl.raw(&[0xC7, 0x00]);
+        ioctl.raw(&0x2146_4457_u32.to_le_bytes()); // "WDF!"
+        ioctl.raw(&[0x44, 0x89, 0x15]);
+        ioctl.disp(K_IOCTL_MARKER_RVA);
+        ioctl.raw(&[0x4C, 0x89, 0xD9]);
+        ioctl.raw(&[0x31, 0xD2]);
+        ioctl.raw(&[0x41, 0xB8]);
+        ioctl.raw(&4_u32.to_le_bytes());
+        ioctl.call_iat(K_IAT_RVA + 72);
+        if ioctl.bytes.len() > 0x60 {
+            panic!("ioctl callback body is {} bytes", ioctl.bytes.len());
+        }
+        ioctl.raw(&vec![0x90; 0x60 - ioctl.bytes.len()]);
+        ioctl.raw(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        let ioctl = ioctl.finish(K_EVT_IOCTL_RVA);
+        assert!(ioctl.len() <= 0x200);
+        let ioctl_offset = 0x200 + (K_EVT_IOCTL_RVA - K_TEXT_RVA) as usize;
+        file[ioctl_offset..ioctl_offset + ioctl.len()].copy_from_slice(&ioctl);
+
+        let data_rva = |address: u32| 0xC00 + (address - K_DATA_RVA) as usize;
+        let config = data_rva(K_CONFIG_RVA);
+        put_u32(&mut file, config, 0x28);
+        let us = data_rva(K_US_DEV_RVA);
+        put_u16(&mut file, us, 30);
+        put_u16(&mut file, us + 2, 32);
+        put_u64(&mut file, us + 8, K_IMAGE_BASE + u64::from(K_WIDE_DEV_RVA));
+        write_wide(
+            &mut file[0xC00..0x1000],
+            (K_WIDE_DEV_RVA - K_DATA_RVA) as usize,
+            "\\Device\\WdfCasa",
+        );
+        put_u32(&mut file, data_rva(K_QCONFIG_RVA), 0x40);
+
+        let rva = |address: u32| 0x600 + (address - K_RDATA_RVA) as usize;
+        let descriptor = rva(K_IMPORT_RVA);
+        put_u32(&mut file, descriptor, K_ILT_RVA);
+        put_u32(&mut file, descriptor + 12, K_DLL_RVA);
+        put_u32(&mut file, descriptor + 16, K_IAT_RVA);
+        file[rva(K_DLL_RVA)..rva(K_DLL_RVA) + 10].copy_from_slice(b"WdfLdr.sys");
+        file[rva(K_DLL_RVA) + 10] = 0;
+        let mut hint_rva = K_HINT_RVA;
+        for (index, symbol) in KMDF_IMPORTS.iter().enumerate() {
+            put_u64(&mut file, rva(K_ILT_RVA) + index * 8, u64::from(hint_rva));
+            put_u64(&mut file, rva(K_IAT_RVA) + index * 8, u64::from(hint_rva));
+            let name = if missing_symbol && index == 0 {
+                "WdfDriverCreatX"
+            } else {
+                symbol
+            };
+            let offset = rva(hint_rva);
+            put_u16(&mut file, offset, 0);
+            file[offset + 2..offset + 2 + name.len()].copy_from_slice(name.as_bytes());
+            file[offset + 2 + name.len()] = 0;
+            hint_rva += (2 + name.len() + 1 + 1) as u32 & !1;
+        }
+        assert!(
+            hint_rva <= 0x2500,
+            "hint/name table overruns rdata: {hint_rva:#x}"
+        );
+        file
+    }
+
+    const F_TEXT_RVA: u32 = 0x1000;
+    const F_ENTRY_RVA: u32 = 0x1000;
+    const F_ADD_RVA: u32 = 0x1180;
+    const F_IOCTL_RVA: u32 = 0x1400;
+    const F_READ_RVA: u32 = 0x1480;
+    const F_WRITE_RVA: u32 = 0x1500;
+    const F_DEFAULT_RVA: u32 = 0x1580;
+    const F_STOP_RVA: u32 = 0x1600;
+    const F_RESUME_RVA: u32 = 0x1640;
+    const F_CANCEL_RVA: u32 = 0x1680;
+    const F_CLEANUP_RVA: u32 = 0x16C0;
+    const F_DESTROY_RVA: u32 = 0x1700;
+    const F_UNLOAD_RVA: u32 = 0x1740;
+    const F_RDATA_RVA: u32 = 0x2000;
+    const F_DATA_RVA: u32 = 0x3000;
+    const F_IMPORT_RVA: u32 = 0x2100;
+    const F_ILT_RVA: u32 = 0x2140;
+    const F_IAT_RVA: u32 = 0x2170;
+    const F_DLL_RVA: u32 = 0x21C0;
+    const F_HINT_RVA: u32 = 0x21E0;
+    const F_IMAGE_BASE: u64 = 0x1_4000_0000;
+
+    const F_CONFIG: u32 = 0x3000;
+    const F_QCONFIG: u32 = 0x3040;
+    const F_Q2CONFIG: u32 = 0x30B0;
+    const F_US_DEVA: u32 = 0x3120;
+    const F_WIDEA: u32 = 0x3140;
+    const F_US_DEVB: u32 = 0x3160;
+    const F_WIDEB: u32 = 0x3180;
+    const F_DEVINIT: u32 = 0x31A0;
+    const F_DRIVER: u32 = 0x31A8;
+    const F_DEV_A: u32 = 0x31B0;
+    const F_DEV_B: u32 = 0x31B8;
+    const F_QUEUE_A: u32 = 0x31C0;
+    const F_QUEUE_B: u32 = 0x31C8;
+    const F_ATTRS: u32 = 0x31D0;
+    const F_TYPEINFO: u32 = 0x3210;
+    const F_OUTBUF_PTR: u32 = 0x3230;
+    const F_OUTBUF_LEN: u32 = 0x3238;
+    const F_REQ_TMP: u32 = 0x3240;
+    const F_IOCTL_MARKER: u32 = 0x3250;
+    const F_IOCTL_COUNT: u32 = 0x3254;
+    const F_READ_COUNT: u32 = 0x3258;
+    const F_WRITE_COUNT: u32 = 0x325C;
+    const F_WRITE_MARKER: u32 = 0x3260;
+    const F_DEFAULT_COUNT: u32 = 0x3264;
+    const F_STOP_COUNT: u32 = 0x3268;
+    const F_RESUME_COUNT: u32 = 0x326C;
+    const F_CANCEL_COUNT: u32 = 0x3270;
+    const F_CLEANUP_COUNT: u32 = 0x3274;
+    const F_DESTROY_COUNT: u32 = 0x3278;
+    const F_ADD_COUNT: u32 = 0x327C;
+    const F_UNLOAD_COUNT: u32 = 0x3280;
+    const F_UNLOAD_MARKER: u32 = 0x3284;
+
+    const F_IAT_DRIVER: u32 = F_IAT_RVA;
+    const F_IAT_ASSIGN: u32 = F_IAT_RVA + 8;
+    const F_IAT_DEVICE: u32 = F_IAT_RVA + 16;
+    const F_IAT_QUEUE: u32 = F_IAT_RVA + 24;
+    const F_IAT_RETRIEVE_OUT: u32 = F_IAT_RVA + 32;
+    const F_IAT_RETRIEVE_IN: u32 = F_IAT_RVA + 40;
+    const F_IAT_COMPLETE_INFO: u32 = F_IAT_RVA + 48;
+    const F_IAT_COMPLETE: u32 = F_IAT_RVA + 56;
+
+    const F_IMPORTS: [&str; 8] = [
+        "WdfDriverCreate",
+        "WdfDeviceInitAssignName",
+        "WdfDeviceCreate",
+        "WdfIoQueueCreate",
+        "WdfRequestRetrieveOutputBuffer",
+        "WdfRequestRetrieveInputBuffer",
+        "WdfRequestCompleteWithInformation",
+        "WdfRequestComplete",
+    ];
+
+    fn build_kmdf_full_driver(dispatch_type: u32, with_cancel_callback: bool) -> Vec<u8> {
+        let mut file = vec![0_u8; 0x1400];
+        file[0..2].copy_from_slice(&0x5A4D_u16.to_le_bytes());
+        put_u32(&mut file, 0x3C, 0x80);
+        file[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let coff = 0x84;
+        put_u16(&mut file, coff, 0x8664);
+        put_u16(&mut file, coff + 2, 3);
+        put_u16(&mut file, coff + 16, 0xF0);
+        put_u16(&mut file, coff + 18, 0x0022);
+        let optional = coff + 20;
+        put_u16(&mut file, optional, 0x020B);
+        put_u32(&mut file, optional + 4, 0x800);
+        put_u32(&mut file, optional + 8, 0x1400);
+        put_u32(&mut file, optional + 16, F_ENTRY_RVA);
+        put_u32(&mut file, optional + 20, F_TEXT_RVA);
+        put_u64(&mut file, optional + 24, F_IMAGE_BASE);
+        put_u32(&mut file, optional + 32, 0x1000);
+        put_u32(&mut file, optional + 36, 0x200);
+        put_u16(&mut file, optional + 48, 6);
+        put_u32(&mut file, optional + 56, 0x4000);
+        put_u32(&mut file, optional + 60, 0x200);
+        put_u16(&mut file, optional + 68, 1);
+        put_u32(&mut file, optional + 108, 16);
+        let directories = optional + 112;
+        put_u32(&mut file, directories + 8, F_IMPORT_RVA);
+        put_u32(&mut file, directories + 12, 0x28);
+
+        let section_table = optional + 0xF0;
+        let mut write_section = |index: usize,
+                                 name: &[u8; 8],
+                                 virtual_size: u32,
+                                 rva: u32,
+                                 raw_size: u32,
+                                 raw: u32,
+                                 characteristics: u32| {
+            let entry = section_table + index * 40;
+            file[entry..entry + 8].copy_from_slice(name);
+            put_u32(&mut file, entry + 8, virtual_size);
+            put_u32(&mut file, entry + 12, rva);
+            put_u32(&mut file, entry + 16, raw_size);
+            put_u32(&mut file, entry + 20, raw);
+            put_u32(&mut file, entry + 36, characteristics);
+        };
+        write_section(
+            0,
+            b".text\0\0\0",
+            0x800,
+            F_TEXT_RVA,
+            0x800,
+            0x200,
+            0x6000_0020,
+        );
+        write_section(
+            1,
+            b".rdata\0\0",
+            0x600,
+            F_RDATA_RVA,
+            0x600,
+            0xA00,
+            0x4000_0040,
+        );
+        write_section(
+            2,
+            b".data\0\0\0",
+            0x400,
+            F_DATA_RVA,
+            0x400,
+            0x1000,
+            0xC000_0040,
+        );
+
+        let mut entry = CodeBuilder::default();
+        entry.raw(&[0x49, 0x89, 0xCA]); // mov r10,rcx
+        entry.raw(&[0x49, 0x89, 0xD3]); // mov r11,rdx
+        entry.raw(&[0x48, 0x8D, 0x05]);
+        entry.disp(F_CONFIG);
+        entry.raw(&[0xC7, 0x00]);
+        entry.raw(&0x20_u32.to_le_bytes());
+        entry.raw(&[0x48, 0x8D, 0x0D]);
+        entry.disp(F_ADD_RVA);
+        entry.raw(&[0x48, 0x89, 0x48, 0x08]);
+        entry.raw(&[0x48, 0x8D, 0x0D]);
+        entry.disp(F_UNLOAD_RVA);
+        entry.raw(&[0x48, 0x89, 0x48, 0x10]);
+        entry.raw(&[0xC7, 0x40, 0x18]);
+        entry.raw(&0x2146_4457_u32.to_le_bytes());
+        entry.raw(&[0x4C, 0x89, 0xD1]); // rcx = DriverObject
+        entry.raw(&[0x4C, 0x89, 0xDA]); // rdx = RegistryPath
+        entry.raw(&[0x45, 0x31, 0xC0]); // xor r8d,r8d
+        entry.raw(&[0x4C, 0x8D, 0x0D]);
+        entry.disp(F_CONFIG);
+        entry.raw(&[0x48, 0x83, 0xEC, 0x28]);
+        entry.raw(&[0x48, 0x8D, 0x05]);
+        entry.disp(F_DRIVER);
+        entry.raw(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+        entry.call_iat(F_IAT_DRIVER);
+        entry.raw(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        let entry = entry.finish(F_ENTRY_RVA);
+        assert!(entry.len() <= 0x180);
+        copy_code(&mut file, F_ENTRY_RVA, &entry);
+
+        let mut add = CodeBuilder::default();
+        add.raw(&[0x48, 0x89, 0x15]); // device init (second argument)
+        add.disp(F_DEVINIT);
+        // WDF_OBJECT_ATTRIBUTES: Size=0x38, cleanup/destroy, context 0x30.
+        add.raw(&[0x48, 0x8D, 0x3D]);
+        add.disp(F_ATTRS);
+        add.raw(&[0xC7, 0x07]);
+        add.raw(&0x38_u32.to_le_bytes());
+        add.raw(&[0x48, 0x8D, 0x05]);
+        add.disp(F_CLEANUP_RVA);
+        add.raw(&[0x48, 0x89, 0x47, 0x08]);
+        add.raw(&[0x48, 0x8D, 0x05]);
+        add.disp(F_DESTROY_RVA);
+        add.raw(&[0x48, 0x89, 0x47, 0x10]);
+        add.raw(&[0x48, 0xC7, 0x47, 0x18, 0, 0, 0, 0]);
+        add.raw(&[0x48, 0xC7, 0x47, 0x20, 0, 0, 0, 0]);
+        add.raw(&[0x48, 0xC7, 0x47, 0x28, 0x30, 0, 0, 0]);
+        add.raw(&[0x48, 0x8D, 0x05]);
+        add.disp(F_TYPEINFO);
+        add.raw(&[0x48, 0x89, 0x47, 0x30]);
+        add.raw(&[0x48, 0x8D, 0x05]);
+        add.disp(F_TYPEINFO);
+        add.raw(&[0xC7, 0x00, 0x18, 0, 0, 0]);
+        add.raw(&[0x48, 0xC7, 0x40, 0x10, 0x30, 0, 0, 0]);
+        add.raw(&[0x48, 0x83, 0xEC, 0x28]);
+
+        // Device A.
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(F_DEVINIT);
+        add.raw(&[0x48, 0x8D, 0x15]);
+        add.disp(F_US_DEVA);
+        add.call_iat(F_IAT_ASSIGN);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(F_DEVINIT);
+        add.raw(&[0x48, 0x8D, 0x15]);
+        add.disp(F_ATTRS);
+        add.raw(&[0x4C, 0x8D, 0x05]);
+        add.disp(F_DEV_A);
+        add.call_iat(F_IAT_DEVICE);
+
+        // Device B reuses the init handle after renaming it.
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(F_DEVINIT);
+        add.raw(&[0x48, 0x8D, 0x15]);
+        add.disp(F_US_DEVB);
+        add.call_iat(F_IAT_ASSIGN);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(F_DEVINIT);
+        add.raw(&[0x48, 0x8D, 0x15]);
+        add.disp(F_ATTRS);
+        add.raw(&[0x4C, 0x8D, 0x05]);
+        add.disp(F_DEV_B);
+        add.call_iat(F_IAT_DEVICE);
+
+        for (config_rva, default_queue, queue_type, device_out, queue_out) in [
+            (F_QCONFIG, 1u8, dispatch_type, F_DEV_A, F_QUEUE_A),
+            (F_Q2CONFIG, 0u8, 1u32, F_DEV_B, F_QUEUE_B),
+        ] {
+            add.raw(&[0x48, 0x8D, 0x05]);
+            add.disp(config_rva);
+            add.raw(&[0xC7, 0x00]);
+            add.raw(&0x50_u32.to_le_bytes());
+            add.raw(&[0xC7, 0x40, 0x04]);
+            add.raw(&queue_type.to_le_bytes());
+            add.raw(&[0xC7, 0x40, 0x08, 0, 0, 0, 0]);
+            add.raw(&[0xC6, 0x40, 0x0C, 0]);
+            add.raw(&[0xC6, 0x40, 0x0D, default_queue]);
+            add.raw(&[0x48, 0x8D, 0x0D]);
+            add.disp(F_DEFAULT_RVA);
+            add.raw(&[0x48, 0x89, 0x48, 0x10]);
+            add.raw(&[0x48, 0x8D, 0x0D]);
+            add.disp(F_READ_RVA);
+            add.raw(&[0x48, 0x89, 0x48, 0x18]);
+            add.raw(&[0x48, 0x8D, 0x0D]);
+            add.disp(F_WRITE_RVA);
+            add.raw(&[0x48, 0x89, 0x48, 0x20]);
+            add.raw(&[0x48, 0x8D, 0x0D]);
+            add.disp(F_IOCTL_RVA);
+            add.raw(&[0x48, 0x89, 0x48, 0x28]);
+            add.raw(&[0x48, 0xC7, 0x40, 0x30, 0, 0, 0, 0]);
+            add.raw(&[0x48, 0x8D, 0x0D]);
+            add.disp(F_STOP_RVA);
+            add.raw(&[0x48, 0x89, 0x48, 0x38]);
+            add.raw(&[0x48, 0x8D, 0x0D]);
+            add.disp(F_RESUME_RVA);
+            add.raw(&[0x48, 0x89, 0x48, 0x40]);
+            if with_cancel_callback {
+                add.raw(&[0x48, 0x8D, 0x0D]);
+                add.disp(F_CANCEL_RVA);
+                add.raw(&[0x48, 0x89, 0x48, 0x48]);
+            } else {
+                add.raw(&[0x48, 0xC7, 0x40, 0x48, 0, 0, 0, 0]);
+            }
+            add.raw(&[0x48, 0x8B, 0x0D]);
+            add.disp(device_out);
+            add.raw(&[0x48, 0x8D, 0x15]);
+            add.disp(config_rva);
+            add.raw(&[0x4C, 0x8D, 0x05]);
+            add.disp(F_ATTRS);
+            add.raw(&[0x4C, 0x8D, 0x0D]);
+            add.disp(queue_out);
+            add.call_iat(F_IAT_QUEUE);
+        }
+        add.raw(&[0x48, 0x83, 0xC4, 0x28]);
+        add.inc_dword(F_ADD_COUNT);
+        add.raw(&[0x31, 0xC0, 0xC2, 0x08, 0x00]);
+        let add = add.finish(F_ADD_RVA);
+        assert!(add.len() <= 0x280, "device add is {} bytes", add.len());
+        copy_code(&mut file, F_ADD_RVA, &add);
+
+        let mut ioctl = CodeBuilder::default();
+        ioctl.raw(&[0x48, 0x89, 0x15]);
+        ioctl.disp(F_REQ_TMP);
+        ioctl.raw(&[0x44, 0x8B, 0x54, 0x24, 0x28]);
+        ioctl.raw(&[0x44, 0x89, 0x15]);
+        ioctl.disp(F_IOCTL_MARKER);
+        ioctl.inc_dword(F_IOCTL_COUNT);
+        ioctl.raw(&[0x48, 0x83, 0xEC, 0x28]);
+        ioctl.raw(&[0x48, 0x8B, 0x0D]);
+        ioctl.disp(F_REQ_TMP);
+        ioctl.raw(&[0xBA, 4, 0, 0, 0]);
+        ioctl.raw(&[0x4C, 0x8D, 0x05]);
+        ioctl.disp(F_OUTBUF_PTR);
+        ioctl.raw(&[0x4C, 0x8D, 0x0D]);
+        ioctl.disp(F_OUTBUF_LEN);
+        ioctl.call_iat(F_IAT_RETRIEVE_OUT);
+        ioctl.raw(&[0x48, 0x8B, 0x05]);
+        ioctl.disp(F_OUTBUF_PTR);
+        ioctl.raw(&[0xC7, 0x00]);
+        ioctl.raw(&0x46444D4B_u32.to_le_bytes()); // "KMDF"
+        ioctl.raw(&[0x48, 0x8B, 0x0D]);
+        ioctl.disp(F_REQ_TMP);
+        ioctl.raw(&[0x31, 0xD2]);
+        ioctl.raw(&[0x41, 0xB8, 4, 0, 0, 0]);
+        ioctl.call_iat(F_IAT_COMPLETE_INFO);
+        ioctl.raw(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        let ioctl = ioctl.finish(F_IOCTL_RVA);
+        assert!(ioctl.len() <= 0x80);
+        copy_code(&mut file, F_IOCTL_RVA, &ioctl);
+
+        let mut read = CodeBuilder::default();
+        read.raw(&[0x48, 0x89, 0x15]);
+        read.disp(F_REQ_TMP);
+        read.inc_dword(F_READ_COUNT);
+        read.raw(&[0x48, 0x83, 0xEC, 0x28]);
+        read.raw(&[0x48, 0x8B, 0x0D]);
+        read.disp(F_REQ_TMP);
+        read.raw(&[0xBA, 4, 0, 0, 0]);
+        read.raw(&[0x4C, 0x8D, 0x05]);
+        read.disp(F_OUTBUF_PTR);
+        read.raw(&[0x4C, 0x8D, 0x0D]);
+        read.disp(F_OUTBUF_LEN);
+        read.call_iat(F_IAT_RETRIEVE_OUT);
+        read.raw(&[0x48, 0x8B, 0x05]);
+        read.disp(F_OUTBUF_PTR);
+        read.raw(&[0xC7, 0x00]);
+        read.raw(&0x31304452_u32.to_le_bytes()); // "RD01"
+        read.raw(&[0x48, 0x8B, 0x0D]);
+        read.disp(F_REQ_TMP);
+        read.raw(&[0x31, 0xD2]);
+        read.raw(&[0x41, 0xB8, 4, 0, 0, 0]);
+        read.call_iat(F_IAT_COMPLETE_INFO);
+        read.raw(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        let read = read.finish(F_READ_RVA);
+        assert!(read.len() <= 0x80);
+        copy_code(&mut file, F_READ_RVA, &read);
+
+        let mut write = CodeBuilder::default();
+        write.raw(&[0x48, 0x89, 0x15]);
+        write.disp(F_REQ_TMP);
+        write.inc_dword(F_WRITE_COUNT);
+        write.raw(&[0x48, 0x83, 0xEC, 0x28]);
+        write.raw(&[0x48, 0x8B, 0x0D]);
+        write.disp(F_REQ_TMP);
+        write.raw(&[0x31, 0xD2]);
+        write.raw(&[0x4C, 0x8D, 0x05]);
+        write.disp(F_OUTBUF_PTR);
+        write.raw(&[0x4C, 0x8D, 0x0D]);
+        write.disp(F_OUTBUF_LEN);
+        write.call_iat(F_IAT_RETRIEVE_IN);
+        write.raw(&[0x48, 0x8B, 0x05]);
+        write.disp(F_OUTBUF_PTR);
+        write.raw(&[0x8B, 0x08]);
+        write.raw(&[0x89, 0x0D]);
+        write.disp(F_WRITE_MARKER);
+        write.raw(&[0x48, 0x8B, 0x0D]);
+        write.disp(F_REQ_TMP);
+        write.raw(&[0x31, 0xD2]);
+        write.raw(&[0x41, 0xB8, 4, 0, 0, 0]);
+        write.call_iat(F_IAT_COMPLETE_INFO);
+        write.raw(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        let write = write.finish(F_WRITE_RVA);
+        assert!(write.len() <= 0x80);
+        copy_code(&mut file, F_WRITE_RVA, &write);
+
+        let mut default = CodeBuilder::default();
+        default.raw(&[0x48, 0x89, 0x15]);
+        default.disp(F_REQ_TMP);
+        default.inc_dword(F_DEFAULT_COUNT);
+        default.raw(&[0x48, 0x83, 0xEC, 0x28]);
+        default.raw(&[0x48, 0x8B, 0x0D]);
+        default.disp(F_REQ_TMP);
+        default.raw(&[0x31, 0xD2, 0x45, 0x31, 0xC0]);
+        default.call_iat(F_IAT_COMPLETE);
+        default.raw(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        let default = default.finish(F_DEFAULT_RVA);
+        copy_code(&mut file, F_DEFAULT_RVA, &default);
+
+        for (rva, marker) in [
+            (F_STOP_RVA, F_STOP_COUNT),
+            (F_RESUME_RVA, F_RESUME_COUNT),
+            (F_CLEANUP_RVA, F_CLEANUP_COUNT),
+            (F_DESTROY_RVA, F_DESTROY_COUNT),
+        ] {
+            let mut callback = CodeBuilder::default();
+            callback.inc_dword(marker);
+            callback.raw(&[0xC3]);
+            let callback = callback.finish(rva);
+            copy_code(&mut file, rva, &callback);
+        }
+
+        let mut cancel = CodeBuilder::default();
+        cancel.raw(&[0x48, 0x89, 0x15]);
+        cancel.disp(F_REQ_TMP);
+        cancel.inc_dword(F_CANCEL_COUNT);
+        cancel.raw(&[0x48, 0x8B, 0x0D]);
+        cancel.disp(F_REQ_TMP);
+        cancel.raw(&[0xBA]);
+        cancel.raw(&STATUS_CANCELLED_u32());
+        cancel.call_iat(F_IAT_COMPLETE);
+        cancel.raw(&[0xC3]);
+        let cancel = cancel.finish(F_CANCEL_RVA);
+        copy_code(&mut file, F_CANCEL_RVA, &cancel);
+
+        let mut unload = CodeBuilder::default();
+        unload.inc_dword(F_UNLOAD_COUNT);
+        unload.raw(&[0xC7, 0x05]);
+        unload.disp_imm32(F_UNLOAD_MARKER, 0xCA5A_0200);
+        unload.raw(&[0xC3]);
+        let unload = unload.finish(F_UNLOAD_RVA);
+        copy_code(&mut file, F_UNLOAD_RVA, &unload);
+
+        let data_rva = |address: u32| 0x1000 + (address - F_DATA_RVA) as usize;
+        let config = data_rva(F_CONFIG);
+        put_u32(&mut file, config, 0x20);
+        put_u64(&mut file, config + 8, F_IMAGE_BASE + u64::from(F_ADD_RVA));
+        put_u64(
+            &mut file,
+            config + 0x10,
+            F_IMAGE_BASE + u64::from(F_UNLOAD_RVA),
+        );
+        put_u32(&mut file, config + 0x18, 0x2146_4457);
+        put_u32(&mut file, config + 0x1C, 0);
+        for (us, wide, name) in [
+            (F_US_DEVA, F_WIDEA, "\\Device\\WdfA"),
+            (F_US_DEVB, F_WIDEB, "\\Device\\WdfB"),
+        ] {
+            let units = name.encode_utf16().count();
+            let us_offset = data_rva(us);
+            put_u16(&mut file, us_offset, (units * 2) as u16);
+            put_u16(&mut file, us_offset + 2, ((units + 1) * 2) as u16);
+            put_u64(&mut file, us_offset + 8, F_IMAGE_BASE + u64::from(wide));
+            write_wide(
+                &mut file[0x1000..0x1400],
+                (wide - F_DATA_RVA) as usize,
+                name,
+            );
+        }
+        let attrs = data_rva(F_ATTRS);
+        put_u32(&mut file, attrs, 0x38);
+        put_u64(
+            &mut file,
+            attrs + 8,
+            F_IMAGE_BASE + u64::from(F_CLEANUP_RVA),
+        );
+        put_u64(
+            &mut file,
+            attrs + 0x10,
+            F_IMAGE_BASE + u64::from(F_DESTROY_RVA),
+        );
+        put_u64(&mut file, attrs + 0x28, 0x30);
+        put_u64(
+            &mut file,
+            attrs + 0x30,
+            F_IMAGE_BASE + u64::from(F_TYPEINFO),
+        );
+        let type_info = data_rva(F_TYPEINFO);
+        put_u32(&mut file, type_info, 0x18);
+        put_u64(&mut file, type_info + 0x10, 0x30);
+
+        let rva = |address: u32| 0xA00 + (address - F_RDATA_RVA) as usize;
+        let descriptor = rva(F_IMPORT_RVA);
+        put_u32(&mut file, descriptor, F_ILT_RVA);
+        put_u32(&mut file, descriptor + 12, F_DLL_RVA);
+        put_u32(&mut file, descriptor + 16, F_IAT_RVA);
+        file[rva(F_DLL_RVA)..rva(F_DLL_RVA) + 10].copy_from_slice(b"WdfLdr.sys");
+        file[rva(F_DLL_RVA) + 10] = 0;
+        let mut hint_rva = F_HINT_RVA;
+        for (index, symbol) in F_IMPORTS.iter().enumerate() {
+            put_u64(&mut file, rva(F_ILT_RVA) + index * 8, u64::from(hint_rva));
+            put_u64(&mut file, rva(F_IAT_RVA) + index * 8, u64::from(hint_rva));
+            let offset = rva(hint_rva);
+            put_u16(&mut file, offset, 0);
+            file[offset + 2..offset + 2 + symbol.len()].copy_from_slice(symbol.as_bytes());
+            file[offset + 2 + symbol.len()] = 0;
+            hint_rva += (2 + symbol.len() + 1 + 1) as u32 & !1;
+        }
+        assert!(hint_rva <= 0x2500, "hint table overruns: {hint_rva:#x}");
+        file
+    }
+
+    const X86K_ENTRY_RVA: u32 = 0x1000;
+    const X86K_ADD_RVA: u32 = 0x1100;
+    const X86K_UNLOAD_RVA: u32 = 0x1180;
+    const X86K_TEXT_RVA: u32 = 0x1000;
+    const X86K_RDATA_RVA: u32 = 0x2000;
+    const X86K_DATA_RVA: u32 = 0x3000;
+    const X86K_IMPORT_RVA: u32 = 0x2100;
+    const X86K_ILT_RVA: u32 = 0x2140;
+    const X86K_IAT_RVA: u32 = 0x2160;
+    const X86K_DLL_RVA: u32 = 0x2180;
+    const X86K_HINT_RVA: u32 = 0x21A0;
+    const X86K_IMAGE_BASE: u32 = 0x1000_0000;
+    const X86K_CONFIG: u32 = 0x3000;
+    const X86K_DRIVER_PTR: u32 = 0x3018;
+    const X86K_REG_PATH: u32 = 0x301C;
+    const X86K_DRIVER_OUT: u32 = 0x3020;
+    const X86K_DEVINIT: u32 = 0x3024;
+    const X86K_DEVICE_OUT: u32 = 0x3028;
+    const X86K_US_DEV: u32 = 0x3030;
+    const X86K_WIDE_DEV: u32 = 0x3050;
+    const X86K_ADD_MARKER: u32 = 0x3070;
+    const X86K_UNLOAD_MARKER: u32 = 0x3074;
+    const X86K_IAT_DRIVER: u32 = X86K_IAT_RVA;
+    const X86K_IAT_ASSIGN: u32 = X86K_IAT_RVA + 4;
+    const X86K_IAT_DEVICE: u32 = X86K_IAT_RVA + 8;
+    const X86K_IMPORTS: [&str; 3] = [
+        "WdfDriverCreate",
+        "WdfDeviceInitAssignName",
+        "WdfDeviceCreate",
+    ];
+
+    fn build_kmdf_driver_pe32() -> Vec<u8> {
+        let mut file = vec![0_u8; 0xC00];
+        file[0..2].copy_from_slice(&0x5A4D_u16.to_le_bytes());
+        put_u32(&mut file, 0x3C, 0x80);
+        file[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let coff = 0x84;
+        put_u16(&mut file, coff, 0x014C);
+        put_u16(&mut file, coff + 2, 3);
+        put_u16(&mut file, coff + 16, 0xE0);
+        put_u16(&mut file, coff + 18, 0x0102);
+        let optional = coff + 20;
+        put_u16(&mut file, optional, 0x010B);
+        put_u32(&mut file, optional + 4, 0x400);
+        put_u32(&mut file, optional + 8, 0xC00);
+        put_u32(&mut file, optional + 16, X86K_ENTRY_RVA);
+        put_u32(&mut file, optional + 20, X86K_TEXT_RVA);
+        put_u32(&mut file, optional + 24, X86K_RDATA_RVA);
+        put_u32(&mut file, optional + 28, X86K_IMAGE_BASE);
+        put_u32(&mut file, optional + 32, 0x1000);
+        put_u32(&mut file, optional + 36, 0x200);
+        put_u16(&mut file, optional + 48, 6);
+        put_u32(&mut file, optional + 56, 0x4000);
+        put_u32(&mut file, optional + 60, 0x200);
+        put_u16(&mut file, optional + 68, 1);
+        put_u32(&mut file, optional + 92, 16);
+        let directories = optional + 96;
+        put_u32(&mut file, directories + 8, X86K_IMPORT_RVA);
+        put_u32(&mut file, directories + 12, 0x28);
+
+        let section_table = optional + 0xE0;
+        let mut write_section = |index: usize,
+                                 name: &[u8; 8],
+                                 virtual_size: u32,
+                                 rva: u32,
+                                 raw_size: u32,
+                                 raw: u32,
+                                 characteristics: u32| {
+            let entry = section_table + index * 40;
+            file[entry..entry + 8].copy_from_slice(name);
+            put_u32(&mut file, entry + 8, virtual_size);
+            put_u32(&mut file, entry + 12, rva);
+            put_u32(&mut file, entry + 16, raw_size);
+            put_u32(&mut file, entry + 20, raw);
+            put_u32(&mut file, entry + 36, characteristics);
+        };
+        write_section(
+            0,
+            b".text\0\0\0",
+            0x400,
+            X86K_TEXT_RVA,
+            0x400,
+            0x200,
+            0x6000_0020,
+        );
+        write_section(
+            1,
+            b".rdata\0\0",
+            0x400,
+            X86K_RDATA_RVA,
+            0x400,
+            0x600,
+            0x4000_0040,
+        );
+        write_section(
+            2,
+            b".data\0\0\0",
+            0x200,
+            X86K_DATA_RVA,
+            0x200,
+            0xA00,
+            0xC000_0040,
+        );
+
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&[0x8B, 0x44, 0x24, 0x04]); // DriverObject
+        entry.extend_from_slice(&[0xA3]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_DRIVER_PTR).to_le_bytes());
+        entry.extend_from_slice(&[0x8B, 0x44, 0x24, 0x08]); // RegistryPath
+        entry.extend_from_slice(&[0xA3]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_REG_PATH).to_le_bytes());
+        entry.extend_from_slice(&[0xC7, 0x05]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_CONFIG).to_le_bytes());
+        entry.extend_from_slice(&0x14_u32.to_le_bytes());
+        entry.extend_from_slice(&[0xC7, 0x05]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_CONFIG + 4).to_le_bytes());
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_ADD_RVA).to_le_bytes());
+        entry.extend_from_slice(&[0xC7, 0x05]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_CONFIG + 8).to_le_bytes());
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_UNLOAD_RVA).to_le_bytes());
+        entry.extend_from_slice(&[0xC7, 0x05]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_CONFIG + 0xC).to_le_bytes());
+        entry.extend_from_slice(&0x2146_4457_u32.to_le_bytes());
+        entry.extend_from_slice(&[0xC7, 0x05]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_CONFIG + 0x10).to_le_bytes());
+        entry.extend_from_slice(&0_u32.to_le_bytes());
+        entry.extend_from_slice(&[0x68]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_DRIVER_OUT).to_le_bytes());
+        entry.extend_from_slice(&[0x68]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_CONFIG).to_le_bytes());
+        entry.extend_from_slice(&[0x6A, 0x00]);
+        entry.extend_from_slice(&[0xFF, 0x35]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_REG_PATH).to_le_bytes());
+        entry.extend_from_slice(&[0xFF, 0x35]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_DRIVER_PTR).to_le_bytes());
+        entry.extend_from_slice(&[0xFF, 0x15]);
+        entry.extend_from_slice(&(X86K_IMAGE_BASE + X86K_IAT_DRIVER).to_le_bytes());
+        entry.extend_from_slice(&[0xC2, 0x08, 0x00]);
+        assert!(entry.len() <= 0x100);
+        file[0x200..0x200 + entry.len()].copy_from_slice(&entry);
+
+        let mut add = Vec::new();
+        add.extend_from_slice(&[0x8B, 0x44, 0x24, 0x08]); // DeviceInit
+        add.extend_from_slice(&[0xA3]);
+        add.extend_from_slice(&(X86K_IMAGE_BASE + X86K_DEVINIT).to_le_bytes());
+        add.extend_from_slice(&[0x68]);
+        add.extend_from_slice(&(X86K_IMAGE_BASE + X86K_US_DEV).to_le_bytes());
+        add.extend_from_slice(&[0xFF, 0x35]);
+        add.extend_from_slice(&(X86K_IMAGE_BASE + X86K_DEVINIT).to_le_bytes());
+        add.extend_from_slice(&[0xFF, 0x15]);
+        add.extend_from_slice(&(X86K_IMAGE_BASE + X86K_IAT_ASSIGN).to_le_bytes());
+        add.extend_from_slice(&[0x68]);
+        add.extend_from_slice(&(X86K_IMAGE_BASE + X86K_DEVICE_OUT).to_le_bytes());
+        add.extend_from_slice(&[0x6A, 0x00]);
+        add.extend_from_slice(&[0x68]);
+        add.extend_from_slice(&(X86K_IMAGE_BASE + X86K_DEVINIT).to_le_bytes());
+        add.extend_from_slice(&[0xFF, 0x15]);
+        add.extend_from_slice(&(X86K_IMAGE_BASE + X86K_IAT_DEVICE).to_le_bytes());
+        add.extend_from_slice(&[0xC7, 0x05]);
+        add.extend_from_slice(&(X86K_IMAGE_BASE + X86K_ADD_MARKER).to_le_bytes());
+        add.extend_from_slice(&0xCA5A_0031_u32.to_le_bytes());
+        add.extend_from_slice(&[0x31, 0xC0, 0xC2, 0x08, 0x00]);
+        assert!(add.len() <= 0x80);
+        file[0x300..0x300 + add.len()].copy_from_slice(&add);
+
+        let mut unload = Vec::new();
+        unload.extend_from_slice(&[0xC7, 0x05]);
+        unload.extend_from_slice(&(X86K_IMAGE_BASE + X86K_UNLOAD_MARKER).to_le_bytes());
+        unload.extend_from_slice(&0xCA5A_0032_u32.to_le_bytes());
+        unload.extend_from_slice(&[0xC2, 0x04, 0x00]);
+        file[0x380..0x380 + unload.len()].copy_from_slice(&unload);
+
+        let rva = |address: u32| 0x600 + (address - X86K_RDATA_RVA) as usize;
+        let descriptor = rva(X86K_IMPORT_RVA);
+        put_u32(&mut file, descriptor, X86K_ILT_RVA);
+        put_u32(&mut file, descriptor + 12, X86K_DLL_RVA);
+        put_u32(&mut file, descriptor + 16, X86K_IAT_RVA);
+        file[rva(X86K_DLL_RVA)..rva(X86K_DLL_RVA) + 10].copy_from_slice(b"WdfLdr.sys");
+        file[rva(X86K_DLL_RVA) + 10] = 0;
+        let mut hint_rva = X86K_HINT_RVA;
+        for (index, symbol) in X86K_IMPORTS.iter().enumerate() {
+            put_u32(&mut file, rva(X86K_ILT_RVA) + index * 4, hint_rva);
+            put_u32(&mut file, rva(X86K_IAT_RVA) + index * 4, hint_rva);
+            let offset = rva(hint_rva);
+            put_u16(&mut file, offset, 0);
+            file[offset + 2..offset + 2 + symbol.len()].copy_from_slice(symbol.as_bytes());
+            file[offset + 2 + symbol.len()] = 0;
+            hint_rva += (2 + symbol.len() + 1 + 1) as u32 & !1;
+        }
+        let data = 0xA00;
+        put_u32(&mut file, data, 0x14);
+        put_u32(&mut file, data + 4, X86K_IMAGE_BASE + X86K_ADD_RVA);
+        put_u32(&mut file, data + 8, X86K_IMAGE_BASE + X86K_UNLOAD_RVA);
+        put_u32(&mut file, data + 0xC, 0x2146_4457);
+        put_u32(&mut file, data + 0x10, 0);
+        let us = 0xA00 + (X86K_US_DEV - X86K_DATA_RVA) as usize;
+        put_u16(&mut file, us, 26);
+        put_u16(&mut file, us + 2, 28);
+        put_u32(&mut file, us + 4, X86K_IMAGE_BASE + X86K_WIDE_DEV);
+        write_wide(
+            &mut file[0xA00..0xC00],
+            (X86K_WIDE_DEV - X86K_DATA_RVA) as usize,
+            "\\Device\\Wdf32",
+        );
+        file
+    }
+
+    fn copy_code(file: &mut [u8], rva: u32, code: &[u8]) {
+        let offset = 0x200 + (rva - F_TEXT_RVA) as usize;
+        file[offset..offset + code.len()].copy_from_slice(code);
+    }
+
+    fn STATUS_CANCELLED_u32() -> [u8; 4] {
+        (STATUS_CANCELLED as u32).to_le_bytes()
+    }
+
     fn write_wide(rdata: &mut [u8], offset: usize, text: &str) {
         for (index, unit) in text.encode_utf16().chain([0]).enumerate() {
             rdata[offset + index * 2..offset + index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
@@ -3158,6 +7146,7 @@ mod tests {
         .expect("create ge");
         configure(&mut ge);
         let runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        reset_runtime_registry(&runtime);
         (runtime, directory)
     }
 
@@ -3196,11 +7185,6 @@ mod tests {
         header
     }
 
-    /// Allocate a host thunk exactly like `alloc_host_thunk` and drive it
-    /// through the real guest callback dispatcher on an x64 guest state.
-    /// Attach the canonical VM and commit the scratch stack plus the
-    /// UNICODE_STRING/argument scratch pages so guest accesses validate even
-    /// before (and after) an island attaches its own mappings.
     fn prepare_guest_memory(runtime: &mut PeHostRuntime, memory: &mut MemoryImage) {
         let vm = runtime.win32.address_space_mut();
         vm.register(STACK_BASE, STACK_SIZE, VmRegionKind::Stack);
@@ -3232,6 +7216,7 @@ mod tests {
         let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
         runtime.guest_arch = GuestArch::X86;
         runtime.next_thunk_address = 0x7100_0000;
+        reset_runtime_registry(&runtime);
         (runtime, directory)
     }
 
@@ -3309,12 +7294,28 @@ mod tests {
         thunk: HostThunk,
         args: &[u64],
     ) -> i32 {
+        dispatch_nt_thunk_on_thread(
+            runtime,
+            memory,
+            thunk,
+            args,
+            STACK_BASE + STACK_SIZE - 0x100,
+        )
+    }
+
+    fn dispatch_nt_thunk_on_thread(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thunk: HostThunk,
+        args: &[u64],
+        stack_pointer: u64,
+    ) -> i32 {
         let thunk_address = runtime.next_thunk_address;
         runtime.next_thunk_address += 0x10;
         runtime.host_thunks.insert(thunk_address, thunk);
         memory.map_bytes(STACK_BASE, &vec![0_u8; STACK_SIZE as usize]);
         let mut cpu = CpuState::new(runtime.guest_arch);
-        cpu.set(Register::Rsp, STACK_BASE + STACK_SIZE - 0x100);
+        cpu.set(Register::Rsp, stack_pointer);
         runtime
             .execute_guest_callback(&mut cpu, memory, thunk_address, args, "NtDispatch")
             .expect("guest thunk dispatch") as u32 as i32
@@ -4248,6 +8249,7037 @@ mod tests {
                 STATUS_OBJECT_NAME_NOT_FOUND,
                 "SERVICE_DISABLED services are not started"
             );
+        });
+    }
+
+    #[test]
+    fn kmdf_device_add_and_ioctl_complete_through_guest_callbacks() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdf",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdf",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS,
+                "WdfDriverCreate must drive EvtDriverDeviceAdd"
+            );
+            let image_base = with_loaded_driver(&runtime, "CasaKmdf", |island| {
+                assert_eq!(island.status(), STATUS_SUCCESS);
+                assert_eq!(island.device_count(), 1);
+                assert_eq!(island.casak_device_names(), vec!["WdfCasa"]);
+                let state = island.inner.borrow();
+                assert_ne!(state.kmdf.driver_handle, 0, "real WDFDRIVER object");
+                assert_eq!(state.kmdf.devices.len(), 1, "real WDFDEVICE object");
+                assert_eq!(state.kmdf.queues.len(), 1, "real WDFQUEUE object");
+                assert_eq!(state.kmdf.wait_locks.len(), 1, "real wait lock");
+                assert!(
+                    state.kmdf.requests.is_empty(),
+                    "WdfRequestCreate built a real CasaK IRP that WdfObjectDelete removed"
+                );
+                let device = state.kmdf.devices.values().next().expect("device");
+                assert_eq!(
+                    memory.read_u32(device.context_guest).unwrap(),
+                    0xC0DE,
+                    "WdfObjectGetTypedContext returned writable context storage"
+                );
+                drop(state);
+                assert_eq!(
+                    memory
+                        .read_u32(island.image_base() + u64::from(K_MARKER_RVA))
+                        .unwrap(),
+                    0xCA5A_0010,
+                    "the guest EvtDriverDeviceAdd code ran"
+                );
+                assert_eq!(
+                    memory
+                        .read_u32(island.image_base() + u64::from(K_DELETE_MARKER_RVA))
+                        .unwrap(),
+                    0xCA5A_0012,
+                    "WdfObjectDelete ran in the guest callback"
+                );
+                assert_ne!(
+                    memory
+                        .read_u64(island.image_base() + u64::from(K_DEVOBJ_OUT_RVA))
+                        .unwrap(),
+                    0,
+                    "WdfDeviceWdmGetDeviceObject returned the real PDEVICE_OBJECT"
+                );
+                island.image_base()
+            })
+            .expect("loaded");
+
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfCasa", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_ne!(handle, 0);
+            let input = 0x51_000;
+            let output = 0x52_000;
+            let iosb = 0x53_000;
+            memory.map_bytes(input, b"PING");
+            memory.map_bytes(output, &[0_u8; 8]);
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtDeviceIoControlFile,
+                    &[
+                        u64::from(handle),
+                        0,
+                        0,
+                        0,
+                        iosb,
+                        0x0022_0004,
+                        input,
+                        4,
+                        output,
+                        8,
+                    ],
+                ),
+                STATUS_SUCCESS,
+                "the framework queue delivered the ioctl to EvtIoDeviceControl"
+            );
+            assert_eq!(memory.read_u32(iosb + 8).unwrap(), 4);
+            assert_eq!(&memory.read_bytes(output, 4).unwrap(), b"WDF!");
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(K_IOCTL_MARKER_RVA))
+                    .unwrap(),
+                0x0022_0004,
+                "the guest EvtIoDeviceControl code ran"
+            );
+            with_loaded_driver(&runtime, "CasaKmdf", |island| {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.ioctl_dispatches, 1);
+                assert_eq!(state.kmdf.requests.len(), 1, "framework request only");
+                assert!(
+                    state
+                        .kmdf
+                        .requests
+                        .values()
+                        .any(|request| request.completed)
+                );
+            })
+            .expect("loaded");
+
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                ),
+                STATUS_DEVICE_BUSY,
+                "the open island handle keeps the KMDF driver busy"
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(handle)],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS,
+                "closing the handle allows unload"
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_ioctl_without_a_queue_fails_with_invalid_device_request() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(false, false, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfNoQueue",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfNoQueue",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfCasa", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            let iosb = 0x53_000;
+            let output = 0x52_000;
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            memory.map_bytes(output, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtDeviceIoControlFile,
+                    &[u64::from(handle), 0, 0, 0, iosb, 0x22_0004, 0, 0, output, 8],
+                ),
+                STATUS_INVALID_DEVICE_REQUEST,
+                "an ioctl with no queue must not reach a callback"
+            );
+            assert!(crate::driver_island::close_island_device_handle(
+                &runtime, handle
+            ));
+        });
+    }
+
+    #[test]
+    fn kmdf_missing_framework_symbol_rejects_the_image() {
+        with_big_stack(|| {
+            let (mut runtime, _directory) = test_runtime();
+            let mut memory = MemoryImage::default();
+            let bytes = build_kmdf_driver(true, true, false);
+            let error = match DriverIsland::load_and_start_named(
+                &bytes,
+                "CasaKmdfBad",
+                &mut runtime,
+                &mut memory,
+            ) {
+                Ok(_) => panic!("a missing WDF symbol must reject the load"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, ReasonCode::RcImportMissing);
+            assert!(
+                error.message.contains("WdfDriverCreatX"),
+                "{}",
+                error.message
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_bad_device_add_callback_is_rejected() {
+        with_big_stack(|| {
+            let (mut runtime, _directory) = test_runtime();
+            let mut memory = MemoryImage::default();
+            let bytes = build_kmdf_driver(true, false, true);
+            let island = DriverIsland::load_and_start_named(
+                &bytes,
+                "CasaKmdfBadCallback",
+                &mut runtime,
+                &mut memory,
+            )
+            .expect("the entry bytes execute");
+            assert_eq!(island.status(), STATUS_INVALID_PARAMETER);
+            assert!(!island.is_loaded());
+            assert_eq!(island.device_count(), 0);
+        });
+    }
+
+    #[test]
+    fn island_handle_close_and_double_close_are_accounted() {
+        with_big_stack(|| {
+            let image = build_io_driver();
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaClose",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaClose",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\CasaTest", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                ),
+                STATUS_DEVICE_BUSY
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(handle)],
+                ),
+                STATUS_SUCCESS,
+                "NtClose releases an island handle"
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(handle)],
+                ),
+                STATUS_INVALID_HANDLE,
+                "double close is rejected"
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS,
+                "unload succeeds after the handle is closed"
+            );
+        });
+    }
+
+    #[test]
+    fn close_handle_releases_an_island_handle() {
+        with_big_stack(|| {
+            let image = build_io_driver();
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaCloseHandle",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaCloseHandle",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\CasaTest", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_ne!(handle, 0);
+            assert!(
+                crate::driver_island::is_island_device_handle(&runtime, handle),
+                "NtCreateFile minted an island handle"
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::CloseHandle,
+                    &[u64::from(handle)],
+                ),
+                1
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+        });
+    }
+
+    fn claim_island(runtime: &PeHostRuntime, service: &str) -> DriverIsland {
+        with_loaded_driver(runtime, service, |island| DriverIsland {
+            inner: island.inner.clone(),
+        })
+        .expect("driver island loaded")
+    }
+
+    fn queue_for_device(island: &DriverIsland, device: u64) -> u64 {
+        island
+            .inner
+            .borrow()
+            .kmdf
+            .queues
+            .iter()
+            .find(|(_, queue)| queue.device == device && queue.default_queue)
+            .map(|(handle, _)| *handle)
+            .expect("default queue")
+    }
+
+    fn pending_request(island: &DriverIsland) -> u64 {
+        island
+            .inner
+            .borrow()
+            .kmdf
+            .requests
+            .iter()
+            .find(|(_, request)| !request.completed)
+            .map(|(handle, _)| *handle)
+            .expect("pending request")
+    }
+
+    fn write_descriptor(memory: &mut MemoryImage, address: u64, pointer: u64, length: u64) {
+        memory.map_bytes(address, &[0_u8; 0x20]);
+        memory.write_u32(address, 0);
+        memory.write_u64(address + 8, pointer);
+        memory.write_u64(address + 0x10, length);
+    }
+
+    #[test]
+    fn kmdf_full_config_parses_and_invokes_evt_driver_unload() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(0, true);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfConfig",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfConfig",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfConfig");
+            assert_eq!(island.device_count(), 2);
+            let names = island.casak_device_names();
+            assert!(names.iter().any(|name| name == "WdfA"), "{names:?}");
+            assert!(names.iter().any(|name| name == "WdfB"), "{names:?}");
+            let image_base = island.image_base();
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.driver_pool_tag, 0x2146_4457);
+                assert_eq!(state.kmdf.driver_init_flags, 0);
+                assert_ne!(state.kmdf.evt_driver_unload, 0);
+                assert_eq!(state.kmdf.devices.len(), 2);
+                assert_eq!(state.kmdf.queues.len(), 2);
+                for device in state.kmdf.devices.values() {
+                    assert_eq!(
+                        state
+                            .kmdf
+                            .objects
+                            .get(&device.context_guest.saturating_sub(0x80))
+                            .map(|object| object.context_size),
+                        Some(0x30),
+                        "requested context size is honored"
+                    );
+                }
+            }
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_ADD_COUNT))
+                    .unwrap(),
+                1,
+                "EvtDriverDeviceAdd ran"
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let unloaded = take_last_unloaded_driver().expect("unloaded island");
+            assert_eq!(unloaded.inner.borrow().kmdf.driver_unload_calls, 1);
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_UNLOAD_MARKER))
+                    .unwrap(),
+                0xCA5A_0200,
+                "WDF_DRIVER_CONFIG.EvtDriverUnload executed"
+            );
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_UNLOAD_COUNT))
+                    .unwrap(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_framework_dispatches_read_write_cleanup_close_and_ioctl() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(0, true);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfDispatch",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfDispatch",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfDispatch");
+            let image_base = island.image_base();
+            let device_guest = island
+                .created_devices()
+                .into_iter()
+                .find(|device| device.name.ends_with("WdfA"))
+                .map(|device| device.guest_pointer)
+                .expect("device A");
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfA", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            let input = 0x51_000;
+            let output = 0x52_000;
+            let iosb = 0x53_000;
+            memory.map_bytes(input, b"PING");
+            memory.map_bytes(output, &[0_u8; 8]);
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtDeviceIoControlFile,
+                    &[
+                        u64::from(handle),
+                        0,
+                        0,
+                        0,
+                        iosb,
+                        0x0022_0004,
+                        input,
+                        4,
+                        output,
+                        8,
+                    ],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(&memory.read_bytes(output, 4).unwrap(), b"KMDF");
+            assert_eq!(memory.read_u32(iosb + 8).unwrap(), 4);
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_IOCTL_MARKER))
+                    .unwrap(),
+                0x0022_0004
+            );
+            memory.map_bytes(output, &[0_u8; 8]);
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtReadFile,
+                    &[u64::from(handle), 0, 0, 0, iosb, output, 8, 0, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(&memory.read_bytes(output, 4).unwrap(), b"RD01");
+            assert_eq!(memory.read_u32(iosb + 8).unwrap(), 4);
+            memory.map_bytes(input, b"DATA");
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtWriteFile,
+                    &[u64::from(handle), 0, 0, 0, iosb, input, 4, 0, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u32(iosb + 8).unwrap(), 4);
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_WRITE_MARKER))
+                    .unwrap(),
+                0x41544144
+            );
+            let (cleanup_status, _) = island
+                .dispatch_irp(
+                    &mut runtime,
+                    &mut memory,
+                    device_guest,
+                    IrpMajorFunction::Cleanup,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("cleanup dispatch");
+            assert_eq!(cleanup_status, STATUS_SUCCESS);
+            let (close_status, _) = island
+                .dispatch_irp(
+                    &mut runtime,
+                    &mut memory,
+                    device_guest,
+                    IrpMajorFunction::Close,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("close dispatch");
+            assert_eq!(close_status, STATUS_SUCCESS);
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.ioctl_dispatches, 1);
+                assert_eq!(state.kmdf.read_dispatches, 1);
+                assert_eq!(state.kmdf.write_dispatches, 1);
+                assert_eq!(state.kmdf.cleanup_dispatches, 1);
+                assert_eq!(state.kmdf.close_dispatches, 1);
+            }
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_DEFAULT_COUNT))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(handle)],
+                ),
+                STATUS_SUCCESS
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_manual_queue_retrieve_and_cancel_callbacks() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(2, true);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfManual",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfManual",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfManual");
+            let image_base = island.image_base();
+            let device = island.kmdf_device_handles()[0];
+            let queue = queue_for_device(&island, device);
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfA", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            let input = 0x51_000;
+            let output = 0x52_000;
+            let iosb = 0x53_000;
+            memory.map_bytes(input, b"PING");
+            memory.map_bytes(output, &[0_u8; 8]);
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            for _ in 0..2 {
+                assert_eq!(
+                    dispatch_nt_thunk(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::NtDeviceIoControlFile,
+                        &[
+                            u64::from(handle),
+                            0,
+                            0,
+                            0,
+                            iosb,
+                            0x0022_0004,
+                            input,
+                            4,
+                            output,
+                            8,
+                        ],
+                    ),
+                    STATUS_PENDING,
+                    "manual queues defer delivery"
+                );
+            }
+            let requests = island
+                .inner
+                .borrow()
+                .kmdf
+                .requests
+                .iter()
+                .filter(|(_, request)| !request.completed)
+                .map(|(handle, _)| *handle)
+                .collect::<Vec<_>>();
+            assert_eq!(requests.len(), 2);
+            let found_out = 0x54_000;
+            memory.map_bytes(found_out, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoQueueRetrieveFoundRequest,
+                        &[queue, requests[1], found_out],
+                    )
+                    .expect("retrieve found") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u64(found_out).unwrap(), requests[1]);
+            let next_out = 0x54_100;
+            memory.map_bytes(next_out, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoQueueRetrieveNextRequest,
+                        &[queue, next_out],
+                    )
+                    .expect("retrieve next") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u64(next_out).unwrap(), requests[0]);
+            for request in requests {
+                assert_eq!(
+                    island
+                        .call_shim_for_test(
+                            &mut runtime,
+                            &mut memory,
+                            DriverShim::WdfRequestCompleteWithInformation,
+                            &[request, STATUS_SUCCESS as u64, 4],
+                        )
+                        .expect("complete") as u32 as i32,
+                    STATUS_SUCCESS
+                );
+                let (completed, status, information, outer) =
+                    island.kmdf_request_state(request).unwrap();
+                assert!(completed);
+                assert_eq!(status, STATUS_SUCCESS);
+                assert_eq!(information, 4);
+                assert_eq!(memory.read_u64(outer + 0x40).unwrap(), 4);
+            }
+            // Queue one more request and cancel it: the queue's
+            // EvtIoCanceledOnQueue callback completes it with STATUS_CANCELLED.
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtDeviceIoControlFile,
+                    &[
+                        u64::from(handle),
+                        0,
+                        0,
+                        0,
+                        iosb,
+                        0x0022_0004,
+                        input,
+                        4,
+                        output,
+                        8,
+                    ],
+                ),
+                STATUS_PENDING
+            );
+            let cancel_request = pending_request(&island);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfRequestCancelQueuedRequest,
+                        &[cancel_request],
+                    )
+                    .expect("cancel queued") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let (completed, status, _, outer) =
+                island.kmdf_request_state(cancel_request).expect("request");
+            assert!(completed);
+            assert_eq!(status, STATUS_CANCELLED);
+            assert_ne!(outer, 0);
+            assert_eq!(
+                memory.read_u32(outer + 0x30).unwrap(),
+                STATUS_CANCELLED as u32
+            );
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.manual_retrievals, 2);
+                assert_eq!(state.kmdf.cancel_dispatches, 1);
+            }
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_CANCEL_COUNT))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(handle)],
+                ),
+                STATUS_SUCCESS
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_queue_stop_resume_and_sequential_dispatch() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(0, true);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfQueue",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfQueue",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfQueue");
+            let image_base = island.image_base();
+            let device = island.kmdf_device_handles()[0];
+            let queue = queue_for_device(&island, device);
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfA", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoQueueStopSynchronously,
+                        &[queue],
+                    )
+                    .expect("stop") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let input = 0x51_000;
+            let output = 0x52_000;
+            let iosb = 0x53_000;
+            memory.map_bytes(input, b"PING");
+            memory.map_bytes(output, &[0_u8; 8]);
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            for _ in 0..2 {
+                assert_eq!(
+                    dispatch_nt_thunk(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::NtDeviceIoControlFile,
+                        &[
+                            u64::from(handle),
+                            0,
+                            0,
+                            0,
+                            iosb,
+                            0x0022_0004,
+                            input,
+                            4,
+                            output,
+                            8,
+                        ],
+                    ),
+                    STATUS_PENDING,
+                    "a stopped queue does not deliver"
+                );
+            }
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoQueueStopSynchronously,
+                        &[queue],
+                    )
+                    .expect("stop queued") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_STOP_COUNT))
+                    .unwrap(),
+                2,
+                "EvtIoStop observed both queued requests"
+            );
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoQueueStart,
+                        &[queue],
+                    )
+                    .expect("start") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_RESUME_COUNT))
+                    .unwrap(),
+                2
+            );
+            {
+                let state = island.inner.borrow();
+                assert_eq!(
+                    memory
+                        .read_u32(image_base + u64::from(F_IOCTL_COUNT))
+                        .unwrap(),
+                    2,
+                    "sequential dispatch delivered both queued requests (ioctl_disp={}, queued_disp={}, queues={:?}, reqs={:?})",
+                    state.kmdf.ioctl_dispatches,
+                    state.kmdf.queued_dispatches,
+                    state.kmdf.queues,
+                    state
+                        .kmdf
+                        .requests
+                        .values()
+                        .map(|request| (request.completed, request.status))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(state.kmdf.ioctl_dispatches, 2);
+                let queue = state.kmdf.queues.get(&queue).expect("queue");
+                assert!(queue.queued.is_empty());
+                assert!(queue.in_flight.is_empty());
+                assert!(!queue.stopped);
+                assert!(
+                    state
+                        .kmdf
+                        .requests
+                        .values()
+                        .all(|request| request.completed)
+                );
+            }
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(handle)],
+                ),
+                STATUS_SUCCESS
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_iotarget_sends_ioctl_to_another_device() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(0, true);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfTarget",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfTarget",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfTarget");
+            let image_base = island.image_base();
+            let device_a = island
+                .inner
+                .borrow()
+                .kmdf
+                .devices
+                .iter()
+                .find(|(_, device)| device.name.ends_with("WdfA"))
+                .map(|(handle, _)| *handle)
+                .expect("device A");
+            let device_b = island
+                .inner
+                .borrow()
+                .kmdf
+                .devices
+                .iter()
+                .find(|(_, device)| device.name.ends_with("WdfB"))
+                .map(|(handle, _)| *handle)
+                .expect("device B");
+            let target_a = island
+                .call_shim_for_test(
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceGetIoTarget,
+                    &[device_a],
+                )
+                .expect("get target");
+            assert_ne!(target_a, 0);
+            let target_b_out = 0x54_000;
+            memory.map_bytes(target_b_out, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoTargetCreate,
+                        &[device_b, 0, target_b_out],
+                    )
+                    .expect("create target") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let target_b = memory.read_u64(target_b_out).unwrap();
+            assert_ne!(target_b, target_a);
+            let input = 0x56_000;
+            let output = 0x56_100;
+            let bytes_returned = 0x56_200;
+            memory.map_bytes(input, b"PING");
+            memory.map_bytes(output, &[0_u8; 8]);
+            memory.map_bytes(bytes_returned, &[0_u8; 8]);
+            let input_descriptor = 0x55_000;
+            let output_descriptor = 0x55_020;
+            write_descriptor(&mut memory, input_descriptor, input, 4);
+            write_descriptor(&mut memory, output_descriptor, output, 8);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoTargetSendIoctlSynchronously,
+                        &[
+                            target_b,
+                            0,
+                            0x0022_0004,
+                            input_descriptor,
+                            output_descriptor,
+                            0,
+                            bytes_returned,
+                        ],
+                    )
+                    .expect("send ioctl") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert_eq!(&memory.read_bytes(output, 4).unwrap(), b"KMDF");
+            assert_eq!(memory.read_u64(bytes_returned).unwrap(), 4);
+            // The formatted-request + WdfRequestSend path completes a real
+            // WDFREQUEST against device B.
+            let request_out = 0x54_100;
+            memory.map_bytes(request_out, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfRequestCreate,
+                        &[0, target_b, request_out],
+                    )
+                    .expect("create request") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let request = memory.read_u64(request_out).unwrap();
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoTargetFormatRequestForIoctl,
+                        &[
+                            target_b,
+                            request,
+                            0x0022_0004,
+                            input_descriptor,
+                            0,
+                            output_descriptor,
+                            0,
+                        ],
+                    )
+                    .expect("format request") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            memory.map_bytes(output, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfRequestSend,
+                        &[request, target_b, 0],
+                    )
+                    .expect("send request") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let (completed, status, information, _) =
+                island.kmdf_request_state(request).expect("request");
+            assert!(completed);
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_eq!(information, 4);
+            assert_eq!(&memory.read_bytes(output, 4).unwrap(), b"KMDF");
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.iotarget_sends, 2);
+                assert_eq!(state.kmdf.iotargets.len(), 2);
+            }
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_IOCTL_COUNT))
+                    .unwrap(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_wait_lock_blocks_with_timeout_and_wakes_waiters() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfLock",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfLock",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfLock");
+            let lock = island.kmdf_wait_lock_handles()[0];
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockAcquire,
+                        &[lock, 0],
+                    )
+                    .expect("acquire") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let gate = island.kmdf_wait_lock_gate(lock).expect("gate");
+            let releaser = {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    let (mutex, wake) = &*gate;
+                    let mut locked = mutex.lock().unwrap();
+                    *locked = false;
+                    drop(locked);
+                    wake.notify_all();
+                })
+            };
+            let timeout = 0x54_000;
+            memory.map_bytes(timeout, &[0_u8; 8]);
+            memory.write_u64(timeout, (-20_000_000_i64) as u64);
+            let started = std::time::Instant::now();
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockAcquire,
+                        &[lock, timeout],
+                    )
+                    .expect("blocking acquire") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= std::time::Duration::from_millis(20),
+                "acquire parked the guest for {elapsed:?}"
+            );
+            releaser.join().expect("releaser");
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockRelease,
+                        &[lock],
+                    )
+                    .expect("release") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            // A held lock with a relative 100 microsecond timeout returns
+            // STATUS_TIMEOUT and leaves the lock held.
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockAcquire,
+                        &[lock, 0],
+                    )
+                    .expect("acquire again") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            memory.write_u64(timeout, (-1_000_i64) as u64);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockAcquire,
+                        &[lock, timeout],
+                    )
+                    .expect("timeout acquire") as u32 as i32,
+                STATUS_TIMEOUT
+            );
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockRelease,
+                        &[lock],
+                    )
+                    .expect("final release") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            // Adversarial: four independent waiters serialize on the same
+            // gate; the shared state must never observe two owners at once.
+            let gate = island.kmdf_wait_lock_gate(lock).expect("gate");
+            let mut held = {
+                let (mutex, _) = &*gate;
+                let mut guard = mutex.lock().unwrap();
+                *guard = true;
+                guard
+            };
+            let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut waiters = Vec::new();
+            for _ in 0..4 {
+                let gate = gate.clone();
+                let active = active.clone();
+                let peak = peak.clone();
+                waiters.push(std::thread::spawn(move || {
+                    let (mutex, wake) = &*gate;
+                    let mut locked = mutex.lock().unwrap();
+                    while *locked {
+                        locked = wake.wait(locked).unwrap();
+                    }
+                    *locked = true;
+                    let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    *locked = false;
+                    drop(locked);
+                    wake.notify_all();
+                }));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            *held = false;
+            drop(held);
+            let (_, wake) = &*gate;
+            wake.notify_all();
+            for waiter in waiters {
+                waiter.join().expect("waiter");
+            }
+            assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn kmdf_object_contexts_attributes_and_cascade_deletion() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(0, true);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfObjects",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfObjects",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfObjects");
+            let image_base = island.image_base();
+            let driver = island.kmdf_driver_handle();
+            let devices = island.kmdf_device_handles();
+            let device = devices[0];
+            let queue = queue_for_device(&island, device);
+            assert_eq!(island.kmdf_context_size(device), Some(0x30));
+            let context = island.kmdf_typed_context(device).expect("context");
+            memory.write_u32(context, 0x00C0_FFEE);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfObjectGetTypedContext,
+                        &[device, 1],
+                    )
+                    .expect("typed context")
+                    .saturating_sub(context),
+                0
+            );
+            let type_info = 0x54_000;
+            let context_out = 0x54_010;
+            memory.map_bytes(type_info, &[0_u8; 0x20]);
+            memory.map_bytes(context_out, &[0_u8; 8]);
+            memory.write_u32(type_info, 0x18);
+            memory.write_u64(type_info + 0x10, 0x40);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfObjectAllocateContext,
+                        &[device, type_info, context_out],
+                    )
+                    .expect("allocate context") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let extra = memory.read_u64(context_out).unwrap();
+            assert_ne!(extra, context);
+            memory.write_u32(extra + 0x30, 0x1234_5678);
+            assert_eq!(memory.read_u32(extra + 0x30).unwrap(), 0x1234_5678);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfObjectDelete,
+                        &[queue],
+                    )
+                    .expect("delete queue") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert!(island.inner.borrow().kmdf.queues.get(&queue).is_none());
+            assert_eq!(island.kmdf_device_handles().len(), 2);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfObjectDelete,
+                        &[driver],
+                    )
+                    .expect("delete driver") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            {
+                let state = island.inner.borrow();
+                assert!(state.kmdf.devices.is_empty());
+                assert!(state.kmdf.queues.is_empty());
+                assert_eq!(state.kmdf.driver_unload_calls, 1);
+            }
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_UNLOAD_MARKER))
+                    .unwrap(),
+                0xCA5A_0200
+            );
+            assert!(
+                memory
+                    .read_u32(image_base + u64::from(F_CLEANUP_COUNT))
+                    .unwrap()
+                    >= 3
+            );
+            assert!(
+                memory
+                    .read_u32(image_base + u64::from(F_DESTROY_COUNT))
+                    .unwrap()
+                    >= 3
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_driver_config_flags_disable_dispatch_override() {
+        with_big_stack(|| {
+            let mut image = build_kmdf_full_driver(0, true);
+            put_u32(&mut image, 0x1000 + 0x1C, 2);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfFlags",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfFlags",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfFlags");
+            let state = island.inner.borrow();
+            assert_eq!(state.kmdf.driver_init_flags, 2);
+            assert!(state.kmdf.framework_dispatches.is_empty());
+            assert_eq!(state.kmdf.driver_pool_tag, 0x2146_4457);
+        });
+    }
+
+    #[test]
+    fn kmdf_pe32_driver_executes_and_unloads() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver_pe32();
+            let (mut runtime, _directory) = test_runtime_x86_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdf32",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string_x86(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdf32",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS,
+                "the crafted PE32 KMDF DriverEntry must execute"
+            );
+            let island = claim_island(&runtime, "CasaKmdf32");
+            let image_base = island.image_base();
+            assert_eq!(island.device_count(), 1);
+            assert_eq!(island.casak_device_names(), vec!["Wdf32"]);
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.driver_pool_tag, 0x2146_4457);
+                assert_ne!(state.kmdf.evt_driver_unload, 0);
+            }
+            assert_eq!(
+                memory
+                    .read_u32(u64::from(image_base as u32 + X86K_ADD_MARKER))
+                    .unwrap(),
+                0xCA5A_0031
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let unloaded = take_last_unloaded_driver().expect("unloaded");
+            assert_eq!(unloaded.inner.borrow().kmdf.driver_unload_calls, 1);
+            assert_eq!(
+                memory
+                    .read_u32(u64::from(image_base as u32 + X86K_UNLOAD_MARKER))
+                    .unwrap(),
+                0xCA5A_0032,
+                "32-bit EvtDriverUnload executed"
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_cancelled_request_without_callback_completes_cancelled() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(2, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfCancel",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfCancel",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfCancel");
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfA", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            let iosb = 0x53_000;
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtDeviceIoControlFile,
+                    &[u64::from(handle), 0, 0, 0, iosb, 0x0022_0004, 0, 0, 0, 0],
+                ),
+                STATUS_PENDING
+            );
+            let request = pending_request(&island);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfRequestCancelQueuedRequest,
+                        &[request],
+                    )
+                    .expect("cancel") as u32 as i32,
+                STATUS_CANCELLED
+            );
+            let (completed, status, _, outer) =
+                island.kmdf_request_state(request).expect("request");
+            assert!(completed);
+            assert_eq!(status, STATUS_CANCELLED);
+            assert_eq!(
+                memory.read_u32(outer + 0x30).unwrap(),
+                STATUS_CANCELLED as u32
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(handle)],
+                ),
+                STATUS_SUCCESS
+            );
+        });
+    }
+
+    #[test]
+    fn loaded_driver_registry_is_shared_across_guest_thread_contexts() {
+        with_big_stack(|| {
+            let image = build_test_driver(false, false, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaThreaded",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaThreaded",
+            );
+            let thread_a = STACK_BASE + STACK_SIZE - 0x180;
+            let thread_b = STACK_BASE + STACK_SIZE - 0x280;
+            assert_eq!(
+                dispatch_nt_thunk_on_thread(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                    thread_a,
+                ),
+                STATUS_SUCCESS,
+                "load from guest thread A"
+            );
+            assert_eq!(
+                dispatch_nt_thunk_on_thread(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                    thread_b,
+                ),
+                STATUS_IMAGE_ALREADY_LOADED,
+                "duplicate load from guest thread B"
+            );
+            assert_eq!(
+                dispatch_nt_thunk_on_thread(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                    thread_b,
+                ),
+                STATUS_SUCCESS,
+                "unload from guest thread B"
+            );
+            assert!(with_loaded_driver(&runtime, "CasaThreaded", |_| ()).is_none());
+        });
+    }
+
+    fn x64_complete_stub(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        island: &DriverIsland,
+        status: i32,
+        information: u32,
+    ) -> u64 {
+        let complete = allocate_shim(runtime, DriverShim::WdfRequestCompleteWithInformation);
+        let mut code = vec![0x48, 0x89, 0xD1, 0xBA];
+        code.extend_from_slice(&status.to_le_bytes());
+        code.extend_from_slice(&[0x41, 0xB8]);
+        code.extend_from_slice(&information.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xB8]);
+        code.extend_from_slice(&complete.to_le_bytes());
+        code.extend_from_slice(&[0xFF, 0xD0, 0xC3]);
+        let entry = island
+            .inner
+            .borrow_mut()
+            .arena
+            .alloc(memory, code.len(), 16)
+            .expect("complete stub");
+        memory.map_bytes(entry, &code);
+        entry
+    }
+
+    fn x64_marker_stub(memory: &mut MemoryImage, island: &DriverIsland, counter: u64) -> u64 {
+        let mut code = vec![0xFF, 0x05, 0, 0, 0, 0, 0xC3];
+        let entry = island
+            .inner
+            .borrow_mut()
+            .arena
+            .alloc(memory, code.len(), 16)
+            .expect("marker stub");
+        let displacement = counter as i64 - (entry as i64 + 6);
+        code[2..6].copy_from_slice(&(displacement as i32).to_le_bytes());
+        memory.map_bytes(entry, &code);
+        entry
+    }
+
+    fn arena_counter(memory: &mut MemoryImage, island: &DriverIsland) -> u64 {
+        island
+            .inner
+            .borrow_mut()
+            .arena
+            .alloc(memory, 8, 8)
+            .expect("counter")
+    }
+
+    fn set_queue_callbacks(island: &DriverIsland, queue: u64, f: impl FnOnce(&mut KmdfQueue)) {
+        if let Some(queue) = island.inner.borrow_mut().kmdf.queues.get_mut(&queue) {
+            f(queue);
+        }
+    }
+
+    fn patch_kmdf_config(image: &mut [u8], flags: u32) {
+        const STUB: u32 = 0x3078;
+        const COUNTER: u32 = 0x30E0;
+        let data_offset = |address: u32| 0xC00 + (address - K_DATA_RVA) as usize;
+        let stub = data_offset(STUB);
+        let counter = data_offset(COUNTER);
+        let displacement = COUNTER as i64 - (STUB as i64 + 6);
+        image[stub..stub + 2].copy_from_slice(&[0xFF, 0x05]);
+        image[stub + 2..stub + 6].copy_from_slice(&(displacement as i32).to_le_bytes());
+        image[stub + 6] = 0xC3;
+        image[counter..counter + 4].copy_from_slice(&0_u32.to_le_bytes());
+        let config = data_offset(K_CONFIG_RVA);
+        image[config + 0x10..config + 0x18]
+            .copy_from_slice(&(K_IMAGE_BASE + u64::from(STUB)).to_le_bytes());
+        image[config + 0x18..config + 0x1C].copy_from_slice(&0x2146_4457_u32.to_le_bytes());
+        image[config + 0x1C..config + 0x20].copy_from_slice(&flags.to_le_bytes());
+    }
+
+    fn unload_marker(memory: &MemoryImage, base: u64) -> u32 {
+        memory.read_u32(base + 0x30E0).unwrap()
+    }
+
+    #[test]
+    fn kmdf_driver_config_parse_and_evt_driver_unload() {
+        with_big_stack(|| {
+            let mut image = build_kmdf_driver(true, false, false);
+            patch_kmdf_config(&mut image, 0);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfCfg",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfCfg",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfCfg");
+            let base = island.image_base();
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.driver_pool_tag, 0x2146_4457);
+                assert_eq!(state.kmdf.driver_init_flags, 0);
+                assert_ne!(state.kmdf.evt_driver_unload, 0);
+                assert_eq!(state.kmdf.framework_dispatches.len(), 5);
+            }
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let unloaded = take_last_unloaded_driver().expect("unloaded island");
+            assert_eq!(unloaded.inner.borrow().kmdf.driver_unload_calls, 1);
+            assert_eq!(unload_marker(&memory, base), 1);
+        });
+    }
+
+    #[test]
+    fn kmdf_read_write_cleanup_and_close_dispatch() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfRw",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfRw",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfRw");
+            let device = island.created_devices()[0].guest_pointer;
+            let queue = *island.inner.borrow().kmdf.queues.keys().next().unwrap();
+            let stub = x64_complete_stub(&mut runtime, &mut memory, &island, STATUS_SUCCESS, 0);
+            set_queue_callbacks(&island, queue, |queue| {
+                queue.callbacks.read = stub;
+                queue.callbacks.write = stub;
+                queue.callbacks.default = stub;
+            });
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfCasa", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            let buffer = 0x52_000;
+            let iosb = 0x53_000;
+            memory.map_bytes(buffer, &[0_u8; 8]);
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtReadFile,
+                    &[u64::from(handle), 0, 0, 0, iosb, buffer, 8, 0, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtWriteFile,
+                    &[u64::from(handle), 0, 0, 0, iosb, buffer, 4, 0, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let (status, _) = island
+                .dispatch_irp(
+                    &mut runtime,
+                    &mut memory,
+                    device,
+                    IrpMajorFunction::Cleanup,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("cleanup");
+            assert_eq!(status, STATUS_SUCCESS);
+            let (status, _) = island
+                .dispatch_irp(
+                    &mut runtime,
+                    &mut memory,
+                    device,
+                    IrpMajorFunction::Close,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("close");
+            assert_eq!(status, STATUS_SUCCESS);
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.read_dispatches, 1);
+                assert_eq!(state.kmdf.write_dispatches, 1);
+                assert_eq!(state.kmdf.cleanup_dispatches, 1);
+                assert_eq!(state.kmdf.close_dispatches, 1);
+            }
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(handle)],
+                ),
+                STATUS_SUCCESS
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_manual_queue_retrieval_and_cancellation() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfManual",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfManual",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfManual");
+            let queue = *island.inner.borrow().kmdf.queues.keys().next().unwrap();
+            set_queue_callbacks(&island, queue, |queue| {
+                queue.dispatch_type = 2;
+                queue.default_queue = true;
+            });
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfCasa", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            let input = 0x51_000;
+            let output = 0x52_000;
+            let iosb = 0x53_000;
+            memory.map_bytes(input, b"PING");
+            memory.map_bytes(output, &[0_u8; 8]);
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            for _ in 0..2 {
+                assert_eq!(
+                    dispatch_nt_thunk(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::NtDeviceIoControlFile,
+                        &[
+                            u64::from(handle),
+                            0,
+                            0,
+                            0,
+                            iosb,
+                            0x0022_0004,
+                            input,
+                            4,
+                            output,
+                            8,
+                        ],
+                    ),
+                    STATUS_PENDING
+                );
+            }
+            let requests = island
+                .inner
+                .borrow()
+                .kmdf
+                .requests
+                .iter()
+                .filter(|(_, request)| !request.completed)
+                .map(|(handle, _)| *handle)
+                .collect::<Vec<_>>();
+            assert_eq!(requests.len(), 2);
+            let out = 0x54_000;
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoQueueRetrieveFoundRequest,
+                        &[queue, requests[1], out],
+                    )
+                    .expect("found") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u64(out).unwrap(), requests[1]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoQueueRetrieveNextRequest,
+                        &[queue, out],
+                    )
+                    .expect("next") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u64(out).unwrap(), requests[0]);
+            for request in &requests {
+                assert_eq!(
+                    island
+                        .call_shim_for_test(
+                            &mut runtime,
+                            &mut memory,
+                            DriverShim::WdfRequestComplete,
+                            &[*request, STATUS_SUCCESS as u64],
+                        )
+                        .expect("complete") as u32 as i32,
+                    STATUS_SUCCESS
+                );
+            }
+            let cancel_stub =
+                x64_complete_stub(&mut runtime, &mut memory, &island, STATUS_CANCELLED, 0);
+            set_queue_callbacks(&island, queue, |queue| {
+                queue.callbacks.canceled_on_queue = cancel_stub;
+            });
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtDeviceIoControlFile,
+                    &[
+                        u64::from(handle),
+                        0,
+                        0,
+                        0,
+                        iosb,
+                        0x0022_0004,
+                        input,
+                        4,
+                        output,
+                        8,
+                    ],
+                ),
+                STATUS_PENDING
+            );
+            let cancel = island
+                .inner
+                .borrow()
+                .kmdf
+                .requests
+                .iter()
+                .find(|(_, request)| !request.completed)
+                .map(|(handle, _)| *handle)
+                .unwrap();
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfRequestCancelQueuedRequest,
+                        &[cancel],
+                    )
+                    .expect("cancel") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let (completed, status, _, _) = island.kmdf_request_state(cancel).unwrap();
+            assert!(completed);
+            assert_eq!(status, STATUS_CANCELLED);
+            // Without EvtIoCanceledOnQueue the framework completes the queued
+            // request itself with STATUS_CANCELLED.
+            set_queue_callbacks(&island, queue, |queue| {
+                queue.callbacks.canceled_on_queue = 0;
+            });
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtDeviceIoControlFile,
+                    &[
+                        u64::from(handle),
+                        0,
+                        0,
+                        0,
+                        iosb,
+                        0x0022_0004,
+                        input,
+                        4,
+                        output,
+                        8,
+                    ],
+                ),
+                STATUS_PENDING
+            );
+            let cancel = island
+                .inner
+                .borrow()
+                .kmdf
+                .requests
+                .iter()
+                .find(|(_, request)| !request.completed)
+                .map(|(handle, _)| *handle)
+                .unwrap();
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfRequestCancelQueuedRequest,
+                        &[cancel],
+                    )
+                    .expect("cancel no callback") as u32 as i32,
+                STATUS_CANCELLED
+            );
+            assert_eq!(
+                island.kmdf_request_state(cancel).unwrap().1,
+                STATUS_CANCELLED
+            );
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.manual_retrievals, 2);
+                assert_eq!(state.kmdf.cancel_dispatches, 2);
+            }
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(handle)],
+                ),
+                STATUS_SUCCESS
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_iotarget_sends_to_another_device_with_real_completion() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfT",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfT",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfT");
+            let base = island.image_base();
+            let device_a = island.kmdf_device_handles()[0];
+            let init = *island
+                .inner
+                .borrow()
+                .kmdf
+                .device_inits
+                .keys()
+                .next()
+                .unwrap();
+            let name = guest_unicode_string(&mut memory, 0x57_000, "\\Device\\WdfB");
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfDeviceInitAssignName,
+                        &[init, name],
+                    )
+                    .expect("name") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let device_b_out = 0x54_000;
+            memory.map_bytes(device_b_out, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfDeviceCreate,
+                        &[init, 0, device_b_out],
+                    )
+                    .expect("device B") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let device_b = memory.read_u64(device_b_out).unwrap();
+            let config = 0x58_000;
+            memory.map_bytes(config, &[0_u8; 0x60]);
+            memory.write_u32(config, 0x50);
+            memory.write_u32(config + 4, 1);
+            memory.write_u64(config + 0x28, base + u64::from(K_EVT_IOCTL_RVA));
+            let queue_out = 0x54_010;
+            memory.map_bytes(queue_out, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoQueueCreate,
+                        &[device_b, config, 0, queue_out],
+                    )
+                    .expect("queue B") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let target_b_out = 0x54_020;
+            memory.map_bytes(target_b_out, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoTargetCreate,
+                        &[device_b, 0, target_b_out],
+                    )
+                    .expect("target B") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let target_b = memory.read_u64(target_b_out).unwrap();
+            assert_ne!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfDeviceGetIoTarget,
+                        &[device_a],
+                    )
+                    .expect("target A"),
+                0
+            );
+            let input = 0x56_000;
+            let output = 0x56_100;
+            let bytes_returned = 0x56_200;
+            memory.map_bytes(input, b"PING");
+            memory.map_bytes(output, &[0_u8; 8]);
+            memory.map_bytes(bytes_returned, &[0_u8; 8]);
+            let input_descriptor = 0x55_000;
+            let output_descriptor = 0x55_020;
+            for (descriptor, pointer, length) in [
+                (input_descriptor, input, 4u64),
+                (output_descriptor, output, 8),
+            ] {
+                memory.map_bytes(descriptor, &[0_u8; 0x20]);
+                memory.write_u32(descriptor, 0);
+                memory.write_u64(descriptor + 8, pointer);
+                memory.write_u64(descriptor + 0x10, length);
+            }
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfIoTargetSendIoctlSynchronously,
+                        &[
+                            target_b,
+                            0,
+                            0x0022_0004,
+                            input_descriptor,
+                            output_descriptor,
+                            0,
+                            bytes_returned,
+                        ],
+                    )
+                    .expect("send") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert_eq!(&memory.read_bytes(output, 4).unwrap(), b"WDF!");
+            assert_eq!(memory.read_u64(bytes_returned).unwrap(), 4);
+            let request_out = 0x54_100;
+            memory.map_bytes(request_out, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfRequestCreate,
+                        &[0, target_b, request_out],
+                    )
+                    .expect("request") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let request = memory.read_u64(request_out).unwrap();
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfRequestFormatRequestForIoctl,
+                        &[request, target_b, 0x0022_0004, input, 4, output, 8, 0,],
+                    )
+                    .expect("format") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            memory.map_bytes(output, &[0_u8; 8]);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfRequestSend,
+                        &[request, target_b, 0],
+                    )
+                    .expect("send request") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let (completed, status, information, _) = island.kmdf_request_state(request).unwrap();
+            assert!(completed);
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_eq!(information, 4);
+            assert_eq!(&memory.read_bytes(output, 4).unwrap(), b"WDF!");
+            assert_eq!(island.inner.borrow().kmdf.iotarget_sends, 2);
+        });
+    }
+
+    #[test]
+    fn kmdf_wait_lock_parks_guest_until_release_with_timeout() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfL",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfL",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfL");
+            let lock = island.kmdf_wait_lock_handles()[0];
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockAcquire,
+                        &[lock, 0],
+                    )
+                    .expect("acquire") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let gate = island.kmdf_wait_lock_gate(lock).unwrap();
+            let releaser = {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    let (mutex, wake) = &*gate;
+                    let mut locked = mutex.lock().unwrap();
+                    *locked = false;
+                    drop(locked);
+                    wake.notify_all();
+                })
+            };
+            let timeout = 0x54_000;
+            memory.map_bytes(timeout, &[0_u8; 8]);
+            memory.write_u64(timeout, (-20_000_000_i64) as u64);
+            let started = std::time::Instant::now();
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockAcquire,
+                        &[lock, timeout],
+                    )
+                    .expect("blocking acquire") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert!(
+                started.elapsed() >= std::time::Duration::from_millis(20),
+                "WdfWaitLockAcquire must block the guest until release"
+            );
+            releaser.join().unwrap();
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockRelease,
+                        &[lock],
+                    )
+                    .expect("release") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            assert!(island.inner.borrow().kmdf.parked_acquires >= 1);
+            // A held lock with a 100 microsecond relative timeout returns
+            // STATUS_TIMEOUT without taking ownership.
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockAcquire,
+                        &[lock, 0],
+                    )
+                    .expect("reacquire") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            memory.write_u64(timeout, (-1_000_i64) as u64);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockAcquire,
+                        &[lock, timeout],
+                    )
+                    .expect("timeout") as u32 as i32,
+                STATUS_TIMEOUT
+            );
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfWaitLockRelease,
+                        &[lock],
+                    )
+                    .expect("final release") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let mut held = {
+                let (mutex, _) = &*gate;
+                let mut guard = mutex.lock().unwrap();
+                *guard = true;
+                guard
+            };
+            // hold the gate while the waiters start
+            let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut waiters = Vec::new();
+            for _ in 0..4 {
+                let gate = gate.clone();
+                let active = active.clone();
+                let peak = peak.clone();
+                waiters.push(std::thread::spawn(move || {
+                    let (mutex, wake) = &*gate;
+                    let mut locked = mutex.lock().unwrap();
+                    while *locked {
+                        locked = wake.wait(locked).unwrap();
+                    }
+                    *locked = true;
+                    let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    *locked = false;
+                    drop(locked);
+                    wake.notify_all();
+                }));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            *held = false;
+            drop(held);
+            let (_, wake) = &*gate;
+            wake.notify_all();
+            for waiter in waiters {
+                waiter.join().unwrap();
+            }
+            assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn kmdf_object_contexts_attributes_and_driver_cascade() {
+        with_big_stack(|| {
+            let mut image = build_kmdf_driver(true, false, false);
+            patch_kmdf_config(&mut image, 0);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfO",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfO",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfO");
+            let base = island.image_base();
+            let driver = island.kmdf_driver_handle();
+            let device = island.kmdf_device_handles()[0];
+            let queue = *island.inner.borrow().kmdf.queues.keys().next().unwrap();
+            assert_eq!(island.kmdf_context_size(device), Some(0x80));
+            let context = island.kmdf_typed_context(device).unwrap();
+            let cleanup_counter = arena_counter(&mut memory, &island);
+            let destroy_counter = arena_counter(&mut memory, &island);
+            let cleanup_stub = x64_marker_stub(&mut memory, &island, cleanup_counter);
+            let destroy_stub = x64_marker_stub(&mut memory, &island, destroy_counter);
+            {
+                let mut state = island.inner.borrow_mut();
+                for handle in [device, queue] {
+                    let object = state.kmdf.objects.get_mut(&handle).unwrap();
+                    object.evt_cleanup = cleanup_stub;
+                    object.evt_destroy = destroy_stub;
+                }
+            }
+            let type_info = 0x54_000;
+            let context_out = 0x54_010;
+            memory.map_bytes(type_info, &[0_u8; 0x20]);
+            memory.map_bytes(context_out, &[0_u8; 8]);
+            memory.write_u32(type_info, 0x18);
+            memory.write_u64(type_info + 0x10, 0x40);
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfObjectAllocateContext,
+                        &[device, type_info, context_out],
+                    )
+                    .expect("allocate context") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            let extra = memory.read_u64(context_out).unwrap();
+            assert_ne!(extra, context);
+            memory.write_u32(extra + 0x30, 0x1234_5678);
+            assert_eq!(memory.read_u32(extra + 0x30).unwrap(), 0x1234_5678);
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .objects
+                    .get(&device)
+                    .unwrap()
+                    .extra_contexts[0]
+                    .2,
+                0x40
+            );
+            assert_eq!(
+                island
+                    .call_shim_for_test(
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfObjectDelete,
+                        &[driver],
+                    )
+                    .expect("delete driver") as u32 as i32,
+                STATUS_SUCCESS
+            );
+            {
+                let state = island.inner.borrow();
+                assert!(state.kmdf.devices.is_empty());
+                assert!(state.kmdf.queues.is_empty());
+                assert_eq!(state.kmdf.driver_unload_calls, 1);
+            }
+            assert_eq!(memory.read_u32(cleanup_counter).unwrap(), 2);
+            assert_eq!(memory.read_u32(destroy_counter).unwrap(), 2);
+            assert_eq!(unload_marker(&memory, base), 1);
+        });
+    }
+
+    #[test]
+    fn kmdf_driver_init_flags_skip_dispatch_override() {
+        with_big_stack(|| {
+            let mut image = build_kmdf_driver(true, false, false);
+            patch_kmdf_config(&mut image, 2);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(
+                    ge,
+                    "CasaKmdfF",
+                    "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaKmdfF",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path],
+                ),
+                STATUS_SUCCESS
+            );
+            let island = claim_island(&runtime, "CasaKmdfF");
+            let state = island.inner.borrow();
+            assert_eq!(state.kmdf.driver_init_flags, 2);
+            assert!(state.kmdf.framework_dispatches.is_empty());
+            assert_eq!(state.kmdf.driver_pool_tag, 0x2146_4457);
+        });
+    }
+
+    fn load_staged_island_x64(
+        image: &[u8],
+        service: &str,
+    ) -> (Box<PeHostRuntime>, TempDir, MemoryImage, DriverIsland) {
+        let (runtime, directory) = test_runtime_with_ge(|ge| {
+            stage_service(
+                ge,
+                service,
+                "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                image,
+            );
+        });
+        let mut runtime = Box::new(runtime);
+        let mut memory = MemoryImage::default();
+        prepare_guest_memory(&mut runtime, &mut memory);
+        let service_path = guest_unicode_string(
+            &mut memory,
+            0x40_000,
+            &format!("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\{service}"),
+        );
+        assert_eq!(
+            dispatch_nt_thunk(
+                &mut runtime,
+                &mut memory,
+                HostThunk::NtLoadDriver,
+                &[service_path],
+            ),
+            STATUS_SUCCESS,
+            "staged service {service} must load"
+        );
+        let island = claim_island(&runtime, service);
+        (runtime, directory, memory, island)
+    }
+
+    fn load_staged_island_x86(
+        image: &[u8],
+        service: &str,
+    ) -> (Box<PeHostRuntime>, TempDir, MemoryImage, DriverIsland) {
+        let (runtime, directory) = test_runtime_x86_with_ge(|ge| {
+            stage_service(
+                ge,
+                service,
+                "\\SystemRoot\\System32\\drivers\\casa_nt.sys",
+                image,
+            );
+        });
+        let mut runtime = Box::new(runtime);
+        let mut memory = MemoryImage::default();
+        prepare_guest_memory(&mut runtime, &mut memory);
+        let service_path = guest_unicode_string_x86(
+            &mut memory,
+            0x40_000,
+            &format!("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\{service}"),
+        );
+        assert_eq!(
+            dispatch_nt_thunk(
+                &mut runtime,
+                &mut memory,
+                HostThunk::NtLoadDriver,
+                &[service_path],
+            ),
+            STATUS_SUCCESS,
+            "staged x86 service {service} must load"
+        );
+        let island = claim_island(&runtime, service);
+        (runtime, directory, memory, island)
+    }
+
+    fn write_guest_wide(memory: &mut MemoryImage, address: u64, text: &str) {
+        let units = text.encode_utf16().collect::<Vec<_>>();
+        memory.map_bytes(address, &vec![0_u8; (units.len() + 1) * 2]);
+        for (index, unit) in units.iter().enumerate() {
+            memory.write_u16(address + index as u64 * 2, *unit);
+        }
+    }
+
+    fn call_island_shim(
+        island: &DriverIsland,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        function: DriverShim,
+        args: &[u64],
+    ) -> AppResult<i32> {
+        island
+            .call_shim_for_test(runtime, memory, function, args)
+            .map(|value| value as u32 as i32)
+    }
+
+    fn call_island_shim_raw(
+        island: &DriverIsland,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        function: DriverShim,
+        args: &[u64],
+    ) -> AppResult<u64> {
+        island.call_shim_for_test(runtime, memory, function, args)
+    }
+
+    #[test]
+    fn shim_x86_arg_bytes_abi_mismatch_or_zero_width_rejects() {
+        let expected = [
+            (DriverShim::DbgPrint, 4u64),
+            (DriverShim::IoCreateDevice, 28),
+            (DriverShim::IoDeleteDevice, 4),
+            (DriverShim::IoCreateSymbolicLink, 8),
+            (DriverShim::IoDeleteSymbolicLink, 8),
+            (DriverShim::IoAllocateIrp, 8),
+            (DriverShim::IoFreeIrp, 4),
+            (DriverShim::RtlInitUnicodeString, 8),
+            (DriverShim::IofCompleteRequest, 8),
+            (DriverShim::IoCompleteRequest, 8),
+            (DriverShim::ExAllocatePoolWithTag, 12),
+            (DriverShim::ExFreePoolWithTag, 8),
+            (DriverShim::IrpDispatch, 8),
+            (DriverShim::WdfDriverCreate, 20),
+            (DriverShim::WdfDeviceInitSetDeviceType, 8),
+            (DriverShim::WdfDeviceInitSetIoType, 8),
+            (DriverShim::WdfDeviceInitAssignName, 8),
+            (DriverShim::WdfDeviceCreate, 12),
+            (DriverShim::WdfIoQueueCreate, 16),
+            (DriverShim::WdfRequestCreate, 12),
+            (DriverShim::WdfRequestFormatRequestForIoctl, 32),
+            (DriverShim::WdfRequestRetrieveInputBuffer, 16),
+            (DriverShim::WdfRequestRetrieveOutputBuffer, 16),
+            (DriverShim::WdfRequestComplete, 8),
+            (DriverShim::WdfRequestCompleteWithInformation, 12),
+            (DriverShim::WdfDeviceWdmGetDeviceObject, 4),
+            (DriverShim::WdfObjectGetTypedContext, 8),
+            (DriverShim::WdfObjectDelete, 4),
+            (DriverShim::WdfWaitLockCreate, 8),
+            (DriverShim::WdfWaitLockAcquire, 8),
+            (DriverShim::WdfWaitLockRelease, 4),
+            (DriverShim::WdfObjectAllocateContext, 12),
+            (DriverShim::WdfDeviceGetIoTarget, 4),
+            (DriverShim::WdfIoTargetCreate, 12),
+            (DriverShim::WdfIoTargetSendIoctlSynchronously, 28),
+            (DriverShim::WdfIoTargetFormatRequestForIoctl, 28),
+            (DriverShim::WdfRequestSend, 12),
+            (DriverShim::WdfRequestCancelQueuedRequest, 4),
+            (DriverShim::WdfIoQueueRetrieveNextRequest, 12),
+            (DriverShim::WdfIoQueueRetrieveFoundRequest, 12),
+            (DriverShim::WdfIoQueueStop, 12),
+            (DriverShim::WdfIoQueueStopSynchronously, 4),
+            (DriverShim::WdfIoQueueDrain, 12),
+            (DriverShim::WdfIoQueueDrainSynchronously, 4),
+            (DriverShim::WdfIoQueuePurge, 12),
+            (DriverShim::WdfIoQueuePurgeSynchronously, 4),
+            (DriverShim::WdfIoQueueStart, 4),
+            (DriverShim::WdfEvtIoReadDispatch, 8),
+            (DriverShim::WdfEvtIoWriteDispatch, 8),
+            (DriverShim::WdfEvtIoDeviceControlDispatch, 8),
+            (DriverShim::WdfEvtIoCleanupDispatch, 8),
+            (DriverShim::WdfEvtIoCloseDispatch, 8),
+        ];
+        for (shim, want) in expected {
+            assert_eq!(
+                shim.x86_arg_bytes(),
+                want,
+                "{shim:?} must pop its exact stdcall byte count"
+            );
+        }
+    }
+
+    #[test]
+    fn unload_error_restores_registration_and_reports_invalid_parameter() {
+        with_big_stack(|| {
+            let image = build_test_driver(false, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaUnloadFail");
+            island.inner.borrow_mut().unload_guest = Some(0xDEAD_BEEF);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaUnloadFail",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                ),
+                STATUS_INVALID_PARAMETER,
+                "a failed DriverUnload must be reported as INVALID_PARAMETER"
+            );
+            assert!(
+                with_loaded_driver(&runtime, "CasaUnloadFail", |_| ()).is_some(),
+                "the island must be re-registered after a failed unload"
+            );
+            assert!(island.is_loaded(), "failed unload leaves the island loaded");
+        });
+    }
+
+    #[test]
+    fn io_shims_reject_malformed_names_and_links() {
+        with_big_stack(|| {
+            let image = build_test_driver(false, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaBadIo");
+            let link = guest_unicode_string(&mut memory, 0x50_000, "\\??\\CasaTest");
+            let target = guest_unicode_string(&mut memory, 0x52_000, "\\Device\\CasaTest");
+
+            let deleted = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoDeleteSymbolicLink,
+                &[link],
+            );
+            assert_eq!(deleted.expect("delete link"), STATUS_SUCCESS);
+            let missing = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoDeleteSymbolicLink,
+                &[link],
+            );
+            assert_eq!(
+                missing.expect("delete missing link"),
+                STATUS_OBJECT_NAME_NOT_FOUND
+            );
+
+            let created = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateSymbolicLink,
+                &[link, target],
+            );
+            assert_eq!(created.expect("recreate link"), STATUS_SUCCESS);
+            let duplicate = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateSymbolicLink,
+                &[link, target],
+            );
+            assert_eq!(
+                duplicate.expect("duplicate link"),
+                STATUS_OBJECT_NAME_COLLISION
+            );
+            let null_link = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateSymbolicLink,
+                &[0, target],
+            );
+            assert_eq!(
+                null_link.expect("empty link name"),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let irp = call_island_shim_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoAllocateIrp,
+                &[1, 0],
+            )
+            .expect("allocate irp");
+            assert_ne!(irp, 0);
+            let freed = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoFreeIrp,
+                &[irp],
+            )
+            .expect("free irp");
+            assert_eq!(freed, 0);
+            let free_unknown = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoFreeIrp,
+                &[0xDEAD_0000],
+            )
+            .expect("free unknown irp");
+            assert_eq!(free_unknown, 0);
+
+            let default_dispatch = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IrpDispatch,
+                &[0, 0],
+            )
+            .expect("default dispatch");
+            assert_eq!(default_dispatch, STATUS_INVALID_DEVICE_REQUEST);
+
+            let wide = 0x54_000;
+            write_guest_wide(&mut memory, wide, "CasaWide");
+            let header = 0x56_000;
+            memory.map_bytes(header, &[0_u8; 16]);
+            let init = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::RtlInitUnicodeString,
+                &[header, wide],
+            );
+            assert_eq!(init.expect("init unicode string"), 0);
+            assert_eq!(memory.read_u16(header).unwrap(), 16);
+            let null_source = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::RtlInitUnicodeString,
+                &[header, 0],
+            );
+            assert_eq!(null_source.expect("null source"), 0);
+            assert_eq!(memory.read_u16(header).unwrap(), 0);
+            let bad_destination = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::RtlInitUnicodeString,
+                &[1, wide],
+            );
+            assert_eq!(
+                bad_destination.expect("bad unicode destination"),
+                STATUS_INVALID_PARAMETER
+            );
+            let unterminated = 0x46_000;
+            memory.map_bytes(unterminated, &vec![0xFF_u8; 0x8000]);
+            let error = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::RtlInitUnicodeString,
+                &[header, unterminated],
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ReasonCode::RcMemoryAccessViolation);
+
+            let no_format = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::DbgPrint,
+                &[0],
+            );
+            assert_eq!(no_format.expect("null format"), 0);
+            let bad_ansi = 0x46_000;
+            memory.map_bytes(bad_ansi, &vec![b'A'; 4096]);
+            let error = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::DbgPrint,
+                &[bad_ansi],
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ReasonCode::RcMemoryAccessViolation);
+
+            let driver = island.driver_object_pointer();
+            let out = 0x58_000;
+            memory.map_bytes(out, &[0_u8; 8]);
+            let wrong_driver = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateDevice,
+                &[0xDEAD, 0, 0, 3, 0, 0, out],
+            );
+            assert_eq!(
+                wrong_driver.expect("wrong driver object"),
+                STATUS_INVALID_PARAMETER
+            );
+            let null_out = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateDevice,
+                &[driver, 0, 0, 3, 0, 0, 0],
+            );
+            assert_eq!(null_out.expect("null device out"), STATUS_INVALID_PARAMETER);
+            let huge_extension = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateDevice,
+                &[driver, 0x20_0000, 0, 3, 0, 0, out],
+            );
+            assert_eq!(
+                huge_extension.expect("oversized extension"),
+                STATUS_INSUFFICIENT_RESOURCES
+            );
+            let nameless = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateDevice,
+                &[driver, 0, 0, 3, 0, 0, out],
+            );
+            assert_eq!(nameless.expect("nameless device"), STATUS_SUCCESS);
+            let exclusive = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateDevice,
+                &[driver, 0, 0, 3, 0, 1, out],
+            );
+            assert_eq!(exclusive.expect("exclusive device"), STATUS_SUCCESS);
+            let duplicate_name = guest_unicode_string(&mut memory, 0x5A_000, "\\Device\\CasaTest");
+            let duplicate = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateDevice,
+                &[driver, 0, duplicate_name, 3, 0, 0, out],
+            );
+            assert_eq!(
+                duplicate.expect("duplicate device name"),
+                STATUS_OBJECT_NAME_COLLISION
+            );
+
+            {
+                let mut state = island.inner.borrow_mut();
+                state.driver_object_guest = 0;
+                let no_driver = state
+                    .create_device_object(&mut memory, Some("NoDriver".into()), 0, 3, false)
+                    .expect("no-driver result");
+                assert_eq!(no_driver, Err(STATUS_INVALID_PARAMETER));
+                state.driver_object_guest = driver;
+                let too_large = state
+                    .create_device_object(&mut memory, Some("TooLarge".into()), 0x20_0000, 3, false)
+                    .expect("oversized result");
+                assert_eq!(too_large, Err(STATUS_INSUFFICIENT_RESOURCES));
+                let saved_end = state.arena.end;
+                state.arena.end = state.arena.cursor;
+                let exhausted = state
+                    .create_device_object(&mut memory, Some("Exhausted".into()), 0, 3, false)
+                    .expect("arena result");
+                assert_eq!(exhausted, Err(STATUS_INSUFFICIENT_RESOURCES));
+                let start = align_up(state.arena.cursor, 16);
+                state.arena.end = start + 0x180;
+                let extension_fail = state
+                    .create_device_object(&mut memory, Some("ExtFail".into()), 0x10, 3, false)
+                    .expect("extension arena result");
+                assert_eq!(extension_fail, Err(STATUS_INSUFFICIENT_RESOURCES));
+                state.arena.end = saved_end;
+            }
+
+            let zero_length = 0x5C_000;
+            memory.map_bytes(zero_length, &[0_u8; 16]);
+            memory.write_u16(zero_length, 0);
+            memory.write_u64(zero_length + 8, wide);
+            let empty_name = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateSymbolicLink,
+                &[zero_length, target],
+            );
+            assert_eq!(
+                empty_name.expect("zero-length link"),
+                STATUS_INVALID_PARAMETER
+            );
+            let odd_length = 0x5D_000;
+            memory.map_bytes(odd_length, &[0_u8; 16]);
+            memory.write_u16(odd_length, 3);
+            memory.write_u64(odd_length + 8, wide);
+            let error = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateSymbolicLink,
+                &[odd_length, target],
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ReasonCode::RcMemoryAccessViolation);
+            let null_buffer = 0x5E_000;
+            memory.map_bytes(null_buffer, &[0_u8; 16]);
+            memory.write_u16(null_buffer, 4);
+            memory.write_u64(null_buffer + 8, 0);
+            let error = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoCreateSymbolicLink,
+                &[null_buffer, target],
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ReasonCode::RcMemoryAccessViolation);
+        });
+    }
+
+    #[test]
+    fn dbg_print_format_rejects_malformed_conversions() {
+        let mut memory = MemoryImage::default();
+        let ansi = 0x10_000;
+        let wide = 0x11_000;
+        let unicode = 0x12_000;
+        write_guest_wide(&mut memory, wide, "wide");
+        memory.map_bytes(ansi, b"ansi\0");
+        memory.map_bytes(unicode, &[0_u8; 16]);
+        memory.write_u16(unicode, 8);
+        memory.write_u64(unicode + 8, wide);
+        assert_eq!(
+            format_dbg_print("tail %", &[], &memory, GuestArch::X64),
+            "tail %"
+        );
+        assert_eq!(format_dbg_print("%%", &[], &memory, GuestArch::X64), "%");
+        assert_eq!(format_dbg_print("%w", &[], &memory, GuestArch::X64), "%");
+        assert_eq!(format_dbg_print("%hd", &[7], &memory, GuestArch::X64), "7");
+        assert_eq!(
+            format_dbg_print("%ws", &[u64::from(wide as u32)], &memory, GuestArch::X64),
+            "wide"
+        );
+        assert_eq!(
+            format_dbg_print("%S", &[u64::from(ansi as u32)], &memory, GuestArch::X64),
+            "ansi"
+        );
+        assert_eq!(
+            format_dbg_print("%Z", &[u64::from(unicode as u32)], &memory, GuestArch::X64),
+            "wide"
+        );
+        assert_eq!(
+            format_dbg_print(
+                "%u %d %x %X %p %c %q",
+                &[1, (-2i32) as u64, 0xAB, 0xCD, 0x10, 0x41, 0],
+                &memory,
+                GuestArch::X64
+            ),
+            "1 -2 ab CD 0x10 A %q"
+        );
+    }
+
+    #[test]
+    fn driver_image_helpers_reject_malformed_layouts_and_paths() {
+        let short = [0_u8; 0x20];
+        assert_eq!(
+            pe_image_arch(&short),
+            Err("driver island requires a PE image".to_string())
+        );
+        let mut bad_magic = vec![0_u8; 0x100];
+        bad_magic[0..2].copy_from_slice(&0x5A4D_u16.to_le_bytes());
+        put_u32(&mut bad_magic, 0x3C, 0x80);
+        assert_eq!(
+            pe_image_arch(&bad_magic),
+            Err("driver island requires a PE image".to_string())
+        );
+        let mut x86_magic = build_test_driver(false, false, false);
+        put_u16(&mut x86_magic, 0x84, 0x014C);
+        assert_eq!(
+            pe_image_arch(&x86_magic),
+            Err("PE32+ optional header on an x86 machine".to_string())
+        );
+        let mut x64_magic = build_test_driver(false, false, false);
+        put_u16(&mut x64_magic, 0x98, 0x010B);
+        assert_eq!(
+            pe_image_arch(&x64_magic),
+            Err("PE32 optional header on an x64 machine".to_string())
+        );
+        let mut unknown = build_test_driver(false, false, false);
+        put_u16(&mut unknown, 0x84, 0x1234);
+        assert_eq!(
+            pe_image_arch(&unknown),
+            Err("driver island rejects machine 0x1234".to_string())
+        );
+        assert_eq!(pe_layout_hint(&short), None);
+        assert_eq!(pe_layout_hint(&bad_magic), None);
+        let mut unknown_magic = build_test_driver(false, false, false);
+        put_u16(&mut unknown_magic, 0x98, 0x9999);
+        assert_eq!(pe_layout_hint(&unknown_magic), None);
+        let hint = pe_layout_hint(&build_test_driver(false, false, false)).expect("layout hint");
+        assert_eq!(hint.0, 0x1_4000_0000);
+        assert_eq!(hint.1, 0x4000);
+
+        assert_eq!(
+            parse_service_name("\\Registry\\Machine\\System\\Foo"),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            parse_service_name("\\Registry\\Machine\\System\\CurrentControlSet\\Foo"),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            parse_service_name("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\\\"),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            parse_service_name(
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaCase\\Parameters"
+            ),
+            Ok("CasaCase".to_string())
+        );
+
+        let environment = BTreeMap::from([
+            ("WINDIR".to_string(), "C:\\Windows".to_string()),
+            ("SYSTEMROOT".to_string(), "C:\\Windows".to_string()),
+        ]);
+        assert_eq!(
+            expand_driver_image_path("\"C:\\Windows\\x.sys\"", &environment),
+            "C:\\Windows\\x.sys"
+        );
+        assert_eq!(
+            expand_driver_image_path("\"C:\\Windows\\x.sys", &environment),
+            "\"C:\\Windows\\x.sys"
+        );
+        assert_eq!(
+            expand_driver_image_path("\\??\\C:\\Windows\\x.sys", &environment),
+            "C:\\Windows\\x.sys"
+        );
+        assert_eq!(
+            expand_driver_image_path("\\DosDevices\\C:\\Windows\\x.sys", &environment),
+            "C:\\Windows\\x.sys"
+        );
+        assert_eq!(
+            expand_driver_image_path("\\SystemRoot\\System32\\x.sys", &environment),
+            "C:\\Windows\\System32\\x.sys"
+        );
+        assert_eq!(
+            expand_driver_image_path("\\System32\\x.sys", &environment),
+            "C:\\Windows\\System32\\x.sys"
+        );
+        assert_eq!(
+            expand_driver_image_path("System32\\x.sys", &environment),
+            "C:\\Windows\\System32\\x.sys"
+        );
+        assert_eq!(
+            expand_driver_image_path("%WINDIR%/x.sys", &environment),
+            "C:\\Windows\\x.sys"
+        );
+        assert_eq!(
+            expand_driver_image_path("%NOPE%\\x.sys", &environment),
+            "C:\\Windows\\%NOPE%\\x.sys"
+        );
+        assert_eq!(expand_environment_percent("%NOPE%", &environment), "%NOPE%");
+        assert_eq!(
+            expand_environment_percent("a%WINDIR%b", &environment),
+            "aC:\\Windowsb"
+        );
+
+        let not_found = AppError::new(ReasonCode::RcFsNotFound, "missing");
+        assert_eq!(
+            nt_load_error_status(&not_found),
+            STATUS_OBJECT_NAME_NOT_FOUND
+        );
+        let registry = AppError::new(ReasonCode::RcRegistryNotFound, "missing");
+        assert_eq!(
+            nt_load_error_status(&registry),
+            STATUS_OBJECT_NAME_NOT_FOUND
+        );
+        let parse = AppError::new(ReasonCode::RcPeParseInvalid, "bad");
+        assert_eq!(
+            nt_load_error_status(&parse),
+            crate::driver_image::STATUS_INVALID_IMAGE_FORMAT as i32
+        );
+        let image_error = driver_image_error(0xC000_0010);
+        assert_eq!(image_error.code, ReasonCode::RcPeParseInvalid);
+        assert_eq!(
+            image_error.message,
+            "driver image rejected with NTSTATUS 0xc0000010"
+        );
+        let io_error = nt_error("IoCreateDriver", STATUS_INVALID_HANDLE);
+        assert_eq!(io_error.code, ReasonCode::RcIo);
+        assert_eq!(
+            io_error.message,
+            "IoCreateDriver failed with NTSTATUS 0xc0000008"
+        );
+        assert_eq!(strip_device_prefix("\\Device\\Casa"), "Casa");
+        assert_eq!(strip_device_prefix("\\\\Casa"), "Casa");
+        assert_eq!(strip_device_prefix("Casa"), "Casa");
+        assert_eq!(align_up(5, 0), 5);
+        assert_eq!(align_up(5, 1), 5);
+        assert_eq!(align_up(5, 4), 8);
+    }
+
+    #[test]
+    fn choose_placement_rejects_exhausted_and_overlapping_x86_ranges() {
+        let (runtime, _directory) = test_runtime_x86();
+        let placed = choose_placement(&runtime, 0x10000, 0x2000, GuestArch::X86)
+            .expect("stack overlap is skipped");
+        assert_ne!(placed.0, 0x10000, "the stack-overlapping base is skipped");
+        assert!(placed.0 > 0x12000, "placement is above the stack");
+        assert_eq!(placed.0 & 0xFFFF, 0, "placement stays 64 KiB aligned");
+        let error = choose_placement(&runtime, 0x7FF0_0000, 0x2000, GuestArch::X86)
+            .expect_err("no x86 range below the 4 GiB boundary");
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert!(
+            error.message.contains("no free guest address range"),
+            "placement error names the exhausted range: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn nt_load_rejects_non_string_image_path_and_expands_quoted_path() {
+        with_big_stack(|| {
+            let image = build_test_driver(false, false, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                let bad_key = "SYSTEM\\CurrentControlSet\\Services\\CasaBadType";
+                ge.registry_create_key("HKLM", bad_key, RegistryView::Native)
+                    .expect("create key");
+                ge.registry_set_value(
+                    "HKLM",
+                    bad_key,
+                    "ImagePath",
+                    "REG_DWORD",
+                    json!(7),
+                    RegistryView::Native,
+                )
+                .expect("write bad type");
+                stage_service(
+                    ge,
+                    "CasaQuoted",
+                    "\"C:\\Windows\\System32\\drivers\\casa_nt.sys\"",
+                    &image,
+                );
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let bad_path = guest_unicode_string(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaBadType",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[bad_path],
+                ),
+                crate::driver_image::STATUS_INVALID_IMAGE_FORMAT as i32,
+                "a non-string ImagePath cannot name a driver image"
+            );
+            let quoted_path = guest_unicode_string(
+                &mut memory,
+                0x42_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaQuoted",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[quoted_path],
+                ),
+                STATUS_SUCCESS,
+                "a quoted ImagePath is stripped and loaded"
+            );
+        });
+    }
+
+    #[test]
+    fn import_ordinals_reject_regular_and_delay_tables() {
+        with_big_stack(|| {
+            let (mut runtime, _directory) = test_runtime();
+            let mut regular = build_test_driver(false, false, false);
+            let ilt = 0x400 + (ILT_RVA - RDATA_RVA) as usize;
+            put_u64(&mut regular, ilt, 0x8000_0000_0000_0001);
+            let mut memory = MemoryImage::default();
+            let error = DriverIsland::load_and_start(&regular, &mut runtime, &mut memory)
+                .expect_err("ordinal imports have no shim");
+            assert_eq!(error.code, ReasonCode::RcImportMissing);
+            assert!(
+                error.message.contains("ntoskrnl.exe"),
+                "ordinal rejection names the module: {}",
+                error.message
+            );
+
+            let (mut runtime, _directory) = test_runtime();
+            let mut delay =
+                with_delay_import(build_test_driver(false, false, false), "IoDeleteDevice");
+            let int = 0x400 + (0x2560 - RDATA_RVA) as usize;
+            put_u64(&mut delay, int, 0x8000_0000_0000_0002);
+            let mut memory = MemoryImage::default();
+            let error = DriverIsland::load_and_start(&delay, &mut runtime, &mut memory)
+                .expect_err("delay ordinal imports have no shim");
+            assert_eq!(error.code, ReasonCode::RcImportMissing);
+        });
+    }
+
+    #[test]
+    fn no_active_island_shim_is_rejected_with_unimplemented_reason() {
+        let (mut runtime, _directory) = test_runtime();
+        let mut memory = MemoryImage::default();
+        let mut cpu = CpuState::new(GuestArch::X64);
+        let error = dispatch_shim(&mut runtime, &mut cpu, &mut memory, DriverShim::DbgPrint)
+            .expect_err("shim outside an island must fail");
+        assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+        assert!(
+            error.message.contains("no active island"),
+            "the error names the missing island: {}",
+            error.message
+        );
+    }
+
+    fn x64_ret_stub(memory: &mut MemoryImage, island: &DriverIsland) -> u64 {
+        let entry = island
+            .inner
+            .borrow_mut()
+            .arena
+            .alloc(memory, 1, 1)
+            .expect("ret stub");
+        memory.map_bytes(entry, &[0xC3]);
+        entry
+    }
+
+    #[test]
+    fn kmdf_driver_and_device_shims_reject_invalid_arguments() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaKmdfBadArgs");
+            let driver = island.driver_object_pointer();
+            let out = 0x58_000;
+            memory.map_bytes(out, &[0_u8; 8]);
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDriverCreate,
+                    &[0xDEAD, 0, 0, 0, out],
+                )
+                .expect("wrong driver object"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDriverCreate,
+                    &[driver, 0, 0, 0, 0],
+                )
+                .expect("null driver out"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDriverCreate,
+                    &[driver, 0, 0, u64::MAX, out],
+                )
+                .expect("unmapped config"),
+                STATUS_INVALID_PARAMETER
+            );
+            let small_config = 0x58_100;
+            memory.map_bytes(small_config, &[0_u8; 0x40]);
+            memory.write_u32(small_config, 4);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDriverCreate,
+                    &[driver, 0, 0, small_config, out],
+                )
+                .expect("undersized config"),
+                STATUS_INVALID_PARAMETER
+            );
+            let good_config = 0x58_200;
+            memory.map_bytes(good_config, &[0_u8; 0x40]);
+            memory.write_u32(good_config, 0x20);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDriverCreate,
+                    &[driver, 0, 0, good_config, out],
+                )
+                .expect("driver create without device add"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDriverCreate,
+                    &[driver, 0, 0, good_config, out],
+                )
+                .expect("driver create reuses framework dispatches"),
+                STATUS_SUCCESS
+            );
+
+            let init = *island
+                .inner
+                .borrow()
+                .kmdf
+                .device_inits
+                .keys()
+                .next()
+                .expect("device init");
+            let name = guest_unicode_string(&mut memory, 0x59_000, "\\Device\\WdfCasa");
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetDeviceType,
+                    &[0xDEAD, 1],
+                )
+                .expect("set type on missing init"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetIoType,
+                    &[0xDEAD, 1],
+                )
+                .expect("set io type on missing init"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitAssignName,
+                    &[0xDEAD, name],
+                )
+                .expect("assign name on missing init"),
+                STATUS_INVALID_PARAMETER
+            );
+            let init_pointer = 0x59_800;
+            memory.map_bytes(init_pointer, &[0_u8; 8]);
+            memory.write_u64(init_pointer, init);
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceCreate,
+                    &[init_pointer, 0, out],
+                )
+                .expect("duplicate device through init pointer"),
+                STATUS_OBJECT_NAME_COLLISION
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceCreate,
+                    &[init, 0, out],
+                )
+                .expect("duplicate device through init handle"),
+                STATUS_OBJECT_NAME_COLLISION
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceCreate,
+                    &[init, 0, 0],
+                )
+                .expect("null device out"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitAssignName,
+                    &[init, 0],
+                )
+                .expect("clear init name"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceCreate,
+                    &[init, 0, out],
+                )
+                .expect("unnamed device via cleared init"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceCreate,
+                    &[0xDEAD, 0, out],
+                )
+                .expect("missing init"),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let device = island.kmdf_device_handles()[0];
+            let queue_out = 0x5A_000;
+            memory.map_bytes(queue_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[0xDEAD, 0, 0, queue_out],
+                )
+                .expect("queue for missing device"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, 0, 0, 0],
+                )
+                .expect("null queue out"),
+                STATUS_INVALID_PARAMETER
+            );
+            let queue_config = 0x5A_100;
+            memory.map_bytes(queue_config, &[0_u8; 0x60]);
+            memory.write_u32(queue_config, 4);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, 1, 0, queue_out],
+                )
+                .expect("unmapped queue config"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, queue_config, 0, queue_out],
+                )
+                .expect("undersized queue config"),
+                STATUS_INVALID_PARAMETER
+            );
+            memory.write_u32(queue_config, 0x50);
+            memory.write_u32(queue_config + 4, 3);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, queue_config, 0, queue_out],
+                )
+                .expect("unsupported dispatch type"),
+                STATUS_INVALID_PARAMETER
+            );
+            memory.write_u32(queue_config + 4, 1);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, queue_config, 0, queue_out],
+                )
+                .expect("valid queue"),
+                STATUS_SUCCESS
+            );
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device, 0],
+                )
+                .expect("null request out"),
+                STATUS_INVALID_PARAMETER
+            );
+            let request_out = 0x5B_000;
+            memory.map_bytes(request_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device, request_out],
+                )
+                .expect("request for live device"),
+                STATUS_SUCCESS
+            );
+            let request = memory.read_u64(request_out).unwrap();
+            assert_ne!(request, 0);
+            let queue = *island.inner.borrow().kmdf.queues.keys().next().unwrap();
+            let target = call_island_shim_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::WdfDeviceGetIoTarget,
+                &[device],
+            )
+            .expect("request target");
+            assert_ne!(target, 0);
+            let saved_devices = {
+                let mut state = island.inner.borrow_mut();
+                std::mem::take(&mut state.kmdf.devices)
+            };
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, 0, request_out],
+                )
+                .expect("request without devices"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            island.inner.borrow_mut().kmdf.devices = saved_devices;
+            let saved_device = {
+                let mut state = island.inner.borrow_mut();
+                state.kmdf.devices.remove(&device)
+            };
+            assert!(saved_device.is_some());
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, target, request_out],
+                )
+                .expect("request for stale iotarget device"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            if let Some(device_record) = saved_device {
+                island
+                    .inner
+                    .borrow_mut()
+                    .kmdf
+                    .devices
+                    .insert(device, device_record);
+            }
+            {
+                let mut state = island.inner.borrow_mut();
+                let missing = state.new_kmdf_request(
+                    &mut memory,
+                    0xDEAD,
+                    queue,
+                    IrpMajorFunction::DeviceControl,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                assert_eq!(
+                    missing.expect("missing device result"),
+                    Err(STATUS_INVALID_DEVICE_REQUEST)
+                );
+                let casak = state.kmdf.devices.get(&device).unwrap().casak;
+                let _ = state.io.delete_device(casak);
+                let deleted = state.new_kmdf_request(
+                    &mut memory,
+                    device,
+                    queue,
+                    IrpMajorFunction::DeviceControl,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                assert_eq!(
+                    deleted.expect("deleted device result"),
+                    Err(crate::casak::io::STATUS_DELETE_PENDING as i32)
+                );
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device, request_out],
+                )
+                .expect("shim allocation failure"),
+                crate::casak::io::STATUS_DELETE_PENDING as i32
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_requests_and_iotargets_reject_bad_handles_and_buffers() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(0, true);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaKmdfBadReq");
+            let device_a = island.kmdf_device_handles()[0];
+            let device_b = island.kmdf_device_handles()[1];
+
+            let out = 0x5C_000;
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device_a, out],
+                )
+                .expect("request a"),
+                STATUS_SUCCESS
+            );
+            let request = memory.read_u64(out).unwrap();
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestFormatRequestForIoctl,
+                    &[0xDEAD, device_a, 1, 0, 0, 0, 0, 0],
+                )
+                .expect("format missing request"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestRetrieveInputBuffer,
+                    &[request, 0, 0, out],
+                )
+                .expect("retrieve null buffer out"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestRetrieveInputBuffer,
+                    &[0xDEAD, 0, out, out],
+                )
+                .expect("retrieve missing request"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestRetrieveOutputBuffer,
+                    &[request, 1, out, out],
+                )
+                .expect("retrieve beyond buffer"),
+                STATUS_BUFFER_TOO_SMALL
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestComplete,
+                    &[0xDEAD, STATUS_SUCCESS as u64],
+                )
+                .expect("complete missing request"),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestComplete,
+                    &[request, STATUS_SUCCESS as u64],
+                )
+                .expect("complete request"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestComplete,
+                    &[request, STATUS_SUCCESS as u64],
+                )
+                .expect("double complete"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceWdmGetDeviceObject,
+                    &[0xDEAD],
+                )
+                .expect("missing device object"),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectGetTypedContext,
+                    &[0xDEAD, 0],
+                )
+                .expect("missing typed context"),
+                0
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectAllocateContext,
+                    &[device_a, 0, 0],
+                )
+                .expect("null context out"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectAllocateContext,
+                    &[0xDEAD, 0, out],
+                )
+                .expect("context for missing object"),
+                STATUS_INVALID_HANDLE
+            );
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device_a, out],
+                )
+                .expect("request for context"),
+                STATUS_SUCCESS
+            );
+            let context_request = memory.read_u64(out).unwrap();
+            let context_out = 0x5C_100;
+            memory.map_bytes(context_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectAllocateContext,
+                    &[context_request, 0, context_out],
+                )
+                .expect("default context size"),
+                STATUS_SUCCESS
+            );
+            let default_context = memory.read_u64(context_out).unwrap();
+            assert_eq!(
+                island.kmdf_context_size(context_request),
+                Some(0x80),
+                "the request kind's default context size is used"
+            );
+            let type_info = 0x5C_200;
+            memory.map_bytes(type_info, &[0_u8; 0x20]);
+            memory.write_u32(type_info, 0x18);
+            memory.write_u64(type_info + 0x10, 0x20);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectAllocateContext,
+                    &[context_request, type_info, context_out],
+                )
+                .expect("typed context size"),
+                STATUS_SUCCESS
+            );
+            let typed_context = memory.read_u64(context_out).unwrap();
+            assert_ne!(typed_context, default_context);
+            assert_eq!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectGetTypedContext,
+                    &[context_request, type_info],
+                )
+                .expect("typed context lookup"),
+                typed_context
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectDelete,
+                    &[0xDEAD],
+                )
+                .expect("delete missing object"),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectDelete,
+                    &[context_request],
+                )
+                .expect("delete context request"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectDelete,
+                    &[context_request],
+                )
+                .expect("double delete object"),
+                STATUS_INVALID_HANDLE
+            );
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device_a, out],
+                )
+                .expect("deleted object request"),
+                STATUS_SUCCESS
+            );
+            let deleted_object = memory.read_u64(out).unwrap();
+            island
+                .inner
+                .borrow_mut()
+                .kmdf
+                .objects
+                .get_mut(&deleted_object)
+                .unwrap()
+                .deleted = true;
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectDelete,
+                    &[deleted_object],
+                )
+                .expect("delete already deleted object"),
+                STATUS_INVALID_HANDLE
+            );
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceGetIoTarget,
+                    &[0xDEAD],
+                )
+                .expect("target for missing device"),
+                STATUS_INVALID_HANDLE
+            );
+            let target_out = 0x5D_000;
+            memory.map_bytes(target_out, &[0_u8; 8]);
+            let target_a = call_island_shim_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::WdfDeviceGetIoTarget,
+                &[device_a],
+            )
+            .expect("target a");
+            assert_ne!(target_a, 0);
+            assert_eq!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceGetIoTarget,
+                    &[device_a],
+                )
+                .expect("cached target a"),
+                target_a
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetCreate,
+                    &[0xDEAD, 0, target_out],
+                )
+                .expect("target for missing device create"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetCreate,
+                    &[device_a, 0, 0],
+                )
+                .expect("null target out"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetCreate,
+                    &[device_b, 0, target_out],
+                )
+                .expect("target b"),
+                STATUS_SUCCESS
+            );
+            let target_b = memory.read_u64(target_out).unwrap();
+            assert_ne!(target_b, 0);
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetFormatRequestForIoctl,
+                    &[target_b, 0xDEAD, 1, 0, 0, 0, 0],
+                )
+                .expect("format missing request"),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestSend,
+                    &[0xDEAD, target_b, 0],
+                )
+                .expect("send missing request"),
+                STATUS_INVALID_HANDLE
+            );
+
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device_a, out],
+                )
+                .expect("send request"),
+                STATUS_SUCCESS
+            );
+            let send_request = memory.read_u64(out).unwrap();
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestSend,
+                    &[send_request, 0, 0],
+                )
+                .expect("send with implicit target"),
+                STATUS_PENDING
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                let request = state.kmdf.requests.get_mut(&send_request).unwrap();
+                request.completed = false;
+                request.input_guest = 1;
+                request.input_len = 4;
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestSend,
+                    &[send_request, 0, 0],
+                )
+                .expect("send with unreadable input"),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let bad_input = 1;
+            let input_descriptor = 0x5E_100;
+            memory.map_bytes(input_descriptor, &[0_u8; 0x20]);
+            memory.write_u64(input_descriptor + 8, bad_input);
+            memory.write_u64(input_descriptor + 0x10, 4);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetSendIoctlSynchronously,
+                    &[target_a, 0, 0x22_0004, input_descriptor, 0, 0, 0],
+                )
+                .expect("sync send with unreadable input"),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let saved_devices = {
+                let mut state = island.inner.borrow_mut();
+                std::mem::take(&mut state.kmdf.devices)
+            };
+            {
+                let mut state = island.inner.borrow_mut();
+                if let Some(request) = state.kmdf.requests.get_mut(&send_request) {
+                    request.completed = false;
+                    request.input_guest = 0;
+                    request.input_len = 0;
+                    request.target = Some(target_b);
+                }
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestSend,
+                    &[send_request, target_b, 0],
+                )
+                .expect("send to iotarget with no device"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                if let Some(request) = state.kmdf.requests.get_mut(&send_request) {
+                    request.completed = false;
+                    request.target = None;
+                }
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetSendIoctlSynchronously,
+                    &[0, 0, 0, 0, 0, 0, 0],
+                )
+                .expect("sync send with no devices"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            island.inner.borrow_mut().kmdf.devices = saved_devices;
+
+            {
+                let mut state = island.inner.borrow_mut();
+                let casak = state.kmdf.devices.get(&device_b).unwrap().casak;
+                let _ = state.io.delete_device(casak);
+            }
+            {
+                let mut state = island.inner.borrow_mut();
+                if let Some(request) = state.kmdf.requests.get_mut(&send_request) {
+                    request.completed = false;
+                }
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestSend,
+                    &[send_request, device_b, 0],
+                )
+                .expect("send after casak device deletion"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+
+            island
+                .inner
+                .borrow_mut()
+                .apply_iotarget_result(&mut memory, 0xDEAD, STATUS_SUCCESS, 0)
+                .expect("missing request result");
+
+            let driver = island.driver_object_pointer();
+            let major_slot = driver + 0x70 + IrpMajorFunction::DeviceControl.code() as u64 * 8;
+            memory.write_u64(major_slot, 0);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetSendIoctlSynchronously,
+                    &[device_a, 0, 0x22_0004, 0, 0, 0, 0],
+                )
+                .expect("sync send with no handler"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            let default_dispatch = island.inner.borrow().default_dispatch;
+            memory.write_u64(major_slot, default_dispatch);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetSendIoctlSynchronously,
+                    &[device_a, 0, 0x22_0004, 0, 0, 0, 0],
+                )
+                .expect("sync send with default handler"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            let framework_dispatch = island.inner.borrow().kmdf.framework_dispatch;
+            assert_ne!(framework_dispatch, 0);
+            memory.write_u64(major_slot, framework_dispatch);
+        });
+    }
+
+    fn kmdf_device_named(island: &DriverIsland, name: &str) -> u64 {
+        island
+            .inner
+            .borrow()
+            .kmdf
+            .devices
+            .iter()
+            .find(|(_, device)| device.name.ends_with(name))
+            .map(|(handle, _)| *handle)
+            .expect("named kmdf device")
+    }
+
+    fn make_kmdf_request(
+        island: &DriverIsland,
+        memory: &mut MemoryImage,
+        device: u64,
+        queue: u64,
+        major: IrpMajorFunction,
+    ) -> u64 {
+        island
+            .inner
+            .borrow_mut()
+            .new_kmdf_request(memory, device, queue, major, 0, 0, 0, 0, 0, 0)
+            .expect("request result")
+            .expect("request")
+    }
+
+    #[test]
+    fn kmdf_queue_edges_reject_stale_requests_and_recover_from_drain_races() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(2, true);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaKmdfQueueEdge");
+            let image_base = island.image_base();
+            let device_a = kmdf_device_named(&island, "WdfA");
+            let device_b = kmdf_device_named(&island, "WdfB");
+            let device_a_guest = island
+                .created_devices()
+                .into_iter()
+                .find(|device| device.name.ends_with("WdfA"))
+                .map(|device| device.guest_pointer)
+                .expect("device a guest");
+            let device_b_guest = island
+                .created_devices()
+                .into_iter()
+                .find(|device| device.name.ends_with("WdfB"))
+                .map(|device| device.guest_pointer)
+                .expect("device b guest");
+            let queue_a = queue_for_device(&island, device_a);
+            let queue_b = island
+                .inner
+                .borrow()
+                .kmdf
+                .queues
+                .iter()
+                .find(|(_, queue)| queue.device == device_b)
+                .map(|(handle, _)| *handle)
+                .expect("queue for device b");
+            let ret_stub = x64_ret_stub(&mut memory, &island);
+            let complete = x64_complete_stub(&mut runtime, &mut memory, &island, STATUS_SUCCESS, 0);
+
+            set_queue_callbacks(&island, queue_a, |queue| {
+                queue.callbacks.default = 0;
+                queue.callbacks.read = 0;
+                queue.callbacks.write = 0;
+                queue.callbacks.device_control = 0;
+                queue.dispatch_type = 0;
+                queue.stopped = false;
+                queue.draining = false;
+                queue.queued.clear();
+                queue.in_flight.clear();
+            });
+
+            let request = make_kmdf_request(
+                &island,
+                &mut memory,
+                device_a,
+                queue_a,
+                IrpMajorFunction::DeviceControl,
+            );
+            island
+                .inner
+                .borrow_mut()
+                .kmdf
+                .queues
+                .get_mut(&queue_a)
+                .unwrap()
+                .queued
+                .push_back(request);
+            {
+                let mut state = island.inner.borrow_mut();
+                assert!(
+                    state
+                        .dispatch_next_queued(&mut memory)
+                        .expect("entry zero dispatch")
+                        .is_none()
+                );
+            }
+            let (completed, status, _, _) = island.kmdf_request_state(request).unwrap();
+            assert!(completed);
+            assert_eq!(status, STATUS_INVALID_DEVICE_REQUEST);
+
+            let cleanup = make_kmdf_request(
+                &island,
+                &mut memory,
+                device_a,
+                queue_a,
+                IrpMajorFunction::Cleanup,
+            );
+            island
+                .inner
+                .borrow_mut()
+                .kmdf
+                .queues
+                .get_mut(&queue_a)
+                .unwrap()
+                .queued
+                .push_back(cleanup);
+            {
+                let mut state = island.inner.borrow_mut();
+                assert!(
+                    state
+                        .dispatch_next_queued(&mut memory)
+                        .expect("cleanup entry zero")
+                        .is_none()
+                );
+            }
+            let (completed, status, _, _) = island.kmdf_request_state(cleanup).unwrap();
+            assert!(completed);
+            assert_eq!(status, STATUS_SUCCESS);
+
+            island
+                .inner
+                .borrow_mut()
+                .kmdf
+                .queues
+                .get_mut(&queue_a)
+                .unwrap()
+                .queued
+                .push_back(0xDEAD);
+            {
+                let mut state = island.inner.borrow_mut();
+                assert!(
+                    state
+                        .dispatch_next_queued(&mut memory)
+                        .expect("stale queued handle")
+                        .is_none()
+                );
+            }
+            assert!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .queues
+                    .get(&queue_a)
+                    .unwrap()
+                    .queued
+                    .is_empty()
+            );
+
+            island
+                .inner
+                .borrow_mut()
+                .kmdf
+                .queues
+                .get_mut(&queue_a)
+                .unwrap()
+                .draining = true;
+            {
+                let mut state = island.inner.borrow_mut();
+                assert!(
+                    state
+                        .dispatch_next_queued(&mut memory)
+                        .expect("drained queue")
+                        .is_none()
+                );
+            }
+            {
+                let state = island.inner.borrow();
+                let queue = state.kmdf.queues.get(&queue_a).unwrap();
+                assert!(!queue.draining);
+                assert!(queue.stopped);
+            }
+
+            let type2 = make_kmdf_request(
+                &island,
+                &mut memory,
+                device_a,
+                queue_a,
+                IrpMajorFunction::DeviceControl,
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                let queue = state.kmdf.queues.get_mut(&queue_a).unwrap();
+                queue.dispatch_type = 2;
+                queue.stopped = false;
+                queue.draining = false;
+                queue.queued.push_back(type2);
+            }
+            {
+                let mut state = island.inner.borrow_mut();
+                assert!(
+                    state
+                        .dispatch_next_queued(&mut memory)
+                        .expect("manual queue skipped")
+                        .is_none()
+                );
+            }
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .queues
+                    .get(&queue_a)
+                    .unwrap()
+                    .queued
+                    .len(),
+                1
+            );
+
+            {
+                let mut state = island.inner.borrow_mut();
+                let queue = state.kmdf.queues.get_mut(&queue_a).unwrap();
+                queue.dispatch_type = 0;
+                queue.stopped = true;
+                queue.draining = false;
+            }
+            {
+                let mut state = island.inner.borrow_mut();
+                assert!(
+                    state
+                        .dispatch_next_queued(&mut memory)
+                        .expect("stopped queue skipped")
+                        .is_none()
+                );
+            }
+            {
+                let mut state = island.inner.borrow_mut();
+                let queue = state.kmdf.queues.get_mut(&queue_a).unwrap();
+                queue.stopped = false;
+                queue.in_flight.insert(type2);
+            }
+            {
+                let mut state = island.inner.borrow_mut();
+                assert!(
+                    state
+                        .dispatch_next_queued(&mut memory)
+                        .expect("sequential in-flight skip")
+                        .is_none()
+                );
+            }
+            {
+                let mut state = island.inner.borrow_mut();
+                let queue = state.kmdf.queues.get_mut(&queue_a).unwrap();
+                queue.queued.clear();
+                queue.in_flight.clear();
+                queue.callbacks.default = complete;
+            }
+
+            for (major, label, counter) in [
+                (IrpMajorFunction::Read, "EvtIoRead", 0usize),
+                (IrpMajorFunction::Write, "EvtIoWrite", 1),
+                (IrpMajorFunction::DeviceControl, "EvtIoDeviceControl", 2),
+                (IrpMajorFunction::Cleanup, "EvtIoDefault", 3),
+                (IrpMajorFunction::Close, "EvtIoDefault", 4),
+                (IrpMajorFunction::Create, "EvtIoDefault", 5),
+            ] {
+                let request = make_kmdf_request(&island, &mut memory, device_a, queue_a, major);
+                island
+                    .inner
+                    .borrow_mut()
+                    .kmdf
+                    .queues
+                    .get_mut(&queue_a)
+                    .unwrap()
+                    .queued
+                    .push_back(request);
+                let call = {
+                    let mut state = island.inner.borrow_mut();
+                    state
+                        .dispatch_next_queued(&mut memory)
+                        .expect("queued dispatch")
+                        .expect("callback")
+                };
+                assert_eq!(call.label, label);
+                assert_eq!(call.args[1], request);
+                {
+                    let mut state = island.inner.borrow_mut();
+                    let queue = state.kmdf.queues.get_mut(&queue_a).unwrap();
+                    queue.in_flight.remove(&request);
+                }
+                let state = island.inner.borrow();
+                let counters = [
+                    state.kmdf.read_dispatches,
+                    state.kmdf.write_dispatches,
+                    state.kmdf.ioctl_dispatches,
+                    state.kmdf.cleanup_dispatches,
+                    state.kmdf.close_dispatches,
+                    state.kmdf.queued_dispatches,
+                ];
+                let expected = match counter {
+                    0 => [1, 0, 0, 0, 0, 1],
+                    1 => [1, 1, 0, 0, 0, 2],
+                    2 => [1, 1, 1, 0, 0, 3],
+                    3 => [1, 1, 1, 1, 0, 4],
+                    4 => [1, 1, 1, 1, 1, 5],
+                    _ => [1, 1, 1, 1, 1, 6],
+                };
+                assert_eq!(counters, expected, "counter {counter}");
+            }
+
+            let device_object = island
+                .inner
+                .borrow()
+                .kmdf
+                .devices
+                .get(&device_a)
+                .unwrap()
+                .object_guest;
+            let mut cpu = CpuState::new(GuestArch::X64);
+            cpu.set(Register::Rcx, 0);
+            cpu.set(Register::Rdx, device_object);
+            let mut state = island.inner.borrow_mut();
+            let call = state
+                .wdf_dispatch(IrpMajorFunction::Create, &mut cpu, &mut memory)
+                .expect("unsupported major dispatch")
+                .expect("default callback");
+            assert_eq!(call.label, "EvtIoDefault");
+            let queue = state.kmdf.queues.get(&queue_a).unwrap().clone();
+            drop(state);
+            for request in queue.in_flight.iter() {
+                island
+                    .inner
+                    .borrow_mut()
+                    .kmdf
+                    .queues
+                    .get_mut(&queue_a)
+                    .unwrap()
+                    .in_flight
+                    .remove(request);
+            }
+
+            let irp_guest = 0x5F_800;
+            memory.map_bytes(irp_guest, &[0_u8; 0x100]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfEvtIoDeviceControlDispatch,
+                    &[irp_guest, 0xDEAD],
+                )
+                .expect("dispatch for missing device object"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                memory.read_u32(irp_guest + 0x30).unwrap(),
+                STATUS_INVALID_DEVICE_REQUEST as u32
+            );
+
+            {
+                let mut state = island.inner.borrow_mut();
+                let casak = state.kmdf.devices.get(&device_b).unwrap().casak;
+                let _ = state.io.delete_device(casak);
+            }
+            let (status, _) = island
+                .dispatch_irp(
+                    &mut runtime,
+                    &mut memory,
+                    device_b_guest,
+                    IrpMajorFunction::DeviceControl,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("dispatch after casak deletion");
+            assert_eq!(status, crate::casak::io::STATUS_DELETE_PENDING as i32);
+
+            set_queue_callbacks(&island, queue_a, |queue| {
+                queue.callbacks.default = 0;
+                queue.callbacks.read = 0;
+                queue.callbacks.write = 0;
+                queue.callbacks.device_control = 0;
+                queue.dispatch_type = 0;
+                queue.stopped = false;
+                queue.draining = false;
+                queue.queued.clear();
+                queue.in_flight.clear();
+            });
+            let (status, _) = island
+                .dispatch_irp(
+                    &mut runtime,
+                    &mut memory,
+                    device_a_guest,
+                    IrpMajorFunction::DeviceControl,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("ioctl without callback");
+            assert_eq!(status, STATUS_INVALID_DEVICE_REQUEST);
+            for major in [IrpMajorFunction::Cleanup, IrpMajorFunction::Close] {
+                let (status, _) = island
+                    .dispatch_irp(
+                        &mut runtime,
+                        &mut memory,
+                        device_a_guest,
+                        major,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .expect("cleanup dispatch without callback");
+                assert_eq!(status, STATUS_SUCCESS);
+            }
+
+            {
+                let mut state = island.inner.borrow_mut();
+                state
+                    .complete_kmdf_request(&mut memory, 0xDEAD, STATUS_SUCCESS, 0)
+                    .expect("complete missing request");
+            }
+            let done = make_kmdf_request(
+                &island,
+                &mut memory,
+                device_a,
+                queue_a,
+                IrpMajorFunction::DeviceControl,
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                state
+                    .complete_kmdf_request(&mut memory, done, STATUS_SUCCESS, 4)
+                    .expect("complete request");
+                state
+                    .complete_kmdf_request(&mut memory, done, STATUS_SUCCESS, 4)
+                    .expect("double complete is ignored");
+            }
+            let draining = make_kmdf_request(
+                &island,
+                &mut memory,
+                device_a,
+                queue_a,
+                IrpMajorFunction::DeviceControl,
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                state
+                    .kmdf
+                    .queues
+                    .get_mut(&queue_a)
+                    .unwrap()
+                    .in_flight
+                    .insert(draining);
+                state.kmdf.queues.get_mut(&queue_a).unwrap().draining = true;
+                state.kmdf.queues.get_mut(&queue_a).unwrap().queued.clear();
+                state
+                    .complete_kmdf_request(&mut memory, draining, STATUS_SUCCESS, 0)
+                    .expect("complete draining request");
+                let queue = state.kmdf.queues.get(&queue_a).unwrap();
+                assert!(!queue.draining);
+                assert!(queue.stopped);
+            }
+
+            set_queue_callbacks(&island, queue_a, |queue| {
+                queue.callbacks.default = complete;
+                queue.callbacks.read = 0;
+                queue.callbacks.write = 0;
+                queue.callbacks.device_control = 0;
+                queue.dispatch_type = 0;
+                queue.stopped = false;
+                queue.draining = false;
+                queue.queued.clear();
+                queue.in_flight.clear();
+            });
+            let (device_handle, file_status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfA", 0x5A_000);
+            assert_eq!(file_status, STATUS_SUCCESS);
+            let buffer = 0x5B_000;
+            let iosb = 0x5B_100;
+            memory.map_bytes(buffer, &[0_u8; 8]);
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtReadFile,
+                    &[u64::from(device_handle), 0, 0, 0, iosb, buffer, 8, 0, 0],
+                ),
+                STATUS_SUCCESS,
+                "read falls back to the default queue callback"
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtWriteFile,
+                    &[u64::from(device_handle), 0, 0, 0, iosb, buffer, 8, 0, 0],
+                ),
+                STATUS_SUCCESS,
+                "write falls back to the default queue callback"
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtDeviceIoControlFile,
+                    &[
+                        u64::from(device_handle),
+                        0,
+                        0,
+                        0,
+                        iosb,
+                        0x0022_0004,
+                        buffer,
+                        8,
+                        buffer,
+                        8,
+                    ],
+                ),
+                STATUS_SUCCESS,
+                "ioctl falls back to the default queue callback"
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(device_handle)],
+                ),
+                STATUS_SUCCESS
+            );
+
+            memory.map_bytes(0x5F_000, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueRetrieveNextRequest,
+                    &[queue_b, 0],
+                )
+                .expect("retrieve null out"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueRetrieveNextRequest,
+                    &[0xDEAD, 0x5F_000],
+                )
+                .expect("retrieve missing queue"),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueRetrieveNextRequest,
+                    &[queue_b, 0x5F_000],
+                )
+                .expect("retrieve from empty queue"),
+                STATUS_NO_MORE_ENTRIES
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStop,
+                    &[0xDEAD],
+                )
+                .expect("stop missing queue"),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueDrain,
+                    &[queue_b],
+                )
+                .expect("drain empty queue"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueDrainSynchronously,
+                    &[queue_b],
+                )
+                .expect("drain synchronously empty queue"),
+                STATUS_SUCCESS
+            );
+
+            let stop_count = memory
+                .read_u32(image_base + u64::from(F_STOP_COUNT))
+                .unwrap();
+            let stop_request = make_kmdf_request(
+                &island,
+                &mut memory,
+                device_a,
+                queue_a,
+                IrpMajorFunction::DeviceControl,
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                let queue = state.kmdf.queues.get_mut(&queue_a).unwrap();
+                queue.callbacks.default = ret_stub;
+                queue.callbacks.stop = image_base + u64::from(F_STOP_RVA);
+                queue.callbacks.resume = image_base + u64::from(F_RESUME_RVA);
+                queue.in_flight.insert(stop_request);
+                queue.queued.clear();
+                queue.stopped = false;
+                queue.draining = false;
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStop,
+                    &[queue_a],
+                )
+                .expect("stop with in-flight request"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_STOP_COUNT))
+                    .unwrap(),
+                stop_count + 1
+            );
+            let resume_count = memory
+                .read_u32(image_base + u64::from(F_RESUME_COUNT))
+                .unwrap();
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStart,
+                    &[queue_a],
+                )
+                .expect("resume in-flight request"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_RESUME_COUNT))
+                    .unwrap(),
+                resume_count + 1
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStart,
+                    &[0xDEAD],
+                )
+                .expect("start missing queue"),
+                STATUS_INVALID_HANDLE
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                state
+                    .kmdf
+                    .queues
+                    .get_mut(&queue_a)
+                    .unwrap()
+                    .in_flight
+                    .clear();
+                state
+                    .kmdf
+                    .requests
+                    .get_mut(&stop_request)
+                    .unwrap()
+                    .completed = true;
+            }
+
+            let cancel_before = memory
+                .read_u32(image_base + u64::from(F_CANCEL_COUNT))
+                .unwrap();
+            let queued_cancel = make_kmdf_request(
+                &island,
+                &mut memory,
+                device_a,
+                queue_a,
+                IrpMajorFunction::DeviceControl,
+            );
+            let inflight_cancel = make_kmdf_request(
+                &island,
+                &mut memory,
+                device_a,
+                queue_a,
+                IrpMajorFunction::DeviceControl,
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                let queue = state.kmdf.queues.get_mut(&queue_a).unwrap();
+                queue.callbacks.canceled_on_queue = image_base + u64::from(F_CANCEL_RVA);
+                queue.queued.push_back(queued_cancel);
+                queue.in_flight.insert(inflight_cancel);
+                queue.stopped = false;
+                queue.draining = false;
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueuePurge,
+                    &[queue_a],
+                )
+                .expect("purge with cancel callback"),
+                STATUS_SUCCESS
+            );
+            for request in [queued_cancel, inflight_cancel] {
+                let (completed, status, _, _) = island.kmdf_request_state(request).unwrap();
+                assert!(completed);
+                assert_eq!(status, STATUS_CANCELLED);
+            }
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_CANCEL_COUNT))
+                    .unwrap(),
+                cancel_before + 2
+            );
+
+            set_queue_callbacks(&island, queue_a, |queue| {
+                queue.callbacks.canceled_on_queue = 0;
+            });
+            let force_cancel = make_kmdf_request(
+                &island,
+                &mut memory,
+                device_a,
+                queue_a,
+                IrpMajorFunction::DeviceControl,
+            );
+            island
+                .inner
+                .borrow_mut()
+                .kmdf
+                .queues
+                .get_mut(&queue_a)
+                .unwrap()
+                .queued
+                .push_back(force_cancel);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueuePurgeSynchronously,
+                    &[queue_a],
+                )
+                .expect("purge without cancel callback"),
+                STATUS_SUCCESS
+            );
+            let (completed, status, _, _) = island.kmdf_request_state(force_cancel).unwrap();
+            assert!(completed);
+            assert_eq!(status, STATUS_CANCELLED);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueuePurgeSynchronously,
+                    &[0xDEAD],
+                )
+                .expect("purge missing queue"),
+                STATUS_INVALID_HANDLE
+            );
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCancelQueuedRequest,
+                    &[0xDEAD],
+                )
+                .expect("cancel missing request"),
+                STATUS_INVALID_HANDLE
+            );
+            let no_queue = make_kmdf_request(
+                &island,
+                &mut memory,
+                device_a,
+                queue_a,
+                IrpMajorFunction::DeviceControl,
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                state.kmdf.requests.get_mut(&no_queue).unwrap().queue = None;
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCancelQueuedRequest,
+                    &[no_queue],
+                )
+                .expect("cancel request without queue"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                state.kmdf.requests.get_mut(&no_queue).unwrap().queue = Some(0xDEAD);
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCancelQueuedRequest,
+                    &[no_queue],
+                )
+                .expect("cancel request with missing queue"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                state.kmdf.requests.get_mut(&no_queue).unwrap().queue = Some(queue_a);
+                state.kmdf.queues.get_mut(&queue_a).unwrap().queued.clear();
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCancelQueuedRequest,
+                    &[no_queue],
+                )
+                .expect("cancel request not queued"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_wait_lock_rejects_invalid_handles_and_recovers_from_poison() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaKmdfBadLock");
+            let lock = island.kmdf_wait_lock_handles()[0];
+            let driver = island.kmdf_driver_handle();
+            let out = 0x5F_000;
+            memory.map_bytes(out, &[0_u8; 8]);
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockCreate,
+                    &[0, 0],
+                )
+                .expect("null lock out"),
+                STATUS_INVALID_PARAMETER
+            );
+            let attrs = 0x5F_100;
+            let type_info = 0x5F_200;
+            memory.map_bytes(attrs, &[0_u8; 0x38]);
+            memory.map_bytes(type_info, &[0_u8; 0x20]);
+            memory.write_u32(attrs, 0x38);
+            memory.write_u64(attrs + 0x20, driver);
+            memory.write_u64(attrs + 0x28, 0);
+            memory.write_u64(attrs + 0x30, type_info);
+            memory.write_u32(type_info, 0x18);
+            memory.write_u64(type_info + 0x10, 0x20);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockCreate,
+                    &[attrs, out],
+                )
+                .expect("typed wait lock"),
+                STATUS_SUCCESS
+            );
+            let typed_lock = memory.read_u64(out).unwrap();
+            assert_eq!(island.kmdf_context_size(typed_lock), Some(0x20));
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .objects
+                    .get(&typed_lock)
+                    .and_then(|object| object.parent),
+                Some(driver)
+            );
+            assert!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .objects
+                    .get(&driver)
+                    .is_some_and(|object| object.children.contains(&typed_lock))
+            );
+            memory.map_bytes(0x5F_FFC, &[0_u8; 4]);
+            memory.write_u32(0x5F_FFC, 0x38);
+            let ignored = island
+                .inner
+                .borrow()
+                .parse_object_attributes(&memory, 0x5F_FFC)
+                .expect("invalid attrs are ignored");
+            assert_eq!(ignored.evt_cleanup, 0);
+            assert_eq!(ignored.evt_destroy, 0);
+            assert!(ignored.parent.is_none());
+            assert_eq!(ignored.context_size_override, 0);
+            assert_eq!(ignored.context_type_info, 0);
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockAcquire,
+                    &[0xDEAD, 0],
+                )
+                .expect("acquire missing lock"),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockRelease,
+                    &[0xDEAD],
+                )
+                .expect("release missing lock"),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockAcquire,
+                    &[lock, 0],
+                )
+                .expect("acquire lock"),
+                STATUS_SUCCESS
+            );
+            let zero_timeout = 0x5F_300;
+            memory.map_bytes(zero_timeout, &[0_u8; 8]);
+            memory.write_u64(zero_timeout, 0);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockAcquire,
+                    &[lock, zero_timeout],
+                )
+                .expect("zero timeout on held lock"),
+                STATUS_TIMEOUT
+            );
+            let gate = island.kmdf_wait_lock_gate(lock).unwrap();
+            let releaser = {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let (mutex, wake) = &*gate;
+                    let mut locked = mutex.lock().unwrap();
+                    *locked = false;
+                    drop(locked);
+                    wake.notify_all();
+                })
+            };
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockAcquire,
+                    &[lock, 0],
+                )
+                .expect("infinite wait"),
+                STATUS_SUCCESS
+            );
+            releaser.join().expect("releaser");
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockRelease,
+                    &[lock],
+                )
+                .expect("release lock"),
+                STATUS_SUCCESS
+            );
+
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockCreate,
+                    &[0, out],
+                )
+                .expect("poisoned lock create"),
+                STATUS_SUCCESS
+            );
+            let poisoned = memory.read_u64(out).unwrap();
+            let gate = island.kmdf_wait_lock_gate(poisoned).unwrap();
+            let poisoner = {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    let (mutex, _) = &*gate;
+                    let mut locked = mutex.lock().unwrap();
+                    *locked = true;
+                    panic!("poison the wait lock");
+                })
+            };
+            assert!(poisoner.join().is_err(), "the poisoner panics");
+            let tiny_timeout = 0x5F_400;
+            memory.map_bytes(tiny_timeout, &[0_u8; 8]);
+            memory.write_u64(tiny_timeout, (-1_i64) as u64);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockAcquire,
+                    &[poisoned, tiny_timeout],
+                )
+                .expect("poisoned timed acquire"),
+                STATUS_TIMEOUT
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockRelease,
+                    &[poisoned],
+                )
+                .expect("poisoned release"),
+                STATUS_SUCCESS
+            );
+
+            let absolute = 0x5F_500;
+            memory.map_bytes(absolute, &[0_u8; 8]);
+            memory.write_u64(absolute, 10);
+            let island_state = island.inner.borrow();
+            assert_eq!(
+                island_state
+                    .wait_lock_timeout(&memory, absolute)
+                    .expect("absolute timeout"),
+                Some(Duration::from_nanos(1_000))
+            );
+            assert_eq!(
+                island_state
+                    .wait_lock_timeout(&memory, zero_timeout)
+                    .expect("zero timeout"),
+                Some(Duration::ZERO)
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_object_cascade_cancels_queued_requests_and_rejects_stale_objects() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(0, true);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaKmdfCascade");
+            let device = island.kmdf_device_handles()[0];
+
+            let mut callbacks = Vec::new();
+            island
+                .inner
+                .borrow_mut()
+                .collect_delete_callbacks(0xDEAD, &mut callbacks);
+            assert!(callbacks.is_empty());
+
+            let out = 0x50_000;
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device, out],
+                )
+                .expect("cascade request"),
+                STATUS_SUCCESS
+            );
+            let cascade_request = memory.read_u64(out).unwrap();
+            {
+                let mut state = island.inner.borrow_mut();
+                state
+                    .kmdf
+                    .objects
+                    .get_mut(&cascade_request)
+                    .unwrap()
+                    .deleted = true;
+                let mut callbacks = Vec::new();
+                state.collect_delete_callbacks(cascade_request, &mut callbacks);
+                assert!(callbacks.is_empty());
+            }
+            {
+                let mut state = island.inner.borrow_mut();
+                assert!(!state.force_cancel_request(0xDEAD));
+                assert!(
+                    state.force_cancel_request(cascade_request),
+                    "a stale-deleted request is still cancelable"
+                );
+            }
+
+            let config = 0x51_000;
+            let queue_out = 0x52_000;
+            memory.map_bytes(config, &[0_u8; 0x60]);
+            memory.map_bytes(queue_out, &[0_u8; 8]);
+            memory.write_u32(config, 0x50);
+            memory.write_u32(config + 4, 0);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, config, 0, queue_out],
+                )
+                .expect("cascade queue"),
+                STATUS_SUCCESS
+            );
+            let cascade_queue = memory.read_u64(queue_out).unwrap();
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device, out],
+                )
+                .expect("queued cascade request"),
+                STATUS_SUCCESS
+            );
+            let queued = memory.read_u64(out).unwrap();
+            {
+                let mut state = island.inner.borrow_mut();
+                state
+                    .kmdf
+                    .queues
+                    .get_mut(&cascade_queue)
+                    .unwrap()
+                    .queued
+                    .push_back(queued);
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectDelete,
+                    &[cascade_queue],
+                )
+                .expect("delete queue with queued requests"),
+                STATUS_SUCCESS
+            );
+            let (canceled, status, _, _) = island.kmdf_request_state(queued).unwrap();
+            assert!(canceled);
+            assert_eq!(status, STATUS_CANCELLED);
+
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device, out],
+                )
+                .expect("current request"),
+                STATUS_SUCCESS
+            );
+            let current = memory.read_u64(out).unwrap();
+            island.inner.borrow_mut().kmdf.current_request = current;
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectDelete,
+                    &[current],
+                )
+                .expect("delete current request"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(island.inner.borrow().kmdf.current_request, 0);
+
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device, out],
+                )
+                .expect("completed request"),
+                STATUS_SUCCESS
+            );
+            let completed = memory.read_u64(out).unwrap();
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestComplete,
+                    &[completed, STATUS_SUCCESS as u64],
+                )
+                .expect("complete request"),
+                STATUS_SUCCESS
+            );
+            assert!(!island.inner.borrow_mut().force_cancel_request(completed));
+        });
+    }
+
+    #[test]
+    fn x86_kmdf_layout_paths_and_shims_reject_malformed_blocks() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver_pe32();
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x86(&image, "CasaX86Layout");
+            let driver = island.kmdf_driver_handle();
+            let device = island.kmdf_device_handles()[0];
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetDeviceType,
+                    &[0xDEAD, 1],
+                )
+                .expect("x86 missing init"),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let irp_guest = 0x50_000;
+            memory.map_bytes(irp_guest, &[0_u8; 0x100]);
+            {
+                let state = island.inner.borrow();
+                state
+                    .write_irp_status(&mut memory, irp_guest, STATUS_ACCESS_VIOLATION, 7)
+                    .expect("x86 irp status");
+            }
+            assert_eq!(
+                memory.read_u32(irp_guest + 0x18).unwrap(),
+                STATUS_ACCESS_VIOLATION as u32
+            );
+            assert_eq!(memory.read_u32(irp_guest + 0x20).unwrap(), 7);
+
+            let attrs = 0x51_000;
+            let type_info = 0x51_040;
+            memory.map_bytes(attrs, &[0_u8; 0x40]);
+            memory.write_u32(attrs, 0x30);
+            memory.write_u32(attrs + 0x04, 0);
+            memory.write_u32(attrs + 0x08, 0);
+            memory.write_u32(attrs + 0x14, driver as u32);
+            memory.write_u32(attrs + 0x18, 0);
+            memory.write_u32(attrs + 0x1C, type_info as u32);
+            let parsed = island
+                .inner
+                .borrow()
+                .parse_object_attributes(&memory, attrs)
+                .expect("x86 attributes");
+            assert_eq!(parsed.evt_cleanup, 0);
+            assert_eq!(parsed.evt_destroy, 0);
+            assert_eq!(parsed.parent, Some(driver));
+            assert_eq!(parsed.context_size_override, 0);
+            assert_eq!(parsed.context_type_info, u64::from(type_info as u32));
+
+            memory.map_bytes(type_info, &[0_u8; 0x20]);
+            memory.write_u32(type_info + 0x08, 0x18);
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .context_type_size(&memory, type_info)
+                    .expect("x86 context type size"),
+                0x18
+            );
+
+            let timeout = 0x52_000;
+            memory.map_bytes(timeout, &[0_u8; 8]);
+            memory.write_u32(timeout, 0);
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .wait_lock_timeout(&memory, timeout)
+                    .expect("x86 zero timeout"),
+                Some(Duration::ZERO)
+            );
+            memory.write_u32(timeout, 10);
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .wait_lock_timeout(&memory, timeout)
+                    .expect("x86 absolute timeout"),
+                Some(Duration::from_nanos(1_000))
+            );
+            memory.write_u32(timeout, (-1_i32) as u32);
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .wait_lock_timeout(&memory, timeout)
+                    .expect("x86 relative timeout"),
+                Some(Duration::from_nanos(100))
+            );
+
+            let descriptor = 0x53_000;
+            memory.map_bytes(descriptor, &[0_u8; 0x20]);
+            memory.write_u32(descriptor, 0);
+            memory.write_u32(descriptor + 4, 0x1234_5678);
+            memory.write_u32(descriptor + 8, 9);
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .read_memory_descriptor(&memory, descriptor)
+                    .expect("x86 descriptor"),
+                (0x1234_5678, 9)
+            );
+
+            let config = 0x54_000;
+            let queue_out = 0x54_100;
+            memory.map_bytes(config, &[0_u8; 0x60]);
+            memory.map_bytes(queue_out, &[0_u8; 4]);
+            memory.write_u32(config, 0x50);
+            memory.write_u32(config + 4, 1);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, config, 0, queue_out],
+                )
+                .expect("x86 queue create"),
+                STATUS_SUCCESS
+            );
+            memory.write_u32(config + 4, 3);
+            memory.map_bytes(queue_out, &[0_u8; 4]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, config, 0, queue_out],
+                )
+                .expect("x86 invalid dispatch type"),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let finish_irp_guest = 0x55_000;
+            memory.map_bytes(finish_irp_guest, &[0_u8; 0x100]);
+            memory.write_u32(finish_irp_guest + 0x18, STATUS_ACCESS_VIOLATION as u32);
+            memory.write_u32(finish_irp_guest + 0x20, 7);
+            let mut state = island.inner.borrow_mut();
+            let casak = state.kmdf.devices.get(&device).unwrap().casak;
+            let irp = state
+                .io
+                .allocate_irp(
+                    casak,
+                    IrpParameterBlock::new(IrpMajorFunction::DeviceControl, 0, 0),
+                )
+                .expect("x86 irp");
+            let pending = PendingIoTargetSend {
+                irp,
+                irp_guest: finish_irp_guest,
+                entry: 0,
+                device_object: 0,
+                system_buffer: 0,
+                output_ptr: 0,
+                output_len: 0,
+                bytes_returned: 0,
+                request: 0,
+                target: 0,
+                io_control: 0,
+                input_ptr: 0,
+                input_len: 0,
+                saved: (0, 0, 0, 0, 0, 0, 0),
+            };
+            assert_eq!(
+                state
+                    .finish_ioctl_send(&mut memory, pending)
+                    .expect("x86 finish send"),
+                (STATUS_ACCESS_VIOLATION, 7)
+            );
+        });
+    }
+
+    #[test]
+    fn island_namespace_rejects_bad_paths_stale_handles_and_missing_services() {
+        with_big_stack(|| {
+            let image = build_test_driver(false, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaNamespace");
+            assert_eq!(normalize_device_path("\\\\.\\CasaTest"), "\\??\\CasaTest");
+            assert_eq!(
+                normalize_device_path("\\Device\\CasaTest\\\\"),
+                "\\Device\\CasaTest"
+            );
+            assert_eq!(normalize_device_path("  "), "");
+            assert!(resolve_island_device(&runtime, "").is_none());
+            assert!(resolve_island_device(&runtime, "   ").is_none());
+
+            let handle_ptr = 0x5F_000;
+            memory.map_bytes(handle_ptr, &[0_u8; 8]);
+            assert_eq!(
+                nt_open_island_device(&runtime, &mut memory, "", handle_ptr),
+                None
+            );
+            assert_eq!(
+                nt_open_island_device(&runtime, &mut memory, "\\Device\\CasaTest", 0),
+                Some(STATUS_INVALID_PARAMETER)
+            );
+            assert_eq!(
+                nt_open_island_device(&runtime, &mut memory, "\\Device\\CasaTest", 1),
+                Some(STATUS_INVALID_PARAMETER)
+            );
+            assert_eq!(
+                nt_open_island_device(&runtime, &mut memory, "\\Device\\CasaTest", handle_ptr),
+                Some(STATUS_SUCCESS)
+            );
+            let direct_handle = memory.read_u32(handle_ptr).unwrap();
+            assert_ne!(direct_handle, 0);
+            assert_eq!(
+                nt_open_island_device(&runtime, &mut memory, "\\??\\CasaTest", handle_ptr),
+                Some(STATUS_SUCCESS),
+                "the driver's symbolic link resolves"
+            );
+            let link_handle = memory.read_u32(handle_ptr).unwrap();
+            assert_ne!(link_handle, direct_handle);
+            assert_eq!(
+                nt_open_island_device(&runtime, &mut memory, "\\DosDevices\\CasaTest", handle_ptr),
+                Some(STATUS_SUCCESS),
+                "the DOS-device prefix resolves without a link"
+            );
+            assert_eq!(
+                nt_open_island_device(&runtime, &mut memory, "\\Device\\CasaTest\\\\", handle_ptr),
+                Some(STATUS_SUCCESS),
+                "trailing separators are normalized"
+            );
+
+            assert_eq!(
+                dispatch_island_device_io(
+                    &mut runtime,
+                    &mut memory,
+                    0xDEAD_0000,
+                    IrpMajorFunction::DeviceControl,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("unknown handle"),
+                None
+            );
+            assert_eq!(
+                dispatch_island_device_io(
+                    &mut runtime,
+                    &mut memory,
+                    direct_handle,
+                    IrpMajorFunction::DeviceControl,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("live handle"),
+                Some((STATUS_INVALID_DEVICE_REQUEST, 0))
+            );
+
+            let runtime_id = runtime_identity(&runtime);
+            let saved_services = lock_registry().services.remove(&runtime_id);
+            assert!(saved_services.is_some());
+            assert_eq!(
+                dispatch_island_device_io(
+                    &mut runtime,
+                    &mut memory,
+                    link_handle,
+                    IrpMajorFunction::DeviceControl,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("handle with missing service"),
+                Some((STATUS_INVALID_HANDLE, 0))
+            );
+            if let Some(services) = saved_services {
+                lock_registry().services.insert(runtime_id, services);
+            }
+
+            let record = lock_registry()
+                .device_handles
+                .get(&runtime_id)
+                .and_then(|handles| handles.get(&direct_handle))
+                .cloned()
+                .expect("direct handle record");
+            island
+                .inner
+                .borrow_mut()
+                .device_ids
+                .remove(&record.device_guest);
+            assert_eq!(
+                dispatch_island_device_io(
+                    &mut runtime,
+                    &mut memory,
+                    direct_handle,
+                    IrpMajorFunction::DeviceControl,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("stale device handle"),
+                Some((STATUS_INVALID_HANDLE, 0))
+            );
+        });
+    }
+
+    #[test]
+    fn wdf_config_edges_reject_stale_parents_and_invalid_dispatch_type() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfConfigEdges");
+            let device = island.kmdf_device_handles()[0];
+            let driver = island.driver_object_pointer();
+            let out = 0x41_000;
+            memory.map_bytes(out, &[0_u8; 0x40]);
+
+            let text = 0x42_000;
+            memory.map_bytes(text, &[0_u8; 0x40]);
+            memory.write_u16(text, u16::from(b'A'));
+            memory.write_u16(text + 2, u16::from(b'B'));
+            memory.write_u16(text + 4, 0);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::RtlInitUnicodeString,
+                    &[0xFFFF_FFFF, text],
+                )
+                .expect("invalid destination"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::RtlInitUnicodeString,
+                    &[text, text],
+                )
+                .expect("overlapping source and destination"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u16(text).unwrap(), 4);
+            assert_eq!(memory.read_u16(text + 2).unwrap(), 6);
+            assert_eq!(memory.read_u64(text + 8).unwrap(), text);
+
+            let attrs = 0x43_000;
+            let type_info = 0x44_000;
+            let lock_out = 0x45_000;
+            memory.map_bytes(attrs, &[0_u8; 0x40]);
+            memory.map_bytes(type_info, &[0_u8; 0x20]);
+            memory.write_u32(attrs, 0x38);
+            memory.write_u64(attrs + 0x20, 0xDEAD_BEEF);
+            memory.write_u64(attrs + 0x28, 0x20_0000);
+            memory.write_u32(type_info, 0x18);
+            memory.write_u64(type_info + 0x10, 0x18);
+            memory.write_u64(attrs + 0x30, type_info);
+            memory.map_bytes(lock_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfWaitLockCreate,
+                    &[attrs, lock_out],
+                )
+                .expect("wait lock with stale parent"),
+                STATUS_SUCCESS
+            );
+            let lock = memory.read_u64(lock_out).unwrap();
+            {
+                let state = island.inner.borrow();
+                let object = state.kmdf.objects.get(&lock).expect("wait lock object");
+                assert_eq!(object.context_size, 0x10_000);
+                assert_eq!(object.parent, Some(state.kmdf.driver_handle));
+            }
+
+            let short_config = 0x46_000;
+            memory.map_bytes(short_config, &[0_u8; 0x40]);
+            memory.write_u32(short_config, 0x1F);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDriverCreate,
+                    &[driver, 0, 0, short_config, out],
+                )
+                .expect("undersized driver config"),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let config = 0x46_040;
+            memory.map_bytes(config, &[0_u8; 0x40]);
+            memory.write_u32(config, 0x20);
+            memory.write_u64(config + 0x10, 0xDEAD_BEEF);
+            memory.write_u32(config + 0x18, 0xCA5A_2146);
+            memory.write_u32(config + 0x1C, 2);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDriverCreate,
+                    &[driver, 0, 0, config, out],
+                )
+                .expect("full driver config"),
+                STATUS_SUCCESS
+            );
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.evt_driver_unload, 0xDEAD_BEEF);
+                assert_eq!(state.kmdf.driver_pool_tag, 0xCA5A_2146);
+                assert_eq!(state.kmdf.driver_init_flags, 2);
+            }
+
+            let queue_config = 0x47_000;
+            let queue_out = 0x47_040;
+            memory.map_bytes(queue_config, &[0_u8; 0x20]);
+            memory.map_bytes(queue_out, &[0_u8; 8]);
+            memory.write_u32(queue_config, 0x0E);
+            memory.write_u32(queue_config + 4, 3);
+            memory.write_u8(queue_config + 0x0C, 1);
+            memory.write_u8(queue_config + 0x0D, 1);
+            let queues_before = island.inner.borrow().kmdf.queues.len();
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, queue_config, 0, queue_out],
+                )
+                .expect("invalid queue dispatch type"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(island.inner.borrow().kmdf.queues.len(), queues_before);
+
+            assert_eq!(
+                parse_service_name("\\Registry\\Machine\\System\\CurrentControlSet\\Other\\X"),
+                Err(STATUS_INVALID_PARAMETER)
+            );
+            assert_eq!(parse_service_name(""), Err(STATUS_INVALID_PARAMETER));
+        });
+    }
+
+    #[test]
+    fn wdf_request_iotarget_edges_reject_stale_devices_and_invalid_driver_objects() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(0, true);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfEdges");
+            let device_a = kmdf_device_named(&island, "WdfA");
+            let device_b = kmdf_device_named(&island, "WdfB");
+            let device_b_object = island
+                .inner
+                .borrow()
+                .kmdf
+                .devices
+                .get(&device_b)
+                .expect("device b")
+                .object_guest;
+            let out = 0x41_000;
+            memory.map_bytes(out, &[0_u8; 8]);
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device_a, out],
+                )
+                .expect("request create"),
+                STATUS_SUCCESS
+            );
+            let request = memory.read_u64(out).unwrap();
+            {
+                let state = island.inner.borrow();
+                assert_eq!(
+                    state
+                        .kmdf
+                        .objects
+                        .get(&request)
+                        .expect("request object")
+                        .parent,
+                    Some(device_a)
+                );
+                assert!(
+                    state
+                        .kmdf
+                        .objects
+                        .get(&device_a)
+                        .expect("device object")
+                        .children
+                        .contains(&request)
+                );
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectDelete,
+                    &[request],
+                )
+                .expect("delete request"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectDelete,
+                    &[request],
+                )
+                .expect("double delete request"),
+                STATUS_INVALID_HANDLE
+            );
+
+            let target_out = 0x42_000;
+            memory.map_bytes(target_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetCreate,
+                    &[0xDEAD, 0, target_out],
+                )
+                .expect("target for missing device"),
+                STATUS_INVALID_PARAMETER
+            );
+            let attrs = 0x43_000;
+            memory.map_bytes(attrs, &[0_u8; 0x40]);
+            memory.write_u32(attrs, 0x38);
+            memory.write_u64(attrs + 0x20, 0xDEAD_BEEF);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetCreate,
+                    &[device_a, attrs, target_out],
+                )
+                .expect("target with stale parent"),
+                STATUS_SUCCESS
+            );
+            let target = memory.read_u64(target_out).unwrap();
+            {
+                let state = island.inner.borrow();
+                assert_eq!(
+                    state
+                        .kmdf
+                        .objects
+                        .get(&target)
+                        .expect("target object")
+                        .parent,
+                    Some(device_a)
+                );
+                assert!(
+                    state
+                        .kmdf
+                        .objects
+                        .get(&device_a)
+                        .expect("device object")
+                        .children
+                        .contains(&target)
+                );
+            }
+
+            let driver = island.driver_object_pointer();
+            let major_slot = driver + 0x70 + IrpMajorFunction::DeviceControl.code() as u64 * 8;
+            memory.write_u64(major_slot, 0);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetSendIoctlSynchronously,
+                    &[target, 0, 0x0022_0004, 0, 0, 0, 0],
+                )
+                .expect("sync send without handler"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, device_a, out],
+                )
+                .expect("send request create"),
+                STATUS_SUCCESS
+            );
+            let send_request = memory.read_u64(out).unwrap();
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestFormatRequestForIoctl,
+                    &[send_request, target, 0x0022_0004, 0, 0, 0, 0, 0],
+                )
+                .expect("format request"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestSend,
+                    &[send_request, target, 0],
+                )
+                .expect("send without handler"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            let (completed, status, _, _) = island
+                .kmdf_request_state(send_request)
+                .expect("request state");
+            assert!(completed);
+            assert_eq!(status, STATUS_INVALID_DEVICE_REQUEST);
+
+            let saved_driver_object = island.inner.borrow().driver_object_guest;
+            island.inner.borrow_mut().driver_object_guest = 0x7000_0000_0000;
+            let sync_error = call_island_shim_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::WdfIoTargetSendIoctlSynchronously,
+                &[target, 0, 0x0022_0004, 0, 0, 0, 0],
+            )
+            .expect_err("sync send with corrupt driver object");
+            assert_eq!(sync_error.code, ReasonCode::RcUnimplInsn);
+            {
+                let mut state = island.inner.borrow_mut();
+                if let Some(request) = state.kmdf.requests.get_mut(&send_request) {
+                    request.completed = false;
+                }
+            }
+            let send_error = call_island_shim_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::WdfRequestSend,
+                &[send_request, target, 0],
+            )
+            .expect_err("request send with corrupt driver object");
+            assert_eq!(send_error.code, ReasonCode::RcUnimplInsn);
+            island.inner.borrow_mut().driver_object_guest = saved_driver_object;
+            memory.write_u64(major_slot, 0);
+
+            let irp_guest = 0x44_000;
+            memory.map_bytes(irp_guest, &[0_u8; 0x100]);
+            {
+                let mut state = island.inner.borrow_mut();
+                let casak = state.kmdf.devices.get(&device_b).expect("device b").casak;
+                let _ = state.io.delete_device(casak);
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfEvtIoDeviceControlDispatch,
+                    &[irp_guest, device_b_object],
+                )
+                .expect("dispatch to deleted device"),
+                crate::casak::io::STATUS_DELETE_PENDING as i32
+            );
+            assert_eq!(
+                memory.read_u32(irp_guest + 0x30).unwrap(),
+                crate::casak::io::STATUS_DELETE_PENDING as u32
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_queue_stop_start_and_purge_reject_orphaned_requests() {
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(0, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfQueueEdges");
+            let image_base = island.image_base();
+            let device = kmdf_device_named(&island, "WdfA");
+            let queue = queue_for_device(&island, device);
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfA", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStopSynchronously,
+                    &[queue],
+                )
+                .expect("stop empty queue"),
+                STATUS_SUCCESS
+            );
+            let input = 0x46_000;
+            let output = 0x47_000;
+            let iosb = 0x48_000;
+            memory.map_bytes(input, b"PING");
+            memory.map_bytes(output, &[0_u8; 8]);
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            for _ in 0..2 {
+                assert_eq!(
+                    dispatch_nt_thunk(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::NtDeviceIoControlFile,
+                        &[
+                            u64::from(handle),
+                            0,
+                            0,
+                            0,
+                            iosb,
+                            0x0022_0004,
+                            input,
+                            4,
+                            output,
+                            8,
+                        ],
+                    ),
+                    STATUS_PENDING
+                );
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStopSynchronously,
+                    &[queue],
+                )
+                .expect("stop queued queue"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_STOP_COUNT))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStart,
+                    &[queue],
+                )
+                .expect("restart queue"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_RESUME_COUNT))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                memory
+                    .read_u32(image_base + u64::from(F_IOCTL_COUNT))
+                    .unwrap(),
+                2
+            );
+            {
+                let state = island.inner.borrow();
+                let queue_state = state.kmdf.queues.get(&queue).expect("queue");
+                assert!(queue_state.queued.is_empty());
+                assert!(queue_state.in_flight.is_empty());
+                assert!(!queue_state.stopped);
+                assert_eq!(state.kmdf.stop_dispatches, 2);
+                assert_eq!(state.kmdf.resume_dispatches, 2);
+                assert!(
+                    state
+                        .kmdf
+                        .requests
+                        .values()
+                        .all(|request| request.completed)
+                );
+            }
+
+            let ret_stub = x64_ret_stub(&mut memory, &island);
+            set_queue_callbacks(&island, queue, |queue| {
+                queue.callbacks.device_control = ret_stub;
+            });
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtDeviceIoControlFile,
+                    &[
+                        u64::from(handle),
+                        0,
+                        0,
+                        0,
+                        iosb,
+                        0x0022_0004,
+                        input,
+                        4,
+                        output,
+                        8,
+                    ],
+                ),
+                STATUS_PENDING
+            );
+            let in_flight_request = island
+                .inner
+                .borrow()
+                .kmdf
+                .requests
+                .iter()
+                .find(|(_, request)| !request.completed && request.queue == Some(queue))
+                .map(|(request, _)| *request)
+                .expect("in-flight request");
+            let (_, _, _, outer) = island
+                .kmdf_request_state(in_flight_request)
+                .expect("request state");
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueuePurge,
+                    &[queue],
+                )
+                .expect("purge in-flight request"),
+                STATUS_SUCCESS
+            );
+            let (completed, status, _, outer_after) = island
+                .kmdf_request_state(in_flight_request)
+                .expect("request state");
+            assert!(completed);
+            assert_eq!(status, STATUS_CANCELLED);
+            assert_eq!(outer_after, outer);
+            assert_eq!(
+                memory.read_u32(outer + 0x30).unwrap(),
+                STATUS_CANCELLED as u32
+            );
+            assert_eq!(island.inner.borrow().kmdf.cancel_dispatches, 1);
+            assert!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .queues
+                    .get(&queue)
+                    .expect("queue")
+                    .in_flight
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn wait_lock_gate_poison_race_and_corrupt_driver_object_reject() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfPoison");
+            let lock = island.kmdf_wait_lock_handles()[0];
+            let gate = island.kmdf_wait_lock_gate(lock).expect("gate");
+            let poison = gate.clone();
+            let panicked = std::thread::spawn(move || {
+                let (mutex, _) = &*poison;
+                let _guard = mutex.lock().expect("lock before poison");
+                panic!("poison wait lock mutex");
+            })
+            .join();
+            assert!(panicked.is_err());
+            assert!(gate.0.is_poisoned());
+            {
+                let (mutex, _) = &*gate;
+                let mut locked = mutex.lock().unwrap_err().into_inner();
+                *locked = true;
+            }
+            let notify = gate.clone();
+            let notifier = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let (mutex, wake) = &*notify;
+                let mut locked = mutex.lock().unwrap_err().into_inner();
+                *locked = false;
+                drop(locked);
+                wake.notify_all();
+            });
+            assert_eq!(
+                island.inner.borrow().wait_lock_acquire_gate(&gate, None),
+                STATUS_SUCCESS
+            );
+            notifier.join().expect("notifier");
+            {
+                let (mutex, _) = &*gate;
+                let mut locked = mutex.lock().unwrap_err().into_inner();
+                *locked = true;
+            }
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .wait_lock_acquire_gate(&gate, Some(Duration::from_millis(20))),
+                STATUS_TIMEOUT
+            );
+
+            let (handle, status) =
+                create_device_file(&mut runtime, &mut memory, "\\Device\\WdfCasa", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            let driver_object = island.driver_object_pointer();
+            let saved_driver_object = island.inner.borrow().driver_object_guest;
+            island.inner.borrow_mut().driver_object_guest = 0x7000_0000_0000;
+            let error = dispatch_island_device_io(
+                &mut runtime,
+                &mut memory,
+                handle,
+                IrpMajorFunction::DeviceControl,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+            .expect_err("dispatch with corrupt driver object");
+            assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+            island.inner.borrow_mut().driver_object_guest = saved_driver_object;
+            let major_slot =
+                driver_object + 0x70 + IrpMajorFunction::DeviceControl.code() as u64 * 8;
+            let saved_handler = memory.read_u64(major_slot).unwrap();
+            memory.write_u64(major_slot, 0);
+            assert_eq!(
+                dispatch_island_device_io(
+                    &mut runtime,
+                    &mut memory,
+                    handle,
+                    IrpMajorFunction::DeviceControl,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("dispatch without handler"),
+                Some((STATUS_INVALID_DEVICE_REQUEST, 0))
+            );
+            memory.write_u64(major_slot, saved_handler);
+        });
+    }
+
+    #[test]
+    fn pe32_unload_corrupt_callback_and_exhausted_unicode_arena_reject() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver_pe32();
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x86(&image, "CasaPe32Edges");
+            let driver = island.driver_object_pointer();
+            let default_dispatch = island.inner.borrow().default_dispatch;
+            assert_eq!(
+                memory.read_u32(driver + 0x38).unwrap(),
+                default_dispatch as u32
+            );
+            let image_base = island.image_base();
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.unload_guest, None);
+                assert_eq!(
+                    state.kmdf.evt_driver_unload,
+                    image_base + u64::from(X86K_UNLOAD_RVA)
+                );
+            }
+            assert_eq!(memory.read_u32(driver + 0x34).unwrap(), 0);
+
+            let header = {
+                let mut state = island.inner.borrow_mut();
+                allocate_unicode_string(&mut state, &mut memory, "AB").expect("unicode string")
+            };
+            assert_eq!(memory.read_u16(header).unwrap(), 4);
+            assert_eq!(memory.read_u16(header + 2).unwrap(), 6);
+            assert_ne!(memory.read_u32(header + 4).unwrap(), 0);
+
+            let saved_cursor = {
+                let mut state = island.inner.borrow_mut();
+                let saved = state.arena.cursor;
+                state.arena.cursor = state.arena.end;
+                saved
+            };
+            let error = {
+                let mut state = island.inner.borrow_mut();
+                allocate_unicode_string(&mut state, &mut memory, "AB").expect_err("exhausted arena")
+            };
+            assert_eq!(error.code, ReasonCode::RcIo);
+            assert!(
+                error.message.contains("driver island arena exhausted"),
+                "{}",
+                error.message
+            );
+            island.inner.borrow_mut().arena.cursor = saved_cursor;
+
+            island.inner.borrow_mut().kmdf.evt_driver_unload = 0xDEAD_BEEF;
+            let service_path = guest_unicode_string_x86(
+                &mut memory,
+                0x40_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaPe32Edges",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert!(island.is_loaded());
+        });
+    }
+
+    #[test]
+    fn kmdf_short_attributes_and_zero_destination_reject_implicit_members() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfAttrShort");
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::RtlInitUnicodeString,
+                    &[0, 0xDEAD_BEEF],
+                )
+                .expect("zero destination must be accepted"),
+                STATUS_SUCCESS
+            );
+
+            let attrs = 0x41_000;
+            memory.map_bytes(attrs, &[0_u8; 0x40]);
+            memory.write_u32(attrs, 8);
+            let parsed = island
+                .inner
+                .borrow()
+                .parse_object_attributes(&memory, attrs)
+                .expect("short attributes");
+            assert_eq!(parsed.evt_cleanup, 0);
+            assert_eq!(parsed.evt_destroy, 0);
+            assert_eq!(parsed.parent, None);
+            assert_eq!(parsed.context_size_override, 0);
+            assert_eq!(parsed.context_type_info, 0);
+
+            memory.write_u32(attrs, 0x28);
+            memory.write_u64(attrs + 0x20, 0x1234_5678);
+            memory.write_u64(attrs + 0x28, 0xDEAD_BEEF);
+            memory.write_u64(attrs + 0x30, 0xFEED_FACE);
+            let parsed = island
+                .inner
+                .borrow()
+                .parse_object_attributes(&memory, attrs)
+                .expect("parent-only attributes");
+            assert_eq!(parsed.parent, Some(0x1234_5678));
+            assert_eq!(parsed.context_size_override, 0);
+            assert_eq!(parsed.context_type_info, 0);
+        });
+    }
+
+    #[test]
+    fn kmdf_driver_and_queue_config_omissions_reject_implicit_fields() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfConfigOmit");
+            let driver = island.driver_object_pointer();
+            let out = 0x41_000;
+            memory.map_bytes(out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDriverCreate,
+                    &[driver, 0, 0, 0, out],
+                )
+                .expect("config-less driver create"),
+                STATUS_SUCCESS
+            );
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.evt_driver_unload, 0);
+                assert_eq!(state.kmdf.driver_pool_tag, 0);
+                assert_eq!(state.kmdf.driver_init_flags, 0);
+            }
+
+            let device = island.kmdf_device_handles()[0];
+            let config = 0x42_000;
+            let queue_out = 0x43_000;
+            memory.map_bytes(config, &[0_u8; 0x20]);
+            memory.map_bytes(queue_out, &[0_u8; 8]);
+            memory.write_u32(config, 8);
+            memory.write_u32(config + 4, 0);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, config, 0, queue_out],
+                )
+                .expect("short queue config"),
+                STATUS_SUCCESS
+            );
+            let queue = memory.read_u64(queue_out).unwrap();
+            {
+                let state = island.inner.borrow();
+                let record = state.kmdf.queues.get(&queue).expect("created queue");
+                assert_eq!(record.default_queue, false);
+                assert_eq!(record.dispatch_type, 0);
+                assert_eq!(record.callbacks.default, 0);
+                assert_eq!(record.callbacks.device_control, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn kmdf_object_parent_edges_and_driverless_delete_reject_cascade() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfParentEdges");
+            let device = island.kmdf_device_handles()[0];
+            let attrs = 0x41_000;
+            memory.map_bytes(attrs, &[0_u8; 0x40]);
+            memory.write_u32(attrs, 0x38);
+            memory.write_u64(attrs + 0x20, device);
+            let request_out = 0x42_000;
+            memory.map_bytes(request_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[attrs, device, request_out],
+                )
+                .expect("request with explicit parent"),
+                STATUS_SUCCESS
+            );
+            let request = memory.read_u64(request_out).unwrap();
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .objects
+                    .get(&request)
+                    .expect("request object")
+                    .parent,
+                Some(device)
+            );
+
+            let saved_driver_object = island.inner.borrow().driver_object_guest;
+            island.inner.borrow_mut().driver_object_guest = 0;
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectDelete,
+                    &[request],
+                )
+                .expect("driverless object delete"),
+                STATUS_SUCCESS
+            );
+            island.inner.borrow_mut().driver_object_guest = saved_driver_object;
+            assert_eq!(
+                island.inner.borrow().kmdf.objects.contains_key(&request),
+                false
+            );
+
+            let target_out = 0x43_000;
+            memory.map_bytes(target_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoTargetCreate,
+                    &[device, attrs, target_out],
+                )
+                .expect("iotarget with explicit parent"),
+                STATUS_SUCCESS
+            );
+            let target = memory.read_u64(target_out).unwrap();
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .objects
+                    .get(&target)
+                    .expect("target object")
+                    .parent,
+                Some(device)
+            );
+        });
+    }
+
+    #[test]
+    fn kmdf_queue_callback_absence_and_stale_completion_edges_reject() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfQueueNoCallbacks");
+            let device = island.kmdf_device_handles()[0];
+            let queue = *island
+                .inner
+                .borrow()
+                .kmdf
+                .queues
+                .keys()
+                .next()
+                .expect("queue");
+            set_queue_callbacks(&island, queue, |record| {
+                record.callbacks.stop = 0;
+                record.callbacks.resume = 0;
+                record.callbacks.canceled_on_queue = 0;
+            });
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStop,
+                    &[queue],
+                )
+                .expect("stop without callback"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .queues
+                    .get(&queue)
+                    .expect("queue")
+                    .stopped,
+                true
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStart,
+                    &[queue],
+                )
+                .expect("start without callback"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .queues
+                    .get(&queue)
+                    .expect("queue")
+                    .stopped,
+                false
+            );
+
+            island
+                .inner
+                .borrow_mut()
+                .kmdf
+                .queues
+                .get_mut(&queue)
+                .expect("queue")
+                .queued
+                .push_back(0xDEAD);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueuePurge,
+                    &[queue],
+                )
+                .expect("purge stale queued handle"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .kmdf
+                    .queues
+                    .get(&queue)
+                    .expect("queue")
+                    .queued
+                    .is_empty(),
+                true
+            );
+
+            let request = make_kmdf_request(
+                &island,
+                &mut memory,
+                device,
+                queue,
+                IrpMajorFunction::DeviceControl,
+            );
+            island
+                .inner
+                .borrow_mut()
+                .kmdf
+                .requests
+                .get_mut(&request)
+                .expect("request")
+                .queue = Some(0xDEAD);
+            island
+                .inner
+                .borrow_mut()
+                .complete_kmdf_request(&mut memory, request, STATUS_CANCELLED, 0)
+                .expect("complete request with stale queue");
+            let (completed, status, _, _) = island.kmdf_request_state(request).expect("state");
+            assert_eq!(completed, true);
+            assert_eq!(status, STATUS_CANCELLED);
+        });
+    }
+
+    #[test]
+    fn kmdf_dispatch_arena_exhaustion_rejects_with_io_error() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _directory, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfArenaFault");
+            let device_object = *island
+                .inner
+                .borrow()
+                .kmdf
+                .devices_by_object
+                .keys()
+                .next()
+                .expect("device object");
+            let saved_cursor = {
+                let mut state = island.inner.borrow_mut();
+                let saved = state.arena.cursor;
+                state.arena.cursor = state.arena.end;
+                saved
+            };
+            let error = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::WdfEvtIoDeviceControlDispatch,
+                &[0, device_object],
+            )
+            .expect_err("exhausted arena must reject request creation");
+            assert_eq!(error.code, ReasonCode::RcIo);
+            assert_eq!(
+                error.message.contains("driver island arena exhausted"),
+                true
+            );
+            island.inner.borrow_mut().arena.cursor = saved_cursor;
         });
     }
 }

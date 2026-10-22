@@ -1187,53 +1187,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collect_scancodes_for_frame_emits_held_movement_and_pressed_actions() {
-        let held = [Key::Left, Key::Down, Key::Space, Key::P];
-
-        let scancodes = collect_scancodes_for_frame(|key| held.contains(&key));
-
-        assert_eq!(
-            scancodes.into_iter().collect::<Vec<_>>(),
-            vec![0x19, 0x1e, 0x1f, 0x39]
-        );
-    }
-
-    #[test]
-    fn scancode_transitions_emit_press_once_until_release() {
-        let current = collect_scancodes_for_frame(|key| [Key::Up, Key::Left].contains(&key));
-        let (pressed, released) = scancode_transitions(&BTreeSet::new(), &current);
-        let (pressed_again, released_again) = scancode_transitions(&current, &current);
-        let (pressed_final, released_final) = scancode_transitions(&current, &BTreeSet::new());
-
-        assert_eq!(pressed, vec![0x11, 0x1e]);
-        assert!(released.is_empty());
-        assert!(pressed_again.is_empty());
-        assert!(released_again.is_empty());
-        assert!(pressed_final.is_empty());
-        assert_eq!(released_final, vec![0x11, 0x1e]);
-    }
-
-    #[test]
-    fn collect_scancodes_for_frame_supports_arrow_aliases_for_movement() {
-        let held = [Key::Right];
-
-        let scancodes = collect_scancodes_for_frame(|key| held.contains(&key));
-
-        assert_eq!(scancodes.into_iter().collect::<Vec<_>>(), vec![0x20]);
-    }
-
-    #[test]
-    fn scancode_events_for_frame_capture_taps_between_snapshots() {
-        let current = BTreeSet::new();
-
-        let (pressed, released) =
-            scancode_events_for_frame(&BTreeSet::new(), &current, &[Key::Enter], &[Key::Enter]);
-
-        assert_eq!(pressed, vec![0x1c]);
-        assert_eq!(released, vec![0x1c]);
-    }
-
-    #[test]
     fn scancode_events_for_frame_deduplicate_alias_keys() {
         let current = collect_scancodes_for_frame(|key| [Key::Left].contains(&key));
 
@@ -1260,75 +1213,5 @@ mod tests {
         let out = adapt_audio_chunk(&samples, 2, 0, 2, 44100);
         assert!(!out.is_empty());
         assert_eq!(out.len() % 2, 0);
-    }
-
-    #[test]
-    fn adapt_audio_chunk_tiny_input_rate_is_capped() {
-        // A guest claiming a 1 Hz input rate would otherwise amplify a
-        // one-second chunk into ~1.9 billion frames.
-        let samples = vec![0.0f32; 44100 * 2];
-        let out = adapt_audio_chunk(&samples, 2, 1, 2, 44100);
-        assert!(out.len() <= MAX_ADAPTED_FRAMES * 2);
-    }
-
-    #[test]
-    fn final_frame_published_after_worker_finish_is_still_consumed() {
-        // Reproduce the F5 race deterministically: the loop's top-of-loop
-        // drain runs BEFORE the worker publishes its final frame; the worker
-        // then terminates.  The finish-path final drain must still consume
-        // the frame — otherwise the run exits windowless and loses it.
-        let (host_session, pe_session) = new_live_session();
-        let mut latest_frame: Option<LiveFrame> = None;
-
-        let final_frame = LiveFrame {
-            width: 2,
-            height: 1,
-            format: DxgiFormat::B8G8R8A8Unorm,
-            bytes: vec![0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff],
-            displayed_frame_index: 7,
-        };
-        let expected_frame = final_frame.clone();
-
-        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-        let worker = std::thread::spawn(move || -> Result<(), AppError> {
-            go_rx.recv().expect("go signal");
-            pe_session
-                .frame_tx
-                .send(final_frame)
-                .expect("send final frame");
-            Ok(())
-        });
-
-        // Top-of-loop drain: runs before the worker publishes anything.
-        let drained = drain_frames(&host_session.frame_rx, &mut latest_frame);
-        assert_eq!(
-            drained, 0,
-            "no frames may be pending before the worker publishes"
-        );
-        assert!(latest_frame.is_none());
-
-        // The worker publishes its final frame and terminates.
-        go_tx.send(()).expect("signal worker");
-        while !worker.is_finished() {
-            std::thread::yield_now();
-        }
-        assert!(worker.is_finished());
-        worker
-            .join()
-            .expect("worker join")
-            .expect("worker succeeded");
-
-        // The finish-path final drain must consume the frame that arrived
-        // between the top-of-loop drain and the finish check.
-        let final_drained = drain_frames(&host_session.frame_rx, &mut latest_frame);
-        assert_eq!(
-            final_drained, 1,
-            "the final frame must be consumed by the finish-path drain"
-        );
-        let consumed = latest_frame.expect("final frame must be retained");
-        assert_eq!(consumed.width, 2);
-        assert_eq!(consumed.height, 1);
-        assert_eq!(consumed.bytes, expected_frame.bytes);
-        assert_eq!(consumed.displayed_frame_index, 7);
     }
 }

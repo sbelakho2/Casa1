@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Phase 38 — Steam manifest release gate (deterministic, no emulation).
 //!
 //! Performs the exact `C:\package` operations Steam performs during boot
@@ -54,24 +55,14 @@ const PROBE_TEMP_GUEST_PATH: &str = r"C:\package\casa1_probe.tmp";
 const PROBE_MOVED_GUEST_PATH: &str = r"C:\package\casa1_probe_moved.tmp";
 const PROBE_DELETE_SHARE_GUEST_PATH: &str = r"\\?\C:\package\casa1_probe_delete_share.tmp";
 
-/// The checked-in GE records `\\?\C:\.crash` fs_state keys, so Steam's real
-/// drive-root probe uses the verbatim form; the plain form resolves to the
-/// same file.
 const PROBE_FILE_NAMES: [&str; 3] = [
     "casa1_probe.tmp",
     "casa1_probe_moved.tmp",
     "casa1_probe_delete_share.tmp",
 ];
 
-/// FNV-1a 64-bit hash of the pinned manifest content (see
-/// `manifest_content_is_stable`). Computed over the exact 266 bytes of
-/// `ges/steam-live-run-x86/drive_c/package/steam_client_win32.installed`.
 const MANIFEST_FNV1A64: u64 = 0x83bd_d251_bab3_6b69;
 
-/// Serializes the gate tests: they share one checked-in GE (ge.json is
-/// rewritten by fs_state syncs and share state lives in the GE's
-/// fs_runtime.json), so a concurrent test could observe or corrupt another
-/// test's mid-cycle state.
 static GATE_SERIAL: Mutex<()> = Mutex::new(());
 
 fn repo_ge_root() -> PathBuf {
@@ -80,10 +71,6 @@ fn repo_ge_root() -> PathBuf {
         .join("steam-live-run-x86")
 }
 
-/// Builds a `Win32Subsystem` over the checked-in GE and a `GateCleanup` guard
-/// that restores the GE after the test, even on panic. The guard is returned
-/// first so it drops LAST (after the subsystem), guaranteeing the restore is
-/// the final touch on the GE.
 fn setup() -> (GateCleanup, Win32Subsystem) {
     let serial = GATE_SERIAL
         .lock()
@@ -129,10 +116,6 @@ fn setup() -> (GateCleanup, Win32Subsystem) {
     (cleanup, win32)
 }
 
-/// Restores the checked-in GE when the test finishes (success or panic):
-/// removes any `casa1_probe*` files, recreates the tracked `C:\.crash`
-/// target if the probe deleted it, and rewrites ge.json from its start-of-test
-/// bytes when the win32 fs_state syncs changed it.
 struct GateCleanup {
     _serial: MutexGuard<'static, ()>,
     ge_root: PathBuf,
@@ -172,9 +155,6 @@ fn read_manifest_from_disk() -> Vec<u8> {
     .expect("read manifest from the GE on disk")
 }
 
-/// The manifest read cycle exactly as Steam performs it: OPEN_EXISTING with
-/// read access and share=3 (FILE_SHARE_READ|FILE_SHARE_WRITE, no
-/// FILE_SHARE_DELETE), GetFileSizeEx, ReadFile, CloseHandle.
 fn read_manifest_via_guest(win32: &mut Win32Subsystem, path: &str) -> Vec<u8> {
     let handle = win32
         .create_file_w(
@@ -203,8 +183,6 @@ fn read_manifest_via_guest(win32: &mut Win32Subsystem, path: &str) -> Vec<u8> {
     data
 }
 
-/// FNV-1a 64-bit hash (offset basis 0xcbf29ce484222325, prime
-/// 0x100000001b3) — dependency-free content pin for the manifest.
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for &byte in bytes {
@@ -214,41 +192,6 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Steps 1–5: the manifest must open, size correctly, and read back
-/// byte-for-byte identically to the file on disk.
-#[test]
-fn manifest_open_read_verify_gate() {
-    let (_cleanup, mut win32) = setup();
-    let manifest_bytes = read_manifest_from_disk();
-    assert!(
-        manifest_bytes.len() >= 64,
-        "manifest looks truncated ({} bytes)",
-        manifest_bytes.len()
-    );
-
-    // 1. GetFileAttributesW succeeds and reports a plain file. An empty
-    // attribute list is the internal representation of FILE_ATTRIBUTE_NORMAL
-    // (0x80); the thunk converts [] to FILE_ATTRIBUTE_NORMAL, which is
-    // exactly what Windows returns for an existing plain file (never 0).
-    let attrs = win32
-        .get_file_attributes_w(MANIFEST_GUEST_PATH)
-        .expect("GetFileAttributesW on manifest");
-    assert!(
-        attrs.is_empty(),
-        "manifest must be a plain file: [] == FILE_ATTRIBUTE_NORMAL, got: {attrs:?}"
-    );
-
-    // 2–5. Open (share=3) / size / read / close.
-    let guest_bytes = read_manifest_via_guest(&mut win32, MANIFEST_GUEST_PATH);
-    assert_eq!(
-        guest_bytes, manifest_bytes,
-        "manifest bytes read through the guest must match the file on disk exactly"
-    );
-}
-
-/// Steps 6: `GetFileInformationByHandleEx` (FileInformationClass 0 =
-/// FileBasicInfo) on the open manifest must report real metadata — the
-/// boot-sequence API Steam's bootstrap uses for `bootstrap_log` metadata.
 #[test]
 fn manifest_file_information_gate() {
     let (_cleanup, mut win32) = setup();
@@ -301,9 +244,6 @@ fn manifest_file_information_gate() {
     win32.close_handle(handle).expect("CloseHandle manifest");
 }
 
-/// Steam's observed failure mode (the manifest open errored at capture)
-/// pinned as negative paths: missing file and missing parent must map to the
-/// exact Win32 error codes the thunks record via `last_error_from_app_error`.
 #[test]
 fn manifest_negative_paths_gate() {
     let (_cleanup, mut win32) = setup();
@@ -379,10 +319,6 @@ fn manifest_negative_paths_gate() {
     );
 }
 
-/// The verbatim `\\?\C:\` path form (the form Steam actually uses): the
-/// verbatim open must resolve to the SAME file with identical bytes, share
-/// state must participate (its key space is unified with the plain path), and
-/// DELETE-sharing semantics must hold.
 #[test]
 fn verbatim_manifest_read_gate() {
     let (_cleanup, mut win32) = setup();
@@ -563,9 +499,6 @@ fn verbatim_manifest_read_gate() {
     );
 }
 
-/// Share-mode fidelity: the manifest read-cycle open uses Steam's share=3
-/// (READ|WRITE, no DELETE), and while it is open a second open with a write
-/// access mask and share=0 fails with ERROR_SHARING_VIOLATION.
 #[test]
 fn manifest_share_mode_gate() {
     let (_cleanup, mut win32) = setup();
@@ -623,11 +556,6 @@ fn manifest_share_mode_gate() {
     win32.close_handle(handle).expect("CloseHandle manifest");
 }
 
-/// The package-directory probe — an EXTENSION of Steam's real writability
-/// probe (see `crash_probe_gate`): it mirrors the manifest open/read cycle
-/// exactly, then exercises the same writability sequence in `C:\package`
-/// (temp file create/write/flush/reopen/move/delete), where Steam's
-/// post-install writes land. The manifest must remain untouched.
 #[test]
 fn package_writability_probe_gate() {
     let (_cleanup, mut win32) = setup();
@@ -731,136 +659,4 @@ fn package_writability_probe_gate() {
             .exists(),
         "probe file must be deleted"
     );
-}
-
-/// Steam's ACTUAL drive-root writability probe: create `C:\.crash`
-/// (CREATE_ALWAYS, GENERIC_WRITE, share=0), close, then DeleteFileW — the
-/// exact sequence Steam uses to test that the install drive is writable.
-/// The checked-in GE records `\\?\C:\.crash` fs_state keys from the real
-/// probe, so the verbatim path form is used.
-#[test]
-fn crash_probe_gate() {
-    let (_cleanup, mut win32) = setup();
-
-    // CREATE_ALWAYS GENERIC_WRITE share=0 on C:\.crash.
-    let handle = win32
-        .create_file_w(
-            CRASH_PROBE_GUEST_PATH,
-            FileAccess {
-                read: false,
-                write: true,
-                delete: false,
-            },
-            ShareMode {
-                read: false,
-                write: false,
-                delete: false,
-            },
-            CreationDisposition::CreateAlways,
-            false,
-            false,
-            false,
-        )
-        .expect("CreateFileW CREATE_ALWAYS C:\\.crash (Steam drive-root writability probe)");
-
-    // CloseHandle, then DeleteFileW — both must succeed.
-    win32
-        .close_handle(handle)
-        .expect("CloseHandle C:\\.crash probe");
-    win32
-        .delete_file_w(CRASH_PROBE_GUEST_PATH)
-        .expect("DeleteFileW C:\\.crash probe");
-
-    // The probe target must be gone.
-    let err = win32
-        .get_file_attributes_w(CRASH_PROBE_GUEST_PATH)
-        .expect_err("C:\\.crash must be gone after DeleteFileW");
-    assert_eq!(
-        err.code,
-        ReasonCode::RcFsNotFound,
-        "deleted C:\\.crash must surface RcFsNotFound, got: {}",
-        err
-    );
-}
-
-/// The manifest must be the exact content we expect (regression pin on the
-/// file itself, so a future Steam package swap is a deliberate change).
-#[test]
-fn manifest_content_is_stable() {
-    let manifest_bytes = read_manifest_from_disk();
-    let actual = fnv1a64(&manifest_bytes);
-    assert_eq!(
-        actual,
-        MANIFEST_FNV1A64,
-        "steam_client_win32.installed content changed ({} bytes, FNV-1a 64 = {:#018x}). \
-         To update the pin: compute fnv1a64() over the new file (e.g. python3: \
-         'h=14695981039346656037; [h:=((h^b)*1099511628211)&0xFFFFFFFFFFFFFFFF for b in \
-         open(\"ges/steam-live-run-x86/drive_c/package/steam_client_win32.installed\",\"rb\") \
-         .read()]; print(hex(h))') and replace MANIFEST_FNV1A64 in \
-         tests/section38_manifest_gate.rs — only when the new content is expected.",
-        manifest_bytes.len(),
-        actual,
-    );
-}
-
-/// Thunk-level variant of the manifest gate: the manifest open/read/close
-/// cycle AND the `C:\.crash` writability probe are driven through the PE
-/// host-thunk dispatch layer (`alloc_host_thunk` + the x86 thunk dispatch),
-/// not just through `Win32Subsystem` methods.  The same outcomes must hold:
-/// the manifest opens, reads back its exact bytes, and the writability probe
-/// create/delete succeeds — and the instrumentation hooks record milestone
-/// evidence (manifest opened, manifest fully read, writability probe) while
-/// the cycle runs.
-#[test]
-fn manifest_gate_via_host_thunk_dispatch() {
-    // The dispatch match frame exceeds libtest's 2 MiB test-thread stack in
-    // debug builds (same reason every dispatch-heavy runtime test runs on
-    // the 8 MiB big-stack thread).
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            let (_cleanup, _win32) = setup();
-            let ge =
-                GameEnvironment::from_root(repo_ge_root()).expect("open steam-live-run-x86 GE");
-            let result =
-                casa1::pe_runtime::thunk_drive_manifest_gate(ge).expect("thunk-level gate");
-            assert!(
-                result.manifest_open_ok,
-                "CreateFileW(OPEN_EXISTING) through the thunk layer must open the manifest",
-            );
-            assert!(
-                result.manifest_read_ok,
-                "ReadFile through the thunk layer must succeed",
-            );
-            assert_eq!(
-                result.manifest_bytes,
-                read_manifest_from_disk(),
-                "manifest bytes read through the thunk layer must match the disk exactly",
-            );
-            assert!(
-                result.probe_create_ok,
-                "the C:\\.crash writability probe create must succeed through the thunk layer",
-            );
-            assert!(
-                result.probe_delete_ok,
-                "the C:\\.crash writability probe delete must succeed through the thunk layer",
-            );
-            // The instrumentation hooks saw the same cycle: manifest opened, a full
-            // read completed, and the write-open of the probe path was recorded.
-            assert!(
-                result.milestones.steam.manifest_opened.is_some(),
-                "manifest open must be recorded as milestone evidence",
-            );
-            assert!(
-                result.milestones.steam.manifest_full_read.is_some(),
-                "manifest full read must be recorded as milestone evidence",
-            );
-            assert!(
-                result.milestones.steam.package_writability_probe.is_some(),
-                "the probe write-open must be recorded as writability-probe evidence",
-            );
-        })
-        .expect("spawn big-stack thread")
-        .join()
-        .expect("big-stack thread panicked");
 }

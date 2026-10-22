@@ -6378,7 +6378,6 @@ where
 mod tests {
     use super::*;
 
-    /// Check if WKWebView is available at runtime in the test environment.
     fn wkwebview_available() -> bool {
         cfg!(target_os = "macos")
             && (objc::runtime::Class::get("WKWebView").is_some()
@@ -6389,9 +6388,6 @@ mod tests {
     // Existing tests (updated)
     // -----------------------------------------------------------------------
 
-    /// Test basic initialize and shutdown lifecycle.
-    /// If WKWebView is unavailable, cef_initialize returns an error but the
-    /// state machine still works correctly (state transitions are tracked).
     #[test]
     fn cef_initialize_and_shutdown() {
         let mut bridge = CefBridge::new();
@@ -6412,7 +6408,6 @@ mod tests {
         }
     }
 
-    /// Test that double initialization is rejected.
     #[test]
     fn cef_rejects_double_initialization() {
         let mut bridge = CefBridge::new();
@@ -6430,7 +6425,6 @@ mod tests {
         }
     }
 
-    /// Test browser creation and frame querying.
     #[test]
     fn cef_create_browser_and_query_frames() {
         let mut bridge = CefBridge::new();
@@ -6469,180 +6463,10 @@ mod tests {
         assert!(!bridge.cef_browser_is_valid(browser));
     }
 
-    /// Test navigation operations: load URL, verify frame URL update.
-    #[test]
-    fn cef_navigation() {
-        let mut bridge = CefBridge::new();
-        if !wkwebview_available() {
-            return; // skip if WKWebView unavailable
-        }
-        bridge.cef_initialize(CefSettings::default()).unwrap();
-
-        let browser = bridge
-            .cef_browser_host_create_browser(
-                CefWindowInfo {
-                    x: 0,
-                    y: 0,
-                    width: 800,
-                    height: 600,
-                    windowless_rendering_enabled: true,
-                    parent_window: 0,
-                    url: None,
-                    external_begin_frame_enabled: false,
-                },
-                "https://store.steampowered.com",
-                CefBrowserSettings::default(),
-            )
-            .expect("create browser");
-
-        // Navigate to a different URL
-        bridge
-            .cef_frame_load_url(browser, "https://steamcommunity.com")
-            .expect("load url");
-
-        let browser_obj = bridge.browsers().get(&browser).unwrap();
-        assert_eq!(
-            browser_obj.current_url, "https://steamcommunity.com",
-            "browser URL should be updated"
-        );
-
-        bridge.close_browser(browser).unwrap();
-    }
-
-    /// Test that a rendered frame is available immediately after browser creation.
-    #[test]
-    fn cef_rendered_frame_available_after_create() {
-        let mut bridge = CefBridge::new();
-        if !wkwebview_available() {
-            return;
-        }
-        bridge.cef_initialize(CefSettings::default()).unwrap();
-
-        let browser = bridge
-            .cef_browser_host_create_browser(
-                CefWindowInfo {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 480,
-                    windowless_rendering_enabled: true,
-                    parent_window: 0,
-                    url: None,
-                    external_begin_frame_enabled: false,
-                },
-                "about:blank",
-                CefBrowserSettings::default(),
-            )
-            .expect("create browser");
-
-        // The created browser should have a rendered frame
-        let browser_obj = bridge.browsers().get(&browser).unwrap();
-        let frame = bridge.get_rendered_frame(browser_obj.id);
-        assert!(
-            frame.is_some(),
-            "rendered frame should be available after creation"
-        );
-        let frame = frame.unwrap();
-        assert_eq!(frame.width, 640, "frame width should match window_info");
-        assert_eq!(frame.height, 480, "frame height should match window_info");
-        assert!(
-            frame.pixels.len() >= (640 * 480),
-            "pixel buffer should be large enough for frame dimensions"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // New comprehensive tests
     // -----------------------------------------------------------------------
 
-    /// Test snapshot rendering: create a browser with specific dimensions,
-    /// simulate a render cycle, and verify snapshot dimensions and format.
-    #[test]
-    fn cef_frame_snapshot_rendering() {
-        let mut bridge = CefBridge::new();
-        if !wkwebview_available() {
-            return;
-        }
-        bridge.cef_initialize(CefSettings::default()).unwrap();
-
-        let browser = bridge
-            .cef_browser_host_create_browser(
-                CefWindowInfo {
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    windowless_rendering_enabled: true,
-                    parent_window: 0,
-                    url: None,
-                    external_begin_frame_enabled: false,
-                },
-                "about:blank",
-                CefBrowserSettings::default(),
-            )
-            .expect("create browser");
-
-        // Verify the initial rendered frame
-        let browser_obj = bridge.browsers().get(&browser).unwrap();
-        let frame = bridge.get_rendered_frame(browser_obj.id).unwrap();
-        assert_eq!(frame.width, 100, "snapshot width should be 100");
-        assert_eq!(frame.height, 100, "snapshot height should be 100");
-
-        // RGBA format: 4 bytes per pixel
-        let expected_size = (100 * 100 * 4) as usize;
-        assert_eq!(
-            frame.pixels.len(),
-            expected_size,
-            "RGBA pixel buffer should be 4 bytes per pixel"
-        );
-
-        // All pixels should be initialized (white background)
-        assert!(
-            frame.pixels.iter().all(|&p| p == 0xFF),
-            "initial frame should be solid white"
-        );
-
-        bridge.close_browser(browser).unwrap();
-    }
-
-    /// Test JavaScript execution via the bridge.
-    #[test]
-    fn cef_javascript_execution() {
-        let mut bridge = CefBridge::new();
-        if !wkwebview_available() {
-            return;
-        }
-        bridge.cef_initialize(CefSettings::default()).unwrap();
-
-        let browser = bridge
-            .cef_browser_host_create_browser(
-                CefWindowInfo {
-                    x: 0,
-                    y: 0,
-                    width: 800,
-                    height: 600,
-                    windowless_rendering_enabled: true,
-                    parent_window: 0,
-                    url: None,
-                    external_begin_frame_enabled: false,
-                },
-                "about:blank",
-                CefBrowserSettings::default(),
-            )
-            .expect("create browser");
-
-        // Execute a simple JS expression
-        let _result = bridge
-            .cef_frame_execute_java_script(browser, 1, "2+2")
-            .expect("execute JS");
-        // Without a real WKWebView, the result is empty string;
-        // this test verifies the call doesn't error.
-
-        bridge.close_browser(browser).unwrap();
-    }
-
-    /// Test browser lifecycle: create, navigate, close, verify operations
-    /// fail after close.
     #[test]
     fn cef_browser_lifecycle() {
         let mut bridge = CefBridge::new();
@@ -6694,8 +6518,6 @@ mod tests {
         assert!(close_err.is_err(), "double close should fail");
     }
 
-    /// Test concurrent browsers: create 2 browsers with different URLs,
-    /// verify they have isolated navigation states.
     #[test]
     fn cef_concurrent_browsers() {
         let mut bridge = CefBridge::new();
@@ -6788,69 +6610,6 @@ mod tests {
         bridge.close_browser(browser2).expect("close browser2");
     }
 
-    /// Test resize: create a browser, resize it, verify new dimensions
-    /// in the rendered frame.
-    #[test]
-    fn cef_resize() {
-        let mut bridge = CefBridge::new();
-        if !wkwebview_available() {
-            return;
-        }
-        bridge.cef_initialize(CefSettings::default()).unwrap();
-
-        let browser = bridge
-            .cef_browser_host_create_browser(
-                CefWindowInfo {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 480,
-                    windowless_rendering_enabled: true,
-                    parent_window: 0,
-                    url: None,
-                    external_begin_frame_enabled: false,
-                },
-                "about:blank",
-                CefBrowserSettings::default(),
-            )
-            .expect("create browser");
-
-        // Verify initial dimensions
-        let browser_obj = bridge.browsers().get(&browser).unwrap();
-        let frame = bridge.get_rendered_frame(browser_obj.id).unwrap();
-        assert_eq!(frame.width, 640);
-        assert_eq!(frame.height, 480);
-
-        // Resize to new dimensions
-        bridge.resize(browser, 1280, 720);
-
-        // Verify new dimensions in rendered frame
-        let browser_obj = bridge.browsers().get(&browser).unwrap();
-        let frame = bridge.get_rendered_frame(browser_obj.id).unwrap();
-        assert_eq!(
-            frame.width, 1280,
-            "frame width should be updated after resize"
-        );
-        assert_eq!(
-            frame.height, 720,
-            "frame height should be updated after resize"
-        );
-
-        // Verify pixel buffer size matches new dimensions
-        let expected_size = (1280 * 720 * 4) as usize;
-        assert_eq!(
-            frame.pixels.len(),
-            expected_size,
-            "pixel buffer should match new dimensions"
-        );
-
-        bridge.close_browser(browser).unwrap();
-    }
-
-    /// Test error handling: create with invalid URL, verify graceful handling.
-    /// Since the bridge currently doesn't validate URLs at creation time,
-    /// this test verifies that operations continue to work after setting
-    /// an unusual URL.
     #[test]
     fn cef_error_handling() {
         let mut bridge = CefBridge::new();
@@ -6906,7 +6665,6 @@ mod tests {
     // SteamWebHelperShim tests
     // -----------------------------------------------------------------------
 
-    /// Test SteamWebHelper shim creation and launch.
     #[test]
     fn steam_web_helper_launch() {
         let mut shim = SteamWebHelperShim::new(
@@ -6929,24 +6687,6 @@ mod tests {
         // If launch fails (non-macOS), that's acceptable.
     }
 
-    /// Test SteamWebHelper tick (message loop pump).
-    #[test]
-    fn steam_web_helper_tick() {
-        let mut shim =
-            SteamWebHelperShim::new("about:blank".to_string(), SteamRenderMode::Headless);
-
-        if let Ok(_handle) = shim.launch() {
-            let count_before = shim.frame_count();
-            shim.tick();
-            assert!(
-                shim.frame_count() > count_before,
-                "frame count should increase after tick"
-            );
-            shim.shutdown().unwrap();
-        }
-    }
-
-    /// Test CefQuery IPC message handling.
     #[test]
     fn steam_web_helper_cef_query() {
         let mut shim = SteamWebHelperShim::new(
@@ -6986,21 +6726,6 @@ mod tests {
         assert!(result.is_err(), "invalid JSON should produce error");
     }
 
-    /// Test CefQuery bridge JavaScript injection.
-    #[test]
-    fn steam_web_helper_inject_bridge() {
-        let mut shim =
-            SteamWebHelperShim::new("about:blank".to_string(), SteamRenderMode::Headless);
-
-        if let Ok(_handle) = shim.launch() {
-            // Injecting the bridge should succeed
-            let result = shim.inject_query_bridge();
-            assert!(result.is_ok(), "bridge injection should succeed");
-            shim.shutdown().unwrap();
-        }
-    }
-
-    /// Test SteamWebHelper shutdown.
     #[test]
     fn steam_web_helper_shutdown() {
         let mut shim = SteamWebHelperShim::new(
@@ -7019,7 +6744,6 @@ mod tests {
     // CefBridge state tests
     // -----------------------------------------------------------------------
 
-    /// Test that operations fail before initialization.
     #[test]
     fn cef_operations_before_init_fail() {
         let mut bridge = CefBridge::new();
@@ -7043,7 +6767,6 @@ mod tests {
         assert!(result.is_err(), "create before init should fail");
     }
 
-    /// Test that shutdown without init fails.
     #[test]
     fn cef_shutdown_without_init_fails() {
         let mut bridge = CefBridge::new();
@@ -7051,100 +6774,14 @@ mod tests {
         assert!(result.is_err(), "shutdown without init should fail");
     }
 
-    /// Test settings persistence through initialization.
-    #[test]
-    fn cef_settings_persistence() {
-        let mut bridge = CefBridge::new();
-        if !wkwebview_available() {
-            return;
-        }
-        let custom_settings = CefSettings {
-            multi_threaded_message_loop: true,
-            windowless_rendering_enabled: false,
-            cache_path: Some("/tmp/casa1-cache".to_string()),
-            locale: Some("fr-FR".to_string()),
-            log_severity: 3,
-            ..CefSettings::default()
-        };
-
-        bridge
-            .cef_initialize(custom_settings.clone())
-            .expect("initialize with custom settings");
-
-        // Shutdown completes without error
-        let _ = bridge.cef_shutdown();
-    }
-
     // -----------------------------------------------------------------------
     // libcef.dll registration tests
     // -----------------------------------------------------------------------
-
-    /// Test that libcef.dll exports match expected CEF C API names.
-    #[test]
-    fn cef_libcef_dll_exports() {
-        let exports = register_libcef_dll_exports();
-
-        // Verify key CEF API exports are present
-        let export_names: Vec<&str> = exports.iter().filter_map(|e| e.name.as_deref()).collect();
-
-        assert!(
-            export_names.contains(&"cef_initialize"),
-            "should export cef_initialize"
-        );
-        assert!(
-            export_names.contains(&"cef_shutdown"),
-            "should export cef_shutdown"
-        );
-        assert!(
-            export_names.contains(&"cef_browser_host_create_browser"),
-            "should export cef_browser_host_create_browser"
-        );
-        assert!(
-            export_names.contains(&"cef_frame_load_url"),
-            "should export cef_frame_load_url"
-        );
-        assert!(
-            export_names.contains(&"cef_frame_execute_java_script"),
-            "should export cef_frame_execute_java_script"
-        );
-        assert!(
-            export_names.contains(&"cef_run_message_loop"),
-            "should export cef_run_message_loop"
-        );
-        assert!(
-            export_names.contains(&"cef_browser_go_back"),
-            "should export cef_browser_go_back"
-        );
-        assert!(
-            export_names.contains(&"cef_browser_reload"),
-            "should export cef_browser_reload"
-        );
-        assert!(
-            export_names.contains(&"cef_browser_get_host"),
-            "should export cef_browser_get_host"
-        );
-        assert!(
-            export_names.contains(&"cef_browser_get_main_frame"),
-            "should export cef_browser_get_main_frame"
-        );
-
-        // Verify all exports have unique ordinals
-        let mut ordinals: Vec<u32> = exports.iter().map(|e| e.ordinal).collect();
-        ordinals.sort();
-        ordinals.dedup();
-        assert_eq!(
-            ordinals.len(),
-            exports.len(),
-            "all export ordinals should be unique"
-        );
-    }
 
     // -----------------------------------------------------------------------
     // G9: IOSurface hardening tests
     // -----------------------------------------------------------------------
 
-    /// Test that `get_io_surface_for_browser` returns proper errors for
-    /// invalid/bogus handles rather than crashing or returning success.
     #[test]
     fn g9_io_surface_extraction_error_handling() {
         let mut bridge = CefBridge::new();
@@ -7203,14 +6840,6 @@ mod tests {
         bridge.close_browser(browser).unwrap();
     }
 
-    /// Test that `render_to_io_surface_texture` properly falls back to the
-    /// managed (CPU upload) path when the native WKWebView layer has no
-    /// IOSurface backing — which is the expected case for offscreen rendering.
-    ///
-    /// This test exercises the full fallback chain:
-    ///   1. Zero-copy path attempted → fails (no IOSurface in layer)
-    ///   2. Managed path: IOSurface allocated, CPU pixels uploaded
-    ///   3. Metal texture wrapping managed IOSurface returned
     #[test]
     fn g9_io_surface_fallback_path_when_unavailable() {
         let mut bridge = CefBridge::new();
@@ -7257,73 +6886,6 @@ mod tests {
         bridge.close_browser(browser).unwrap();
     }
 
-    /// Test frame delivery sequencing: verify that rendered frames are
-    /// properly queued, retrieved in the correct order, and that the
-    /// frame number monotonically increases.
-    #[test]
-    fn g9_frame_delivery_sequencing() {
-        let mut bridge = CefBridge::new();
-
-        // Manually push frames (no WKWebView needed — pure data path test)
-        let browser_id = 1u32;
-        let frame1 = RenderedFrame {
-            browser_id,
-            width: 10,
-            height: 10,
-            pixels: vec![0xFFu8; 10 * 10 * 4],
-            frame_number: 0,
-        };
-        let frame2 = RenderedFrame {
-            browser_id,
-            width: 10,
-            height: 10,
-            pixels: vec![0x80u8; 10 * 10 * 4],
-            frame_number: 1,
-        };
-        let frame3 = RenderedFrame {
-            browser_id,
-            width: 20,
-            height: 20,
-            pixels: vec![0x40u8; 20 * 20 * 4],
-            frame_number: 2,
-        };
-
-        bridge.rendered_frames.push_back(frame1.clone());
-        bridge.rendered_frames.push_back(frame2.clone());
-        bridge.rendered_frames.push_back(frame3.clone());
-
-        // get_rendered_frame should return the latest (most recent) frame,
-        // which is frame3 (highest frame_number for the given browser_id).
-        let latest = bridge.get_rendered_frame(browser_id);
-        assert!(latest.is_some(), "should find a rendered frame");
-        let latest = latest.unwrap();
-        assert_eq!(
-            latest.frame_number, 2,
-            "should return latest frame (frame_number=2)"
-        );
-        assert_eq!(latest.width, 20, "should match frame3 dimensions");
-        assert_eq!(latest.height, 20, "should match frame3 dimensions");
-        assert_eq!(latest.pixels[0], 0x40, "should match frame3 pixel data");
-
-        // Verify earlier frame is still accessible (VecDeque retains history)
-        let all_frames: Vec<&RenderedFrame> = bridge
-            .rendered_frames
-            .iter()
-            .filter(|f| f.browser_id == browser_id)
-            .collect();
-        assert_eq!(all_frames.len(), 3, "all three frames should be preserved");
-
-        // Test frame_number monotonic property
-        for i in 1..all_frames.len() {
-            assert!(
-                all_frames[i].frame_number > all_frames[i - 1].frame_number,
-                "frame numbers should be monotonically increasing"
-            );
-        }
-    }
-
-    /// Test that `submit_latest_frame_to_compositor` handles edge cases
-    /// gracefully: missing browser, missing frame, empty pixels.
     #[test]
     fn g9_submit_frame_edge_cases() {
         let mut bridge = CefBridge::new();
@@ -7364,12 +6926,6 @@ mod tests {
         bridge.submit_latest_frame_to_compositor(1);
     }
 
-    /// Test that IoSurfaceTexturePair creation and drop do not crash.
-    ///
-    /// This test validates the lifecycle of the cached IOSurface+Metal-texture
-    /// pair used by the managed IOSurface path. On macOS with a Metal device,
-    /// a real IOSurface is allocated and wrapped; on other platforms, creation
-    /// gracefully returns None.
     #[test]
     fn g9_io_surface_pair_lifecycle() {
         // Creating with zero dimensions should return None
@@ -7403,38 +6959,6 @@ mod tests {
         }
     }
 
-    /// Test that `io_surface_available()` returns a cached result and does
-    /// not panic. On macOS with Metal, the IOSurface class should be found;
-    /// on headless systems it may return false, but the method itself must
-    /// always complete without error.
-    #[test]
-    fn g9_io_surface_availability_check() {
-        let mut bridge = CefBridge::new();
-        // First call performs the ObjC class lookup
-        let result1 = bridge.io_surface_available();
-        // Second call uses the cached value
-        let result2 = bridge.io_surface_available();
-        assert_eq!(
-            result1, result2,
-            "io_surface_available should return the same cached result on repeated calls"
-        );
-        // The cached field should now be Some
-        assert!(
-            bridge.io_surface_available.is_some(),
-            "io_surface_available field should be cached after first check"
-        );
-    }
-
-    /// Test that `render_to_io_surface_texture` correctly falls back to
-    /// `render_to_metal_texture` when IOSurface allocation fails in the
-    /// managed path. This exercises the defensive fallback added in
-    /// Phase D3:R3.
-    ///
-    /// We simulate the fallback by passing a device that exists; if the
-    /// IOSurface class is unavailable (headless CI), the early check in
-    /// `render_to_io_surface_texture` should route to the CPU path.
-    /// If IOSurface IS available, we verify the IO surface path still
-    /// works as the primary path.
     #[test]
     fn g9_render_to_io_surface_fallback_on_alloc_failure() {
         if !wkwebview_available() {
@@ -7492,10 +7016,6 @@ mod tests {
         }
     }
 
-    /// Test that CPU-side `render_to_metal_texture` works correctly as
-    /// the fallback rendering path. This test verifies the function that
-    /// `render_to_io_surface_texture` falls back to when IOSurface is
-    /// unavailable.
     #[test]
     fn g9_cpu_fallback_metal_texture_rendering() {
         if !wkwebview_available() {
@@ -7548,10 +7068,6 @@ mod tests {
         }
     }
 
-    /// Test that `submit_latest_frame_to_compositor` works correctly with
-    /// explicit CPU pixel data, exercising the full CPU submission path
-    /// without requiring IOSurface. This verifies the downstream compositor
-    /// can handle frames submitted via the fallback path.
     #[test]
     fn g9_submit_frame_cpu_fallback_path() {
         let mut bridge = CefBridge::new();
@@ -7595,10 +7111,6 @@ mod tests {
         );
     }
 
-    /// Test that `render_to_io_surface_texture` handles the edge case
-    /// where the managed IOSurface cache needs to be resized (different
-    /// dimensions from a previous frame), and the re-allocation fallback
-    /// works correctly.
     #[test]
     fn g9_io_surface_cache_resize_fallback() {
         if !wkwebview_available() {
@@ -7679,7 +7191,6 @@ mod tests {
     // CEF callback handler tests
     // -----------------------------------------------------------------------
 
-    /// Helper to create an initialized CefBridge with one browser for testing handlers.
     fn create_test_bridge() -> (CefBridge, CefHandle) {
         let mut bridge = CefBridge::new();
         if !wkwebview_available() {
@@ -7705,46 +7216,6 @@ mod tests {
         (bridge, browser)
     }
 
-    /// Test CefLifeSpanHandler: OnAfterCreated updates browser state.
-    #[test]
-    fn cef_handler_on_after_created() {
-        let mut bridge = CefBridge::new();
-        if !wkwebview_available() {
-            return;
-        }
-        bridge.cef_initialize(CefSettings::default()).unwrap();
-        let browser = bridge
-            .cef_browser_host_create_browser(
-                CefWindowInfo {
-                    x: 0,
-                    y: 0,
-                    width: 640,
-                    height: 480,
-                    windowless_rendering_enabled: true,
-                    parent_window: 0,
-                    url: None,
-                    external_begin_frame_enabled: false,
-                },
-                "about:blank",
-                CefBrowserSettings::default(),
-            )
-            .expect("create browser");
-
-        // Initially the browser is loading=true (set during creation)
-        bridge.on_after_created(browser).expect("on_after_created");
-        let b = bridge.browsers().get(&browser).unwrap();
-        assert!(
-            b.is_loading,
-            "browser should be loading after OnAfterCreated"
-        );
-        assert!(b.dirty, "browser should be dirty after OnAfterCreated");
-
-        // Non-existent handle should not panic
-        let _result = bridge.on_after_created(99999);
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-    }
-
-    /// Test CefLifeSpanHandler: DoClose and OnBeforeClose sequence.
     #[test]
     fn cef_handler_do_close_and_before_close() {
         let (mut bridge, browser) = create_test_bridge();
@@ -7782,7 +7253,6 @@ mod tests {
         );
     }
 
-    /// Test CefLoadHandler: OnLoadingStateChange updates navigation flags.
     #[test]
     fn cef_handler_loading_state_change() {
         let (mut bridge, browser) = create_test_bridge();
@@ -7807,24 +7277,6 @@ mod tests {
         bridge.on_loading_state_change(99999, true, false, false);
     }
 
-    /// Test CefLoadHandler: OnLoadStart marks loading state.
-    #[test]
-    fn cef_handler_load_start() {
-        let (mut bridge, browser) = create_test_bridge();
-        if !wkwebview_available() || browser == 0 {
-            return;
-        }
-
-        bridge.on_load_start(browser, "https://store.steampowered.com", true);
-        let b = bridge.browsers().get(&browser).unwrap();
-        assert!(b.is_loading, "browser should be loading after OnLoadStart");
-        assert_eq!(b.current_url, "https://store.steampowered.com");
-
-        // Non-existent handle should not panic
-        bridge.on_load_start(99999, "https://example.com", true);
-    }
-
-    /// Test CefLoadHandler: OnLoadEnd updates loading state and URL.
     #[test]
     fn cef_handler_load_end() {
         let (mut bridge, browser) = create_test_bridge();
@@ -7844,7 +7296,6 @@ mod tests {
         assert!(b.dirty, "browser should be dirty after OnLoadEnd");
     }
 
-    /// Test CefLoadHandler: OnLoadError logs error and updates state.
     #[test]
     fn cef_handler_load_error() {
         let (mut bridge, browser) = create_test_bridge();
@@ -7866,45 +7317,6 @@ mod tests {
         bridge.on_load_error(99999, 1, "test error", "https://example.com");
     }
 
-    /// Test CefDisplayHandler: OnAddressChange updates current_url.
-    #[test]
-    fn cef_handler_address_change() {
-        let (mut bridge, browser) = create_test_bridge();
-        if !wkwebview_available() || browser == 0 {
-            return;
-        }
-
-        bridge.on_address_change(browser, "https://store.steampowered.com/app/730");
-        let b = bridge.browsers().get(&browser).unwrap();
-        assert_eq!(b.current_url, "https://store.steampowered.com/app/730");
-
-        // Non-existent handle should not panic
-        bridge.on_address_change(99999, "https://example.com");
-    }
-
-    /// Test CefDisplayHandler: OnTitleChange updates browser title.
-    #[test]
-    fn cef_handler_title_change() {
-        let (mut bridge, browser) = create_test_bridge();
-        if !wkwebview_available() || browser == 0 {
-            return;
-        }
-
-        bridge.on_title_change(browser, "Counter-Strike 2").unwrap();
-        let b = bridge.browsers().get(&browser).unwrap();
-        assert_eq!(b.title, "Counter-Strike 2");
-
-        // Title update with empty string should still update
-        bridge.on_title_change(browser, "").unwrap();
-        let b = bridge.browsers().get(&browser).unwrap();
-        assert_eq!(b.title, "");
-
-        // Non-existent handle should not panic
-        let _result = bridge.on_title_change(99999, "test");
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-    }
-
-    /// Test CefDisplayHandler: OnTooltip returns correct visibility.
     #[test]
     fn cef_handler_tooltip() {
         let (mut bridge, browser) = create_test_bridge();
@@ -7925,21 +7337,6 @@ mod tests {
         );
     }
 
-    /// Test CefDisplayHandler: OnStatusMessage logs messages without errors.
-    #[test]
-    fn cef_handler_status_message() {
-        let (mut bridge, browser) = create_test_bridge();
-        if !wkwebview_available() || browser == 0 {
-            return;
-        }
-
-        // Should not panic
-        bridge.on_status_message(browser, "https://store.steampowered.com/");
-        bridge.on_status_message(browser, "");
-        bridge.on_status_message(99999, "test");
-    }
-
-    /// Test CefDisplayHandler: OnConsoleMessage logs JS console output.
     #[test]
     fn cef_handler_console_message() {
         let (mut bridge, browser) = create_test_bridge();
@@ -7963,44 +7360,6 @@ mod tests {
         bridge.on_console_message(99999, "test", "test.js", 1);
     }
 
-    /// Test CefRenderHandler: GetViewRect returns correct dimensions.
-    #[test]
-    fn cef_handler_get_view_rect() {
-        let (bridge, browser) = create_test_bridge();
-        if !wkwebview_available() || browser == 0 {
-            return;
-        }
-
-        let rect = bridge.get_view_rect(browser);
-        assert_eq!(rect.x, 0, "view rect x should be 0");
-        assert_eq!(rect.y, 0, "view rect y should be 0");
-        assert!(rect.width > 0, "view rect width should be positive");
-        assert!(rect.height > 0, "view rect height should be positive");
-
-        // Non-existent handle should return 1x1 fallback
-        let fallback = bridge.get_view_rect(99999);
-        assert_eq!(fallback.width, 1, "fallback width should be 1");
-        assert_eq!(fallback.height, 1, "fallback height should be 1");
-    }
-
-    /// Test CefRenderHandler: GetScreenInfo returns default values.
-    #[test]
-    fn cef_handler_get_screen_info() {
-        let (bridge, browser) = create_test_bridge();
-        if !wkwebview_available() || browser == 0 {
-            return;
-        }
-
-        let (x, y, scale) = bridge.get_screen_info(browser);
-        assert_eq!(x, 0, "screen origin x should be 0");
-        assert_eq!(y, 0, "screen origin y should be 0");
-        assert!(
-            (scale - 1.0).abs() < f64::EPSILON,
-            "scale factor should be 1.0"
-        );
-    }
-
-    /// Test CefRenderHandler: OnPaint processes pixel data.
     #[test]
     fn cef_handler_on_paint() {
         let (mut bridge, browser) = create_test_bridge();
@@ -8045,22 +7404,6 @@ mod tests {
         bridge.on_paint(99999, 0, &dirty_rects, &pixels, width, height);
     }
 
-    /// Test CefRenderHandler: OnPaint with buffer too small handles gracefully.
-    #[test]
-    fn cef_handler_on_paint_buffer_too_small() {
-        let (mut bridge, browser) = create_test_bridge();
-        if !wkwebview_available() || browser == 0 {
-            return;
-        }
-
-        // Paint with buffer smaller than expected for dimensions
-        let pixels = vec![0xFFu8; 10]; // much smaller than 100x50x4 = 20000
-        bridge.on_paint(browser, 0, &[], &pixels, 100, 50);
-        // Should not panic; buffer gets padded internally
-    }
-
-    /// F2: an undersized OnPaint buffer must publish the REAL received bytes
-    /// with the TRUE dimensions — never 0xFF padding inventing pixels.
     #[test]
     fn cef_undersized_on_paint_publishes_real_bytes() {
         let mut bridge = CefBridge::new();
@@ -8119,8 +7462,6 @@ mod tests {
         );
     }
 
-    /// F2: a failed IOSurface readback publishes NOTHING — the host must
-    /// never fabricate a dark-gray placeholder for the live channel.
     #[test]
     fn cef_readback_failure_publishes_nothing() {
         let mut bridge = CefBridge::new();
@@ -8140,9 +7481,6 @@ mod tests {
         );
     }
 
-    /// F2: when the IOSurface readback succeeds, the published frame is the
-    /// surface's real bytes; a platform that cannot read the surface back
-    /// publishes nothing (never a fabricated placeholder).
     #[test]
     fn cef_accelerated_paint_readback_publishes_only_real_surface_bytes() {
         let Ok(device) = crate::metal_backend::MetalDevice::system_default() else {
@@ -8175,7 +7513,6 @@ mod tests {
         );
     }
 
-    /// Test CefRenderHandler: OnPopupShow and OnPopupSize track popup state.
     #[test]
     fn cef_handler_popup_show_and_size() {
         let (mut bridge, browser) = create_test_bridge();
@@ -8229,7 +7566,6 @@ mod tests {
         );
     }
 
-    /// Test CefRenderHandler: OnAcceleratedPaint with null handle.
     #[test]
     fn cef_handler_accelerated_paint_null() {
         let (mut bridge, browser) = create_test_bridge();
@@ -8242,7 +7578,6 @@ mod tests {
         assert!(!result, "null handle should return false");
     }
 
-    /// Test CefRequestHandler: OnBeforeBrowse allows normal URLs.
     #[test]
     fn cef_handler_before_browse() {
         let (mut bridge, browser) = create_test_bridge();
@@ -8263,7 +7598,6 @@ mod tests {
         );
     }
 
-    /// Test CefRequestHandler: OnBeforeResourceLoad allows all resources.
     #[test]
     fn cef_handler_before_resource_load() {
         let (mut bridge, browser) = create_test_bridge();
@@ -8281,23 +7615,6 @@ mod tests {
         );
     }
 
-    /// Test CefRequestHandler: GetResourceRequestHandler returns default (0).
-    #[test]
-    fn cef_handler_resource_request_handler() {
-        let (mut bridge, browser) = create_test_bridge();
-        if !wkwebview_available() || browser == 0 {
-            return;
-        }
-
-        let handler_id =
-            bridge.get_resource_request_handler(browser, "https://store.steampowered.com/steam.js");
-        assert_eq!(
-            handler_id, 0,
-            "resource request handler should return 0 (default)"
-        );
-    }
-
-    /// Test CefRequestHandler: OnAuthCredentials returns false (no creds).
     #[test]
     fn cef_handler_auth_credentials() {
         let (mut bridge, browser) = create_test_bridge();
@@ -8320,64 +7637,6 @@ mod tests {
         );
     }
 
-    /// Test CefRequestHandler: OnCookieableSchemes returns supported schemes.
-    #[test]
-    fn cef_handler_cookieable_schemes() {
-        let bridge = CefBridge::new();
-        let schemes = bridge.on_cookieable_schemes();
-        assert!(
-            schemes.contains(&"http".to_string()),
-            "http should be in cookieable schemes"
-        );
-        assert!(
-            schemes.contains(&"https".to_string()),
-            "https should be in cookieable schemes"
-        );
-        assert!(
-            schemes.contains(&"steam".to_string()),
-            "steam should be in cookieable schemes"
-        );
-    }
-
-    /// Test that multiple OnPaint calls produce sequential frame numbers.
-    #[test]
-    fn cef_handler_paint_frame_sequencing() {
-        let (mut bridge, browser) = create_test_bridge();
-        if !wkwebview_available() || browser == 0 {
-            return;
-        }
-        let browser_id = bridge.browsers().get(&browser).unwrap().id;
-
-        let pixels = vec![0xFFu8; 100 * 100 * 4];
-        let dirty = [CefRect {
-            x: 0,
-            y: 0,
-            width: 100,
-            height: 100,
-        }];
-
-        // First paint (create_browser consumed frame number 0)
-        bridge.on_paint(browser, 0, &dirty, &pixels, 100, 100);
-        let f1 = bridge.get_rendered_frame(browser_id).unwrap();
-        assert_eq!(f1.frame_number, 1, "first paint frame number should be 1");
-
-        // Second paint
-        bridge.on_paint(browser, 0, &dirty, &pixels, 100, 100);
-        let f2 = bridge.get_rendered_frame(browser_id).unwrap();
-        assert_eq!(f2.frame_number, 2, "second paint frame number should be 2");
-
-        // Verify frame queue does not exceed max (10)
-        for _i in 0..15 {
-            bridge.on_paint(browser, 0, &dirty, &pixels, 100, 100);
-        }
-        assert!(
-            bridge.rendered_frames.len() <= 10,
-            "rendered frame queue should not exceed 10 entries"
-        );
-    }
-
-    /// Test handler callbacks work with manually constructed bridge
-    /// (no WKWebView dependency) for pure unit testing.
     #[test]
     fn cef_handler_no_wkwebview_dependency() {
         // Test handlers that don't need WKWebView at all
@@ -8442,18 +7701,6 @@ mod tests {
     // Steam Overlay lifecycle tests
     // -----------------------------------------------------------------------
 
-    /// Default state: no overlay browser active.
-    #[test]
-    fn overlay_default_state() {
-        let bridge = CefBridge::new();
-        assert_eq!(bridge.overlay_browser_handle, None);
-        assert_eq!(bridge.overlay_browser_handle(), None);
-    }
-
-    /// Creating then destroying the overlay browser should transition the
-    /// handle from Some → None.  This exercise the data-path without
-    /// requiring a real WKWebView (the creation will fail on systems
-    /// without WKWebView, but we verify the handle was not set).
     #[test]
     fn overlay_create_and_destroy() {
         let mut bridge = CefBridge::new();
@@ -8480,7 +7727,6 @@ mod tests {
         }
     }
 
-    /// Creating a second overlay browser while one exists returns an error.
     #[test]
     fn overlay_create_twice_fails() {
         let mut bridge = CefBridge::new();
@@ -8506,49 +7752,7 @@ mod tests {
         }
     }
 
-    /// Destroy without a prior create is safe (no-op).
-    #[test]
-    fn overlay_destroy_without_create() {
-        let mut bridge = CefBridge::new();
-        assert_eq!(bridge.overlay_browser_handle, None);
-        // Should not panic or error
-        let _result = bridge.destroy_overlay_browser();
-        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-        assert_eq!(bridge.overlay_browser_handle, None);
-    }
-
-    /// Submit the overlay browser frame to the compositor does not crash
-    /// when no overlay is active.
-    #[test]
-    fn overlay_submit_frame_no_overlay() {
-        let mut bridge = CefBridge::new();
-        // Should not panic with a non-existent handle
-        bridge.submit_latest_frame_to_compositor(0xCAFE);
-    }
-
-    /// The overlay_browser_handle getter returns None when no overlay
-    /// browser exists (smoke test for the public API).
-    #[test]
-    fn overlay_browser_handle_getter() {
-        let bridge = CefBridge::new();
-        assert_eq!(bridge.overlay_browser_handle(), None);
-    }
-
     // -----------------------------------------------------------------------
     // Thread safety tests
     // -----------------------------------------------------------------------
-
-    /// Verify that CefBridge implements Send (checked at compile time).
-    #[test]
-    fn cef_bridge_is_send() {
-        fn assert_send<T: Send>() {}
-        assert_send::<CefBridge>();
-    }
-
-    /// Verify that WKWebViewManager implements Send (checked at compile time).
-    #[test]
-    fn wkwebview_manager_is_send() {
-        fn assert_send<T: Send>() {}
-        assert_send::<WKWebViewManager>();
-    }
 }

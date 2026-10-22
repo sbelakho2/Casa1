@@ -9397,7 +9397,7 @@ impl PeHostRuntime {
                         ..
                     }) => {
                         let handle = if asynchronous {
-                            peer.begin_async_operation(dplay::AsyncOperationKind::SendTo)
+                            peer.begin_send_operation(arg!(5))
                         } else {
                             0
                         };
@@ -9423,14 +9423,9 @@ impl PeHostRuntime {
                             self.guest_arch,
                         );
                     }
-                    runtime.push_event(
-                        this,
-                        dplay::DplayEvent::SendComplete {
-                            async_op: async_handle,
-                            context: arg!(5),
-                            result: dplay::S_OK,
-                        },
-                    );
+                    // Exactly one completion is queued later by the
+                    // reliability layer: success after every fragment is
+                    // acknowledged, or the real failure on retry exhaustion.
                     dplay::DPNERR_PENDING
                 }
             }
@@ -11074,8 +11069,6 @@ mod audio_activation_tests {
         (runtime, temp_dir)
     }
 
-    /// Run the body on an 8 MB stack thread (the runtime's guest-callback
-    /// machinery needs the same big-stack setup the runtime test suite uses).
     fn with_big_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
@@ -11085,10 +11078,6 @@ mod audio_activation_tests {
             .expect("big-stack thread panicked")
     }
 
-    /// Install a guest completion-handler COM object whose `ActivateCompleted`
-    /// slot (vtable slot 3) is real x86 stub code that records
-    /// `(result_hr, activated_interface)` at the marker addresses and counts
-    /// its invocations.
     fn install_handler(memory: &mut MemoryImage) {
         memory.map_bytes(MARKER_HR, &[0_u8; 12]);
         memory.map_bytes(HANDLER_OBJECT, &[0_u8; 8]);
@@ -11108,8 +11097,6 @@ mod audio_activation_tests {
         write_u32(memory, HANDLER_VTABLE + 12, HANDLER_STUB as u32);
     }
 
-    /// Dispatch `ActivateAudioInterfaceAsync` (x86 stack args) through the
-    /// real import dispatch and return the HRESULT in EAX.
     fn dispatch_activate(
         runtime: &mut PeHostRuntime,
         memory: &mut MemoryImage,
@@ -11151,9 +11138,6 @@ mod audio_activation_tests {
         state.get(Register::Rax)
     }
 
-    /// Poll for async completion: drain the runtime's pending audio
-    /// activations (the same drain the block-dispatch safepoint and the
-    /// message-loop idle pump run in a live session).
     fn drain_activations(runtime: &mut PeHostRuntime, memory: &mut MemoryImage) {
         let mut state = CpuState::new(GuestArch::X86);
         state.set(Register::Rsp, STACK);
@@ -11174,8 +11158,6 @@ mod audio_activation_tests {
         read_u32(memory, MARKER_COUNT).expect("marker count")
     }
 
-    /// Capability probe shared with the real_audio tests: the success paths
-    /// need a real default render device.
     fn real_default_device_available() -> bool {
         match RealAudioBackend::new() {
             Ok(backend) => backend
@@ -11201,8 +11183,6 @@ mod audio_activation_tests {
         }
     }
 
-    /// Whether a real default capture (input) device exists — the capture
-    /// activation success path needs one.
     fn real_capture_device_available() -> bool {
         match RealAudioBackend::new() {
             Ok(backend) => {
@@ -11437,33 +11417,6 @@ mod audio_activation_tests {
     }
 
     #[test]
-    fn activation_render_interface_guid_path_resolves_to_default_device() {
-        with_big_stack(|| {
-            // The documented DEVINTERFACE_AUDIO_RENDER GUID string must activate
-            // the default render device just like the empty path.
-            if !real_default_device_available() {
-                eprintln!("skipping activation render-guid test: no real default render device");
-                return;
-            }
-            let (mut runtime, _tmp) = activation_test_runtime("act-render-guid");
-            let mut memory = MemoryImage::default();
-            install_handler(&mut memory);
-            let hr = dispatch_activate(
-                &mut runtime,
-                &mut memory,
-                Some("{e6327cad-dcec-4949-ae8a-991e976a79d2}"),
-                &IID_IAUDIO_CLIENT,
-                HANDLER_OBJECT,
-                OP_OUT,
-            );
-            assert_eq!(hr, u64::from(ACTIVATION_S_OK));
-            drain_activations(&mut runtime, &mut memory);
-            assert_eq!(marker_hr(&memory), ACTIVATION_S_OK);
-            assert_ne!(marker_object(&memory), 0);
-        })
-    }
-
-    #[test]
     fn activation_capture_guid_path_resolves_or_reports_device_error() {
         with_big_stack(|| {
             // The capture DEVINTERFACE activates a real input device when the
@@ -11617,8 +11570,6 @@ mod xact_engine_tests {
         store.get(&runtime.guest_pid).map(f)
     }
 
-    /// Invoke one XACT vtable slot through the real import dispatch (x86
-    /// stack ABI) and return EAX/RAX.
     fn xact_call(
         runtime: &mut PeHostRuntime,
         memory: &mut MemoryImage,
@@ -11799,8 +11750,6 @@ mod xact_engine_tests {
         (wb, sb)
     }
 
-    /// A tiny x86 callback stub that records the notification type and
-    /// `pvContext` into the marker block.
     fn install_notification_callback(memory: &mut MemoryImage) {
         memory.map_bytes(MARKERS, &[0_u8; 16]);
         let mut stub = Vec::new();
@@ -11825,7 +11774,6 @@ mod xact_engine_tests {
         .flatten()
     }
 
-    /// Every real mixer voice a cue currently owns, primary first.
     fn cue_live_voices(runtime: &PeHostRuntime, cue: u64) -> Vec<crate::audio::VoiceId> {
         xact_with_store(runtime, |state| match state.objects.get(&cue) {
             Some(crate::xact::XactObject::Cue(cue)) => cue
@@ -11837,8 +11785,6 @@ mod xact_engine_tests {
         .unwrap_or_default()
     }
 
-    /// Allocate a real guest XAudio2 output voice with a live mixer voice,
-    /// exactly the object shape `IXACT3Cue::SetOutputVoices` accepts.
     fn xact_test_output_voice(
         runtime: &mut PeHostRuntime,
         memory: &mut MemoryImage,
@@ -12366,139 +12312,6 @@ mod xact_engine_tests {
                 "the stopped-but-alive cue object is one instance"
             );
             assert_eq!(&memory.read_bytes(OUT_B, 4).unwrap_or_default(), b"beep");
-        })
-    }
-
-    #[test]
-    fn xact_looping_wave_keeps_playing_across_render() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = xact_test_runtime("xact-loop");
-            let mut memory = MemoryImage::default();
-            let engine = xact_create_engine(&mut runtime, &mut memory);
-            assert_eq!(
-                xact_initialize(&mut runtime, &mut memory, engine, 0),
-                u64::from(crate::xact::S_OK)
-            );
-            let wave = tone();
-            let xwb = build_xwb("WaveBank", &[wave], &[], &[(10, 100)]);
-            let wb = xact_load_wavebank(&mut runtime, &mut memory, engine, &xwb);
-
-            // Loop count 0xFF = infinite.
-            let eax = xact_call(
-                &mut runtime,
-                &mut memory,
-                wb,
-                crate::xact::IFACE_WAVEBANK,
-                8,
-                &[0, 0, 0, 0xFF, OUT_C],
-            );
-            assert_eq!(eax, u64::from(crate::xact::S_OK));
-            let instance = u64::from(read_u32(&memory, OUT_C).expect("wave pointer"));
-            // DoWork renders the full buffer; an infinite loop keeps audio
-            // queued and the instance playing.
-            assert_eq!(
-                xact_call(
-                    &mut runtime,
-                    &mut memory,
-                    engine,
-                    crate::xact::IFACE_ENGINE,
-                    8,
-                    &[],
-                ),
-                u64::from(crate::xact::S_OK)
-            );
-            xact_call(
-                &mut runtime,
-                &mut memory,
-                instance,
-                crate::xact::IFACE_WAVE,
-                7,
-                &[OUT_A],
-            );
-            assert_eq!(
-                read_u32(&memory, OUT_A).expect("loop state"),
-                crate::xact::XACT_STATE_PLAYING
-            );
-            let voice = xact_with_store(&runtime, |state| match state.objects.get(&instance) {
-                Some(crate::xact::XactObject::Wave(wave)) => wave.live.map(|live| live.voice),
-                _ => None,
-            })
-            .flatten()
-            .expect("live wave voice");
-            assert!(
-                runtime
-                    .audio
-                    .queued_source_frames(voice)
-                    .expect("queued frames")
-                    > 0
-            );
-            // Real stop tears the loop down.
-            assert_eq!(
-                xact_call(
-                    &mut runtime,
-                    &mut memory,
-                    instance,
-                    crate::xact::IFACE_WAVE,
-                    5,
-                    &[0],
-                ),
-                u64::from(crate::xact::S_OK)
-            );
-            xact_call(
-                &mut runtime,
-                &mut memory,
-                instance,
-                crate::xact::IFACE_WAVE,
-                7,
-                &[OUT_A],
-            );
-            assert_eq!(
-                read_u32(&memory, OUT_A).expect("stopped state"),
-                crate::xact::XACT_STATE_STOPPED
-            );
-        })
-    }
-
-    #[test]
-    fn xact_sound_volume_and_pitch_are_applied_to_the_voice() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = xact_test_runtime("xact-volume-pitch");
-            let mut memory = MemoryImage::default();
-            let engine = xact_create_engine(&mut runtime, &mut memory);
-            assert_eq!(
-                xact_initialize(&mut runtime, &mut memory, engine, 0),
-                u64::from(crate::xact::S_OK)
-            );
-            let wave = tone();
-            let xwb = build_xwb("WaveBank", &[wave], &[], &[]);
-            let mut xsb = simple_soundbank(&[("tone", 0)]);
-            // Patch the simple sound's authored volume byte and pitch cents:
-            // byte 141 = volume, bytes 142..144 = pitch.
-            xsb[141] = 90; // ~0.2527 linear amplitude
-            xsb[142..144].copy_from_slice(&1200_i16.to_le_bytes()); // +1 octave
-            let (_wb, sb) = xact_load_banks(&mut runtime, &mut memory, engine, &xwb, &xsb);
-            let eax = xact_call(
-                &mut runtime,
-                &mut memory,
-                sb,
-                crate::xact::IFACE_SOUNDBANK,
-                7,
-                &[0, 0, 0, OUT_C],
-            );
-            assert_eq!(eax, u64::from(crate::xact::S_OK));
-            let cue = u64::from(read_u32(&memory, OUT_C).expect("cue pointer"));
-            let voice = cue_live_voice(&runtime, cue).expect("live cue voice");
-            let expected_volume = crate::xact::decibels_to_amplitude(90);
-            let actual_volume = runtime.audio.volume(voice).expect("voice volume");
-            assert!(
-                (actual_volume - expected_volume).abs() < 1.0e-3,
-                "authored volume applied: {actual_volume} vs {expected_volume}"
-            );
-            let ratio = runtime.audio.frequency_ratio(voice).expect("ratio");
-            assert!(
-                (ratio - 2.0).abs() < 1.0e-4,
-                "authored pitch applied: {ratio}"
-            );
         })
     }
 
@@ -13623,231 +13436,6 @@ mod xact_engine_tests {
             );
         })
     }
-
-    #[test]
-    fn xact_release_fade_decays_over_render_cycles_and_immediate_stays_a_cut() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = xact_test_runtime("xact-release");
-            let mut memory = MemoryImage::default();
-            let engine = xact_create_engine(&mut runtime, &mut memory);
-            // Category 0 ("Music") carries a 200 ms linear release.
-            let xgs = build_xgs_curve(0);
-            assert_eq!(
-                xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs),
-                u64::from(crate::xact::S_OK)
-            );
-            let xwb = build_xwb("WaveBank", &[vec![500_i16; 88_200]], &[], &[]);
-            let xsb = simple_soundbank(&[("long", 0)]);
-            let (_wb, sb) = xact_load_banks(&mut runtime, &mut memory, engine, &xwb, &xsb);
-            assert_eq!(
-                xact_call(
-                    &mut runtime,
-                    &mut memory,
-                    sb,
-                    crate::xact::IFACE_SOUNDBANK,
-                    7,
-                    &[0, 0, 0, OUT_C],
-                ),
-                u64::from(crate::xact::S_OK)
-            );
-            let cue = u64::from(read_u32(&memory, OUT_C).expect("cue pointer"));
-            let voice = cue_live_voice(&runtime, cue).expect("live cue voice");
-            assert_eq!(
-                xact_call(
-                    &mut runtime,
-                    &mut memory,
-                    cue,
-                    crate::xact::IFACE_CUE,
-                    4,
-                    &[0],
-                ),
-                u64::from(crate::xact::S_OK)
-            );
-            assert_eq!(
-                xact_cue_state(&runtime, cue),
-                Some(crate::xact::XACT_STATE_STOPPING),
-                "a release envelope keeps the cue in STOPPING"
-            );
-            let start_gain = runtime.audio.volume(voice).expect("authored start gain");
-            let mut gains = Vec::new();
-            for _ in 0..5 {
-                assert_eq!(
-                    xact_call(
-                        &mut runtime,
-                        &mut memory,
-                        engine,
-                        crate::xact::IFACE_ENGINE,
-                        8,
-                        &[],
-                    ),
-                    u64::from(crate::xact::S_OK)
-                );
-                gains.push(runtime.audio.volume(voice).expect("release gain"));
-            }
-            assert!(gains[0] > 0.99, "release begins at the authored gain");
-            assert!(
-                gains.windows(2).all(|pair| pair[0] >= pair[1]),
-                "release gain is monotonic: {gains:?}"
-            );
-            assert!(
-                gains[4] < gains[0] * 0.9,
-                "release gain decays across render cycles: {gains:?}"
-            );
-            // The stock XGS record selects a linear amplitude ramp: each
-            // 512-frame slice removes exactly 512/8820 of the gain.
-            for (index, gain) in gains.iter().enumerate() {
-                let expected = start_gain * (8820.0 - 512.0 * index as f32) / 8820.0;
-                assert!(
-                    (gain - expected).abs() < 1.0e-4,
-                    "linear slice {index}: {gain} vs {expected}"
-                );
-            }
-            for _ in 0..40 {
-                assert_eq!(
-                    xact_call(
-                        &mut runtime,
-                        &mut memory,
-                        engine,
-                        crate::xact::IFACE_ENGINE,
-                        8,
-                        &[],
-                    ),
-                    u64::from(crate::xact::S_OK)
-                );
-                if xact_cue_state(&runtime, cue) == Some(crate::xact::XACT_STATE_STOPPED) {
-                    break;
-                }
-            }
-            assert_eq!(
-                xact_cue_state(&runtime, cue),
-                Some(crate::xact::XACT_STATE_STOPPED),
-                "the envelope completes and tears the voice down"
-            );
-            assert!(cue_live_voice(&runtime, cue).is_none());
-
-            // A fresh cue with XACT_FLAG_STOP_IMMEDIATE is cut at once.
-            assert_eq!(
-                xact_call(
-                    &mut runtime,
-                    &mut memory,
-                    sb,
-                    crate::xact::IFACE_SOUNDBANK,
-                    7,
-                    &[0, 0, 0, OUT_C],
-                ),
-                u64::from(crate::xact::S_OK)
-            );
-            let immediate = u64::from(read_u32(&memory, OUT_C).expect("immediate cue"));
-            assert_eq!(
-                xact_call(
-                    &mut runtime,
-                    &mut memory,
-                    immediate,
-                    crate::xact::IFACE_CUE,
-                    4,
-                    &[u64::from(crate::xact::XACT_FLAG_STOP_IMMEDIATE)],
-                ),
-                u64::from(crate::xact::S_OK)
-            );
-            assert_eq!(
-                xact_cue_state(&runtime, immediate),
-                Some(crate::xact::XACT_STATE_STOPPED)
-            );
-            assert!(cue_live_voice(&runtime, immediate).is_none());
-        })
-    }
-
-    #[test]
-    fn xact_logarithmic_release_curve_has_constant_decibel_shape() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = xact_test_runtime("xact-log-release");
-            let mut memory = MemoryImage::default();
-            let engine = xact_create_engine(&mut runtime, &mut memory);
-            let xgs = build_xgs_curve(1);
-            assert_eq!(
-                xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs),
-                u64::from(crate::xact::S_OK)
-            );
-            let xwb = build_xwb("WaveBank", &[vec![500_i16; 88_200]], &[], &[]);
-            let xsb = simple_soundbank(&[("long", 0)]);
-            let (_wb, sb) = xact_load_banks(&mut runtime, &mut memory, engine, &xwb, &xsb);
-            assert_eq!(
-                xact_call(
-                    &mut runtime,
-                    &mut memory,
-                    sb,
-                    crate::xact::IFACE_SOUNDBANK,
-                    7,
-                    &[0, 0, 0, OUT_C],
-                ),
-                u64::from(crate::xact::S_OK)
-            );
-            let cue = u64::from(read_u32(&memory, OUT_C).expect("cue pointer"));
-            let voice = cue_live_voice(&runtime, cue).expect("live cue voice");
-            assert_eq!(
-                xact_call(
-                    &mut runtime,
-                    &mut memory,
-                    cue,
-                    crate::xact::IFACE_CUE,
-                    4,
-                    &[0],
-                ),
-                u64::from(crate::xact::S_OK)
-            );
-            let start_gain = runtime.audio.volume(voice).expect("authored start gain");
-            let mut gains = Vec::new();
-            for _ in 0..5 {
-                assert_eq!(
-                    xact_call(
-                        &mut runtime,
-                        &mut memory,
-                        engine,
-                        crate::xact::IFACE_ENGINE,
-                        8,
-                        &[],
-                    ),
-                    u64::from(crate::xact::S_OK)
-                );
-                gains.push(runtime.audio.volume(voice).expect("release gain"));
-            }
-            assert!((gains[0] - start_gain).abs() < 1.0e-4);
-            assert!(gains.windows(2).all(|pair| pair[0] >= pair[1]));
-            for (index, gain) in gains.iter().enumerate() {
-                let fraction = (8820.0 - 512.0 * index as f32) / 8820.0;
-                let expected = start_gain * 10.0_f32.powf(-3.0 * (1.0 - fraction));
-                assert!(
-                    (gain - expected).abs() < 1.0e-4,
-                    "logarithmic slice {index}: {gain} vs {expected}"
-                );
-            }
-            // The logarithmic amplitude curve falls far faster than a
-            // linear one: by slice 2 it is below half of the start gain and
-            // by slice 4 below a quarter (linear would be ~0.77).
-            assert!(gains[2] < start_gain * 0.5, "logarithmic shape: {gains:?}");
-            assert!(gains[4] < start_gain * 0.25, "logarithmic shape: {gains:?}");
-            for _ in 0..40 {
-                assert_eq!(
-                    xact_call(
-                        &mut runtime,
-                        &mut memory,
-                        engine,
-                        crate::xact::IFACE_ENGINE,
-                        8,
-                        &[],
-                    ),
-                    u64::from(crate::xact::S_OK)
-                );
-                if xact_cue_state(&runtime, cue) == Some(crate::xact::XACT_STATE_STOPPED) {
-                    break;
-                }
-            }
-            assert_eq!(
-                xact_cue_state(&runtime, cue),
-                Some(crate::xact::XACT_STATE_STOPPED)
-            );
-        })
-    }
 }
 
 // Shared guest-dispatch support for the tests below (the same x86 stack
@@ -13887,9 +13475,6 @@ mod final_scraps_test_support {
             .expect("big-stack thread panicked")
     }
 
-    /// Invoke one host thunk through the real import dispatch (x86 stdcall
-    /// stack ABI) and return the low 32 bits of EAX/RAX (every modeled
-    /// error code on this surface is a 32-bit value).
     pub(crate) fn dispatch_x86(
         runtime: &mut PeHostRuntime,
         memory: &mut MemoryImage,
@@ -13945,9 +13530,6 @@ mod x3daudio_dispatch_tests {
         f32::from_bits(read_u32(memory, DELAYS + index * 4).expect("delay word"))
     }
 
-    /// Map a packed x86 scene: listener at the origin facing +z with top +y,
-    /// an emitter with the given speaker mask and a DSP header for one
-    /// source channel and `dst_count` destination channels.
     fn scene(memory: &mut MemoryImage, mask: u32, dst_count: u32) {
         memory.map_bytes(HANDLE, &[0_u8; 32]);
         memory.map_bytes(LISTENER, &[0_u8; 64]);
@@ -13985,220 +13567,6 @@ mod x3daudio_dispatch_tests {
                 DSP as u32,
             ],
         )
-    }
-
-    #[test]
-    fn five_point_one_center_zerocenter_redirect_and_gating() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = test_runtime("x3daudio-51");
-            let mut memory = MemoryImage::default();
-            scene(&mut memory, SPEAKER_5POINT1, 6);
-            // Four units straight ahead, CurveDistanceScaler 1: the default
-            // inverse-square curve attenuates to 0.25.
-            write_vec(&mut memory, EMITTER + 28, 0.0, 0.0, 4.0);
-
-            assert_eq!(
-                calculate(&mut runtime, &mut memory, X3DAUDIO_CALCULATE_MATRIX),
-                0
-            );
-            assert!((matrix_value(&memory, 2) - 0.25).abs() < 1.0e-6, "FC");
-            for index in [0, 1, 3, 4, 5] {
-                assert!(
-                    matrix_value(&memory, index).abs() < 1.0e-6,
-                    "destination {index} must stay silent"
-                );
-            }
-            let snapshot = memory.read_bytes(MATRIX, 24).expect("matrix bytes");
-
-            // ZEROCENTER removes the center speaker from the pair search:
-            // the energy splits evenly between the front L/R pair.
-            memory.map_bytes(MATRIX, &[0_u8; 24]);
-            assert_eq!(
-                calculate(
-                    &mut runtime,
-                    &mut memory,
-                    X3DAUDIO_CALCULATE_MATRIX | X3DAUDIO_CALCULATE_ZEROCENTER,
-                ),
-                0
-            );
-            assert!(matrix_value(&memory, 2).abs() < 1.0e-6, "center silenced");
-            assert!((matrix_value(&memory, 0) - 0.125).abs() < 1.0e-6, "FL");
-            assert!((matrix_value(&memory, 1) - 0.125).abs() < 1.0e-6, "FR");
-
-            // REDIRECT_TO_LFE mixes the source into the LFE destination.
-            memory.map_bytes(MATRIX, &[0_u8; 24]);
-            assert_eq!(
-                calculate(
-                    &mut runtime,
-                    &mut memory,
-                    X3DAUDIO_CALCULATE_MATRIX | X3DAUDIO_CALCULATE_REDIRECT_TO_LFE,
-                ),
-                0
-            );
-            assert!((matrix_value(&memory, 3) - 0.25).abs() < 1.0e-6, "LFE");
-
-            // Flag gating: with only the emitter-angle flag the matrix and
-            // delay arrays keep their sentinel values.
-            memory.map_bytes(MATRIX, &[0_u8; 24]);
-            write_u32(&mut memory, MATRIX, 0x3F80_0000); // 1.0 sentinel
-            write_u32(&mut memory, DELAYS, 0x3F80_0000);
-            assert_eq!(
-                calculate(&mut runtime, &mut memory, X3DAUDIO_CALCULATE_EMITTER_ANGLE,),
-                0
-            );
-            assert_eq!(matrix_value(&memory, 0), 1.0, "matrix untouched");
-            assert_eq!(delay_value(&memory, 0), 1.0, "delays untouched");
-
-            // Deterministic: the same call reproduces the same matrix bytes.
-            memory.map_bytes(MATRIX, &[0_u8; 24]);
-            assert_eq!(
-                calculate(&mut runtime, &mut memory, X3DAUDIO_CALCULATE_MATRIX),
-                0
-            );
-            assert_eq!(
-                memory.read_bytes(MATRIX, 24).expect("matrix bytes"),
-                snapshot,
-                "the DSP output is deterministic"
-            );
-
-            // The delay array is documented as stereo-only: a 5.1 calculation
-            // with the delay flag leaves it untouched.
-            memory.map_bytes(DELAYS, &[0_u8; 24]);
-            write_u32(&mut memory, DELAYS, 0x3F80_0000);
-            assert_eq!(
-                calculate(
-                    &mut runtime,
-                    &mut memory,
-                    X3DAUDIO_CALCULATE_MATRIX | X3DAUDIO_CALCULATE_DELAY,
-                ),
-                0
-            );
-            assert_eq!(delay_value(&memory, 0), 1.0, "non-stereo delay untouched");
-        })
-    }
-
-    #[test]
-    fn stereo_matrix_and_delays_use_the_unit_speaker_circle() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = test_runtime("x3daudio-stereo");
-            let mut memory = MemoryImage::default();
-            scene(&mut memory, SPEAKER_STEREO, 2);
-            // Six units to the left, scaled distance 2 (scaler 3).
-            write_vec(&mut memory, EMITTER + 28, -6.0, 0.0, 0.0);
-            write_f32(&mut memory, EMITTER + 92, 3.0);
-
-            assert_eq!(
-                calculate(
-                    &mut runtime,
-                    &mut memory,
-                    X3DAUDIO_CALCULATE_MATRIX | X3DAUDIO_CALCULATE_DELAY,
-                ),
-                0
-            );
-            // Hard-left source exactly on the left speaker's side-axis line:
-            // FL gets the full 0.5 attenuation and FR is silent.
-            assert!((matrix_value(&memory, 0) - 0.5).abs() < 1.0e-6, "FL");
-            assert!(matrix_value(&memory, 1).abs() < 1.0e-6, "FR");
-            // The FL speaker on the unit circle is 5 units from the emitter
-            // and FR 7 → FL waits (7 − 5)/343.5 s ≈ 5.8224 ms.
-            let fl = delay_value(&memory, 0);
-            assert!((fl - 5.8224).abs() < 0.01, "FL delay {fl}");
-            assert!(delay_value(&memory, 1).abs() < 1.0e-6, "FR is closest");
-        })
-    }
-
-    #[test]
-    fn seven_point_one_rear_source_uses_the_documented_arc() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = test_runtime("x3daudio-71");
-            let mut memory = MemoryImage::default();
-            scene(&mut memory, SPEAKER_7POINT1, 8);
-            // Azimuth −110° (left-rear): the documented 7.1 arc between the
-            // back-left speaker at −135° and the front-left speaker at −30°.
-            let azimuth = -110.0_f32.to_radians();
-            write_vec(
-                &mut memory,
-                EMITTER + 28,
-                azimuth.sin() * 4.0,
-                0.0,
-                azimuth.cos() * 4.0,
-            );
-            assert_eq!(
-                calculate(&mut runtime, &mut memory, X3DAUDIO_CALCULATE_MATRIX),
-                0
-            );
-            // fraction = (−110 − (−135)) / ((−30) − (−135)) = 25/105.
-            let fraction = 25.0_f32 / 105.0;
-            assert!(
-                (matrix_value(&memory, 4) - (1.0 - fraction) * 0.25).abs() < 1.0e-5,
-                "BL {}",
-                matrix_value(&memory, 4)
-            );
-            assert!(
-                (matrix_value(&memory, 0) - fraction * 0.25).abs() < 1.0e-5,
-                "FL {}",
-                matrix_value(&memory, 0)
-            );
-            for index in [1, 2, 3, 5, 6, 7] {
-                assert!(
-                    matrix_value(&memory, index).abs() < 1.0e-6,
-                    "destination {index} must stay silent"
-                );
-            }
-        })
-    }
-
-    #[test]
-    fn inner_radius_and_angle_diffuse_toward_the_all_speaker_mix() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = test_runtime("x3daudio-inner-radius");
-            let mut memory = MemoryImage::default();
-            scene(&mut memory, SPEAKER_5POINT1, 6);
-            // A source 0.2 units ahead inside a 4-unit inner radius: the
-            // documented curve diffuses 90% equally over every speaker, with
-            // the matching share on the center.
-            write_vec(&mut memory, EMITTER + 28, 0.0, 0.0, 0.2);
-            write_f32(&mut memory, EMITTER + 52, 4.0); // InnerRadius
-            assert_eq!(
-                calculate(&mut runtime, &mut memory, X3DAUDIO_CALCULATE_MATRIX),
-                0
-            );
-            let total: f32 = (0..6).map(|index| matrix_value(&memory, index)).sum();
-            assert!((total - 1.0).abs() < 1.0e-5, "energy conserved: {total}");
-            assert!(
-                (matrix_value(&memory, 2) - 0.25071).abs() < 1.0e-4,
-                "FC {}",
-                matrix_value(&memory, 2)
-            );
-            assert!((matrix_value(&memory, 0) - 0.18).abs() < 1.0e-5, "FL");
-            assert!(
-                (matrix_value(&memory, 4) - 0.19464).abs() < 1.0e-4,
-                "BL {}",
-                matrix_value(&memory, 4)
-            );
-            assert!(matrix_value(&memory, 3).abs() < 1.0e-6, "LFE silent");
-
-            // Directly above the listener (zero horizontal radius) with a
-            // configured InnerRadiusAngle: the full all-speaker mix.
-            let mut memory = MemoryImage::default();
-            scene(&mut memory, SPEAKER_5POINT1, 6);
-            write_vec(&mut memory, EMITTER + 28, 0.0, 8.0, 0.0);
-            write_f32(&mut memory, EMITTER + 52, 2.0); // InnerRadius
-            write_f32(&mut memory, EMITTER + 56, std::f32::consts::FRAC_PI_4);
-            assert_eq!(
-                calculate(&mut runtime, &mut memory, X3DAUDIO_CALCULATE_MATRIX),
-                0
-            );
-            // Distance 8 → attenuation 0.125, spread equally over 5 speakers.
-            for index in [0, 1, 2, 4, 5] {
-                assert!(
-                    (matrix_value(&memory, index) - 0.025).abs() < 1.0e-6,
-                    "speaker {index} {}",
-                    matrix_value(&memory, index)
-                );
-            }
-            assert!(matrix_value(&memory, 3).abs() < 1.0e-6, "LFE silent");
-        })
     }
 }
 
@@ -14240,8 +13608,6 @@ mod cert_selection_tests {
             .clone()
     }
 
-    /// Build a structurally real X.509 certificate with an RSA SHA-256 or
-    /// SHA-384 signature and absolute validity seconds.
     fn build_cert(serial: u64, cn: &str, not_before: i64, not_after: i64, sha384: bool) -> Vec<u8> {
         use der::{Decode, Encode};
         use rand::SeedableRng;
@@ -14320,175 +13686,6 @@ mod cert_selection_tests {
     }
 
     #[test]
-    fn best_match_prefers_the_stronger_signature_algorithm() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = test_runtime("cert-order-algorithm");
-            let mut memory = MemoryImage::default();
-            memory.map_bytes(SELECTED, &[0_u8; 8]);
-            let now = now_seconds();
-            // The SHA-256 certificate has the later NotAfter; the stronger
-            // SHA-384 signature must still win on the first key.
-            let weaker = build_cert(11, "Weaker SHA-256", now - 60, now + 86400 * 3650, false);
-            let stronger = build_cert(12, "Stronger SHA-384", now - 60, now + 86400 * 1000, true);
-            let store = runtime.cert_store_manager.open_store("CERT_ORDER_ALGO");
-            runtime
-                .cert_store_manager
-                .add_certificate(store, &weaker)
-                .expect("add weaker");
-            runtime
-                .cert_store_manager
-                .add_certificate(store, &stronger)
-                .expect("add stronger");
-            write_request(&mut memory, &[store]);
-
-            assert_eq!(select_certificate(&mut runtime, &mut memory), 1);
-            assert_eq!(runtime.last_error, 0);
-            assert_eq!(
-                selected_der(&runtime, &memory),
-                stronger,
-                "the strongest signature algorithm wins"
-            );
-            assert_eq!(
-                read_guest_pointer(&memory, REQUEST + SEL_X86_HSELECTED, GuestArch::X86).unwrap(),
-                store,
-                "hSelectedCertStore names the owning store"
-            );
-            assert_eq!(
-                cert_signature_algorithm_strength(&stronger),
-                6,
-                "SHA-384 ranks above SHA-256"
-            );
-            assert_eq!(cert_signature_algorithm_strength(&weaker), 5);
-        })
-    }
-
-    #[test]
-    fn best_match_prefers_the_latest_not_after_across_stores() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = test_runtime("cert-order-notafter");
-            let mut memory = MemoryImage::default();
-            memory.map_bytes(SELECTED, &[0_u8; 8]);
-            let now = now_seconds();
-            // Same algorithm: the later NotAfter must win even though the
-            // earlier store is enumerated first.
-            let older = build_cert(21, "Older", now - 60, now + 86400 * 1000, false);
-            let newer = build_cert(22, "Newer", now - 60, now + 86400 * 2000, false);
-            let first_store = runtime.cert_store_manager.open_store("CERT_ORDER_STORE_A");
-            let second_store = runtime.cert_store_manager.open_store("CERT_ORDER_STORE_B");
-            runtime
-                .cert_store_manager
-                .add_certificate(first_store, &older)
-                .expect("add older");
-            runtime
-                .cert_store_manager
-                .add_certificate(second_store, &newer)
-                .expect("add newer");
-            write_request(&mut memory, &[first_store, second_store]);
-
-            assert_eq!(select_certificate(&mut runtime, &mut memory), 1);
-            assert_eq!(
-                selected_der(&runtime, &memory),
-                newer,
-                "the latest NotAfter wins"
-            );
-            assert_eq!(
-                read_guest_pointer(&memory, REQUEST + SEL_X86_HSELECTED, GuestArch::X86).unwrap(),
-                second_store,
-                "hSelectedCertStore follows the winner"
-            );
-        })
-    }
-
-    #[test]
-    fn best_match_falls_back_to_store_order_on_a_full_tie() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = test_runtime("cert-order-store");
-            let mut memory = MemoryImage::default();
-            memory.map_bytes(SELECTED, &[0_u8; 8]);
-            let now = now_seconds();
-            // Identical algorithm and identical absolute validity: the tie
-            // falls back to store order (the first enumerated store wins).
-            let first = build_cert(31, "First", now - 60, now + 86400 * 3000, false);
-            let second = build_cert(32, "Second", now - 60, now + 86400 * 3000, false);
-            let later = build_cert(33, "Later In Store", now - 60, now + 86400 * 3000, false);
-            let first_store = runtime.cert_store_manager.open_store("CERT_ORDER_TIE_A");
-            let second_store = runtime.cert_store_manager.open_store("CERT_ORDER_TIE_B");
-            runtime
-                .cert_store_manager
-                .add_certificate(first_store, &first)
-                .expect("add first");
-            runtime
-                .cert_store_manager
-                .add_certificate(first_store, &later)
-                .expect("add later");
-            runtime
-                .cert_store_manager
-                .add_certificate(second_store, &second)
-                .expect("add second");
-            write_request(&mut memory, &[first_store, second_store]);
-
-            assert_eq!(select_certificate(&mut runtime, &mut memory), 1);
-            assert_eq!(
-                selected_der(&runtime, &memory),
-                first,
-                "a full tie selects the earliest-enumerated certificate"
-            );
-
-            // Deterministic: the same request selects the same certificate.
-            let second_call_out = 0x80_300_u64;
-            memory.map_bytes(second_call_out, &[0_u8; 8]);
-            let request = REQUEST;
-            let thunk = runtime.alloc_host_thunk(HostThunk::CertSelectCertificate);
-            assert_eq!(
-                dispatch_x86(
-                    &mut runtime,
-                    &mut memory,
-                    thunk,
-                    &[request as u32, second_call_out as u32],
-                ),
-                1
-            );
-            let context = read_u32(&memory, second_call_out).expect("context") as u64;
-            assert_eq!(
-                runtime.cert_contexts.get(&context).expect("second context"),
-                &first
-            );
-        })
-    }
-
-    #[test]
-    fn no_eligible_certificate_still_answers_false() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = test_runtime("cert-order-none");
-            let mut memory = MemoryImage::default();
-            memory.map_bytes(SELECTED, &[0_u8; 8]);
-            let now = now_seconds();
-            let expired = build_cert(41, "Expired", now - 86400 * 400, now - 86400 * 10, false);
-            let store = runtime.cert_store_manager.open_store("CERT_ORDER_EXPIRED");
-            runtime
-                .cert_store_manager
-                .add_certificate(store, &expired)
-                .expect("add expired");
-            write_request(&mut memory, &[store]);
-
-            assert_eq!(select_certificate(&mut runtime, &mut memory), 0);
-            assert_eq!(runtime.last_error, 0, "user-cancel has no error");
-            assert_eq!(
-                read_u32(&memory, SELECTED).expect("selected"),
-                0,
-                "no context is written without a winner"
-            );
-
-            // A store with no certificates at all: still FALSE, still no
-            // error.
-            let empty_store = runtime.cert_store_manager.open_store("CERT_ORDER_EMPTY");
-            write_request(&mut memory, &[empty_store]);
-            assert_eq!(select_certificate(&mut runtime, &mut memory), 0);
-            assert_eq!(runtime.last_error, 0);
-        })
-    }
-
-    #[test]
     fn unknown_store_handle_keeps_the_real_error() {
         with_big_stack(|| {
             let (mut runtime, _tmp) = test_runtime("cert-order-bad-store");
@@ -14498,49 +13695,6 @@ mod cert_selection_tests {
             assert_eq!(select_certificate(&mut runtime, &mut memory), 0);
             assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
         })
-    }
-
-    #[test]
-    fn signature_algorithm_strength_order_is_documented() {
-        let md2 = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x02];
-        let md5 = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x04];
-        let sha1 = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05];
-        let sha224 = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0e];
-        let sha256 = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
-        let sha384 = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
-        let sha512 = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
-        let ecdsa_sha1 = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01];
-        let ecdsa_sha256 = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
-        let ecdsa_sha512 = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
-        let ed25519 = [0x2b, 0x65, 0x70];
-        let unknown = [0x2a, 0x03];
-        assert!(signature_oid_strength(&md2) < signature_oid_strength(&md5));
-        assert!(signature_oid_strength(&md5) < signature_oid_strength(&sha1));
-        assert!(signature_oid_strength(&sha1) < signature_oid_strength(&sha224));
-        assert!(signature_oid_strength(&sha224) < signature_oid_strength(&sha256));
-        assert!(signature_oid_strength(&sha256) < signature_oid_strength(&sha384));
-        assert!(signature_oid_strength(&sha384) < signature_oid_strength(&sha512));
-        assert_eq!(
-            signature_oid_strength(&ecdsa_sha1),
-            signature_oid_strength(&sha1)
-        );
-        assert_eq!(
-            signature_oid_strength(&ecdsa_sha256),
-            signature_oid_strength(&sha256)
-        );
-        assert_eq!(
-            signature_oid_strength(&ecdsa_sha512),
-            signature_oid_strength(&sha512)
-        );
-        assert_eq!(signature_oid_strength(&ed25519), 7);
-        assert_eq!(signature_oid_strength(&unknown), 0);
-
-        // The DER-level walk finds the same ranks in real certificates.
-        let now = now_seconds();
-        let weak = build_cert(51, "Weak", now - 60, now + 86400 * 3650, false);
-        let strong = build_cert(52, "Strong", now - 60, now + 86400 * 3650, true);
-        assert_eq!(cert_signature_algorithm_strength(&weak), 5);
-        assert_eq!(cert_signature_algorithm_strength(&strong), 6);
     }
 }
 

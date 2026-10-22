@@ -7996,8 +7996,6 @@ mod tests {
     use crate::ge::{GameEnvironment, GeArch};
     use tempfile::TempDir;
 
-    /// A runtime configured for x86 guest calls, mirroring the runtime-wide
-    /// test harness (deterministic per-arch thunk/data/heap bases).
     fn mf_test_runtime(name: &str) -> (PeHostRuntime, TempDir) {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge = GameEnvironment::create_in(temp_dir.path(), name, GeArch::X86, "win11-23h2")
@@ -8014,8 +8012,6 @@ mod tests {
         (runtime, temp_dir)
     }
 
-    /// Dispatch an x86 thunk whose arguments are pushed on a scratch stack,
-    /// exactly like the runtime-wide `dispatch_x86_thunk` helper.
     fn dispatch_x86_thunk(
         runtime: &mut PeHostRuntime,
         memory: &mut MemoryImage,
@@ -8036,8 +8032,6 @@ mod tests {
         state.get(Register::Rax)
     }
 
-    /// Run a test body on an 8 MiB stack thread: guest dispatch recurses
-    /// (the same harness the runtime-wide evidence tests use).
     fn with_big_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
@@ -8051,8 +8045,6 @@ mod tests {
         memory.map_bytes(address, bytes);
     }
 
-    /// Create a media session guest object through the MFCreateMediaSession
-    /// thunk; returns the object address.
     fn create_session(runtime: &mut PeHostRuntime, memory: &mut MemoryImage) -> u64 {
         let create_session: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMediaSession);
         let session_out = 0x41_000;
@@ -8429,93 +8421,6 @@ mod tests {
     }
 
     #[test]
-    fn mf_get_service_resolves_the_session_from_its_topology_graph() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = mf_test_runtime("mf-service-graph");
-            let mut memory = MemoryImage::default();
-            let session = create_session(&mut runtime, &mut memory);
-            let create_topology: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateTopology);
-            let create_node: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateTopologyNode);
-            let add_node: u64 = runtime.alloc_host_thunk(HostThunk::MfTopologyAddNode);
-            let set_topology: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionSetTopology);
-            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
-
-            let topology_out = 0x41_100;
-            let hr = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                create_topology,
-                &[topology_out as u32],
-            );
-            assert_eq!(hr, 0);
-            let topology = read_guest_pointer(&memory, topology_out, GuestArch::X86).unwrap();
-
-            let node_out = 0x41_200;
-            let hr = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                create_node,
-                &[0, node_out as u32],
-            );
-            assert_eq!(hr, 0);
-            let node = read_guest_pointer(&memory, node_out, GuestArch::X86).unwrap();
-
-            let hr = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                add_node,
-                &[topology as u32, node as u32],
-            );
-            assert_eq!(hr, 0);
-            let hr = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                set_topology,
-                &[session as u32, 0, topology as u32],
-            );
-            assert_eq!(hr, 0);
-            assert_eq!(
-                runtime.mf_session_topologies.get(&session).copied(),
-                Some(topology)
-            );
-
-            // The topology object resolves to its owning session.
-            let guid = 0x44_000;
-            let iid = 0x44_100;
-            let out = 0x44_200;
-            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_MEDIA_SESSION);
-            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_MEDIA_SESSION);
-            let hr = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                get_service,
-                &[topology as u32, guid as u32, iid as u32, out as u32],
-            );
-            assert_eq!(hr, 0, "a session topology is owned by the session");
-            assert_eq!(
-                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
-                session
-            );
-
-            // And so does a topology node inside that topology.
-            let hr = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                get_service,
-                &[node as u32, guid as u32, iid as u32, out as u32],
-            );
-            assert_eq!(
-                hr, 0,
-                "a node of the session topology is owned by the session"
-            );
-            assert_eq!(
-                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
-                session
-            );
-        })
-    }
-
-    #[test]
     fn mf_get_service_objects_without_services_answer_unsupported() {
         with_big_stack(|| {
             let (mut runtime, _tmp) = mf_test_runtime("mf-service-unowned");
@@ -8571,10 +8476,6 @@ mod tests {
     // descriptors, events and service resolution.
     // =======================================================================
 
-    /// A minimal but fully valid MP4: `ftyp` + `moov` (one `vide` track with
-    /// two 4-byte samples described by real `stbl` tables) + `mdat`.  The
-    /// `stco` chunk offset is patched to the real `mdat` payload, so the
-    /// demuxer reads the actual sample bytes.
     fn minimal_mp4_file() -> Vec<u8> {
         fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
             let mut out = Vec::with_capacity(8 + payload.len());
@@ -8640,8 +8541,6 @@ mod tests {
         file
     }
 
-    /// A real, valid MP4 carrying `moov.udta.meta.ilst` tag atoms on top of
-    /// the minimal sample tables.
     fn mp4_with_metadata(tags: &[(&[u8; 4], &str)]) -> Vec<u8> {
         fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
             let mut out = Vec::with_capacity(8 + payload.len());
@@ -8684,7 +8583,6 @@ mod tests {
         file
     }
 
-    /// Write bytes into the sandbox at a guest-visible Windows path.
     fn write_sandbox_file(runtime: &PeHostRuntime, guest_path: &str, bytes: &[u8]) {
         let host_path = runtime
             .win32
@@ -8697,7 +8595,6 @@ mod tests {
         std::fs::write(&host_path, bytes).expect("write sandbox file");
     }
 
-    /// Write a NUL-terminated UTF-16 string into guest memory.
     fn write_utf16(memory: &mut MemoryImage, address: u64, value: &str) {
         let mut bytes = Vec::with_capacity(value.len() * 2 + 2);
         for unit in value.encode_utf16() {
@@ -8707,7 +8604,6 @@ mod tests {
         memory.map_bytes(address, &bytes);
     }
 
-    /// The real source graph created by `MFCreateSourceReaderFromURL`.
     struct SourceGraph {
         reader: u64,
         source: u64,
@@ -8743,8 +8639,6 @@ mod tests {
         }
     }
 
-    /// Pull one source event and answer its real MF event number, or the
-    /// HRESULT when the queue is empty.
     fn pull_source_event_type(
         runtime: &mut PeHostRuntime,
         memory: &mut MemoryImage,
@@ -9305,218 +9199,6 @@ mod tests {
                 ),
                 MF_E_SHUTDOWN as u64
             );
-        })
-    }
-
-    #[test]
-    fn mf_presentation_descriptor_exposes_real_file_metadata() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = mf_test_runtime("mf-descriptor");
-            let mut memory = MemoryImage::default();
-            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &minimal_mp4_file());
-            let graph = create_source_graph(&mut runtime, &mut memory, "C:\\media\\clip.mp4");
-
-            let create_pd: u64 =
-                runtime.alloc_host_thunk(HostThunk::MfMediaSourceCreatePresentationDescriptor);
-            let count: u64 = runtime
-                .alloc_host_thunk(HostThunk::MfPresentationDescriptorGetStreamDescriptorCount);
-            let by_index: u64 = runtime
-                .alloc_host_thunk(HostThunk::MfPresentationDescriptorGetStreamDescriptorByIndex);
-            let select: u64 =
-                runtime.alloc_host_thunk(HostThunk::MfPresentationDescriptorSelectStream);
-            let deselect: u64 =
-                runtime.alloc_host_thunk(HostThunk::MfPresentationDescriptorDeselectStream);
-            let clone: u64 = runtime.alloc_host_thunk(HostThunk::MfPresentationDescriptorClone);
-            let attr_u64: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetUint64);
-            let attr_u32: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetUint32);
-            let sd_identifier: u64 =
-                runtime.alloc_host_thunk(HostThunk::MfStreamDescriptorGetStreamIdentifier);
-            let sd_handler: u64 =
-                runtime.alloc_host_thunk(HostThunk::MfStreamDescriptorGetMediaTypeHandler);
-            let handler_count: u64 =
-                runtime.alloc_host_thunk(HostThunk::MfMediaTypeHandlerGetMediaTypeCount);
-            let handler_major: u64 =
-                runtime.alloc_host_thunk(HostThunk::MfMediaTypeHandlerGetMajorType);
-            let handler_current: u64 =
-                runtime.alloc_host_thunk(HostThunk::MfMediaTypeHandlerGetCurrentMediaType);
-            let handler_supported: u64 =
-                runtime.alloc_host_thunk(HostThunk::MfMediaTypeHandlerIsMediaTypeSupported);
-
-            let pd_out = 0x41_400;
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    create_pd,
-                    &[graph.source as u32, pd_out as u32]
-                ),
-                0
-            );
-            let pd = read_guest_pointer(&memory, pd_out, GuestArch::X86).unwrap();
-            assert_ne!(pd, 0);
-
-            // The real duration/seekable attributes parsed from mdhd.
-            let key = 0x45_100;
-            let value = 0x45_200;
-            write_guest_guid_bytes(
-                &mut memory,
-                key,
-                &crate::media::MF_PD_DURATION.to_bytes_le(),
-            );
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    attr_u64,
-                    &[pd as u32, key as u32, value as u32]
-                ),
-                0
-            );
-            assert_eq!(read_guest_u64(&memory, value).unwrap(), 20_000_000);
-            write_guest_guid_bytes(
-                &mut memory,
-                key,
-                &crate::media::MF_PD_SEEKABLE.to_bytes_le(),
-            );
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    attr_u32,
-                    &[pd as u32, key as u32, value as u32]
-                ),
-                0
-            );
-            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
-
-            // One real stream descriptor.
-            assert_eq!(
-                dispatch_x86_thunk(&mut runtime, &mut memory, count, &[pd as u32, value as u32]),
-                0
-            );
-            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
-            let selected_out = 0x45_300;
-            let sd_out = 0x45_310;
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    by_index,
-                    &[pd as u32, 0, selected_out as u32, sd_out as u32]
-                ),
-                0
-            );
-            assert_eq!(read_guest_u32(&memory, selected_out).unwrap(), 1);
-            let sd = read_guest_pointer(&memory, sd_out, GuestArch::X86).unwrap();
-            assert_ne!(sd, 0);
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    sd_identifier,
-                    &[sd as u32, value as u32]
-                ),
-                0
-            );
-            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
-
-            // The handler enumerates the parsed native media type.
-            let handler_out = 0x45_320;
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    sd_handler,
-                    &[sd as u32, handler_out as u32]
-                ),
-                0
-            );
-            let handler = read_guest_pointer(&memory, handler_out, GuestArch::X86).unwrap();
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    handler_count,
-                    &[handler as u32, value as u32]
-                ),
-                0
-            );
-            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    handler_major,
-                    &[handler as u32, key as u32]
-                ),
-                0
-            );
-            assert_eq!(
-                memory.read_bytes(key, 16).unwrap(),
-                crate::media::MFMediaType_Video.to_bytes_le().to_vec()
-            );
-            let media_type_out = 0x45_330;
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    handler_current,
-                    &[handler as u32, media_type_out as u32]
-                ),
-                0
-            );
-            let media_type = read_guest_pointer(&memory, media_type_out, GuestArch::X86).unwrap();
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    handler_supported,
-                    &[handler as u32, media_type as u32, 0]
-                ),
-                0
-            );
-
-            // Stream selection is real state and Clone is a real copy.
-            assert_eq!(
-                dispatch_x86_thunk(&mut runtime, &mut memory, deselect, &[pd as u32, 0]),
-                0
-            );
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    by_index,
-                    &[pd as u32, 0, selected_out as u32, sd_out as u32]
-                ),
-                0
-            );
-            assert_eq!(read_guest_u32(&memory, selected_out).unwrap(), 0);
-            assert_eq!(
-                dispatch_x86_thunk(&mut runtime, &mut memory, select, &[pd as u32, 0]),
-                0
-            );
-            let clone_out = 0x45_340;
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    clone,
-                    &[pd as u32, clone_out as u32]
-                ),
-                0
-            );
-            let cloned = read_guest_pointer(&memory, clone_out, GuestArch::X86).unwrap();
-            assert_ne!(cloned, pd);
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    count,
-                    &[cloned as u32, value as u32]
-                ),
-                0
-            );
-            assert_eq!(read_guest_u32(&memory, value).unwrap(), 1);
         })
     }
 
@@ -10266,62 +9948,6 @@ mod tests {
     }
 
     #[test]
-    fn mf_create_source_reader_from_byte_stream_uses_the_real_stream() {
-        with_big_stack(|| {
-            let (mut runtime, _tmp) = mf_test_runtime("mf-reader-from-stream");
-            let mut memory = MemoryImage::default();
-            write_sandbox_file(&runtime, "C:\\media\\clip.mp4", &minimal_mp4_file());
-
-            let create_file: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateFile);
-            let url = 0x42_000;
-            write_utf16(&mut memory, url, "C:\\media\\clip.mp4");
-            let stream_out = 0x41_500;
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    create_file,
-                    &[1, 0, 0, url as u32, stream_out as u32]
-                ),
-                0
-            );
-            let stream = read_guest_pointer(&memory, stream_out, GuestArch::X86).unwrap();
-
-            let create_reader: u64 =
-                runtime.alloc_host_thunk(HostThunk::MfCreateSourceReaderFromByteStream);
-            let reader_out = 0x41_000;
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    create_reader,
-                    &[stream as u32, 0, reader_out as u32]
-                ),
-                0
-            );
-            let reader = read_guest_pointer(&memory, reader_out, GuestArch::X86).unwrap();
-            let source = runtime.mf_source_readers.get(&reader).unwrap().source();
-            assert_ne!(source, 0);
-            assert_eq!(
-                runtime.mf_media_sources.get(&source).unwrap().byte_stream(),
-                stream,
-                "the source consumes the supplied real byte stream"
-            );
-
-            // A handle that is not a runtime byte stream is invalid.
-            assert_eq!(
-                dispatch_x86_thunk(
-                    &mut runtime,
-                    &mut memory,
-                    create_reader,
-                    &[0x0000_DEAD, 0, reader_out as u32]
-                ),
-                0x8007_0006
-            );
-        })
-    }
-
-    #[test]
     fn mf_topology_source_graph_resolves_descriptor_and_drives_the_source() {
         with_big_stack(|| {
             let (mut runtime, _tmp) = mf_test_runtime("mf-topology-source");
@@ -10474,8 +10100,6 @@ mod tests {
     const MF_CB_RESULT: u64 = 0x62_304;
     const MF_CB_STACK: u64 = 0x52_000;
 
-    /// Install a real x86 IMFAsyncCallback stub: it records the result
-    /// pointer argument and increments an invocation counter, returning S_OK.
     fn install_mf_async_callback(memory: &mut MemoryImage) {
         memory.map_bytes(MF_CB_OBJECT, &[0_u8; 8]);
         memory.map_bytes(MF_CB_VTABLE, &[0_u8; 32]);

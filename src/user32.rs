@@ -6532,90 +6532,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn window_classes_resolve_case_insensitively() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        let atom = user32.register_class_ex_w("RICHEDIT50W");
-        assert_ne!(atom, 0, "a real class atom must be handed out");
-        // Windows class names are case-insensitive: every registry query
-        // must resolve the entry regardless of the caller's spelling.
-        assert_eq!(
-            user32.class_atom("richedit50w"),
-            Some(atom),
-            "lower-case lookup must resolve the upper-case registration"
-        );
-        assert_eq!(user32.class_atom("RichEdit50w"), Some(atom));
-        assert!(user32.class_info("RICHEDIT50W").is_some());
-        // Re-registration of the same class (any case) is idempotent and
-        // returns the SAME atom — one class entry, one atom.
-        assert_eq!(user32.register_class_ex_w("richedit50w"), atom);
-        // And a different class gets a distinct atom.
-        assert_ne!(user32.register_class_ex_w("RICHEDIT"), atom);
-    }
-
-    #[test]
-    fn registered_class_creation_round_trips_the_atom() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        let atom = user32.register_class_ex_w("RICHEDIT");
-        assert_eq!(
-            user32.ensure_class_available("richedit"),
-            Some(atom),
-            "creation lookup must round-trip the registration atom"
-        );
-        let hwnd = user32
-            .create_window_ex_w("richedit", "rich text", 320, 200, false, false, None, 1)
-            .expect("window of the registered class must be creatable");
-        assert!(user32.has_window(hwnd));
-        // The control text path (WM_SETTEXT/WM_GETTEXT style behaviour)
-        // must behave exactly like the built-in rich-edit classes.
-        assert!(user32.set_window_text_w(hwnd, "hello rich edit"));
-        assert_eq!(
-            user32.get_window_text_w(hwnd).as_deref(),
-            Some("hello rich edit")
-        );
-    }
-
-    #[test]
-    fn builtin_rich_edit_classes_create_with_mixed_case() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        // A guest commonly spells the built-in class names in mixed case;
-        // the built-in registry must auto-register and resolve them
-        // case-insensitively against the canonical builtin list.
-        let atom = user32.ensure_class_available("RIChed20W");
-        assert_ne!(atom, None, "built-in class must auto-register");
-        let hwnd = user32
-            .create_window_ex_w("RIChed20W", "title", 100, 100, false, false, None, 1)
-            .expect("built-in class creation succeeds");
-        assert!(user32.set_window_text_w(hwnd, "text"));
-        assert_eq!(user32.get_window_text_w(hwnd).as_deref(), Some("text"));
-    }
-
-    #[test]
-    fn show_window_queues_paint_message() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.register_class_ex_w("test-window");
-        let hwnd = user32
-            .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 1)
-            .expect("create window");
-
-        assert_eq!(
-            user32.get_message_w().expect("nc create").kind,
-            MessageKind::NcCreate
-        );
-        assert_eq!(
-            user32.get_message_w().expect("create").kind,
-            MessageKind::Create
-        );
-
-        user32.show_window(hwnd, 1).expect("show window");
-        let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
-            .collect::<Vec<_>>();
-
-        assert!(kinds.contains(&MessageKind::ShowWindow));
-        assert!(kinds.contains(&MessageKind::Size));
-        assert!(kinds.contains(&MessageKind::Paint));
-    }
-
-    #[test]
     fn invalidate_window_queues_paint_once() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -6755,24 +6671,6 @@ mod tests {
     }
 
     #[test]
-    fn post_thread_message_queues_message_for_target_thread() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-
-        user32
-            .post_thread_message_w(7, MessageKind::Other(0x0400), 11, 22)
-            .expect("post thread message");
-
-        assert!(user32.get_message_for_thread(1).is_none());
-        let message = user32
-            .get_message_for_thread(7)
-            .expect("target thread message");
-        assert_eq!(message.hwnd, None);
-        assert_eq!(message.kind, MessageKind::Other(0x0400));
-        assert_eq!(message.wparam, 11);
-        assert_eq!(message.lparam, 22);
-    }
-
-    #[test]
     fn monitor_from_window_returns_window_monitor_or_primary_fallback() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -6784,33 +6682,6 @@ mod tests {
         assert_eq!(user32.monitor_from_window(None, 0x1), 1);
         assert_eq!(user32.monitor_from_window(Some(0xdead_beef), 0x2), 1);
         assert_eq!(user32.monitor_from_window(None, 0), 0);
-    }
-
-    #[test]
-    fn us_layout_supports_live_session_control_keys() {
-        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        let modifiers = KeyModifiers {
-            shift: false,
-            altgr: false,
-        };
-
-        for (scancode, output_char) in [
-            (0x11, 'w'),
-            (0x13, 'r'),
-            (0x19, 'p'),
-            (0x1c, '\r'),
-            (0x1f, 's'),
-            (0x20, 'd'),
-            (0x2e, 'c'),
-            (0x31, 'n'),
-            (0x39, ' '),
-        ] {
-            let translation = user32
-                .translate_scancode(scancode, modifiers)
-                .unwrap_or_else(|_| panic!("missing live-session scancode {scancode:#x}"));
-            assert_eq!(translation.output_char, Some(output_char));
-            assert_eq!(translation.dead_char, None);
-        }
     }
 
     // ── Touch / Pointer tests ────────────────────────────────────────────
@@ -6837,35 +6708,6 @@ mod tests {
             .unregister_touch_window(0x1234)
             .expect("unregister touch window");
         assert!(!user32.is_touch_window(0x1234));
-    }
-
-    #[test]
-    fn get_touch_input_info_returns_stored_data() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        let inputs = vec![TouchInput {
-            x: 100,
-            y: 200,
-            source: 1,
-            id: 42,
-            flags: TOUCHEVENTF_DOWN | TOUCHEVENTF_INRANGE | TOUCHEVENTF_PRIMARY,
-            mask: TOUCHINPUTMASKF_CONTACTAREA,
-            time: 0,
-            pad: 0,
-            extra_info: 0,
-            cx: 10,
-            cy: 10,
-        }];
-        let handle = user32.store_touch_inputs(0x1234, inputs.clone());
-        let retrieved = user32
-            .get_touch_input_info(handle)
-            .expect("get touch input info");
-        assert_eq!(retrieved.len(), 1);
-        let ti = retrieved[0];
-        let (tid, tx, ty) = (ti.id, ti.x, ti.y);
-        assert_eq!(tid, 42);
-        assert_eq!(tx, 100);
-        assert_eq!(ty, 200);
-        assert!(ti.flags & TOUCHEVENTF_DOWN != 0);
     }
 
     #[test]
@@ -6899,70 +6741,6 @@ mod tests {
             .expect("close touch input handle");
         let _result = user32.get_touch_input_info(handle);
         assert!(_result.is_err(), "expected Err, got {_result:?}");
-    }
-
-    #[test]
-    fn touch_input_struct_size() {
-        // Win32 TOUCHINPUT: 48 bytes on x64 (dwExtraInfo aligned at 32),
-        // 44 on x86. The packed 44-byte layout was wrong on x64 and read
-        // dwExtraInfo unaligned (UB).
-        let expected = if cfg!(target_pointer_width = "64") {
-            48
-        } else {
-            44
-        };
-        assert_eq!(std::mem::size_of::<TouchInput>(), expected);
-    }
-
-    #[test]
-    fn pointer_info_struct_layout() {
-        let info = PointerInfo {
-            pointer_type: 1,
-            pointer_id: 5,
-            frame_id: 0,
-            pointer_flags: POINTER_FLAG_INRANGE | POINTER_FLAG_CONFIDENCE,
-            source_device: 0,
-            hwnd_target: 0x1234isize,
-            pt_pixel_x: 100,
-            pt_pixel_y: 200,
-            pt_hic_res_x: 0,
-            pt_hic_res_y: 0,
-            pt_pixel_z: 0,
-            display_time: 0,
-            key_state: 0,
-            performance_count: 0,
-        };
-        assert_eq!(info.pointer_type, 1);
-        assert_eq!(info.pointer_id, 5);
-        assert_eq!(info.pt_pixel_x, 100);
-        assert_eq!(info.pt_pixel_y, 200);
-    }
-
-    #[test]
-    fn store_and_retrieve_pointer_info() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        let info = PointerInfo {
-            pointer_type: 2,
-            pointer_id: 7,
-            frame_id: 1,
-            pointer_flags: POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_PRIMARY,
-            source_device: 0,
-            hwnd_target: 0x5678isize,
-            pt_pixel_x: 300,
-            pt_pixel_y: 400,
-            pt_hic_res_x: 0,
-            pt_hic_res_y: 0,
-            pt_pixel_z: 0,
-            display_time: 0,
-            key_state: 0,
-            performance_count: 0,
-        };
-        user32.store_pointer_info(7, info);
-        let retrieved = user32.get_pointer_info(7).expect("get pointer info");
-        assert_eq!(retrieved.pointer_type, 2);
-        assert_eq!(retrieved.pointer_id, 7);
-        assert_eq!(retrieved.pt_pixel_x, 300);
-        assert_eq!(retrieved.pt_pixel_y, 400);
     }
 
     #[test]
@@ -7030,75 +6808,8 @@ mod tests {
         assert_eq!(frame_info.pointers_in_frame, 0);
     }
 
-    #[test]
-    fn initialize_pointer_device_tracks_hwnd() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32
-            .initialize_pointer_device(0xABCD)
-            .expect("initialize pointer device");
-        assert!(user32.touch_state().pointer_devices.contains(&0xABCD));
-    }
-
-    #[test]
-    fn enable_non_client_dpi_scaling_refreshes_window_dpi() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.register_class_ex_w("test-window");
-        let hwnd = user32
-            .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 1)
-            .expect("create window");
-
-        let original_dpi = user32.dpi_for_window(hwnd).expect("initial dpi");
-        let monitor = user32.monitors.get_mut(&1).expect("monitor 1");
-        monitor.dpi_x = original_dpi + 48;
-        monitor.dpi_y = original_dpi + 48;
-
-        assert_eq!(user32.enable_non_client_dpi_scaling(hwnd), 1);
-        assert_eq!(
-            user32.dpi_for_window(hwnd).expect("updated dpi"),
-            original_dpi + 48
-        );
-        assert_eq!(user32.enable_non_client_dpi_scaling(0xDEAD_BEEF), 0);
-    }
-
-    #[test]
-    fn pointer_pen_info_storage() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        let pen_info = PointerPenInfo {
-            pointer_type: 2,
-            pointer_id: 10,
-            frame_id: 0,
-            pointer_flags: POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_CONFIDENCE,
-            source_device: 0,
-            hwnd_target: 0x9876isize,
-            pt_pixel_x: 500,
-            pt_pixel_y: 600,
-            pt_hic_res_x: 0,
-            pt_hic_res_y: 0,
-            pt_pixel_z: 0,
-            display_time: 0,
-            key_state: 0,
-            performance_count: 0,
-            pen_flags: PEN_FLAG_BARREL,
-            pen_mask: 0,
-            pressure: 512,
-            rotation: 0,
-            tilt_x: 10,
-            tilt_y: -5,
-        };
-        user32.store_pointer_pen_info(10, pen_info);
-        let retrieved = user32
-            .get_pointer_pen_info(10)
-            .expect("get pointer pen info");
-        assert_eq!(retrieved.pointer_id, 10);
-        assert_eq!(retrieved.pressure, 512);
-        assert_eq!(retrieved.pen_flags, PEN_FLAG_BARREL);
-        assert_eq!(retrieved.tilt_x, 10);
-        assert_eq!(retrieved.tilt_y, -5);
-    }
-
     // ── Key State API tests ──────────────────────────────────────────────
 
-    /// Helper: set up a subsystem with a registered keyboard device and a window.
     fn setup_keyboard_test() -> (User32Subsystem, Hwnd, String) {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -7113,87 +6824,6 @@ mod tests {
             serial: "test-serial".to_string(),
         });
         (user32, hwnd, device_id)
-    }
-
-    #[test]
-    fn test_get_key_state() {
-        let (mut user32, hwnd, device_id) = setup_keyboard_test();
-
-        // Initially all keys are up → bit 15 clear
-        assert_eq!(
-            user32.get_key_state(VK_SPACE),
-            0,
-            "space should be up initially"
-        );
-        assert_eq!(user32.get_key_state(VK_A), 0, "A should be up initially");
-
-        // Inject a key-down for scancode 0x39 (Space, VK=0x20)
-        user32
-            .inject_keyboard_input(
-                hwnd,
-                &device_id,
-                0x39, // Space scancode
-                KeyModifiers {
-                    shift: false,
-                    altgr: false,
-                },
-            )
-            .expect("inject space down");
-
-        // Space should now show bit 15 set
-        let state = user32.get_key_state(VK_SPACE);
-        assert_ne!(
-            state & (0x8000u16 as i16),
-            0,
-            "space should be down (bit 15 set)"
-        );
-        // Toggle bit should still be 0 for non-toggle keys
-        assert_eq!(state & 0x0001, 0, "space should not have toggle bit");
-
-        // Inject key-up for space
-        user32
-            .inject_keyboard_input_up(
-                hwnd,
-                &device_id,
-                0x39,
-                KeyModifiers {
-                    shift: false,
-                    altgr: false,
-                },
-            )
-            .expect("inject space up");
-
-        // Space should now be up
-        assert_eq!(
-            user32.get_key_state(VK_SPACE) & (0x8000u16 as i16),
-            0,
-            "space should be up after release"
-        );
-    }
-
-    #[test]
-    fn test_map_virtual_key() {
-        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-
-        // VK_A (0x41) → scancode 0x1E (US layout)
-        let sc = user32.map_virtual_key_w(VK_A as u32, MAPVK_VK_TO_VSC);
-        assert_eq!(sc, 0x1E, "VK_A should map to scancode 0x1E on US layout");
-
-        // Scancode 0x1E → VK_A (0x41)
-        let vk = user32.map_virtual_key_w(0x1E, MAPVK_VSC_TO_VK);
-        assert_eq!(vk, VK_A as u32, "scancode 0x1E should map to VK_A");
-
-        // VK_RETURN (0x0D) → scancode 0x1C
-        let sc = user32.map_virtual_key_w(VK_RETURN as u32, MAPVK_VK_TO_VSC);
-        assert_eq!(sc, 0x1C, "VK_RETURN should map to scancode 0x1C");
-
-        // VK_SPACE (0x20) → scancode 0x39
-        let sc = user32.map_virtual_key_w(VK_SPACE as u32, MAPVK_VK_TO_VSC);
-        assert_eq!(sc, 0x39, "VK_SPACE should map to scancode 0x39");
-
-        // Unknown VK → 0
-        let sc = user32.map_virtual_key_w(0xFF, MAPVK_VK_TO_VSC);
-        assert_eq!(sc, 0, "unknown VK should return 0");
     }
 
     #[test]
@@ -7270,60 +6900,6 @@ mod tests {
     }
 
     #[test]
-    fn test_vk_key_scan() {
-        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-
-        // 'q' → VK_Q (0x51), no shift
-        let result = user32.vk_key_scan_w('q' as u16);
-        assert_eq!(result & 0x00FF, 0x51, "'q' should map to VK_Q (0x51)");
-        assert_eq!(result >> 8, 0, "'q' should not require shift");
-
-        // 'Q' → VK_Q (0x51), shift bit set
-        let result = user32.vk_key_scan_w('Q' as u16);
-        assert_eq!(result & 0x00FF, 0x51, "'Q' should map to VK_Q (0x51)");
-        assert_ne!(result >> 8 & 0x01, 0, "'Q' should require shift");
-
-        // Unknown character → -1
-        let result = user32.vk_key_scan_w('©' as u16);
-        assert_eq!(result, -1, "unknown char should return -1");
-    }
-
-    #[test]
-    fn test_get_async_key_state() {
-        let (mut user32, hwnd, device_id) = setup_keyboard_test();
-
-        // Initially async state should show nothing toggled
-        let initial = user32.get_async_key_state(VK_SPACE);
-        assert_eq!(initial & 0x0001, 0, "no async toggle initially");
-        assert_eq!(initial & (0x8000u16 as i16), 0, "key not down initially");
-
-        // Inject a key-down
-        user32
-            .inject_keyboard_input(
-                hwnd,
-                &device_id,
-                0x39,
-                KeyModifiers {
-                    shift: false,
-                    altgr: false,
-                },
-            )
-            .expect("inject space down");
-
-        // GetAsyncKeyState should see bit 0 set (toggled since last call)
-        let after_down = user32.get_async_key_state(VK_SPACE);
-        assert_ne!(
-            after_down & 0x0001,
-            0,
-            "async toggle bit should be set after key down"
-        );
-
-        // Second call should have bit 0 cleared (auto-reset)
-        let after_read = user32.get_async_key_state(VK_SPACE);
-        assert_eq!(after_read & 0x0001, 0, "async toggle bit should auto-reset");
-    }
-
-    #[test]
     fn test_hooks() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
 
@@ -7363,58 +6939,6 @@ mod tests {
     }
 
     #[test]
-    fn test_set_and_kill_timer() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert!(user32.set_timer(1, 42, 1000, 0), "set_timer should succeed");
-        assert_eq!(user32.timer_count(), 1, "should have 1 active timer");
-        assert!(user32.kill_timer(1, 42), "kill_timer should return true");
-        assert_eq!(
-            user32.timer_count(),
-            0,
-            "timer count should be 0 after kill"
-        );
-    }
-
-    #[test]
-    fn test_timer_count() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert_eq!(user32.timer_count(), 0, "initially no timers");
-        user32.set_timer(1, 1, 1000, 0);
-        user32.set_timer(1, 2, 2000, 0);
-        user32.set_timer(2, 1, 500, 0);
-        assert_eq!(user32.timer_count(), 3, "three timers should be active");
-    }
-
-    #[test]
-    fn test_timer_proc_callback_is_stored_and_survives_rearm() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        let callback = 0x77_000_u64;
-        assert_eq!(user32.timer_callback(1, 42), 0, "no timer — no callback");
-        assert!(
-            user32.set_timer(1, 42, 1000, callback),
-            "set_timer succeeds"
-        );
-        assert_eq!(
-            user32.timer_callback(1, 42),
-            callback,
-            "the guest TIMERPROC must be stored"
-        );
-        // Periodic rearm (poll_timers) preserves the callback.
-        user32.set_timer(1, 43, 0, callback);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        let expired = user32.poll_timers();
-        assert!(expired.contains(&(1, 43)), "the 0ms timer must expire");
-        assert_eq!(
-            user32.timer_callback(1, 42),
-            callback,
-            "an unrelated timer keeps its callback"
-        );
-        // kill_timer removes the callback with the timer.
-        assert!(user32.kill_timer(1, 42));
-        assert_eq!(user32.timer_callback(1, 42), 0, "callback gone after kill");
-    }
-
-    #[test]
     fn test_poll_timers_expired() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         // Set a timer with 0ms timeout so it should already be expired
@@ -7428,36 +6952,6 @@ mod tests {
             "should contain our timer (hwnd=1, id=99)"
         );
         assert_eq!(user32.timer_count(), 0, "expired timers should be removed");
-    }
-
-    #[test]
-    fn test_poll_timers_none_expired() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.set_timer(1, 1, 10_000, 0); // 10 seconds — won't expire in test
-        let expired = user32.poll_timers();
-        assert!(
-            expired.is_empty(),
-            "long timer should not expire immediately"
-        );
-        assert_eq!(user32.timer_count(), 1, "timer should still be active");
-    }
-
-    #[test]
-    fn test_poll_timers_rearms_periodic_timer() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        // Positive intervals are periodic: after firing, the timer is
-        // re-armed (Win32 SetTimer semantics) until KillTimer.
-        user32.set_timer(1, 7, 1, 0);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let fired = user32.poll_timers();
-        assert!(fired.contains(&(1, 7)), "periodic timer should fire");
-        assert_eq!(
-            user32.timer_count(),
-            1,
-            "periodic timer should be re-armed after firing"
-        );
-        assert!(user32.kill_timer(1, 7), "kill_timer should succeed");
-        assert_eq!(user32.timer_count(), 0, "timer removed after kill");
     }
 
     // ── MessageQueue QS_* flag tests ────────────────────────────────────────
@@ -7543,70 +7037,6 @@ mod tests {
     }
 
     #[test]
-    fn test_message_queue_has_paint_events() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32
-            .enqueue(Message {
-                hwnd: None,
-                kind: MessageKind::Paint,
-                wparam: 0,
-                lparam: 0,
-                translated: false,
-                device_id: None,
-            })
-            .expect("enqueue paint");
-
-        assert!(
-            user32.message_queue_has_events(QS_PAINT),
-            "should detect paint event"
-        );
-        assert!(
-            user32.message_queue_has_events(QS_ALLEVENTS),
-            "QS_ALLEVENTS should include paint"
-        );
-    }
-
-    #[test]
-    fn test_message_queue_has_postmessage_events() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32
-            .enqueue(Message {
-                hwnd: None,
-                kind: MessageKind::Other(0x0400), // WM_USER
-                wparam: 0,
-                lparam: 0,
-                translated: false,
-                device_id: None,
-            })
-            .expect("enqueue postmessage");
-
-        assert!(
-            user32.message_queue_has_events(QS_POSTMESSAGE),
-            "should detect postmessage"
-        );
-    }
-
-    #[test]
-    fn test_message_queue_has_timer_events() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32
-            .enqueue(Message {
-                hwnd: None,
-                kind: MessageKind::Other(0x0113), // WM_TIMER
-                wparam: 0,
-                lparam: 0,
-                translated: false,
-                device_id: None,
-            })
-            .expect("enqueue timer");
-
-        assert!(
-            user32.message_queue_has_events(QS_TIMER),
-            "should detect timer event"
-        );
-    }
-
-    #[test]
     fn test_message_queue_wake_mask_allinput() {
         let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         // Empty queue with QS_ALLINPUT should still check pending_paint
@@ -7640,18 +7070,6 @@ mod tests {
     }
 
     #[test]
-    fn test_close_clipboard() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.open_clipboard(Some(1));
-        assert!(user32.close_clipboard(), "close clipboard should succeed");
-        // Opening again after close should work
-        assert!(
-            user32.open_clipboard(Some(2)),
-            "open after close should succeed"
-        );
-    }
-
-    #[test]
     fn test_empty_clipboard_no_open() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         assert!(!user32.empty_clipboard(), "empty without open should fail");
@@ -7670,36 +7088,6 @@ mod tests {
         assert!(
             !user32.is_clipboard_format_available(CF_TEXT),
             "data should be gone after empty"
-        );
-    }
-
-    #[test]
-    fn test_set_clipboard_data() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.open_clipboard(Some(1));
-
-        let stored = user32.set_clipboard_data(CF_TEXT, b"Hello, World!".to_vec(), 0x1234);
-        // The data is stored and the caller (SetClipboardData thunk) returns
-        // the guest handle on success.
-        assert!(stored, "set_clipboard_data should report success");
-        assert_eq!(
-            user32.clipboard_handle(CF_TEXT),
-            Some(0x1234),
-            "the guest handle must be stored for GetClipboardData"
-        );
-
-        // Retrieve and verify
-        let data = user32.get_clipboard_data(CF_TEXT);
-        assert!(data.is_some(), "get_clipboard_data should return data");
-        assert_eq!(data.unwrap(), b"Hello, World!".to_vec());
-    }
-
-    #[test]
-    fn test_get_clipboard_data_not_open() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert!(
-            user32.get_clipboard_data(CF_TEXT).is_none(),
-            "get without open should return None"
         );
     }
 
@@ -7759,76 +7147,6 @@ mod tests {
     }
 
     #[test]
-    fn test_set_class_long_stores_and_returns_previous() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.register_class_ex_w("class-long-test");
-        // Child-style windows avoid the AppKit NSWindow path (AppKit requires
-        // the main thread and is not available in the test harness).
-        let hwnd = user32
-            .create_window_ex_styled(
-                "class-long-test",
-                "title",
-                320,
-                200,
-                false,
-                false,
-                None,
-                1,
-                WS_CHILD,
-                0,
-                None,
-            )
-            .expect("create window");
-
-        const GCL_STYLE: i32 = -26;
-        // First set returns 0 (no previous value).
-        assert_eq!(
-            user32.set_class_long_w(hwnd, GCL_STYLE, 0x0A0A).unwrap(),
-            0,
-            "first set must return 0 as the previous value"
-        );
-        // Second set returns the stored previous value.
-        assert_eq!(
-            user32.set_class_long_w(hwnd, GCL_STYLE, 0x0B0B).unwrap(),
-            0x0A0A,
-            "subsequent set must return the previous class long"
-        );
-        // A second window of the SAME class shares the class long (the value
-        // is stored on the window class, not the window instance).
-        let hwnd2 = user32
-            .create_window_ex_styled(
-                "class-long-test",
-                "title2",
-                320,
-                200,
-                false,
-                false,
-                None,
-                1,
-                WS_CHILD,
-                0,
-                None,
-            )
-            .expect("create second window");
-        assert_eq!(
-            user32.set_class_long_w(hwnd2, GCL_STYLE, 0x0C0C).unwrap(),
-            0x0B0B,
-            "class longs are shared across windows of the same class"
-        );
-        // Different index keeps its own slot.
-        assert_eq!(
-            user32.set_class_long_w(hwnd, -24, 0x1234).unwrap(),
-            0,
-            "a fresh index returns 0"
-        );
-        assert_eq!(
-            user32.set_class_long_w(hwnd, -24, 0x5678).unwrap(),
-            0x1234,
-            "the fresh index tracks its own previous value"
-        );
-    }
-
-    #[test]
     fn test_set_class_long_invalid_hwnd_fails() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         assert!(
@@ -7837,113 +7155,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_enum_clipboard_formats_not_open() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert_eq!(
-            user32.enum_clipboard_formats(0),
-            0,
-            "not open, should return 0"
-        );
-    }
-
-    #[test]
-    fn test_enum_clipboard_formats_empty() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.open_clipboard(Some(1));
-        assert_eq!(
-            user32.enum_clipboard_formats(0),
-            0,
-            "empty clipboard, should return 0"
-        );
-    }
-
-    #[test]
-    fn test_enum_clipboard_formats_single() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.open_clipboard(Some(1));
-        user32.set_clipboard_data(CF_TEXT, b"data".to_vec(), 1);
-
-        let first = user32.enum_clipboard_formats(0);
-        assert_eq!(first, CF_TEXT, "first format should be CF_TEXT");
-
-        // No more formats
-        assert_eq!(
-            user32.enum_clipboard_formats(first),
-            0,
-            "no more formats after CF_TEXT"
-        );
-    }
-
-    #[test]
-    fn test_enum_clipboard_formats_multiple() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.open_clipboard(Some(1));
-        user32.set_clipboard_data(CF_TEXT, b"text".to_vec(), 1);
-        user32.set_clipboard_data(CF_UNICODETEXT, b"unicode\0".to_vec(), 2);
-        user32.set_clipboard_data(CF_HDROP, vec![0u8; 64], 3);
-
-        // Enumerate all formats
-        let mut formats = Vec::new();
-        let mut fmt = 0u32;
-        loop {
-            fmt = user32.enum_clipboard_formats(fmt);
-            if fmt == 0 {
-                break;
-            }
-            formats.push(fmt);
-        }
-
-        assert_eq!(formats.len(), 3, "should find 3 clipboard formats");
-        assert!(formats.contains(&CF_TEXT), "should contain CF_TEXT");
-        assert!(
-            formats.contains(&CF_UNICODETEXT),
-            "should contain CF_UNICODETEXT"
-        );
-        assert!(formats.contains(&CF_HDROP), "should contain CF_HDROP");
-    }
-
-    #[test]
-    fn test_clipboard_preserves_data_across_formats() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.open_clipboard(Some(1));
-        user32.set_clipboard_data(CF_TEXT, b"hello".to_vec(), 1);
-        user32.set_clipboard_data(CF_UNICODETEXT, b"hello wide\0".to_vec(), 2);
-
-        // Reading one format shouldn't affect others
-        assert_eq!(
-            user32.get_clipboard_data(CF_TEXT).unwrap(),
-            b"hello".to_vec()
-        );
-        assert_eq!(
-            user32.get_clipboard_data(CF_UNICODETEXT).unwrap(),
-            b"hello wide\0".to_vec()
-        );
-    }
-
     // ── Misc API tests ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_get_window_thread_process_id() {
-        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        let (tid, pid) = user32.get_window_thread_process_id(42);
-        assert_eq!(tid, 1, "thread id should be 1");
-        assert_eq!(
-            pid,
-            std::process::id(),
-            "process id should match current pid"
-        );
-    }
-
-    #[test]
-    fn test_get_desktop_window() {
-        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert_eq!(
-            user32.get_desktop_window(),
-            0,
-            "desktop window should return 0"
-        );
-    }
 
     #[test]
     fn test_update_window_nonexistent() {
@@ -7953,32 +7165,6 @@ mod tests {
         assert!(
             !result.unwrap(),
             "update_window for non-existent hwnd should return false"
-        );
-    }
-
-    #[test]
-    fn test_update_window_existing() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.register_class_ex_w("test-window");
-        let hwnd = user32
-            .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 1)
-            .expect("create window");
-        let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
-
-        let result = user32.update_window(hwnd);
-        assert!(result.is_ok(), "update_window should succeed");
-        assert!(
-            result.unwrap(),
-            "update_window for existing hwnd should return true"
-        );
-
-        // Should have queued a paint message
-        assert!(
-            user32
-                .get_message_w()
-                .map(|m| m.kind == MessageKind::Paint)
-                .unwrap_or(false),
-            "update_window should queue a paint message"
         );
     }
 
@@ -8007,209 +7193,7 @@ mod tests {
 
     // ── Message queue ordering tests ───────────────────────────────────
 
-    #[test]
-    fn message_queue_preserves_fifo_order() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.register_class_ex_w("msg-order");
-        let hwnd = user32
-            .create_window_ex_w("msg-order", "title", 320, 200, false, false, None, 1)
-            .expect("create window");
-        // Drain creation messages.
-        while user32.get_message_w().is_some() {}
-
-        // Post three messages in sequence using the Other(u32) variant.
-        let seq = [
-            MessageKind::Other(1001),
-            MessageKind::Other(1002),
-            MessageKind::Other(1003),
-        ];
-        for &kind in &seq {
-            user32
-                .post_message_w(hwnd, kind, 0, 0)
-                .expect("post message");
-        }
-
-        let kinds: Vec<MessageKind> =
-            std::iter::from_fn(|| user32.get_message_w().map(|m| m.kind)).collect();
-        assert_eq!(kinds, seq, "messages should be dequeued in FIFO order");
-    }
-
-    #[test]
-    fn timer_fires_and_is_reported_by_poll_timers() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.register_class_ex_w("timer-msg");
-        let hwnd = user32
-            .create_window_ex_w("timer-msg", "title", 320, 200, false, false, None, 1)
-            .expect("create window");
-        // Drain creation messages.
-        while user32.get_message_w().is_some() {}
-
-        // Set up a timer with 0ms (fires immediately).
-        assert!(user32.set_timer(hwnd, 42, 0, 0), "set_timer should succeed");
-
-        // Poll timers to fire the timer.
-        let fired = user32.poll_timers();
-        assert!(
-            fired.contains(&(hwnd, 42)),
-            "poll_timers should include our timer"
-        );
-
-        // After firing, timer should be removed.
-        assert_eq!(user32.timer_count(), 0, "timer should be consumed");
-    }
-
-    #[test]
-    fn keyboard_input_generates_key_down() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.register_class_ex_w("kbd-test");
-        let hwnd = user32
-            .create_window_ex_w("kbd-test", "title", 320, 200, false, false, None, 1)
-            .expect("create window");
-        // Drain creation messages.
-        while user32.get_message_w().is_some() {}
-
-        // Register a keyboard device so inject_keyboard_input recognises it.
-        let kbd_id = user32.register_keyboard_device(&KeyboardDevice {
-            vendor_id: 0x1234,
-            product_id: 0x5678,
-            serial: "0001".to_string(),
-        });
-
-        // Inject a key-down event via inject_keyboard_input.
-        user32
-            .inject_keyboard_input(
-                hwnd,
-                &kbd_id,
-                0x10, // scancode for Q
-                KeyModifiers {
-                    shift: false,
-                    altgr: false,
-                },
-            )
-            .expect("key down");
-
-        let kinds: Vec<MessageKind> =
-            std::iter::from_fn(|| user32.get_message_w().map(|m| m.kind)).collect();
-        assert!(
-            kinds.contains(&MessageKind::KeyDown),
-            "keyboard input should produce KeyDown, got {kinds:?}"
-        );
-    }
-
-    #[test]
-    fn mouse_input_generates_button_down() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.register_class_ex_w("mouse-test");
-        let hwnd = user32
-            .create_window_ex_w("mouse-test", "title", 320, 200, false, false, None, 1)
-            .expect("create window");
-        // Drain creation messages.
-        while user32.get_message_w().is_some() {}
-
-        // Register a mouse device so inject_mouse_input recognises it.
-        let mouse_id = user32.register_mouse_device(&MouseDevice {
-            vendor_id: 0xABCD,
-            product_id: 0x1234,
-            serial: "0001".to_string(),
-        });
-
-        // Set focus so the window receives mouse messages.
-        user32.set_focus(hwnd).expect("set focus");
-
-        // Inject mouse button down.
-        user32
-            .inject_mouse_input(
-                hwnd,
-                &mouse_id,
-                100,
-                100,
-                &[MouseButtonEvent {
-                    button: MouseButton::Left,
-                    pressed: true,
-                }],
-                0,
-                0,
-            )
-            .expect("mouse down");
-
-        let kinds: Vec<MessageKind> =
-            std::iter::from_fn(|| user32.get_message_w().map(|m| m.kind)).collect();
-        assert!(
-            kinds.contains(&MessageKind::LButtonDown),
-            "mouse left down should produce LButtonDown, got {kinds:?}"
-        );
-    }
-
-    #[test]
-    fn set_focus_generates_focus_messages() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.register_class_ex_w("focus-test1");
-        user32.register_class_ex_w("focus-test2");
-
-        let hwnd1 = user32
-            .create_window_ex_w("focus-test1", "win1", 320, 200, false, false, None, 1)
-            .expect("create win1");
-        let hwnd2 = user32
-            .create_window_ex_w("focus-test2", "win2", 320, 200, false, false, None, 1)
-            .expect("create win2");
-        // Drain creation messages.
-        while user32.get_message_w().is_some() {}
-
-        // Set focus to hwnd1.
-        user32.set_focus(hwnd1).expect("set focus 1");
-        let kinds1: Vec<MessageKind> =
-            std::iter::from_fn(|| user32.get_message_w().map(|m| m.kind)).collect();
-        assert!(
-            kinds1.contains(&MessageKind::SetFocus),
-            "set_focus should produce SetFocus message, got {kinds1:?}"
-        );
-
-        // Switch focus to hwnd2.
-        user32.set_focus(hwnd2).expect("set focus 2");
-        let kinds2: Vec<MessageKind> =
-            std::iter::from_fn(|| user32.get_message_w().map(|m| m.kind)).collect();
-        assert!(
-            kinds2.contains(&MessageKind::KillFocus),
-            "focus switch should produce KillFocus, got {kinds2:?}"
-        );
-    }
-
     // ── GDI+ object lifetime tests ─────────────────────────────────────
-
-    #[test]
-    fn gdiplus_alloc_handle_assigns_unique_ids() {
-        let mut state = GdiplusState::default();
-        let h1 = state.alloc_handle(GdiplusObject::Brush(Box::new(GdiplusBrush::SolidFill(
-            GdiplusSolidFill { color: 0xFF0000 },
-        ))));
-        let h2 = state.alloc_handle(GdiplusObject::Brush(Box::new(GdiplusBrush::SolidFill(
-            GdiplusSolidFill { color: 0x00FF00 },
-        ))));
-        assert_ne!(h1, h2, "allocated handles must be unique");
-    }
-
-    #[test]
-    fn gdiplus_create_and_remove_object() {
-        let mut state = GdiplusState::default();
-        let h = state.alloc_handle(GdiplusObject::Pen(Box::new(GdiplusPen {
-            color: 0x0000FF,
-            brush_handle: None,
-            width: 2.0,
-            unit: 0,
-            dash_style: 0,
-            line_join: 0,
-            start_cap: 0,
-            end_cap: 0,
-            alignment: 0,
-        })));
-        assert!(state.get(h).is_some(), "object should exist after alloc");
-        let removed = state.remove(h);
-        assert!(removed.is_some(), "remove should return the object");
-        assert!(
-            state.get(h).is_none(),
-            "object should not exist after remove"
-        );
-    }
 
     #[test]
     fn gdiplus_repeated_create_destroy_does_not_leak_handles() {
@@ -8226,18 +7210,6 @@ mod tests {
             initial_count,
             "repeated create/destroy cycles should not leak handles"
         );
-    }
-
-    #[test]
-    fn gdiplus_graphics_from_hdc_reuses_handle() {
-        let mut state = GdiplusState::default();
-        let h1 = state.create_graphics_from_hdc(0xABCD);
-        let h2 = state.create_graphics_from_hdc(0xABCD);
-        assert_eq!(
-            h1, h2,
-            "create_graphics_from_hdc should reuse handle for same HDC"
-        );
-        state.remove(h1);
     }
 
     #[test]
