@@ -227,6 +227,21 @@ fn u64_at(data: &[u8], offset: usize) -> Option<u64> {
     })
 }
 
+/// Convert a delay-import descriptor field to an RVA.
+///
+/// `attributes` bit 0 (`dlattrRva`) selects RVA fields; without it the field
+/// holds a preferred-base virtual address, which must be rebased.
+fn delay_field_to_rva(value: u32, rva_based: bool, preferred_base: u64) -> Option<u32> {
+    if rva_based {
+        return Some(value);
+    }
+    let value = u64::from(value);
+    if value < preferred_base {
+        return None;
+    }
+    u32::try_from(value - preferred_base).ok()
+}
+
 fn read_c_string(data: &[u8], offset: usize, limit: usize) -> Option<String> {
     let tail = data.get(offset..)?;
     let end = tail.iter().position(|byte| *byte == 0)? + offset;
@@ -492,19 +507,39 @@ pub fn load_driver_image(data: &[u8], actual_base: u64) -> Result<LoadedDriver, 
             if attributes == 0 {
                 break;
             }
-            let name_rva = u32_at(&image, descriptor + 4).ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
-            let iat_rva = u32_at(&image, descriptor + 12).ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
-            let int_rva = u32_at(&image, descriptor + 16).ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+            let rva_based = attributes & 1 != 0;
+            let raw_name = u32_at(&image, descriptor + 4).ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+            let raw_iat = u32_at(&image, descriptor + 12).ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+            let raw_int = u32_at(&image, descriptor + 16).ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
             let timestamp = u32_at(&image, descriptor + 28).ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+            let name_rva = if raw_name == 0 {
+                0
+            } else {
+                delay_field_to_rva(raw_name, rva_based, image_base)
+                    .ok_or(STATUS_INVALID_IMAGE_FORMAT)?
+            };
+            let iat_rva = if raw_iat == 0 {
+                0
+            } else {
+                delay_field_to_rva(raw_iat, rva_based, image_base)
+                    .ok_or(STATUS_INVALID_IMAGE_FORMAT)?
+            };
+            let int_rva = if raw_int == 0 {
+                0
+            } else {
+                delay_field_to_rva(raw_int, rva_based, image_base)
+                    .ok_or(STATUS_INVALID_IMAGE_FORMAT)?
+            };
             let dll = if name_rva == 0 {
                 String::new()
             } else {
                 read_c_string(&image, name_rva as usize, 260).ok_or(STATUS_INVALID_IMAGE_FORMAT)?
             };
-            // Real delay-import descriptors store RVAs before the image is
-            // loaded; attributes bit 0 tells the loader the fields are RVAs.
+            // Real delay-import descriptors may store RVAs or preferred-base
+            // VAs (attributes bit 0); both are normalized above and thunk
+            // entries are rebased the same way.
             let mut symbols = Vec::new();
-            if attributes & 1 != 0 && int_rva != 0 {
+            if int_rva != 0 {
                 let mut thunk = int_rva as usize;
                 loop {
                     let value = if is_64 {
@@ -524,7 +559,11 @@ pub fn load_driver_image(data: &[u8], actual_base: u64) -> Result<LoadedDriver, 
                     if value & ordinal_flag != 0 {
                         symbols.push(ImportRef::Ordinal((value & 0xFFFF) as u16));
                     } else {
-                        let name = read_c_string(&image, value as usize + 2, 260)
+                        let value =
+                            u32::try_from(value).map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
+                        let name_rva = delay_field_to_rva(value, rva_based, image_base)
+                            .ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+                        let name = read_c_string(&image, name_rva as usize + 2, 260)
                             .ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
                         symbols.push(ImportRef::Name(name));
                     }
@@ -1074,6 +1113,33 @@ mod tests {
         assert_eq!(
             load_driver_image(&bytes, 0).err(),
             Some(STATUS_INVALID_IMAGE_PROTECT)
+        );
+    }
+
+    #[test]
+    fn delay_descriptor_fields_support_rva_and_va_forms() {
+        // RVA form: the field is used verbatim.
+        assert_eq!(
+            delay_field_to_rva(0x1234, true, PREFERRED_BASE),
+            Some(0x1234)
+        );
+        // VA form (32-bit images): preferred-base addresses rebase to RVAs.
+        let base32 = 0x1000_0000u64;
+        assert_eq!(
+            delay_field_to_rva((base32 + 0x2000) as u32, false, base32),
+            Some(0x2000)
+        );
+        // A VA below the base is invalid; a VA above it subtracts exactly.
+        assert_eq!(delay_field_to_rva(0x1000, false, base32), None);
+        assert_eq!(
+            delay_field_to_rva(0xFFFF_FFFF, false, base32),
+            Some(0xEFFF_FFFF)
+        );
+        // RVA form intentionally accepts any value (validation happens when
+        // the referenced structure is read).
+        assert_eq!(
+            delay_field_to_rva(0xFFFF_FFFF, true, PREFERRED_BASE),
+            Some(0xFFFF_FFFF)
         );
     }
 

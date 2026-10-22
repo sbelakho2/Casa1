@@ -4555,6 +4555,10 @@ pub enum HostThunk {
     NtUnloadDriver,
     /// `NtDeviceIoControlFile` — ntdll!NtDeviceIoControlFile
     NtDeviceIoControlFile,
+    /// `NtReadFile` — ntdll!NtReadFile
+    NtReadFile,
+    /// `NtWriteFile` — ntdll!NtWriteFile
+    NtWriteFile,
     /// `NtCreateKey` — ntdll!NtCreateKey
     NtCreateKey,
     /// `NtOpenKey` — ntdll!NtOpenKey
@@ -5676,6 +5680,8 @@ pub enum HostThunk {
     ActivateAudioInterfaceAsync,
     // ── IAudioClient / IAudioRenderClient methods of an activated audio
     //    endpoint (real host thunks; see `crate::audio_activation`) ──
+    AudioActivationOperationQueryInterface,
+    AudioActivationOperationGetActivateResult,
     AudioClientQueryInterface,
     AudioClientInitialize,
     AudioClientGetBufferSize,
@@ -19113,6 +19119,12 @@ impl PeHostRuntime {
             //    surface of an `ActivateAudioInterfaceAsync` endpoint.  The
             //    endpoint object's vtable slots are these thunks; the state
             //    behind them lives in `crate::audio_activation`.
+            HostThunk::AudioActivationOperationQueryInterface => {
+                self.dispatch_audio_activation_operation_query_interface(state, memory)?;
+            }
+            HostThunk::AudioActivationOperationGetActivateResult => {
+                self.dispatch_audio_activation_operation_get_activate_result(state, memory)?;
+            }
             HostThunk::AudioClientQueryInterface => {
                 self.dispatch_audio_client_query_interface(state, memory)?;
             }
@@ -56113,6 +56125,12 @@ impl PeHostRuntime {
             HostThunk::NtDeviceIoControlFile => {
                 self.dispatch_nt_device_io_control_file(state, memory)?;
             }
+            HostThunk::NtReadFile => {
+                self.dispatch_nt_read_file(state, memory)?;
+            }
+            HostThunk::NtWriteFile => {
+                self.dispatch_nt_write_file(state, memory)?;
+            }
             HostThunk::NtCreateKey => {
                 self.dispatch_nt_create_key(state, memory)?;
             }
@@ -78161,6 +78179,81 @@ impl PeHostRuntime {
     // guest arguments, touch guest memory, and route the ready-event signal
     // through the runtime's real guest event machinery.
 
+    /// `IActivateAudioInterfaceAsyncOperation::QueryInterface(riid, ppv)`.
+    fn dispatch_audio_activation_operation_query_interface(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_POINTER,
+            activation_operation_supports_riid,
+        };
+        let object = guest_call_arg(state, memory, 0)?;
+        let riid_ptr = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if riid_ptr == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let riid = match memory.read_bytes(riid_ptr, 16) {
+            Ok(bytes) => <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0_u8; 16]),
+            Err(_) => {
+                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        if activation_operation_supports_riid(&riid) {
+            self.add_ref_guest_object(object)?;
+            if out != 0 {
+                write_guest_pointer(memory, out, object, self.guest_arch)?;
+            }
+            state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+        } else {
+            if out != 0 {
+                write_guest_pointer(memory, out, 0, self.guest_arch)?;
+            }
+            state.set(Register::Rax, u64::from(ACTIVATION_E_NOINTERFACE));
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IActivateAudioInterfaceAsyncOperation::GetActivateResult(activateResult,
+    /// activatedInterface)`.
+    fn dispatch_audio_activation_operation_get_activate_result(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_S_OK, AUDCLNT_E_POINTER, operation_get_activate_result,
+        };
+        let operation = guest_call_arg(state, memory, 0)?;
+        let result_out = guest_call_arg(state, memory, 1)?;
+        let interface_out = guest_call_arg(state, memory, 2)?;
+        if result_out == 0 || interface_out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        match operation_get_activate_result(self.guest_pid, operation) {
+            Ok((result_hr, interface_object)) => {
+                if interface_object != 0 {
+                    self.add_ref_guest_object(interface_object)?;
+                }
+                write_u32(memory, result_out, result_hr);
+                write_guest_pointer(memory, interface_out, interface_object, self.guest_arch)?;
+                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+            }
+            Err(hr) => state.set(Register::Rax, u64::from(hr)),
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
     /// `IAudioClient::QueryInterface(riid, ppv)`.
     fn dispatch_audio_client_query_interface(
         &mut self,
@@ -78634,6 +78727,25 @@ impl PeHostRuntime {
             write_guest_pointer(memory, out, object, self.guest_arch)?;
             ACTIVATION_S_OK
         } else if let Some(kind) = crate::audio_activation::audio_service_kind_for_riid(&riid) {
+            let direction = crate::audio_activation::client_direction(self.guest_pid, object);
+            let Some(direction) = direction else {
+                write_guest_pointer(memory, out, 0, self.guest_arch)?;
+                state.set(
+                    Register::Rax,
+                    u64::from(crate::audio_activation::AUDCLNT_E_DEVICE_INVALIDATED),
+                );
+                self.last_error = 0;
+                return Ok(());
+            };
+            if !crate::audio_activation::service_supported_for_direction(direction, kind) {
+                write_guest_pointer(memory, out, 0, self.guest_arch)?;
+                state.set(
+                    Register::Rax,
+                    u64::from(crate::audio_activation::AUDCLNT_E_WRONG_ENDPOINT_TYPE),
+                );
+                self.last_error = 0;
+                return Ok(());
+            }
             let cached = crate::audio_activation::service_for(self.guest_pid, object, kind)
                 .filter(|service| self.guest_objects.contains_key(service));
             let service = match cached {
@@ -78779,15 +78891,28 @@ impl PeHostRuntime {
                         Err(_) => Vec::new(),
                     }
                 };
-                if !samples.is_empty()
-                    && let Some(device_id) = release.real_device_id
-                {
-                    push_real_render_samples(
-                        device_id,
-                        &samples,
-                        release.channels,
-                        release.sample_rate,
-                    );
+                if !samples.is_empty() {
+                    if let Some(device_id) = release.real_device_id {
+                        push_real_render_samples(
+                            device_id,
+                            &samples,
+                            release.channels,
+                            release.sample_rate,
+                        );
+                    }
+                    // The client-side render queue feeds loopback capture even
+                    // when the host output stream could not be opened.
+                    if let Some(device) =
+                        crate::audio_activation::device_of(self.guest_pid, release.endpoint)
+                    {
+                        crate::audio_activation::push_loopback_render_samples(
+                            self.guest_pid,
+                            &device.key,
+                            &samples,
+                            release.channels,
+                            release.sample_rate,
+                        );
+                    }
                 }
                 self.signal_audio_ready_event(release.endpoint);
                 state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
@@ -79191,6 +79316,7 @@ impl PeHostRuntime {
                     match capture_get_buffer(pid, this) {
                         Ok(packet) => {
                             let buffer = packet.buffer_address;
+                            memory.map_bytes(buffer, &packet.sample_bytes());
                             let _ = write_guest_pointer(memory, data_out, buffer, self.guest_arch);
                             write_u32(memory, frames_out, packet.frames);
                             if flags_out != 0 {
@@ -79523,8 +79649,9 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         use crate::audio_activation::{
-            ACTIVATION_S_OK, audio_client_methods, endpoint_record, has_audio_client,
-            register_audio_client,
+            ACTIVATION_S_OK, AudioDirection, audio_activation_operation_methods,
+            audio_client_methods, device_is_capture, endpoint_record, has_audio_client,
+            register_activation_operation, register_audio_client_direction,
         };
         if state.get(Register::Rax) != u64::from(ACTIVATION_S_OK) {
             return Ok(());
@@ -79533,16 +79660,44 @@ impl PeHostRuntime {
         if operation_out == 0 {
             return Ok(());
         }
-        let object = read_guest_pointer(memory, operation_out, self.guest_arch)?;
-        if object == 0 || has_audio_client(self.guest_pid, object) {
+        // The activation dispatch wrote the activated endpoint (0 on a failed
+        // activation) here.  Turn the out-parameter into the real Windows
+        // operation object; failed activations still get an operation whose
+        // GetActivateResult reports the failure HRESULT.
+        let interface_object = read_guest_pointer(memory, operation_out, self.guest_arch)?;
+        let operation_vtable =
+            self.alloc_guest_vtable(memory, audio_activation_operation_methods())?;
+        let operation =
+            self.alloc_guest_object(memory, GuestObjectKind::DirectSound8, operation_vtable)?;
+        register_activation_operation(self.guest_pid, operation, interface_object);
+        // One reference for the guest (the out-parameter) and one held by the
+        // pending completion, so a guest that releases the operation before
+        // the asynchronous completion still receives a valid operation.
+        self.add_ref_guest_object(operation)?;
+        write_guest_pointer(memory, operation_out, operation, self.guest_arch)?;
+        if interface_object == 0 {
             return Ok(());
         }
-        let Some(record) = endpoint_record(self.guest_pid, object) else {
+        if has_audio_client(self.guest_pid, interface_object) {
+            return Ok(());
+        }
+        let Some(record) = endpoint_record(self.guest_pid, interface_object) else {
             return Ok(());
         };
         let vtable = self.alloc_guest_vtable(memory, audio_client_methods())?;
-        write_guest_pointer(memory, object, vtable, self.guest_arch)?;
-        register_audio_client(self.guest_pid, object, record.device, record.requested_riid);
+        write_guest_pointer(memory, interface_object, vtable, self.guest_arch)?;
+        let direction = if device_is_capture(&record.device) {
+            AudioDirection::Capture
+        } else {
+            AudioDirection::Render
+        };
+        register_audio_client_direction(
+            self.guest_pid,
+            interface_object,
+            record.device,
+            record.requested_riid,
+            direction,
+        );
         Ok(())
     }
 
@@ -85392,6 +85547,12 @@ impl HostThunk {
             ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtDeviceIoControlFile" => {
                 Self::NtDeviceIoControlFile
             }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtReadFile" => {
+                Self::NtReadFile
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtWriteFile" => {
+                Self::NtWriteFile
+            }
             ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateKey" => {
                 Self::NtCreateKey
             }
@@ -91093,6 +91254,7 @@ impl HostThunk {
             Self::NtCreateSection | Self::NtDuplicateObject | Self::NtCreateKey => 28,
             Self::NtCreateThreadEx | Self::NtDeviceIoControlFile | Self::NtMapViewOfSection => 40,
             Self::NtCreateFile => 44,
+            Self::NtReadFile | Self::NtWriteFile => 36,
             Self::NtLoadDriver | Self::NtUnloadDriver => 4,
             // ── kernel32 core surface (x86 stdcall byte counts) ────────────
             Self::DisableThreadLibraryCalls => 4,
@@ -91157,6 +91319,9 @@ impl HostThunk {
             Self::StrRChrW => 12,
             Self::SHRegGetValueW | Self::SHRegSetValueW => 28,
             Self::UrlCombineW => 20,
+            // IActivateAudioInterfaceAsyncOperation (this = first arg).
+            Self::AudioActivationOperationQueryInterface
+            | Self::AudioActivationOperationGetActivateResult => 12,
             // IAudioClient / IAudioRenderClient methods (this = first arg).
             Self::AudioClientQueryInterface
             | Self::AudioClientGetService
@@ -91217,6 +91382,7 @@ impl HostThunk {
             // argument byte count on the thunk itself (see `crate::dplay`).
             Self::Dplay8Method { x86_arg_bytes, .. } => u64::from(*x86_arg_bytes),
             Self::DirectPlay8AddressCreate => 12,
+            Self::DriverIslandShim { function } => function.x86_arg_bytes(),
             Self::ComMethod(method) => method.x86_arg_bytes(),
             _ => 0,
         }
@@ -139779,10 +139945,8 @@ mod tests {
         memory.map_bytes(AUDIO_CLIENT_HANDLER_OBJECT, &[0_u8; 8]);
         memory.map_bytes(AUDIO_CLIENT_HANDLER_VTABLE, &[0_u8; 16]);
         let mut stub = vec![0x90_u8; 0x40];
-        stub[..36].copy_from_slice(&[
-            0x8B, 0x44, 0x24, 0x08, // mov eax, [esp+8]   (result hr)
-            0xA3, 0x00, 0x40, 0x04, 0x00, // mov [0x44000], eax
-            0x8B, 0x44, 0x24, 0x0C, // mov eax, [esp+12]  (interface object)
+        stub[..27].copy_from_slice(&[
+            0x8B, 0x44, 0x24, 0x08, // mov eax, [esp+8]   (operation object)
             0xA3, 0x04, 0x40, 0x04, 0x00, // mov [0x44004], eax
             0xA1, 0x08, 0x40, 0x04, 0x00, // mov eax, [0x44008] (count)
             0x05, 0x01, 0x00, 0x00, 0x00, // add eax, 1
@@ -139859,9 +140023,33 @@ mod tests {
                 .dispatch_import(thunk, &mut cpu, &mut memory)
                 .expect("dispatch ActivateAudioInterfaceAsync");
             assert_eq!(cpu.get(Register::Rax), 0, "activation starts (S_OK)");
-            let endpoint =
+            let operation =
                 read_guest_pointer(&memory, AUDIO_CLIENT_OP_OUT, GuestArch::X86).unwrap();
-            assert_ne!(endpoint, 0, "the activation produced an endpoint");
+            assert_ne!(operation, 0, "the activation produced an operation object");
+            let endpoint = crate::audio_activation::activation_operation_interface(
+                runtime.guest_pid,
+                operation,
+            )
+            .expect("operation bound to the activated endpoint");
+            assert_ne!(endpoint, 0, "the operation carries the endpoint");
+            // Before the completion is delivered, GetActivateResult reports the
+            // documented illegal-call error.
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 16]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioActivationOperationGetActivateResult,
+                &[
+                    operation as u32,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                    (AUDIO_CLIENT_OUT_ADDR + 8) as u32,
+                ],
+            );
+            assert_eq!(
+                hr,
+                u64::from(crate::audio_activation::E_ILLEGAL_METHOD_CALL),
+                "GetActivateResult before completion"
+            );
             let record = crate::audio_activation::endpoint_record(runtime.guest_pid, endpoint)
                 .expect("real device record bound to the endpoint");
             assert_eq!(
@@ -140012,7 +140200,305 @@ mod tests {
                 .drain_pending_audio_activations(&mut drain_cpu, &mut memory)
                 .expect("drain activation completions");
             assert_eq!(read_u32(&memory, 0x44_008).unwrap(), 1);
-            assert_eq!(read_u32(&memory, 0x44_004).unwrap(), endpoint as u32);
+            assert_eq!(
+                read_u32(&memory, 0x44_004).unwrap(),
+                operation as u32,
+                "the handler receives the operation object"
+            );
+            // After completion, GetActivateResult returns the real activation
+            // HRESULT and the activated endpoint, exactly once.
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 16]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioActivationOperationGetActivateResult,
+                &[
+                    operation as u32,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                    (AUDIO_CLIENT_OUT_ADDR + 8) as u32,
+                ],
+            );
+            assert_eq!(hr, 0, "GetActivateResult after completion");
+            assert_eq!(read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap(), 0);
+            assert_eq!(
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR + 8, GuestArch::X86).unwrap(),
+                endpoint,
+                "GetActivateResult hands out the activated interface"
+            );
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioActivationOperationGetActivateResult,
+                &[
+                    operation as u32,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                    (AUDIO_CLIENT_OUT_ADDR + 8) as u32,
+                ],
+            );
+            assert_eq!(
+                hr,
+                u64::from(crate::audio_activation::E_ILLEGAL_METHOD_CALL),
+                "a completed result is returned only once"
+            );
+        })
+    }
+
+    #[test]
+    fn loopback_capture_reads_real_render_client_frames() {
+        with_big_stack(|| {
+            if !real_default_device_available() {
+                eprintln!("skipping loopback test: no real default render device");
+                return;
+            }
+            let (mut runtime, _tmp) = test_runtime("audio-client-loopback");
+            let mut memory = MemoryImage::default();
+            let device = crate::real_audio::RealAudioBackend::new()
+                .expect("real audio backend")
+                .activation_device_snapshot()
+                .into_iter()
+                .find(|device| device.is_default)
+                .expect("default render device");
+            memory.map_bytes(
+                AUDIO_CLIENT_FMT_ADDR,
+                &pcm16_wave_format_bytes(device.channels, device.sample_rate),
+            );
+
+            // Real render client: initialize, start, write a frame pattern and
+            // release it into the real output path.
+            let render = runtime
+                .alloc_audio_client_endpoint(
+                    &mut memory,
+                    &device,
+                    crate::audio_activation::IID_IAUDIO_CLIENT,
+                )
+                .expect("render endpoint");
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientInitialize,
+                &[
+                    render as u32,
+                    crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                    0,
+                    100_000,
+                    0,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                ],
+            );
+            assert_eq!(hr, 0, "render Initialize");
+            let render_snapshot =
+                crate::audio_activation::test_client_snapshot(runtime.guest_pid, render)
+                    .expect("render state");
+            let buffer_frames = render_snapshot.buffer_frames;
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioClientStart,
+                    &[render as u32],
+                ),
+                0
+            );
+            memory.map_bytes(
+                AUDIO_CLIENT_RIID_ADDR,
+                &crate::audio_activation::IID_IAUDIO_RENDER_CLIENT,
+            );
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 8]);
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioClientGetService,
+                    &[
+                        render as u32,
+                        AUDIO_CLIENT_RIID_ADDR as u32,
+                        AUDIO_CLIENT_OUT_ADDR as u32,
+                    ],
+                ),
+                0
+            );
+            let render_service =
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioRenderClientGetBuffer,
+                    &[
+                        render_service as u32,
+                        buffer_frames,
+                        AUDIO_CLIENT_OUT_ADDR as u32,
+                    ],
+                ),
+                0
+            );
+            let data = read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+            let mut pcm = Vec::new();
+            for frame in 0..buffer_frames {
+                let sample = ((frame % 16) as i16 - 8) * 400;
+                for _ in 0..device.channels {
+                    pcm.extend_from_slice(&sample.to_le_bytes());
+                }
+            }
+            memory.map_bytes(data, &pcm);
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioRenderClientReleaseBuffer,
+                    &[render_service as u32, buffer_frames, 0],
+                ),
+                0,
+                "the render client releases real frames"
+            );
+
+            // Loopback capture on the same render endpoint reads those frames.
+            let capture = runtime
+                .alloc_audio_client_endpoint(
+                    &mut memory,
+                    &device,
+                    crate::audio_activation::IID_IAUDIO_CLIENT,
+                )
+                .expect("capture endpoint");
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientInitialize,
+                &[
+                    capture as u32,
+                    crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                    crate::audio_activation::AUDCLNT_STREAMFLAGS_LOOPBACK
+                        | crate::audio_activation::AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    100_000,
+                    0,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                ],
+            );
+            assert_eq!(hr, 0, "loopback Initialize");
+            let (event, _) = runtime.win32.create_event(true, false, false, None);
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioClientSetEventHandle,
+                    &[capture as u32, event],
+                ),
+                0
+            );
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioClientStart,
+                    &[capture as u32],
+                ),
+                0
+            );
+            assert!(
+                runtime.win32.event_previous_state(event).unwrap(),
+                "loopback capture signals its event for the queued render frames"
+            );
+            memory.map_bytes(
+                AUDIO_CLIENT_RIID_ADDR,
+                &crate::audio_activation::IID_IAUDIO_CAPTURE_CLIENT,
+            );
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 8]);
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioClientGetService,
+                    &[
+                        capture as u32,
+                        AUDIO_CLIENT_RIID_ADDR as u32,
+                        AUDIO_CLIENT_OUT_ADDR as u32,
+                    ],
+                ),
+                0,
+                "loopback exposes IAudioCaptureClient"
+            );
+            let capture_service =
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioCaptureClientGetNextPacketSize,
+                    &[capture_service as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+                ),
+                0
+            );
+            let available = read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap();
+            assert!(
+                available > 0,
+                "GetNextPacketSize reflects the real loopback queue"
+            );
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 32]);
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioCaptureClientGetBuffer,
+                    &[
+                        capture_service as u32,
+                        AUDIO_CLIENT_OUT_ADDR as u32,
+                        (AUDIO_CLIENT_OUT_ADDR + 4) as u32,
+                        (AUDIO_CLIENT_OUT_ADDR + 8) as u32,
+                        (AUDIO_CLIENT_OUT_ADDR + 16) as u32,
+                        (AUDIO_CLIENT_OUT_ADDR + 24) as u32,
+                    ],
+                ),
+                0
+            );
+            let frames = read_u32(&memory, AUDIO_CLIENT_OUT_ADDR + 4).unwrap();
+            let flags = read_u32(&memory, AUDIO_CLIENT_OUT_ADDR + 8).unwrap();
+            assert_eq!(frames, available);
+            assert_eq!(flags, 0, "real render frames are not silent");
+            let samples_ptr =
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+            let expected = crate::real_audio::pcm_bytes_to_float(&pcm, 1, 16, device.channels);
+            let sample_count = frames as usize * device.channels as usize;
+            let captured_bytes = memory
+                .read_bytes(samples_ptr, sample_count * 2)
+                .expect("loopback samples");
+            let captured_f32 =
+                crate::real_audio::pcm_bytes_to_float(&captured_bytes, 1, 16, device.channels);
+            assert_eq!(captured_f32.len(), expected.len());
+            for (captured, expected) in captured_f32.iter().zip(expected.iter()) {
+                assert!(
+                    (captured - expected).abs() < 1.0e-4,
+                    "loopback frame {captured} != render frame {expected}"
+                );
+            }
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioCaptureClientReleaseBuffer,
+                    &[capture_service as u32, frames, 0],
+                ),
+                0
+            );
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioClientStop,
+                    &[capture as u32],
+                ),
+                0
+            );
+            assert_eq!(
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioClientReset,
+                    &[capture as u32],
+                ),
+                0
+            );
         })
     }
 }

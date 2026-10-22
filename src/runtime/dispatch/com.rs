@@ -2766,22 +2766,380 @@ impl PeHostRuntime {
             .get(&storage)
             .and_then(|state| state.host_dir.as_deref())
             .and_then(|directory| directory.strip_prefix(COM_CFB_PREFIX))
-            .map(str::to_string)
+            .map(|rest| rest.split('\u{1}').next().unwrap_or_default().to_string())
     }
 
-    /// Read one on-disk OLE compound file into (name, bytes) streams through
-    /// the MSI module's CFB reader.
-    fn com_compound_streams(path: &str) -> std::result::Result<Vec<(String, Vec<u8>)>, u32> {
+    /// The path of a compound-backed storage inside its file (empty for the
+    /// root storage).
+    fn com_storage_compound_relative(&self, storage: u64) -> Option<Vec<String>> {
+        let directory = self.com_storages.get(&storage)?.host_dir.as_deref()?;
+        let rest = directory.strip_prefix(COM_CFB_PREFIX)?;
+        Some(
+            rest.split('\u{1}')
+                .skip(1)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
+    /// The host directory for a child element: a CFB path component for
+    /// compound-backed parents, a nested directory otherwise.
+    fn com_storage_child_host_dir(&self, storage: u64, name: &str) -> Option<String> {
+        let directory = self.com_storages.get(&storage)?.host_dir.as_ref()?;
+        if directory.starts_with(COM_CFB_PREFIX) {
+            Some(format!("{directory}\u{1}{name}"))
+        } else {
+            Some(format!("{directory}/{name}"))
+        }
+    }
+
+    fn com_compound_file(
+        path: &str,
+    ) -> std::result::Result<crate::runtime::dispatch::msi::CompoundFile, u32> {
         let bytes = std::fs::read(path).map_err(|_| STG_E_FILENOTFOUND)?;
-        let compound = crate::runtime::dispatch::msi::CompoundFile::parse(bytes)
-            .map_err(|_| STG_E_INVALIDHEADER)?;
-        let mut streams = Vec::new();
-        for name in compound.stream_names() {
-            if let Some(data) = compound.stream(&name) {
-                streams.push((name, data));
+        crate::runtime::dispatch::msi::CompoundFile::parse(bytes).map_err(|_| STG_E_INVALIDHEADER)
+    }
+
+    fn com_storage_tree_timestamp() -> u64 {
+        let duration = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        (duration.as_secs() + 11_644_473_600) * 10_000_000
+            + u64::from(duration.subsec_nanos() / 100)
+    }
+
+    /// Rebuild one storage's in-memory view from the directory tree of a
+    /// parsed compound file.
+    fn com_storage_load_compound_children(
+        &mut self,
+        memory: &mut MemoryImage,
+        storage: u64,
+        compound: &crate::runtime::dispatch::msi::CompoundFile,
+        path: &str,
+    ) -> AppResult<()> {
+        for child in compound.children(path).unwrap_or_default() {
+            let name = child.decoded_name();
+            if name.is_empty() {
+                continue;
+            }
+            match child.kind {
+                2 => {
+                    if let Some(data) = compound.stream_at(&format!("{path}/{name}")) {
+                        if let Some(state) = self.com_storages.get_mut(&storage) {
+                            state.streams.insert(name.clone(), data);
+                            if !state.element_order.contains(&name) {
+                                state.element_order.push(name.clone());
+                            }
+                        }
+                    }
+                }
+                1 => {
+                    let host_dir = self.com_storage_child_host_dir(storage, &name);
+                    let child_object = self.alloc_com_storage_object(memory, host_dir, &name, 0)?;
+                    if child.clsid.iter().any(|byte| *byte != 0)
+                        && let Some(state) = self.com_storages.get_mut(&child_object)
+                    {
+                        state.clsid = Some(child.clsid);
+                    }
+                    if let Some(state) = self.com_storages.get_mut(&storage) {
+                        state.child_storages.insert(name.clone(), child_object);
+                        if !state.element_order.contains(&name) {
+                            state.element_order.push(name.clone());
+                        }
+                    }
+                    self.com_storage_load_compound_children(
+                        memory,
+                        child_object,
+                        compound,
+                        &format!("{path}/{name}"),
+                    )?;
+                }
+                _ => {}
             }
         }
-        Ok(streams)
+        Ok(())
+    }
+
+    /// Reload a storage subtree from disk in place.  Live child storage and
+    /// stream objects keep their identity; their bytes and dirty flags are
+    /// reset to the committed file state.
+    fn com_storage_reload_compound_children(
+        &mut self,
+        memory: &mut MemoryImage,
+        storage: u64,
+        compound: &crate::runtime::dispatch::msi::CompoundFile,
+        path: &str,
+    ) -> AppResult<()> {
+        let children = compound.children(path).unwrap_or_default();
+        let existing_children = self
+            .com_storages
+            .get(&storage)
+            .map(|state| state.child_storages.clone())
+            .unwrap_or_default();
+        let existing_streams = self
+            .com_storages
+            .get(&storage)
+            .map(|state| state.stream_objects.clone())
+            .unwrap_or_default();
+
+        let mut streams = std::collections::HashMap::new();
+        for child in &children {
+            if child.kind != 2 {
+                continue;
+            }
+            let name = child.decoded_name();
+            if let Some(data) = compound.stream_at(&format!("{path}/{name}")) {
+                streams.insert(name, data);
+            }
+        }
+        let mut surviving_streams = std::collections::HashMap::new();
+        for (name, object) in &existing_streams {
+            if streams.contains_key(name) {
+                surviving_streams.insert(name.clone(), *object);
+            }
+        }
+        if let Some(state) = self.com_storages.get_mut(&storage) {
+            state.streams = streams.clone();
+            state.stream_objects = surviving_streams.clone();
+            state.child_storages.clear();
+            state.element_order.clear();
+        }
+        for (name, data) in &streams {
+            if let Some(object) = surviving_streams.get(name)
+                && let Some(stream) = self.com_streams.get_mut(object)
+            {
+                stream.data = data.clone();
+                stream.position = stream.position.min(data.len() as u64);
+                stream.dirty = false;
+            }
+        }
+
+        for child in children {
+            let name = child.decoded_name();
+            match child.kind {
+                2 => {
+                    if let Some(state) = self.com_storages.get_mut(&storage)
+                        && !state.element_order.contains(&name)
+                    {
+                        state.element_order.push(name);
+                    }
+                }
+                1 => {
+                    let host_dir = self.com_storage_child_host_dir(storage, &name);
+                    let reused = existing_children
+                        .get(&name)
+                        .copied()
+                        .filter(|object| self.com_storages.contains_key(object));
+                    let child_object = if let Some(object) = reused {
+                        object
+                    } else {
+                        self.alloc_com_storage_object(memory, host_dir.clone(), &name, 0)?
+                    };
+                    if let Some(state) = self.com_storages.get_mut(&child_object) {
+                        state.name = name.clone();
+                        if host_dir.is_some() {
+                            state.host_dir = host_dir;
+                        }
+                        if child.clsid.iter().any(|byte| *byte != 0) {
+                            state.clsid = Some(child.clsid);
+                        }
+                    }
+                    if let Some(state) = self.com_storages.get_mut(&storage) {
+                        state.child_storages.insert(name.clone(), child_object);
+                        if !state.element_order.contains(&name) {
+                            state.element_order.push(name.clone());
+                        }
+                    }
+                    self.com_storage_reload_compound_children(
+                        memory,
+                        child_object,
+                        compound,
+                        &format!("{path}/{name}"),
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Serialize a live storage subtree, folding dirty stream objects into
+    /// their storage's stream map so the committed tree is current.
+    fn com_storage_build_compound_tree(
+        &mut self,
+        storage: u64,
+    ) -> crate::runtime::dispatch::msi::CompoundTree {
+        use crate::runtime::dispatch::msi::{CompoundTree, CompoundTreeChild};
+        let Some(state) = self.com_storages.get(&storage).cloned() else {
+            return CompoundTree::default();
+        };
+        let mut names = state.element_order.clone();
+        for name in state.streams.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        for name in state.child_storages.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        let mut children = Vec::new();
+        for name in names {
+            let live = state
+                .stream_objects
+                .get(&name)
+                .and_then(|stream| self.com_streams.get(stream))
+                .map(|stream| stream.data.clone());
+            if let Some(data) = live.or_else(|| state.streams.get(&name).cloned()) {
+                if let Some(entry) = self.com_storages.get_mut(&storage) {
+                    entry.streams.insert(name.clone(), data.clone());
+                }
+                children.push(CompoundTreeChild::Stream {
+                    name,
+                    data,
+                    created: 0,
+                    modified: 0,
+                });
+            } else if let Some(child) = state.child_storages.get(&name).copied() {
+                let mut child_tree = self.com_storage_build_compound_tree(child);
+                child_tree.name = name.clone();
+                children.push(CompoundTreeChild::Storage(child_tree));
+            }
+        }
+        let timestamp = Self::com_storage_tree_timestamp();
+        CompoundTree {
+            name: state.name.clone(),
+            clsid: state.clsid,
+            created: timestamp,
+            modified: timestamp,
+            children,
+        }
+    }
+
+    fn com_storage_compound_root(&self, storage: u64) -> Option<u64> {
+        if self.com_storage_compound_relative(storage)?.is_empty() {
+            return Some(storage);
+        }
+        let path = self.com_storage_compound_path(storage)?;
+        let root_dir = format!("{COM_CFB_PREFIX}{path}");
+        let mut first = None;
+        for (object, state) in &self.com_storages {
+            if state.host_dir.as_deref() != Some(root_dir.as_str()) {
+                continue;
+            }
+            first.get_or_insert(*object);
+            if self.com_storage_subtree_objects(*object).contains(&storage) {
+                return Some(*object);
+            }
+        }
+        first
+    }
+
+    fn com_storage_subtree_objects(&self, storage: u64) -> Vec<u64> {
+        let mut seen = Vec::new();
+        let mut stack = vec![storage];
+        while let Some(current) = stack.pop() {
+            if seen.contains(&current) {
+                continue;
+            }
+            seen.push(current);
+            if let Some(state) = self.com_storages.get(&current) {
+                stack.extend(state.child_storages.values().copied());
+            }
+        }
+        seen
+    }
+
+    fn com_storage_forget_subtree(&mut self, storage: u64) {
+        let children: Vec<u64> = self
+            .com_storages
+            .get(&storage)
+            .map(|state| state.child_storages.values().copied().collect())
+            .unwrap_or_default();
+        for child in children {
+            self.com_storage_forget_subtree(child);
+        }
+        self.com_storages.remove(&storage);
+    }
+
+    fn com_storage_element_names(&self, storage: u64) -> Vec<String> {
+        let Some(state) = self.com_storages.get(&storage) else {
+            return Vec::new();
+        };
+        let mut names = state.element_order.clone();
+        for name in state.streams.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        for name in state.child_storages.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
+    /// Deep-copy every element of `source` into `target`.  Collisions are
+    /// detected before the first element is written.
+    fn com_storage_copy_into(
+        &mut self,
+        memory: &mut MemoryImage,
+        source: u64,
+        target: u64,
+    ) -> AppResult<u32> {
+        let Some(source_state) = self.com_storages.get(&source).cloned() else {
+            return Ok(STG_E_INVALIDPOINTER);
+        };
+        let Some(target_state) = self.com_storages.get(&target).cloned() else {
+            return Ok(STG_E_INVALIDPOINTER);
+        };
+        let names = self.com_storage_element_names(source);
+        for name in &names {
+            if target_state.streams.contains_key(name)
+                || target_state.child_storages.contains_key(name)
+                || target_state.stream_objects.contains_key(name)
+            {
+                return Ok(STG_E_FILEALREADYEXISTS);
+            }
+        }
+        for name in names {
+            let live = source_state
+                .stream_objects
+                .get(&name)
+                .and_then(|stream| self.com_streams.get(stream))
+                .map(|stream| stream.data.clone());
+            if let Some(data) = live.or_else(|| source_state.streams.get(&name).cloned()) {
+                if let Some(entry) = self.com_storages.get_mut(&target) {
+                    entry.streams.insert(name.clone(), data);
+                    if !entry.element_order.contains(&name) {
+                        entry.element_order.push(name.clone());
+                    }
+                }
+            } else if let Some(child) = source_state.child_storages.get(&name).copied() {
+                let host_dir = self.com_storage_child_host_dir(target, &name);
+                let child_object = self.alloc_com_storage_object(memory, host_dir, &name, 0)?;
+                if let Some(child_state) = self.com_storages.get(&child).cloned() {
+                    if let Some(entry) = self.com_storages.get_mut(&child_object) {
+                        entry.clsid = child_state.clsid;
+                        entry.mode = child_state.mode;
+                    }
+                }
+                if let Some(entry) = self.com_storages.get_mut(&target) {
+                    entry.child_storages.insert(name.clone(), child_object);
+                    if !entry.element_order.contains(&name) {
+                        entry.element_order.push(name.clone());
+                    }
+                }
+                let result = self.com_storage_copy_into(memory, child, child_object)?;
+                if result != S_OK {
+                    return Ok(result);
+                }
+            }
+        }
+        Ok(S_OK)
     }
 
     /// Create/open an IStorage over a real on-disk OLE compound file.
@@ -2796,13 +3154,13 @@ impl PeHostRuntime {
         create: bool,
     ) -> AppResult<std::result::Result<u64, u32>> {
         let path = std::path::Path::new(host_file);
-        let streams = if path.exists() {
-            match Self::com_compound_streams(host_file) {
-                Ok(streams) => streams,
+        let compound = if path.exists() {
+            match Self::com_compound_file(host_file) {
+                Ok(compound) => Some(compound),
                 Err(hr) => return Ok(Err(hr)),
             }
         } else if create {
-            Vec::new()
+            None
         } else {
             return Ok(Err(STG_E_FILENOTFOUND));
         };
@@ -2811,6 +3169,11 @@ impl PeHostRuntime {
             .and_then(|name| name.to_str())
             .unwrap_or("storage")
             .to_string();
+        let root_clsid = compound
+            .as_ref()
+            .and_then(|compound| compound.root_entry())
+            .map(|entry| entry.clsid)
+            .filter(|clsid| clsid.iter().any(|byte| *byte != 0));
         let methods = vec![
             HostThunk::ComMethod(ComMethod::QueryInterface),
             HostThunk::GuestObjectAddRef,
@@ -2833,58 +3196,81 @@ impl PeHostRuntime {
         ];
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::ComStorage, vtable)?;
-        let element_order = streams.iter().map(|(name, _)| name.clone()).collect();
-        let streams = streams.into_iter().collect();
         self.com_storages.insert(
             object,
             crate::runtime::state::ComStorageState {
-                streams,
                 host_dir: Some(format!("{COM_CFB_PREFIX}{host_file}")),
-                element_order,
+                clsid: root_clsid,
                 mode,
                 name,
                 ..Default::default()
             },
         );
+        if let Some(compound) = &compound {
+            self.com_storage_load_compound_children(memory, object, compound, "Root")?;
+        }
         Ok(Ok(object))
     }
 
-    /// Commit one compound-file-backed storage: serialize every live stream
-    /// as a real CFB v3 file (the MSI module's writer).
+    /// Commit one compound-file-backed storage: serialize the whole live
+    /// storage tree as a real CFB v3 file (the MSI module's writer).  A
+    /// nested storage's commit rewrites the file through its root object.
     fn com_storage_commit_compound(&mut self, storage: u64) -> u32 {
         let Some(path) = self.com_storage_compound_path(storage) else {
             return STG_E_FILENOTFOUND;
         };
-        let Some(state) = self.com_storages.get(&storage).cloned() else {
-            return STG_E_INVALIDPOINTER;
+        let Some(root) = self.com_storage_compound_root(storage) else {
+            return STG_E_ACCESSDENIED;
         };
-        let mut streams = state.streams.clone();
-        for (name, stream) in &state.stream_objects {
-            if let Some(entry) = self.com_streams.get(stream) {
-                streams.insert(name.clone(), entry.data.clone());
-            }
-        }
-        let mut ordered = Vec::with_capacity(streams.len());
-        for name in &state.element_order {
-            if let Some(data) = streams.remove(name) {
-                ordered.push((name.clone(), data));
-            }
-        }
-        for (name, data) in streams {
-            ordered.push((name, data));
-        }
-        let bytes = crate::runtime::dispatch::msi::write_compound_file(&ordered);
+        let mut tree = self.com_storage_build_compound_tree(root);
+        tree.name = "Root Entry".to_string();
+        let bytes = crate::runtime::dispatch::msi::write_compound_tree(&tree);
         if std::fs::write(&path, bytes).is_err() {
             return STG_E_ACCESSDENIED;
         }
-        for stream in state.stream_objects.values() {
-            if let Some(entry) = self.com_streams.get_mut(stream) {
-                entry.dirty = false;
+        for object in self.com_storage_subtree_objects(root) {
+            let streams: Vec<u64> = self
+                .com_storages
+                .get(&object)
+                .map(|state| state.stream_objects.values().copied().collect())
+                .unwrap_or_default();
+            for stream in streams {
+                if let Some(entry) = self.com_streams.get_mut(&stream) {
+                    entry.dirty = false;
+                }
             }
         }
-        let updated: std::collections::HashMap<String, Vec<u8>> = ordered.into_iter().collect();
-        if let Some(entry) = self.com_storages.get_mut(&storage) {
-            entry.streams = updated;
+        S_OK
+    }
+
+    /// Commit a directory-backed storage tree: write each storage's direct
+    /// streams into its nested host directory and recurse into child
+    /// storages.
+    fn com_storage_commit_directory(&mut self, storage: u64) -> u32 {
+        let Some(state) = self.com_storages.get(&storage).cloned() else {
+            return STG_E_INVALIDPOINTER;
+        };
+        if let Some(directory) = &state.host_dir {
+            if std::fs::create_dir_all(directory).is_err() {
+                return STG_E_ACCESSDENIED;
+            }
+            for (name, data) in &state.streams {
+                let live = state
+                    .stream_objects
+                    .get(name)
+                    .and_then(|object| self.com_streams.get(object))
+                    .map(|stream| stream.data.as_slice());
+                let bytes = live.unwrap_or(data.as_slice());
+                if std::fs::write(format!("{directory}/{name}"), bytes).is_err() {
+                    return STG_E_ACCESSDENIED;
+                }
+            }
+        }
+        for child in state.child_storages.values() {
+            let hr = self.com_storage_commit_directory(*child);
+            if hr != S_OK {
+                return hr;
+            }
         }
         S_OK
     }
@@ -2919,12 +3305,17 @@ impl PeHostRuntime {
             return Ok(());
         }
         if let Some(storage) = self.com_storages.get_mut(&this) {
-            if storage.streams.contains_key(&name) {
+            if storage.streams.contains_key(&name)
+                || storage.stream_objects.contains_key(&name)
+                || storage.child_storages.contains_key(&name)
+            {
                 state.set(Register::Rax, u64::from(STG_E_FILEALREADYEXISTS));
                 return Ok(());
             }
             storage.streams.insert(name.clone(), Vec::new());
-            storage.element_order.push(name.clone());
+            if !storage.element_order.contains(&name) {
+                storage.element_order.push(name.clone());
+            }
         }
         let stream = self.alloc_com_stream_object(memory, Vec::new(), &name, host_path)?;
         if let Some(stream_state) = self.com_streams.get_mut(&stream) {
@@ -3019,26 +3410,20 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
             return Ok(());
         };
-        if storage
-            .host_dir
-            .as_deref()
-            .is_some_and(|directory| directory.starts_with(COM_CFB_PREFIX))
+        if storage.child_storages.contains_key(&name)
+            || storage.streams.contains_key(&name)
+            || storage.stream_objects.contains_key(&name)
         {
-            state.set(Register::Rax, u64::from(STG_E_INVALIDFUNCTION));
-            return Ok(());
-        }
-        if storage.child_storages.contains_key(&name) {
             state.set(Register::Rax, u64::from(STG_E_FILEALREADYEXISTS));
             return Ok(());
         }
-        let host_dir = storage
-            .host_dir
-            .as_ref()
-            .map(|directory| format!("{directory}/{name}"));
+        let host_dir = self.com_storage_child_host_dir(this, &name);
         let child = self.alloc_com_storage_object(memory, host_dir, &name, 0)?;
         if let Some(parent) = self.com_storages.get_mut(&this) {
             parent.child_storages.insert(name.clone(), child);
-            parent.element_order.push(name);
+            if !parent.element_order.contains(&name) {
+                parent.element_order.push(name);
+            }
         }
         write_guest_pointer(memory, out, child, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
@@ -3062,7 +3447,7 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
             return Ok(());
         }
-        let Some(storage) = self.com_storages.get(&this) else {
+        let Some(storage) = self.com_storages.get(&this).cloned() else {
             state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
             return Ok(());
         };
@@ -3077,7 +3462,11 @@ impl PeHostRuntime {
             .as_deref()
             .is_some_and(|directory| directory.starts_with(COM_CFB_PREFIX))
         {
-            state.set(Register::Rax, u64::from(STG_E_INVALIDFUNCTION));
+            // Compound children are materialized when the parent storage is
+            // opened, so a missing name here is a destroyed or absent
+            // element: never resurrect it from the on-disk file before the
+            // next Commit/Revert.
+            state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
             return Ok(());
         }
         let host_dir = storage
@@ -3094,7 +3483,9 @@ impl PeHostRuntime {
         let child = self.alloc_com_storage_object(memory, host_dir, &name, 0)?;
         if let Some(parent) = self.com_storages.get_mut(&this) {
             parent.child_storages.insert(name.clone(), child);
-            parent.element_order.push(name);
+            if !parent.element_order.contains(&name) {
+                parent.element_order.push(name);
+            }
         }
         write_guest_pointer(memory, out, child, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
@@ -3108,29 +3499,16 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
         let destination = guest_call_arg(state, memory, 4)?;
+        if this == destination {
+            state.set(Register::Rax, u64::from(STG_E_ACCESSDENIED));
+            return Ok(());
+        }
         if !self.com_storages.contains_key(&this) || !self.com_storages.contains_key(&destination) {
             state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
             return Ok(());
         }
-        let snapshot = self.com_storages.get(&this).cloned().unwrap_or_default();
-        if let Some(target) = self.com_storages.get_mut(&destination) {
-            for (name, data) in &snapshot.streams {
-                target
-                    .streams
-                    .entry(name.clone())
-                    .or_insert_with(|| data.clone());
-                if !target.element_order.contains(name) {
-                    target.element_order.push(name.clone());
-                }
-            }
-            for (name, child) in &snapshot.child_storages {
-                target.child_storages.entry(name.clone()).or_insert(*child);
-                if !target.element_order.contains(name) {
-                    target.element_order.push(name.clone());
-                }
-            }
-        }
-        state.set(Register::Rax, u64::from(S_OK));
+        let result = self.com_storage_copy_into(memory, this, destination)?;
+        state.set(Register::Rax, u64::from(result));
         Ok(())
     }
 
@@ -3190,16 +3568,11 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(hr));
             return Ok(());
         }
-        if let Some(directory) = &storage.host_dir {
-            if std::fs::create_dir_all(directory).is_err() {
-                state.set(Register::Rax, u64::from(STG_E_ACCESSDENIED));
+        if storage.host_dir.is_some() {
+            let hr = self.com_storage_commit_directory(this);
+            if hr != S_OK {
+                state.set(Register::Rax, u64::from(hr));
                 return Ok(());
-            }
-            for (name, data) in &storage.streams {
-                if std::fs::write(format!("{directory}/{name}"), data).is_err() {
-                    state.set(Register::Rax, u64::from(STG_E_ACCESSDENIED));
-                    return Ok(());
-                }
             }
         }
         // Streams handed out by this storage flush their own host files.
@@ -3259,17 +3632,36 @@ impl PeHostRuntime {
             return Ok(());
         };
         if let Some(path) = self.com_storage_compound_path(this) {
-            let streams = match Self::com_compound_streams(&path) {
-                Ok(streams) => streams,
+            let compound = match Self::com_compound_file(&path) {
+                Ok(compound) => compound,
                 Err(hr) => {
                     state.set(Register::Rax, u64::from(hr));
                     return Ok(());
                 }
             };
+            let relative = self.com_storage_compound_relative(this).unwrap_or_default();
+            let element_path = if relative.is_empty() {
+                "Root".to_string()
+            } else {
+                format!("Root/{}", relative.join("/"))
+            };
+            let Some(entry) = compound
+                .entry_at(&element_path)
+                .filter(|entry| entry.kind == 1 || entry.kind == 5)
+                .cloned()
+            else {
+                state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
+                return Ok(());
+            };
+            let clsid = entry
+                .clsid
+                .iter()
+                .any(|byte| *byte != 0)
+                .then_some(entry.clsid);
             if let Some(entry) = self.com_storages.get_mut(&this) {
-                entry.element_order = streams.iter().map(|(name, _)| name.clone()).collect();
-                entry.streams = streams.into_iter().collect();
+                entry.clsid = clsid;
             }
+            self.com_storage_reload_compound_children(memory, this, &compound, &element_path)?;
             state.set(Register::Rax, u64::from(S_OK));
             return Ok(());
         }
@@ -3349,16 +3741,23 @@ impl PeHostRuntime {
         let name_ptr = guest_call_arg(state, memory, 1)?;
         let name = read_utf16_string(memory, name_ptr).unwrap_or_default();
         let host_path = self.com_storage_element_path(this, &name);
-        let Some(storage) = self.com_storages.get_mut(&this) else {
-            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
-            return Ok(());
+        let removed_child = {
+            let Some(storage) = self.com_storages.get_mut(&this) else {
+                state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+                return Ok(());
+            };
+            let removed_stream = storage.streams.remove(&name).is_some();
+            let removed_object = storage.stream_objects.remove(&name).is_some();
+            let removed_child = storage.child_storages.remove(&name);
+            storage.element_order.retain(|element| element != &name);
+            if !removed_stream && !removed_object && removed_child.is_none() {
+                state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
+                return Ok(());
+            }
+            removed_child
         };
-        let removed = storage.streams.remove(&name).is_some()
-            || storage.child_storages.remove(&name).is_some();
-        storage.element_order.retain(|element| element != &name);
-        if !removed {
-            state.set(Register::Rax, u64::from(STG_E_FILENOTFOUND));
-            return Ok(());
+        if let Some(child) = removed_child {
+            self.com_storage_forget_subtree(child);
         }
         if let Some(path) = host_path {
             let path = std::path::PathBuf::from(path);
@@ -9344,10 +9743,9 @@ mod tests {
             )
             .unwrap();
 
-            // Nested storages are not representable in the flat CFB writer:
-            // the directory backend has the real function, this backend
-            // rejects it.
+            // Nested storages are real directory entries in the CFB writer.
             write_utf16(&mut fixture, NAME, "nested");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
             assert_eq!(
                 call_slot(
                     &mut fixture,
@@ -9355,8 +9753,10 @@ mod tests {
                     5,
                     &[reopened as u32, NAME as u32, 0, 0, OUT as u32]
                 ),
-                STG_E_INVALIDFUNCTION
+                0,
+                "IStorage::CreateStorage(nested)"
             );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
 
             // Malformed and absent files answer the real HRESULTs.
             let malformed_path = fixture._temp.path().join("malformed.cfb");
@@ -9410,6 +9810,681 @@ mod tests {
                     .get("legacy.bin")
                     .cloned(),
                 Some(b"legacy".to_vec())
+            );
+        })
+    }
+
+    // ── Nested compound storages ───────────────────────────────────────────
+
+    const NESTED_ROOT_CLSID: [u8; 16] = [
+        0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19,
+    ];
+    const NESTED_SUB_CLSID: [u8; 16] = [
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+        0x30,
+    ];
+
+    fn cfb_create_storage(fixture: &mut Fixture, parent: u64, name: &str) -> u64 {
+        write_utf16(fixture, NAME, name);
+        fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+        assert_eq!(
+            call_slot(
+                fixture,
+                parent,
+                5,
+                &[parent as u32, NAME as u32, 0, 0, OUT as u32]
+            ),
+            0,
+            "IStorage::CreateStorage({name})"
+        );
+        guest_ptr(fixture, OUT)
+    }
+
+    fn cfb_open_storage_hr(fixture: &mut Fixture, parent: u64, name: &str) -> u32 {
+        write_utf16(fixture, NAME, name);
+        fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+        call_slot(
+            fixture,
+            parent,
+            6,
+            &[parent as u32, NAME as u32, 0, 0, 0, OUT as u32],
+        )
+    }
+
+    fn cfb_open_storage(fixture: &mut Fixture, parent: u64, name: &str) -> u64 {
+        assert_eq!(
+            cfb_open_storage_hr(fixture, parent, name),
+            0,
+            "IStorage::OpenStorage({name})"
+        );
+        guest_ptr(fixture, OUT)
+    }
+
+    fn cfb_create_stream(fixture: &mut Fixture, parent: u64, name: &str, data: &[u8]) -> u64 {
+        write_utf16(fixture, NAME, name);
+        fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+        assert_eq!(
+            call_slot(
+                fixture,
+                parent,
+                3,
+                &[parent as u32, NAME as u32, 0x1002, 0, OUT as u32]
+            ),
+            0,
+            "IStorage::CreateStream({name})"
+        );
+        let stream = guest_ptr(fixture, OUT);
+        fixture.memory.map_bytes(BUF, data);
+        let written = OUT + 0x40;
+        assert_eq!(
+            call_slot(
+                fixture,
+                stream,
+                4,
+                &[stream as u32, BUF as u32, data.len() as u32, written as u32]
+            ),
+            0,
+            "IStream::Write({name})"
+        );
+        assert_eq!(
+            fixture.memory.read_u32(written).unwrap() as usize,
+            data.len()
+        );
+        stream
+    }
+
+    fn cfb_open_stream_hr(fixture: &mut Fixture, parent: u64, name: &str) -> u32 {
+        write_utf16(fixture, NAME, name);
+        fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+        call_slot(
+            fixture,
+            parent,
+            4,
+            &[parent as u32, NAME as u32, 0, 0, 0, OUT as u32],
+        )
+    }
+
+    fn cfb_read_stream(fixture: &mut Fixture, stream: u64, expected: &[u8]) {
+        fixture.memory.map_bytes(BUF, &[0_u8; 128]);
+        let read_out = OUT + 0x48;
+        assert_eq!(
+            call_slot(
+                fixture,
+                stream,
+                3,
+                &[
+                    stream as u32,
+                    BUF as u32,
+                    expected.len() as u32,
+                    read_out as u32
+                ]
+            ),
+            0,
+            "IStream::Read"
+        );
+        assert_eq!(
+            fixture.memory.read_u32(read_out).unwrap() as usize,
+            expected.len()
+        );
+        assert_eq!(
+            fixture.memory.read_bytes(BUF, expected.len()).unwrap(),
+            expected.to_vec()
+        );
+    }
+
+    fn cfb_commit(fixture: &mut Fixture, storage: u64) {
+        assert_eq!(
+            call_slot(fixture, storage, 9, &[storage as u32, 0]),
+            0,
+            "IStorage::Commit"
+        );
+    }
+
+    fn cfb_enum_elements(fixture: &mut Fixture, storage: u64) -> Vec<(String, u32, [u8; 16])> {
+        fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+        assert_eq!(
+            call_slot(fixture, storage, 11, &[storage as u32, 0, 0, 0, OUT as u32]),
+            0,
+            "IStorage::EnumElements"
+        );
+        let enumerator = guest_ptr(fixture, OUT);
+        fixture.memory.map_bytes(BUF, &[0_u8; 32 * 4]);
+        let fetched = OUT + 0x40;
+        let hr = call_slot(
+            fixture,
+            enumerator,
+            3,
+            &[enumerator as u32, 32, BUF as u32, fetched as u32],
+        );
+        assert!(hr == 0 || hr == S_FALSE, "IEnumSTATSTG::Next {hr:#x}");
+        let count = fixture.memory.read_u32(fetched).unwrap();
+        let mut elements = Vec::new();
+        for index in 0..count as u64 {
+            let descriptor = guest_ptr(fixture, BUF + index * 4);
+            let name_ptr = guest_ptr(fixture, descriptor);
+            let name = read_utf16_string(&fixture.memory, name_ptr).unwrap();
+            let kind = fixture.memory.read_u32(descriptor + 4).unwrap();
+            let mut clsid = [0_u8; 16];
+            clsid.copy_from_slice(&fixture.memory.read_bytes(descriptor + 48, 16).unwrap());
+            elements.push((name, kind, clsid));
+        }
+        elements
+    }
+
+    /// root/alpha.bin
+    /// root/Storage/outer.bin
+    /// root/Storage/Sub/{beta.bin,gamma.bin}
+    fn build_nested_compound(
+        fixture: &mut Fixture,
+        file_name: &str,
+    ) -> (std::path::PathBuf, String, u64) {
+        let path = fixture._temp.path().join(file_name);
+        let path_text = path.to_string_lossy().to_string();
+        let root = match fixture
+            .runtime
+            .alloc_com_compound_storage(&mut fixture.memory, &path_text, 0, true)
+            .unwrap()
+        {
+            Ok(storage) => storage,
+            Err(hr) => panic!("create compound storage failed: {hr:#x}"),
+        };
+        fixture.memory.map_bytes(OUT + 0x80, &NESTED_ROOT_CLSID);
+        assert_eq!(
+            call_slot(fixture, root, 15, &[root as u32, (OUT + 0x80) as u32]),
+            0,
+            "IStorage::SetClass(root)"
+        );
+        let storage = cfb_create_storage(fixture, root, "Storage");
+        let sub = cfb_create_storage(fixture, storage, "Sub");
+        fixture.memory.map_bytes(OUT + 0x80, &NESTED_SUB_CLSID);
+        assert_eq!(
+            call_slot(fixture, sub, 15, &[sub as u32, (OUT + 0x80) as u32]),
+            0,
+            "IStorage::SetClass(Sub)"
+        );
+        cfb_create_stream(fixture, root, "alpha.bin", b"alpha-bytes");
+        cfb_create_stream(fixture, storage, "outer.bin", b"outer-bytes");
+        cfb_create_stream(fixture, sub, "beta.bin", b"beta-bytes");
+        cfb_create_stream(fixture, sub, "gamma.bin", b"gamma-bytes");
+        (path, path_text, root)
+    }
+
+    fn reopen_compound(fixture: &mut Fixture, path_text: &str) -> u64 {
+        match fixture
+            .runtime
+            .alloc_com_compound_storage(&mut fixture.memory, path_text, 0, false)
+            .unwrap()
+        {
+            Ok(storage) => storage,
+            Err(hr) => panic!("reopen compound storage failed: {hr:#x}"),
+        }
+    }
+
+    #[test]
+    fn nested_storage_tree_round_trips_and_enumerates() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-cfb-nested-tree");
+            let (path, path_text, root) = build_nested_compound(&mut fixture, "nested-tree.cfb");
+            cfb_commit(&mut fixture, root);
+
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                bytes.get(..8).unwrap(),
+                &[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1],
+                "real OLE compound-file header"
+            );
+            let compound =
+                crate::runtime::dispatch::msi::CompoundFile::parse(bytes).expect("parse tree");
+            assert_eq!(
+                compound.stream_at("Root/Storage/Sub/beta.bin"),
+                Some(b"beta-bytes".to_vec()),
+                "nested stream resolved by path"
+            );
+            assert_eq!(
+                compound.stream_at("Root/Storage/Sub/gamma.bin"),
+                Some(b"gamma-bytes".to_vec())
+            );
+            assert_eq!(
+                compound.stream_at("Root/Storage/outer.bin"),
+                Some(b"outer-bytes".to_vec())
+            );
+            assert_eq!(
+                compound.stream_at("Root/alpha.bin"),
+                Some(b"alpha-bytes".to_vec())
+            );
+            let root_entry = compound.root_entry().expect("root entry");
+            assert_eq!(root_entry.kind, 5);
+            assert_eq!(root_entry.clsid, NESTED_ROOT_CLSID);
+            let sub_entry = compound
+                .entry_at("Root/Storage/Sub")
+                .expect("nested storage entry");
+            assert_eq!(sub_entry.kind, 1);
+            assert_eq!(sub_entry.clsid, NESTED_SUB_CLSID);
+            assert_ne!(sub_entry.created, 0);
+            assert_ne!(sub_entry.modified, 0);
+            let storage_children = compound.children("Root/Storage").unwrap();
+            assert_eq!(storage_children.len(), 2);
+            assert!(
+                storage_children
+                    .iter()
+                    .any(|entry| { entry.decoded_name() == "Sub" && entry.kind == 1 })
+            );
+            assert!(
+                storage_children
+                    .iter()
+                    .any(|entry| { entry.decoded_name() == "outer.bin" && entry.kind == 2 })
+            );
+
+            let reopened = reopen_compound(&mut fixture, &path_text);
+            let storage = cfb_open_storage(&mut fixture, reopened, "Storage");
+            let sub = cfb_open_storage(&mut fixture, storage, "Sub");
+
+            assert_eq!(
+                cfb_open_stream_hr(&mut fixture, sub, "beta.bin"),
+                0,
+                "OpenStream(nested)"
+            );
+            let beta = guest_ptr(&fixture, OUT);
+            cfb_read_stream(&mut fixture, beta, b"beta-bytes");
+
+            assert_eq!(
+                cfb_open_stream_hr(&mut fixture, sub, "absent.bin"),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                cfb_open_storage_hr(&mut fixture, reopened, "Missing"),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                cfb_open_storage_hr(&mut fixture, storage, "Sub"),
+                0,
+                "reopening a live nested storage"
+            );
+
+            let root_elements = cfb_enum_elements(&mut fixture, reopened);
+            assert_eq!(root_elements.len(), 2);
+            assert!(root_elements.iter().any(|(name, kind, clsid)| {
+                name == "Storage" && *kind == 1 && clsid.iter().all(|byte| *byte == 0)
+            }));
+            assert!(
+                root_elements
+                    .iter()
+                    .any(|(name, kind, _)| { name == "alpha.bin" && *kind == 2 })
+            );
+            let storage_elements = cfb_enum_elements(&mut fixture, storage);
+            assert_eq!(storage_elements.len(), 2);
+            assert!(storage_elements.iter().any(|(name, kind, clsid)| {
+                name == "Sub" && *kind == 1 && *clsid == NESTED_SUB_CLSID
+            }));
+            assert!(
+                storage_elements
+                    .iter()
+                    .any(|(name, kind, _)| { name == "outer.bin" && *kind == 2 })
+            );
+            let sub_elements = cfb_enum_elements(&mut fixture, sub);
+            assert_eq!(sub_elements.len(), 2);
+            assert!(
+                sub_elements
+                    .iter()
+                    .any(|(name, kind, _)| { name == "beta.bin" && *kind == 2 })
+            );
+            assert!(
+                sub_elements
+                    .iter()
+                    .any(|(name, kind, _)| { name == "gamma.bin" && *kind == 2 })
+            );
+
+            // The storage CLSID round-trips through Stat after reopening.
+            fixture.memory.map_bytes(STAT, &[0_u8; 72]);
+            assert_eq!(
+                call_slot(&mut fixture, sub, 17, &[sub as u32, STAT as u32, 0]),
+                0,
+                "IStorage::Stat(sub)"
+            );
+            assert_eq!(fixture.memory.read_u32(STAT + 4).unwrap(), 1);
+            assert_eq!(
+                fixture.memory.read_bytes(STAT + 48, 16).unwrap(),
+                NESTED_SUB_CLSID.to_vec()
+            );
+            fixture.memory.map_bytes(STAT, &[0_u8; 72]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    reopened,
+                    17,
+                    &[reopened as u32, STAT as u32, 0]
+                ),
+                0,
+                "IStorage::Stat(root)"
+            );
+            assert_eq!(
+                fixture.memory.read_bytes(STAT + 48, 16).unwrap(),
+                NESTED_ROOT_CLSID.to_vec()
+            );
+
+            // Nested IStream writes honor a real seek offset, and a Commit
+            // issued through the nested storage rewrites the whole file.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    beta,
+                    5,
+                    &[beta as u32, 5, 0, 0, (OUT + 0x40) as u32]
+                ),
+                0,
+                "IStream::Seek(nested, 5)"
+            );
+            fixture.memory.map_bytes(BUF, b"BYTES");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    beta,
+                    4,
+                    &[beta as u32, BUF as u32, 5, (OUT + 0x44) as u32]
+                ),
+                0,
+                "IStream::Write(nested at offset 5)"
+            );
+            cfb_commit(&mut fixture, sub);
+            let after_offset_write = reopen_compound(&mut fixture, &path_text);
+            let storage_after = cfb_open_storage(&mut fixture, after_offset_write, "Storage");
+            let sub_after = cfb_open_storage(&mut fixture, storage_after, "Sub");
+            assert_eq!(cfb_open_stream_hr(&mut fixture, sub_after, "beta.bin"), 0);
+            let beta_after = guest_ptr(&fixture, OUT);
+            cfb_read_stream(&mut fixture, beta_after, b"beta-BYTES");
+        })
+    }
+
+    #[test]
+    fn nested_storage_destroy_copy_and_error_paths_persist() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-cfb-nested-copy");
+            let (path, path_text, root) = build_nested_compound(&mut fixture, "nested-copy.cfb");
+            cfb_commit(&mut fixture, root);
+
+            let reopened = reopen_compound(&mut fixture, &path_text);
+            assert_eq!(
+                cfb_open_storage_hr(&mut fixture, reopened, "Missing"),
+                STG_E_FILENOTFOUND
+            );
+
+            write_utf16(&mut fixture, NAME, "Storage");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    reopened,
+                    5,
+                    &[reopened as u32, NAME as u32, 0, 0, OUT as u32]
+                ),
+                STG_E_FILEALREADYEXISTS,
+                "CreateStorage collision"
+            );
+            write_utf16(&mut fixture, NAME, "alpha.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    reopened,
+                    3,
+                    &[reopened as u32, NAME as u32, 0x1002, 0, OUT as u32]
+                ),
+                STG_E_FILEALREADYEXISTS,
+                "CreateStream collision"
+            );
+            write_utf16(&mut fixture, NAME, "Storage");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    reopened,
+                    3,
+                    &[reopened as u32, NAME as u32, 0x1002, 0, OUT as u32]
+                ),
+                STG_E_FILEALREADYEXISTS,
+                "CreateStream over a storage"
+            );
+
+            let source_storage = cfb_open_storage(&mut fixture, reopened, "Storage");
+            let copy = cfb_create_storage(&mut fixture, reopened, "Copy");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    source_storage,
+                    7,
+                    &[source_storage as u32, 0, 0, 0, copy as u32]
+                ),
+                0,
+                "IStorage::CopyTo"
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    source_storage,
+                    7,
+                    &[source_storage as u32, 0, 0, 0, copy as u32]
+                ),
+                STG_E_FILEALREADYEXISTS,
+                "CopyTo collision"
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    source_storage,
+                    7,
+                    &[source_storage as u32, 0, 0, 0, source_storage as u32]
+                ),
+                STG_E_ACCESSDENIED,
+                "CopyTo onto itself"
+            );
+            cfb_commit(&mut fixture, reopened);
+
+            let reopened_copy = reopen_compound(&mut fixture, &path_text);
+            let copy_storage = cfb_open_storage(&mut fixture, reopened_copy, "Copy");
+            let copied_sub = cfb_open_storage(&mut fixture, copy_storage, "Sub");
+            assert_eq!(cfb_open_stream_hr(&mut fixture, copied_sub, "beta.bin"), 0);
+            let copied_beta = guest_ptr(&fixture, OUT);
+            cfb_read_stream(&mut fixture, copied_beta, b"beta-bytes");
+            assert_eq!(
+                cfb_open_stream_hr(&mut fixture, copy_storage, "outer.bin"),
+                0
+            );
+            let copied_outer = guest_ptr(&fixture, OUT);
+            cfb_read_stream(&mut fixture, copied_outer, b"outer-bytes");
+
+            // Destroy one stream and one whole storage subtree; both survive
+            // a commit/reopen round trip.
+            write_utf16(&mut fixture, NAME, "beta.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    copied_sub,
+                    12,
+                    &[copied_sub as u32, NAME as u32]
+                ),
+                0,
+                "DestroyElement(stream)"
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    copied_sub,
+                    12,
+                    &[copied_sub as u32, NAME as u32]
+                ),
+                STG_E_FILENOTFOUND,
+                "DestroyElement(missing stream)"
+            );
+            assert_eq!(
+                cfb_open_stream_hr(&mut fixture, copied_sub, "beta.bin"),
+                STG_E_FILENOTFOUND
+            );
+            write_utf16(&mut fixture, NAME, "Missing");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    copy_storage,
+                    12,
+                    &[copy_storage as u32, NAME as u32]
+                ),
+                STG_E_FILENOTFOUND,
+                "DestroyElement(missing element)"
+            );
+            cfb_commit(&mut fixture, reopened_copy);
+
+            let bytes = std::fs::read(&path).unwrap();
+            let compound =
+                crate::runtime::dispatch::msi::CompoundFile::parse(bytes).expect("parse tree");
+            assert_eq!(compound.stream_at("Root/Copy/Sub/beta.bin"), None);
+            assert_eq!(
+                compound.stream_at("Root/Copy/Sub/gamma.bin"),
+                Some(b"gamma-bytes".to_vec())
+            );
+            assert_eq!(
+                compound.stream_at("Root/Copy/outer.bin"),
+                Some(b"outer-bytes".to_vec())
+            );
+            assert_eq!(
+                compound.stream_at("Root/Storage/Sub/beta.bin"),
+                Some(b"beta-bytes".to_vec()),
+                "destroying a copied stream leaves the source intact"
+            );
+
+            write_utf16(&mut fixture, NAME, "Sub");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    copy_storage,
+                    12,
+                    &[copy_storage as u32, NAME as u32]
+                ),
+                0,
+                "DestroyElement(storage subtree)"
+            );
+            assert_eq!(
+                cfb_open_storage_hr(&mut fixture, copy_storage, "Sub"),
+                STG_E_FILENOTFOUND
+            );
+            cfb_commit(&mut fixture, reopened_copy);
+            let bytes = std::fs::read(&path).unwrap();
+            let compound =
+                crate::runtime::dispatch::msi::CompoundFile::parse(bytes).expect("parse tree");
+            assert!(compound.entry_at("Root/Copy/Sub").is_none());
+            assert!(compound.entry_at("Root/Copy/Sub/gamma.bin").is_none());
+            assert_eq!(
+                compound.stream_at("Root/Copy/outer.bin"),
+                Some(b"outer-bytes".to_vec())
+            );
+            assert_eq!(
+                compound.stream_at("Root/Storage/Sub/gamma.bin"),
+                Some(b"gamma-bytes".to_vec()),
+                "destroying a copied storage leaves the source intact"
+            );
+        })
+    }
+
+    #[test]
+    fn nested_storage_revert_discards_changes_and_rejects_malformed_directories() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-cfb-nested-revert");
+            let (path, path_text, root) = build_nested_compound(&mut fixture, "nested-revert.cfb");
+            cfb_commit(&mut fixture, root);
+
+            let reopened = reopen_compound(&mut fixture, &path_text);
+            let storage = cfb_open_storage(&mut fixture, reopened, "Storage");
+            let sub = cfb_open_storage(&mut fixture, storage, "Sub");
+            assert_eq!(cfb_open_stream_hr(&mut fixture, sub, "beta.bin"), 0);
+            let beta = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                call_slot(&mut fixture, beta, 5, &[beta as u32, 0, 0, 0, OUT as u32]),
+                0,
+                "IStream::Seek(0)"
+            );
+            fixture.memory.map_bytes(BUF, b"CORRUPTED!");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    beta,
+                    4,
+                    &[beta as u32, BUF as u32, 10, (OUT + 4) as u32]
+                ),
+                0,
+                "IStream::Write(before revert)"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, reopened, 10, &[reopened as u32]),
+                0,
+                "IStorage::Revert(root)"
+            );
+            // The already-open nested objects observe the reverted tree.
+            assert_eq!(cfb_open_stream_hr(&mut fixture, sub, "beta.bin"), 0);
+            let reverted_beta = guest_ptr(&fixture, OUT);
+            cfb_read_stream(&mut fixture, reverted_beta, b"beta-bytes");
+            let storage = cfb_open_storage(&mut fixture, reopened, "Storage");
+            let sub = cfb_open_storage(&mut fixture, storage, "Sub");
+            assert_eq!(cfb_open_stream_hr(&mut fixture, sub, "beta.bin"), 0);
+            let beta = guest_ptr(&fixture, OUT);
+            cfb_read_stream(&mut fixture, beta, b"beta-bytes");
+            let bytes = std::fs::read(&path).unwrap();
+            let compound =
+                crate::runtime::dispatch::msi::CompoundFile::parse(bytes).expect("parse tree");
+            assert_eq!(
+                compound.stream_at("Root/Storage/Sub/beta.bin"),
+                Some(b"beta-bytes".to_vec()),
+                "Revert discards uncommitted nested writes"
+            );
+
+            // Malformed directory trees: cyclic sibling, absent pointer,
+            // missing root, and a root child cycle.
+            let base = crate::runtime::dispatch::msi::write_compound_file(&[(
+                "payload".to_string(),
+                b"data".to_vec(),
+            )]);
+            let dir_start = u32::from_le_bytes(base[0x2C..0x30].try_into().unwrap()) as usize;
+            let dir_offset = (dir_start + 1) * 512;
+            let second = dir_offset + 128;
+
+            let mut cyclic = base.clone();
+            cyclic[second + 0x48..second + 0x4C].copy_from_slice(&1u32.to_le_bytes());
+            assert!(
+                crate::runtime::dispatch::msi::CompoundFile::parse(cyclic.clone()).is_err(),
+                "cyclic sibling chain rejected"
+            );
+            let cyclic_path = fixture._temp.path().join("cyclic.cfb");
+            std::fs::write(&cyclic_path, &cyclic).unwrap();
+            assert_eq!(
+                fixture
+                    .runtime
+                    .alloc_com_compound_storage(
+                        &mut fixture.memory,
+                        &cyclic_path.to_string_lossy(),
+                        0,
+                        false
+                    )
+                    .unwrap(),
+                Err(STG_E_INVALIDHEADER)
+            );
+
+            let mut absent = base.clone();
+            absent[second + 0x4C..second + 0x50].copy_from_slice(&999u32.to_le_bytes());
+            assert!(
+                crate::runtime::dispatch::msi::CompoundFile::parse(absent).is_err(),
+                "absent child pointer rejected"
+            );
+
+            let mut rootless = base.clone();
+            rootless[dir_offset + 0x42] = 0;
+            assert!(
+                crate::runtime::dispatch::msi::CompoundFile::parse(rootless).is_err(),
+                "missing root entry rejected"
+            );
+
+            let mut root_cycle = base.clone();
+            root_cycle[dir_offset + 0x4C..dir_offset + 0x50].copy_from_slice(&0u32.to_le_bytes());
+            assert!(
+                crate::runtime::dispatch::msi::CompoundFile::parse(root_cycle).is_err(),
+                "root child cycle rejected"
             );
         })
     }

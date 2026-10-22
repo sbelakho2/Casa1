@@ -385,14 +385,10 @@ impl PeHostRuntime {
     ///   **asynchronously**: the completion handler's `ActivateCompleted`
     ///   slot (vtable slot 3) is invoked from the runtime servicing points
     ///   (`drain_pending_audio_activations`) — never inline inside this call
-    ///   — with the real activation result (HRESULT) and the activated
-    ///   interface object (or 0 on failure).  Every `S_OK` return therefore
-    ///   delivers exactly one completion.
-    ///
-    /// Model divergence (reported): Windows hands the handler an
-    /// `IActivateAudioInterfaceAsyncOperation` object whose `GetActivateResult`
-    /// carries the result; this runtime has no operation-object guest model,
-    /// so the handler receives `(result_hr, activated_interface)` directly.
+    ///   — with the real `IActivateAudioInterfaceAsyncOperation` object
+    ///   (Windows contract).  `GetActivateResult` on that operation reports
+    ///   the real activation HRESULT and activated interface.  Every `S_OK`
+    ///   return therefore delivers exactly one completion.
     pub(crate) fn dispatch_activate_audio_interface_async(
         &mut self,
         state: &mut CpuState,
@@ -590,10 +586,10 @@ impl PeHostRuntime {
     ) -> AppResult<u64> {
         // The vtable is the runtime's established real-object wrapper shape
         // (QueryInterface/AddRef/Release preamble — the refcount lives in the
-        // guest-object table, so AddRef/Release genuinely track it).  No
-        // IAudioClient method host thunks exist in the runtime yet, so the
-        // activated object's real content is the bound device record rather
-        // than per-method audio-client calls (see the module report).
+        // guest-object table, so AddRef/Release genuinely track it).  The
+        // audio region's post-dispatch hook then replaces it with the full
+        // IAudioClient method vtable and wraps this object in the real
+        // IActivateAudioInterfaceAsyncOperation returned through op-out.
         let vtable = self.alloc_guest_vtable(
             memory,
             vec![
@@ -616,8 +612,9 @@ impl PeHostRuntime {
 
     /// Deliver the pending audio-interface activation completions of this
     /// runtime: each queued completion handler's `ActivateCompleted` slot is
-    /// invoked in guest context with the real activation result and the
-    /// activated interface object (or 0).
+    /// invoked in guest context with the real
+    /// `IActivateAudioInterfaceAsyncOperation` object (whose completed
+    /// `GetActivateResult` carries the real activation HRESULT and interface).
     ///
     /// This runs ONLY from the runtime servicing points (the block-dispatch
     /// safepoint and the message-loop idle drain in `runtime/mod.rs`) and
@@ -635,17 +632,23 @@ impl PeHostRuntime {
             if completion.handler_method == 0 {
                 continue;
             }
-            self.execute_guest_callback(
+            // Windows contract: ActivateCompleted receives exactly the
+            // IActivateAudioInterfaceAsyncOperation object (popped completion has
+            // completed that operation in `audio_activation`).
+            let operation = completion.interface_object;
+            let delivered = self.execute_guest_callback(
                 state,
                 memory,
                 completion.handler_method,
-                &[
-                    completion.handler_object,
-                    u64::from(completion.result_hr),
-                    completion.interface_object,
-                ],
+                &[completion.handler_object, operation],
                 "ActivateAudioInterfaceAsync::ActivateCompleted",
-            )?;
+            );
+            // Drop the reference held by the pending completion.  If the guest
+            // released the operation early this is the final Release.
+            if crate::audio_activation::is_activation_operation(self.guest_pid, operation) {
+                let _ = self.release_guest_object(operation);
+            }
+            delivered?;
         }
         Ok(())
     }
@@ -4666,6 +4669,12 @@ struct XactResolvedPlayback {
     volume: f32,
     pitch: i16,
     category: u16,
+    /// Optional source-to-destination channel matrix applied before the
+    /// samples reach the source voice.
+    matrix: Option<(u32, u32, Vec<f32>)>,
+    /// Real output-voice destinations selected by `SetOutputVoices`.
+    /// Empty means the default route to the engine mastering voice.
+    routes: Vec<crate::xact::OutputVoiceRoute>,
 }
 
 /// Read argument `index` of a guest-object vtable call.  For the x86 stdcall
@@ -4978,11 +4987,15 @@ impl PeHostRuntime {
                         _ => None,
                     };
                     if let Some(live) = live {
-                        let _ = self.xact_stop_live_voice(live.voice);
+                        for voice in live.voices() {
+                            let _ = self.xact_stop_live_voice(voice);
+                        }
                     }
                 }
                 for live in state.wave_voices.values() {
-                    let _ = self.xact_stop_live_voice(live.voice);
+                    for voice in live.voices() {
+                        let _ = self.xact_stop_live_voice(voice);
+                    }
                 }
                 if let Some(mastering) = state.mastering_voice {
                     let _ = self.xact_stop_live_voice(mastering);
@@ -5032,7 +5045,9 @@ impl PeHostRuntime {
             }
             crate::xact::XactObject::Cue(state) => {
                 if let Some(live) = state.live {
-                    let _ = self.xact_stop_live_voice(live.voice);
+                    for voice in live.voices() {
+                        let _ = self.xact_stop_live_voice(voice);
+                    }
                 }
                 pending.extend(xact_collect_notifications(
                     runtime.engine(state.engine),
@@ -5044,7 +5059,9 @@ impl PeHostRuntime {
             }
             crate::xact::XactObject::Wave(state) => {
                 if let Some(live) = state.live {
-                    let _ = self.xact_stop_live_voice(live.voice);
+                    for voice in live.voices() {
+                        let _ = self.xact_stop_live_voice(voice);
+                    }
                 }
                 pending.extend(xact_collect_notifications(
                     runtime.engine(state.engine),
@@ -5233,6 +5250,8 @@ impl PeHostRuntime {
                         refcount: 1,
                         engine: this,
                         bank,
+                        prepared: std::collections::BTreeSet::new(),
+                        streaming_cache: std::collections::BTreeMap::new(),
                     }),
                 )?;
                 write_guest_pointer(memory, out, object, self.guest_arch)?;
@@ -5245,18 +5264,226 @@ impl PeHostRuntime {
                 Ok((crate::xact::S_OK, Vec::new()))
             }
             11 => {
-                // CreateStreamingWaveBank: real streaming needs the engine's
-                // file-I/O callback path over a guest HANDLE, which this model
-                // does not implement.  Genuine E_NOTIMPL rather than fake
-                // success.
-                Ok((crate::xact::E_NOTIMPL, Vec::new()))
+                // CreateStreamingWaveBank(path, out): open the guest file
+                // through the GE file tables, parse the WBND header and entry
+                // metadata, and keep the file path for on-demand seeks.
+                let path = xact_arg(state, memory, 1)?;
+                let out = xact_arg(state, memory, 2)?;
+                let initialized = runtime
+                    .engine(this)
+                    .map(|engine| engine.initialized)
+                    .unwrap_or(false);
+                if !initialized {
+                    return Ok((crate::xact::XACTENGINE_E_NOTINITIALIZED, Vec::new()));
+                }
+                if path == 0 || out == 0 {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                }
+                let Some(guest_path) = xact_guest_string(memory, path) else {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                };
+                let Some(host_path) = self.xact_resolve_file_path(&guest_path) else {
+                    return Ok((crate::xact::E_FAIL, Vec::new()));
+                };
+                let bank = match crate::xact::open_streaming_wave_bank(&host_path) {
+                    Ok(bank) => bank,
+                    Err(error) => return Ok((error, Vec::new())),
+                };
+                let object = self.xact_alloc_streaming_bank_object(memory, runtime, this, bank)?;
+                write_guest_pointer(memory, out, object, self.guest_arch)?;
+                self.push_trace(
+                    "audio",
+                    "IXACT3Engine::CreateStreamingWaveBank",
+                    BTreeMap::from([("path".to_string(), json!(guest_path))]),
+                    json!(format!("{object:#x}")),
+                );
+                Ok((crate::xact::S_OK, Vec::new()))
             }
-            12 | 13 | 14 => {
-                // PrepareWave / PrepareInMemoryWave / PrepareStreamingWave:
-                // standalone wave preparation is not part of the modeled
-                // surface (the wave-bank Prepare/Play path is).  Genuine
-                // E_NOTIMPL.
-                Ok((crate::xact::E_NOTIMPL, Vec::new()))
+            12 => {
+                // PrepareWave(flags, path, packetSize, align, offset, loops, out)
+                let path = xact_arg(state, memory, 2)?;
+                let _packet_size = xact_arg_u32(state, memory, 3)?;
+                let _align = xact_arg_u32(state, memory, 4)?;
+                let _offset = xact_arg_u32(state, memory, 5)?;
+                let loop_count = xact_arg_u32(state, memory, 6)? as u8;
+                let out = xact_arg(state, memory, 7)?;
+                let initialized = runtime
+                    .engine(this)
+                    .map(|engine| engine.initialized)
+                    .unwrap_or(false);
+                if !initialized {
+                    return Ok((crate::xact::XACTENGINE_E_NOTINITIALIZED, Vec::new()));
+                }
+                if path == 0 || out == 0 {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                }
+                let Some(guest_path) = xact_guest_string(memory, path) else {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                };
+                let Some(host_path) = self.xact_resolve_file_path(&guest_path) else {
+                    return Ok((crate::xact::E_FAIL, Vec::new()));
+                };
+                let bank = match crate::xact::open_streaming_wave_bank(&host_path) {
+                    Ok(bank) => bank,
+                    Err(error) => return Ok((error, Vec::new())),
+                };
+                if bank.entries.is_empty() {
+                    return Ok((crate::xact::XACTENGINE_E_INVALIDDATA, Vec::new()));
+                }
+                let bank_object =
+                    self.xact_alloc_streaming_bank_object(memory, runtime, this, bank)?;
+                match xact_prepare_bank_entry(runtime, bank_object, 0) {
+                    Ok(()) => {}
+                    Err(error) => return Ok((error, Vec::new())),
+                }
+                let object = self.xact_alloc_wave_object(
+                    memory,
+                    runtime,
+                    this,
+                    bank_object,
+                    0,
+                    crate::xact::XACT_STATE_PREPARED,
+                    None,
+                    loop_count,
+                )?;
+                write_guest_pointer(memory, out, object, self.guest_arch)?;
+                Ok((crate::xact::S_OK, Vec::new()))
+            }
+            13 => {
+                // PrepareInMemoryWave(flags, entry, seekTable, data, offset,
+                // loops, out): decode the caller's 24-byte WAVEBANKENTRY
+                // metadata against the supplied PCM buffer.
+                let entry = xact_arg(state, memory, 2)?;
+                let _seek_table = xact_arg(state, memory, 3)?;
+                let data = xact_arg(state, memory, 4)?;
+                let offset = xact_arg_u32(state, memory, 5)? as usize;
+                let loop_count = xact_arg_u32(state, memory, 6)? as u8;
+                let out = xact_arg(state, memory, 7)?;
+                let initialized = runtime
+                    .engine(this)
+                    .map(|engine| engine.initialized)
+                    .unwrap_or(false);
+                if !initialized {
+                    return Ok((crate::xact::XACTENGINE_E_NOTINITIALIZED, Vec::new()));
+                }
+                if entry == 0 || data == 0 || out == 0 {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                }
+                let Ok(parsed) = xact_read_wave_entry(memory, entry) else {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                };
+                if parsed.data_length == 0 {
+                    return Ok((crate::xact::XACTENGINE_E_INVALIDDATA, Vec::new()));
+                }
+                let payload = read_guest_bytes(
+                    memory,
+                    data.saturating_add(offset as u64),
+                    parsed.data_length as usize,
+                )?;
+                let mut decoded = parsed;
+                crate::xact::decode_wave_payload(&mut decoded, &payload);
+                if decoded.pcm.is_none() {
+                    return Ok((
+                        decoded
+                            .decode_error
+                            .unwrap_or(crate::xact::XACTENGINE_E_INVALIDDATA),
+                        Vec::new(),
+                    ));
+                }
+                let bank = crate::xact::WaveBank {
+                    name: "InMemoryWave".to_string(),
+                    streaming: false,
+                    source_path: None,
+                    entry_names: Vec::new(),
+                    entries: vec![decoded],
+                };
+                let bank_object =
+                    self.xact_alloc_streaming_bank_object(memory, runtime, this, bank)?;
+                let object = self.xact_alloc_wave_object(
+                    memory,
+                    runtime,
+                    this,
+                    bank_object,
+                    0,
+                    crate::xact::XACT_STATE_PREPARED,
+                    None,
+                    loop_count,
+                )?;
+                write_guest_pointer(memory, out, object, self.guest_arch)?;
+                Ok((crate::xact::S_OK, Vec::new()))
+            }
+            14 => {
+                // PrepareStreamingWave(flags, entry, params, align, seek,
+                // offset, loops, out).  The params block is the XACT
+                // streaming descriptor: { path, fileOffset, length, reserved }.
+                // The payload is read from the guest file with a real seek.
+                let entry = xact_arg(state, memory, 2)?;
+                let params = xact_arg(state, memory, 3)?;
+                let _align = xact_arg_u32(state, memory, 4)?;
+                let _seek = xact_arg(state, memory, 5)?;
+                let _offset = xact_arg_u32(state, memory, 6)?;
+                let loop_count = xact_arg_u32(state, memory, 7)? as u8;
+                let out = xact_arg(state, memory, 8)?;
+                let initialized = runtime
+                    .engine(this)
+                    .map(|engine| engine.initialized)
+                    .unwrap_or(false);
+                if !initialized {
+                    return Ok((crate::xact::XACTENGINE_E_NOTINITIALIZED, Vec::new()));
+                }
+                if entry == 0 || params == 0 || out == 0 {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                }
+                let path_pointer = u64::from(read_u32(memory, params)?);
+                let file_offset = read_u32(memory, params + 4)?;
+                let declared_length = read_u32(memory, params + 8)?;
+                if path_pointer == 0 {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                }
+                let Some(guest_path) = xact_guest_string(memory, path_pointer) else {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                };
+                let Some(host_path) = self.xact_resolve_file_path(&guest_path) else {
+                    return Ok((crate::xact::E_FAIL, Vec::new()));
+                };
+                let Ok(mut parsed) = xact_read_wave_entry(memory, entry) else {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                };
+                parsed.data_offset = file_offset;
+                if declared_length != 0 {
+                    parsed.data_length = declared_length;
+                }
+                if parsed.data_length == 0 {
+                    return Ok((crate::xact::XACTENGINE_E_INVALIDDATA, Vec::new()));
+                }
+                let bank = crate::xact::WaveBank {
+                    name: "StreamingWave".to_string(),
+                    streaming: true,
+                    source_path: Some(host_path),
+                    entry_names: Vec::new(),
+                    entries: vec![parsed],
+                };
+                if crate::xact::load_streaming_pcm(&bank, 0).is_err() {
+                    return Ok((crate::xact::XACTENGINE_E_INVALIDDATA, Vec::new()));
+                }
+                let bank_object =
+                    self.xact_alloc_streaming_bank_object(memory, runtime, this, bank)?;
+                match xact_prepare_bank_entry(runtime, bank_object, 0) {
+                    Ok(()) => {}
+                    Err(error) => return Ok((error, Vec::new())),
+                }
+                let object = self.xact_alloc_wave_object(
+                    memory,
+                    runtime,
+                    this,
+                    bank_object,
+                    0,
+                    crate::xact::XACT_STATE_PREPARED,
+                    None,
+                    loop_count,
+                )?;
+                write_guest_pointer(memory, out, object, self.guest_arch)?;
+                Ok((crate::xact::S_OK, Vec::new()))
             }
             15 => {
                 // RegisterNotification(desc)
@@ -5598,6 +5825,8 @@ impl PeHostRuntime {
                     instance_limit: category.instance_limit,
                     paused: false,
                     visibility: category.visibility,
+                    release_ms: category.fade_out_ms,
+                    release_curve: category.release_curve,
                 });
             }
             for variable in settings.variables {
@@ -5615,6 +5844,8 @@ impl PeHostRuntime {
                     instance_limit: 255,
                     paused: false,
                     visibility: 1,
+                    release_ms: 0,
+                    release_curve: crate::xact::ReleaseCurve::Linear,
                 });
             }
         }
@@ -5795,10 +6026,22 @@ impl PeHostRuntime {
             match object {
                 crate::xact::XactObject::Cue(cue) => {
                     if let Some(live) = cue.live {
+                        let release_gain = live
+                            .release
+                            .map(|fade| {
+                                if fade.total_frames == 0 {
+                                    0.0
+                                } else {
+                                    fade.remaining_frames as f32 / fade.total_frames as f32
+                                }
+                            })
+                            .unwrap_or(1.0);
                         updates.push((
                             *address,
                             live.voice,
-                            live.base_volume * engine_state.category_gain(live.category),
+                            live.base_volume
+                                * engine_state.category_gain(live.category)
+                                * release_gain,
                         ));
                     }
                 }
@@ -6156,6 +6399,14 @@ impl PeHostRuntime {
                 }
                 let mut pending = Vec::new();
                 let mut voice = None;
+                if method == 7 {
+                    // Prepare performs the real streaming read now and marks
+                    // the entry prepared; Play later reads it from the cache.
+                    match xact_prepare_bank_entry(runtime, this, index) {
+                        Ok(()) => {}
+                        Err(error) => return Ok((error, Vec::new())),
+                    }
+                }
                 if method == 8 {
                     match self.xact_play_wave(
                         runtime,
@@ -6238,6 +6489,55 @@ impl PeHostRuntime {
             _ => Ok((crate::xact::E_INVALIDARG, Vec::new())),
         }
     }
+}
+
+/// Prepare one wave-bank entry: in-memory entries are marked ready, and a
+/// streaming entry is loaded from the real file with `seek`/`read` and cached
+/// until the bank is destroyed.
+fn xact_prepare_bank_entry(
+    runtime: &mut crate::xact::XactRuntime,
+    bank_object: u64,
+    index: u16,
+) -> Result<(), u32> {
+    let Some(crate::xact::XactObject::WaveBank(state)) = runtime.objects.get_mut(&bank_object)
+    else {
+        return Err(crate::xact::E_INVALIDARG);
+    };
+    if index as usize >= state.bank.entries.len() {
+        return Err(crate::xact::XACTENGINE_E_INVALIDWAVEINDEX);
+    }
+    if state.prepared.contains(&index) {
+        return Ok(());
+    }
+    let pcm = match state.bank.entries[index as usize].pcm.clone() {
+        Some(pcm) => pcm,
+        None if state.bank.streaming => {
+            crate::xact::load_streaming_pcm(&state.bank, index as usize)?
+        }
+        None => return Err(crate::xact::XACTENGINE_E_INVALIDDATA),
+    };
+    if state.bank.streaming {
+        state.streaming_cache.insert(index, pcm);
+    }
+    state.prepared.insert(index);
+    Ok(())
+}
+
+/// Read one 24-byte `WAVEBANKENTRY` metadata block from guest memory.
+fn xact_read_wave_entry(memory: &MemoryImage, address: u64) -> AppResult<crate::xact::WaveEntry> {
+    let flags_and_duration = read_u32(memory, address)?;
+    let format = crate::xact::MiniFormat::decode(read_u32(memory, address + 4)?);
+    Ok(crate::xact::WaveEntry {
+        flags: flags_and_duration & 0xF,
+        duration_samples: (flags_and_duration >> 4) & 0x0FFF_FFFF,
+        format,
+        data_offset: read_u32(memory, address + 8)?,
+        data_length: read_u32(memory, address + 12)?,
+        loop_start_sample: read_u32(memory, address + 16)?,
+        loop_total_samples: read_u32(memory, address + 20)?,
+        pcm: None,
+        decode_error: None,
+    })
 }
 
 /// Borrow one wave bank's parsed data from the store.
@@ -6328,7 +6628,9 @@ impl PeHostRuntime {
                 };
                 let mut pending = Vec::new();
                 if let Some(live) = live {
-                    let _ = self.xact_stop_live_voice(live.voice);
+                    for voice in live.voices() {
+                        let _ = self.xact_stop_live_voice(voice);
+                    }
                     if let Some(engine_state) = runtime.engine_mut(engine) {
                         engine_state.cue_voices.remove(&this);
                     }
@@ -6361,9 +6663,14 @@ impl PeHostRuntime {
                 }
             }
             4 => {
-                // Stop(flags)
+                // Stop(flags): a non-immediate stop with an authored XGS
+                // release envelope starts the real fade and leaves the voice
+                // alive for the drain; otherwise the cut is immediate.
+                let flags = xact_arg_u32(state, memory, 1)?;
                 let mut pending = Vec::new();
-                self.xact_stop_cue_object(runtime, this, &mut pending)?;
+                if !self.xact_begin_cue_release(runtime, this, flags, &mut pending)? {
+                    self.xact_stop_cue_object(runtime, this, &mut pending)?;
+                }
                 Ok((crate::xact::S_OK, pending))
             }
             5 => {
@@ -6411,17 +6718,163 @@ impl PeHostRuntime {
                 Ok((crate::xact::S_OK, Vec::new()))
             }
             8 => {
-                // GetVariableIndex(name): cue-local variables are not part of
-                // the modeled sound-bank surface; the genuine invalid index is
-                // returned.
-                Ok((
-                    u32::from(crate::xact::XACTVARIABLEINDEX_INVALID),
-                    Vec::new(),
-                ))
+                // GetVariableIndex(name): cue-local friendly names take
+                // precedence over the global variable table.  The local
+                // name table is the XSB per-slot name index; content that
+                // carries no table falls back to the global names of the
+                // variables the cue's local slots shadow, then to the
+                // engine's globals.
+                let name = xact_arg(state, memory, 1)?;
+                let Some(name) = xact_guest_string(memory, name) else {
+                    return Ok((
+                        u32::from(crate::xact::XACTVARIABLEINDEX_INVALID),
+                        Vec::new(),
+                    ));
+                };
+                let (engine, names, bindings) = match runtime.objects.get(&this) {
+                    Some(crate::xact::XactObject::Cue(cue)) => (
+                        cue.engine,
+                        cue.local_variable_names.clone(),
+                        cue.local_variables.clone(),
+                    ),
+                    _ => return Ok((crate::xact::E_INVALIDARG, Vec::new())),
+                };
+                if let Some(slot) = names
+                    .iter()
+                    .position(|candidate| !candidate.is_empty() && *candidate == name)
+                {
+                    return Ok((slot as u32, Vec::new()));
+                }
+                let Some(engine_state) = runtime.engine(engine) else {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                };
+                if let Some(slot) = bindings.iter().position(|binding| {
+                    *binding >= 0
+                        && engine_state
+                            .variables
+                            .get(*binding as usize)
+                            .map(|variable| variable.name == name)
+                            .unwrap_or(false)
+                }) {
+                    return Ok((slot as u32, Vec::new()));
+                }
+                let global = engine_state
+                    .variables
+                    .iter()
+                    .position(|variable| {
+                        variable.name == name
+                            && variable.accessibility & 0x01 != 0
+                            && variable.accessibility & 0x04 == 0
+                    })
+                    .map(|index| index as u16)
+                    .unwrap_or(crate::xact::XACTVARIABLEINDEX_INVALID);
+                Ok((u32::from(global), Vec::new()))
             }
-            9 | 10 => {
-                // SetVariable / GetVariable: no cue-local variable table.
-                Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()))
+            9 => {
+                // SetVariable(index, value): indices inside the cue's local
+                // slot range are cue-local overrides layered over the global
+                // variable they shadow; higher indices address the engine
+                // globals directly, matching GetVariableIndex's fallback.
+                let index = xact_arg_u16(state, memory, 1)?;
+                let value = xact_arg_f32(state, memory, 2)?;
+                let (engine, binding, local_count) = match runtime.objects.get(&this) {
+                    Some(crate::xact::XactObject::Cue(cue)) => (
+                        cue.engine,
+                        cue.local_variables.get(index as usize).copied(),
+                        cue.local_variables.len(),
+                    ),
+                    _ => return Ok((crate::xact::E_INVALIDARG, Vec::new())),
+                };
+                let Some(engine_state) = runtime.engine(engine) else {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                };
+                if index as usize >= local_count {
+                    let Some(variable) = engine_state.variables.get(index as usize) else {
+                        return Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()));
+                    };
+                    if variable.accessibility & 0x01 == 0 || variable.accessibility & 0x04 != 0 {
+                        return Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()));
+                    }
+                    let clamped = value.clamp(variable.min, variable.max);
+                    if let Some(engine_state) = runtime.engine_mut(engine)
+                        && let Some(slot) = engine_state.variable_values.get_mut(index as usize)
+                    {
+                        *slot = clamped;
+                    }
+                    return Ok((crate::xact::S_OK, Vec::new()));
+                }
+                let Some(binding) = binding.filter(|binding| *binding >= 0) else {
+                    return Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()));
+                };
+                let Some(variable) = engine_state.variables.get(binding as usize) else {
+                    return Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()));
+                };
+                if variable.accessibility & 0x01 == 0 || variable.accessibility & 0x04 != 0 {
+                    return Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()));
+                }
+                let clamped = value.clamp(variable.min, variable.max);
+                if let Some(crate::xact::XactObject::Cue(cue)) = runtime.objects.get_mut(&this) {
+                    cue.local_values.insert(binding as u16, clamped);
+                }
+                Ok((crate::xact::S_OK, Vec::new()))
+            }
+            10 => {
+                // GetVariable(index, out): the cue-local override wins; with
+                // no override the shadowed global value is read.  Indices
+                // outside the local slot range read the engine global.
+                let index = xact_arg_u16(state, memory, 1)?;
+                let out = xact_arg(state, memory, 2)?;
+                let (engine, binding, local_value, local_count) = match runtime.objects.get(&this) {
+                    Some(crate::xact::XactObject::Cue(cue)) => {
+                        let binding = cue.local_variables.get(index as usize).copied();
+                        let local = binding.and_then(|binding| {
+                            (binding >= 0)
+                                .then(|| cue.local_values.get(&(binding as u16)).copied())
+                                .flatten()
+                        });
+                        (cue.engine, binding, local, cue.local_variables.len())
+                    }
+                    _ => return Ok((crate::xact::E_INVALIDARG, Vec::new())),
+                };
+                let Some(engine_state) = runtime.engine(engine) else {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                };
+                if out == 0 {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                }
+                if index as usize >= local_count {
+                    let Some(variable) = engine_state.variables.get(index as usize) else {
+                        return Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()));
+                    };
+                    if variable.accessibility & 0x01 == 0 || variable.accessibility & 0x04 != 0 {
+                        return Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()));
+                    }
+                    let value = engine_state
+                        .variable_values
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or(variable.initial);
+                    xact_write_f32(memory, out, value)?;
+                    return Ok((crate::xact::S_OK, Vec::new()));
+                }
+                let Some(binding) = binding.filter(|binding| *binding >= 0) else {
+                    return Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()));
+                };
+                let Some(variable) = engine_state.variables.get(binding as usize) else {
+                    return Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()));
+                };
+                if variable.accessibility & 0x01 == 0 || variable.accessibility & 0x04 != 0 {
+                    return Ok((crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX, Vec::new()));
+                }
+                let value = local_value.unwrap_or_else(|| {
+                    engine_state
+                        .variable_values
+                        .get(binding as usize)
+                        .copied()
+                        .unwrap_or(variable.initial)
+                });
+                xact_write_f32(memory, out, value)?;
+                Ok((crate::xact::S_OK, Vec::new()))
             }
             11 => {
                 // Pause(fPause)
@@ -6431,7 +6884,9 @@ impl PeHostRuntime {
                     _ => return Ok((crate::xact::E_INVALIDARG, Vec::new())),
                 };
                 if let Some(live) = live {
-                    self.xact_pause_voice(live.voice, pause)?;
+                    for voice in live.voices() {
+                        self.xact_pause_voice(voice, pause)?;
+                    }
                     if let Some(crate::xact::XactObject::Cue(cue)) = runtime.objects.get_mut(&this)
                     {
                         cue.state = if pause {
@@ -6460,10 +6915,127 @@ impl PeHostRuntime {
                 write_guest_pointer(memory, out, properties, self.guest_arch)?;
                 Ok((crate::xact::S_OK, Vec::new()))
             }
-            13 | 14 => {
-                // SetOutputVoices / SetOutputVoiceMatrix: custom routing is
-                // not part of the modeled surface.  Genuine E_NOTIMPL.
-                Ok((crate::xact::E_NOTIMPL, Vec::new()))
+            13 => {
+                // SetOutputVoices(const XAUDIO2_VOICE_SENDS *): a real send
+                // list of guest IXAudio2Voice objects.  Null restores the
+                // default mastering route.  Each send descriptor is
+                // { UINT32 Flags; IXAudio2Voice *pOutputVoice; }.
+                let sends = xact_arg(state, memory, 1)?;
+                if sends == 0 {
+                    if let Some(crate::xact::XactObject::Cue(cue)) = runtime.objects.get_mut(&this)
+                    {
+                        cue.output_voices = None;
+                    }
+                    return Ok((crate::xact::S_OK, Vec::new()));
+                }
+                let pointer_size = self.guest_arch.pointer_bytes() as u64;
+                let count = read_u32(memory, sends)?;
+                let descriptors = if pointer_size == 4 {
+                    u64::from(read_u32(memory, sends + 4)?)
+                } else {
+                    memory.read_u64(sends + 8)?
+                };
+                if count == 0 {
+                    if let Some(crate::xact::XactObject::Cue(cue)) = runtime.objects.get_mut(&this)
+                    {
+                        cue.output_voices = None;
+                    }
+                    return Ok((crate::xact::S_OK, Vec::new()));
+                }
+                if count as usize > crate::xact::XACT_MAX_OUTPUT_VOICES || descriptors == 0 {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                }
+                let descriptor_size = if pointer_size == 4 { 8 } else { 16 };
+                let pointer_offset = if pointer_size == 4 { 4 } else { 8 };
+                let previous = match runtime.objects.get(&this) {
+                    Some(crate::xact::XactObject::Cue(cue)) => cue.output_voices.clone(),
+                    _ => return Ok((crate::xact::E_INVALIDARG, Vec::new())),
+                };
+                let mut routes: Vec<crate::xact::OutputVoiceRoute> =
+                    Vec::with_capacity(count as usize);
+                for index in 0..u64::from(count) {
+                    let entry = descriptors + index * descriptor_size;
+                    let _flags = read_u32(memory, entry)?;
+                    let voice = if pointer_size == 4 {
+                        u64::from(read_u32(memory, entry + pointer_offset)?)
+                    } else {
+                        memory.read_u64(entry + pointer_offset)?
+                    };
+                    if voice == 0 || routes.iter().any(|route| route.voice == voice) {
+                        return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                    }
+                    let Some(channels) = self.xact_output_voice_channels(voice) else {
+                        return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                    };
+                    let matrix = previous
+                        .as_ref()
+                        .and_then(|routes| routes.iter().find(|route| route.voice == voice))
+                        .and_then(|route| route.matrix.clone());
+                    routes.push(crate::xact::OutputVoiceRoute {
+                        voice,
+                        channels,
+                        matrix,
+                    });
+                }
+                if let Some(crate::xact::XactObject::Cue(cue)) = runtime.objects.get_mut(&this) {
+                    cue.output_voices = Some(routes);
+                }
+                Ok((crate::xact::S_OK, Vec::new()))
+            }
+            14 => {
+                // SetOutputVoiceMatrix(pOutputVoice, src, dst, matrix):
+                // apply per-output-voice coefficients to this cue's mix.
+                // The destination must be one of the real output voices
+                // selected by SetOutputVoices and `dst` must match that
+                // voice's channel count; the source count is validated when
+                // the cue's decoded wave is mixed.
+                let voice = xact_arg(state, memory, 1)?;
+                let source_channels = xact_arg_u32(state, memory, 2)?;
+                let destination_channels = xact_arg_u32(state, memory, 3)?;
+                let matrix = xact_arg(state, memory, 4)?;
+                if voice == 0
+                    || source_channels == 0
+                    || destination_channels == 0
+                    || source_channels > 8
+                    || destination_channels > 8
+                    || source_channels * destination_channels > 64
+                    || matrix == 0
+                {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                }
+                let count = (source_channels * destination_channels) as usize;
+                let bytes = read_guest_bytes(memory, matrix, count * 4)?;
+                let values = bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect::<Vec<_>>();
+                if values.iter().any(|value| !value.is_finite()) {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                }
+                let route_index = match runtime.objects.get(&this) {
+                    Some(crate::xact::XactObject::Cue(cue)) => cue
+                        .output_voices
+                        .as_ref()
+                        .and_then(|routes| routes.iter().position(|route| route.voice == voice)),
+                    _ => return Ok((crate::xact::E_INVALIDARG, Vec::new())),
+                };
+                let Some(route_index) = route_index else {
+                    return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                };
+                if let Some(crate::xact::XactObject::Cue(cue)) = runtime.objects.get_mut(&this)
+                    && let Some(route) = cue
+                        .output_voices
+                        .as_mut()
+                        .and_then(|routes| routes.get_mut(route_index))
+                {
+                    if u16::from(route.channels) != destination_channels as u16 {
+                        return Ok((crate::xact::E_INVALIDARG, Vec::new()));
+                    }
+                    route.matrix = Some((source_channels, destination_channels, values));
+                }
+                Ok((crate::xact::S_OK, Vec::new()))
             }
             _ => Ok((crate::xact::E_INVALIDARG, Vec::new())),
         }
@@ -6500,7 +7072,9 @@ impl PeHostRuntime {
                 };
                 let mut pending = Vec::new();
                 if let Some(live) = live {
-                    let _ = self.xact_stop_live_voice(live.voice);
+                    for voice in live.voices() {
+                        let _ = self.xact_stop_live_voice(voice);
+                    }
                     if let Some(engine_state) = runtime.engine_mut(engine) {
                         engine_state.wave_voices.remove(&this);
                     }
@@ -6662,7 +7236,14 @@ impl PeHostRuntime {
         index: u16,
         state_bits: u32,
     ) -> AppResult<u64> {
-        let (name, interactive, num_variations, instance_limit) = {
+        let (
+            name,
+            interactive,
+            num_variations,
+            instance_limit,
+            cue_local_variables,
+            cue_local_names,
+        ) = {
             let Some(crate::xact::XactObject::SoundBank(bank)) = runtime.objects.get(&sound_bank)
             else {
                 return Err(AppError::new(
@@ -6692,6 +7273,8 @@ impl PeHostRuntime {
                 interactive,
                 num_variations,
                 cue.instance_limit,
+                cue.local_variables.clone(),
+                cue.local_variable_names.clone(),
             )
         };
         let current_instances = runtime
@@ -6730,9 +7313,105 @@ impl PeHostRuntime {
                 properties_address: properties,
                 matrix: None,
                 loop_count: 0,
+                local_variables: cue_local_variables,
+                local_variable_names: cue_local_names,
+                local_values: BTreeMap::new(),
+                output_voices: None,
             }),
         )?;
         Ok(object)
+    }
+
+    /// Resolve a guest `IXAudio2Voice` output target to its channel count.
+    /// Only real voices created through the runtime's XAudio2 surface (source
+    /// voices, including submix voices, and mastering voices) are accepted.
+    fn xact_output_voice_channels(&self, address: u64) -> Option<u16> {
+        let voice = self
+            .xaudio_source_voices
+            .get(&address)
+            .or_else(|| self.xaudio_mastering_voices.get(&address))?;
+        self.audio
+            .voice_format(voice.voice_id)
+            .ok()
+            .map(|format| format.channels)
+    }
+
+    /// Resolve a guest XACT file path through the runtime's GE file tables.
+    /// Absolute drive paths go through `host_path_for_windows_path`; the
+    /// Win32 path forms XACT content actually uses are handled first:
+    /// drive-relative (`C:banks\x.xwb`), `\SystemRoot\...`, and
+    /// `%SystemRoot%` / `%windir%` are expanded against the GE and the
+    /// guest environment.  Device paths that already name a real host file
+    /// are accepted as-is so tests and tools can pass a raw path.  Missing
+    /// paths return `None`, which the callers surface as the genuine
+    /// `E_FAIL` file-open error.
+    fn xact_resolve_file_path(&self, guest_path: &str) -> Option<String> {
+        let normalized = guest_path.replace('/', "\\");
+        let system_root = self
+            .win32
+            .get_environment_variable_w("SystemRoot")
+            .or_else(|| self.win32.get_environment_variable_w("windir"))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "C:\\Windows".to_string());
+        let rooted_env = normalized.strip_prefix('\\').filter(|rest| {
+            let rest = rest.to_ascii_lowercase();
+            rest.starts_with("%systemroot%\\") || rest.starts_with("%windir%\\")
+        });
+        let normalized = rooted_env.unwrap_or(normalized.as_str());
+        let lower = normalized.to_ascii_lowercase();
+        let absolute = if let Some(rest) = normalized
+            .strip_prefix("\\SystemRoot\\")
+            .or_else(|| normalized.strip_prefix("SystemRoot\\"))
+        {
+            format!("{system_root}\\{rest}")
+        } else if lower.starts_with("%systemroot%\\") {
+            format!("{system_root}\\{}", &normalized[13..])
+        } else if lower.starts_with("%windir%\\") {
+            format!("{system_root}\\{}", &normalized[9..])
+        } else if normalized.len() >= 2
+            && normalized.as_bytes()[1] == b':'
+            && !normalized[2..].starts_with('\\')
+            && !normalized[2..].is_empty()
+        {
+            // Drive-relative: the drive's current directory is the GE drive
+            // root in this model (the guest process starts at `C:\`).
+            format!("{}:\\{}", &normalized[..1], &normalized[2..])
+        } else {
+            normalized.to_string()
+        };
+        if let Ok(host) = self.win32.ge().host_path_for_windows_path(&absolute)
+            && host.is_file()
+        {
+            return Some(host.to_string_lossy().into_owned());
+        }
+        let direct = std::path::Path::new(guest_path);
+        if direct.is_file() {
+            return Some(direct.to_string_lossy().into_owned());
+        }
+        None
+    }
+
+    /// Allocate a wave-bank object for a streaming (or standalone prepared)
+    /// bank, with empty prepare/cache state.
+    fn xact_alloc_streaming_bank_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        runtime: &mut crate::xact::XactRuntime,
+        engine: u64,
+        bank: crate::xact::WaveBank,
+    ) -> AppResult<u64> {
+        self.xact_alloc_object(
+            memory,
+            runtime,
+            crate::xact::IFACE_WAVEBANK,
+            crate::xact::XactObject::WaveBank(crate::xact::WaveBankState {
+                refcount: 1,
+                engine,
+                bank,
+                prepared: std::collections::BTreeSet::new(),
+                streaming_cache: std::collections::BTreeMap::new(),
+            }),
+        )
     }
 
     /// Allocate a wave object.
@@ -6788,23 +7467,33 @@ impl PeHostRuntime {
             Some(crate::xact::XactObject::SoundBank(bank)) => bank.engine,
             _ => return Ok(Err(crate::xact::E_INVALIDARG)),
         };
-        let resolved = match xact_resolve_cue(runtime, engine, bank_object, index) {
+        let resolved = match xact_resolve_cue(runtime, engine, bank_object, cue_object, index) {
             Ok(resolved) => resolved,
             Err(error) => return Ok(Err(error)),
         };
         let base_volume = resolved.volume;
         let pitch_cents = resolved.pitch;
         let category = resolved.category;
-        let voice = match self.xact_start_resolved_playback(runtime, engine, resolved)? {
-            Ok(voice) => voice,
+        let voices = match self.xact_start_resolved_playback(runtime, engine, resolved)? {
+            Ok(voices) => voices,
             Err(error) => return Ok(Err(error)),
         };
+        let Some((voice, extra)) = voices.split_first() else {
+            return Ok(Err(crate::xact::E_FAIL));
+        };
+        let mut extra_voices = [0_u64; crate::xact::XACT_MAX_OUTPUT_VOICES - 1];
+        let extra_voice_count = extra.len().min(extra_voices.len()) as u8;
+        extra_voices[..usize::from(extra_voice_count)]
+            .copy_from_slice(&extra[..usize::from(extra_voice_count)]);
         let live = crate::xact::LiveVoice {
-            voice,
+            voice: *voice,
+            extra_voices,
+            extra_voice_count,
             base_volume,
             pitch_cents,
             category,
             paused: false,
+            release: None,
         };
         if let Some(crate::xact::XactObject::Cue(cue)) = runtime.objects.get_mut(&cue_object) {
             cue.live = Some(live);
@@ -6834,16 +7523,22 @@ impl PeHostRuntime {
         let base_volume = resolved.volume;
         let pitch_cents = resolved.pitch;
         let category = resolved.category;
-        let voice = match self.xact_start_resolved_playback(runtime, engine, resolved)? {
-            Ok(voice) => voice,
+        let voices = match self.xact_start_resolved_playback(runtime, engine, resolved)? {
+            Ok(voices) => voices,
             Err(error) => return Ok(Err(error)),
+        };
+        let Some(voice) = voices.first().copied() else {
+            return Ok(Err(crate::xact::E_FAIL));
         };
         Ok(Ok(crate::xact::LiveVoice {
             voice,
+            extra_voices: [0_u64; crate::xact::XACT_MAX_OUTPUT_VOICES - 1],
+            extra_voice_count: 0,
             base_volume,
             pitch_cents,
             category,
             paused: false,
+            release: None,
         }))
     }
 
@@ -6884,84 +7579,197 @@ impl PeHostRuntime {
         }
     }
 
-    /// Start a resolved cue/wave on a real source voice: real PCM submission,
-    /// real loop points, real volume, real pitch.
+    /// Start a resolved cue/wave on real source voices: real PCM submission,
+    /// real loop points, real volume, real pitch.  A cue routed through
+    /// `SetOutputVoices` gets one real source voice per guest output voice;
+    /// every voice is a child of the engine mastering voice, so the rendered
+    /// mix carries each destination's coefficients and gain.
     fn xact_start_resolved_playback(
         &mut self,
         runtime: &mut crate::xact::XactRuntime,
         engine: u64,
         resolved: XactResolvedPlayback,
-    ) -> AppResult<Result<crate::audio::VoiceId, u32>> {
+    ) -> AppResult<Result<Vec<crate::audio::VoiceId>, u32>> {
         let mastering = match self.xact_ensure_mastering_voice(runtime, engine)? {
             Ok(voice) => voice,
             Err(error) => return Ok(Err(error)),
         };
-        let channels = resolved.channels.max(1) as u32;
-        let frames = (resolved.samples.len() as u32) / channels;
-        let format = crate::audio::WaveFormat {
-            channels: resolved.channels.max(1),
-            sample_rate: resolved.sample_rate,
-            sample_format: crate::audio::SampleFormat::Pcm16,
-        };
-        let voice = match self.audio.create_source_voice(format, mastering) {
-            Ok(voice) => voice,
-            Err(error) => {
-                self.push_trace(
-                    "audio",
-                    "IXACT3Engine::SourceVoiceError",
-                    BTreeMap::from([("error".to_string(), json!(error.to_string()))]),
-                    json!(crate::xact::E_FAIL),
-                );
-                return Ok(Err(crate::xact::E_FAIL));
-            }
-        };
-        let (loop_begin, loop_length, loop_count) = if resolved.loop_count > 0 {
-            let (begin_samples, length_samples) = if resolved.loop_total_samples > 0 {
-                (resolved.loop_start_samples, resolved.loop_total_samples)
-            } else {
-                (0, frames)
-            };
-            (
-                Some(begin_samples.saturating_mul(channels)),
-                Some(length_samples.saturating_mul(channels)),
-                Some(
-                    if resolved.loop_count == crate::xact::XACTLOOPCOUNT_INFINITE {
-                        0
-                    } else {
-                        u32::from(resolved.loop_count)
-                    },
-                ),
-            )
-        } else {
-            (None, None, None)
-        };
-        let tag = format!("xact-{}", self.next_audio_buffer_tag);
-        self.next_audio_buffer_tag += 1;
-        let buffer = crate::audio::SourceBuffer {
-            tag,
-            samples: crate::audio::AudioSamples::Pcm16(resolved.samples),
-            loop_begin,
-            loop_length,
-            loop_count,
-        };
-        if self.audio.submit_source_buffer(voice, buffer).is_err() {
-            let _ = self.audio.destroy_voice(voice);
-            return Ok(Err(crate::xact::E_FAIL));
-        }
         let category_gain = runtime
             .engine(engine)
             .map(|engine_state| engine_state.category_gain(resolved.category))
             .unwrap_or(1.0);
         let gain = (resolved.volume * category_gain).clamp(0.0, XACT_VOLUME_MAX);
-        let _ = self.audio.set_volume(voice, gain);
-        let _ = self
-            .audio
-            .set_frequency_ratio(voice, crate::xact::pitch_to_ratio(resolved.pitch));
-        if self.audio.start_voice(voice).is_err() {
-            let _ = self.audio.destroy_voice(voice);
-            return Ok(Err(crate::xact::E_FAIL));
+        let frequency = crate::xact::pitch_to_ratio(resolved.pitch);
+        let routes = resolved.routes.clone();
+        let mut destinations = Vec::new();
+        if routes.is_empty() {
+            destinations.push((None, resolved.channels));
+        } else {
+            for route in &routes {
+                destinations.push((Some(route), route.channels));
+            }
         }
-        Ok(Ok(voice))
+        let mut created = Vec::with_capacity(destinations.len());
+        for (route, _channels) in destinations {
+            let (samples, channels) = match route {
+                None => match xact_apply_output_matrix(
+                    resolved.samples.clone(),
+                    resolved.channels,
+                    resolved.matrix.as_ref(),
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.xact_destroy_voices(&created);
+                        return Ok(Err(error));
+                    }
+                },
+                Some(route) => {
+                    match xact_route_output_voice(&resolved.samples, resolved.channels, route) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            self.xact_destroy_voices(&created);
+                            return Ok(Err(error));
+                        }
+                    }
+                }
+            };
+            let channels = u32::from(channels.max(1));
+            let frames = (samples.len() as u32) / channels;
+            let format = crate::audio::WaveFormat {
+                channels: channels as u16,
+                sample_rate: resolved.sample_rate,
+                sample_format: crate::audio::SampleFormat::Pcm16,
+            };
+            let voice = match self.audio.create_source_voice(format, mastering) {
+                Ok(voice) => voice,
+                Err(error) => {
+                    self.push_trace(
+                        "audio",
+                        "IXACT3Engine::SourceVoiceError",
+                        BTreeMap::from([("error".to_string(), json!(error.to_string()))]),
+                        json!(crate::xact::E_FAIL),
+                    );
+                    self.xact_destroy_voices(&created);
+                    return Ok(Err(crate::xact::E_FAIL));
+                }
+            };
+            let (loop_begin, loop_length, loop_count) = if resolved.loop_count > 0 {
+                let (begin_samples, length_samples) = if resolved.loop_total_samples > 0 {
+                    (resolved.loop_start_samples, resolved.loop_total_samples)
+                } else {
+                    (0, frames)
+                };
+                (
+                    Some(begin_samples.saturating_mul(channels)),
+                    Some(length_samples.saturating_mul(channels)),
+                    Some(
+                        if resolved.loop_count == crate::xact::XACTLOOPCOUNT_INFINITE {
+                            0
+                        } else {
+                            u32::from(resolved.loop_count)
+                        },
+                    ),
+                )
+            } else {
+                (None, None, None)
+            };
+            let tag = format!("xact-{}", self.next_audio_buffer_tag);
+            self.next_audio_buffer_tag += 1;
+            let buffer = crate::audio::SourceBuffer {
+                tag,
+                samples: crate::audio::AudioSamples::Pcm16(samples),
+                loop_begin,
+                loop_length,
+                loop_count,
+            };
+            if self.audio.submit_source_buffer(voice, buffer).is_err() {
+                let _ = self.audio.destroy_voice(voice);
+                self.xact_destroy_voices(&created);
+                return Ok(Err(crate::xact::E_FAIL));
+            }
+            let _ = self.audio.set_volume(voice, gain);
+            let _ = self.audio.set_frequency_ratio(voice, frequency);
+            if self.audio.start_voice(voice).is_err() {
+                let _ = self.audio.destroy_voice(voice);
+                self.xact_destroy_voices(&created);
+                return Ok(Err(crate::xact::E_FAIL));
+            }
+            created.push(voice);
+        }
+        Ok(Ok(created))
+    }
+
+    fn xact_destroy_voices(&mut self, voices: &[crate::audio::VoiceId]) {
+        for voice in voices {
+            let _ = self.audio.stop_voice(*voice);
+            let _ = self.audio.destroy_voice(*voice);
+        }
+    }
+
+    /// Begin the authored release for one cue when the category carries a
+    /// non-zero XGS fade-out time.  Returns false when the stop must be
+    /// immediate (explicit immediate flag, no envelope, or already fading).
+    fn xact_begin_cue_release(
+        &mut self,
+        runtime: &mut crate::xact::XactRuntime,
+        object: u64,
+        flags: u32,
+        pending: &mut Vec<XactPendingNotification>,
+    ) -> AppResult<bool> {
+        if flags & crate::xact::XACT_FLAG_STOP_IMMEDIATE != 0 {
+            return Ok(false);
+        }
+        let (engine, live) = match runtime.objects.get(&object) {
+            Some(crate::xact::XactObject::Cue(cue)) => (cue.engine, cue.live),
+            _ => return Ok(false),
+        };
+        let Some(live) = live else {
+            return Ok(false);
+        };
+        if live.release.is_some() {
+            return Ok(true);
+        }
+        let (release_ms, release_curve) = runtime
+            .engine(engine)
+            .and_then(|engine| engine.categories.get(live.category as usize))
+            .map(|category| (category.release_ms, category.release_curve))
+            .unwrap_or((0, crate::xact::ReleaseCurve::Linear));
+        if release_ms == 0 {
+            return Ok(false);
+        }
+        let sample_rate = self
+            .audio
+            .voice_format(live.voice)
+            .map(|format| format.sample_rate)
+            .unwrap_or(48_000);
+        let total_frames = ((u64::from(release_ms) * u64::from(sample_rate)) / 1000).max(1) as u32;
+        let category_gain = runtime
+            .engine(engine)
+            .map(|engine| engine.category_gain(live.category))
+            .unwrap_or(1.0);
+        let start_gain = (live.base_volume * category_gain).clamp(0.0, XACT_VOLUME_MAX);
+        let fade = crate::xact::ReleaseFade {
+            total_frames,
+            remaining_frames: total_frames,
+            start_gain,
+            curve: release_curve,
+        };
+        let fading = crate::xact::LiveVoice {
+            release: Some(fade),
+            ..live
+        };
+        for voice in live.voices() {
+            let _ = self.audio.set_volume(voice, start_gain);
+        }
+        if let Some(crate::xact::XactObject::Cue(cue)) = runtime.objects.get_mut(&object) {
+            cue.live = Some(fading);
+            cue.state = crate::xact::XACT_STATE_STOPPING;
+        }
+        if let Some(engine_state) = runtime.engine_mut(engine) {
+            engine_state.cue_voices.insert(object, fading);
+        }
+        let _ = pending;
+        Ok(true)
     }
 
     /// Stop one cue object: real voice teardown and a CUESTOP notification.
@@ -6980,7 +7788,9 @@ impl PeHostRuntime {
             _ => return Ok(()),
         };
         if let Some(live) = live {
-            let _ = self.xact_stop_live_voice(live.voice);
+            for voice in live.voices() {
+                let _ = self.xact_stop_live_voice(voice);
+            }
         }
         if let Some(engine_state) = runtime.engine_mut(engine) {
             engine_state.cue_voices.remove(&object);
@@ -7012,7 +7822,9 @@ impl PeHostRuntime {
             _ => return Ok(()),
         };
         if let Some(live) = live {
-            let _ = self.xact_stop_live_voice(live.voice);
+            for voice in live.voices() {
+                let _ = self.xact_stop_live_voice(voice);
+            }
         }
         if let Some(engine_state) = runtime.engine_mut(engine) {
             engine_state.wave_voices.remove(&object);
@@ -7044,10 +7856,10 @@ impl PeHostRuntime {
             };
             let mut voices = Vec::new();
             for live in engine_state.cue_voices.values() {
-                voices.push(live.voice);
+                voices.extend(live.voices());
             }
             for live in engine_state.wave_voices.values() {
-                voices.push(live.voice);
+                voices.extend(live.voices());
             }
             (engine_state.mastering_voice, voices)
         };
@@ -7058,6 +7870,46 @@ impl PeHostRuntime {
         for voice in &voices {
             if self.audio.voice_started(*voice)? {
                 frames = frames.max(self.audio.queued_source_frames(*voice)?);
+            }
+        }
+        let release_voices = runtime
+            .engine(engine)
+            .map(|engine_state| {
+                engine_state
+                    .cue_voices
+                    .iter()
+                    .filter_map(|(object, live)| {
+                        live.release.map(|fade| {
+                            (
+                                *object,
+                                live.voices().collect::<Vec<_>>(),
+                                live.base_volume,
+                                live.category,
+                                fade,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !release_voices.is_empty() {
+            // Release envelopes advance in fixed render slices so the gain
+            // curve is observable across DoWork calls.
+            frames = frames.min(512);
+            let gains = release_voices
+                .iter()
+                .flat_map(|(_, voices, base, category, fade)| {
+                    let category_gain = runtime
+                        .engine(engine)
+                        .map(|engine| engine.category_gain(*category))
+                        .unwrap_or(1.0);
+                    let gain =
+                        (*base * category_gain * fade.fraction()).clamp(0.0, XACT_VOLUME_MAX);
+                    voices.iter().map(move |voice| (*voice, gain))
+                })
+                .collect::<Vec<_>>();
+            for (voice, gain) in gains {
+                let _ = self.audio.set_volume(voice, gain);
             }
         }
         if frames > 0 {
@@ -7081,6 +7933,34 @@ impl PeHostRuntime {
                 json!(output.crc32),
             );
         }
+        // Advance active release envelopes by the rendered slice; a cue
+        // whose envelope hit zero is torn down after this render.
+        let mut release_updates = Vec::new();
+        let mut expired_releases = Vec::new();
+        for (object, _, _, _, fade) in &release_voices {
+            let remaining = fade.remaining_frames.saturating_sub(frames as u32);
+            release_updates.push((*object, remaining));
+            if remaining == 0 {
+                expired_releases.push(*object);
+            }
+        }
+        for (object, remaining) in &release_updates {
+            if let Some(crate::xact::XactObject::Cue(cue)) = runtime.objects.get_mut(object)
+                && let Some(live) = cue.live.as_mut()
+                && let Some(fade) = live.release.as_mut()
+            {
+                fade.remaining_frames = *remaining;
+            }
+            if let Some(engine_state) = runtime.engine_mut(engine)
+                && let Some(live) = engine_state.cue_voices.get_mut(object)
+                && let Some(fade) = live.release.as_mut()
+            {
+                fade.remaining_frames = *remaining;
+            }
+        }
+        for object in expired_releases {
+            self.xact_stop_cue_object(runtime, object, pending)?;
+        }
         // Retire everything that finished playing.
         let finished_cues = runtime
             .engine(engine)
@@ -7089,10 +7969,12 @@ impl PeHostRuntime {
                     .cue_voices
                     .iter()
                     .filter(|(_, live)| {
-                        self.audio
-                            .queued_source_frames(live.voice)
-                            .map(|queued| queued == 0)
-                            .unwrap_or(false)
+                        live.voices().all(|voice| {
+                            self.audio
+                                .queued_source_frames(voice)
+                                .map(|queued| queued == 0)
+                                .unwrap_or(false)
+                        })
                     })
                     .map(|(object, _)| *object)
                     .collect::<Vec<_>>()
@@ -7108,10 +7990,12 @@ impl PeHostRuntime {
                     .wave_voices
                     .iter()
                     .filter(|(_, live)| {
-                        self.audio
-                            .queued_source_frames(live.voice)
-                            .map(|queued| queued == 0)
-                            .unwrap_or(false)
+                        live.voices().all(|voice| {
+                            self.audio
+                                .queued_source_frames(voice)
+                                .map(|queued| queued == 0)
+                                .unwrap_or(false)
+                        })
                     })
                     .map(|(object, _)| *object)
                     .collect::<Vec<_>>()
@@ -7228,12 +8112,28 @@ fn xact_resolve_cue(
     runtime: &crate::xact::XactRuntime,
     engine: u64,
     bank_object: u64,
+    cue_object: u64,
     cue_index: u16,
 ) -> Result<XactResolvedPlayback, u32> {
     let Some(crate::xact::XactObject::SoundBank(bank)) = runtime.objects.get(&bank_object) else {
         return Err(crate::xact::E_INVALIDARG);
     };
-    let selection = bank.bank.select_cue(cue_index)?;
+    let mut variables = runtime
+        .engine(engine)
+        .map(|engine| engine.variable_values.clone())
+        .unwrap_or_default();
+    let mut matrix = None;
+    let mut routes = Vec::new();
+    if let Some(crate::xact::XactObject::Cue(cue)) = runtime.objects.get(&cue_object) {
+        for (index, value) in &cue.local_values {
+            if let Some(slot) = variables.get_mut(*index as usize) {
+                *slot = *value;
+            }
+        }
+        matrix = cue.matrix.clone();
+        routes = cue.output_voices.clone().unwrap_or_default();
+    }
+    let selection = bank.bank.select_cue_with_variables(cue_index, &variables)?;
     let mut channels = 0u16;
     let mut sample_rate = 0u32;
     let mut loop_count = 0u8;
@@ -7255,11 +8155,14 @@ fn xact_resolve_cue(
         let Some(entry) = wave_bank.bank.entries.get(track.wave.wave_index as usize) else {
             return Err(crate::xact::XACTENGINE_E_INVALIDWAVEINDEX);
         };
-        let pcm = entry.pcm.clone().ok_or_else(|| {
-            entry
-                .decode_error
-                .unwrap_or(crate::xact::XACTENGINE_E_INVALIDDATA)
-        })?;
+        let pcm = match entry.pcm.clone() {
+            Some(pcm) => pcm,
+            None => wave_bank
+                .streaming_cache
+                .get(&(track.wave.wave_index))
+                .cloned()
+                .ok_or(crate::xact::XACTENGINE_E_WAVEBANKNOTPREPARED)?,
+        };
         if channels == 0 {
             channels = entry.format.channels;
             sample_rate = entry.format.sample_rate;
@@ -7285,6 +8188,8 @@ fn xact_resolve_cue(
         volume: selection.sound.volume,
         pitch: selection.sound.pitch,
         category: selection.sound.category,
+        matrix,
+        routes,
     })
 }
 
@@ -7303,11 +8208,14 @@ fn xact_resolve_wave_entry(
     let Some(entry) = wave_bank.bank.entries.get(index as usize) else {
         return Err(crate::xact::XACTENGINE_E_INVALIDWAVEINDEX);
     };
-    let pcm = entry.pcm.clone().ok_or_else(|| {
-        entry
-            .decode_error
-            .unwrap_or(crate::xact::XACTENGINE_E_INVALIDDATA)
-    })?;
+    let pcm = match entry.pcm.clone() {
+        Some(pcm) => pcm,
+        None => wave_bank
+            .streaming_cache
+            .get(&index)
+            .cloned()
+            .ok_or(crate::xact::XACTENGINE_E_WAVEBANKNOTPREPARED)?,
+    };
     Ok(XactResolvedPlayback {
         samples: pcm,
         channels: entry.format.channels,
@@ -7318,7 +8226,82 @@ fn xact_resolve_wave_entry(
         volume: 1.0,
         pitch: 0,
         category: 0,
+        matrix: None,
+        routes: Vec::new(),
     })
+}
+
+/// Mix one cue into one real output voice.  An explicit
+/// `SetOutputVoiceMatrix` supplies the coefficients; otherwise a documented
+/// default routing maps matching channels one-to-one and spreads a mono
+/// source across every destination channel.  A mismatched matrix is
+/// `XACTENGINE_E_INVALIDDATA`.
+fn xact_route_output_voice(
+    samples: &[i16],
+    channels: u16,
+    route: &crate::xact::OutputVoiceRoute,
+) -> Result<(Vec<i16>, u16), u32> {
+    let destination_channels = route.channels.max(1) as usize;
+    let source_channels = channels.max(1) as usize;
+    let matrix = match &route.matrix {
+        Some(matrix) => matrix.clone(),
+        None => {
+            let mut coefficients = vec![0.0_f32; source_channels * destination_channels];
+            if source_channels == 1 {
+                coefficients.fill(1.0);
+            } else {
+                for channel in 0..source_channels.min(destination_channels) {
+                    coefficients[channel * destination_channels + channel] = 1.0;
+                }
+            }
+            (
+                source_channels as u32,
+                destination_channels as u32,
+                coefficients,
+            )
+        }
+    };
+    if matrix.1 as usize != destination_channels {
+        return Err(crate::xact::XACTENGINE_E_INVALIDDATA);
+    }
+    xact_apply_output_matrix(samples.to_vec(), channels, Some(&matrix))
+}
+
+/// Apply a source-to-destination channel matrix to interleaved PCM.  The
+/// matrix is row-major source-major (the XACT `SetMatrixCoefficients`
+/// layout): `out[src][dst] = in[src] * matrix[src * dst_count + dst]`.
+/// A matrix whose source count does not match the decoded wave is invalid.
+fn xact_apply_output_matrix(
+    samples: Vec<i16>,
+    channels: u16,
+    matrix: Option<&(u32, u32, Vec<f32>)>,
+) -> Result<(Vec<i16>, u16), u32> {
+    let Some((source, destination, coefficients)) = matrix else {
+        return Ok((samples, channels));
+    };
+    let source_channels = *source as usize;
+    let destination_channels = *destination as usize;
+    if source_channels == 0
+        || destination_channels == 0
+        || source_channels != channels as usize
+        || coefficients.len() != source_channels * destination_channels
+    {
+        return Err(crate::xact::XACTENGINE_E_INVALIDDATA);
+    }
+    let frames = samples.len() / source_channels;
+    let mut mixed = Vec::with_capacity(frames * destination_channels);
+    for frame in 0..frames {
+        for destination_index in 0..destination_channels {
+            let mut value = 0.0_f32;
+            for source_index in 0..source_channels {
+                let sample = samples[frame * source_channels + source_index] as f32;
+                value +=
+                    sample * coefficients[source_index * destination_channels + destination_index];
+            }
+            mixed.push(value.clamp(-32768.0, 32767.0) as i16);
+        }
+    }
+    Ok((mixed, destination_channels as u16))
 }
 
 /// Sum the decoded tracks of one sound, scaling each track by its authored
@@ -8940,22 +9923,60 @@ impl PeHostRuntime {
                     Duration::from_millis(u64::from(timeout_ms))
                 };
                 let context = arg!(9);
+                let flags = arg_u32!(11);
+                let asynchronous = flags & dplay::DPNOP_SYNC == 0;
                 let application_guid =
                     dplay_read_app_desc(memory, arg!(1), self.guest_arch).application_guid;
-                let results = match runtime.objects.get(&this) {
-                    Some(dplay::DplayObjectEntry {
-                        object: dplay::DplayObject::Peer(peer),
-                        ..
-                    }) => peer.enum_hosts(&application_guid, &targets, timeout),
-                    _ => return dplay::DPNERR_INVALIDPARAM,
-                };
-                for session in results {
-                    runtime.push_event(
-                        this,
-                        dplay::DplayEvent::EnumHostsResponse { context, session },
-                    );
+                if asynchronous {
+                    let handle = match runtime.objects.get_mut(&this) {
+                        Some(dplay::DplayObjectEntry {
+                            object: dplay::DplayObject::Peer(peer),
+                            ..
+                        }) => {
+                            match peer.start_enum_hosts(
+                                &application_guid,
+                                &targets,
+                                timeout,
+                                context,
+                            ) {
+                                Ok(handle) => handle,
+                                Err(error) => return error,
+                            }
+                        }
+                        _ => return dplay::DPNERR_INVALIDPARAM,
+                    };
+                    if arg!(10) != 0 {
+                        let _ = write_guest_pointer(
+                            memory,
+                            arg!(10),
+                            u64::from(handle),
+                            self.guest_arch,
+                        );
+                    }
+                    dplay::DPNERR_PENDING
+                } else {
+                    let results = match runtime.objects.get(&this) {
+                        Some(dplay::DplayObjectEntry {
+                            object: dplay::DplayObject::Peer(peer),
+                            ..
+                        }) => peer.enum_hosts(&application_guid, &targets, timeout),
+                        _ => return dplay::DPNERR_INVALIDPARAM,
+                    };
+                    if arg!(10) != 0 {
+                        let _ = write_guest_pointer(memory, arg!(10), 0, self.guest_arch);
+                    }
+                    for session in results {
+                        runtime.push_event(
+                            this,
+                            dplay::DplayEvent::EnumHostsResponse {
+                                context,
+                                session,
+                                async_op: 0,
+                            },
+                        );
+                    }
+                    dplay::S_OK
                 }
-                dplay::S_OK
             }
             26 => {
                 let data_size = arg_u32!(3) as usize;
@@ -9447,7 +10468,9 @@ impl PeHostRuntime {
                 }
                 Ok((11, base))
             }
-            DplayEvent::EnumHostsResponse { context, session } => {
+            DplayEvent::EnumHostsResponse {
+                context, session, ..
+            } => {
                 let (size, context_at, latency_at) = if is64 { (40, 8, 32) } else { (20, 4, 16) };
                 let base = self.alloc_zeroed(memory, size, pointer_size as u64)?;
                 write_u32(memory, base, size as u32);
@@ -10071,10 +11094,8 @@ mod audio_activation_tests {
         memory.map_bytes(HANDLER_OBJECT, &[0_u8; 8]);
         memory.map_bytes(HANDLER_VTABLE, &[0_u8; 16]);
         let mut stub = vec![0x90_u8; 0x40];
-        stub[..36].copy_from_slice(&[
-            0x8B, 0x44, 0x24, 0x08, // mov eax, [esp+8]   (result hr)
-            0xA3, 0x00, 0x40, 0x04, 0x00, // mov [0x44000], eax
-            0x8B, 0x44, 0x24, 0x0C, // mov eax, [esp+12]  (interface object)
+        stub[..27].copy_from_slice(&[
+            0x8B, 0x44, 0x24, 0x08, // mov eax, [esp+8]   (operation object)
             0xA3, 0x04, 0x40, 0x04, 0x00, // mov [0x44004], eax
             0xA1, 0x08, 0x40, 0x04, 0x00, // mov eax, [0x44008] (count)
             0x05, 0x01, 0x00, 0x00, 0x00, // add eax, 1
@@ -10255,25 +11276,70 @@ mod audio_activation_tests {
                 1
             );
             let operation = read_guest_pointer(&memory, OP_OUT, GuestArch::X86).unwrap();
-            assert_eq!(operation, 0, "failed activations return no interface");
+            assert_ne!(operation, 0, "failed activations still return an operation");
 
             drain_activations(&mut runtime, &mut memory);
             assert_eq!(marker_count(&memory), 1, "handler invoked exactly once");
             assert_eq!(
-                marker_hr(&memory),
-                ACTIVATION_E_NOINTERFACE,
+                marker_object(&memory) as u64,
+                operation,
+                "the handler receives the operation object"
+            );
+            let (result_hr, interface) = crate::audio_activation::operation_get_activate_result(
+                runtime.guest_pid,
+                operation,
+            )
+            .expect("completion delivered");
+            assert_eq!(
+                result_hr, ACTIVATION_E_NOINTERFACE,
                 "unsupported riid delivers E_NOINTERFACE"
             );
-            assert_eq!(
-                marker_object(&memory),
-                0,
-                "no interface object for E_NOINTERFACE"
-            );
+            assert_eq!(interface, 0, "no interface object for E_NOINTERFACE");
             assert_eq!(
                 crate::audio_activation::pending_activation_completions(runtime.guest_pid),
                 0,
                 "the completion queue is empty after the drain"
             );
+        })
+    }
+
+    #[test]
+    fn activation_operation_survives_early_guest_release_until_completion() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = activation_test_runtime("act-early-release");
+            let mut memory = MemoryImage::default();
+            install_handler(&mut memory);
+            let unknown_riid = [0xCD; 16];
+            let hr = dispatch_activate(
+                &mut runtime,
+                &mut memory,
+                None,
+                &unknown_riid,
+                HANDLER_OBJECT,
+                OP_OUT,
+            );
+            assert_eq!(hr, u64::from(ACTIVATION_S_OK));
+            let operation = read_guest_pointer(&memory, OP_OUT, GuestArch::X86).unwrap();
+            assert_ne!(operation, 0);
+            // The guest drops its reference before completion: the pending
+            // completion still holds one, so the handler receives a live
+            // operation object.
+            assert_eq!(
+                runtime
+                    .release_guest_object(operation)
+                    .expect("guest Release"),
+                1
+            );
+            drain_activations(&mut runtime, &mut memory);
+            assert_eq!(marker_count(&memory), 1);
+            assert_eq!(marker_object(&memory) as u64, operation);
+            // The completion's reference was the last one: the operation and
+            // its activation state are gone after delivery.
+            assert!(!runtime.guest_objects.contains_key(&operation));
+            assert!(!crate::audio_activation::is_activation_operation(
+                runtime.guest_pid,
+                operation,
+            ));
         })
     }
 
@@ -10301,8 +11367,8 @@ mod audio_activation_tests {
             assert_eq!(hr, u64::from(ACTIVATION_S_OK));
             // Not delivered inline: the handler must be invoked asynchronously.
             assert_eq!(marker_count(&memory), 0, "handler must not run inline");
-            let endpoint = read_guest_pointer(&memory, OP_OUT, GuestArch::X86).unwrap();
-            assert_ne!(endpoint, 0, "the activation operation carries the endpoint");
+            let operation = read_guest_pointer(&memory, OP_OUT, GuestArch::X86).unwrap();
+            assert_ne!(operation, 0, "the activation carries an operation object");
             assert_eq!(
                 crate::audio_activation::pending_activation_completions(runtime.guest_pid),
                 1,
@@ -10311,8 +11377,18 @@ mod audio_activation_tests {
 
             drain_activations(&mut runtime, &mut memory);
             assert_eq!(marker_count(&memory), 1, "handler invoked exactly once");
-            assert_eq!(marker_hr(&memory), ACTIVATION_S_OK);
-            assert_eq!(marker_object(&memory) as u64, endpoint);
+            assert_eq!(
+                marker_object(&memory) as u64,
+                operation,
+                "the handler receives the operation object"
+            );
+            let (result_hr, endpoint) = crate::audio_activation::operation_get_activate_result(
+                runtime.guest_pid,
+                operation,
+            )
+            .expect("completion delivered");
+            assert_eq!(result_hr, ACTIVATION_S_OK);
+            assert_ne!(endpoint, 0, "the operation carries the endpoint");
 
             // The endpoint is a REAL guest object bound to the REAL device data.
             let kind = runtime
@@ -10338,6 +11414,25 @@ mod audio_activation_tests {
                 0
             );
             assert!(!runtime.guest_objects.contains_key(&endpoint));
+
+            // The operation object's IUnknown lifecycle is real too: the last
+            // Release forgets its activation state.
+            assert_eq!(runtime.add_ref_guest_object(operation).expect("AddRef"), 2);
+            assert_eq!(runtime.release_guest_object(operation).expect("Release"), 1);
+            assert_eq!(
+                runtime
+                    .release_guest_object(operation)
+                    .expect("final Release"),
+                0
+            );
+            assert!(!runtime.guest_objects.contains_key(&operation));
+            assert_eq!(
+                crate::audio_activation::activation_operation_interface(
+                    runtime.guest_pid,
+                    operation,
+                ),
+                None
+            );
         })
     }
 
@@ -10393,13 +11488,21 @@ mod audio_activation_tests {
                 OP_OUT,
             );
             assert_eq!(hr, u64::from(ACTIVATION_S_OK));
+            let operation = read_guest_pointer(&memory, OP_OUT, GuestArch::X86).unwrap();
+            assert_ne!(operation, 0);
             drain_activations(&mut runtime, &mut memory);
+            assert_ne!(marker_object(&memory), 0);
+            let (result_hr, interface) = crate::audio_activation::operation_get_activate_result(
+                runtime.guest_pid,
+                operation,
+            )
+            .expect("completion delivered");
             if capture_available {
-                assert_eq!(marker_hr(&memory), ACTIVATION_S_OK);
-                assert_ne!(marker_object(&memory), 0);
+                assert_eq!(result_hr, ACTIVATION_S_OK);
+                assert_ne!(interface, 0);
             } else {
-                assert_eq!(marker_hr(&memory), AUDCLNT_E_DEVICE_INVALIDATED);
-                assert_eq!(marker_object(&memory), 0);
+                assert_eq!(result_hr, AUDCLNT_E_DEVICE_INVALIDATED);
+                assert_eq!(interface, 0);
             }
             assert_eq!(marker_count(&memory), 1);
         })
@@ -10427,9 +11530,17 @@ mod audio_activation_tests {
                 OP_OUT,
             );
             assert_eq!(hr, u64::from(ACTIVATION_S_OK));
+            let operation = read_guest_pointer(&memory, OP_OUT, GuestArch::X86).unwrap();
+            assert_ne!(operation, 0, "failed activations still return an operation");
             drain_activations(&mut runtime, &mut memory);
-            assert_eq!(marker_hr(&memory), AUDCLNT_E_DEVICE_INVALIDATED);
-            assert_eq!(marker_object(&memory), 0);
+            assert_eq!(marker_object(&memory) as u64, operation);
+            let (result_hr, interface) = crate::audio_activation::operation_get_activate_result(
+                runtime.guest_pid,
+                operation,
+            )
+            .expect("completion delivered");
+            assert_eq!(result_hr, AUDCLNT_E_DEVICE_INVALIDATED);
+            assert_eq!(interface, 0);
             assert_eq!(marker_count(&memory), 1);
         })
     }
@@ -10443,7 +11554,10 @@ mod audio_activation_tests {
 mod xact_engine_tests {
     use super::*;
     use crate::ge::{GameEnvironment, GeArch};
-    use crate::xact::fixtures::{XsbSpec, XwbTestEntry, build_xsb, build_xwb, build_xwb_entries};
+    use crate::xact::fixtures::{
+        XsbSpec, XwbTestEntry, build_xgs, build_xgs_curve, build_xsb, build_xsb_interactive,
+        build_xwb, build_xwb_entries,
+    };
     use tempfile::TempDir;
 
     const STACK: u64 = 0x60_000;
@@ -10589,6 +11703,50 @@ mod xact_engine_tests {
         )
     }
 
+    fn xact_initialize_with_settings(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        engine: u64,
+        settings: &[u8],
+    ) -> u64 {
+        memory.map_bytes(BANK_BUFFER, settings);
+        let buffer = BANK_BUFFER;
+        memory.map_bytes(PARAMS, &[0_u8; 64]);
+        write_u32(memory, PARAMS + 4, buffer as u32);
+        write_u32(memory, PARAMS + 8, settings.len() as u32);
+        xact_call(
+            runtime,
+            memory,
+            engine,
+            crate::xact::IFACE_ENGINE,
+            6,
+            &[PARAMS],
+        )
+    }
+
+    fn xact_mastering_voice(runtime: &PeHostRuntime) -> crate::audio::VoiceId {
+        xact_with_store(runtime, |state| {
+            state.objects.values().find_map(|object| match object {
+                crate::xact::XactObject::Engine(engine) => engine.mastering_voice,
+                _ => None,
+            })
+        })
+        .flatten()
+        .expect("engine mastering voice")
+    }
+
+    fn xact_f32(value: f32) -> u64 {
+        u64::from(value.to_bits())
+    }
+
+    fn xact_cue_state(runtime: &PeHostRuntime, cue: u64) -> Option<u32> {
+        xact_with_store(runtime, |state| match state.objects.get(&cue) {
+            Some(crate::xact::XactObject::Cue(cue)) => Some(cue.state),
+            _ => None,
+        })
+        .flatten()
+    }
+
     fn xact_load_wavebank(
         runtime: &mut PeHostRuntime,
         memory: &mut MemoryImage,
@@ -10665,6 +11823,43 @@ mod xact_engine_tests {
             _ => None,
         })
         .flatten()
+    }
+
+    /// Every real mixer voice a cue currently owns, primary first.
+    fn cue_live_voices(runtime: &PeHostRuntime, cue: u64) -> Vec<crate::audio::VoiceId> {
+        xact_with_store(runtime, |state| match state.objects.get(&cue) {
+            Some(crate::xact::XactObject::Cue(cue)) => cue
+                .live
+                .map(|live| live.voices().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default()
+    }
+
+    /// Allocate a real guest XAudio2 output voice with a live mixer voice,
+    /// exactly the object shape `IXACT3Cue::SetOutputVoices` accepts.
+    fn xact_test_output_voice(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        channels: u16,
+    ) -> u64 {
+        let format = crate::audio::WaveFormat {
+            channels,
+            sample_rate: 48_000,
+            sample_format: crate::audio::SampleFormat::Float32,
+        };
+        let mastering = runtime
+            .audio
+            .create_mastering_voice(format.clone())
+            .expect("output-voice mastering");
+        let voice = runtime
+            .audio
+            .create_submix_voice(format, mastering)
+            .expect("output-voice submix");
+        runtime
+            .alloc_xaudio2_source_voice_object(memory, 0, voice)
+            .expect("guest output-voice object")
     }
 
     fn tone() -> Vec<i16> {
@@ -11496,8 +12691,9 @@ mod xact_engine_tests {
             assert_eq!(read_u32(&memory, OUT_A + 4).expect("sample rate"), 48_000);
             assert_eq!(read_u16(&memory, OUT_A + 14).expect("bits"), 32);
 
-            // Streaming wave banks are a documented E_NOTIMPL gap.
-            memory.map_bytes(PARAMS, &[0_u8; 64]);
+            // Streaming wave banks are real: a missing file is a real
+            // file-I/O failure, not a not-implemented placeholder.
+            write_guest_c_string(&mut memory, STRING_BUF, r"C:\missing-stream.xwb");
             assert_eq!(
                 xact_call(
                     &mut runtime,
@@ -11505,9 +12701,9 @@ mod xact_engine_tests {
                     engine,
                     crate::xact::IFACE_ENGINE,
                     11,
-                    &[PARAMS, OUT_B],
+                    &[STRING_BUF, OUT_B],
                 ),
-                u64::from(crate::xact::E_NOTIMPL)
+                u64::from(crate::xact::E_FAIL)
             );
         })
     }
@@ -11598,6 +12794,1058 @@ mod xact_engine_tests {
                 u64::from(crate::xact::S_OK)
             );
             assert_eq!(read_u32(&memory, MARKERS).expect("no callback"), 0);
+        })
+    }
+
+    #[test]
+    fn xact_streaming_wavebank_loads_prepares_and_plays_from_a_real_file() {
+        with_big_stack(|| {
+            let (mut runtime, tmp) = xact_test_runtime("xact-streaming");
+            let mut memory = MemoryImage::default();
+            let engine = xact_create_engine(&mut runtime, &mut memory);
+            assert_eq!(
+                xact_initialize(&mut runtime, &mut memory, engine, 0),
+                u64::from(crate::xact::S_OK)
+            );
+            let first = vec![1234_i16; 64];
+            let second = vec![-2345_i16; 96];
+            let entries = [
+                XwbTestEntry {
+                    name: "first".to_string(),
+                    payload: first
+                        .iter()
+                        .flat_map(|sample| sample.to_le_bytes())
+                        .collect(),
+                    tag: crate::xact::WAVEBANK_TAG_PCM,
+                    channels: 1,
+                    sample_rate: 44100,
+                    block_align: 2,
+                    bits_per_sample: 16,
+                    duration_samples: first.len() as u32,
+                    loop_region: (0, 0),
+                },
+                XwbTestEntry {
+                    name: "second".to_string(),
+                    payload: second
+                        .iter()
+                        .flat_map(|sample| sample.to_le_bytes())
+                        .collect(),
+                    tag: crate::xact::WAVEBANK_TAG_PCM,
+                    channels: 1,
+                    sample_rate: 44100,
+                    block_align: 2,
+                    bits_per_sample: 16,
+                    duration_samples: second.len() as u32,
+                    loop_region: (0, 0),
+                },
+            ];
+            let mut xwb = build_xwb_entries("StreamBank", &entries);
+            // Bank-data flags live at offset 52 in a genuine WBND header.
+            xwb[52] |= crate::xact::WAVEBANK_TYPE_STREAMING as u8;
+            let drive = tmp.path().join("xact-streaming").join("drive_c");
+            std::fs::write(drive.join("stream.xwb"), &xwb).expect("write streaming bank");
+            write_guest_c_string(&mut memory, STRING_BUF, r"C:\stream.xwb");
+            memory.map_bytes(OUT_B, &[0_u8; 8]);
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    engine,
+                    crate::xact::IFACE_ENGINE,
+                    11,
+                    &[STRING_BUF, OUT_B],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let wb = u64::from(read_u32(&memory, OUT_B).expect("streaming bank pointer"));
+            let (streaming, payload_free, entries_len) =
+                xact_with_store(&runtime, |state| match state.objects.get(&wb) {
+                    Some(crate::xact::XactObject::WaveBank(state)) => (
+                        state.bank.streaming,
+                        state.bank.entries.iter().all(|entry| entry.pcm.is_none()),
+                        state.bank.entries.len(),
+                    ),
+                    _ => (false, false, 0),
+                })
+                .expect("bank state");
+            assert!(streaming, "streaming flag parsed from the file");
+            assert!(payload_free, "creation did not materialise wave PCM");
+            assert_eq!(entries_len, 2);
+
+            // Playing an unprepared streaming entry is the genuine error.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    wb,
+                    crate::xact::IFACE_WAVEBANK,
+                    8,
+                    &[0, 0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::XACTENGINE_E_WAVEBANKNOTPREPARED)
+            );
+            // Bad wave index.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    wb,
+                    crate::xact::IFACE_WAVEBANK,
+                    7,
+                    &[9, 0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::XACTENGINE_E_INVALIDWAVEINDEX)
+            );
+            // Prepare entry 1: a real seek/read of that entry's byte range.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    wb,
+                    crate::xact::IFACE_WAVEBANK,
+                    7,
+                    &[1, 0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let cached = xact_with_store(&runtime, |state| match state.objects.get(&wb) {
+                Some(crate::xact::XactObject::WaveBank(state)) => {
+                    state.streaming_cache.get(&1).cloned()
+                }
+                _ => None,
+            })
+            .flatten()
+            .expect("prepared streaming payload");
+            assert_eq!(
+                cached, second,
+                "the second entry's bytes were read, not the first"
+            );
+            // Play the prepared entry through the real audio stack.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    wb,
+                    crate::xact::IFACE_WAVEBANK,
+                    8,
+                    &[1, 0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let wave = u64::from(read_u32(&memory, OUT_C).expect("wave pointer"));
+            let voice = xact_with_store(&runtime, |state| match state.objects.get(&wave) {
+                Some(crate::xact::XactObject::Wave(wave)) => wave.live.map(|live| live.voice),
+                _ => None,
+            })
+            .flatten()
+            .expect("streamed live voice");
+            assert!(
+                runtime
+                    .audio
+                    .queued_source_frames(voice)
+                    .expect("queued frames")
+                    > 0
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    engine,
+                    crate::xact::IFACE_ENGINE,
+                    8,
+                    &[],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+
+            // Missing file and a non-streaming bank both fail genuinely.
+            write_guest_c_string(&mut memory, STRING_BUF, r"C:\missing.xwb");
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    engine,
+                    crate::xact::IFACE_ENGINE,
+                    11,
+                    &[STRING_BUF, OUT_B],
+                ),
+                u64::from(crate::xact::E_FAIL)
+            );
+            let plain = build_xwb("PlainBank", &[tone()], &[], &[]);
+            std::fs::write(drive.join("plain.xwb"), &plain).expect("write plain bank");
+            write_guest_c_string(&mut memory, STRING_BUF, r"C:\plain.xwb");
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    engine,
+                    crate::xact::IFACE_ENGINE,
+                    11,
+                    &[STRING_BUF, OUT_B],
+                ),
+                u64::from(crate::xact::XACTENGINE_E_INVALIDUSAGE)
+            );
+        })
+    }
+
+    #[test]
+    fn xact_streaming_wavebank_accepts_drive_and_systemroot_relative_paths() {
+        with_big_stack(|| {
+            let (mut runtime, tmp) = xact_test_runtime("xact-stream-paths");
+            let mut memory = MemoryImage::default();
+            let engine = xact_create_engine(&mut runtime, &mut memory);
+            assert_eq!(
+                xact_initialize(&mut runtime, &mut memory, engine, 0),
+                u64::from(crate::xact::S_OK)
+            );
+            let pcm = vec![777_i16; 32];
+            let entries = [XwbTestEntry {
+                name: "tone".to_string(),
+                payload: pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect(),
+                tag: crate::xact::WAVEBANK_TAG_PCM,
+                channels: 1,
+                sample_rate: 44100,
+                block_align: 2,
+                bits_per_sample: 16,
+                duration_samples: pcm.len() as u32,
+                loop_region: (0, 0),
+            }];
+            let mut xwb = build_xwb_entries("StreamBank", &entries);
+            xwb[52] |= crate::xact::WAVEBANK_TYPE_STREAMING as u8;
+            let drive = tmp.path().join("xact-stream-paths").join("drive_c");
+            std::fs::create_dir_all(drive.join("windows").join("system32"))
+                .expect("system32 directory");
+            std::fs::write(drive.join("stream-drive.xwb"), &xwb).expect("drive-root bank");
+            std::fs::write(drive.join("windows/system32/stream-sys.xwb"), &xwb)
+                .expect("system-root bank");
+
+            let create = |runtime: &mut PeHostRuntime, memory: &mut MemoryImage, path: &str| {
+                write_guest_c_string(memory, STRING_BUF, path);
+                memory.map_bytes(OUT_B, &[0_u8; 8]);
+                xact_call(
+                    runtime,
+                    memory,
+                    engine,
+                    crate::xact::IFACE_ENGINE,
+                    11,
+                    &[STRING_BUF, OUT_B],
+                )
+            };
+
+            // Drive-relative: C:current-directory-relative resolves through
+            // the GE drive tables, not the host working directory.
+            assert_eq!(
+                create(&mut runtime, &mut memory, r"C:stream-drive.xwb"),
+                u64::from(crate::xact::S_OK)
+            );
+            let drive_bank = u64::from(read_u32(&memory, OUT_B).expect("drive bank pointer"));
+            let source = xact_with_store(&runtime, |state| match state.objects.get(&drive_bank) {
+                Some(crate::xact::XactObject::WaveBank(bank)) => bank.bank.source_path.clone(),
+                _ => None,
+            })
+            .flatten()
+            .expect("resolved streaming source");
+            assert!(
+                std::path::Path::new(&source).is_file(),
+                "drive-relative bank resolved to a real file: {source}"
+            );
+            // The real file path supports the on-demand seek/read.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    drive_bank,
+                    crate::xact::IFACE_WAVEBANK,
+                    7,
+                    &[0, 0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let cached = xact_with_store(&runtime, |state| match state.objects.get(&drive_bank) {
+                Some(crate::xact::XactObject::WaveBank(bank)) => {
+                    bank.streaming_cache.get(&0).cloned()
+                }
+                _ => None,
+            })
+            .flatten()
+            .expect("streamed payload");
+            assert_eq!(cached, pcm);
+
+            for path in [
+                r"\SystemRoot\system32\stream-sys.xwb",
+                r"\%SystemRoot%\system32\stream-sys.xwb",
+                r"\%windir%\system32\stream-sys.xwb",
+            ] {
+                let result = create(&mut runtime, &mut memory, path);
+                assert_eq!(result, u64::from(crate::xact::S_OK), "{path}");
+            }
+
+            // Missing files keep the genuine file-open error for every
+            // supported path form.
+            for path in [
+                r"C:missing.xwb",
+                r"\SystemRoot\system32\missing.xwb",
+                r"%SystemRoot%\system32\missing.xwb",
+                "relative-missing.xwb",
+            ] {
+                assert_eq!(
+                    create(&mut runtime, &mut memory, path),
+                    u64::from(crate::xact::E_FAIL),
+                    "{path}"
+                );
+            }
+        })
+    }
+
+    #[test]
+    fn xact_two_output_voices_apply_per_voice_matrix_gains() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = xact_test_runtime("xact-output-voices");
+            let mut memory = MemoryImage::default();
+            let engine = xact_create_engine(&mut runtime, &mut memory);
+            assert_eq!(
+                xact_initialize(&mut runtime, &mut memory, engine, 0),
+                u64::from(crate::xact::S_OK)
+            );
+            let xwb = build_xwb("WaveBank", &[vec![1000_i16; 441]], &[], &[]);
+            let xsb = simple_soundbank(&[("mono", 0)]);
+            let (_wb, sb) = xact_load_banks(&mut runtime, &mut memory, engine, &xwb, &xsb);
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    sb,
+                    crate::xact::IFACE_SOUNDBANK,
+                    6,
+                    &[0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let cue = u64::from(read_u32(&memory, OUT_C).expect("cue pointer"));
+
+            // Two real guest IXAudio2Voice output voices, both stereo.
+            let left_voice = xact_test_output_voice(&mut runtime, &mut memory, 2);
+            let right_voice = xact_test_output_voice(&mut runtime, &mut memory, 2);
+
+            // XAUDIO2_VOICE_SENDS { OutputCount, pSends } with 8-byte
+            // XAUDIO2_SEND_DESCRIPTOR { Flags, pOutputVoice } entries.
+            memory.map_bytes(PARAMS, &[0_u8; 128]);
+            write_u32(&mut memory, PARAMS, 2);
+            write_u32(&mut memory, PARAMS + 4, (PARAMS + 16) as u32);
+            write_u32(&mut memory, PARAMS + 16, 0);
+            write_u32(&mut memory, PARAMS + 20, left_voice as u32);
+            write_u32(&mut memory, PARAMS + 24, 0);
+            write_u32(&mut memory, PARAMS + 28, right_voice as u32);
+
+            // A matrix cannot target a voice that was not selected, and an
+            // unknown/dead output-voice pointer is rejected.
+            write_u32(&mut memory, PARAMS + 64, 0.5_f32.to_bits());
+            write_u32(&mut memory, PARAMS + 68, 0.0_f32.to_bits());
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    14,
+                    &[left_voice, 1, 2, PARAMS + 64],
+                ),
+                u64::from(crate::xact::E_INVALIDARG),
+                "matrix before SetOutputVoices is invalid"
+            );
+            write_u32(&mut memory, PARAMS, 9);
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    13,
+                    &[PARAMS],
+                ),
+                u64::from(crate::xact::E_INVALIDARG),
+                "more than XAUDIO2_MAX_SEND_COUNT destinations"
+            );
+            write_u32(&mut memory, PARAMS, 1);
+            write_u32(&mut memory, PARAMS + 20, 0x00AB_CDEF);
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    13,
+                    &[PARAMS],
+                ),
+                u64::from(crate::xact::E_INVALIDARG),
+                "a non-XAudio2 pointer is not an output voice"
+            );
+            write_u32(&mut memory, PARAMS, 2);
+            write_u32(&mut memory, PARAMS + 20, left_voice as u32);
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    13,
+                    &[PARAMS],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let routes = xact_with_store(&runtime, |state| match state.objects.get(&cue) {
+                Some(crate::xact::XactObject::Cue(cue)) => cue.output_voices.clone(),
+                _ => None,
+            })
+            .flatten()
+            .expect("output-voice routes");
+            assert_eq!(routes.len(), 2);
+            assert_eq!(routes[0].voice, left_voice);
+            assert_eq!(routes[0].channels, 2);
+            assert_eq!(routes[1].voice, right_voice);
+            assert_eq!(routes[1].channels, 2);
+
+            // Mono cue -> left output voice (left 0.5) and right output
+            // voice (right 0.25).  Each destination genuinely scales the
+            // cue mix with its own coefficients.
+            write_u32(&mut memory, PARAMS + 64, 0.5_f32.to_bits());
+            write_u32(&mut memory, PARAMS + 68, 0.0_f32.to_bits());
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    14,
+                    &[left_voice, 1, 2, PARAMS + 64],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            write_u32(&mut memory, PARAMS + 72, 0.0_f32.to_bits());
+            write_u32(&mut memory, PARAMS + 76, 0.25_f32.to_bits());
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    14,
+                    &[right_voice, 1, 2, PARAMS + 72],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            // Destination channel count must match the real voice.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    14,
+                    &[left_voice, 1, 3, PARAMS + 64],
+                ),
+                u64::from(crate::xact::E_INVALIDARG)
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    14,
+                    &[left_voice, 0, 2, PARAMS + 64],
+                ),
+                u64::from(crate::xact::E_INVALIDARG)
+            );
+
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    3,
+                    &[],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let voices = cue_live_voices(&runtime, cue);
+            assert_eq!(voices.len(), 2, "one real source voice per destination");
+            for voice in &voices {
+                assert_eq!(
+                    runtime
+                        .audio
+                        .voice_format(*voice)
+                        .expect("route format")
+                        .channels,
+                    2
+                );
+                assert!((runtime.audio.volume(*voice).expect("route gain") - 1.0).abs() < 1.0e-3);
+            }
+            let mastering = xact_mastering_voice(&runtime);
+            let output = runtime
+                .audio
+                .render_xaudio2(mastering, 441)
+                .expect("render two output voices");
+            let amplitude = 1000.0_f32 / i16::MAX as f32 * crate::xact::decibels_to_amplitude(180);
+            assert!(
+                (output.samples[0] - amplitude * 0.5).abs() < 1.0e-5,
+                "left output voice gain: {}",
+                output.samples[0]
+            );
+            assert!(
+                (output.samples[1] - amplitude * 0.25).abs() < 1.0e-5,
+                "right output voice gain: {}",
+                output.samples[1]
+            );
+
+            // A matrix whose source count does not match the decoded wave
+            // is rejected at Play with the genuine bad-content error.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    4,
+                    &[u64::from(crate::xact::XACT_FLAG_STOP_IMMEDIATE)],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            for index in 0..4 {
+                write_u32(&mut memory, PARAMS + 80 + index * 4, 0.25_f32.to_bits());
+            }
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    14,
+                    &[left_voice, 2, 2, PARAMS + 80],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    3,
+                    &[],
+                ),
+                u64::from(crate::xact::XACTENGINE_E_INVALIDDATA),
+                "matrix source channels must match the cue wave"
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    14,
+                    &[left_voice, 1, 2, PARAMS + 64],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    3,
+                    &[],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+        })
+    }
+
+    #[test]
+    fn xact_cue_local_variables_override_globals_and_drive_variations() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = xact_test_runtime("xact-variables");
+            let mut memory = MemoryImage::default();
+            let engine = xact_create_engine(&mut runtime, &mut memory);
+            let mut xgs = build_xgs();
+            // Make the XGS variable settable (bit 0x02 is read-only).
+            xgs[100] = 0x01;
+            assert_eq!(
+                xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs),
+                u64::from(crate::xact::S_OK)
+            );
+            let xwb = build_xwb(
+                "WaveBank",
+                &[vec![100_i16; 441], vec![200_i16; 441]],
+                &[],
+                &[],
+            );
+            let xsb = build_xsb_interactive(
+                "SoundBank",
+                "WaveBank",
+                "variableCue",
+                0,
+                &[(0, 0.0, 500.0), (1, 500.0, 1000.0)],
+                Some("CueSpeed"),
+            );
+            let (_wb, sb) = xact_load_banks(&mut runtime, &mut memory, engine, &xwb, &xsb);
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    sb,
+                    crate::xact::IFACE_SOUNDBANK,
+                    6,
+                    &[0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let cue = u64::from(read_u32(&memory, OUT_C).expect("cue pointer"));
+            write_guest_c_string(&mut memory, STRING_BUF, "SpeedOfSound");
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    8,
+                    &[STRING_BUF],
+                ),
+                0,
+                "cue-local index for the bound variable"
+            );
+            write_guest_c_string(&mut memory, STRING_BUF, "CueSpeed");
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    8,
+                    &[STRING_BUF],
+                ),
+                0,
+                "the XSB local friendly-name table resolves first"
+            );
+            write_guest_c_string(&mut memory, STRING_BUF, "NotAVariable");
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    8,
+                    &[STRING_BUF],
+                ),
+                u64::from(crate::xact::XACTVARIABLEINDEX_INVALID)
+            );
+            // A global name that is not cue-local still falls back to the
+            // engine variable table.
+            write_guest_c_string(&mut memory, STRING_BUF, "SpeedOfSound");
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    8,
+                    &[STRING_BUF],
+                ),
+                0,
+                "global-name fallback"
+            );
+
+            // Invalid local indices are rejected; valid values clamp to the
+            // global variable's authored range.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    9,
+                    &[7, xact_f32(1.0)],
+                ),
+                u64::from(crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX)
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    9,
+                    &[0, xact_f32(800.0)],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    10,
+                    &[0, OUT_A],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            assert_eq!(
+                f32::from_bits(read_u32(&memory, OUT_A).expect("local value")),
+                800.0
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    engine,
+                    crate::xact::IFACE_ENGINE,
+                    23,
+                    &[0, OUT_A],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            assert_eq!(
+                f32::from_bits(read_u32(&memory, OUT_A).expect("global value")),
+                343.0
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    engine,
+                    crate::xact::IFACE_ENGINE,
+                    23,
+                    &[9, OUT_A],
+                ),
+                u64::from(crate::xact::XACTENGINE_E_INVALIDVARIABLEINDEX)
+            );
+
+            // The cue-local value selects the upper interactive range; the
+            // global value is still the lower range.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    3,
+                    &[],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let mastering = xact_mastering_voice(&runtime);
+            let output = runtime
+                .audio
+                .render_xaudio2(mastering, 441)
+                .expect("render local-variable selection");
+            let expected_upper = 200.0_f32 / i16::MAX as f32;
+            assert!(
+                (output.samples[0] - expected_upper).abs() < 1.0e-5,
+                "cue-local 800 selects the upper wave: {}",
+                output.samples[0]
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    4,
+                    &[u64::from(crate::xact::XACT_FLAG_STOP_IMMEDIATE)],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    engine,
+                    crate::xact::IFACE_ENGINE,
+                    22,
+                    &[0, xact_f32(100.0)],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    10,
+                    &[0, OUT_A],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            assert_eq!(
+                f32::from_bits(read_u32(&memory, OUT_A).expect("cue scope")),
+                800.0,
+                "the cue override wins over the changed global"
+            );
+
+            // A fresh cue without an override follows the global value and
+            // picks the lower wave.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    sb,
+                    crate::xact::IFACE_SOUNDBANK,
+                    6,
+                    &[0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let second = u64::from(read_u32(&memory, OUT_C).expect("second cue"));
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    second,
+                    crate::xact::IFACE_CUE,
+                    3,
+                    &[],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let output = runtime
+                .audio
+                .render_xaudio2(mastering, 441)
+                .expect("render global-variable selection");
+            let expected_lower = 100.0_f32 / i16::MAX as f32;
+            assert!(
+                (output.samples[0] - expected_lower).abs() < 1.0e-5,
+                "global 100 selects the lower wave: {}",
+                output.samples[0]
+            );
+        })
+    }
+
+    #[test]
+    fn xact_release_fade_decays_over_render_cycles_and_immediate_stays_a_cut() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = xact_test_runtime("xact-release");
+            let mut memory = MemoryImage::default();
+            let engine = xact_create_engine(&mut runtime, &mut memory);
+            // Category 0 ("Music") carries a 200 ms linear release.
+            let xgs = build_xgs_curve(0);
+            assert_eq!(
+                xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs),
+                u64::from(crate::xact::S_OK)
+            );
+            let xwb = build_xwb("WaveBank", &[vec![500_i16; 88_200]], &[], &[]);
+            let xsb = simple_soundbank(&[("long", 0)]);
+            let (_wb, sb) = xact_load_banks(&mut runtime, &mut memory, engine, &xwb, &xsb);
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    sb,
+                    crate::xact::IFACE_SOUNDBANK,
+                    7,
+                    &[0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let cue = u64::from(read_u32(&memory, OUT_C).expect("cue pointer"));
+            let voice = cue_live_voice(&runtime, cue).expect("live cue voice");
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    4,
+                    &[0],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            assert_eq!(
+                xact_cue_state(&runtime, cue),
+                Some(crate::xact::XACT_STATE_STOPPING),
+                "a release envelope keeps the cue in STOPPING"
+            );
+            let start_gain = runtime.audio.volume(voice).expect("authored start gain");
+            let mut gains = Vec::new();
+            for _ in 0..5 {
+                assert_eq!(
+                    xact_call(
+                        &mut runtime,
+                        &mut memory,
+                        engine,
+                        crate::xact::IFACE_ENGINE,
+                        8,
+                        &[],
+                    ),
+                    u64::from(crate::xact::S_OK)
+                );
+                gains.push(runtime.audio.volume(voice).expect("release gain"));
+            }
+            assert!(gains[0] > 0.99, "release begins at the authored gain");
+            assert!(
+                gains.windows(2).all(|pair| pair[0] >= pair[1]),
+                "release gain is monotonic: {gains:?}"
+            );
+            assert!(
+                gains[4] < gains[0] * 0.9,
+                "release gain decays across render cycles: {gains:?}"
+            );
+            // The stock XGS record selects a linear amplitude ramp: each
+            // 512-frame slice removes exactly 512/8820 of the gain.
+            for (index, gain) in gains.iter().enumerate() {
+                let expected = start_gain * (8820.0 - 512.0 * index as f32) / 8820.0;
+                assert!(
+                    (gain - expected).abs() < 1.0e-4,
+                    "linear slice {index}: {gain} vs {expected}"
+                );
+            }
+            for _ in 0..40 {
+                assert_eq!(
+                    xact_call(
+                        &mut runtime,
+                        &mut memory,
+                        engine,
+                        crate::xact::IFACE_ENGINE,
+                        8,
+                        &[],
+                    ),
+                    u64::from(crate::xact::S_OK)
+                );
+                if xact_cue_state(&runtime, cue) == Some(crate::xact::XACT_STATE_STOPPED) {
+                    break;
+                }
+            }
+            assert_eq!(
+                xact_cue_state(&runtime, cue),
+                Some(crate::xact::XACT_STATE_STOPPED),
+                "the envelope completes and tears the voice down"
+            );
+            assert!(cue_live_voice(&runtime, cue).is_none());
+
+            // A fresh cue with XACT_FLAG_STOP_IMMEDIATE is cut at once.
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    sb,
+                    crate::xact::IFACE_SOUNDBANK,
+                    7,
+                    &[0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let immediate = u64::from(read_u32(&memory, OUT_C).expect("immediate cue"));
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    immediate,
+                    crate::xact::IFACE_CUE,
+                    4,
+                    &[u64::from(crate::xact::XACT_FLAG_STOP_IMMEDIATE)],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            assert_eq!(
+                xact_cue_state(&runtime, immediate),
+                Some(crate::xact::XACT_STATE_STOPPED)
+            );
+            assert!(cue_live_voice(&runtime, immediate).is_none());
+        })
+    }
+
+    #[test]
+    fn xact_logarithmic_release_curve_has_constant_decibel_shape() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = xact_test_runtime("xact-log-release");
+            let mut memory = MemoryImage::default();
+            let engine = xact_create_engine(&mut runtime, &mut memory);
+            let xgs = build_xgs_curve(1);
+            assert_eq!(
+                xact_initialize_with_settings(&mut runtime, &mut memory, engine, &xgs),
+                u64::from(crate::xact::S_OK)
+            );
+            let xwb = build_xwb("WaveBank", &[vec![500_i16; 88_200]], &[], &[]);
+            let xsb = simple_soundbank(&[("long", 0)]);
+            let (_wb, sb) = xact_load_banks(&mut runtime, &mut memory, engine, &xwb, &xsb);
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    sb,
+                    crate::xact::IFACE_SOUNDBANK,
+                    7,
+                    &[0, 0, 0, OUT_C],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let cue = u64::from(read_u32(&memory, OUT_C).expect("cue pointer"));
+            let voice = cue_live_voice(&runtime, cue).expect("live cue voice");
+            assert_eq!(
+                xact_call(
+                    &mut runtime,
+                    &mut memory,
+                    cue,
+                    crate::xact::IFACE_CUE,
+                    4,
+                    &[0],
+                ),
+                u64::from(crate::xact::S_OK)
+            );
+            let start_gain = runtime.audio.volume(voice).expect("authored start gain");
+            let mut gains = Vec::new();
+            for _ in 0..5 {
+                assert_eq!(
+                    xact_call(
+                        &mut runtime,
+                        &mut memory,
+                        engine,
+                        crate::xact::IFACE_ENGINE,
+                        8,
+                        &[],
+                    ),
+                    u64::from(crate::xact::S_OK)
+                );
+                gains.push(runtime.audio.volume(voice).expect("release gain"));
+            }
+            assert!((gains[0] - start_gain).abs() < 1.0e-4);
+            assert!(gains.windows(2).all(|pair| pair[0] >= pair[1]));
+            for (index, gain) in gains.iter().enumerate() {
+                let fraction = (8820.0 - 512.0 * index as f32) / 8820.0;
+                let expected = start_gain * 10.0_f32.powf(-3.0 * (1.0 - fraction));
+                assert!(
+                    (gain - expected).abs() < 1.0e-4,
+                    "logarithmic slice {index}: {gain} vs {expected}"
+                );
+            }
+            // The logarithmic amplitude curve falls far faster than a
+            // linear one: by slice 2 it is below half of the start gain and
+            // by slice 4 below a quarter (linear would be ~0.77).
+            assert!(gains[2] < start_gain * 0.5, "logarithmic shape: {gains:?}");
+            assert!(gains[4] < start_gain * 0.25, "logarithmic shape: {gains:?}");
+            for _ in 0..40 {
+                assert_eq!(
+                    xact_call(
+                        &mut runtime,
+                        &mut memory,
+                        engine,
+                        crate::xact::IFACE_ENGINE,
+                        8,
+                        &[],
+                    ),
+                    u64::from(crate::xact::S_OK)
+                );
+                if xact_cue_state(&runtime, cue) == Some(crate::xact::XACT_STATE_STOPPED) {
+                    break;
+                }
+            }
+            assert_eq!(
+                xact_cue_state(&runtime, cue),
+                Some(crate::xact::XACT_STATE_STOPPED)
+            );
         })
     }
 }

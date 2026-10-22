@@ -1247,6 +1247,30 @@ impl PeHostRuntime {
             return Ok(());
         }
         let normalized = nt::file::normalize_nt_object_name(&raw_name);
+        // Island device namespace: a loaded driver's `\Device\...` path (or
+        // its symbolic link) opens a handle whose I/O is dispatched to the
+        // driver's real MajorFunction.
+        if let Some(status) =
+            crate::driver_island::nt_open_island_device(self, memory, &raw_name, handle_ptr)
+        {
+            let status = nt::NtStatus::from_raw(status as u32);
+            if status == nt::STATUS_SUCCESS {
+                write_io_status_block(state, memory, io_status_block, status, 1, self.guest_arch)?;
+            } else {
+                write_io_status_block(state, memory, io_status_block, status, 0, self.guest_arch)?;
+            }
+            state.set(Register::Rax, u64::from(status.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        // An unknown `\Device\...` name is outside the file namespace.
+        if normalized.to_ascii_lowercase().starts_with("\\device\\") {
+            let status = nt::STATUS_OBJECT_NAME_NOT_FOUND;
+            write_io_status_block(state, memory, io_status_block, status, 0, self.guest_arch)?;
+            state.set(Register::Rax, u64::from(status.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
         // Named pipes route through the pipe client opener (same as the
         // Win32 CreateFileW path).
         if normalized.starts_with("\\\\.\\pipe\\") || normalized.starts_with("\\\\?\\pipe\\") {
@@ -1335,6 +1359,34 @@ impl PeHostRuntime {
         let output_buffer = guest_call_arg(state, memory, 8)?;
         let output_length = guest_call_arg_u32(state, memory, 9)?;
 
+        if crate::driver_island::is_island_device_handle(self, file_handle) {
+            let result = crate::driver_island::dispatch_island_device_io(
+                self,
+                memory,
+                file_handle,
+                crate::casak::io::IrpMajorFunction::DeviceControl,
+                io_control_code,
+                input_buffer,
+                input_length,
+                output_buffer,
+                output_length,
+                0,
+            )?;
+            if let Some((status, information)) = result {
+                let status = nt::NtStatus::from_raw(status as u32);
+                write_io_status_block(
+                    state,
+                    memory,
+                    io_status_block,
+                    status,
+                    information as u64,
+                    self.guest_arch,
+                )?;
+                state.set(Register::Rax, u64::from(status.raw()));
+                self.last_error = 0;
+                return Ok(());
+            }
+        }
         let info_offset = match self.guest_arch {
             GuestArch::X64 => 8_u64,
             GuestArch::X86 => 4_u64,
@@ -1376,6 +1428,110 @@ impl PeHostRuntime {
             write_io_status_block(state, memory, io_status_block, status, 0, self.guest_arch)?;
             state.set(Register::Rax, u64::from(status.raw()));
         }
+        Ok(())
+    }
+
+    /// `NtReadFile` — island device handles dispatch `IRP_MJ_READ` to the
+    /// driver's real MajorFunction; ordinary file handles use the file layer.
+    pub(crate) fn dispatch_nt_read_file(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let file_handle = guest_call_arg_u32(state, memory, 0)?;
+        let io_status_block = guest_call_arg(state, memory, 4)?;
+        let buffer = guest_call_arg(state, memory, 5)?;
+        let length = guest_call_arg_u32(state, memory, 6)?;
+        let byte_offset_ptr = guest_call_arg(state, memory, 7)?;
+        let byte_offset = if byte_offset_ptr != 0 {
+            read_guest_pointer(memory, byte_offset_ptr, self.guest_arch).unwrap_or(0)
+        } else {
+            0
+        };
+        if crate::driver_island::is_island_device_handle(self, file_handle) {
+            let result = crate::driver_island::dispatch_island_device_io(
+                self,
+                memory,
+                file_handle,
+                crate::casak::io::IrpMajorFunction::Read,
+                0,
+                0,
+                0,
+                buffer,
+                length,
+                byte_offset,
+            )?;
+            if let Some((status, information)) = result {
+                let status = nt::NtStatus::from_raw(status as u32);
+                write_io_status_block(
+                    state,
+                    memory,
+                    io_status_block,
+                    status,
+                    information as u64,
+                    self.guest_arch,
+                )?;
+                state.set(Register::Rax, u64::from(status.raw()));
+                self.last_error = 0;
+                return Ok(());
+            }
+        }
+        let status = nt::STATUS_INVALID_HANDLE;
+        write_io_status_block(state, memory, io_status_block, status, 0, self.guest_arch)?;
+        state.set(Register::Rax, u64::from(status.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `NtWriteFile` — island device handles dispatch `IRP_MJ_WRITE` to the
+    /// driver's real MajorFunction.
+    pub(crate) fn dispatch_nt_write_file(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let file_handle = guest_call_arg_u32(state, memory, 0)?;
+        let io_status_block = guest_call_arg(state, memory, 4)?;
+        let buffer = guest_call_arg(state, memory, 5)?;
+        let length = guest_call_arg_u32(state, memory, 6)?;
+        let byte_offset_ptr = guest_call_arg(state, memory, 7)?;
+        let byte_offset = if byte_offset_ptr != 0 {
+            read_guest_pointer(memory, byte_offset_ptr, self.guest_arch).unwrap_or(0)
+        } else {
+            0
+        };
+        if crate::driver_island::is_island_device_handle(self, file_handle) {
+            let result = crate::driver_island::dispatch_island_device_io(
+                self,
+                memory,
+                file_handle,
+                crate::casak::io::IrpMajorFunction::Write,
+                0,
+                buffer,
+                length,
+                0,
+                0,
+                byte_offset,
+            )?;
+            if let Some((status, information)) = result {
+                let status = nt::NtStatus::from_raw(status as u32);
+                write_io_status_block(
+                    state,
+                    memory,
+                    io_status_block,
+                    status,
+                    information as u64,
+                    self.guest_arch,
+                )?;
+                state.set(Register::Rax, u64::from(status.raw()));
+                self.last_error = 0;
+                return Ok(());
+            }
+        }
+        let status = nt::STATUS_INVALID_HANDLE;
+        write_io_status_block(state, memory, io_status_block, status, 0, self.guest_arch)?;
+        state.set(Register::Rax, u64::from(status.raw()));
+        self.last_error = 0;
         Ok(())
     }
 

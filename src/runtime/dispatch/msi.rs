@@ -163,12 +163,14 @@ pub(crate) struct MsiTable {
     pub(crate) rows: Vec<Vec<MsiValue>>,
 }
 
-/// One `SELECT` item.  A `None` column is `*`/`table.*`.
+/// One `SELECT` item.  A `None` column is `*`/`table.*`; `expression`
+/// carries aggregates, literals, parameters and scalar subqueries.
 #[derive(Debug, Clone)]
 struct SqlSelectItem {
     table: Option<String>,
     column: Option<String>,
     alias: Option<String>,
+    expression: Option<SqlExpr>,
 }
 
 /// A table reference in `FROM`, with an optional `AS`/bare alias.
@@ -182,13 +184,16 @@ struct SqlTableRef {
 enum SqlJoinKind {
     Inner,
     LeftOuter,
+    RightOuter,
+    FullOuter,
+    Cross,
 }
 
 #[derive(Debug, Clone)]
 struct SqlJoin {
     kind: SqlJoinKind,
     table: SqlTableRef,
-    on: SqlExpr,
+    on: Option<SqlExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,11 +212,11 @@ enum SqlCompareOp {
     Ge,
 }
 
-/// The supported expression set is deliberately small: a column reference
-/// (optionally `Table.Column` or `Alias.Column`), an integer/string literal,
-/// a positional `?` parameter, `IS [NOT] NULL`, the comparison operators
-/// `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, and `AND`/`OR` with parentheses.
-/// There are no arithmetic, function, subquery or `NOT` expressions.
+/// The supported expression set: a column reference (optionally
+/// `Table.Column` or `Alias.Column`), an integer/string literal, a positional
+/// `?` parameter, `IS [NOT] NULL`, comparisons, `[NOT] LIKE ... [ESCAPE c]`,
+/// `[NOT] BETWEEN`, `[NOT] IN (list|subquery)`, unary `NOT`, parentheses,
+/// `AND`/`OR`, aggregates and scalar subqueries.
 #[derive(Debug, Clone)]
 enum SqlExpr {
     Column {
@@ -231,6 +236,43 @@ enum SqlExpr {
     },
     And(Box<SqlExpr>, Box<SqlExpr>),
     Or(Box<SqlExpr>, Box<SqlExpr>),
+    Not(Box<SqlExpr>),
+    Like {
+        value: Box<SqlExpr>,
+        pattern: Box<SqlExpr>,
+        escape: Option<char>,
+        negated: bool,
+    },
+    Between {
+        value: Box<SqlExpr>,
+        low: Box<SqlExpr>,
+        high: Box<SqlExpr>,
+        negated: bool,
+    },
+    InList {
+        value: Box<SqlExpr>,
+        items: Vec<SqlExpr>,
+        negated: bool,
+    },
+    InQuery {
+        value: Box<SqlExpr>,
+        query: Box<MsiQuery>,
+        negated: bool,
+    },
+    ScalarQuery(Box<MsiQuery>),
+    Aggregate {
+        function: SqlAggregate,
+        argument: Option<Box<SqlExpr>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlAggregate {
+    Count,
+    Sum,
+    Average,
+    Min,
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,22 +283,31 @@ enum SqlDirection {
 
 #[derive(Debug, Clone)]
 struct SqlOrderKey {
-    table: Option<String>,
-    name: String,
+    expr: SqlExpr,
     direction: SqlDirection,
+}
+
+#[derive(Debug, Clone)]
+struct SqlUnionPart {
+    all: bool,
+    query: Box<MsiQuery>,
 }
 
 /// A parsed SELECT statement before schema resolution.  MSI SQL surface:
 /// `SELECT [DISTINCT] *|exprlist FROM table [alias]
-///  [INNER|LEFT [OUTER] JOIN table [alias] ON expr]...
-///  [WHERE expr] [ORDER BY column [ASC|DESC], ...]`.
+///  [{INNER|LEFT|RIGHT|FULL [OUTER]|CROSS} JOIN table [alias] [ON expr]]...
+///  [WHERE expr] [GROUP BY exprlist] [HAVING expr]
+///  [UNION [ALL] SELECT ...]... [ORDER BY expr [ASC|DESC], ...]`.
 #[derive(Debug, Clone)]
 struct MsiQuery {
     distinct: bool,
     columns: Vec<SqlSelectItem>,
     from: SqlFrom,
     filter: Option<SqlExpr>,
+    group_by: Vec<SqlExpr>,
+    having: Option<SqlExpr>,
     order: Vec<SqlOrderKey>,
+    unions: Vec<SqlUnionPart>,
     parameter_count: usize,
 }
 
@@ -268,25 +319,29 @@ struct ResolvedTable {
 }
 
 /// One projected output column and its label/type for `MsiViewGetColumnInfo`.
+/// `expression` is set for aggregate/literal/parameter/subquery items; a
+/// plain column keeps the direct (table, column) pair.
 #[derive(Debug, Clone)]
 struct ResolvedColumn {
     table: usize,
     column: usize,
     label: String,
     type_name: String,
+    expression: Option<ResolvedExpr>,
 }
 
 #[derive(Debug, Clone)]
 struct ResolvedJoin {
     table: usize,
     kind: SqlJoinKind,
-    on: ResolvedExpr,
+    on: Option<ResolvedExpr>,
 }
 
 #[derive(Debug, Clone)]
 enum OrderSource {
     Column { table: usize, column: usize },
     Output(usize),
+    Expr(ResolvedExpr),
 }
 
 #[derive(Debug, Clone)]
@@ -323,6 +378,40 @@ enum ResolvedExpr {
     },
     And(Box<ResolvedExpr>, Box<ResolvedExpr>),
     Or(Box<ResolvedExpr>, Box<ResolvedExpr>),
+    Not(Box<ResolvedExpr>),
+    Like {
+        value: Box<ResolvedExpr>,
+        pattern: Box<ResolvedExpr>,
+        escape: Option<char>,
+        negated: bool,
+    },
+    Between {
+        value: Box<ResolvedExpr>,
+        low: Box<ResolvedExpr>,
+        high: Box<ResolvedExpr>,
+        negated: bool,
+    },
+    InList {
+        value: Box<ResolvedExpr>,
+        items: Vec<ResolvedExpr>,
+        negated: bool,
+    },
+    InQuery {
+        value: Box<ResolvedExpr>,
+        query: Box<ResolvedQuery>,
+        negated: bool,
+    },
+    ScalarQuery(Box<ResolvedQuery>),
+    Aggregate {
+        function: SqlAggregate,
+        argument: Option<Box<ResolvedExpr>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedUnion {
+    all: bool,
+    query: Box<ResolvedQuery>,
 }
 
 #[derive(Debug, Clone)]
@@ -332,16 +421,23 @@ struct ResolvedQuery {
     columns: Vec<ResolvedColumn>,
     joins: Vec<ResolvedJoin>,
     filter: Option<ResolvedExpr>,
+    group_by: Vec<ResolvedExpr>,
+    having: Option<ResolvedExpr>,
+    grouped: bool,
     order: Vec<ResolvedOrder>,
+    unions: Vec<ResolvedUnion>,
     parameter_expectations: Vec<ParameterExpectation>,
 }
 
 /// A projected view row plus the source row index in each FROM table
-/// (`None` for the null-extended side of an outer join).
+/// (`None` for the null-extended side of an outer join).  `group` retains
+/// the source rows of an aggregate group so ORDER BY aggregate expressions
+/// can be evaluated after projection.
 #[derive(Debug, Clone)]
 struct ViewRow {
     values: Vec<MsiValue>,
     source: Vec<Option<usize>>,
+    group: Option<Vec<Vec<Option<usize>>>>,
 }
 
 /// A view: the resolved query plus the executed row snapshot and cursor.
@@ -369,13 +465,32 @@ pub(crate) struct MsiDatabaseState {
     extras: BTreeMap<String, (bool, Vec<u8>)>,
 }
 
-/// A directory entry in an OLE compound file.
+/// A directory entry in an OLE compound file.  The tree pointers and the
+/// per-storage CLSID/timestamps are retained so nested storages can be
+/// resolved by path and round-tripped through the writer.
 #[derive(Debug, Clone)]
 pub(crate) struct CompoundEntry {
     pub(crate) name: String,
     pub(crate) kind: u8,
     pub(crate) start: u32,
     pub(crate) size: u64,
+    pub(crate) left: u32,
+    pub(crate) right: u32,
+    pub(crate) child: u32,
+    pub(crate) clsid: [u8; 16],
+    #[allow(dead_code)] // parsed/written for CFB timestamp round-trip coverage
+    pub(crate) created: u64,
+    #[allow(dead_code)] // parsed/written for CFB timestamp round-trip coverage
+    pub(crate) modified: u64,
+}
+
+impl CompoundEntry {
+    /// The element name with the MSI stream-name encoding removed.
+    pub(crate) fn decoded_name(&self) -> String {
+        decode_stream_name(&self.name)
+            .trim_start_matches('\u{4840}')
+            .to_string()
+    }
 }
 
 /// A parsed OLE compound file (CFB v3/v4) with its allocation tables and
@@ -480,6 +595,15 @@ impl CompoundFile {
                 .collect();
             let name = String::from_utf16_lossy(&name_units);
             let kind = chunk[0x42];
+            let left = le_u32(chunk, 0x44).unwrap_or(NOSTREAM);
+            let right = le_u32(chunk, 0x48).unwrap_or(NOSTREAM);
+            let child = le_u32(chunk, 0x4C).unwrap_or(NOSTREAM);
+            let mut clsid = [0_u8; 16];
+            if let Some(bytes) = chunk.get(0x50..0x60) {
+                clsid.copy_from_slice(bytes);
+            }
+            let created = le_u64(chunk, 0x64).unwrap_or(0);
+            let modified = le_u64(chunk, 0x6C).unwrap_or(0);
             let start = le_u32(chunk, 0x74).unwrap_or(ENDOFCHAIN);
             let size = if major == 3 {
                 u64::from(le_u32(chunk, 0x78).unwrap_or(0))
@@ -491,8 +615,15 @@ impl CompoundFile {
                 kind,
                 start,
                 size,
+                left,
+                right,
+                child,
+                clsid,
+                created,
+                modified,
             });
         }
+        Self::validate_directory(&entries)?;
 
         let mut mini_fat = Vec::new();
         if mini_fat_start != ENDOFCHAIN && mini_fat_count > 0 {
@@ -520,6 +651,78 @@ impl CompoundFile {
             entries,
             mini_stream,
         })
+    }
+
+    /// Reject directory trees that reference absent entries or contain
+    /// sibling/child cycles.  A compound file without a root storage is also
+    /// malformed.  Free entries are not traversed (their link fields are
+    /// ignored storage).
+    fn validate_directory(entries: &[CompoundEntry]) -> Result<(), String> {
+        let mut root_index = None;
+        for (index, entry) in entries.iter().enumerate() {
+            if !matches!(entry.kind, 0 | 1 | 2 | 5) {
+                return Err(format!("directory entry {index} has invalid type"));
+            }
+            if entry.kind == 5 {
+                if root_index.is_some() {
+                    return Err("compound file has multiple root storages".to_string());
+                }
+                root_index = Some(index);
+            }
+            if entry.kind == 0 {
+                continue;
+            }
+            for (pointer, edge) in [
+                (entry.left, "left"),
+                (entry.right, "right"),
+                (entry.child, "child"),
+            ] {
+                if pointer == NOSTREAM {
+                    continue;
+                }
+                let target = pointer as usize;
+                if target >= entries.len() {
+                    return Err(format!(
+                        "directory entry {index} {edge} pointer references absent entry {target}"
+                    ));
+                }
+                if entries[target].kind == 0 {
+                    return Err(format!(
+                        "directory entry {index} {edge} pointer references a free entry"
+                    ));
+                }
+            }
+        }
+        if root_index.is_none() {
+            return Err("compound file has no root storage".to_string());
+        }
+
+        let mut colors = vec![0_u8; entries.len()];
+        fn visit(index: usize, entries: &[CompoundEntry], colors: &mut [u8]) -> Result<(), String> {
+            match colors[index] {
+                1 => return Err("cyclic compound-file directory tree".to_string()),
+                2 => return Ok(()),
+                _ => {}
+            }
+            colors[index] = 1;
+            if entries[index].kind != 0 {
+                for pointer in [
+                    entries[index].left,
+                    entries[index].right,
+                    entries[index].child,
+                ] {
+                    if pointer != NOSTREAM {
+                        visit(pointer as usize, entries, colors)?;
+                    }
+                }
+            }
+            colors[index] = 2;
+            Ok(())
+        }
+        for index in 0..entries.len() {
+            visit(index, entries, &mut colors)?;
+        }
+        Ok(())
     }
 
     fn sector_slice(bytes: &[u8], sector: u32, sector_size: usize) -> Result<&[u8], String> {
@@ -628,6 +831,101 @@ impl CompoundFile {
                 decoded.trim_start_matches('\u{4840}').to_string()
             })
             .collect()
+    }
+
+    pub(crate) fn root_entry(&self) -> Option<&CompoundEntry> {
+        self.entries.iter().find(|entry| entry.kind == 5)
+    }
+
+    /// Enumerate the directory entries below `storage` in sibling order.
+    fn child_indices(&self, storage: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let Some(storage_entry) = self.entries.get(storage) else {
+            return out;
+        };
+        let mut stack = Vec::new();
+        let mut current = storage_entry.child;
+        while current != NOSTREAM || !stack.is_empty() {
+            while current != NOSTREAM {
+                let Some(entry) = self.entries.get(current as usize) else {
+                    return out;
+                };
+                stack.push(current);
+                current = entry.left;
+            }
+            let Some(index) = stack.pop() else {
+                break;
+            };
+            let Some(entry) = self.entries.get(index as usize) else {
+                break;
+            };
+            out.push(index as usize);
+            current = entry.right;
+        }
+        out
+    }
+
+    /// Resolve a storage or stream path such as
+    /// `Root/Storage/Sub/Stream`.  Both `/` and `\` separators are accepted,
+    /// a leading `Root`/`Root Entry` component is optional, and names match
+    /// case-insensitively.
+    pub(crate) fn entry_index_at(&self, path: &str) -> Option<usize> {
+        let root = self.entries.iter().position(|entry| entry.kind == 5)?;
+        let root_name = self.entries[root].decoded_name();
+        let mut current = root;
+        for part in path.split(|ch| ch == '/' || ch == '\\') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if current == root
+                && (part.eq_ignore_ascii_case("Root")
+                    || part.eq_ignore_ascii_case("Root Entry")
+                    || part.eq_ignore_ascii_case(&root_name))
+            {
+                continue;
+            }
+            let entry = self.entries.get(current)?;
+            if entry.kind != 1 && entry.kind != 5 {
+                return None;
+            }
+            current = self.child_indices(current).into_iter().find(|index| {
+                let child = &self.entries[*index];
+                child.decoded_name().eq_ignore_ascii_case(part)
+                    || child.name.eq_ignore_ascii_case(part)
+            })?;
+        }
+        Some(current)
+    }
+
+    pub(crate) fn entry_at(&self, path: &str) -> Option<&CompoundEntry> {
+        self.entry_index_at(path)
+            .and_then(|index| self.entries.get(index))
+    }
+
+    /// The direct children of a storage (streams and child storages).
+    pub(crate) fn children(&self, path: &str) -> Option<Vec<CompoundEntry>> {
+        let index = self.entry_index_at(path)?;
+        let entry = self.entries.get(index)?;
+        if entry.kind != 1 && entry.kind != 5 {
+            return None;
+        }
+        Some(
+            self.child_indices(index)
+                .into_iter()
+                .filter_map(|child| self.entries.get(child).cloned())
+                .filter(|child| child.kind == 1 || child.kind == 2)
+                .collect(),
+        )
+    }
+
+    pub(crate) fn stream_at(&self, path: &str) -> Option<Vec<u8>> {
+        let index = self.entry_index_at(path)?;
+        let entry = self.entries.get(index)?;
+        if entry.kind != 2 {
+            return None;
+        }
+        self.read_entry(entry).ok()
     }
 }
 
@@ -1440,11 +1738,11 @@ impl PeHostRuntime {
         }
         let source = vec![Some(row_index)];
         if let Some(filter) = &view.query.filter {
-            if !eval_expr(database, &view.query, &source, &view.bound, filter) {
+            if !eval_expr(database, &view.query, &source, &view.bound, None, filter) {
                 return ERROR_NO_MORE_ITEMS;
             }
         }
-        let values = project_row(database, &view.query, &source);
+        let values = project_row(database, &view.query, &source, &view.bound, None);
         let Some(position) = view
             .rows
             .iter()
@@ -1707,11 +2005,91 @@ fn source_value(
         .unwrap_or(MsiValue::Null)
 }
 
+fn eval_aggregate(
+    database: &MsiDatabaseState,
+    query: &ResolvedQuery,
+    parameters: &[MsiValue],
+    group: Option<&[Vec<Option<usize>>]>,
+    function: SqlAggregate,
+    argument: Option<&ResolvedExpr>,
+) -> MsiValue {
+    let Some(group) = group else {
+        return MsiValue::Null;
+    };
+    match function {
+        SqlAggregate::Count => {
+            let Some(argument) = argument else {
+                return MsiValue::Int(group.len() as i32);
+            };
+            let count = group
+                .iter()
+                .filter(|source| {
+                    !matches!(
+                        eval_value(database, query, source, parameters, None, argument),
+                        MsiValue::Null
+                    )
+                })
+                .count();
+            MsiValue::Int(count as i32)
+        }
+        SqlAggregate::Sum | SqlAggregate::Average => {
+            let Some(argument) = argument else {
+                return MsiValue::Null;
+            };
+            let mut total = 0i64;
+            let mut count = 0i64;
+            for source in group {
+                if let MsiValue::Int(number) =
+                    eval_value(database, query, source, parameters, None, argument)
+                {
+                    total += i64::from(number);
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                return MsiValue::Null;
+            }
+            if function == SqlAggregate::Average {
+                total /= count;
+            }
+            MsiValue::Int(total.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+        }
+        SqlAggregate::Min | SqlAggregate::Max => {
+            let Some(argument) = argument else {
+                return MsiValue::Null;
+            };
+            let mut best: Option<MsiValue> = None;
+            for source in group {
+                let value = eval_value(database, query, source, parameters, None, argument);
+                if matches!(value, MsiValue::Null) {
+                    continue;
+                }
+                let replace = match &best {
+                    None => true,
+                    Some(current) => {
+                        let ordering = compare_order_values(&value, current);
+                        if function == SqlAggregate::Min {
+                            ordering.is_lt()
+                        } else {
+                            ordering.is_gt()
+                        }
+                    }
+                };
+                if replace {
+                    best = Some(value);
+                }
+            }
+            best.unwrap_or(MsiValue::Null)
+        }
+    }
+}
+
 fn eval_value(
     database: &MsiDatabaseState,
     query: &ResolvedQuery,
     source: &[Option<usize>],
     parameters: &[MsiValue],
+    group: Option<&[Vec<Option<usize>>]>,
     expression: &ResolvedExpr,
 ) -> MsiValue {
     match expression {
@@ -1720,8 +2098,100 @@ fn eval_value(
         }
         ResolvedExpr::Literal(value) => value.clone(),
         ResolvedExpr::Parameter(index) => parameters.get(*index).cloned().unwrap_or(MsiValue::Null),
+        ResolvedExpr::Aggregate { function, argument } => eval_aggregate(
+            database,
+            query,
+            parameters,
+            group,
+            *function,
+            argument.as_deref(),
+        ),
+        ResolvedExpr::ScalarQuery(subquery) => execute_query(database, subquery, parameters)
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|row| row.values.into_iter().next())
+            .unwrap_or(MsiValue::Null),
         _ => MsiValue::Null,
     }
+}
+
+fn like_match(text: &str, pattern: &str, escape: Option<char>) -> bool {
+    let text: Vec<char> = text.chars().map(sql_lower).collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+
+    fn matches(text: &[char], pattern: &[char], escape: Option<char>) -> bool {
+        let Some((&head, rest)) = pattern.split_first() else {
+            return text.is_empty();
+        };
+        if Some(head) == escape {
+            let Some((&literal, tail)) = rest.split_first() else {
+                return false;
+            };
+            return text.first().is_some_and(|ch| *ch == sql_lower(literal))
+                && matches(&text[1..], tail, escape);
+        }
+        match head {
+            '%' => {
+                let mut start = 0;
+                loop {
+                    if matches(&text[start..], rest, escape) {
+                        return true;
+                    }
+                    if start >= text.len() {
+                        return false;
+                    }
+                    start += 1;
+                }
+            }
+            '_' => !text.is_empty() && matches(&text[1..], rest, escape),
+            '[' => {
+                let mut index = 0;
+                let mut negated = false;
+                if rest.first() == Some(&'^') {
+                    negated = true;
+                    index += 1;
+                }
+                let mut class_match = false;
+                let mut first = true;
+                let mut closed = false;
+                while index < rest.len() {
+                    if rest[index] == ']' && !first {
+                        closed = true;
+                        break;
+                    }
+                    first = false;
+                    let mut ch = rest[index];
+                    if Some(ch) == escape && index + 1 < rest.len() {
+                        index += 1;
+                        ch = rest[index];
+                    }
+                    if index + 2 < rest.len() && rest[index + 1] == '-' && rest[index + 2] != ']' {
+                        let start = sql_lower(ch);
+                        let end = sql_lower(rest[index + 2]);
+                        if text.first().is_some_and(|c| *c >= start && *c <= end) {
+                            class_match = true;
+                        }
+                        index += 3;
+                    } else {
+                        if text.first().is_some_and(|c| *c == sql_lower(ch)) {
+                            class_match = true;
+                        }
+                        index += 1;
+                    }
+                }
+                if !closed || !text.first().is_some_and(|_| class_match != negated) {
+                    return false;
+                }
+                matches(&text[1..], &rest[index + 1..], escape)
+            }
+            other => {
+                text.first().is_some_and(|ch| *ch == sql_lower(other))
+                    && matches(&text[1..], rest, escape)
+            }
+        }
+    }
+
+    matches(&text, &pattern, escape)
 }
 
 fn eval_expr(
@@ -1729,28 +2199,111 @@ fn eval_expr(
     query: &ResolvedQuery,
     source: &[Option<usize>],
     parameters: &[MsiValue],
+    group: Option<&[Vec<Option<usize>>]>,
     expression: &ResolvedExpr,
 ) -> bool {
     match expression {
         ResolvedExpr::And(left, right) => {
-            eval_expr(database, query, source, parameters, left)
-                && eval_expr(database, query, source, parameters, right)
+            eval_expr(database, query, source, parameters, group, left)
+                && eval_expr(database, query, source, parameters, group, right)
         }
         ResolvedExpr::Or(left, right) => {
-            eval_expr(database, query, source, parameters, left)
-                || eval_expr(database, query, source, parameters, right)
+            eval_expr(database, query, source, parameters, group, left)
+                || eval_expr(database, query, source, parameters, group, right)
         }
+        ResolvedExpr::Not(inner) => !eval_expr(database, query, source, parameters, group, inner),
         ResolvedExpr::Compare { left, op, right } => compare_msi_values(
-            &eval_value(database, query, source, parameters, left),
+            &eval_value(database, query, source, parameters, group, left),
             *op,
-            &eval_value(database, query, source, parameters, right),
+            &eval_value(database, query, source, parameters, group, right),
         ),
         ResolvedExpr::IsNull { value, negated } => {
             let is_null = matches!(
-                eval_value(database, query, source, parameters, value),
+                eval_value(database, query, source, parameters, group, value),
                 MsiValue::Null
             );
             if *negated { !is_null } else { is_null }
+        }
+        ResolvedExpr::Like {
+            value,
+            pattern,
+            escape,
+            negated,
+        } => {
+            let value = eval_value(database, query, source, parameters, group, value);
+            let pattern = eval_value(database, query, source, parameters, group, pattern);
+            let (MsiValue::Str(text), MsiValue::Str(pattern)) = (value, pattern) else {
+                return false;
+            };
+            let matched = like_match(&text, &pattern, *escape);
+            if *negated { !matched } else { matched }
+        }
+        ResolvedExpr::Between {
+            value,
+            low,
+            high,
+            negated,
+        } => {
+            let value = eval_value(database, query, source, parameters, group, value);
+            let low = eval_value(database, query, source, parameters, group, low);
+            let high = eval_value(database, query, source, parameters, group, high);
+            if matches!(value, MsiValue::Null)
+                || matches!(low, MsiValue::Null)
+                || matches!(high, MsiValue::Null)
+            {
+                return false;
+            }
+            let matched = compare_msi_values(&value, SqlCompareOp::Ge, &low)
+                && compare_msi_values(&value, SqlCompareOp::Le, &high);
+            if *negated { !matched } else { matched }
+        }
+        ResolvedExpr::InList {
+            value,
+            items,
+            negated,
+        } => {
+            let value = eval_value(database, query, source, parameters, group, value);
+            if matches!(value, MsiValue::Null) {
+                return false;
+            }
+            let mut found = false;
+            let mut has_null = false;
+            for item in items {
+                let item = eval_value(database, query, source, parameters, group, item);
+                if matches!(item, MsiValue::Null) {
+                    has_null = true;
+                } else if msi_value_equal(&value, &item) {
+                    found = true;
+                }
+            }
+            if *negated { !found && !has_null } else { found }
+        }
+        ResolvedExpr::InQuery {
+            value,
+            query: subquery,
+            negated,
+        } => {
+            let value = eval_value(database, query, source, parameters, group, value);
+            if matches!(value, MsiValue::Null) {
+                return false;
+            }
+            let Ok(rows) = execute_query(database, subquery, parameters) else {
+                return false;
+            };
+            let mut found = false;
+            let mut has_null = false;
+            for row in rows {
+                match row.values.first() {
+                    Some(MsiValue::Null) => has_null = true,
+                    Some(item) => {
+                        if msi_value_equal(&value, item) {
+                            found = true;
+                        }
+                    }
+                    None => {}
+                }
+            }
+            if *negated { !found && !has_null } else { found }
         }
         _ => false,
     }
@@ -1760,11 +2313,16 @@ fn project_row(
     database: &MsiDatabaseState,
     query: &ResolvedQuery,
     source: &[Option<usize>],
+    parameters: &[MsiValue],
+    group: Option<&[Vec<Option<usize>>]>,
 ) -> Vec<MsiValue> {
     query
         .columns
         .iter()
-        .map(|column| source_value(database, &query.tables, source, column.table, column.column))
+        .map(|column| match &column.expression {
+            Some(expression) => eval_value(database, query, source, parameters, group, expression),
+            None => source_value(database, &query.tables, source, column.table, column.column),
+        })
         .collect()
 }
 
@@ -1791,12 +2349,17 @@ fn order_value(
     query: &ResolvedQuery,
     source: &[Option<usize>],
     values: &[MsiValue],
+    parameters: &[MsiValue],
+    group: Option<&[Vec<Option<usize>>]>,
     key: &OrderSource,
 ) -> MsiValue {
     match key {
         OrderSource::Output(index) => values.get(*index).cloned().unwrap_or(MsiValue::Null),
         OrderSource::Column { table, column } => {
             source_value(database, &query.tables, source, *table, *column)
+        }
+        OrderSource::Expr(expression) => {
+            eval_value(database, query, source, parameters, group, expression)
         }
     }
 }
@@ -1816,12 +2379,32 @@ fn compare_order_values(left: &MsiValue, right: &MsiValue) -> std::cmp::Ordering
     }
 }
 
-fn sort_rows(database: &MsiDatabaseState, query: &ResolvedQuery, rows: &mut [ViewRow]) {
+fn sort_rows(
+    database: &MsiDatabaseState,
+    query: &ResolvedQuery,
+    parameters: &[MsiValue],
+    rows: &mut [ViewRow],
+) {
     rows.sort_by(|left, right| {
         for order in &query.order {
-            let left_value = order_value(database, query, &left.source, &left.values, &order.key);
-            let right_value =
-                order_value(database, query, &right.source, &right.values, &order.key);
+            let left_value = order_value(
+                database,
+                query,
+                &left.source,
+                &left.values,
+                parameters,
+                left.group.as_deref(),
+                &order.key,
+            );
+            let right_value = order_value(
+                database,
+                query,
+                &right.source,
+                &right.values,
+                parameters,
+                right.group.as_deref(),
+                &order.key,
+            );
             let mut ordering = compare_order_values(&left_value, &right_value);
             if order.direction == SqlDirection::Descending {
                 ordering = ordering.reverse();
@@ -1834,7 +2417,41 @@ fn sort_rows(database: &MsiDatabaseState, query: &ResolvedQuery, rows: &mut [Vie
     });
 }
 
+fn join_matches(
+    database: &MsiDatabaseState,
+    query: &ResolvedQuery,
+    source: &[Option<usize>],
+    parameters: &[MsiValue],
+    on: &Option<ResolvedExpr>,
+) -> bool {
+    match on {
+        Some(on) => eval_expr(database, query, source, parameters, None, on),
+        None => true,
+    }
+}
+
 fn execute_query(
+    database: &MsiDatabaseState,
+    query: &ResolvedQuery,
+    parameters: &[MsiValue],
+) -> Result<Vec<ViewRow>, u32> {
+    let mut rows = execute_query_core(database, query, parameters)?;
+    if !query.unions.is_empty() {
+        for union in &query.unions {
+            let mut part = execute_query(database, &union.query, parameters)?;
+            rows.append(&mut part);
+        }
+        if query.unions.iter().any(|union| !union.all) {
+            deduplicate_rows(&mut rows);
+        }
+    }
+    if !query.order.is_empty() {
+        sort_rows(database, query, parameters, &mut rows);
+    }
+    Ok(rows)
+}
+
+fn execute_query_core(
     database: &MsiDatabaseState,
     query: &ResolvedQuery,
     parameters: &[MsiValue],
@@ -1851,40 +2468,163 @@ fn execute_query(
             return Err(ERROR_BAD_QUERY_SYNTAX);
         };
         let table = database.table(&meta.name).ok_or(ERROR_INVALID_TABLE)?;
+        let width = join.table;
         let mut combined = Vec::new();
-        for source in partial {
-            let mut matched = false;
-            for row_index in 0..table.rows.len() {
-                let mut candidate = source.clone();
-                candidate.push(Some(row_index));
-                if eval_expr(database, query, &candidate, parameters, &join.on) {
-                    matched = true;
-                    combined.push(candidate);
+        match join.kind {
+            SqlJoinKind::Cross => {
+                for source in partial {
+                    for row_index in 0..table.rows.len() {
+                        let mut candidate = source.clone();
+                        candidate.push(Some(row_index));
+                        combined.push(candidate);
+                    }
                 }
             }
-            if !matched && join.kind == SqlJoinKind::LeftOuter {
-                let mut candidate = source;
-                candidate.push(None);
-                combined.push(candidate);
+            SqlJoinKind::Inner | SqlJoinKind::LeftOuter => {
+                for source in partial {
+                    let mut matched = false;
+                    for row_index in 0..table.rows.len() {
+                        let mut candidate = source.clone();
+                        candidate.push(Some(row_index));
+                        if join_matches(database, query, &candidate, parameters, &join.on) {
+                            matched = true;
+                            combined.push(candidate);
+                        }
+                    }
+                    if !matched && join.kind == SqlJoinKind::LeftOuter {
+                        let mut candidate = source;
+                        candidate.push(None);
+                        combined.push(candidate);
+                    }
+                }
+            }
+            SqlJoinKind::RightOuter => {
+                let mut right_matched = vec![false; table.rows.len()];
+                for source in &partial {
+                    for row_index in 0..table.rows.len() {
+                        let mut candidate = source.clone();
+                        candidate.push(Some(row_index));
+                        if join_matches(database, query, &candidate, parameters, &join.on) {
+                            right_matched[row_index] = true;
+                            combined.push(candidate);
+                        }
+                    }
+                }
+                for (row_index, matched) in right_matched.iter().enumerate() {
+                    if !matched {
+                        let mut candidate = vec![None; width];
+                        candidate.push(Some(row_index));
+                        combined.push(candidate);
+                    }
+                }
+            }
+            SqlJoinKind::FullOuter => {
+                let mut right_matched = vec![false; table.rows.len()];
+                for source in partial {
+                    let mut matched = false;
+                    for row_index in 0..table.rows.len() {
+                        let mut candidate = source.clone();
+                        candidate.push(Some(row_index));
+                        if join_matches(database, query, &candidate, parameters, &join.on) {
+                            matched = true;
+                            right_matched[row_index] = true;
+                            combined.push(candidate);
+                        }
+                    }
+                    if !matched {
+                        let mut candidate = source;
+                        candidate.push(None);
+                        combined.push(candidate);
+                    }
+                }
+                for (row_index, matched) in right_matched.iter().enumerate() {
+                    if !matched {
+                        let mut candidate = vec![None; width];
+                        candidate.push(Some(row_index));
+                        combined.push(candidate);
+                    }
+                }
             }
         }
         partial = combined;
     }
+    let filtered: Vec<Vec<Option<usize>>> = partial
+        .into_iter()
+        .filter(|source| match &query.filter {
+            Some(filter) => eval_expr(database, query, source, parameters, None, filter),
+            None => true,
+        })
+        .collect();
     let mut rows = Vec::new();
-    for source in partial {
-        if let Some(filter) = &query.filter {
-            if !eval_expr(database, query, &source, parameters, filter) {
-                continue;
+    if query.grouped {
+        let mut groups: Vec<(Vec<MsiValue>, Vec<Vec<Option<usize>>>)> = Vec::new();
+        for source in filtered {
+            let key: Vec<MsiValue> = query
+                .group_by
+                .iter()
+                .map(|expression| {
+                    eval_value(database, query, &source, parameters, None, expression)
+                })
+                .collect();
+            if let Some((_, members)) = groups.iter_mut().find(|(existing, _)| {
+                existing.len() == key.len()
+                    && existing
+                        .iter()
+                        .zip(&key)
+                        .all(|(left, right)| msi_value_equal(left, right))
+            }) {
+                members.push(source);
+            } else {
+                groups.push((key, vec![source]));
             }
         }
-        let values = project_row(database, query, &source);
-        rows.push(ViewRow { values, source });
+        if groups.is_empty() && query.group_by.is_empty() {
+            let members: Vec<Vec<Option<usize>>> = Vec::new();
+            let source = vec![None; query.tables.len()];
+            let keep = match &query.having {
+                Some(having) => {
+                    eval_expr(database, query, &source, parameters, Some(&members), having)
+                }
+                None => true,
+            };
+            if keep {
+                let values = project_row(database, query, &source, parameters, Some(&members));
+                rows.push(ViewRow {
+                    values,
+                    source,
+                    group: Some(members),
+                });
+            }
+        }
+        for (_, members) in groups {
+            let source = members
+                .first()
+                .cloned()
+                .unwrap_or_else(|| vec![None; query.tables.len()]);
+            if let Some(having) = &query.having {
+                if !eval_expr(database, query, &source, parameters, Some(&members), having) {
+                    continue;
+                }
+            }
+            let values = project_row(database, query, &source, parameters, Some(&members));
+            rows.push(ViewRow {
+                values,
+                source,
+                group: Some(members),
+            });
+        }
+    } else {
+        for source in filtered {
+            let values = project_row(database, query, &source, parameters, None);
+            rows.push(ViewRow {
+                values,
+                source,
+                group: None,
+            });
+        }
     }
     if query.distinct {
         deduplicate_rows(&mut rows);
-    }
-    if !query.order.is_empty() {
-        sort_rows(database, query, &mut rows);
     }
     Ok(rows)
 }
@@ -2408,7 +3148,34 @@ impl SqlCursor {
         }
     }
 
-    fn select_item(&mut self) -> Result<SqlSelectItem, ()> {
+    /// True when the cursor is at `(` followed by `SELECT`.
+    fn select_follows_paren(&self) -> bool {
+        let Some('(') = self.peek() else {
+            return false;
+        };
+        let mut position = self.position + 1;
+        while self
+            .chars
+            .get(position)
+            .is_some_and(|ch| ch.is_whitespace())
+        {
+            position += 1;
+        }
+        let start = position;
+        while self
+            .chars
+            .get(position)
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+        {
+            position += 1;
+        }
+        self.chars[start..position]
+            .iter()
+            .collect::<String>()
+            .eq_ignore_ascii_case("SELECT")
+    }
+
+    fn select_item(&mut self, parameters: &mut usize) -> Result<SqlSelectItem, ()> {
         self.skip_space();
         if self.peek() == Some('*') {
             self.position += 1;
@@ -2416,56 +3183,88 @@ impl SqlCursor {
                 table: None,
                 column: None,
                 alias: None,
+                expression: None,
             });
         }
-        let first = self.ident()?;
-        if first.is_empty() {
-            return Err(());
-        }
-        if first.ends_with('.') && self.peek() == Some('*') {
-            self.position += 1;
-            return Ok(SqlSelectItem {
-                table: Some(first.trim_end_matches('.').to_string()),
-                column: None,
-                alias: None,
-            });
-        }
-        if self.peek() == Some('.') {
-            self.position += 1;
-            if self.peek() == Some('*') {
-                self.position += 1;
-                return Ok(SqlSelectItem {
-                    table: Some(first),
+        let start = self.position;
+        match self.peek() {
+            Some(ch) if ch.is_ascii_alphabetic() || ch == '_' || ch == '`' || ch == '[' => {
+                let first = self.ident()?;
+                if first.is_empty() {
+                    return Err(());
+                }
+                if first.ends_with('.') && self.peek() == Some('*') {
+                    self.position += 1;
+                    return Ok(SqlSelectItem {
+                        table: Some(first.trim_end_matches('.').to_string()),
+                        column: None,
+                        alias: None,
+                        expression: None,
+                    });
+                }
+                if self.peek() == Some('.') {
+                    self.position += 1;
+                    if self.peek() == Some('*') {
+                        self.position += 1;
+                        return Ok(SqlSelectItem {
+                            table: Some(first),
+                            column: None,
+                            alias: None,
+                            expression: None,
+                        });
+                    }
+                    let second = self.ident()?;
+                    if second.is_empty() || second.contains('.') {
+                        return Err(());
+                    }
+                    return Ok(SqlSelectItem {
+                        table: Some(first),
+                        column: Some(second),
+                        alias: None,
+                        expression: None,
+                    });
+                }
+                self.skip_space();
+                if self.peek() == Some('(') {
+                    self.position = start;
+                    let expression = parse_operand(self, parameters)?;
+                    return Ok(SqlSelectItem {
+                        table: None,
+                        column: None,
+                        alias: None,
+                        expression: Some(expression),
+                    });
+                }
+                match first.split_once('.') {
+                    Some((table, column))
+                        if !table.is_empty() && !column.is_empty() && !column.contains('.') =>
+                    {
+                        Ok(SqlSelectItem {
+                            table: Some(table.to_string()),
+                            column: Some(column.to_string()),
+                            alias: None,
+                            expression: None,
+                        })
+                    }
+                    Some(_) => Err(()),
+                    None => Ok(SqlSelectItem {
+                        table: None,
+                        column: Some(first),
+                        alias: None,
+                        expression: None,
+                    }),
+                }
+            }
+            _ => {
+                self.position = start;
+                let expression = parse_operand(self, parameters)?;
+                Ok(SqlSelectItem {
+                    table: None,
                     column: None,
                     alias: None,
-                });
-            }
-            let second = self.ident()?;
-            if second.is_empty() || second.contains('.') {
-                return Err(());
-            }
-            return Ok(SqlSelectItem {
-                table: Some(first),
-                column: Some(second),
-                alias: None,
-            });
-        }
-        match first.split_once('.') {
-            Some((table, column))
-                if !table.is_empty() && !column.is_empty() && !column.contains('.') =>
-            {
-                Ok(SqlSelectItem {
-                    table: Some(table.to_string()),
-                    column: Some(column.to_string()),
-                    alias: None,
+                    expression: Some(expression),
                 })
             }
-            Some(_) => Err(()),
-            None => Ok(SqlSelectItem {
-                table: None,
-                column: Some(first),
-                alias: None,
-            }),
         }
     }
 
@@ -2549,44 +3348,92 @@ impl SqlCursor {
 fn parse_select(text: &str) -> Result<MsiQuery, ()> {
     let mut cursor = SqlCursor::new(text);
     let mut parameters = 0usize;
-    cursor.expect_word("SELECT")?;
-    let distinct = cursor.consume_word("DISTINCT");
-    let columns = parse_select_list(&mut cursor)?;
-    cursor.expect_word("FROM")?;
-    let from = parse_from(&mut cursor, &mut parameters)?;
-    let filter = if cursor.consume_word("WHERE") {
-        Some(parse_expression(&mut cursor, &mut parameters)?)
-    } else {
-        None
-    };
-    let order = if cursor.consume_word("ORDER") {
-        cursor.expect_word("BY")?;
-        parse_order_list(&mut cursor)?
-    } else {
-        Vec::new()
-    };
+    let mut query = parse_query(&mut cursor, &mut parameters)?;
     if !cursor.at_end() {
         return Err(());
     }
+    query.parameter_count = parameters;
+    Ok(query)
+}
+
+fn parse_query(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<MsiQuery, ()> {
+    let mut query = parse_query_core(cursor, parameters)?;
+    while cursor.consume_word("UNION") {
+        let all = cursor.consume_word("ALL");
+        let part = parse_query_core(cursor, parameters)?;
+        query.unions.push(SqlUnionPart {
+            all,
+            query: Box::new(part),
+        });
+    }
+    if cursor.consume_word("ORDER") {
+        cursor.expect_word("BY")?;
+        query.order = parse_order_list(cursor, parameters)?;
+    }
+    Ok(query)
+}
+
+fn parse_query_core(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<MsiQuery, ()> {
+    cursor.expect_word("SELECT")?;
+    let distinct = cursor.consume_word("DISTINCT");
+    let columns = parse_select_list(cursor, parameters)?;
+    cursor.expect_word("FROM")?;
+    let from = parse_from(cursor, parameters)?;
+    let filter = if cursor.consume_word("WHERE") {
+        Some(parse_expression(cursor, parameters)?)
+    } else {
+        None
+    };
+    let group_by = if cursor.consume_word("GROUP") {
+        cursor.expect_word("BY")?;
+        parse_group_list(cursor, parameters)?
+    } else {
+        Vec::new()
+    };
+    let having = if cursor.consume_word("HAVING") {
+        Some(parse_expression(cursor, parameters)?)
+    } else {
+        None
+    };
     Ok(MsiQuery {
         distinct,
         columns,
         from,
         filter,
-        order,
-        parameter_count: parameters,
+        group_by,
+        having,
+        order: Vec::new(),
+        unions: Vec::new(),
+        parameter_count: *parameters,
     })
 }
 
-fn parse_select_list(cursor: &mut SqlCursor) -> Result<Vec<SqlSelectItem>, ()> {
+fn parse_select_list(
+    cursor: &mut SqlCursor,
+    parameters: &mut usize,
+) -> Result<Vec<SqlSelectItem>, ()> {
     let mut items = Vec::new();
     loop {
-        let mut item = cursor.select_item()?;
+        let mut item = cursor.select_item(parameters)?;
         item.alias = cursor.parse_optional_alias(&["FROM"])?;
-        if item.column.is_none() && item.alias.is_some() {
+        if item.column.is_none() && item.expression.is_none() && item.alias.is_some() {
             return Err(());
         }
         items.push(item);
+        cursor.skip_space();
+        if cursor.peek() == Some(',') {
+            cursor.position += 1;
+            continue;
+        }
+        break;
+    }
+    Ok(items)
+}
+
+fn parse_group_list(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<Vec<SqlExpr>, ()> {
+    let mut items = Vec::new();
+    loop {
+        items.push(parse_operand(cursor, parameters)?);
         cursor.skip_space();
         if cursor.peek() == Some(',') {
             cursor.position += 1;
@@ -2602,8 +3449,10 @@ fn parse_table_ref(cursor: &mut SqlCursor) -> Result<SqlTableRef, ()> {
     if table.is_empty() {
         return Err(());
     }
-    let alias =
-        cursor.parse_optional_alias(&["INNER", "LEFT", "OUTER", "JOIN", "ON", "WHERE", "ORDER"])?;
+    let alias = cursor.parse_optional_alias(&[
+        "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER", "JOIN", "ON", "WHERE", "GROUP",
+        "HAVING", "ORDER", "UNION",
+    ])?;
     Ok(SqlTableRef { table, alias })
 }
 
@@ -2618,34 +3467,48 @@ fn parse_from(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlFrom,
             cursor.consume_word("OUTER");
             cursor.expect_word("JOIN")?;
             SqlJoinKind::LeftOuter
+        } else if cursor.consume_word("RIGHT") {
+            cursor.consume_word("OUTER");
+            cursor.expect_word("JOIN")?;
+            SqlJoinKind::RightOuter
+        } else if cursor.consume_word("FULL") {
+            cursor.consume_word("OUTER");
+            cursor.expect_word("JOIN")?;
+            SqlJoinKind::FullOuter
+        } else if cursor.consume_word("CROSS") {
+            cursor.expect_word("JOIN")?;
+            SqlJoinKind::Cross
         } else if cursor.consume_word("JOIN") {
             SqlJoinKind::Inner
         } else {
             break;
         };
         let table = parse_table_ref(cursor)?;
-        cursor.expect_word("ON")?;
-        let on = parse_expression(cursor, parameters)?;
+        let on = if kind == SqlJoinKind::Cross {
+            None
+        } else {
+            cursor.expect_word("ON")?;
+            Some(parse_expression(cursor, parameters)?)
+        };
         joins.push(SqlJoin { kind, table, on });
     }
     Ok(SqlFrom { base, joins })
 }
 
-fn parse_order_list(cursor: &mut SqlCursor) -> Result<Vec<SqlOrderKey>, ()> {
+fn parse_order_list(
+    cursor: &mut SqlCursor,
+    parameters: &mut usize,
+) -> Result<Vec<SqlOrderKey>, ()> {
     let mut keys = Vec::new();
     loop {
-        let (table, name) = cursor.name_ref()?;
+        let expr = parse_operand(cursor, parameters)?;
         let direction = if cursor.consume_word("DESC") {
             SqlDirection::Descending
         } else {
             cursor.consume_word("ASC");
             SqlDirection::Ascending
         };
-        keys.push(SqlOrderKey {
-            table,
-            name,
-            direction,
-        });
+        keys.push(SqlOrderKey { expr, direction });
         cursor.skip_space();
         if cursor.peek() == Some(',') {
             cursor.position += 1;
@@ -2680,7 +3543,7 @@ fn parse_and(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlExpr, 
 
 fn parse_primary(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlExpr, ()> {
     cursor.skip_space();
-    if cursor.peek() == Some('(') {
+    if cursor.peek() == Some('(') && !cursor.select_follows_paren() {
         cursor.position += 1;
         let expression = parse_or(cursor, parameters)?;
         cursor.skip_space();
@@ -2688,6 +3551,9 @@ fn parse_primary(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlEx
             return Err(());
         }
         return Ok(expression);
+    }
+    if cursor.consume_word("NOT") {
+        return Ok(SqlExpr::Not(Box::new(parse_primary(cursor, parameters)?)));
     }
     parse_comparison(cursor, parameters)
 }
@@ -2702,6 +3568,90 @@ fn parse_comparison(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<Sq
             value: Box::new(left),
             negated,
         });
+    }
+    let negated = cursor.consume_word("NOT");
+    if negated
+        && !matches!(
+            cursor.peek_word().to_ascii_uppercase().as_str(),
+            "IN" | "LIKE" | "BETWEEN"
+        )
+    {
+        return Err(());
+    }
+    if cursor.consume_word("IN") {
+        cursor.skip_space();
+        if cursor.peek() != Some('(') {
+            return Err(());
+        }
+        if cursor.select_follows_paren() {
+            cursor.position += 1;
+            let query = parse_query(cursor, parameters)?;
+            cursor.skip_space();
+            if cursor.bump() != Some(')') {
+                return Err(());
+            }
+            return Ok(SqlExpr::InQuery {
+                value: Box::new(left),
+                query: Box::new(query),
+                negated,
+            });
+        }
+        cursor.position += 1;
+        let mut items = Vec::new();
+        loop {
+            cursor.skip_space();
+            if cursor.peek() == Some(')') {
+                cursor.position += 1;
+                break;
+            }
+            items.push(parse_operand(cursor, parameters)?);
+            cursor.skip_space();
+            if cursor.peek() == Some(',') {
+                cursor.position += 1;
+                continue;
+            }
+            if cursor.peek() == Some(')') {
+                cursor.position += 1;
+                break;
+            }
+            return Err(());
+        }
+        return Ok(SqlExpr::InList {
+            value: Box::new(left),
+            items,
+            negated,
+        });
+    }
+    if cursor.consume_word("LIKE") {
+        let pattern = parse_operand(cursor, parameters)?;
+        let escape = if cursor.consume_word("ESCAPE") {
+            match cursor.literal()? {
+                MsiValue::Str(text) if text.chars().count() == 1 => text.chars().next(),
+                _ => return Err(()),
+            }
+        } else {
+            None
+        };
+        return Ok(SqlExpr::Like {
+            value: Box::new(left),
+            pattern: Box::new(pattern),
+            escape,
+            negated,
+        });
+    }
+    if cursor.consume_word("BETWEEN") {
+        let low = parse_operand(cursor, parameters)?;
+        cursor.expect_word("AND")?;
+        let high = parse_operand(cursor, parameters)?;
+        return Ok(SqlExpr::Between {
+            value: Box::new(left),
+            low: Box::new(low),
+            high: Box::new(high),
+            negated,
+        });
+    }
+    if negated {
+        return Err(());
     }
     let op = match cursor.peek() {
         Some('=') => {
@@ -2754,6 +3704,15 @@ fn parse_comparison(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<Sq
 fn parse_operand(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlExpr, ()> {
     cursor.skip_space();
     match cursor.peek() {
+        Some('(') if cursor.select_follows_paren() => {
+            cursor.position += 1;
+            let query = parse_query(cursor, parameters)?;
+            cursor.skip_space();
+            if cursor.bump() != Some(')') {
+                return Err(());
+            }
+            Ok(SqlExpr::ScalarQuery(Box::new(query)))
+        }
         Some('?') => {
             cursor.position += 1;
             let index = *parameters;
@@ -2777,6 +3736,41 @@ fn parse_operand(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlEx
             Ok(SqlExpr::Literal(cursor.literal()?))
         }
         _ => {
+            let start = cursor.position;
+            let word = cursor.word();
+            cursor.skip_space();
+            if !word.is_empty() && cursor.peek() == Some('(') {
+                let function = if word.eq_ignore_ascii_case("COUNT") {
+                    Some(SqlAggregate::Count)
+                } else if word.eq_ignore_ascii_case("SUM") {
+                    Some(SqlAggregate::Sum)
+                } else if word.eq_ignore_ascii_case("AVG") {
+                    Some(SqlAggregate::Average)
+                } else if word.eq_ignore_ascii_case("MIN") {
+                    Some(SqlAggregate::Min)
+                } else if word.eq_ignore_ascii_case("MAX") {
+                    Some(SqlAggregate::Max)
+                } else {
+                    None
+                };
+                if let Some(function) = function {
+                    cursor.position += 1;
+                    cursor.skip_space();
+                    let argument = if function == SqlAggregate::Count && cursor.peek() == Some('*')
+                    {
+                        cursor.position += 1;
+                        None
+                    } else {
+                        Some(Box::new(parse_operand(cursor, parameters)?))
+                    };
+                    cursor.skip_space();
+                    if cursor.bump() != Some(')') {
+                        return Err(());
+                    }
+                    return Ok(SqlExpr::Aggregate { function, argument });
+                }
+            }
+            cursor.position = start;
             let (table, name) = cursor.name_ref()?;
             Ok(SqlExpr::Column { table, name })
         }
@@ -2784,9 +3778,29 @@ fn parse_operand(cursor: &mut SqlCursor, parameters: &mut usize) -> Result<SqlEx
 }
 
 fn resolve_query(database: &MsiDatabaseState, parsed: MsiQuery) -> Result<ResolvedQuery, u32> {
-    let mut references: Vec<&SqlTableRef> = Vec::with_capacity(1 + parsed.from.joins.len());
-    references.push(&parsed.from.base);
-    for join in &parsed.from.joins {
+    let mut expectations = vec![ParameterExpectation::Any; parsed.parameter_count];
+    resolve_query_with(database, parsed, &mut expectations)
+}
+
+fn resolve_query_with(
+    database: &MsiDatabaseState,
+    parsed: MsiQuery,
+    expectations: &mut [ParameterExpectation],
+) -> Result<ResolvedQuery, u32> {
+    let MsiQuery {
+        distinct,
+        columns: select_items,
+        from,
+        filter: parsed_filter,
+        group_by: parsed_group_by,
+        having: parsed_having,
+        order: parsed_order,
+        unions: parsed_unions,
+        parameter_count: _,
+    } = parsed;
+    let mut references: Vec<&SqlTableRef> = Vec::with_capacity(1 + from.joins.len());
+    references.push(&from.base);
+    for join in &from.joins {
         references.push(&join.table);
     }
     let mut tables: Vec<ResolvedTable> = Vec::with_capacity(references.len());
@@ -2820,7 +3834,36 @@ fn resolve_query(database: &MsiDatabaseState, parsed: MsiQuery) -> Result<Resolv
     }
 
     let mut columns = Vec::new();
-    for item in &parsed.columns {
+    let mut aliases: Vec<(String, ResolvedExpr)> = Vec::new();
+    for item in &select_items {
+        if let Some(expression) = &item.expression {
+            let resolved = resolve_expr(
+                database,
+                &tables,
+                expression,
+                tables.len(),
+                expectations,
+                &[],
+            )?;
+            if contains_resolved_aggregate(&resolved) && aggregate_contains_aggregate(&resolved) {
+                return Err(ERROR_BAD_QUERY_SYNTAX);
+            }
+            let label = item
+                .alias
+                .clone()
+                .unwrap_or_else(|| expression_label(expression));
+            if let Some(alias) = &item.alias {
+                aliases.push((alias.clone(), resolved.clone()));
+            }
+            columns.push(ResolvedColumn {
+                table: 0,
+                column: 0,
+                label,
+                type_name: resolved_expression_type_name(database, &tables, &resolved)?,
+                expression: Some(resolved),
+            });
+            continue;
+        }
         match &item.column {
             None => {
                 let table_indices = match &item.table {
@@ -2837,6 +3880,7 @@ fn resolve_query(database: &MsiDatabaseState, parsed: MsiQuery) -> Result<Resolv
                             column: column_index,
                             label: column.name.clone(),
                             type_name: column.type_name(),
+                            expression: None,
                         });
                     }
                 }
@@ -2854,11 +3898,22 @@ fn resolve_query(database: &MsiDatabaseState, parsed: MsiQuery) -> Result<Resolv
                     .table(&tables[table_index].name)
                     .ok_or(ERROR_INVALID_TABLE)?;
                 let column = table.columns.get(column_index).ok_or(ERROR_BAD_COLUMN)?;
+                let label = item.alias.clone().unwrap_or_else(|| column.name.clone());
+                if let Some(alias) = &item.alias {
+                    aliases.push((
+                        alias.clone(),
+                        ResolvedExpr::Column {
+                            table: table_index,
+                            column: column_index,
+                        },
+                    ));
+                }
                 columns.push(ResolvedColumn {
                     table: table_index,
                     column: column_index,
-                    label: item.alias.clone().unwrap_or_else(|| column.name.clone()),
+                    label,
                     type_name: column.type_name(),
+                    expression: None,
                 });
             }
         }
@@ -2867,77 +3922,369 @@ fn resolve_query(database: &MsiDatabaseState, parsed: MsiQuery) -> Result<Resolv
         return Err(ERROR_BAD_QUERY_SYNTAX);
     }
 
-    let mut expectations = vec![ParameterExpectation::Any; parsed.parameter_count];
-    let mut joins = Vec::new();
-    for (index, join) in parsed.from.joins.iter().enumerate() {
-        let table_index = index + 1;
-        let on = resolve_expr(
+    let mut group_by = Vec::new();
+    for expression in &parsed_group_by {
+        let resolved = resolve_expr(
             database,
             &tables,
-            &join.on,
-            table_index + 1,
-            &mut expectations,
+            expression,
+            tables.len(),
+            expectations,
+            &aliases,
         )?;
+        if contains_resolved_aggregate(&resolved) {
+            return Err(ERROR_BAD_QUERY_SYNTAX);
+        }
+        group_by.push(resolved);
+    }
+    let having = match &parsed_having {
+        Some(expression) => Some(resolve_expr(
+            database,
+            &tables,
+            expression,
+            tables.len(),
+            expectations,
+            &aliases,
+        )?),
+        None => None,
+    };
+
+    let mut joins = Vec::new();
+    for (index, join) in from.joins.iter().enumerate() {
+        let table_index = index + 1;
+        let on = match &join.on {
+            Some(expression) => Some(resolve_expr(
+                database,
+                &tables,
+                expression,
+                table_index + 1,
+                expectations,
+                &[],
+            )?),
+            None => None,
+        };
+        if on.as_ref().is_some_and(contains_resolved_aggregate) {
+            return Err(ERROR_BAD_QUERY_SYNTAX);
+        }
         joins.push(ResolvedJoin {
             table: table_index,
             kind: join.kind,
             on,
         });
     }
-    let filter = match &parsed.filter {
-        Some(expression) => Some(resolve_expr(
-            database,
-            &tables,
-            expression,
-            tables.len(),
-            &mut expectations,
-        )?),
+    let filter = match &parsed_filter {
+        Some(expression) => {
+            let resolved = resolve_expr(
+                database,
+                &tables,
+                expression,
+                tables.len(),
+                expectations,
+                &[],
+            )?;
+            if contains_resolved_aggregate(&resolved) {
+                return Err(ERROR_BAD_QUERY_SYNTAX);
+            }
+            Some(resolved)
+        }
         None => None,
     };
+
     let mut order = Vec::new();
-    for parsed_key in &parsed.order {
+    for parsed_key in &parsed_order {
         let direction = parsed_key.direction;
-        let output = if parsed_key.table.is_none() {
-            let matches: Vec<usize> = columns
-                .iter()
-                .enumerate()
-                .filter(|(_, column)| column.label.eq_ignore_ascii_case(&parsed_key.name))
-                .map(|(index, _)| index)
-                .collect();
-            match matches.len() {
-                1 => Some(matches[0]),
-                0 => None,
-                _ => return Err(ERROR_BAD_COLUMN),
+        let key = match &parsed_key.expr {
+            SqlExpr::Literal(MsiValue::Int(ordinal)) if *ordinal >= 1 => {
+                let index = (*ordinal - 1) as usize;
+                if index >= columns.len() {
+                    return Err(ERROR_BAD_COLUMN);
+                }
+                OrderSource::Output(index)
             }
-        } else {
-            None
-        };
-        let key = match output {
-            Some(index) => OrderSource::Output(index),
-            None => {
-                let (table, column) = resolve_column(
-                    database,
-                    &tables,
-                    parsed_key.table.as_deref(),
-                    &parsed_key.name,
-                    tables.len(),
-                    ColumnScope::Expression,
-                )?;
-                OrderSource::Column { table, column }
+            SqlExpr::Column { table, name } => {
+                if table.is_none() && name.chars().all(|ch| ch.is_ascii_digit()) {
+                    let ordinal = name.parse::<usize>().unwrap_or(0);
+                    if ordinal == 0 || ordinal > columns.len() {
+                        return Err(ERROR_BAD_COLUMN);
+                    }
+                    OrderSource::Output(ordinal - 1)
+                } else if table.is_none() {
+                    let matches: Vec<usize> = columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, column)| column.label.eq_ignore_ascii_case(name))
+                        .map(|(index, _)| index)
+                        .collect();
+                    match matches.len() {
+                        1 => OrderSource::Output(matches[0]),
+                        0 => {
+                            let (table, column) = resolve_column(
+                                database,
+                                &tables,
+                                None,
+                                name,
+                                tables.len(),
+                                ColumnScope::Expression,
+                            )?;
+                            OrderSource::Column { table, column }
+                        }
+                        _ => return Err(ERROR_BAD_COLUMN),
+                    }
+                } else {
+                    let (table_index, column_index) = resolve_column(
+                        database,
+                        &tables,
+                        table.as_deref(),
+                        name,
+                        tables.len(),
+                        ColumnScope::Expression,
+                    )?;
+                    OrderSource::Column {
+                        table: table_index,
+                        column: column_index,
+                    }
+                }
             }
+            expression => OrderSource::Expr(resolve_expr(
+                database,
+                &tables,
+                expression,
+                tables.len(),
+                expectations,
+                &aliases,
+            )?),
         };
         order.push(ResolvedOrder { key, direction });
     }
 
+    let has_aggregates = columns.iter().any(|column| {
+        column
+            .expression
+            .as_ref()
+            .is_some_and(contains_resolved_aggregate)
+    }) || having.as_ref().is_some_and(contains_resolved_aggregate)
+        || order.iter().any(|order| match &order.key {
+            OrderSource::Expr(expression) => contains_resolved_aggregate(expression),
+            _ => false,
+        });
+    let grouped = has_aggregates || !group_by.is_empty();
+    if grouped {
+        for column in &columns {
+            if !grouped_expression_valid(&resolved_column_expression(column), &group_by) {
+                return Err(ERROR_BAD_QUERY_SYNTAX);
+            }
+        }
+        if having
+            .as_ref()
+            .is_some_and(|having| !grouped_expression_valid(having, &group_by))
+        {
+            return Err(ERROR_BAD_QUERY_SYNTAX);
+        }
+        for order in &order {
+            let valid = match &order.key {
+                OrderSource::Expr(expression) => grouped_expression_valid(expression, &group_by),
+                OrderSource::Column { table, column } => grouped_expression_valid(
+                    &ResolvedExpr::Column {
+                        table: *table,
+                        column: *column,
+                    },
+                    &group_by,
+                ),
+                OrderSource::Output(_) => true,
+            };
+            if !valid {
+                return Err(ERROR_BAD_QUERY_SYNTAX);
+            }
+        }
+    }
+
+    let mut unions = Vec::new();
+    for part in parsed_unions {
+        let resolved = resolve_query_with(database, *part.query, expectations)?;
+        if resolved.columns.len() != columns.len() {
+            return Err(ERROR_BAD_QUERY_SYNTAX);
+        }
+        for (left, right) in columns.iter().zip(&resolved.columns) {
+            if !types_compatible(&left.type_name, &right.type_name) {
+                return Err(ERROR_BAD_QUERY_SYNTAX);
+            }
+        }
+        unions.push(ResolvedUnion {
+            all: part.all,
+            query: Box::new(resolved),
+        });
+    }
+
     Ok(ResolvedQuery {
-        distinct: parsed.distinct,
+        distinct,
         tables,
         columns,
         joins,
         filter,
+        group_by,
+        having,
+        grouped,
         order,
-        parameter_expectations: expectations,
+        unions,
+        parameter_expectations: expectations.to_vec(),
     })
+}
+
+fn resolved_column_expression(column: &ResolvedColumn) -> ResolvedExpr {
+    column.expression.clone().unwrap_or(ResolvedExpr::Column {
+        table: column.table,
+        column: column.column,
+    })
+}
+
+fn contains_resolved_aggregate(expression: &ResolvedExpr) -> bool {
+    match expression {
+        ResolvedExpr::Aggregate { .. } => true,
+        ResolvedExpr::IsNull { value, .. } | ResolvedExpr::Not(value) => {
+            contains_resolved_aggregate(value)
+        }
+        ResolvedExpr::Compare { left, right, .. }
+        | ResolvedExpr::And(left, right)
+        | ResolvedExpr::Or(left, right) => {
+            contains_resolved_aggregate(left) || contains_resolved_aggregate(right)
+        }
+        ResolvedExpr::Like { value, pattern, .. } => {
+            contains_resolved_aggregate(value) || contains_resolved_aggregate(pattern)
+        }
+        ResolvedExpr::Between {
+            value, low, high, ..
+        } => {
+            contains_resolved_aggregate(value)
+                || contains_resolved_aggregate(low)
+                || contains_resolved_aggregate(high)
+        }
+        ResolvedExpr::InList { value, items, .. } => {
+            contains_resolved_aggregate(value) || items.iter().any(contains_resolved_aggregate)
+        }
+        ResolvedExpr::InQuery { value, .. } => contains_resolved_aggregate(value),
+        _ => false,
+    }
+}
+
+fn aggregate_contains_aggregate(expression: &ResolvedExpr) -> bool {
+    match expression {
+        ResolvedExpr::Aggregate { argument, .. } => {
+            argument.as_deref().is_some_and(contains_resolved_aggregate)
+        }
+        _ => false,
+    }
+}
+
+fn grouped_expression_valid(expression: &ResolvedExpr, group_by: &[ResolvedExpr]) -> bool {
+    match expression {
+        ResolvedExpr::Aggregate { .. } => true,
+        ResolvedExpr::Column { table, column } => group_by.iter().any(|key| {
+            matches!(
+                key,
+                ResolvedExpr::Column {
+                    table: key_table,
+                    column: key_column,
+                } if key_table == table && key_column == column
+            )
+        }),
+        ResolvedExpr::Literal(_) | ResolvedExpr::Parameter(_) => true,
+        ResolvedExpr::ScalarQuery(_) => true,
+        ResolvedExpr::IsNull { value, .. } | ResolvedExpr::Not(value) => {
+            grouped_expression_valid(value, group_by)
+        }
+        ResolvedExpr::Compare { left, right, .. }
+        | ResolvedExpr::And(left, right)
+        | ResolvedExpr::Or(left, right) => {
+            grouped_expression_valid(left, group_by) && grouped_expression_valid(right, group_by)
+        }
+        ResolvedExpr::Like { value, pattern, .. } => {
+            grouped_expression_valid(value, group_by) && grouped_expression_valid(pattern, group_by)
+        }
+        ResolvedExpr::Between {
+            value, low, high, ..
+        } => {
+            grouped_expression_valid(value, group_by)
+                && grouped_expression_valid(low, group_by)
+                && grouped_expression_valid(high, group_by)
+        }
+        ResolvedExpr::InList { value, items, .. } => {
+            grouped_expression_valid(value, group_by)
+                && items
+                    .iter()
+                    .all(|item| grouped_expression_valid(item, group_by))
+        }
+        ResolvedExpr::InQuery { value, .. } => grouped_expression_valid(value, group_by),
+    }
+}
+
+fn type_kind(name: &str) -> Option<SqlColumnKind> {
+    if name.starts_with('i') {
+        Some(SqlColumnKind::Int)
+    } else if name.starts_with('s') {
+        Some(SqlColumnKind::String { width: 0 })
+    } else if name.starts_with('v') {
+        Some(SqlColumnKind::Binary)
+    } else {
+        None
+    }
+}
+
+fn types_compatible(left: &str, right: &str) -> bool {
+    match (type_kind(left), type_kind(right)) {
+        (Some(SqlColumnKind::Int), Some(SqlColumnKind::Int)) => true,
+        (Some(SqlColumnKind::String { .. }), Some(SqlColumnKind::String { .. })) => true,
+        (Some(SqlColumnKind::Binary), Some(SqlColumnKind::Binary)) => true,
+        (None, None) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
+fn expression_label(expression: &SqlExpr) -> String {
+    match expression {
+        SqlExpr::Aggregate { function, .. } => match function {
+            SqlAggregate::Count => "COUNT".to_string(),
+            SqlAggregate::Sum => "SUM".to_string(),
+            SqlAggregate::Average => "AVG".to_string(),
+            SqlAggregate::Min => "MIN".to_string(),
+            SqlAggregate::Max => "MAX".to_string(),
+        },
+        SqlExpr::Column { name, .. } => name.clone(),
+        _ => "Expr".to_string(),
+    }
+}
+
+fn resolved_expression_type_name(
+    database: &MsiDatabaseState,
+    tables: &[ResolvedTable],
+    expression: &ResolvedExpr,
+) -> Result<String, u32> {
+    match expression {
+        ResolvedExpr::Column { table, column } => {
+            let kind = column_kind(database, tables, *table, *column)?;
+            Ok(match kind {
+                SqlColumnKind::Binary => "v0".to_string(),
+                SqlColumnKind::String { width } => format!("s{width}"),
+                SqlColumnKind::Int => "i4".to_string(),
+            })
+        }
+        ResolvedExpr::Literal(MsiValue::Int(_)) => Ok("i4".to_string()),
+        ResolvedExpr::Literal(MsiValue::Str(_)) => Ok("s0".to_string()),
+        ResolvedExpr::Literal(MsiValue::Stream(_)) => Ok("v0".to_string()),
+        ResolvedExpr::Literal(MsiValue::Null) => Ok("s0".to_string()),
+        ResolvedExpr::Aggregate { function, argument } => match function {
+            SqlAggregate::Count | SqlAggregate::Sum | SqlAggregate::Average => Ok("i4".to_string()),
+            SqlAggregate::Min | SqlAggregate::Max => match argument.as_deref() {
+                Some(argument) => resolved_expression_type_name(database, tables, argument),
+                None => Ok("i4".to_string()),
+            },
+        },
+        ResolvedExpr::ScalarQuery(query) => Ok(query
+            .columns
+            .first()
+            .map(|column| column.type_name.clone())
+            .unwrap_or_else(|| "s0".to_string())),
+        _ => Ok("s0".to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3045,8 +4392,55 @@ fn resolved_column_kind(
         ResolvedExpr::Column { table, column } => {
             Ok(Some(column_kind(database, tables, *table, *column)?))
         }
+        ResolvedExpr::Literal(MsiValue::Int(_)) => Ok(Some(SqlColumnKind::Int)),
+        ResolvedExpr::Literal(MsiValue::Str(_)) => Ok(Some(SqlColumnKind::String { width: 0 })),
+        ResolvedExpr::Literal(MsiValue::Stream(_)) => Ok(Some(SqlColumnKind::Binary)),
+        ResolvedExpr::Aggregate { function, argument } => match function {
+            SqlAggregate::Count | SqlAggregate::Sum | SqlAggregate::Average => {
+                Ok(Some(SqlColumnKind::Int))
+            }
+            SqlAggregate::Min | SqlAggregate::Max => match argument.as_deref() {
+                Some(argument) => resolved_column_kind(database, tables, argument),
+                None => Ok(None),
+            },
+        },
+        ResolvedExpr::ScalarQuery(query) => Ok(query
+            .columns
+            .first()
+            .and_then(|column| type_kind(&column.type_name))),
         _ => Ok(None),
     }
+}
+
+fn kinds_compatible(left: SqlColumnKind, right: SqlColumnKind) -> bool {
+    matches!(
+        (left, right),
+        (SqlColumnKind::Int, SqlColumnKind::Int)
+            | (SqlColumnKind::String { .. }, SqlColumnKind::String { .. })
+            | (SqlColumnKind::Binary, SqlColumnKind::Binary)
+    )
+}
+
+fn coerce_against(
+    database: &MsiDatabaseState,
+    tables: &[ResolvedTable],
+    operand: &mut ResolvedExpr,
+    kind: SqlColumnKind,
+    expectations: &mut [ParameterExpectation],
+) -> Result<(), u32> {
+    if let Some(existing) = resolved_column_kind(database, tables, operand)? {
+        if kinds_compatible(existing, kind) {
+            return Ok(());
+        }
+        if matches!(
+            operand,
+            ResolvedExpr::Literal(_) | ResolvedExpr::Parameter(_)
+        ) {
+            return coerce_operand(operand, kind, expectations);
+        }
+        return Err(ERROR_BAD_QUERY_SYNTAX);
+    }
+    coerce_operand(operand, kind, expectations)
 }
 
 fn coerce_operand(
@@ -3096,9 +4490,18 @@ fn resolve_expr(
     expression: &SqlExpr,
     limit: usize,
     expectations: &mut [ParameterExpectation],
+    aliases: &[(String, ResolvedExpr)],
 ) -> Result<ResolvedExpr, u32> {
     match expression {
         SqlExpr::Column { table, name } => {
+            if table.is_none() {
+                if let Some((_, alias)) = aliases
+                    .iter()
+                    .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
+                {
+                    return Ok(alias.clone());
+                }
+            }
             let (table, column) = resolve_column(
                 database,
                 tables,
@@ -3117,7 +4520,7 @@ fn resolve_expr(
             Ok(ResolvedExpr::Parameter(*index))
         }
         SqlExpr::IsNull { value, negated } => {
-            let value = resolve_expr(database, tables, value, limit, expectations)?;
+            let value = resolve_expr(database, tables, value, limit, expectations, aliases)?;
             if !matches!(value, ResolvedExpr::Column { .. }) {
                 return Err(ERROR_BAD_QUERY_SYNTAX);
             }
@@ -3127,21 +4530,22 @@ fn resolve_expr(
             })
         }
         SqlExpr::Compare { left, op, right } => {
-            let mut left = resolve_expr(database, tables, left, limit, expectations)?;
-            let mut right = resolve_expr(database, tables, right, limit, expectations)?;
+            let mut left = resolve_expr(database, tables, left, limit, expectations, aliases)?;
+            let mut right = resolve_expr(database, tables, right, limit, expectations, aliases)?;
             let left_kind = resolved_column_kind(database, tables, &left)?;
             let right_kind = resolved_column_kind(database, tables, &right)?;
             match (left_kind, right_kind) {
                 (Some(SqlColumnKind::Binary), _) | (_, Some(SqlColumnKind::Binary)) => {
                     return Err(ERROR_BAD_QUERY_SYNTAX);
                 }
+                (Some(left_kind), Some(right_kind)) if kinds_compatible(left_kind, right_kind) => {}
                 (Some(left_kind), Some(right_kind)) => {
-                    let compatible = matches!(
-                        (left_kind, right_kind),
-                        (SqlColumnKind::Int, SqlColumnKind::Int)
-                            | (SqlColumnKind::String { .. }, SqlColumnKind::String { .. })
-                    );
-                    if !compatible {
+                    if matches!(right, ResolvedExpr::Literal(_) | ResolvedExpr::Parameter(_)) {
+                        coerce_operand(&mut right, left_kind, expectations)?;
+                    } else if matches!(left, ResolvedExpr::Literal(_) | ResolvedExpr::Parameter(_))
+                    {
+                        coerce_operand(&mut left, right_kind, expectations)?;
+                    } else {
                         return Err(ERROR_BAD_QUERY_SYNTAX);
                     }
                 }
@@ -3156,13 +4560,201 @@ fn resolve_expr(
             })
         }
         SqlExpr::And(left, right) => Ok(ResolvedExpr::And(
-            Box::new(resolve_expr(database, tables, left, limit, expectations)?),
-            Box::new(resolve_expr(database, tables, right, limit, expectations)?),
+            Box::new(resolve_expr(
+                database,
+                tables,
+                left,
+                limit,
+                expectations,
+                aliases,
+            )?),
+            Box::new(resolve_expr(
+                database,
+                tables,
+                right,
+                limit,
+                expectations,
+                aliases,
+            )?),
         )),
         SqlExpr::Or(left, right) => Ok(ResolvedExpr::Or(
-            Box::new(resolve_expr(database, tables, left, limit, expectations)?),
-            Box::new(resolve_expr(database, tables, right, limit, expectations)?),
+            Box::new(resolve_expr(
+                database,
+                tables,
+                left,
+                limit,
+                expectations,
+                aliases,
+            )?),
+            Box::new(resolve_expr(
+                database,
+                tables,
+                right,
+                limit,
+                expectations,
+                aliases,
+            )?),
         )),
+        SqlExpr::Not(inner) => Ok(ResolvedExpr::Not(Box::new(resolve_expr(
+            database,
+            tables,
+            inner,
+            limit,
+            expectations,
+            aliases,
+        )?))),
+        SqlExpr::Like {
+            value,
+            pattern,
+            escape,
+            negated,
+        } => {
+            let value = resolve_expr(database, tables, value, limit, expectations, aliases)?;
+            let mut pattern =
+                resolve_expr(database, tables, pattern, limit, expectations, aliases)?;
+            match resolved_column_kind(database, tables, &value)? {
+                Some(SqlColumnKind::String { .. }) | None => {}
+                Some(_) => return Err(ERROR_BAD_QUERY_SYNTAX),
+            }
+            match resolved_column_kind(database, tables, &pattern)? {
+                Some(SqlColumnKind::String { .. }) => {}
+                Some(_) => return Err(ERROR_BAD_QUERY_SYNTAX),
+                None => {
+                    coerce_operand(
+                        &mut pattern,
+                        SqlColumnKind::String { width: 0 },
+                        expectations,
+                    )?;
+                }
+            }
+            Ok(ResolvedExpr::Like {
+                value: Box::new(value),
+                pattern: Box::new(pattern),
+                escape: *escape,
+                negated: *negated,
+            })
+        }
+        SqlExpr::Between {
+            value,
+            low,
+            high,
+            negated,
+        } => {
+            let mut value = resolve_expr(database, tables, value, limit, expectations, aliases)?;
+            let mut low = resolve_expr(database, tables, low, limit, expectations, aliases)?;
+            let mut high = resolve_expr(database, tables, high, limit, expectations, aliases)?;
+            let kind = resolved_column_kind(database, tables, &value)?
+                .or(resolved_column_kind(database, tables, &low)?)
+                .or(resolved_column_kind(database, tables, &high)?);
+            if let Some(kind) = kind {
+                if kind == SqlColumnKind::Binary {
+                    return Err(ERROR_BAD_QUERY_SYNTAX);
+                }
+                coerce_against(database, tables, &mut value, kind, expectations)?;
+                coerce_against(database, tables, &mut low, kind, expectations)?;
+                coerce_against(database, tables, &mut high, kind, expectations)?;
+            }
+            Ok(ResolvedExpr::Between {
+                value: Box::new(value),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated: *negated,
+            })
+        }
+        SqlExpr::InList {
+            value,
+            items,
+            negated,
+        } => {
+            let mut value = resolve_expr(database, tables, value, limit, expectations, aliases)?;
+            let mut resolved_items = Vec::with_capacity(items.len());
+            for item in items {
+                resolved_items.push(resolve_expr(
+                    database,
+                    tables,
+                    item,
+                    limit,
+                    expectations,
+                    aliases,
+                )?);
+            }
+            let mut kind = resolved_column_kind(database, tables, &value)?;
+            if kind.is_none() {
+                for item in &resolved_items {
+                    kind = resolved_column_kind(database, tables, item)?;
+                    if kind.is_some() {
+                        break;
+                    }
+                }
+            }
+            if let Some(kind) = kind {
+                if kind == SqlColumnKind::Binary {
+                    return Err(ERROR_BAD_QUERY_SYNTAX);
+                }
+                coerce_against(database, tables, &mut value, kind, expectations)?;
+                for item in &mut resolved_items {
+                    coerce_against(database, tables, item, kind, expectations)?;
+                }
+            }
+            Ok(ResolvedExpr::InList {
+                value: Box::new(value),
+                items: resolved_items,
+                negated: *negated,
+            })
+        }
+        SqlExpr::InQuery {
+            value,
+            query,
+            negated,
+        } => {
+            let mut value = resolve_expr(database, tables, value, limit, expectations, aliases)?;
+            let resolved = resolve_query_with(database, (**query).clone(), expectations)?;
+            if resolved.columns.len() != 1 {
+                return Err(ERROR_BAD_QUERY_SYNTAX);
+            }
+            let subquery_kind = type_kind(&resolved.columns[0].type_name);
+            match (
+                resolved_column_kind(database, tables, &value)?,
+                subquery_kind,
+            ) {
+                (Some(SqlColumnKind::Binary), _) | (_, Some(SqlColumnKind::Binary)) => {
+                    return Err(ERROR_BAD_QUERY_SYNTAX);
+                }
+                (Some(left), Some(right)) if kinds_compatible(left, right) => {}
+                (Some(_), Some(_)) => return Err(ERROR_BAD_QUERY_SYNTAX),
+                (None, Some(kind)) => coerce_operand(&mut value, kind, expectations)?,
+                _ => {}
+            }
+            Ok(ResolvedExpr::InQuery {
+                value: Box::new(value),
+                query: Box::new(resolved),
+                negated: *negated,
+            })
+        }
+        SqlExpr::ScalarQuery(query) => {
+            let resolved = resolve_query_with(database, (**query).clone(), expectations)?;
+            if resolved.columns.len() != 1 {
+                return Err(ERROR_BAD_QUERY_SYNTAX);
+            }
+            Ok(ResolvedExpr::ScalarQuery(Box::new(resolved)))
+        }
+        SqlExpr::Aggregate { function, argument } => {
+            let argument = match argument {
+                Some(argument) => {
+                    let resolved =
+                        resolve_expr(database, tables, argument, limit, expectations, aliases)?;
+                    if contains_resolved_aggregate(&resolved) {
+                        return Err(ERROR_BAD_QUERY_SYNTAX);
+                    }
+                    Some(Box::new(resolved))
+                }
+                None => None,
+            };
+            Ok(ResolvedExpr::Aggregate {
+                function: *function,
+                argument,
+            })
+        }
     }
 }
 
@@ -3549,10 +5141,60 @@ fn encode_table_stream(
     Ok(out)
 }
 
-/// Write a CFB v3 compound file.  Streams shorter than 4096 bytes go into the
-/// mini stream (miniFAT); larger ones get regular FAT chains; the FAT itself
-/// spills into DIFAT sectors past 109 FAT sectors.
+/// One node in a compound-file storage tree.  `children` preserves element
+/// order so storage enumeration round-trips through a commit.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CompoundTree {
+    pub(crate) name: String,
+    pub(crate) clsid: Option<[u8; 16]>,
+    pub(crate) created: u64,
+    pub(crate) modified: u64,
+    pub(crate) children: Vec<CompoundTreeChild>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum CompoundTreeChild {
+    Stream {
+        name: String,
+        data: Vec<u8>,
+        created: u64,
+        modified: u64,
+    },
+    Storage(CompoundTree),
+}
+
+impl CompoundTree {
+    pub(crate) fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn stream(name: &str, data: Vec<u8>) -> CompoundTreeChild {
+        CompoundTreeChild::Stream {
+            name: name.to_string(),
+            data,
+            created: 0,
+            modified: 0,
+        }
+    }
+}
+
+/// Write a flat CFB v3 compound file (a root storage holding `streams`).
 pub(crate) fn write_compound_file(streams: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut root = CompoundTree::new("Root Entry");
+    root.children = streams
+        .iter()
+        .map(|(name, data)| CompoundTree::stream(name, data.clone()))
+        .collect();
+    write_compound_tree(&root)
+}
+
+/// Write a CFB v3 compound file with a real storage tree.  Streams shorter
+/// than 4096 bytes go into the mini stream (miniFAT); larger ones get regular
+/// FAT chains; the FAT itself spills into DIFAT sectors past 109 FAT sectors.
+pub(crate) fn write_compound_tree(root: &CompoundTree) -> Vec<u8> {
     const SECTOR: usize = 512;
     const MINI: usize = 64;
     const CUTOFF: u64 = 4096;
@@ -3584,8 +5226,31 @@ pub(crate) fn write_compound_file(streams: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut mini_fat: Vec<u32> = Vec::new();
     let mut bytes = Vec::new();
     let mut fat: Vec<u32> = Vec::new();
-    let mut layouts = Vec::with_capacity(streams.len());
-    for (_, data) in streams {
+    fn collect_stream_data<'a>(node: &'a CompoundTree, out: &mut Vec<&'a [u8]>) {
+        for child in &node.children {
+            match child {
+                CompoundTreeChild::Stream { data, .. } => out.push(data.as_slice()),
+                CompoundTreeChild::Storage(storage) => collect_stream_data(storage, out),
+            }
+        }
+    }
+
+    fn count_nodes(node: &CompoundTree) -> usize {
+        let mut count = 1usize;
+        for child in &node.children {
+            count += match child {
+                CompoundTreeChild::Stream { .. } => 1,
+                CompoundTreeChild::Storage(storage) => count_nodes(storage),
+            };
+        }
+        count
+    }
+
+    let mut stream_data = Vec::new();
+    collect_stream_data(root, &mut stream_data);
+    let mut layouts = Vec::with_capacity(stream_data.len());
+    for data in &stream_data {
+        let data = *data;
         if data.is_empty() {
             layouts.push(Layout::Mini(ENDOFCHAIN));
         } else if data.len() as u64 >= CUTOFF {
@@ -3616,7 +5281,7 @@ pub(crate) fn write_compound_file(streams: &[(String, Vec<u8>)]) -> Vec<u8> {
         )
     };
 
-    let entry_count = 1 + streams.len();
+    let entry_count = count_nodes(root);
     let dir_sector_count = (entry_count * 128).div_ceil(SECTOR).max(1);
     let dir_start = fat.len() as u32;
     for index in 0..dir_sector_count {
@@ -3703,28 +5368,101 @@ pub(crate) fn write_compound_file(streams: &[(String, Vec<u8>)]) -> Vec<u8> {
         }
     }
 
+    struct DirectoryRecord {
+        name: String,
+        kind: u8,
+        clsid: Option<[u8; 16]>,
+        created: u64,
+        modified: u64,
+        start: u32,
+        size: u64,
+        child: u32,
+        right: u32,
+    }
+
+    fn flatten_tree(
+        node: &CompoundTree,
+        layouts: &[Layout],
+        cursor: &mut usize,
+        out: &mut Vec<DirectoryRecord>,
+    ) -> usize {
+        let index = out.len();
+        out.push(DirectoryRecord {
+            name: node.name.clone(),
+            kind: 1,
+            clsid: node.clsid,
+            created: node.created,
+            modified: node.modified,
+            start: ENDOFCHAIN,
+            size: 0,
+            child: NOSTREAM,
+            right: NOSTREAM,
+        });
+        let mut previous: Option<usize> = None;
+        for child in &node.children {
+            let child_index = match child {
+                CompoundTreeChild::Stream {
+                    name,
+                    data,
+                    created,
+                    modified,
+                } => {
+                    let (start, size) = match layouts.get(*cursor) {
+                        Some(Layout::Mini(start)) | Some(Layout::Big(start)) => {
+                            (*start, data.len() as u64)
+                        }
+                        None => (ENDOFCHAIN, data.len() as u64),
+                    };
+                    *cursor += 1;
+                    out.push(DirectoryRecord {
+                        name: name.clone(),
+                        kind: 2,
+                        clsid: None,
+                        created: *created,
+                        modified: *modified,
+                        start,
+                        size,
+                        child: NOSTREAM,
+                        right: NOSTREAM,
+                    });
+                    out.len() - 1
+                }
+                CompoundTreeChild::Storage(storage) => flatten_tree(storage, layouts, cursor, out),
+            };
+            if let Some(previous) = previous {
+                out[previous].right = child_index as u32;
+            } else {
+                out[index].child = child_index as u32;
+            }
+            previous = Some(child_index);
+        }
+        index
+    }
+
+    let mut records = Vec::with_capacity(entry_count);
+    let mut stream_cursor = 0usize;
+    flatten_tree(root, &layouts, &mut stream_cursor, &mut records);
+    if let Some(root_record) = records.first_mut() {
+        root_record.name = "Root Entry".to_string();
+        root_record.kind = 5;
+        root_record.start = mini_start;
+        root_record.size = mini_size;
+    }
     let mut directory = Vec::with_capacity(dir_sector_count * SECTOR);
-    let root_child = if streams.is_empty() { NOSTREAM } else { 1 };
-    push_directory_entry(
-        &mut directory,
-        "Root Entry",
-        5,
-        NOSTREAM,
-        root_child,
-        mini_start,
-        mini_size,
-    );
-    for (index, ((name, data), layout)) in streams.iter().zip(layouts.iter()).enumerate() {
-        let right = if index + 1 < streams.len() {
-            index as u32 + 2
-        } else {
-            NOSTREAM
-        };
-        let (start, size) = match layout {
-            Layout::Mini(start) => (*start, data.len() as u64),
-            Layout::Big(start) => (*start, data.len() as u64),
-        };
-        push_directory_entry(&mut directory, name, 2, right, NOSTREAM, start, size);
+    for record in &records {
+        push_directory_entry(
+            &mut directory,
+            &record.name,
+            record.kind,
+            NOSTREAM,
+            record.right,
+            record.child,
+            record.start,
+            record.size,
+            record.clsid.as_ref(),
+            record.created,
+            record.modified,
+        );
     }
     while directory.len() < dir_sector_count * SECTOR {
         push_empty_directory_entry(&mut directory);
@@ -3759,14 +5497,19 @@ pub(crate) fn write_compound_file(streams: &[(String, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_directory_entry(
     out: &mut Vec<u8>,
     name: &str,
     kind: u8,
+    left: u32,
     right: u32,
     child: u32,
     start: u32,
     size: u64,
+    clsid: Option<&[u8; 16]>,
+    created: u64,
+    modified: u64,
 ) {
     let units: Vec<u16> = name.encode_utf16().take(31).collect();
     let mut entry = vec![0u8; 128];
@@ -3776,9 +5519,14 @@ fn push_directory_entry(
     entry[0x40..0x42].copy_from_slice(&(((units.len() + 1) * 2) as u16).to_le_bytes());
     entry[0x42] = kind;
     entry[0x43] = 1;
-    entry[0x44..0x48].copy_from_slice(&NOSTREAM.to_le_bytes());
+    entry[0x44..0x48].copy_from_slice(&left.to_le_bytes());
     entry[0x48..0x4C].copy_from_slice(&right.to_le_bytes());
     entry[0x4C..0x50].copy_from_slice(&child.to_le_bytes());
+    if let Some(clsid) = clsid {
+        entry[0x50..0x60].copy_from_slice(clsid);
+    }
+    entry[0x64..0x6C].copy_from_slice(&created.to_le_bytes());
+    entry[0x6C..0x74].copy_from_slice(&modified.to_le_bytes());
     entry[0x74..0x78].copy_from_slice(&start.to_le_bytes());
     entry[0x78..0x7C].copy_from_slice(&(size as u32).to_le_bytes());
     entry[0x7C..0x80].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
@@ -4202,6 +5950,27 @@ mod tests {
                         MsiValue::Str("C4".to_string()),
                         MsiValue::Int(99),
                         MsiValue::Str("orphan".to_string()),
+                    ],
+                ],
+            },
+        );
+        database.tables.insert(
+            "Doc".to_string(),
+            MsiTable {
+                name: "Doc".to_string(),
+                columns: vec![column("DocId", S32_KEY), column("Body", S64)],
+                rows: vec![
+                    vec![
+                        MsiValue::Str("d1".to_string()),
+                        MsiValue::Str("100%".to_string()),
+                    ],
+                    vec![
+                        MsiValue::Str("d2".to_string()),
+                        MsiValue::Str("a_b".to_string()),
+                    ],
+                    vec![
+                        MsiValue::Str("d3".to_string()),
+                        MsiValue::Str("abc".to_string()),
                     ],
                 ],
             },
@@ -4931,6 +6700,650 @@ mod tests {
             assert_eq!(
                 collect_rows(&mut fixture, view, 1),
                 vec![vec!["4".to_string()]]
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_right_full_cross_and_three_way_joins() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-join-kinds");
+            let (db, _path) = open_fixture(&mut fixture, "joinkinds.msi", &relational_compound());
+
+            let right = open_view(
+                &mut fixture,
+                db,
+                "SELECT f.FeatureId, p.Name FROM Product p RIGHT OUTER JOIN Feature f \
+                 ON p.ProductCode = f.ProductCode ORDER BY f.FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, right), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, right, 2),
+                vec![
+                    vec!["1".to_string(), "Alpha".to_string()],
+                    vec!["2".to_string(), "Alpha".to_string()],
+                    vec!["3".to_string(), "Beta".to_string()],
+                    vec!["4".to_string(), String::new()],
+                    vec!["5".to_string(), "Beta".to_string()],
+                ]
+            );
+
+            let full = open_view(
+                &mut fixture,
+                db,
+                "SELECT p.ProductCode, f.FeatureId FROM Product p FULL OUTER JOIN Feature f \
+                 ON p.ProductCode = f.ProductCode ORDER BY p.ProductCode, f.FeatureId",
+            );
+            assert_eq!(execute(&mut fixture, full), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, full, 2),
+                vec![
+                    vec![String::new(), "4".to_string()],
+                    vec!["P1".to_string(), "1".to_string()],
+                    vec!["P1".to_string(), "2".to_string()],
+                    vec!["P2".to_string(), "3".to_string()],
+                    vec!["P2".to_string(), "5".to_string()],
+                    vec!["P3".to_string(), String::new()],
+                ]
+            );
+
+            let cross = open_view(
+                &mut fixture,
+                db,
+                "SELECT COUNT(*) AS Cnt FROM Product CROSS JOIN Component",
+            );
+            assert_eq!(execute(&mut fixture, cross), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, cross, 1),
+                vec![vec!["12".to_string()]]
+            );
+
+            let chain = open_view(
+                &mut fixture,
+                db,
+                "SELECT p.ProductCode, f.FeatureId, c.ComponentId FROM Product p \
+                 INNER JOIN Feature f ON p.ProductCode = f.ProductCode \
+                 INNER JOIN Component c ON f.FeatureId = c.FeatureId \
+                 ORDER BY f.FeatureId, c.ComponentId",
+            );
+            assert_eq!(execute(&mut fixture, chain), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, chain, 3),
+                vec![
+                    vec!["P1".to_string(), "1".to_string(), "C1".to_string()],
+                    vec!["P1".to_string(), "1".to_string(), "C2".to_string()],
+                    vec!["P1".to_string(), "2".to_string(), "C3".to_string()],
+                ]
+            );
+
+            let right_chain = open_view(
+                &mut fixture,
+                db,
+                "SELECT p.ProductCode, f.FeatureId, c.ComponentId FROM Product p \
+                 LEFT JOIN Feature f ON p.ProductCode = f.ProductCode \
+                 RIGHT JOIN Component c ON f.FeatureId = c.FeatureId \
+                 ORDER BY c.ComponentId",
+            );
+            assert_eq!(execute(&mut fixture, right_chain), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, right_chain, 3),
+                vec![
+                    vec!["P1".to_string(), "1".to_string(), "C1".to_string()],
+                    vec!["P1".to_string(), "1".to_string(), "C2".to_string()],
+                    vec!["P1".to_string(), "2".to_string(), "C3".to_string()],
+                    vec![String::new(), String::new(), "C4".to_string()],
+                ]
+            );
+
+            let on_or = open_view(
+                &mut fixture,
+                db,
+                "SELECT COUNT(*) AS Cnt FROM Product p INNER JOIN Feature f \
+                 ON p.ProductCode = f.ProductCode AND (f.Weight = 1 OR f.Weight = 10)",
+            );
+            assert_eq!(execute(&mut fixture, on_or), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, on_or, 1),
+                vec![vec!["3".to_string()]]
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_grouping_aggregates_having_and_nulls() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-group");
+            let (db, _path) = open_fixture(&mut fixture, "group.msi", &relational_compound());
+
+            let view = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode, COUNT(*) AS Cnt, COUNT(Weight) AS NonNull, \
+                 SUM(Weight) AS Total, AVG(Weight) AS Mean, MIN(Weight) AS Lo, \
+                 MAX(Weight) AS Hi FROM Feature GROUP BY ProductCode ORDER BY ProductCode",
+            );
+            assert_eq!(execute(&mut fixture, view), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, view, 7),
+                vec![
+                    vec![
+                        "P1".to_string(),
+                        "2".to_string(),
+                        "2".to_string(),
+                        "15".to_string(),
+                        "7".to_string(),
+                        "5".to_string(),
+                        "10".to_string(),
+                    ],
+                    vec![
+                        "P2".to_string(),
+                        "2".to_string(),
+                        "2".to_string(),
+                        "2".to_string(),
+                        "1".to_string(),
+                        "1".to_string(),
+                        "1".to_string(),
+                    ],
+                    vec![
+                        "P9".to_string(),
+                        "1".to_string(),
+                        "0".to_string(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ],
+                ]
+            );
+
+            let alias = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode AS Code, COUNT(*) AS Cnt FROM Feature GROUP BY Code \
+                 HAVING Cnt > 1 ORDER BY Code",
+            );
+            assert_eq!(execute(&mut fixture, alias), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, alias, 2),
+                vec![
+                    vec!["P1".to_string(), "2".to_string()],
+                    vec!["P2".to_string(), "2".to_string()],
+                ]
+            );
+
+            let having = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode, SUM(Weight) AS Total FROM Feature GROUP BY ProductCode \
+                 HAVING SUM(Weight) >= 2 ORDER BY ProductCode",
+            );
+            assert_eq!(execute(&mut fixture, having), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, having, 2),
+                vec![
+                    vec!["P1".to_string(), "15".to_string()],
+                    vec!["P2".to_string(), "2".to_string()],
+                ]
+            );
+
+            let grouped_having = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode, COUNT(*) AS Cnt FROM Feature GROUP BY ProductCode \
+                 HAVING ProductCode = 'P1'",
+            );
+            assert_eq!(execute(&mut fixture, grouped_having), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, grouped_having, 2),
+                vec![vec!["P1".to_string(), "2".to_string()]]
+            );
+
+            let global = open_view(
+                &mut fixture,
+                db,
+                "SELECT COUNT(*) AS Cnt, COUNT(Weight) AS W, SUM(Weight) AS S FROM Feature",
+            );
+            assert_eq!(execute(&mut fixture, global), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, global, 3),
+                vec![vec!["5".to_string(), "4".to_string(), "17".to_string()]]
+            );
+
+            let empty = open_view(
+                &mut fixture,
+                db,
+                "SELECT COUNT(*) AS Cnt, SUM(Weight) AS S FROM Feature WHERE FeatureId > 100",
+            );
+            assert_eq!(execute(&mut fixture, empty), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, empty, 2),
+                vec![vec!["0".to_string(), String::new()]]
+            );
+
+            let grouped_by_name = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name, COUNT(*) AS Cnt FROM Product GROUP BY Name ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, grouped_by_name), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, grouped_by_name, 2),
+                vec![
+                    vec!["Alpha".to_string(), "1".to_string()],
+                    vec!["Beta".to_string(), "1".to_string()],
+                    vec!["Gamma".to_string(), "1".to_string()],
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_like_in_between_not_and_predicates() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-predicates");
+            let (db, _path) = open_fixture(&mut fixture, "predicates.msi", &relational_compound());
+
+            for (sql, expected) in [
+                (
+                    "SELECT FeatureId FROM Feature WHERE Title LIKE 'F%' ORDER BY FeatureId",
+                    vec![vec!["1".to_string()], vec!["5".to_string()]],
+                ),
+                (
+                    "SELECT FeatureId FROM Feature WHERE Title LIKE '_a%' ORDER BY FeatureId",
+                    vec![vec!["1".to_string()], vec!["5".to_string()]],
+                ),
+                (
+                    "SELECT FeatureId FROM Feature WHERE Title LIKE '[F-M]%' ORDER BY FeatureId",
+                    vec![vec!["1".to_string()], vec!["5".to_string()]],
+                ),
+                (
+                    "SELECT FeatureId FROM Feature WHERE Title LIKE '[^F]%' ORDER BY FeatureId",
+                    vec![vec!["2".to_string()], vec!["3".to_string()]],
+                ),
+                (
+                    "SELECT FeatureId FROM Feature WHERE FeatureId IN (1, 3, 5) ORDER BY FeatureId",
+                    vec![
+                        vec!["1".to_string()],
+                        vec!["3".to_string()],
+                        vec!["5".to_string()],
+                    ],
+                ),
+                (
+                    "SELECT FeatureId FROM Feature WHERE Title IN ('Fast', 'Only') ORDER BY FeatureId",
+                    vec![
+                        vec!["1".to_string()],
+                        vec!["3".to_string()],
+                        vec!["5".to_string()],
+                    ],
+                ),
+                (
+                    "SELECT FeatureId FROM Feature WHERE Weight BETWEEN 1 AND 5 ORDER BY FeatureId",
+                    vec![
+                        vec!["1".to_string()],
+                        vec!["3".to_string()],
+                        vec!["5".to_string()],
+                    ],
+                ),
+                (
+                    "SELECT FeatureId FROM Feature WHERE Weight NOT BETWEEN 1 AND 5 ORDER BY FeatureId",
+                    vec![vec!["2".to_string()]],
+                ),
+                (
+                    "SELECT FeatureId FROM Feature WHERE NOT (FeatureId = 1 OR FeatureId = 2) \
+                     ORDER BY FeatureId",
+                    vec![
+                        vec!["3".to_string()],
+                        vec!["4".to_string()],
+                        vec!["5".to_string()],
+                    ],
+                ),
+                (
+                    "SELECT FeatureId FROM Feature WHERE \
+                     (Weight = 1 OR Weight = 10) AND NOT Title = 'Fast' ORDER BY FeatureId",
+                    vec![vec!["2".to_string()], vec!["3".to_string()]],
+                ),
+                (
+                    "SELECT DocId FROM Doc WHERE Body LIKE '100\\%' ESCAPE '\\'",
+                    vec![vec!["d1".to_string()]],
+                ),
+                (
+                    "SELECT DocId FROM Doc WHERE Body LIKE 'a\\_b' ESCAPE '\\' ORDER BY DocId",
+                    vec![vec!["d2".to_string()]],
+                ),
+                (
+                    "SELECT DocId FROM Doc WHERE Body LIKE 'a_%' ORDER BY DocId",
+                    vec![vec!["d2".to_string()], vec!["d3".to_string()]],
+                ),
+            ] {
+                let view = open_view(&mut fixture, db, sql);
+                assert_eq!(execute(&mut fixture, view), OK, "{sql}");
+                assert_eq!(collect_rows(&mut fixture, view, 1), expected, "{sql}");
+            }
+        });
+    }
+
+    #[test]
+    fn msi_sql_scalar_and_in_subqueries() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-subquery");
+            let (db, _path) = open_fixture(&mut fixture, "subquery.msi", &relational_compound());
+
+            for (sql, expected) in [
+                (
+                    "SELECT Name FROM Product WHERE Price > (SELECT AVG(Weight) FROM Feature) \
+                     ORDER BY Name",
+                    vec![
+                        vec!["Alpha".to_string()],
+                        vec!["Beta".to_string()],
+                        vec!["Gamma".to_string()],
+                    ],
+                ),
+                (
+                    "SELECT Name FROM Product WHERE Price > (SELECT MAX(Weight) FROM Feature) \
+                     ORDER BY Name",
+                    vec![vec!["Beta".to_string()]],
+                ),
+                (
+                    "SELECT Name FROM Product WHERE Price > \
+                     (SELECT AVG(Weight) FROM Feature WHERE ProductCode = 'P1') ORDER BY Name",
+                    vec![vec!["Alpha".to_string()], vec!["Beta".to_string()]],
+                ),
+                (
+                    "SELECT Name FROM Product WHERE Price = (SELECT COUNT(*) FROM Feature) \
+                     ORDER BY Name",
+                    vec![vec!["Gamma".to_string()]],
+                ),
+                (
+                    "SELECT Name FROM Product WHERE ProductCode IN \
+                     (SELECT ProductCode FROM Feature WHERE Weight >= 10) ORDER BY Name",
+                    vec![vec!["Alpha".to_string()]],
+                ),
+                (
+                    "SELECT Name FROM Product WHERE ProductCode NOT IN \
+                     (SELECT ProductCode FROM Feature WHERE Weight >= 10) ORDER BY Name",
+                    vec![vec!["Beta".to_string()], vec!["Gamma".to_string()]],
+                ),
+            ] {
+                let view = open_view(&mut fixture, db, sql);
+                assert_eq!(execute(&mut fixture, view), OK, "{sql}");
+                assert_eq!(collect_rows(&mut fixture, view, 1), expected, "{sql}");
+            }
+
+            let select_list = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name, (SELECT COUNT(*) FROM Feature) AS Cnt FROM Product ORDER BY Name",
+            );
+            assert_eq!(execute(&mut fixture, select_list), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, select_list, 2),
+                vec![
+                    vec!["Alpha".to_string(), "5".to_string()],
+                    vec!["Beta".to_string(), "5".to_string()],
+                    vec!["Gamma".to_string(), "5".to_string()],
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_union_and_union_all() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-union");
+            let (db, _path) = open_fixture(&mut fixture, "union.msi", &relational_compound());
+
+            let view = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode FROM Product UNION SELECT ProductCode FROM Feature \
+                 ORDER BY ProductCode",
+            );
+            assert_eq!(execute(&mut fixture, view), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, view, 1),
+                vec![
+                    vec!["P1".to_string()],
+                    vec!["P2".to_string()],
+                    vec!["P3".to_string()],
+                    vec!["P9".to_string()],
+                ]
+            );
+
+            let all = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode FROM Product UNION ALL SELECT ProductCode FROM Feature \
+                 ORDER BY ProductCode",
+            );
+            assert_eq!(execute(&mut fixture, all), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, all, 1),
+                vec![
+                    vec!["P1".to_string()],
+                    vec!["P1".to_string()],
+                    vec!["P1".to_string()],
+                    vec!["P2".to_string()],
+                    vec!["P2".to_string()],
+                    vec!["P2".to_string()],
+                    vec!["P3".to_string()],
+                    vec!["P9".to_string()],
+                ]
+            );
+
+            let dedup = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode FROM Feature UNION SELECT ProductCode FROM Feature \
+                 ORDER BY ProductCode",
+            );
+            assert_eq!(execute(&mut fixture, dedup), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, dedup, 1),
+                vec![
+                    vec!["P1".to_string()],
+                    vec!["P2".to_string()],
+                    vec!["P9".to_string()],
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_order_ordinals_aggregate_aliases_and_parameters() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-order-ext");
+            let (db, _path) = open_fixture(&mut fixture, "orderext.msi", &relational_compound());
+
+            let ordinal = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name, Price FROM Product ORDER BY 2 DESC, 1",
+            );
+            assert_eq!(execute(&mut fixture, ordinal), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, ordinal, 2),
+                vec![
+                    vec!["Beta".to_string(), "20".to_string()],
+                    vec!["Alpha".to_string(), "10".to_string()],
+                    vec!["Gamma".to_string(), "5".to_string()],
+                ]
+            );
+
+            let aggregate_alias = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode, COUNT(*) AS Cnt FROM Feature GROUP BY ProductCode \
+                 ORDER BY Cnt DESC, ProductCode",
+            );
+            assert_eq!(execute(&mut fixture, aggregate_alias), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, aggregate_alias, 2),
+                vec![
+                    vec!["P1".to_string(), "2".to_string()],
+                    vec!["P2".to_string(), "2".to_string()],
+                    vec!["P9".to_string(), "1".to_string()],
+                ]
+            );
+
+            let aggregate_expr = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode FROM Feature GROUP BY ProductCode \
+                 ORDER BY COUNT(*) DESC, ProductCode",
+            );
+            assert_eq!(execute(&mut fixture, aggregate_expr), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, aggregate_expr, 1),
+                vec![
+                    vec!["P1".to_string()],
+                    vec!["P2".to_string()],
+                    vec!["P9".to_string()],
+                ]
+            );
+
+            let parameter_select = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name, ? AS Tag FROM Product WHERE Price >= ? ORDER BY 1",
+            );
+            let record = new_record(&mut fixture, 2);
+            set_record_text(&mut fixture, record, 1, "tag");
+            set_record_int(&mut fixture, record, 2, 5);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::MsiViewExecute,
+                    &[parameter_select as u32, record as u32]
+                ),
+                OK
+            );
+            assert_eq!(
+                collect_rows(&mut fixture, parameter_select, 2),
+                vec![
+                    vec!["Alpha".to_string(), "tag".to_string()],
+                    vec!["Beta".to_string(), "tag".to_string()],
+                    vec!["Gamma".to_string(), "tag".to_string()],
+                ]
+            );
+
+            let parameter_order = open_view(
+                &mut fixture,
+                db,
+                "SELECT Name FROM Product ORDER BY ? DESC, Name",
+            );
+            let key = new_record(&mut fixture, 1);
+            set_record_text(&mut fixture, key, 1, "ignored");
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::MsiViewExecute,
+                    &[parameter_order as u32, key as u32]
+                ),
+                OK
+            );
+            assert_eq!(
+                collect_rows(&mut fixture, parameter_order, 1),
+                vec![
+                    vec!["Alpha".to_string()],
+                    vec!["Beta".to_string()],
+                    vec!["Gamma".to_string()],
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn msi_sql_extended_error_matrix() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("msi-sql-errors-ext");
+            let (db, _path) = open_fixture(&mut fixture, "errorsext.msi", &relational_compound());
+
+            for (sql, expected) in [
+                ("SELECT Name, COUNT(*) FROM Product", ERROR_BAD_QUERY_SYNTAX),
+                (
+                    "SELECT Name, SUM(Price) FROM Product",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+                (
+                    "SELECT Name, COUNT(*) FROM Product HAVING COUNT(*) > 1",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+                (
+                    "SELECT Name FROM Product WHERE COUNT(*) > 1",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+                (
+                    "SELECT COUNT(*) FROM Feature HAVING Weight > 1",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+                (
+                    "SELECT COUNT(*) FROM Feature ORDER BY Weight",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+                (
+                    "SELECT COUNT(SUM(Weight)) FROM Feature",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+                (
+                    "SELECT ProductCode, COUNT(*) AS Cnt FROM Feature GROUP BY ProductCode \
+                     HAVING Missing > 1",
+                    ERROR_BAD_COLUMN,
+                ),
+                (
+                    "SELECT ProductCode, COUNT(*) AS Cnt FROM Feature GROUP BY ProductCode \
+                     ORDER BY Missing",
+                    ERROR_BAD_COLUMN,
+                ),
+                (
+                    "SELECT ProductCode FROM Feature GROUP BY Missing",
+                    ERROR_BAD_COLUMN,
+                ),
+                ("SELECT Name FROM Product ORDER BY 5", ERROR_BAD_COLUMN),
+                (
+                    "SELECT Name FROM Product UNION SELECT FeatureId FROM Feature",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+                (
+                    "SELECT ProductCode FROM Product UNION \
+                     SELECT FeatureId, ProductCode FROM Feature",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+                (
+                    "SELECT Name FROM Product WHERE Price = \
+                     (SELECT FeatureId, Weight FROM Feature)",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+                (
+                    "SELECT Name FROM Product WHERE ProductCode IN \
+                     (SELECT ProductCode, Title FROM Feature)",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+                (
+                    "SELECT Name FROM Product WHERE Price IN (SELECT ProductCode FROM Feature)",
+                    ERROR_BAD_QUERY_SYNTAX,
+                ),
+            ] {
+                assert_eq!(
+                    open_view_error(&mut fixture, db, sql),
+                    u64::from(expected),
+                    "{sql}"
+                );
+            }
+
+            let valid = open_view(
+                &mut fixture,
+                db,
+                "SELECT ProductCode, COUNT(*) AS Cnt FROM Feature GROUP BY ProductCode \
+                 HAVING COUNT(*) >= 1 ORDER BY ProductCode",
+            );
+            assert_eq!(execute(&mut fixture, valid), OK);
+            assert_eq!(
+                collect_rows(&mut fixture, valid, 2),
+                vec![
+                    vec!["P1".to_string(), "2".to_string()],
+                    vec!["P2".to_string(), "2".to_string()],
+                    vec!["P9".to_string(), "1".to_string()],
+                ]
             );
         });
     }

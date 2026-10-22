@@ -1644,6 +1644,11 @@ pub struct GraphicsBackend {
     /// API that presents through this backend; labels every `PresentedFrame`
     /// produced by [`presented_frame`](Self::presented_frame).
     frame_source: FrameSource,
+    /// IOSurface-backed present channel shared with the D3D present path.
+    /// When set, [`presented_frame`](Self::presented_frame) reads the same
+    /// surface bytes the present path wrote instead of the shadow gfx resource,
+    /// so live consumers observe zero-copy presents.
+    presented_surface: Option<crate::metal_backend::IoSurfacePresentChannel>,
     /// Per-instance observability counters for translation optimisations.
     translation_stats: std::cell::RefCell<TranslationStats>,
     /// Cache of translated descriptor tables (revision-validated).
@@ -1676,6 +1681,7 @@ impl std::fmt::Debug for GraphicsBackend {
                     .map(|_| "FnMut(PresentedFrame)"),
             )
             .field("frame_source", &self.frame_source)
+            .field("presented_surface", &self.presented_surface)
             .field("translation_stats", &self.translation_stats)
             .field(
                 "descriptor_translation_cache",
@@ -1707,6 +1713,7 @@ impl Clone for GraphicsBackend {
             pending_split_barriers: self.pending_split_barriers.clone(),
             frame_published_callback: None,
             frame_source: self.frame_source,
+            presented_surface: self.presented_surface.clone(),
             translation_stats: std::cell::RefCell::new(*self.translation_stats.borrow()),
             descriptor_translation_cache: std::cell::RefCell::new(
                 self.descriptor_translation_cache.borrow().clone(),
@@ -2316,6 +2323,7 @@ impl GraphicsBackend {
             adapter: profile.adapter,
             frame_published_callback: None,
             frame_source: FrameSource::DxgiD3D11,
+            presented_surface: None,
             capabilities: profile.capabilities,
             outputs: vec![
                 OutputInfo {
@@ -2559,8 +2567,41 @@ impl GraphicsBackend {
         })
     }
 
+    /// Share the IOSurface-backed present channel with this backend.
+    ///
+    /// D3D devices call this on every present so the live-preview callback
+    /// (and [`presented_frame`](Self::presented_frame)) consumes the exact
+    /// surface the present path wrote, with no intermediate host copy.
+    pub fn set_presented_surface(
+        &mut self,
+        surface: Option<crate::metal_backend::IoSurfacePresentChannel>,
+    ) {
+        self.presented_surface = surface;
+    }
+
+    /// Raw handle of the shared present IOSurface, when one is attached.
+    /// Tests use this to prove the consumer and present path alias the same
+    /// storage.
+    pub fn presented_surface_handle(&self) -> Option<*mut std::ffi::c_void> {
+        self.presented_surface
+            .as_ref()
+            .map(|surface| surface.surface_ptr())
+    }
+
     pub fn presented_frame(&self, swapchain: SwapchainId) -> AppResult<PresentedFrame> {
         let record = self.swapchain(swapchain)?;
+        if let Some(surface) = &self.presented_surface {
+            return Ok(PresentedFrame {
+                width: surface.width(),
+                height: surface.height(),
+                format: record.state.desc.format,
+                bytes: surface.read_pixels()?,
+                source: self.frame_source,
+                stride: surface.width() as usize * 4,
+                sequence: record.next_present_index,
+                timestamp: std::time::Instant::now(),
+            });
+        }
         if record.state.backbuffers.is_empty() {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
@@ -2585,6 +2626,23 @@ impl GraphicsBackend {
             sequence: record.next_present_index,
             timestamp: std::time::Instant::now(),
         })
+    }
+
+    /// Consumer API for live preview/window callbacks: RGBA8 bytes of the
+    /// presented frame. On the IOSurface path this reads the shared surface
+    /// directly (no staging avatar) and converts only when the surface is BGRA.
+    pub fn presented_frame_rgba(&self, swapchain: SwapchainId) -> AppResult<Vec<u8>> {
+        let frame = self.presented_frame(swapchain)?;
+        let mut bytes = frame.bytes;
+        if matches!(
+            frame.format,
+            DxgiFormat::B8G8R8A8Unorm | DxgiFormat::B8G8R8A8UnormSrgb | DxgiFormat::B8G8R8X8Unorm
+        ) {
+            for pixel in bytes.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        Ok(bytes)
     }
 
     pub fn open_presented_frame(&self, swapchain: SwapchainId) -> AppResult<()> {
@@ -6021,6 +6079,45 @@ mod tests {
         let stats = backend.translation_stats();
         assert_eq!(stats.zero_copy_updates, 2);
         assert_eq!(stats.staged_copies, 1);
+    }
+
+    #[test]
+    fn presented_frame_reads_the_shared_iosurface_on_the_zero_copy_path() {
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
+        let swapchain = backend
+            .create_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create swapchain");
+        let Ok(mut channel) = crate::metal_backend::IoSurfacePresentChannel::new(
+            4,
+            2,
+            crate::metal_backend::dxgi_to_metal_format(DxgiFormat::R8G8B8A8Unorm),
+        ) else {
+            return;
+        };
+        let pixels: Vec<u8> = (0..4 * 2 * 4).map(|index| (index * 13) as u8).collect();
+        channel.write_pixels(&pixels).expect("surface write");
+        let surface = channel.surface_ptr();
+        backend.set_presented_surface(Some(channel));
+
+        assert_eq!(backend.presented_surface_handle(), Some(surface));
+        let frame = backend
+            .presented_frame(swapchain)
+            .expect("presented frame from surface");
+        assert_eq!(frame.bytes, pixels);
+        assert_eq!(frame.width, 4);
+        assert_eq!(frame.height, 2);
+        assert_eq!(
+            backend
+                .presented_frame_rgba(swapchain)
+                .expect("rgba consumer"),
+            pixels
+        );
     }
 
     #[test]

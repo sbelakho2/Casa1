@@ -1070,9 +1070,11 @@ pub struct D3d11Device {
     iosurface_channels: Vec<crate::metal_backend::IoSurfacePresentChannel>,
     /// Presents that bound the IOSurface-backed Metal texture.
     iosurface_presents: u64,
-    /// Frame writes that landed directly in the IOSurface mapping (no staging
-    /// Vec upload).
-    zero_copy_uploads: u64,
+    /// Writes that landed directly in the IOSurface mapping (no staging Vec).
+    surface_writes: u64,
+    /// Writes that had to update the CPU backing Vec because the zero-copy
+    /// channel was unavailable or the resource is not a present backbuffer.
+    cpu_backing_writes: u64,
     /// Present-time uploads through the fallback host-visible path because no
     /// IOSurface channel was available.
     fallback_uploads: u64,
@@ -1122,7 +1124,22 @@ impl D3d11Device {
 
     /// Writes that went directly into the IOSurface mapping.
     pub fn zero_copy_upload_count(&self) -> u64 {
-        self.zero_copy_uploads
+        self.surface_writes
+    }
+
+    /// Writes that landed in the IOSurface (authoritative present pixels).
+    pub fn surface_writes(&self) -> u64 {
+        self.surface_writes
+    }
+
+    /// Writes that had to update the CPU backing storage.
+    pub fn cpu_backing_writes(&self) -> u64 {
+        self.cpu_backing_writes
+    }
+
+    /// Raw handle of the shared surface attached to the gfx backend.
+    pub fn presented_surface_handle(&self) -> Option<*mut std::ffi::c_void> {
+        self.backend.presented_surface_handle()
     }
 
     /// Present-time uploads that had to use the fallback path.
@@ -1734,31 +1751,48 @@ impl D3d11Device {
     /// mappings; callers that only write a subset should prefer
     /// `update_subresource`.
     pub fn map(&mut self, resource: D3d11ResourceId) -> AppResult<Vec<u8>> {
-        let record = self.resource_mut(resource)?;
-        record.mapped = true;
-        Ok(record.bytes.clone())
+        let pixels = if let Some(index) = self.present_backbuffer_index(resource) {
+            self.iosurface_channels[index].read_pixels()?
+        } else {
+            self.resource(resource)?.bytes.clone()
+        };
+        self.resource_mut(resource)?.mapped = true;
+        Ok(pixels)
     }
 
     pub fn unmap(&mut self, resource: D3d11ResourceId, bytes: &[u8]) -> AppResult<()> {
+        let mapped = self.resource(resource)?.mapped;
+        if !mapped {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "resource {} is not mapped",
+                    self.resource(resource)?.desc.label
+                ),
+            ));
+        }
+        if bytes.len() > self.resource(resource)?.bytes.len() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "unmap payload exceeds resource {}",
+                    self.resource(resource)?.desc.label
+                ),
+            ));
+        }
+        self.resource_mut(resource)?.mapped = false;
+        if self.write_present_backbuffer_bytes(resource, 0, bytes)? {
+            self.resource_mut(resource)?.digest = None;
+            self.promote_texture_cpu_write_usage(resource)?;
+            return Ok(());
+        }
         let backend_id = {
             let record = self.resource_mut(resource)?;
-            if !record.mapped {
-                return Err(AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    format!("resource {} is not mapped", record.desc.label),
-                ));
-            }
-            if bytes.len() > record.bytes.len() {
-                return Err(AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    format!("unmap payload exceeds resource {}", record.desc.label),
-                ));
-            }
             record.bytes[..bytes.len()].copy_from_slice(bytes);
-            record.mapped = false;
             record.digest = None;
             record.backend_id
         };
+        self.record_cpu_backing_write();
         self.promote_texture_cpu_write_usage(resource)?;
         // Mapped memory is host-visible by definition: classify the write so
         // host-visible resources are counted as zero-copy updates and
@@ -1922,7 +1956,7 @@ impl D3d11Device {
             backend,
             iosurface_channels,
             iosurface_presents,
-            zero_copy_uploads,
+            cpu_backing_writes,
             fallback_uploads,
             zero_copy_present_syncs,
             ..
@@ -1938,11 +1972,7 @@ impl D3d11Device {
                     ),
                 ));
             }
-            for (index, (channel, backbuffer_id)) in iosurface_channels
-                .iter_mut()
-                .zip(backbuffer_ids.iter())
-                .enumerate()
-            {
+            for (index, channel) in iosurface_channels.iter_mut().enumerate() {
                 if channel.width() != state.desc.width || channel.height() != state.desc.height {
                     return Err(AppError::new(
                         ReasonCode::RcD3dInvalidState,
@@ -1968,18 +1998,10 @@ impl D3d11Device {
                         ),
                     ));
                 }
-                let source = resources
-                    .get(backbuffer_id)
-                    .ok_or_else(|| {
-                        AppError::new(
-                            ReasonCode::RcD3dInvalidState,
-                            format!("swapchain backbuffer {backbuffer_id} is missing"),
-                        )
-                    })?
-                    .bytes
-                    .as_slice();
-                channel.write_pixels(source)?;
-                *zero_copy_uploads += 1;
+                // The surface is authoritative: clears, Map/Unmap,
+                // UpdateSubresource and staged uploads already wrote it. Present
+                // only binds the aliasing texture; copying the shadow Vec here
+                // would resurrect stale CPU backing bytes.
             }
             // Bind the presented backbuffer's aliasing Metal texture (the gfx
             // backend presents index 0).
@@ -2000,41 +2022,77 @@ impl D3d11Device {
                 backend.overwrite_resource_bytes(*backbuffer_id, source)?;
                 *zero_copy_present_syncs += 1;
                 *fallback_uploads += 1;
+                *cpu_backing_writes += 1;
             }
         }
         Ok(())
     }
 
-    /// Write an update straight into the IOSurface when `resource` is a
-    /// current swapchain backbuffer. Non-backbuffer resources and the fallback
-    /// path are left untouched.
-    fn write_backbuffer_to_iosurface(
+    /// Index of `resource` when it is a current swapchain backbuffer on the
+    /// zero-copy present path.
+    fn present_backbuffer_index(&self, resource: D3d11ResourceId) -> Option<usize> {
+        if self.iosurface_channels.is_empty() {
+            return None;
+        }
+        self.swapchain_state()
+            .and_then(|state| state.backbuffers.iter().position(|id| *id == resource))
+    }
+
+    /// Read a resource for a transfer/copy. Backbuffers on the zero-copy path
+    /// read the surface (the CPU Vec is intentionally not maintained).
+    fn resource_bytes_for_transfer(&self, resource: D3d11ResourceId) -> AppResult<Vec<u8>> {
+        if let Some(index) = self.present_backbuffer_index(resource) {
+            if let Some(channel) = self.iosurface_channels.get(index) {
+                return channel.read_pixels();
+            }
+        }
+        Ok(self.resource(resource)?.bytes.clone())
+    }
+
+    /// Write `bytes` at `offset` straight into the IOSurface when `resource`
+    /// is a present backbuffer and the channel is active. Returns `false` when
+    /// the caller must fall back to the CPU backing store.
+    fn write_present_backbuffer_bytes(
         &mut self,
         resource: D3d11ResourceId,
+        offset: usize,
         bytes: &[u8],
-    ) -> AppResult<()> {
-        if self.iosurface_channels.is_empty() {
-            return Ok(());
-        }
-        let index = self
-            .swapchain_state()
-            .and_then(|state| state.backbuffers.iter().position(|id| *id == resource));
-        let Some(index) = index else {
-            return Ok(());
+    ) -> AppResult<bool> {
+        let Some(index) = self.present_backbuffer_index(resource) else {
+            return Ok(false);
         };
         let channel = match self.iosurface_channels.get_mut(index) {
             Some(channel) => channel,
-            None => return Ok(()),
+            None => return Ok(false),
         };
         let expected = channel.width() as usize * channel.height() as usize * 4;
-        if bytes.len() != expected {
-            // Partial updates (sub-rectangles/rows) leave the surface write to
-            // the next present, which always publishes the full backbuffer.
-            return Ok(());
+        let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "surface write range overflow",
+            )
+        })?;
+        if end > expected {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "surface write exceeds present backbuffer",
+            ));
         }
-        channel.write_pixels(bytes)?;
-        self.zero_copy_uploads += 1;
-        Ok(())
+        if offset == 0 && bytes.len() == expected {
+            channel.write_pixels(bytes)?;
+        } else {
+            // Partial writes are applied to the surface itself, keeping it
+            // authoritative instead of updating the CPU shadow.
+            let mut pixels = channel.read_pixels()?;
+            pixels[offset..end].copy_from_slice(bytes);
+            channel.write_pixels(&pixels)?;
+        }
+        self.surface_writes += 1;
+        Ok(true)
+    }
+
+    fn record_cpu_backing_write(&mut self) {
+        self.cpu_backing_writes += 1;
     }
 
     pub fn present_swapchain(
@@ -2060,6 +2118,8 @@ impl D3d11Device {
         // mapping and present binds the aliasing Metal texture. Fallback: the
         // previous host-visible sync into the gfx backend resource.
         self.sync_present_backbuffers()?;
+        let presented_surface = self.iosurface_channels.first().cloned();
+        self.backend.set_presented_surface(presented_surface);
         let present = self
             .backend
             .present(swapchain, sync_interval, allow_tearing)?;
@@ -2108,6 +2168,23 @@ impl D3d11Device {
             )
         })?;
         self.backend.open_presented_frame(swapchain)
+    }
+
+    /// Live-consumer API: RGBA8 pixels of the presented frame. Reads the
+    /// IOSurface directly on the zero-copy path and only reorders channels when
+    /// the surface layout is BGRA.
+    pub fn presented_frame_rgba(&self) -> AppResult<Vec<u8>> {
+        let frame = self.presented_frame()?;
+        let mut bytes = frame.bytes;
+        if matches!(
+            frame.format,
+            DxgiFormat::B8G8R8A8Unorm | DxgiFormat::B8G8R8A8UnormSrgb | DxgiFormat::B8G8R8X8Unorm
+        ) {
+            for pixel in bytes.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        Ok(bytes)
     }
 
     pub fn execute_deferred_command_lists(
@@ -2333,41 +2410,50 @@ impl D3d11Device {
 
             match command {
                 RecordedCommand::UpdateSubresource { resource, bytes } => {
+                    if bytes.len() > self.resource(*resource)?.bytes.len() {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!(
+                                "update subresource payload exceeds resource {}",
+                                self.resource(*resource)?.desc.label
+                            ),
+                        ));
+                    }
+                    if self.write_present_backbuffer_bytes(*resource, 0, bytes)? {
+                        self.resource_mut(*resource)?.digest = None;
+                        continue;
+                    }
                     let backend_id = {
                         let record = self.resource_mut(*resource)?;
-                        if bytes.len() > record.bytes.len() {
-                            return Err(AppError::new(
-                                ReasonCode::RcD3dInvalidState,
-                                format!(
-                                    "update subresource payload exceeds resource {}",
-                                    record.desc.label
-                                ),
-                            ));
-                        }
                         record.bytes[..bytes.len()].copy_from_slice(bytes);
                         record.digest = None;
                         record.backend_id
                     };
+                    self.record_cpu_backing_write();
                     // The payload already lives in host memory; classify the
                     // write so host-visible resources hit the in-place
                     // (zero-copy) path and private ones count as staged.
                     self.backend
                         .overwrite_resource_host_visible(backend_id, bytes)?;
-                    self.write_backbuffer_to_iosurface(*resource, bytes)?;
                 }
                 RecordedCommand::CopyResource { src, dst } => {
-                    let source_bytes = self.resource(*src)?.bytes.clone();
+                    let source_bytes = self.resource_bytes_for_transfer(*src)?;
                     let src_backend = self.resource(*src)?.backend_id;
                     let dst_backend = self.resource(*dst)?.backend_id;
-                    let destination = self.resource_mut(*dst)?;
-                    if source_bytes.len() > destination.bytes.len() {
+                    if source_bytes.len() > self.resource(*dst)?.bytes.len() {
                         return Err(AppError::new(
                             ReasonCode::RcD3dInvalidState,
                             "copy resource destination is smaller than source",
                         ));
                     }
-                    destination.bytes = source_bytes;
-                    destination.digest = None;
+                    if !self.write_present_backbuffer_bytes(*dst, 0, &source_bytes)? {
+                        let destination = self.resource_mut(*dst)?;
+                        destination.bytes = source_bytes;
+                        destination.digest = None;
+                        self.record_cpu_backing_write();
+                    } else {
+                        self.resource_mut(*dst)?.digest = None;
+                    }
                     self.backend
                         .record_copy_resource(list, src_backend, dst_backend)?;
                     // A blit closes the active render pass in the backend plan.
@@ -2380,8 +2466,7 @@ impl D3d11Device {
                     dst_offset,
                     size,
                 } => {
-                    let source = self.resource(*src)?.bytes.clone();
-                    let destination = self.resource_mut(*dst)?;
+                    let source = self.resource_bytes_for_transfer(*src)?;
                     let src_end = src_offset.checked_add(*size).ok_or_else(|| {
                         AppError::new(
                             ReasonCode::RcD3dInvalidState,
@@ -2394,15 +2479,25 @@ impl D3d11Device {
                             "copy subresource region destination offset overflow",
                         )
                     })?;
-                    if src_end > source.len() || dst_end > destination.bytes.len() {
+                    if src_end > source.len() || dst_end > self.resource(*dst)?.bytes.len() {
                         return Err(AppError::new(
                             ReasonCode::RcD3dInvalidState,
                             "copy subresource region out of bounds",
                         ));
                     }
-                    destination.bytes[*dst_offset..dst_end]
-                        .copy_from_slice(&source[*src_offset..src_end]);
-                    destination.digest = None;
+                    if !self.write_present_backbuffer_bytes(
+                        *dst,
+                        *dst_offset,
+                        &source[*src_offset..src_end],
+                    )? {
+                        let destination = self.resource_mut(*dst)?;
+                        destination.bytes[*dst_offset..dst_end]
+                            .copy_from_slice(&source[*src_offset..src_end]);
+                        destination.digest = None;
+                        self.record_cpu_backing_write();
+                    } else {
+                        self.resource_mut(*dst)?.digest = None;
+                    }
                 }
                 RecordedCommand::ClearRenderTargetView { view, color } => {
                     let (resource_id, heap) = {
@@ -2417,18 +2512,31 @@ impl D3d11Device {
                             })?,
                         )
                     };
-                    let resource = self.resource_mut(resource_id)?;
+                    let (format, len) = {
+                        let resource = self.resource(resource_id)?;
+                        (resource.desc.format, resource.bytes.len())
+                    };
                     // The clear colour arrives in RGBA byte order (D3D11
                     // ClearRenderTargetView semantics); the resource stores
                     // pixels in its declared format layout, so reorder the
                     // bytes before writing (B8G8R8A8 targets must be
                     // [b, g, r, a], or the clear would swap R/B).
-                    let stored_color = clear_color_bytes_for_format(*color, resource.desc.format);
-                    for chunk in resource.bytes.chunks_mut(4) {
-                        let len = chunk.len().min(4);
-                        chunk[..len].copy_from_slice(&stored_color[..len]);
+                    let stored_color = clear_color_bytes_for_format(*color, format);
+                    let mut pixels = vec![0u8; len];
+                    for chunk in pixels.chunks_mut(4) {
+                        let count = chunk.len().min(4);
+                        chunk[..count].copy_from_slice(&stored_color[..count]);
                     }
-                    resource.digest = None;
+                    if self.write_present_backbuffer_bytes(resource_id, 0, &pixels)? {
+                        self.resource_mut(resource_id)?.digest = None;
+                    } else {
+                        {
+                            let resource = self.resource_mut(resource_id)?;
+                            resource.bytes.copy_from_slice(&pixels);
+                            resource.digest = None;
+                        }
+                        self.record_cpu_backing_write();
+                    }
                     self.backend.record_clear_rtv(list, heap, 0)?;
                 }
                 RecordedCommand::ClearDepthStencilView {
@@ -2464,6 +2572,7 @@ impl D3d11Device {
                         }
                     }
                     resource.digest = None;
+                    self.record_cpu_backing_write();
                     self.backend.record_clear_dsv(list, heap, 0)?;
                 }
                 RecordedCommand::Draw { vertices, .. } => {
@@ -2491,16 +2600,21 @@ impl D3d11Device {
                     let dst_backend = self.resource(*dst)?.backend_id;
                     // For MSAA resolve, use Average mode (D3D11 default).
                     // The CPU-side bytes are copied; the GPU command is recorded for Metal backend.
-                    let source_bytes = self.resource(*src)?.bytes.clone();
-                    let destination = self.resource_mut(*dst)?;
-                    if source_bytes.len() > destination.bytes.len() {
+                    let source_bytes = self.resource_bytes_for_transfer(*src)?;
+                    if source_bytes.len() > self.resource(*dst)?.bytes.len() {
                         return Err(AppError::new(
                             ReasonCode::RcD3dInvalidState,
                             "resolve subresource destination is smaller than source",
                         ));
                     }
-                    destination.bytes = source_bytes;
-                    destination.digest = None;
+                    if !self.write_present_backbuffer_bytes(*dst, 0, &source_bytes)? {
+                        let destination = self.resource_mut(*dst)?;
+                        destination.bytes = source_bytes;
+                        destination.digest = None;
+                        self.record_cpu_backing_write();
+                    } else {
+                        self.resource_mut(*dst)?.digest = None;
+                    }
                     self.backend.record_resolve_subresource(
                         list,
                         dst_backend,
@@ -2527,26 +2641,32 @@ impl D3d11Device {
                     // count is still written into the destination so games see
                     // the documented no-output value instead of stale bytes.
                     self.view(*src_view)?;
-                    let (backend_id, upload) = {
-                        let destination = self.resource_mut(*dst)?;
-                        let offset = *aligned_byte_offset as usize;
-                        let end = offset.checked_add(4).ok_or_else(|| {
-                            AppError::new(
-                                ReasonCode::RcD3dInvalidState,
-                                "copy structure count offset overflow",
-                            )
-                        })?;
-                        if end > destination.bytes.len() {
-                            return Err(AppError::new(
-                                ReasonCode::RcD3dInvalidState,
-                                "copy structure count out of bounds",
-                            ));
-                        }
-                        destination.bytes[offset..end].copy_from_slice(&0u32.to_le_bytes());
-                        destination.digest = None;
-                        (destination.backend_id, destination.bytes.clone())
-                    };
-                    self.backend.overwrite_resource_bytes(backend_id, &upload)?;
+                    let offset = *aligned_byte_offset as usize;
+                    let end = offset.checked_add(4).ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            "copy structure count offset overflow",
+                        )
+                    })?;
+                    if end > self.resource(*dst)?.bytes.len() {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            "copy structure count out of bounds",
+                        ));
+                    }
+                    let zero = 0u32.to_le_bytes();
+                    if !self.write_present_backbuffer_bytes(*dst, offset, &zero)? {
+                        let (backend_id, upload) = {
+                            let destination = self.resource_mut(*dst)?;
+                            destination.bytes[offset..end].copy_from_slice(&zero);
+                            destination.digest = None;
+                            (destination.backend_id, destination.bytes.clone())
+                        };
+                        self.record_cpu_backing_write();
+                        self.backend.overwrite_resource_bytes(backend_id, &upload)?;
+                    } else {
+                        self.resource_mut(*dst)?.digest = None;
+                    }
                 }
             }
         }
@@ -4639,7 +4759,8 @@ fn create_device_internal_with_backend(
         zero_copy_present_syncs: 0,
         iosurface_channels,
         iosurface_presents: 0,
-        zero_copy_uploads: 0,
+        surface_writes: 0,
+        cpu_backing_writes: 0,
         fallback_uploads: 0,
     })
 }
@@ -5155,6 +5276,15 @@ mod tests {
         assert_eq!(device.fallback_upload_count(), backbuffers);
         assert_eq!(device.iosurface_present_count(), 0);
         assert_eq!(device.zero_copy_present_sync_count(), backbuffers);
+        assert_eq!(
+            device.surface_writes(),
+            0,
+            "no surface exists on the fallback path"
+        );
+        assert!(
+            device.cpu_backing_writes() >= 1,
+            "the fallback path must update CPU backing bytes"
+        );
         let frame = device.presented_frame().expect("presented frame");
         assert_eq!(&frame.bytes[..pixels.len()], &pixels);
     }
@@ -5210,6 +5340,8 @@ mod tests {
             "pixels must round-trip through surface"
         );
 
+        let writes_before_repeats = device.surface_writes();
+        let surface_before_repeats = device.iosurface_channels[0].surface_ptr();
         for _ in 0..8 {
             device
                 .present_swapchain(1, false, true)
@@ -5221,6 +5353,205 @@ mod tests {
             "the aliasing texture is reused across frames (no per-frame leak)"
         );
         assert_eq!(device.fallback_upload_count(), 0);
+        assert_eq!(
+            device.surface_writes(),
+            writes_before_repeats,
+            "present must not rewrite the authoritative surface"
+        );
+        assert_eq!(
+            device.iosurface_channels[0].surface_ptr(),
+            surface_before_repeats,
+            "repeated presents must reuse the same surface"
+        );
+        assert_eq!(device.iosurface_channels.len(), 2);
+        assert_eq!(device.cpu_backing_writes(), 0);
+    }
+
+    #[test]
+    fn iosurface_is_authoritative_for_clear_draw_map_and_update() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+        if !device.iosurface_zero_copy_active() {
+            return;
+        }
+        let backbuffer = device
+            .swapchain_backbuffer(0)
+            .expect("swapchain backbuffer");
+        let rtv = device
+            .create_render_target_view(backbuffer, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create render target view");
+        let surface_before = device.surface_writes();
+        let cpu_before = device.cpu_backing_writes();
+        let initial_backing = device
+            .resource(backbuffer)
+            .expect("backbuffer")
+            .bytes
+            .clone();
+
+        device.om_set_render_targets(vec![rtv], None);
+        device.ia_set_primitive_topology(4);
+        device
+            .clear_render_target_view(rtv, [255, 0, 0, 255])
+            .expect("clear red");
+        device.draw(3);
+        device.submit_immediate().expect("submit clear and draw");
+
+        assert_eq!(
+            device.resource(backbuffer).expect("backbuffer").bytes,
+            initial_backing,
+            "the CPU backing Vec must not be touched on the zero-copy path"
+        );
+        assert_eq!(device.surface_writes(), surface_before + 1);
+        assert_eq!(device.cpu_backing_writes(), cpu_before);
+
+        let swapchain = device.swapchain_state().expect("state").id;
+        device
+            .present_swapchain(1, false, true)
+            .expect("present clear");
+        assert_eq!(
+            device.presented_surface_handle(),
+            Some(device.iosurface_channels[0].surface_ptr()),
+            "gfx consumer must alias the D3D present surface"
+        );
+        let frame = device.presented_frame().expect("presented frame");
+        assert!(
+            frame
+                .bytes
+                .chunks_exact(4)
+                .all(|pixel| pixel == [0x00, 0x00, 0xff, 0xff]),
+            "clear colour must come from the surface"
+        );
+        let rgba = device
+            .backend()
+            .presented_frame_rgba(swapchain)
+            .expect("rgba consumer");
+        assert_eq!(&rgba[..4], &[0xff, 0x00, 0x00, 0xff]);
+
+        // Map reads the surface, Unmap writes it back; neither touches CPU
+        // backing bytes.
+        let mapped = device.map(backbuffer).expect("map");
+        assert_eq!(
+            &mapped[..4],
+            &[0x00, 0x00, 0xff, 0xff],
+            "Map must expose present pixels"
+        );
+        let mut blue = mapped;
+        for pixel in blue.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0xff, 0x00, 0x00, 0xff]);
+        }
+        device.unmap(backbuffer, &blue).expect("unmap");
+        assert_eq!(device.surface_writes(), surface_before + 2);
+        assert_eq!(device.cpu_backing_writes(), cpu_before);
+
+        let green: Vec<u8> = [0x00u8, 0xff, 0x00, 0xff]
+            .iter()
+            .copied()
+            .cycle()
+            .take(4 * 2 * 4)
+            .collect();
+        device
+            .update_subresource(backbuffer, &green)
+            .expect("update");
+        device.submit_immediate().expect("submit update");
+        assert_eq!(device.surface_writes(), surface_before + 3);
+        assert_eq!(device.cpu_backing_writes(), cpu_before);
+
+        device
+            .present_swapchain(1, false, true)
+            .expect("present update");
+        let frame = device.presented_frame().expect("presented update");
+        assert_eq!(frame.bytes, green);
+    }
+
+    #[test]
+    fn live_consumer_callback_reads_iosurface_pixels_without_cpu_backing() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+        if !device.iosurface_zero_copy_active() {
+            return;
+        }
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        device
+            .backend
+            .set_frame_published_callback(Some(Box::new(move |frame| {
+                sink.lock().expect("callback sink").push(frame);
+            })));
+
+        let backbuffer = device
+            .swapchain_backbuffer(0)
+            .expect("swapchain backbuffer");
+        let pixels: Vec<u8> = (0..4 * 2 * 4).map(|index| (index * 7) as u8).collect();
+        device
+            .update_subresource(backbuffer, &pixels)
+            .expect("update");
+        device.present_swapchain(1, false, true).expect("present");
+
+        let frames = captured.lock().expect("captured frames");
+        assert_eq!(frames.len(), 1, "present must publish exactly one frame");
+        assert_eq!(
+            frames[0].bytes, pixels,
+            "the live consumer must see the surface pixels"
+        );
+        assert_eq!(device.zero_copy_present_sync_count(), 0);
+        assert_eq!(device.cpu_backing_writes(), 0);
+        assert_eq!(device.fallback_upload_count(), 0);
+        assert_eq!(
+            device.presented_surface_handle(),
+            Some(device.iosurface_channels[0].surface_ptr())
+        );
+    }
+
+    #[test]
+    fn iosurface_present_rejects_mismatched_channel_format() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 2,
+                height: 1,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+        if !device.iosurface_zero_copy_active() {
+            return;
+        }
+        device.iosurface_channels[0] = crate::metal_backend::IoSurfacePresentChannel::new(
+            2,
+            1,
+            metal::MTLPixelFormat::RGBA8Unorm,
+        )
+        .expect("mismatched channel allocation");
+        let error = device
+            .present_swapchain(1, false, true)
+            .expect_err("mismatched format must be rejected");
+        assert!(
+            error.to_string().contains("format"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

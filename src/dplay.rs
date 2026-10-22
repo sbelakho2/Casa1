@@ -908,11 +908,22 @@ const MAGIC_DATA: &[u8; 4] = b"DP8D";
 const MAGIC_TERMINATE: &[u8; 4] = b"DP8S";
 const MAGIC_KEEPALIVE: &[u8; 4] = b"DP8P";
 const MAGIC_GROUP: &[u8; 4] = b"DP8G";
+const MAGIC_GROUP_DATA: &[u8; 4] = b"DP8M";
+const MAGIC_ACK: &[u8; 4] = b"DP8K";
 const GROUP_OP_CREATE: u8 = 1;
 const GROUP_OP_DESTROY: u8 = 2;
 const GROUP_OP_ADD_MEMBER: u8 = 3;
 const GROUP_OP_REMOVE_MEMBER: u8 = 4;
 const GROUP_OP_INFO: u8 = 5;
+const GROUP_OP_ALLOCATE_REQUEST: u8 = 6;
+const GROUP_OP_ALLOCATE_RESPONSE: u8 = 7;
+/// Reliable group-control retry window: one retransmission per interval, up
+/// to the attempt cap, before the message is considered undeliverable.
+const GROUP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_GROUP_SEND_ATTEMPTS: u32 = 20;
+/// How many sender sequence numbers a receiver remembers for duplicate
+/// suppression (the transport itself is a lossy, unordered datagram link).
+const MAX_TRACKED_GROUP_SEQUENCES: usize = 4096;
 const WIRE_PROTOCOL_VERSION: u8 = 1;
 
 fn put_u16(out: &mut Vec<u8>, value: u16) {
@@ -1166,39 +1177,79 @@ fn parse_terminate(data: &[u8]) -> Option<(u32, &[u8])> {
     Some((get_u32(data, 4)?, &data[8..]))
 }
 
-/// A decoded `DP8G` group operation.
+/// A decoded `DP8G` group operation.  Every reliable group message carries
+/// the sending player id and a per-sender sequence number; receivers use the
+/// pair to suppress retransmitted duplicates and acknowledge receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum GroupWire {
     Create {
+        sender: u32,
+        sequence: u32,
         group_id: u32,
         owner: u32,
         name: String,
         data: Vec<u8>,
     },
     Destroy {
+        sender: u32,
+        sequence: u32,
         group_id: u32,
     },
     AddMember {
+        sender: u32,
+        sequence: u32,
         group_id: u32,
         dpnid: u32,
     },
     RemoveMember {
+        sender: u32,
+        sequence: u32,
         group_id: u32,
         dpnid: u32,
     },
     Info {
+        sender: u32,
+        sequence: u32,
         group_id: u32,
         name: String,
         data: Vec<u8>,
     },
+    AllocateRequest {
+        sender: u32,
+        sequence: u32,
+        owner: u32,
+        name: String,
+        data: Vec<u8>,
+    },
+    AllocateResponse {
+        sender: u32,
+        sequence: u32,
+        group_id: u32,
+        client: u32,
+        request_sequence: u32,
+        result: u32,
+    },
+}
+
+fn group_header(out: &mut Vec<u8>, op: u8, group_id: u32, sender: u32, sequence: u32) {
+    out.extend_from_slice(MAGIC_GROUP);
+    out.push(op);
+    put_u32(out, group_id);
+    put_u32(out, sender);
+    put_u32(out, sequence);
 }
 
 /// `DP8G` create encoder.
-fn wire_group_create(group_id: u32, owner: u32, name: &str, data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(15 + name.len() + data.len());
-    out.extend_from_slice(MAGIC_GROUP);
-    out.push(GROUP_OP_CREATE);
-    put_u32(&mut out, group_id);
+fn wire_group_create(
+    sender: u32,
+    sequence: u32,
+    group_id: u32,
+    owner: u32,
+    name: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(23 + name.len() + data.len());
+    group_header(&mut out, GROUP_OP_CREATE, group_id, sender, sequence);
     put_u32(&mut out, owner);
     put_bytes(&mut out, name.as_bytes());
     put_bytes(&mut out, data);
@@ -1206,111 +1257,235 @@ fn wire_group_create(group_id: u32, owner: u32, name: &str, data: &[u8]) -> Vec<
 }
 
 /// `DP8G` destroy encoder.
-fn wire_group_destroy(group_id: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(9);
-    out.extend_from_slice(MAGIC_GROUP);
-    out.push(GROUP_OP_DESTROY);
-    put_u32(&mut out, group_id);
+fn wire_group_destroy(sender: u32, sequence: u32, group_id: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17);
+    group_header(&mut out, GROUP_OP_DESTROY, group_id, sender, sequence);
     out
 }
 
 /// `DP8G` add/remove member encoder.
-fn wire_group_member(op: u8, group_id: u32, dpnid: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(13);
-    out.extend_from_slice(MAGIC_GROUP);
-    out.push(op);
-    put_u32(&mut out, group_id);
+fn wire_group_member(op: u8, sender: u32, sequence: u32, group_id: u32, dpnid: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(21);
+    group_header(&mut out, op, group_id, sender, sequence);
     put_u32(&mut out, dpnid);
     out
 }
 
 /// `DP8G` info/context encoder.
-fn wire_group_info(group_id: u32, name: &str, data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(11 + name.len() + data.len());
-    out.extend_from_slice(MAGIC_GROUP);
-    out.push(GROUP_OP_INFO);
-    put_u32(&mut out, group_id);
+fn wire_group_info(sender: u32, sequence: u32, group_id: u32, name: &str, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(19 + name.len() + data.len());
+    group_header(&mut out, GROUP_OP_INFO, group_id, sender, sequence);
     put_bytes(&mut out, name.as_bytes());
     put_bytes(&mut out, data);
     out
 }
 
+/// `DP8G` client-to-host group id allocation request.
+fn wire_group_allocate_request(
+    sender: u32,
+    sequence: u32,
+    owner: u32,
+    name: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(23 + name.len() + data.len());
+    group_header(&mut out, GROUP_OP_ALLOCATE_REQUEST, 0, sender, sequence);
+    put_u32(&mut out, owner);
+    put_bytes(&mut out, name.as_bytes());
+    put_bytes(&mut out, data);
+    out
+}
+
+/// `DP8G` host-to-client group id allocation answer.
+fn wire_group_allocate_response(
+    sender: u32,
+    sequence: u32,
+    group_id: u32,
+    client: u32,
+    request_sequence: u32,
+    result: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(29);
+    group_header(
+        &mut out,
+        GROUP_OP_ALLOCATE_RESPONSE,
+        group_id,
+        sender,
+        sequence,
+    );
+    put_u32(&mut out, client);
+    put_u32(&mut out, request_sequence);
+    put_u32(&mut out, result);
+    out
+}
+
 fn parse_group(data: &[u8]) -> Option<GroupWire> {
-    if !starts_with_magic(data, MAGIC_GROUP) || data.len() < 9 {
+    if !starts_with_magic(data, MAGIC_GROUP) || data.len() < 17 {
         return None;
     }
     let op = data[4];
     let group_id = get_u32(data, 5)?;
+    let sender = get_u32(data, 9)?;
+    let sequence = get_u32(data, 13)?;
     match op {
-        GROUP_OP_CREATE => {
-            let owner = get_u32(data, 9)?;
-            let name_len = get_u16(data, 13)? as usize;
-            let name = data.get(15..15 + name_len)?;
-            let data_len = get_u16(data, 15 + name_len)? as usize;
-            let payload = data.get(17 + name_len..17 + name_len + data_len)?;
-            Some(GroupWire::Create {
+        GROUP_OP_CREATE | GROUP_OP_ALLOCATE_REQUEST => {
+            let owner = get_u32(data, 17)?;
+            let name_len = get_u16(data, 21)? as usize;
+            let name = data.get(23..23 + name_len)?;
+            let data_len = get_u16(data, 23 + name_len)? as usize;
+            let payload = data.get(25 + name_len..25 + name_len + data_len)?;
+            if op == GROUP_OP_CREATE {
+                Some(GroupWire::Create {
+                    sender,
+                    sequence,
+                    group_id,
+                    owner,
+                    name: String::from_utf8_lossy(name).into_owned(),
+                    data: payload.to_vec(),
+                })
+            } else {
+                Some(GroupWire::AllocateRequest {
+                    sender,
+                    sequence,
+                    owner,
+                    name: String::from_utf8_lossy(name).into_owned(),
+                    data: payload.to_vec(),
+                })
+            }
+        }
+        GROUP_OP_DESTROY => Some(GroupWire::Destroy {
+            sender,
+            sequence,
+            group_id,
+        }),
+        GROUP_OP_ADD_MEMBER | GROUP_OP_REMOVE_MEMBER => {
+            let dpnid = get_u32(data, 17)?;
+            if op == GROUP_OP_ADD_MEMBER {
+                Some(GroupWire::AddMember {
+                    sender,
+                    sequence,
+                    group_id,
+                    dpnid,
+                })
+            } else {
+                Some(GroupWire::RemoveMember {
+                    sender,
+                    sequence,
+                    group_id,
+                    dpnid,
+                })
+            }
+        }
+        GROUP_OP_INFO => {
+            let name_len = get_u16(data, 17)? as usize;
+            let name = data.get(19..19 + name_len)?;
+            let data_len = get_u16(data, 19 + name_len)? as usize;
+            let payload = data.get(21 + name_len..21 + name_len + data_len)?;
+            Some(GroupWire::Info {
+                sender,
+                sequence,
                 group_id,
-                owner,
                 name: String::from_utf8_lossy(name).into_owned(),
                 data: payload.to_vec(),
             })
         }
-        GROUP_OP_DESTROY => Some(GroupWire::Destroy { group_id }),
-        GROUP_OP_ADD_MEMBER | GROUP_OP_REMOVE_MEMBER => {
-            let dpnid = get_u32(data, 9)?;
-            if op == GROUP_OP_ADD_MEMBER {
-                Some(GroupWire::AddMember { group_id, dpnid })
-            } else {
-                Some(GroupWire::RemoveMember { group_id, dpnid })
-            }
-        }
-        GROUP_OP_INFO => {
-            let name_len = get_u16(data, 9)? as usize;
-            let name = data.get(11..11 + name_len)?;
-            let data_len = get_u16(data, 11 + name_len)? as usize;
-            let payload = data.get(13 + name_len..13 + name_len + data_len)?;
-            Some(GroupWire::Info {
+        GROUP_OP_ALLOCATE_RESPONSE => {
+            let client = get_u32(data, 17)?;
+            let request_sequence = get_u32(data, 21)?;
+            let result = get_u32(data, 25)?;
+            Some(GroupWire::AllocateResponse {
+                sender,
+                sequence,
                 group_id,
-                name: String::from_utf8_lossy(name).into_owned(),
-                data: payload.to_vec(),
+                client,
+                request_sequence,
+                result,
             })
         }
         _ => None,
     }
 }
 
+/// `DP8M` reliable group-addressed application data encoder.
+fn wire_group_data(source: u32, destination: u32, sequence: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + payload.len());
+    out.extend_from_slice(MAGIC_GROUP_DATA);
+    put_u32(&mut out, source);
+    put_u32(&mut out, destination);
+    put_u32(&mut out, sequence);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn parse_group_data(data: &[u8]) -> Option<(u32, u32, u32, &[u8])> {
+    if !starts_with_magic(data, MAGIC_GROUP_DATA) || data.len() < 16 {
+        return None;
+    }
+    Some((
+        get_u32(data, 4)?,
+        get_u32(data, 8)?,
+        get_u32(data, 12)?,
+        &data[16..],
+    ))
+}
+
+/// `DP8K` group acknowledgement (sequence + acknowledging player).
+fn wire_group_ack(sender: u32, sequence: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(MAGIC_ACK);
+    put_u32(&mut out, sender);
+    put_u32(&mut out, sequence);
+    out
+}
+
+fn parse_group_ack(data: &[u8]) -> Option<(u32, u32)> {
+    if !starts_with_magic(data, MAGIC_ACK) || data.len() < 12 {
+        return None;
+    }
+    Some((get_u32(data, 4)?, get_u32(data, 8)?))
+}
+
 // ---------------------------------------------------------------------------
 // Shared runtime pieces
 // ---------------------------------------------------------------------------
 
-/// A condition-variable receive queue: producers are the transport threads,
-/// the consumer is [`Dplay8Peer::receive_from`].
+/// A condition-variable receive queue with two independent consumers:
+/// [`Dplay8Peer::receive_from`] (manual receive) and the registered message
+/// handler.  Every transport datagram is appended to both queues, exactly like
+/// the Windows service provider: an application that consumes a datagram with
+/// `ReceiveFrom` still sees the same datagram through its message handler, and
+/// each consumer observes every datagram at most once.
 struct InboundQueue {
-    queue: Mutex<VecDeque<ReceivedDatagram>>,
+    manual: Mutex<VecDeque<ReceivedDatagram>>,
+    handler: Mutex<VecDeque<ReceivedDatagram>>,
     cv: Condvar,
 }
 
 impl InboundQueue {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            queue: Mutex::new(VecDeque::new()),
+            manual: Mutex::new(VecDeque::new()),
+            handler: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
         })
     }
 
     fn push(&self, message: ReceivedDatagram) {
-        let mut queue = self
-            .queue
+        self.manual
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        queue.push_back(message);
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push_back(message.clone());
+        self.handler
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push_back(message);
         self.cv.notify_all();
     }
 
     fn pop_timeout(&self, timeout: Duration) -> Option<ReceivedDatagram> {
         let deadline = Instant::now() + timeout;
         let mut queue = self
-            .queue
+            .manual
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         loop {
@@ -1329,8 +1504,15 @@ impl InboundQueue {
         }
     }
 
+    fn pop_handler(&self) -> Option<ReceivedDatagram> {
+        self.handler
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .pop_front()
+    }
+
     fn len(&self) -> usize {
-        self.queue
+        self.manual
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .len()
@@ -1381,6 +1563,126 @@ struct PlayerRecord {
     addr: SocketAddr,
 }
 
+/// One reliable group message awaiting acknowledgement.
+struct PendingGroupMessage {
+    message: Vec<u8>,
+    destinations: BTreeSet<SocketAddr>,
+    attempts: u32,
+    next_retry: Instant,
+}
+
+/// The reliable layer over the unordered UDP group link: a per-sender
+/// sequence space, an acknowledgement/retransmission table and the set of
+/// sequence numbers already applied (duplicate suppression).
+#[derive(Default)]
+struct GroupReliability {
+    next_sequence: u32,
+    pending: BTreeMap<u32, PendingGroupMessage>,
+    seen: BTreeMap<u32, BTreeSet<u32>>,
+    duplicates_suppressed: u64,
+}
+
+impl GroupReliability {
+    fn allocate_sequence(&mut self) -> u32 {
+        let sequence = self.next_sequence.max(1);
+        self.next_sequence = sequence.wrapping_add(1).max(1);
+        sequence
+    }
+
+    fn record_pending(
+        &mut self,
+        sequence: u32,
+        message: Vec<u8>,
+        destinations: BTreeSet<SocketAddr>,
+    ) {
+        if destinations.is_empty() {
+            return;
+        }
+        self.pending.insert(
+            sequence,
+            PendingGroupMessage {
+                message,
+                destinations,
+                attempts: 1,
+                next_retry: Instant::now() + GROUP_RETRY_INTERVAL,
+            },
+        );
+    }
+
+    /// Remember an inbound sequence.  Returns `true` for the first delivery,
+    /// `false` for a retransmitted duplicate (which must be acknowledged but
+    /// not applied or delivered again).
+    fn note_inbound(&mut self, sender: u32, sequence: u32) -> bool {
+        let seen = self.seen.entry(sender).or_default();
+        if seen.contains(&sequence) {
+            self.duplicates_suppressed = self.duplicates_suppressed.saturating_add(1);
+            return false;
+        }
+        seen.insert(sequence);
+        while seen.len() > MAX_TRACKED_GROUP_SEQUENCES {
+            let Some(first) = seen.iter().next().copied() else {
+                break;
+            };
+            seen.remove(&first);
+        }
+        true
+    }
+
+    fn acknowledge(&mut self, sequence: u32, from: Option<SocketAddr>) {
+        if let Some(from) = from {
+            if let Some(pending) = self.pending.get_mut(&sequence) {
+                pending.destinations.remove(&from);
+                if pending.destinations.is_empty() {
+                    self.pending.remove(&sequence);
+                }
+            }
+        } else {
+            self.pending.remove(&sequence);
+        }
+    }
+
+    fn cancel(&mut self, sequence: u32) {
+        self.pending.remove(&sequence);
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.seen.clear();
+    }
+
+    /// Retransmit every message whose retry interval elapsed.  Messages that
+    /// exceed the bounded attempt count are dropped.
+    fn retransmit(&mut self, mut send: impl FnMut(&[u8], SocketAddr)) {
+        let now = Instant::now();
+        let mut exhausted = Vec::new();
+        for (sequence, pending) in self.pending.iter_mut() {
+            if now < pending.next_retry {
+                continue;
+            }
+            if pending.attempts >= MAX_GROUP_SEND_ATTEMPTS {
+                exhausted.push(*sequence);
+                continue;
+            }
+            for destination in pending.destinations.clone() {
+                send(&pending.message, destination);
+            }
+            pending.attempts = pending.attempts.saturating_add(1);
+            pending.next_retry = now + GROUP_RETRY_INTERVAL;
+        }
+        for sequence in exhausted {
+            self.pending.remove(&sequence);
+        }
+    }
+}
+
+/// Host-authoritative group id allocation: the answer the host gave for one
+/// client request, kept so a retransmitted request gets the same answer.
+#[derive(Clone, Copy, Debug)]
+struct GroupAllocation {
+    group_id: u32,
+    result: u32,
+}
+
 /// A hosted session: its real socket, its players and its service thread.
 struct SessionShared {
     instance_guid: [u8; 16],
@@ -1394,6 +1696,10 @@ struct SessionShared {
     groups: Mutex<BTreeMap<u32, GroupRecord>>,
     inbound: Arc<InboundQueue>,
     events: Arc<EventQueue>,
+    reliability: Mutex<GroupReliability>,
+    allocations: Mutex<BTreeMap<(u32, u32), GroupAllocation>>,
+    drop_group_datagrams: AtomicU32,
+    drop_ack_datagrams: AtomicU32,
     closing: AtomicBool,
     service: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1449,18 +1755,59 @@ impl SessionShared {
             .collect()
     }
 
-    fn broadcast_group(&self, message: &[u8]) {
-        for player in self.snapshot_players() {
-            let _ = self.socket.send_to(message, player.addr);
+    fn send_reliable_group(
+        &self,
+        destinations: BTreeSet<SocketAddr>,
+        build: impl FnOnce(u32) -> Vec<u8>,
+    ) {
+        if destinations.is_empty() {
+            return;
         }
+        let mut reliability = self
+            .reliability
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let sequence = reliability.allocate_sequence();
+        let message = build(sequence);
+        for destination in &destinations {
+            let _ = self.socket.send_to(&message, *destination);
+        }
+        reliability.record_pending(sequence, message, destinations);
     }
 
-    fn relay_group(&self, message: &[u8], except: u32) {
-        for player in self.snapshot_players() {
-            if player.dpnid != except {
-                let _ = self.socket.send_to(message, player.addr);
-            }
-        }
+    fn broadcast_reliable_group(&self, build: impl FnOnce(u32) -> Vec<u8>) {
+        let destinations: BTreeSet<SocketAddr> = self
+            .snapshot_players()
+            .into_iter()
+            .map(|player| player.addr)
+            .collect();
+        self.send_reliable_group(destinations, build);
+    }
+
+    fn relay_reliable_group(&self, except: u32, build: impl FnOnce(u32) -> Vec<u8>) {
+        let destinations: BTreeSet<SocketAddr> = self
+            .snapshot_players()
+            .into_iter()
+            .filter(|player| player.dpnid != except)
+            .map(|player| player.addr)
+            .collect();
+        self.send_reliable_group(destinations, build);
+    }
+
+    fn send_group_ack(&self, destination: SocketAddr, sequence: u32) {
+        let _ = self
+            .socket
+            .send_to(&wire_group_ack(HOST_PLAYER_ID, sequence), destination);
+    }
+
+    fn retransmit_group(&self) {
+        let socket = Arc::clone(&self.socket);
+        self.reliability
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retransmit(move |message, destination| {
+                let _ = socket.send_to(message, destination);
+            });
     }
 }
 
@@ -1590,15 +1937,48 @@ fn map_bind_error(error: &io::Error) -> u32 {
 
 /// The host session service loop: discovery, connect/ack, join/leave, data
 /// relay and termination — all over the session's real UDP socket.
+fn consume_drop(counter: &AtomicU32) -> bool {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+}
+
+fn allocate_group_id(session: &SessionShared) -> u32 {
+    loop {
+        let candidate = session.next_dpnid.fetch_add(1, Ordering::SeqCst).max(2);
+        let groups = session
+            .groups
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !groups.contains_key(&candidate) && session.player_addr(candidate).is_none() {
+            break candidate;
+        }
+    }
+}
+
 fn session_service_loop(session: Arc<SessionShared>) {
     let mut buffer = vec![0u8; RECEIVE_BUFFER];
     loop {
         if session.closing.load(Ordering::SeqCst) {
             break;
         }
+        session.retransmit_group();
         match session.socket.recv_from(&mut buffer) {
             Ok((length, from)) => {
                 let datagram = &buffer[..length];
+                if (starts_with_magic(datagram, MAGIC_GROUP)
+                    || starts_with_magic(datagram, MAGIC_GROUP_DATA))
+                    && consume_drop(&session.drop_group_datagrams)
+                {
+                    continue;
+                }
+                if starts_with_magic(datagram, MAGIC_ACK)
+                    && consume_drop(&session.drop_ack_datagrams)
+                {
+                    continue;
+                }
                 if let Some((version, query_id, application_guid)) = parse_query(datagram) {
                     if version == WIRE_PROTOCOL_VERSION
                         && (application_guid == [0u8; 16] || application_guid == session.app_guid)
@@ -1623,16 +2003,7 @@ fn session_service_loop(session: Arc<SessionShared>) {
                             .send_to(&wire_reject(request_id, DPNERR_SESSIONFULL), from);
                         continue;
                     }
-                    let dpnid = loop {
-                        let candidate = session.next_dpnid.fetch_add(1, Ordering::SeqCst);
-                        let groups = session
-                            .groups
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner());
-                        if !groups.contains_key(&candidate) {
-                            break candidate;
-                        }
-                    };
+                    let dpnid = allocate_group_id(&session);
                     let existing: Vec<(u32, String)> = session
                         .snapshot_players()
                         .into_iter()
@@ -1663,6 +2034,68 @@ fn session_service_loop(session: Arc<SessionShared>) {
                     session
                         .events
                         .push(SessionEvent::PlayerJoined { dpnid, name });
+                    continue;
+                }
+                if let Some((_ack_sender, sequence)) = parse_group_ack(datagram) {
+                    if session.player_by_addr(from).is_some() {
+                        session
+                            .reliability
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .acknowledge(sequence, Some(from));
+                    }
+                    continue;
+                }
+                if let Some((source, destination, sequence, payload)) = parse_group_data(datagram) {
+                    let Some(sender) = session.player_by_addr(from) else {
+                        continue;
+                    };
+                    if source != sender {
+                        continue;
+                    }
+                    let is_new = session
+                        .reliability
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .note_inbound(source, sequence);
+                    session.send_group_ack(from, sequence);
+                    if !is_new {
+                        continue;
+                    }
+                    if let Some(group) = session.group(destination) {
+                        if group.members.contains(&HOST_PLAYER_ID) {
+                            session.inbound.push(ReceivedDatagram {
+                                from_dpnid: source,
+                                from_addr: from,
+                                data: payload.to_vec(),
+                            });
+                        }
+                        let destinations: BTreeSet<SocketAddr> = group
+                            .members
+                            .iter()
+                            .filter_map(|member| session.player_addr(*member))
+                            .collect();
+                        let payload = payload.to_vec();
+                        session.send_reliable_group(destinations, |host_sequence| {
+                            wire_group_data(source, destination, host_sequence, &payload)
+                        });
+                    } else if destination == DPNID_ALL_PLAYERS_GROUP {
+                        session.inbound.push(ReceivedDatagram {
+                            from_dpnid: source,
+                            from_addr: from,
+                            data: payload.to_vec(),
+                        });
+                        let destinations: BTreeSet<SocketAddr> = session
+                            .snapshot_players()
+                            .into_iter()
+                            .filter(|player| player.dpnid != source)
+                            .map(|player| player.addr)
+                            .collect();
+                        let payload = payload.to_vec();
+                        session.send_reliable_group(destinations, |host_sequence| {
+                            wire_group_data(source, destination, host_sequence, &payload)
+                        });
+                    }
                     continue;
                 }
                 if let Some((source, destination, payload)) = parse_data(datagram) {
@@ -1704,12 +2137,127 @@ fn session_service_loop(session: Arc<SessionShared>) {
                     let Some(sender) = session.player_by_addr(from) else {
                         continue;
                     };
+                    let (sequence, operation_sender) = match &operation {
+                        GroupWire::Create {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::Destroy {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::AddMember {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::RemoveMember {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::Info {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::AllocateRequest {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::AllocateResponse {
+                            sender, sequence, ..
+                        } => (*sequence, *sender),
+                    };
+                    if operation_sender != sender {
+                        continue;
+                    }
+                    let is_new = session
+                        .reliability
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .note_inbound(sender, sequence);
+                    session.send_group_ack(from, sequence);
+                    if !is_new {
+                        if matches!(&operation, GroupWire::AllocateRequest { .. }) {
+                            if let Some(allocation) = session
+                                .allocations
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .get(&(sender, sequence))
+                                .copied()
+                            {
+                                session.send_reliable_group(
+                                    BTreeSet::from([from]),
+                                    |host_sequence| {
+                                        wire_group_allocate_response(
+                                            HOST_PLAYER_ID,
+                                            host_sequence,
+                                            allocation.group_id,
+                                            sender,
+                                            sequence,
+                                            allocation.result,
+                                        )
+                                    },
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     match operation {
+                        GroupWire::AllocateRequest {
+                            owner, name, data, ..
+                        } => {
+                            let (result, group_id) = if data.len() > MAX_MESSAGE_PAYLOAD {
+                                (DPNERR_DATATOOLARGE, 0)
+                            } else if owner != HOST_PLAYER_ID
+                                && session.player_addr(owner).is_none()
+                            {
+                                (DPNERR_INVALIDPLAYER, 0)
+                            } else {
+                                let group_id = allocate_group_id(&session);
+                                session
+                                    .groups
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner())
+                                    .insert(
+                                        group_id,
+                                        GroupRecord {
+                                            group_id,
+                                            owner,
+                                            name: name.clone(),
+                                            data: data.clone(),
+                                            members: BTreeSet::new(),
+                                        },
+                                    );
+                                (S_OK, group_id)
+                            };
+                            session
+                                .allocations
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .insert((sender, sequence), GroupAllocation { group_id, result });
+                            let response_data = data.clone();
+                            session.send_reliable_group(BTreeSet::from([from]), |host_sequence| {
+                                wire_group_allocate_response(
+                                    HOST_PLAYER_ID,
+                                    host_sequence,
+                                    group_id,
+                                    sender,
+                                    sequence,
+                                    result,
+                                )
+                            });
+                            if result == S_OK {
+                                session.relay_reliable_group(sender, |host_sequence| {
+                                    wire_group_create(
+                                        HOST_PLAYER_ID,
+                                        host_sequence,
+                                        group_id,
+                                        owner,
+                                        &name,
+                                        &response_data,
+                                    )
+                                });
+                            }
+                        }
                         GroupWire::Create {
                             group_id,
                             owner,
                             name,
                             data,
+                            ..
                         } => {
                             if group_id < 2 || data.len() > MAX_MESSAGE_PAYLOAD {
                                 continue;
@@ -1739,10 +2287,18 @@ fn session_service_loop(session: Arc<SessionShared>) {
                                 },
                             );
                             drop(groups);
-                            let message = wire_group_create(group_id, owner, &name, &data);
-                            session.relay_group(&message, sender);
+                            session.relay_reliable_group(sender, |host_sequence| {
+                                wire_group_create(
+                                    HOST_PLAYER_ID,
+                                    host_sequence,
+                                    group_id,
+                                    owner,
+                                    &name,
+                                    &data,
+                                )
+                            });
                         }
-                        GroupWire::Destroy { group_id } => {
+                        GroupWire::Destroy { group_id, .. } => {
                             let removed = session
                                 .groups
                                 .lock()
@@ -1750,10 +2306,14 @@ fn session_service_loop(session: Arc<SessionShared>) {
                                 .remove(&group_id)
                                 .is_some();
                             if removed {
-                                session.relay_group(&wire_group_destroy(group_id), sender);
+                                session.relay_reliable_group(sender, |host_sequence| {
+                                    wire_group_destroy(HOST_PLAYER_ID, host_sequence, group_id)
+                                });
                             }
                         }
-                        GroupWire::AddMember { group_id, dpnid } => {
+                        GroupWire::AddMember {
+                            group_id, dpnid, ..
+                        } => {
                             let player_exists =
                                 dpnid == HOST_PLAYER_ID || session.player_addr(dpnid).is_some();
                             let changed = match session
@@ -1766,13 +2326,20 @@ fn session_service_loop(session: Arc<SessionShared>) {
                                 _ => false,
                             };
                             if changed {
-                                session.relay_group(
-                                    &wire_group_member(GROUP_OP_ADD_MEMBER, group_id, dpnid),
-                                    sender,
-                                );
+                                session.relay_reliable_group(sender, |host_sequence| {
+                                    wire_group_member(
+                                        GROUP_OP_ADD_MEMBER,
+                                        HOST_PLAYER_ID,
+                                        host_sequence,
+                                        group_id,
+                                        dpnid,
+                                    )
+                                });
                             }
                         }
-                        GroupWire::RemoveMember { group_id, dpnid } => {
+                        GroupWire::RemoveMember {
+                            group_id, dpnid, ..
+                        } => {
                             let changed = match session
                                 .groups
                                 .lock()
@@ -1783,16 +2350,22 @@ fn session_service_loop(session: Arc<SessionShared>) {
                                 None => false,
                             };
                             if changed {
-                                session.relay_group(
-                                    &wire_group_member(GROUP_OP_REMOVE_MEMBER, group_id, dpnid),
-                                    sender,
-                                );
+                                session.relay_reliable_group(sender, |host_sequence| {
+                                    wire_group_member(
+                                        GROUP_OP_REMOVE_MEMBER,
+                                        HOST_PLAYER_ID,
+                                        host_sequence,
+                                        group_id,
+                                        dpnid,
+                                    )
+                                });
                             }
                         }
                         GroupWire::Info {
                             group_id,
                             name,
                             data,
+                            ..
                         } => {
                             if data.len() > MAX_MESSAGE_PAYLOAD {
                                 continue;
@@ -1811,10 +2384,18 @@ fn session_service_loop(session: Arc<SessionShared>) {
                                 None => false,
                             };
                             if changed {
-                                session
-                                    .relay_group(&wire_group_info(group_id, &name, &data), sender);
+                                session.relay_reliable_group(sender, |host_sequence| {
+                                    wire_group_info(
+                                        HOST_PLAYER_ID,
+                                        host_sequence,
+                                        group_id,
+                                        &name,
+                                        &data,
+                                    )
+                                });
                             }
                         }
+                        GroupWire::AllocateResponse { .. } => {}
                     }
                     continue;
                 }
@@ -1868,8 +2449,110 @@ struct ClientTransport {
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     host: SocketAddr,
-    /// Group state replicated by the host over `DP8G`.
+    local_dpnid: u32,
+    /// Group state replicated by the host over `DP8G`/`DP8M`.
     groups: Arc<Mutex<BTreeMap<u32, GroupRecord>>>,
+    reliability: Arc<Mutex<GroupReliability>>,
+    create_wait: Arc<GroupCreateWait>,
+    drop_group_datagrams: Arc<AtomicU32>,
+    drop_ack_datagrams: Arc<AtomicU32>,
+}
+
+impl ClientTransport {
+    fn send_reliable(&self, build: impl FnOnce(u32) -> Vec<u8>) -> Option<u32> {
+        let mut reliability = self
+            .reliability
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let sequence = reliability.allocate_sequence();
+        let message = build(sequence);
+        if self.socket.send(&message).is_err() {
+            return None;
+        }
+        reliability.record_pending(sequence, message, BTreeSet::from([self.host]));
+        Some(sequence)
+    }
+
+    fn retransmit_group(&self) {
+        let socket = Arc::clone(&self.socket);
+        self.reliability
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retransmit(move |message, _destination| {
+                let _ = socket.send(message);
+            });
+    }
+
+    fn pending_group_messages(&self) -> usize {
+        self.reliability
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .pending
+            .len()
+    }
+}
+
+/// A pending host-authoritative group id allocation.
+struct GroupCreateWait {
+    state: Mutex<Option<Result<u32, u32>>>,
+    cv: Condvar,
+}
+
+impl GroupCreateWait {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(None),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn reset(&self) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+
+    fn complete(&self, result: Result<u32, u32>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.is_none() {
+            *state = Some(result);
+            self.cv.notify_all();
+        }
+    }
+
+    fn wait(&self, timeout: Duration) -> Option<Result<u32, u32>> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if let Some(result) = *state {
+                return Some(result);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|poison| poison.into_inner());
+            state = guard;
+        }
+    }
+}
+
+/// A running asynchronous `EnumHosts` operation.
+struct AsyncEnumHosts {
+    cancel: Arc<AtomicBool>,
+    results: Arc<Mutex<Vec<SessionInfo>>>,
+    done: Arc<AtomicBool>,
+    context: u64,
 }
 
 /// The asynchronous peer operations the engine can queue and cancel.
@@ -1905,11 +2588,12 @@ pub(crate) struct Dplay8Peer {
     /// On a client this is the host-replicated copy (the same map the
     /// receiver thread updates from `DP8G`).
     groups: BTreeMap<u32, GroupRecord>,
-    next_group_id: u32,
+    group_create_timeout: Duration,
     /// Pending asynchronous operations that `CancelAsyncOperation` can abort.
     pending_operations: BTreeMap<u32, AsyncOperationKind>,
     completed_operations: BTreeSet<u32>,
     next_async_operation: u32,
+    enum_operations: BTreeMap<u32, AsyncEnumHosts>,
     /// The local player name/data set with `SetPeerInfo`.
     local_player_name: String,
     local_player_data: Vec<u8>,
@@ -1929,6 +2613,101 @@ pub(crate) struct GroupRecord {
     pub(crate) name: String,
     pub(crate) data: Vec<u8>,
     pub(crate) members: BTreeSet<u32>,
+}
+
+/// The real `DP8Q`/`DP8R` enumeration loop shared by synchronous and
+/// asynchronous `EnumHosts`.  `cancel` is checked before every response and
+/// on every receive timeout, so cancellation really stops new responses.
+fn run_enum_hosts_query(
+    application_guid: &[u8; 16],
+    targets: &[SocketAddr],
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+    mut on_response: impl FnMut(SessionInfo),
+) -> Vec<SessionInfo> {
+    let probe = match UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)) {
+        Ok(socket) => socket,
+        Err(_) => return Vec::new(),
+    };
+    let _ = probe.set_broadcast(true);
+    let _ = probe.set_read_timeout(Some(Duration::from_millis(SERVICE_TICK_MS)));
+    let mut destinations: Vec<SocketAddr> = Vec::new();
+    for target in targets {
+        let target = if target.ip().is_unspecified() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), target.port())
+        } else {
+            *target
+        };
+        if !destinations.contains(&target) {
+            destinations.push(target);
+        }
+    }
+    for addr in local_session_addresses() {
+        if !destinations.contains(&addr) {
+            destinations.push(addr);
+        }
+    }
+    if destinations.is_empty() {
+        return Vec::new();
+    }
+    let query_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::SeqCst);
+    let query = wire_query(query_id, application_guid);
+    let mut sent: BTreeMap<SocketAddr, Instant> = BTreeMap::new();
+    for destination in &destinations {
+        if probe.send_to(&query, destination).is_ok() {
+            sent.insert(*destination, Instant::now());
+        }
+    }
+    let deadline = Instant::now() + timeout;
+    let mut results: Vec<SessionInfo> = Vec::new();
+    let mut buffer = vec![0u8; RECEIVE_BUFFER];
+    loop {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst)) {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let _ = probe.set_read_timeout(Some((deadline - now).min(Duration::from_millis(100))));
+        match probe.recv_from(&mut buffer) {
+            Ok((length, from)) => {
+                let Some(mut info) = parse_response(&buffer[..length], from) else {
+                    continue;
+                };
+                if application_guid != &[0u8; 16] && &info.application_guid != application_guid {
+                    continue;
+                }
+                info.latency_ms = sent
+                    .get(&from)
+                    .map(|start| start.elapsed().as_millis() as u32)
+                    .unwrap_or(0);
+                if results
+                    .iter()
+                    .any(|existing| existing.instance_guid == info.instance_guid)
+                {
+                    continue;
+                }
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst)) {
+                    break;
+                }
+                on_response(info.clone());
+                results.push(info);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    results
 }
 
 impl Dplay8Peer {
@@ -1953,10 +2732,11 @@ impl Dplay8Peer {
             enum_timeout: Duration::from_millis(u64::from(DEFAULT_ENUM_TIMEOUT_MS)),
             player_cache: BTreeMap::new(),
             groups: BTreeMap::new(),
-            next_group_id: 1,
+            group_create_timeout: Duration::from_millis(2_000),
             pending_operations: BTreeMap::new(),
             completed_operations: BTreeSet::new(),
             next_async_operation: 1,
+            enum_operations: BTreeMap::new(),
             local_player_name: String::new(),
             local_player_data: Vec::new(),
             local_context: 0,
@@ -2101,6 +2881,61 @@ impl Dplay8Peer {
         self.enum_timeout = timeout;
     }
 
+    pub(crate) fn set_group_create_timeout(&mut self, timeout: Duration) {
+        self.group_create_timeout = timeout;
+    }
+
+    /// Deterministic loss injection for the reliable group link: the next
+    /// `group` group operation/data datagrams and the next `acks`
+    /// acknowledgement datagrams received by this peer are dropped before
+    /// processing.  Returns the previous counters.
+    pub(crate) fn set_group_packet_loss(&mut self, group: u32, acks: u32) -> (u32, u32) {
+        if let Some(session) = &self.session {
+            let previous_group = session.drop_group_datagrams.swap(group, Ordering::SeqCst);
+            let previous_acks = session.drop_ack_datagrams.swap(acks, Ordering::SeqCst);
+            return (previous_group, previous_acks);
+        }
+        if let Some(client) = &self.client {
+            let previous_group = client.drop_group_datagrams.swap(group, Ordering::SeqCst);
+            let previous_acks = client.drop_ack_datagrams.swap(acks, Ordering::SeqCst);
+            return (previous_group, previous_acks);
+        }
+        (0, 0)
+    }
+
+    pub(crate) fn group_duplicates_suppressed(&self) -> u64 {
+        if let Some(session) = &self.session {
+            return session
+                .reliability
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .duplicates_suppressed;
+        }
+        if let Some(client) = &self.client {
+            return client
+                .reliability
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .duplicates_suppressed;
+        }
+        0
+    }
+
+    pub(crate) fn pending_group_messages(&self) -> usize {
+        if let Some(session) = &self.session {
+            return session
+                .reliability
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .pending
+                .len();
+        }
+        self.client
+            .as_ref()
+            .map(ClientTransport::pending_group_messages)
+            .unwrap_or(0)
+    }
+
     /// `Host` — bind the real session socket, publish the session and start
     /// the service thread.  A busy port reports `DPNERR_ADDRESSING`.
     pub(crate) fn host(&mut self, desc: &DplayAppDesc, bind: SocketAddr) -> u32 {
@@ -2139,6 +2974,10 @@ impl Dplay8Peer {
             groups: Mutex::new(BTreeMap::new()),
             inbound: Arc::clone(&self.inbound),
             events: Arc::clone(&self.events),
+            reliability: Mutex::new(GroupReliability::default()),
+            allocations: Mutex::new(BTreeMap::new()),
+            drop_group_datagrams: AtomicU32::new(0),
+            drop_ack_datagrams: AtomicU32::new(0),
             closing: AtomicBool::new(false),
             service: Mutex::new(None),
         });
@@ -2216,6 +3055,14 @@ impl Dplay8Peer {
         let client_groups: Arc<Mutex<BTreeMap<u32, GroupRecord>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let thread_groups = Arc::clone(&client_groups);
+        let client_reliability = Arc::new(Mutex::new(GroupReliability::default()));
+        let thread_reliability = Arc::clone(&client_reliability);
+        let client_create_wait = GroupCreateWait::new();
+        let thread_create_wait = Arc::clone(&client_create_wait);
+        let client_drop_group = Arc::new(AtomicU32::new(0));
+        let thread_drop_group = Arc::clone(&client_drop_group);
+        let client_drop_ack = Arc::new(AtomicU32::new(0));
+        let thread_drop_ack = Arc::clone(&client_drop_ack);
         let handle = thread::Builder::new()
             .name(format!("casa1-dplay8-client-{request_id}"))
             .spawn(move || {
@@ -2229,6 +3076,10 @@ impl Dplay8Peer {
                     thread_shutdown,
                     thread_counters,
                     thread_groups,
+                    thread_reliability,
+                    thread_create_wait,
+                    thread_drop_group,
+                    thread_drop_ack,
                 );
             });
         let handle = match handle {
@@ -2254,7 +3105,12 @@ impl Dplay8Peer {
                     shutdown,
                     thread: Some(handle),
                     host,
+                    local_dpnid: self.local_dpnid,
                     groups: client_groups,
+                    reliability: client_reliability,
+                    create_wait: client_create_wait,
+                    drop_group_datagrams: client_drop_group,
+                    drop_ack_datagrams: client_drop_ack,
                 });
                 S_OK
             }
@@ -2309,13 +3165,14 @@ impl Dplay8Peer {
         }
         if let Some(session) = &self.session {
             if dpnid == DPNID_ALL_PLAYERS_GROUP {
-                let message = wire_data(HOST_PLAYER_ID, DPNID_ALL_PLAYERS_GROUP, payload);
-                let mut delivered = false;
-                for player in session.snapshot_players() {
-                    if session.socket.send_to(&message, player.addr).is_ok() {
-                        delivered = true;
-                    }
-                }
+                let destinations: BTreeSet<SocketAddr> = session
+                    .snapshot_players()
+                    .into_iter()
+                    .map(|player| player.addr)
+                    .collect();
+                session.send_reliable_group(destinations, |sequence| {
+                    wire_group_data(HOST_PLAYER_ID, DPNID_ALL_PLAYERS_GROUP, sequence, payload)
+                });
                 self.inbound.push(ReceivedDatagram {
                     from_dpnid: HOST_PLAYER_ID,
                     from_addr: session.addr,
@@ -2325,11 +3182,7 @@ impl Dplay8Peer {
                     .bytes_sent
                     .fetch_add(payload.len() as u64, Ordering::SeqCst);
                 self.counters.packets_sent.fetch_add(1, Ordering::SeqCst);
-                return if delivered || session.remote_player_count() == 0 {
-                    S_OK
-                } else {
-                    DPNERR_NOCONNECTION
-                };
+                return S_OK;
             }
             if dpnid == HOST_PLAYER_ID {
                 self.inbound.push(ReceivedDatagram {
@@ -2344,7 +3197,7 @@ impl Dplay8Peer {
                 return S_OK;
             }
             if let Some(group) = session.group(dpnid) {
-                let message = wire_data(HOST_PLAYER_ID, dpnid, payload);
+                let mut destinations = BTreeSet::new();
                 for member in &group.members {
                     if *member == HOST_PLAYER_ID {
                         self.inbound.push(ReceivedDatagram {
@@ -2353,9 +3206,12 @@ impl Dplay8Peer {
                             data: payload.to_vec(),
                         });
                     } else if let Some(addr) = session.player_addr(*member) {
-                        let _ = session.socket.send_to(&message, addr);
+                        destinations.insert(addr);
                     }
                 }
+                session.send_reliable_group(destinations, |sequence| {
+                    wire_group_data(HOST_PLAYER_ID, dpnid, sequence, payload)
+                });
                 self.counters
                     .bytes_sent
                     .fetch_add(payload.len() as u64, Ordering::SeqCst);
@@ -2376,16 +3232,28 @@ impl Dplay8Peer {
             return S_OK;
         }
         if let Some(client) = &self.client {
+            let is_group = dpnid == DPNID_ALL_PLAYERS_GROUP || self.group(dpnid).is_some();
             if dpnid != DPNID_ALL_PLAYERS_GROUP
                 && dpnid != self.host_dpnid
                 && !self.player_cache.contains_key(&dpnid)
-                && self.group(dpnid).is_none()
+                && !is_group
             {
                 return DPNERR_INVALIDPLAYER;
             }
-            let message = wire_data(self.local_dpnid, dpnid, payload);
-            if client.socket.send(&message).is_err() {
-                return DPNERR_CONNECTIONLOST;
+            if is_group {
+                if client
+                    .send_reliable(|sequence| {
+                        wire_group_data(self.local_dpnid, dpnid, sequence, payload)
+                    })
+                    .is_none()
+                {
+                    return DPNERR_CONNECTIONLOST;
+                }
+            } else {
+                let message = wire_data(self.local_dpnid, dpnid, payload);
+                if client.socket.send(&message).is_err() {
+                    return DPNERR_CONNECTIONLOST;
+                }
             }
             self.counters
                 .bytes_sent
@@ -2421,91 +3289,71 @@ impl Dplay8Peer {
         self.receive_from(Duration::ZERO)
     }
 
-    /// `EnumHosts` — send a real `DP8Q` to every target (plus every session
-    /// hosted by this runtime) and collect the real `DP8R` answers.
+    /// `EnumHosts` synchronous mode — send a real `DP8Q` to every target
+    /// (plus every session hosted by this runtime) and collect the real
+    /// `DP8R` answers.
     pub(crate) fn enum_hosts(
         &self,
         application_guid: &[u8; 16],
         targets: &[SocketAddr],
         timeout: Duration,
     ) -> Vec<SessionInfo> {
-        let probe = match UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)) {
-            Ok(socket) => socket,
-            Err(_) => return Vec::new(),
-        };
-        let _ = probe.set_broadcast(true);
-        let _ = probe.set_read_timeout(Some(Duration::from_millis(SERVICE_TICK_MS)));
-        let mut destinations: Vec<SocketAddr> = Vec::new();
-        for target in targets {
-            let target = if target.ip().is_unspecified() {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), target.port())
-            } else {
-                *target
-            };
-            if !destinations.contains(&target) {
-                destinations.push(target);
-            }
+        run_enum_hosts_query(application_guid, targets, timeout, None, |_| {})
+    }
+
+    /// `EnumHosts` asynchronous mode — start the real enumeration on a worker
+    /// and return the async operation handle.  Responses are drained by
+    /// [`Self::poll_engine_events`] and delivered through the registered
+    /// message handler until the window ends or the operation is cancelled.
+    pub(crate) fn start_enum_hosts(
+        &mut self,
+        application_guid: &[u8; 16],
+        targets: &[SocketAddr],
+        timeout: Duration,
+        context: u64,
+    ) -> Result<u32, u32> {
+        let handle = self.begin_async_operation(AsyncOperationKind::EnumHosts);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_results = Arc::clone(&results);
+        let worker_done = Arc::clone(&done);
+        let application_guid = *application_guid;
+        let targets = targets.to_vec();
+        let spawn = thread::Builder::new()
+            .name(format!("casa1-dplay8-enum-{handle}"))
+            .spawn(move || {
+                run_enum_hosts_query(
+                    &application_guid,
+                    &targets,
+                    timeout,
+                    Some(&worker_cancel),
+                    |session| {
+                        if !worker_cancel.load(Ordering::SeqCst) {
+                            worker_results
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .push(session);
+                        }
+                    },
+                );
+                worker_done.store(true, Ordering::SeqCst);
+            });
+        if spawn.is_err() {
+            self.pending_operations.remove(&handle);
+            return Err(DPNERR_OUTOFMEMORY);
         }
-        for addr in local_session_addresses() {
-            if !destinations.contains(&addr) {
-                destinations.push(addr);
-            }
-        }
-        if destinations.is_empty() {
-            return Vec::new();
-        }
-        let query_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::SeqCst);
-        let query = wire_query(query_id, application_guid);
-        let mut sent: BTreeMap<SocketAddr, Instant> = BTreeMap::new();
-        for destination in &destinations {
-            if probe.send_to(&query, destination).is_ok() {
-                sent.insert(*destination, Instant::now());
-            }
-        }
-        let deadline = Instant::now() + timeout;
-        let mut results: Vec<SessionInfo> = Vec::new();
-        let mut buffer = vec![0u8; RECEIVE_BUFFER];
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let _ = probe.set_read_timeout(Some((deadline - now).min(Duration::from_millis(100))));
-            match probe.recv_from(&mut buffer) {
-                Ok((length, from)) => {
-                    let Some(mut info) = parse_response(&buffer[..length], from) else {
-                        continue;
-                    };
-                    if application_guid != &[0u8; 16] && &info.application_guid != application_guid
-                    {
-                        continue;
-                    }
-                    info.latency_ms = sent
-                        .get(&from)
-                        .map(|start| start.elapsed().as_millis() as u32)
-                        .unwrap_or(0);
-                    if results
-                        .iter()
-                        .any(|existing| existing.instance_guid == info.instance_guid)
-                    {
-                        continue;
-                    }
-                    results.push(info);
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue;
-                }
-                Err(_) => break,
-            }
-        }
-        results
+        self.enum_operations.insert(
+            handle,
+            AsyncEnumHosts {
+                cancel,
+                results,
+                done,
+                context,
+            },
+        );
+        Ok(handle)
     }
 
     /// `Close` — real session teardown: the host announces `DP8S` to every
@@ -2533,6 +3381,16 @@ impl Dplay8Peer {
             if let Some(handle) = handle {
                 let _ = handle.join();
             }
+            session
+                .reliability
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clear();
+            session
+                .allocations
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clear();
         }
         if let Some(client) = self.client.take() {
             let _ = client.socket.send(&wire_leave(self.local_dpnid));
@@ -2540,6 +3398,18 @@ impl Dplay8Peer {
             if let Some(handle) = client.thread {
                 let _ = handle.join();
             }
+            client
+                .reliability
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clear();
+        }
+        let enum_handles: Vec<u32> = self.enum_operations.keys().copied().collect();
+        for handle in enum_handles {
+            if let Some(operation) = self.enum_operations.remove(&handle) {
+                operation.cancel.store(true, Ordering::SeqCst);
+            }
+            self.pending_operations.remove(&handle);
         }
         self.player_cache.clear();
         self.local_dpnid = 0;
@@ -2667,6 +3537,9 @@ impl Dplay8Peer {
             return DPNERR_INVALIDHANDLE;
         }
         if self.pending_operations.remove(&handle).is_some() {
+            if let Some(operation) = self.enum_operations.remove(&handle) {
+                operation.cancel.store(true, Ordering::SeqCst);
+            }
             return S_OK;
         }
         if self.completed_operations.contains(&handle) {
@@ -2680,8 +3553,8 @@ impl Dplay8Peer {
     }
 
     /// Pull the real queued engine events — received datagrams, player
-    /// create/destroy changes and session termination — into the
-    /// guest-visible [`DplayEvent`] stream.
+    /// create/destroy changes, session termination and asynchronous
+    /// enumeration responses — into the guest-visible [`DplayEvent`] stream.
     pub(crate) fn poll_engine_events(&mut self) -> Vec<DplayEvent> {
         let mut events = Vec::new();
         for event in self.drain_events() {
@@ -2701,12 +3574,49 @@ impl Dplay8Peer {
                 }
             }
         }
-        while let Some(message) = self.poll_receive() {
+        while let Some(message) = self.inbound.pop_handler() {
             events.push(DplayEvent::Receive {
                 sender: message.from_dpnid,
                 context: 0,
                 data: message.data,
             });
+        }
+        let enum_handles: Vec<u32> = self.enum_operations.keys().copied().collect();
+        for handle in enum_handles {
+            let cancelled = self
+                .enum_operations
+                .get(&handle)
+                .is_some_and(|operation| operation.cancel.load(Ordering::SeqCst));
+            if cancelled {
+                continue;
+            }
+            let (responses, done, context) = {
+                let Some(operation) = self.enum_operations.get_mut(&handle) else {
+                    continue;
+                };
+                let responses: Vec<SessionInfo> = operation
+                    .results
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .drain(..)
+                    .collect();
+                (
+                    responses,
+                    operation.done.load(Ordering::SeqCst),
+                    operation.context,
+                )
+            };
+            for session in responses {
+                events.push(DplayEvent::EnumHostsResponse {
+                    context,
+                    session,
+                    async_op: handle,
+                });
+            }
+            if done {
+                self.enum_operations.remove(&handle);
+                let _ = self.complete_async_operation(handle);
+            }
         }
         events
     }
@@ -2761,61 +3671,60 @@ impl Dplay8Peer {
                         members: BTreeSet::new(),
                     },
                 );
-            let message = wire_group_create(group_id, owner, name, data);
-            session.broadcast_group(&message);
+            let message_data = data.to_vec();
+            session.broadcast_reliable_group(|sequence| {
+                wire_group_create(
+                    HOST_PLAYER_ID,
+                    sequence,
+                    group_id,
+                    owner,
+                    name,
+                    &message_data,
+                )
+            });
             return Ok(group_id);
-        }
-        if self.client.is_some() {
-            // Refresh the player cache from the real transport events before
-            // picking an id from the shared DPNID namespace.
-            let _ = self.drain_events();
         }
         if let Some(client) = &self.client {
-            // Never collide with a known player id (the host's data relay
-            // resolves players before groups).
-            let highest_player = self
-                .player_cache
-                .keys()
-                .copied()
-                .max()
-                .unwrap_or(0)
-                .max(self.local_dpnid)
-                .max(self.host_dpnid);
-            let highest_group = client
-                .groups
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .keys()
-                .copied()
-                .max()
-                .unwrap_or(0);
-            let group_id = self
-                .next_group_id
-                .max(2)
-                .max(highest_player + 1)
-                .max(highest_group + 1);
-            self.next_group_id = group_id + 1;
-            client
-                .groups
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .insert(
-                    group_id,
-                    GroupRecord {
-                        group_id,
-                        owner,
-                        name: name.to_string(),
-                        data: data.to_vec(),
-                        members: BTreeSet::new(),
-                    },
-                );
-            let message = wire_group_create(group_id, owner, name, data);
-            if client.socket.send(&message).is_err() {
+            // Host-authoritative group ids: ask the host, wait for its real
+            // answer, and only then create the local group record.  The
+            // request itself is retransmitted by the reliable group link; a
+            // lost answer is retransmitted by the host.
+            client.create_wait.reset();
+            let local_dpnid = self.local_dpnid;
+            let Some(request_sequence) = client.send_reliable(|sequence| {
+                wire_group_allocate_request(local_dpnid, sequence, owner, name, data)
+            }) else {
                 return Err(DPNERR_CONNECTIONLOST);
+            };
+            match client.create_wait.wait(self.group_create_timeout) {
+                Some(Ok(group_id)) => {
+                    client
+                        .groups
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .entry(group_id)
+                        .or_insert_with(|| GroupRecord {
+                            group_id,
+                            owner,
+                            name: name.to_string(),
+                            data: data.to_vec(),
+                            members: BTreeSet::new(),
+                        });
+                    Ok(group_id)
+                }
+                Some(Err(error)) => Err(error),
+                None => {
+                    client
+                        .reliability
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .cancel(request_sequence);
+                    Err(DPNERR_TIMEDOUT)
+                }
             }
-            return Ok(group_id);
+        } else {
+            Err(DPNERR_NOCONNECTION)
         }
-        Err(DPNERR_NOCONNECTION)
     }
 
     pub(crate) fn destroy_group(&mut self, group_id: u32) -> u32 {
@@ -2829,7 +3738,9 @@ impl Dplay8Peer {
             {
                 return DPNERR_INVALIDGROUP;
             }
-            session.broadcast_group(&wire_group_destroy(group_id));
+            session.broadcast_reliable_group(|sequence| {
+                wire_group_destroy(HOST_PLAYER_ID, sequence, group_id)
+            });
             return S_OK;
         }
         if let Some(client) = &self.client {
@@ -2842,7 +3753,12 @@ impl Dplay8Peer {
             {
                 return DPNERR_INVALIDGROUP;
             }
-            let _ = client.socket.send(&wire_group_destroy(group_id));
+            if client
+                .send_reliable(|sequence| wire_group_destroy(self.local_dpnid, sequence, group_id))
+                .is_none()
+            {
+                return DPNERR_CONNECTIONLOST;
+            }
             return S_OK;
         }
         DPNERR_NOCONNECTION
@@ -2865,7 +3781,15 @@ impl Dplay8Peer {
             if !inserted {
                 return DPNERR_DUPLICATECOMMAND;
             }
-            session.broadcast_group(&wire_group_member(GROUP_OP_ADD_MEMBER, group_id, dpnid));
+            session.broadcast_reliable_group(|sequence| {
+                wire_group_member(
+                    GROUP_OP_ADD_MEMBER,
+                    HOST_PLAYER_ID,
+                    sequence,
+                    group_id,
+                    dpnid,
+                )
+            });
             return S_OK;
         }
         if let Some(client) = &self.client {
@@ -2881,9 +3805,15 @@ impl Dplay8Peer {
             if !inserted {
                 return DPNERR_DUPLICATECOMMAND;
             }
-            let _ = client
-                .socket
-                .send(&wire_group_member(GROUP_OP_ADD_MEMBER, group_id, dpnid));
+            let local_dpnid = self.local_dpnid;
+            if client
+                .send_reliable(|sequence| {
+                    wire_group_member(GROUP_OP_ADD_MEMBER, local_dpnid, sequence, group_id, dpnid)
+                })
+                .is_none()
+            {
+                return DPNERR_CONNECTIONLOST;
+            }
             return S_OK;
         }
         DPNERR_NOCONNECTION
@@ -2903,7 +3833,15 @@ impl Dplay8Peer {
             if !removed {
                 return DPNERR_INVALIDPLAYER;
             }
-            session.broadcast_group(&wire_group_member(GROUP_OP_REMOVE_MEMBER, group_id, dpnid));
+            session.broadcast_reliable_group(|sequence| {
+                wire_group_member(
+                    GROUP_OP_REMOVE_MEMBER,
+                    HOST_PLAYER_ID,
+                    sequence,
+                    group_id,
+                    dpnid,
+                )
+            });
             return S_OK;
         }
         if let Some(client) = &self.client {
@@ -2919,9 +3857,21 @@ impl Dplay8Peer {
             if !removed {
                 return DPNERR_INVALIDPLAYER;
             }
-            let _ = client
-                .socket
-                .send(&wire_group_member(GROUP_OP_REMOVE_MEMBER, group_id, dpnid));
+            let local_dpnid = self.local_dpnid;
+            if client
+                .send_reliable(|sequence| {
+                    wire_group_member(
+                        GROUP_OP_REMOVE_MEMBER,
+                        local_dpnid,
+                        sequence,
+                        group_id,
+                        dpnid,
+                    )
+                })
+                .is_none()
+            {
+                return DPNERR_CONNECTIONLOST;
+            }
             return S_OK;
         }
         DPNERR_NOCONNECTION
@@ -2949,7 +3899,10 @@ impl Dplay8Peer {
             if !updated {
                 return DPNERR_INVALIDGROUP;
             }
-            session.broadcast_group(&wire_group_info(group_id, name, data));
+            let message_data = data.to_vec();
+            session.broadcast_reliable_group(|sequence| {
+                wire_group_info(HOST_PLAYER_ID, sequence, group_id, name, &message_data)
+            });
             return S_OK;
         }
         if let Some(client) = &self.client {
@@ -2969,7 +3922,15 @@ impl Dplay8Peer {
             if !updated {
                 return DPNERR_INVALIDGROUP;
             }
-            let _ = client.socket.send(&wire_group_info(group_id, name, data));
+            let local_dpnid = self.local_dpnid;
+            if client
+                .send_reliable(|sequence| {
+                    wire_group_info(local_dpnid, sequence, group_id, name, data)
+                })
+                .is_none()
+            {
+                return DPNERR_CONNECTIONLOST;
+            }
             return S_OK;
         }
         DPNERR_NOCONNECTION
@@ -3064,8 +4025,9 @@ impl Drop for Dplay8Peer {
     }
 }
 
-/// The client receiver loop: parses accept/reject/data/join/leave/terminate
-/// datagrams from the real socket and feeds the peer's queues.
+/// The client receiver loop: parses accept/reject/data/group/ack/join/leave/
+/// terminate datagrams from the real socket, acknowledges reliable group
+/// messages, suppresses duplicates and feeds the peer's queues.
 #[allow(clippy::too_many_arguments)]
 fn client_receive_loop(
     socket: Arc<UdpSocket>,
@@ -3077,16 +4039,39 @@ fn client_receive_loop(
     shutdown: Arc<AtomicBool>,
     counters: Arc<Counters>,
     groups: Arc<Mutex<BTreeMap<u32, GroupRecord>>>,
+    reliability: Arc<Mutex<GroupReliability>>,
+    create_wait: Arc<GroupCreateWait>,
+    drop_group_datagrams: Arc<AtomicU32>,
+    drop_ack_datagrams: Arc<AtomicU32>,
 ) {
     let _ = &counters;
+    let host_addr = socket
+        .peer_addr()
+        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
     let mut buffer = vec![0u8; RECEIVE_BUFFER];
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
+        let send_socket = Arc::clone(&socket);
+        reliability
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retransmit(move |message, _destination| {
+                let _ = send_socket.send(message);
+            });
         match socket.recv(&mut buffer) {
             Ok(length) => {
                 let datagram = &buffer[..length];
+                if (starts_with_magic(datagram, MAGIC_GROUP)
+                    || starts_with_magic(datagram, MAGIC_GROUP_DATA))
+                    && consume_drop(&drop_group_datagrams)
+                {
+                    continue;
+                }
+                if starts_with_magic(datagram, MAGIC_ACK) && consume_drop(&drop_ack_datagrams) {
+                    continue;
+                }
                 if let Some((_request_id, assigned, host, players)) = parse_accept(datagram) {
                     wait.complete(Ok(ConnectAccept {
                         assigned,
@@ -3099,25 +4084,83 @@ fn client_receive_loop(
                     wait.complete(Err(reason));
                     continue;
                 }
+                if let Some((_ack_sender, sequence)) = parse_group_ack(datagram) {
+                    reliability
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .acknowledge(sequence, None);
+                    continue;
+                }
+                if let Some((source, _destination, sequence, payload)) = parse_group_data(datagram)
+                {
+                    let is_new = reliability
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .note_inbound(HOST_PLAYER_ID, sequence);
+                    let _ = socket.send(&wire_group_ack(0, sequence));
+                    if !is_new {
+                        continue;
+                    }
+                    inbound.push(ReceivedDatagram {
+                        from_dpnid: source,
+                        from_addr: host_addr,
+                        data: payload.to_vec(),
+                    });
+                    continue;
+                }
                 if let Some((source, _destination, payload)) = parse_data(datagram) {
                     inbound.push(ReceivedDatagram {
                         from_dpnid: source,
-                        from_addr: socket.peer_addr().unwrap_or_else(|_| {
-                            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-                        }),
+                        from_addr: host_addr,
                         data: payload.to_vec(),
                     });
                     continue;
                 }
                 if let Some(operation) = parse_group(datagram) {
-                    let mut groups = groups.lock().unwrap_or_else(|poison| poison.into_inner());
+                    let (sequence, sender) = match &operation {
+                        GroupWire::Create {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::Destroy {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::AddMember {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::RemoveMember {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::Info {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::AllocateRequest {
+                            sender, sequence, ..
+                        }
+                        | GroupWire::AllocateResponse {
+                            sender, sequence, ..
+                        } => (*sequence, *sender),
+                    };
+                    if sender != HOST_PLAYER_ID {
+                        continue;
+                    }
+                    let is_new = reliability
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .note_inbound(HOST_PLAYER_ID, sequence);
+                    let _ = socket.send(&wire_group_ack(0, sequence));
+                    if !is_new {
+                        continue;
+                    }
                     match operation {
                         GroupWire::Create {
                             group_id,
                             owner,
                             name,
                             data,
+                            ..
                         } => {
+                            let mut groups =
+                                groups.lock().unwrap_or_else(|poison| poison.into_inner());
                             let group = groups.entry(group_id).or_insert_with(|| GroupRecord {
                                 group_id,
                                 owner,
@@ -3129,14 +4172,21 @@ fn client_receive_loop(
                             group.name = name;
                             group.data = data;
                         }
-                        GroupWire::Destroy { group_id } => {
-                            groups.remove(&group_id);
+                        GroupWire::Destroy { group_id, .. } => {
+                            groups
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .remove(&group_id);
                         }
-                        GroupWire::AddMember { group_id, dpnid } => {
+                        GroupWire::AddMember {
+                            group_id, dpnid, ..
+                        } => {
                             // UDP may deliver the membership announcement
                             // before the create; keep it in a placeholder that
                             // the later create fills in.
                             groups
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
                                 .entry(group_id)
                                 .or_insert_with(|| GroupRecord {
                                     group_id,
@@ -3148,8 +4198,14 @@ fn client_receive_loop(
                                 .members
                                 .insert(dpnid);
                         }
-                        GroupWire::RemoveMember { group_id, dpnid } => {
-                            if let Some(group) = groups.get_mut(&group_id) {
+                        GroupWire::RemoveMember {
+                            group_id, dpnid, ..
+                        } => {
+                            if let Some(group) = groups
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .get_mut(&group_id)
+                            {
                                 group.members.remove(&dpnid);
                             }
                         }
@@ -3157,12 +4213,27 @@ fn client_receive_loop(
                             group_id,
                             name,
                             data,
+                            ..
                         } => {
-                            if let Some(group) = groups.get_mut(&group_id) {
+                            if let Some(group) = groups
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .get_mut(&group_id)
+                            {
                                 group.name = name;
                                 group.data = data;
                             }
                         }
+                        GroupWire::AllocateResponse {
+                            result, group_id, ..
+                        } => {
+                            create_wait.complete(if result == S_OK {
+                                Ok(group_id)
+                            } else {
+                                Err(result)
+                            });
+                        }
+                        GroupWire::AllocateRequest { .. } => {}
                     }
                     continue;
                 }
@@ -3238,7 +4309,7 @@ impl DplayRuntime {
     pub(crate) fn cancel_pending_async(&mut self, handle: u32) -> bool {
         let before = self.pending.len();
         self.pending
-            .retain(|pending| pending.event.async_operation() != Some(handle));
+            .retain(|pending| pending.event.operation_handle() != Some(handle));
         self.pending.len() != before
     }
 }
@@ -3790,6 +4861,7 @@ pub(crate) enum DplayEvent {
     EnumHostsResponse {
         context: u64,
         session: SessionInfo,
+        async_op: u32,
     },
 }
 
@@ -3799,6 +4871,17 @@ impl DplayEvent {
         match self {
             DplayEvent::ConnectComplete { async_op, .. }
             | DplayEvent::SendComplete { async_op, .. } => Some(*async_op),
+            _ => None,
+        }
+    }
+
+    /// The async-operation handle that produced this event, including
+    /// streaming responses (an enumeration emits one response per host).
+    pub(crate) fn operation_handle(&self) -> Option<u32> {
+        match self {
+            DplayEvent::ConnectComplete { async_op, .. }
+            | DplayEvent::SendComplete { async_op, .. } => Some(*async_op),
+            DplayEvent::EnumHostsResponse { async_op, .. } if *async_op != 0 => Some(*async_op),
             _ => None,
         }
     }
@@ -4305,6 +5388,66 @@ mod tests {
         host.close();
     }
 
+    #[test]
+    fn manual_receive_and_handler_observe_the_same_datagrams() {
+        let mut host = started_peer();
+        assert_eq!(
+            host.host(&DplayAppDesc::new("Dual Consumers", 4), localhost()),
+            S_OK
+        );
+        let host_addr = host.local_address().expect("host address");
+        let mut client = started_peer();
+        client.set_connect_timeout(Duration::from_secs(3));
+        assert_eq!(client.connect(host_addr, "Sender", &[]), S_OK);
+
+        // Manual receive consumes its copy; the handler still receives an
+        // independent event for the same datagram.
+        assert_eq!(client.send_to(HOST_PLAYER_ID, b"manual-first"), S_OK);
+        let manual = host
+            .receive_from(Duration::from_secs(3))
+            .expect("manual receive");
+        assert_eq!(manual.data, b"manual-first");
+
+        assert_eq!(client.send_to(HOST_PLAYER_ID, b"handler-first"), S_OK);
+        let mut handled = Vec::new();
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                for event in host.poll_engine_events() {
+                    if let DplayEvent::Receive { data, .. } = event {
+                        handled.push(data);
+                    }
+                }
+                handled
+                    .iter()
+                    .any(|data| data.as_slice() == b"handler-first")
+            }),
+            "the message handler observes the real datagrams"
+        );
+        assert!(
+            handled
+                .iter()
+                .any(|data| data.as_slice() == b"manual-first"),
+            "a manually consumed datagram is still delivered to the handler"
+        );
+
+        // The handler consuming its copy does not steal the manual copy.
+        let manual = host
+            .receive_from(Duration::from_secs(3))
+            .expect("manual receive after handler delivery");
+        assert_eq!(manual.data, b"handler-first");
+        assert!(host.poll_receive().is_none(), "no manual duplicate");
+        assert!(
+            !host
+                .poll_engine_events()
+                .iter()
+                .any(|event| matches!(event, DplayEvent::Receive { .. })),
+            "no handler duplicate"
+        );
+
+        client.close();
+        host.close();
+    }
+
     // ── guest dispatch (real vtables through the runtime dispatcher) ───────
 
     fn guest_put(memory: &mut crate::cpu::MemoryImage, address: u64, bytes: &[u8]) {
@@ -4716,10 +5859,12 @@ mod tests {
 
     #[test]
     fn wire_group_messages_round_trip() {
-        let create = wire_group_create(7, 3, "Team", b"ctx");
+        let create = wire_group_create(3, 11, 7, 3, "Team", b"ctx");
         assert_eq!(
             parse_group(&create),
             Some(GroupWire::Create {
+                sender: 3,
+                sequence: 11,
                 group_id: 7,
                 owner: 3,
                 name: "Team".to_string(),
@@ -4727,31 +5872,69 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_group(&wire_group_destroy(7)),
-            Some(GroupWire::Destroy { group_id: 7 })
+            parse_group(&wire_group_destroy(3, 12, 7)),
+            Some(GroupWire::Destroy {
+                sender: 3,
+                sequence: 12,
+                group_id: 7
+            })
         );
         assert_eq!(
-            parse_group(&wire_group_member(GROUP_OP_ADD_MEMBER, 7, 9)),
+            parse_group(&wire_group_member(GROUP_OP_ADD_MEMBER, 3, 13, 7, 9)),
             Some(GroupWire::AddMember {
+                sender: 3,
+                sequence: 13,
                 group_id: 7,
                 dpnid: 9
             })
         );
         assert_eq!(
-            parse_group(&wire_group_member(GROUP_OP_REMOVE_MEMBER, 7, 9)),
+            parse_group(&wire_group_member(GROUP_OP_REMOVE_MEMBER, 3, 14, 7, 9)),
             Some(GroupWire::RemoveMember {
+                sender: 3,
+                sequence: 14,
                 group_id: 7,
                 dpnid: 9
             })
         );
         assert_eq!(
-            parse_group(&wire_group_info(7, "Renamed", b"data")),
+            parse_group(&wire_group_info(3, 15, 7, "Renamed", b"data")),
             Some(GroupWire::Info {
+                sender: 3,
+                sequence: 15,
                 group_id: 7,
                 name: "Renamed".to_string(),
                 data: b"data".to_vec(),
             })
         );
+        assert_eq!(
+            parse_group(&wire_group_allocate_request(3, 16, 3, "New", b"ctx")),
+            Some(GroupWire::AllocateRequest {
+                sender: 3,
+                sequence: 16,
+                owner: 3,
+                name: "New".to_string(),
+                data: b"ctx".to_vec(),
+            })
+        );
+        assert_eq!(
+            parse_group(&wire_group_allocate_response(1, 17, 8, 3, 16, S_OK)),
+            Some(GroupWire::AllocateResponse {
+                sender: 1,
+                sequence: 17,
+                group_id: 8,
+                client: 3,
+                request_sequence: 16,
+                result: S_OK,
+            })
+        );
+        let group_data = wire_group_data(3, 7, 18, b"payload");
+        assert_eq!(
+            parse_group_data(&group_data),
+            Some((3, 7, 18, b"payload".as_slice()))
+        );
+        let ack = wire_group_ack(1, 18);
+        assert_eq!(parse_group_ack(&ack), Some((1, 18)));
         assert_eq!(parse_group(b"DP8G"), None);
         assert_eq!(parse_group(&create[..11]), None);
     }
@@ -4916,6 +6099,248 @@ mod tests {
         host.close();
         assert_ne!(first_id, 0);
         assert_ne!(second_id, 0);
+    }
+
+    #[test]
+    fn group_replication_retransmits_under_loss_and_suppresses_duplicates() {
+        let mut host = started_peer();
+        assert_eq!(
+            host.host(&DplayAppDesc::new("Lossy Groups", 8), localhost()),
+            S_OK
+        );
+        let host_addr = host.local_address().expect("host address");
+        let mut first = started_peer();
+        first.set_connect_timeout(Duration::from_secs(3));
+        assert_eq!(first.connect(host_addr, "First", &[]), S_OK);
+        let mut second = started_peer();
+        second.set_connect_timeout(Duration::from_secs(3));
+        assert_eq!(second.connect(host_addr, "Second", &[]), S_OK);
+        let first_id = first.local_dpnid();
+        let second_id = second.local_dpnid();
+
+        let group = host
+            .create_group("Lossy Team", HOST_PLAYER_ID, b"context")
+            .expect("host group");
+        assert_eq!(host.add_player_to_group(group, first_id), S_OK);
+        assert_eq!(host.add_player_to_group(group, second_id), S_OK);
+        assert!(wait_until(Duration::from_secs(3), || {
+            first.group(group).is_some() && second.group(group).is_some()
+        }));
+
+        // Drop the first group datagram for `second` and the first
+        // acknowledgement arriving at the host.  The reliable layer must
+        // retransmit, and the retransmitted duplicate must be suppressed.
+        second.set_group_packet_loss(1, 0);
+        host.set_group_packet_loss(0, 1);
+        assert_eq!(
+            host.set_group_info(group, "Lossy Renamed", b"new-context"),
+            S_OK
+        );
+        assert!(
+            wait_until(Duration::from_secs(4), || {
+                second.group(group).is_some_and(|group| {
+                    group.name == "Lossy Renamed" && group.data == b"new-context"
+                })
+            }),
+            "dropped group state converges through retransmission"
+        );
+        assert!(
+            wait_until(Duration::from_secs(3), || host.pending_group_messages()
+                == 0),
+            "all acknowledgements eventually complete the reliable sends"
+        );
+        assert!(
+            first.group_duplicates_suppressed() + second.group_duplicates_suppressed() >= 1,
+            "the retransmitted duplicate was suppressed, not reapplied"
+        );
+
+        // Group-addressed application data is reliable too: drop the first
+        // delivery to the second member and observe exactly one delivery.
+        second.set_group_packet_loss(1, 0);
+        assert_eq!(host.send_to(group, b"lossy-data"), S_OK);
+        let mut received = Vec::new();
+        assert!(
+            wait_until(Duration::from_secs(4), || {
+                if let Some(message) = second.receive_from(Duration::ZERO) {
+                    received.push(message.data);
+                }
+                received.iter().any(|data| data == b"lossy-data")
+            }),
+            "dropped group data converges through retransmission"
+        );
+        thread::sleep(Duration::from_millis(250));
+        while let Some(message) = second.receive_from(Duration::ZERO) {
+            received.push(message.data);
+        }
+        assert_eq!(
+            received
+                .iter()
+                .filter(|data| data.as_slice() == b"lossy-data")
+                .count(),
+            1,
+            "the application observes the group datagram exactly once"
+        );
+
+        first.close();
+        second.close();
+        host.close();
+    }
+
+    #[test]
+    fn client_group_id_allocation_is_host_authoritative_and_times_out() {
+        let mut host = started_peer();
+        assert_eq!(
+            host.host(&DplayAppDesc::new("Group Alloc", 8), localhost()),
+            S_OK
+        );
+        let host_addr = host.local_address().expect("host address");
+        let mut client = started_peer();
+        client.set_connect_timeout(Duration::from_secs(3));
+        assert_eq!(client.connect(host_addr, "Allocator", &[]), S_OK);
+        let client_id = client.local_dpnid();
+
+        // Drop the first allocation request at the host: the client must
+        // retransmit, and the host's assigned id must be the one returned.
+        host.set_group_packet_loss(1, 0);
+        let group = client
+            .create_group("Allocated By Host", client_id, b"alloc-ctx")
+            .expect("the host assigns a real group id");
+        assert!(
+            host.group(group)
+                .is_some_and(|group| group.name == "Allocated By Host"),
+            "the host really created the group under the assigned id"
+        );
+        assert!(client.group(group).is_some(), "the client adopted the id");
+        assert!(
+            wait_until(Duration::from_secs(3), || host.pending_group_messages()
+                == 0),
+            "the allocation request and response were acknowledged"
+        );
+
+        let mut timed_out = started_peer();
+        timed_out.set_connect_timeout(Duration::from_secs(3));
+        assert_eq!(timed_out.connect(host_addr, "Timed Out", &[]), S_OK);
+        timed_out.set_group_create_timeout(Duration::from_millis(180));
+        host.set_group_packet_loss(1_000, 0);
+        let result = timed_out.create_group("Never Allocated", timed_out.local_dpnid(), b"");
+        host.set_group_packet_loss(0, 0);
+        assert_eq!(
+            result,
+            Err(DPNERR_TIMEDOUT),
+            "a host that never answers yields the real timeout error"
+        );
+        assert!(timed_out.groups().is_empty(), "no optimistic id was kept");
+
+        timed_out.close();
+        client.close();
+        host.close();
+    }
+
+    #[test]
+    fn session_close_discards_pending_group_retransmissions() {
+        let mut host = started_peer();
+        assert_eq!(
+            host.host(&DplayAppDesc::new("Closing Retries", 4), localhost()),
+            S_OK
+        );
+        let host_addr = host.local_address().expect("host address");
+        let mut client = started_peer();
+        client.set_connect_timeout(Duration::from_secs(3));
+        assert_eq!(client.connect(host_addr, "Member", &[]), S_OK);
+
+        // Every acknowledgement received by the host is dropped, leaving the
+        // host's reliable group sends pending when the session closes.
+        host.set_group_packet_loss(0, 1_000);
+        let group = host
+            .create_group("Pending Retries", HOST_PLAYER_ID, b"")
+            .expect("host group");
+        assert_eq!(host.add_player_to_group(group, client.local_dpnid()), S_OK);
+        assert!(
+            wait_until(Duration::from_secs(2), || host.pending_group_messages() > 0),
+            "a reliable send is pending"
+        );
+
+        assert_eq!(host.close(), S_OK);
+        assert_eq!(
+            host.pending_group_messages(),
+            0,
+            "closing the session discards pending retransmissions"
+        );
+        client.close();
+    }
+
+    #[test]
+    fn enum_hosts_async_returns_pending_and_cancel_stops_responses() {
+        let mut host = started_peer();
+        let mut desc = DplayAppDesc::new("Async Enum", 4);
+        desc.application_guid = [5u8; 16];
+        assert_eq!(host.host(&desc, localhost()), S_OK);
+        let host_addr = host.local_address().expect("host address");
+        let instance = host.host_instance_guid().expect("instance");
+
+        let mut scout = started_peer();
+        let handle = scout
+            .start_enum_hosts(&[5u8; 16], &[host_addr], Duration::from_millis(600), 0x77)
+            .expect("async operation");
+        assert!(
+            scout.async_operation_pending(handle),
+            "EnumHosts returned a live async handle"
+        );
+        assert_eq!(scout.cancel_async_operation(handle), S_OK);
+        thread::sleep(Duration::from_millis(150));
+        let events = scout.poll_engine_events();
+        assert!(
+            !events.iter().any(|event| {
+                matches!(
+                    event,
+                    DplayEvent::EnumHostsResponse { session, .. }
+                        if session.instance_guid == instance
+                )
+            }),
+            "a cancelled enumeration emits no further responses"
+        );
+        assert!(!scout.async_operation_pending(handle));
+        assert_eq!(
+            scout.cancel_async_operation(handle),
+            DPNERR_INVALIDHANDLE,
+            "the cancelled handle is gone"
+        );
+
+        let handle = scout
+            .start_enum_hosts(&[5u8; 16], &[host_addr], Duration::from_millis(600), 0x88)
+            .expect("second async operation");
+        let mut found = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            for event in scout.poll_engine_events() {
+                if let DplayEvent::EnumHostsResponse {
+                    context,
+                    session,
+                    async_op,
+                } = event
+                {
+                    if async_op == handle && context == 0x88 && session.instance_guid == instance {
+                        found = true;
+                    }
+                }
+            }
+            if found {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            found,
+            "async responses are delivered with the operation context"
+        );
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                let _ = scout.poll_engine_events();
+                !scout.async_operation_pending(handle)
+            }),
+            "the operation completes when the enumeration window ends"
+        );
+        host.close();
     }
 
     #[test]
@@ -5112,6 +6537,150 @@ mod tests {
                 );
             }
             client.close();
+            lock_dplay_runtimes().remove(&pid);
+        })
+    }
+
+    #[test]
+    fn guest_enum_hosts_async_returns_pending_and_cancel_stops_delivery() {
+        use crate::cpu::{CpuState, GuestArch, Register};
+        with_big_stack(|| {
+            let mut host_peer = started_peer();
+            let mut desc = DplayAppDesc::new("Async Guest Enum", 4);
+            desc.application_guid = [6u8; 16];
+            assert_eq!(host_peer.host(&desc, localhost()), S_OK);
+            let host_addr = host_peer.local_address().expect("host address");
+
+            let mut fixture = x86_fixture("dplay-enum-async");
+            let msgid_out = 0x45_100_u64;
+            guest_put_u32(&mut fixture.memory, msgid_out, 0);
+            let handler = 0x46_000_u64;
+            let mut code = vec![
+                0x8B, 0x44, 0x24, 0x08, // mov eax,[esp+8]
+                0xA3, // mov [msgid_out],eax
+            ];
+            code.extend_from_slice(&(msgid_out as u32).to_le_bytes());
+            code.extend_from_slice(&[0x33, 0xC0, 0xC3]); // xor eax,eax; ret
+            guest_put(&mut fixture.memory, handler, &code);
+
+            let pid = fixture.runtime.guest_pid;
+            let address_object = 0x2100_u64;
+            {
+                let mut address = Dplay8Address::new();
+                assert_eq!(address.set_hostname("127.0.0.1"), S_OK);
+                assert_eq!(address.set_port(host_addr.port()), S_OK);
+                assert_eq!(address.set_sp(&CLSID_DP8SP_TCPIP), S_OK);
+                let mut store = lock_dplay_runtimes();
+                let runtime = store.entry(pid).or_default();
+                let mut peer = Dplay8Peer::new();
+                assert_eq!(peer.initialize(0x55, handler, 0), S_OK);
+                runtime.objects.insert(
+                    0x2000,
+                    DplayObjectEntry {
+                        refcount: 1,
+                        object: DplayObject::Peer(peer),
+                    },
+                );
+                runtime.objects.insert(
+                    address_object,
+                    DplayObjectEntry {
+                        refcount: 1,
+                        object: DplayObject::Address(address),
+                    },
+                );
+            }
+            let app_desc = 0x41_000_u64;
+            guest_put(&mut fixture.memory, app_desc, &[0u8; 72]);
+            guest_put_u32(&mut fixture.memory, app_desc, 72);
+            let async_out = 0x47_000_u64;
+            guest_put_u32(&mut fixture.memory, async_out, 0);
+            let hr = guest_call(
+                &mut fixture,
+                0x2000,
+                IFACE_PEER,
+                25,
+                &[
+                    app_desc as u32,
+                    address_object as u32,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    300,
+                    0x1234,
+                    async_out as u32,
+                    0,
+                ],
+            );
+            assert_eq!(
+                hr,
+                u64::from(DPNERR_PENDING),
+                "async EnumHosts reports pending"
+            );
+            let handle = guest_read_u32(&fixture.memory, async_out);
+            assert_ne!(handle, 0, "a real async handle was written");
+
+            let mut state = CpuState::new(GuestArch::X86);
+            fixture.memory.map_bytes(0x4F_000, &vec![0u8; 0x2000]);
+            state.set(Register::Rsp, 0x50_000);
+            let mut delivered = false;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                fixture
+                    .runtime
+                    .drain_pending_dplay_events(&mut state, &mut fixture.memory)
+                    .expect("drain enum response");
+                if guest_read_u32(&fixture.memory, msgid_out) == 13 {
+                    delivered = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(delivered, "DPN_MSGID_ENUM_HOSTS_RESPONSE delivered");
+
+            // A second operation cancelled before delivery must not run.
+            guest_put_u32(&mut fixture.memory, msgid_out, 0);
+            guest_put_u32(&mut fixture.memory, async_out, 0);
+            assert_eq!(
+                guest_call(
+                    &mut fixture,
+                    0x2000,
+                    IFACE_PEER,
+                    25,
+                    &[
+                        app_desc as u32,
+                        address_object as u32,
+                        0,
+                        0,
+                        0,
+                        1,
+                        0,
+                        1_000,
+                        0x5678,
+                        async_out as u32,
+                        0,
+                    ],
+                ),
+                u64::from(DPNERR_PENDING)
+            );
+            let cancel_handle = guest_read_u32(&fixture.memory, async_out);
+            assert_eq!(
+                guest_call(&mut fixture, 0x2000, IFACE_PEER, 5, &[cancel_handle]),
+                u64::from(S_OK)
+            );
+            thread::sleep(Duration::from_millis(150));
+            fixture
+                .runtime
+                .drain_pending_dplay_events(&mut state, &mut fixture.memory)
+                .expect("drain after cancel");
+            assert_eq!(
+                guest_read_u32(&fixture.memory, msgid_out),
+                0,
+                "cancelled enumeration delivered no handler response"
+            );
+
+            host_peer.close();
             lock_dplay_runtimes().remove(&pid);
         })
     }

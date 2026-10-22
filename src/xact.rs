@@ -507,6 +507,9 @@ impl WaveEntry {
 pub(crate) struct WaveBank {
     pub(crate) name: String,
     pub(crate) streaming: bool,
+    /// Resolved host path for a streaming bank opened through the runtime's
+    /// file tables; `None` for in-memory banks.
+    pub(crate) source_path: Option<String>,
     pub(crate) entry_names: Vec<String>,
     pub(crate) entries: Vec<WaveEntry>,
 }
@@ -697,10 +700,221 @@ impl WaveBank {
         Ok(Self {
             name,
             streaming,
+            source_path: None,
             entry_names,
             entries,
         })
     }
+
+    /// Parse the header and entry metadata of a streaming XWB without
+    /// materialising its wave payload.  `file_length` is the real on-disk
+    /// size; every entry's `[data_offset, data_offset + data_length)` range
+    /// is validated against it.  Wave PCM is loaded later by
+    /// [`load_streaming_pcm`] with a real seek/read.
+    pub(crate) fn parse_streaming_header(
+        data: &[u8],
+        file_length: usize,
+        source_path: &str,
+    ) -> Result<Self, u32> {
+        let magic = u32_at(data, 0)?;
+        if magic == WAVEBANK_SIGNATURE_BE || magic != WAVEBANK_SIGNATURE_LE {
+            return Err(XACTENGINE_E_INVALIDDATA);
+        }
+        let version = u32_at(data, 4)?;
+        if version <= 41 || version > 46 {
+            return Err(XACTENGINE_E_INVALIDDATA);
+        }
+        let header_version = u32_at(data, 8)?;
+        if !(42..=44).contains(&header_version) {
+            return Err(XACTENGINE_E_INVALIDDATA);
+        }
+        let mut segments = [(0u32, 0u32); 5];
+        for (index, segment) in segments.iter_mut().enumerate() {
+            let offset = u32_at(data, 12 + index * 8)?;
+            let length = u32_at(data, 16 + index * 8)?;
+            *segment = (offset, length);
+        }
+        for (index, &(offset, length)) in segments.iter().enumerate() {
+            if length == 0 {
+                continue;
+            }
+            let end = (offset as usize)
+                .checked_add(length as usize)
+                .ok_or(XACTENGINE_E_INVALIDDATA)?;
+            let limit = if index == 4 { file_length } else { data.len() };
+            if end > limit {
+                return Err(XACTENGINE_E_INVALIDDATA);
+            }
+        }
+        let bank_data_offset = segments[0].0 as usize;
+        let flags = u32_at(data, bank_data_offset)?;
+        let entry_count = u32_at(data, bank_data_offset + 4)?;
+        if entry_count > 0x10_0000 {
+            return Err(XACTENGINE_E_INVALIDENTRYCOUNT);
+        }
+        let name = zstring_at(data, bank_data_offset + 8, 64);
+        let metadata_size = u32_at(data, bank_data_offset + 72)? as usize;
+        let _name_element_size = u32_at(data, bank_data_offset + 76)? as usize;
+        let alignment = u32_at(data, bank_data_offset + 80)?;
+        let compact_format = MiniFormat::decode(u32_at(data, bank_data_offset + 84)?);
+        let streaming = flags & WAVEBANK_TYPE_STREAMING != 0;
+        if !streaming {
+            return Err(XACTENGINE_E_INVALIDUSAGE);
+        }
+        let compact = flags & WAVEBANK_FLAGS_COMPACT != 0;
+        let metadata_offset = segments[1].0 as usize;
+        let wave_data_offset = segments[4].0 as usize;
+        let wave_data_length = segments[4].1 as usize;
+
+        let mut entries = Vec::with_capacity(entry_count as usize);
+        if compact {
+            if metadata_size < 4 {
+                return Err(XACTENGINE_E_INVALIDDATA);
+            }
+            let mut offsets = Vec::with_capacity(entry_count as usize);
+            for index in 0..entry_count as usize {
+                let value = u32_at(data, metadata_offset + index * metadata_size)?;
+                offsets.push((value & ((1 << 21) - 1)) as u64 * alignment as u64);
+            }
+            for (index, relative_offset) in offsets.iter().enumerate() {
+                let next = offsets
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(wave_data_length as u64);
+                let length = next.saturating_sub(*relative_offset) as u32;
+                let absolute = wave_data_offset as u64 + relative_offset;
+                if absolute + length as u64 > file_length as u64 {
+                    return Err(XACTENGINE_E_INVALIDDATA);
+                }
+                entries.push(WaveEntry {
+                    flags: 0,
+                    duration_samples: 0,
+                    format: compact_format,
+                    data_offset: absolute.min(u32::MAX as u64) as u32,
+                    data_length: length,
+                    loop_start_sample: 0,
+                    loop_total_samples: 0,
+                    pcm: None,
+                    decode_error: None,
+                });
+            }
+        } else {
+            if metadata_size < 4 {
+                return Err(XACTENGINE_E_INVALIDDATA);
+            }
+            for index in 0..entry_count as usize {
+                let base = metadata_offset + index * metadata_size;
+                let flags_and_duration = u32_at(data, base)?;
+                let format = MiniFormat::decode(u32_at(data, base + 4)?);
+                let play_offset = if metadata_size >= 12 {
+                    u32_at(data, base + 8)?
+                } else {
+                    0
+                };
+                let play_length = if metadata_size >= 16 {
+                    u32_at(data, base + 12)?
+                } else {
+                    wave_data_length as u32
+                };
+                let loop_start = if metadata_size >= 20 {
+                    u32_at(data, base + 16)?
+                } else {
+                    0
+                };
+                let loop_total = if metadata_size >= 24 {
+                    u32_at(data, base + 20)?
+                } else {
+                    0
+                };
+                let data_offset = wave_data_offset.saturating_add(play_offset as usize);
+                if data_offset as u64 + play_length as u64 > file_length as u64 {
+                    return Err(XACTENGINE_E_INVALIDDATA);
+                }
+                entries.push(WaveEntry {
+                    flags: flags_and_duration & 0xF,
+                    duration_samples: (flags_and_duration >> 4) & 0x0FFF_FFFF,
+                    format,
+                    data_offset: data_offset as u32,
+                    data_length: play_length,
+                    loop_start_sample: loop_start,
+                    loop_total_samples: loop_total,
+                    pcm: None,
+                    decode_error: None,
+                });
+            }
+        }
+
+        let mut entry_names = Vec::new();
+        if flags & WAVEBANK_FLAGS_ENTRYNAMES != 0 && segments[3].1 > 0 {
+            let names_offset = segments[3].0 as usize;
+            for index in 0..entry_count as usize {
+                entry_names.push(zstring_at(data, names_offset + index * 64, 64));
+            }
+        }
+
+        Ok(Self {
+            name,
+            streaming,
+            source_path: Some(source_path.to_string()),
+            entry_names,
+            entries,
+        })
+    }
+}
+
+/// Read the exact header/metadata prefix a streaming bank needs, then parse
+/// it without touching the wave-data segment.  File I/O errors surface as
+/// `E_FAIL`; malformed content surfaces the genuine `XACTENGINE_E_*` code.
+pub(crate) fn open_streaming_wave_bank(path: &str) -> Result<WaveBank, u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(|_| E_FAIL)?;
+    let file_length = file.metadata().map_err(|_| E_FAIL)?.len() as usize;
+    let mut header = [0_u8; 52];
+    file.read_exact(&mut header).map_err(|_| E_FAIL)?;
+    let mut needed = 52_usize;
+    for index in 0..4 {
+        let offset = u32::from_le_bytes([
+            header[12 + index * 8],
+            header[13 + index * 8],
+            header[14 + index * 8],
+            header[15 + index * 8],
+        ]) as usize;
+        let length = u32::from_le_bytes([
+            header[16 + index * 8],
+            header[17 + index * 8],
+            header[18 + index * 8],
+            header[19 + index * 8],
+        ]) as usize;
+        if length > 0 {
+            needed = needed.max(offset.saturating_add(length));
+        }
+    }
+    if needed > file_length {
+        return Err(XACTENGINE_E_INVALIDDATA);
+    }
+    let mut data = vec![0_u8; needed];
+    file.seek(SeekFrom::Start(0)).map_err(|_| E_FAIL)?;
+    file.read_exact(&mut data).map_err(|_| E_FAIL)?;
+    WaveBank::parse_streaming_header(&data, file_length, path)
+}
+
+/// Load one streaming entry's payload with a real seek/read and decode it.
+/// This is the on-demand path used by `Prepare` and `Play`.
+pub(crate) fn load_streaming_pcm(bank: &WaveBank, index: usize) -> Result<Vec<i16>, u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (Some(path), Some(entry)) = (bank.source_path.as_deref(), bank.entries.get(index)) else {
+        return Err(XACTENGINE_E_INVALIDWAVEINDEX);
+    };
+    let mut file = std::fs::File::open(path).map_err(|_| E_FAIL)?;
+    file.seek(SeekFrom::Start(u64::from(entry.data_offset)))
+        .map_err(|_| E_FAIL)?;
+    let mut payload = vec![0_u8; entry.data_length as usize];
+    file.read_exact(&mut payload).map_err(|_| E_FAIL)?;
+    let mut decoded = entry.clone();
+    decode_wave_payload(&mut decoded, &payload);
+    decoded
+        .pcm
+        .ok_or(decoded.decode_error.unwrap_or(XACTENGINE_E_INVALIDDATA))
 }
 
 /// Decode one entry's payload into `pcm`, or record the genuine decode error.
@@ -714,6 +928,12 @@ fn decode_wave_entry(data: &[u8], entry: &mut WaveEntry) {
             return;
         }
     };
+    decode_wave_payload(entry, payload);
+}
+
+/// Decode one already-read payload into `entry.pcm`, or record the genuine
+/// decode error (unsupported XMA/WMA codecs included).
+pub(crate) fn decode_wave_payload(entry: &mut WaveEntry, payload: &[u8]) {
     match entry.format.tag {
         WAVEBANK_TAG_PCM => match entry.format.bits_per_sample {
             16 => {
@@ -862,6 +1082,15 @@ pub(crate) struct CueDef {
     pub(crate) fade_in_ms: u16,
     pub(crate) fade_out_ms: u16,
     pub(crate) max_instance_behavior: u8,
+    /// Cue-local variable bindings parsed from the cue's interactive
+    /// variation table: each entry is the global variable index the local
+    /// slot shadows.  Empty when the cue has no variable-bound variation.
+    pub(crate) local_variables: Vec<i16>,
+    /// Friendly names for the cue-local slots, parallel to
+    /// `local_variables` when the sound bank carries the variable-name
+    /// index table.  Empty when the table is absent; bindings then resolve
+    /// through the shadowed global variable names.
+    pub(crate) local_variable_names: Vec<String>,
 }
 
 /// One entry of a cue variation table.
@@ -935,6 +1164,18 @@ impl SoundBank {
     /// Select the playback for `cue_index`: a direct sound for single-sound
     /// cues, or a weighted selection from the cue's variation table.
     pub(crate) fn select_cue(&self, cue_index: u16) -> Result<PlaySelection, u32> {
+        self.select_cue_with_variables(cue_index, &[])
+    }
+
+    /// Select a cue's playback with the engine's current variable values.
+    /// Interactive variations bound to a variable choose the entry whose
+    /// authored `[min, max]` range contains the value (nearest range when it
+    /// falls outside every range); unbound tables keep the weighted draw.
+    pub(crate) fn select_cue_with_variables(
+        &self,
+        cue_index: u16,
+        variables: &[f32],
+    ) -> Result<PlaySelection, u32> {
         let cue = self
             .cues
             .get(cue_index as usize)
@@ -967,7 +1208,22 @@ impl SoundBank {
                     .collect::<Vec<_>>()
                     .as_slice(),
             ),
-            VARIATION_TABLE_TYPE_SOUND | VARIATION_TABLE_TYPE_INTERACTIVE => weighted_entry_index(
+            VARIATION_TABLE_TYPE_INTERACTIVE => {
+                match variables.get(variation.variable.max(0) as usize) {
+                    Some(value) if variation.variable >= 0 => {
+                        interactive_entry_index(&variation.entries, *value)
+                    }
+                    _ => weighted_entry_index(
+                        variation
+                            .entries
+                            .iter()
+                            .map(entry_weight)
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    ),
+                }
+            }
+            VARIATION_TABLE_TYPE_SOUND => weighted_entry_index(
                 variation
                     .entries
                     .iter()
@@ -1064,7 +1320,10 @@ impl SoundBank {
         let cue_simple_offset = i32_at(data, 34)?;
         let cue_complex_offset = i32_at(data, 38)?;
         let cue_name_offset = i32_at(data, 42)?;
-        // Unknown i32 at 46.
+        // Friendly-name index table for cue-local variables.  Content that
+        // carries the extension stores a 6-byte (name offset, sort key) entry
+        // per local slot; -1 means the bank has no variable-name table.
+        let local_variable_name_index_offset = i32_at(data, 46)?;
         let variation_offset = i32_at(data, 50)?;
         let _transition_offset = i32_at(data, 54)?;
         let wavebank_name_offset = i32_at(data, 58)?;
@@ -1144,6 +1403,8 @@ impl SoundBank {
                     fade_in_ms: 0,
                     fade_out_ms: 0,
                     max_instance_behavior: 0,
+                    local_variables: Vec::new(),
+                    local_variable_names: Vec::new(),
                 });
                 cursor += 5;
             }
@@ -1178,6 +1439,8 @@ impl SoundBank {
                     fade_in_ms,
                     fade_out_ms,
                     max_instance_behavior,
+                    local_variables: Vec::new(),
+                    local_variable_names: Vec::new(),
                 });
                 cursor += 15;
             }
@@ -1263,13 +1526,44 @@ impl SoundBank {
             }
         }
 
-        // Bind every variation cue to its table.
+        // Bind every variation cue to its table.  An interactive table is
+        // the cue's local variable table: its variable index is the global
+        // variable the cue-local slot shadows.
         for cue in cues.iter_mut().filter(|cue| !cue.single_sound) {
             cue.variation_index = variations
                 .iter()
                 .position(|variation| variation.code == cue.sound_code);
-            if cue.variation_index.is_none() {
+            let Some(index) = cue.variation_index else {
                 return Err(XACTENGINE_E_INVALIDDATA);
+            };
+            let binding = variations.get(index).and_then(|variation| {
+                (variation.kind == VARIATION_TABLE_TYPE_INTERACTIVE && variation.variable >= 0)
+                    .then_some(variation.variable)
+            });
+            cue.local_variables.extend(binding);
+        }
+
+        // Cue-local friendly names: one 6-byte (absolute string offset,
+        // sort key) index entry per local variable slot, in cue/local-slot
+        // order.  A bank without the table keeps empty names and the cue
+        // still resolves local slots through the global variable names.
+        let local_slot_count = cues
+            .iter()
+            .map(|cue| cue.local_variables.len())
+            .sum::<usize>();
+        if local_variable_name_index_offset > 0 {
+            let mut names = Vec::with_capacity(local_slot_count);
+            for index in 0..local_slot_count {
+                let entry = local_variable_name_index_offset as usize + index * 6;
+                let string_offset = u32_at(data, entry)? as usize;
+                names.push(zstring_at(data, string_offset, 255));
+            }
+            let mut next = 0_usize;
+            for cue in cues.iter_mut() {
+                let count = cue.local_variables.len();
+                cue.local_variable_names
+                    .extend(names[next..next + count].iter().cloned());
+                next += count;
             }
         }
 
@@ -1281,6 +1575,34 @@ impl SoundBank {
             cues,
         })
     }
+}
+
+/// Pick the interactive variation entry whose authored range contains
+/// `value`, or the nearest range when the value is outside them all.
+fn interactive_entry_index(entries: &[VariationEntry], value: f32) -> usize {
+    let mut nearest = 0_usize;
+    let mut nearest_distance = f32::INFINITY;
+    for (index, entry) in entries.iter().enumerate() {
+        let VariationEntry::Interactive {
+            var_min, var_max, ..
+        } = entry
+        else {
+            continue;
+        };
+        if value >= *var_min && value <= *var_max {
+            return index;
+        }
+        let distance = if value < *var_min {
+            *var_min - value
+        } else {
+            value - *var_max
+        };
+        if distance < nearest_distance {
+            nearest_distance = distance;
+            nearest = index;
+        }
+    }
+    nearest
 }
 
 fn entry_weight(entry: &VariationEntry) -> (u8, u8, u32) {
@@ -1554,6 +1876,9 @@ pub(crate) struct XgsCategory {
     pub(crate) fade_out_ms: u16,
     pub(crate) max_instance_behavior: u8,
     pub(crate) visibility: u8,
+    /// Authored release-curve form.  The extended XGS category record adds
+    /// one curve byte per category; the 10-byte stock record has no curve.
+    pub(crate) release_curve: ReleaseCurve,
 }
 
 /// One global-settings variable.
@@ -1607,9 +1932,20 @@ impl GlobalSettings {
         // categoryNameOffset at 57, variableNameOffset at 61, rpc at 65,
         // dsp preset at 69, dsp parameter at 73.
 
+        // The stock June-2010 category record is 10 bytes.  Authored content
+        // that carries the release-curve extension uses an 11-byte record;
+        // detect that layout from the real table span instead of guessing.
+        let category_stride = if category_count > 0
+            && variable_offset >= category_offset
+            && (variable_offset - category_offset) as usize == category_count as usize * 11
+        {
+            11
+        } else {
+            10
+        };
         let mut categories = Vec::with_capacity(category_count as usize);
         for index in 0..category_count as usize {
-            let base = category_offset as usize + index * 10;
+            let base = category_offset as usize + index * category_stride;
             let instance_limit = u8_at(data, base)?;
             let fade_in_ms = u16_at(data, base + 1)?;
             let fade_out_ms = u16_at(data, base + 3)?;
@@ -1617,6 +1953,14 @@ impl GlobalSettings {
             let parent = u16_at(data, base + 6)?;
             let volume = decibels_to_amplitude(u8_at(data, base + 8)?);
             let visibility = u8_at(data, base + 9)?;
+            let release_curve = if category_stride == 11 {
+                match u8_at(data, base + 10)? {
+                    1 => ReleaseCurve::Logarithmic,
+                    _ => ReleaseCurve::Linear,
+                }
+            } else {
+                ReleaseCurve::Linear
+            };
             let name_entry = category_name_index_offset as usize + index * 6;
             let name_offset = u32_at(data, name_entry)? as usize;
             let name = zstring_at(data, name_offset, 255);
@@ -1629,6 +1973,7 @@ impl GlobalSettings {
                 fade_out_ms,
                 max_instance_behavior,
                 visibility,
+                release_curve,
             });
         }
 
@@ -1708,6 +2053,11 @@ pub(crate) struct CategoryState {
     pub(crate) instance_limit: u8,
     pub(crate) paused: bool,
     pub(crate) visibility: u8,
+    /// Authored release time from the XGS category fade-out field.  `Stop`
+    /// without `XACT_FLAG_STOP_IMMEDIATE` fades over this many milliseconds.
+    pub(crate) release_ms: u16,
+    /// Authored release-curve shape (`Linear` for stock 10-byte records).
+    pub(crate) release_curve: ReleaseCurve,
 }
 
 /// One registered notification (`XACT_NOTIFICATION_DESCRIPTION` copied into
@@ -1725,14 +2075,95 @@ pub(crate) struct NotificationRegistration {
     pub(crate) context: u64,
 }
 
-/// A live source voice owned by a cue or standalone wave.
+/// `XAUDIO2_MAX_SEND_COUNT` — the maximum output voices one cue can target.
+pub(crate) const XACT_MAX_OUTPUT_VOICES: usize = 8;
+
+/// One real guest output voice selected by `IXACT3Cue::SetOutputVoices`.
+/// The guest object is an `IXAudio2Voice` created through the runtime's
+/// XAudio2 surface; the runtime resolves it to a real mixer voice and reads
+/// its channel count from the audio stack.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutputVoiceRoute {
+    /// Guest `IXAudio2Voice *` address.
+    pub(crate) voice: u64,
+    /// Destination channel count of the output voice.
+    pub(crate) channels: u16,
+    /// `SetOutputVoiceMatrix` coefficients, source-major.
+    pub(crate) matrix: Option<(u32, u32, Vec<f32>)>,
+}
+
+/// A live source voice owned by a cue or standalone wave.  A cue that routes
+/// to several output voices owns one real source voice per destination; all
+/// of them render through the engine's mastering voice.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct LiveVoice {
     pub(crate) voice: VoiceId,
+    pub(crate) extra_voices: [VoiceId; XACT_MAX_OUTPUT_VOICES - 1],
+    pub(crate) extra_voice_count: u8,
     pub(crate) base_volume: f32,
     pub(crate) pitch_cents: i16,
     pub(crate) category: u16,
     pub(crate) paused: bool,
+    /// Active release envelope after a non-immediate `Stop`.
+    pub(crate) release: Option<ReleaseFade>,
+}
+
+impl LiveVoice {
+    /// Every real mixer voice this instance owns, primary first.
+    pub(crate) fn voices(&self) -> impl Iterator<Item = VoiceId> + '_ {
+        std::iter::once(self.voice).chain(
+            self.extra_voices[..usize::from(self.extra_voice_count.min(7))]
+                .iter()
+                .copied(),
+        )
+    }
+
+    pub(crate) fn voice_count(&self) -> usize {
+        1 + usize::from(self.extra_voice_count.min(7))
+    }
+}
+
+/// The authored release curve form.  XGS categories carry a release-curve
+/// byte in the extended category record; content without the extension uses
+/// the documented linear amplitude form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ReleaseCurve {
+    #[default]
+    Linear,
+    Logarithmic,
+}
+
+/// An amplitude release from `start_gain` to zero over the authored category
+/// release time.  `remaining_frames` drives the render drain and `curve`
+/// selects the authored shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ReleaseFade {
+    pub(crate) total_frames: u32,
+    pub(crate) remaining_frames: u32,
+    pub(crate) start_gain: f32,
+    pub(crate) curve: ReleaseCurve,
+}
+
+impl ReleaseFade {
+    /// Normalized release position, 1.0 at the start and 0.0 at the end.
+    /// Linear amplitude is the documented default; the logarithmic form is
+    /// a constant-decibel amplitude ramp that reaches -60 dB at the end.
+    pub(crate) fn fraction(&self) -> f32 {
+        if self.total_frames == 0 {
+            0.0
+        } else {
+            let linear = self.remaining_frames as f32 / self.total_frames as f32;
+            match self.curve {
+                ReleaseCurve::Linear => linear,
+                ReleaseCurve::Logarithmic => 10.0_f32.powf(-3.0 * (1.0 - linear)),
+            }
+        }
+    }
+
+    /// Gain at the start of the next render slice.
+    pub(crate) fn gain(&self) -> f32 {
+        self.start_gain * self.fraction()
+    }
 }
 
 /// Engine state: one per `XACT3CreateEngine` result.
@@ -1798,6 +2229,11 @@ pub(crate) struct WaveBankState {
     pub(crate) refcount: u32,
     pub(crate) engine: u64,
     pub(crate) bank: WaveBank,
+    /// Streaming entries whose payload has been prepared (real seek/read).
+    pub(crate) prepared: std::collections::BTreeSet<u16>,
+    /// Prepared streaming payloads, kept for playback until the bank is
+    /// destroyed.  In-memory banks never populate this map.
+    pub(crate) streaming_cache: BTreeMap<u16, Vec<i16>>,
 }
 
 /// A cue object handed to the guest.
@@ -1813,6 +2249,16 @@ pub(crate) struct CueObject {
     pub(crate) properties_address: u64,
     pub(crate) matrix: Option<(u32, u32, Vec<f32>)>,
     pub(crate) loop_count: u8,
+    /// Cue-local variable bindings (local slot -> global variable index).
+    pub(crate) local_variables: Vec<i16>,
+    /// Friendly names of the cue-local slots (parallel to `local_variables`).
+    pub(crate) local_variable_names: Vec<String>,
+    /// Cue-local overrides keyed by the shadowed global variable index.
+    pub(crate) local_values: BTreeMap<u16, f32>,
+    /// `SetOutputVoices` targets: real guest `IXAudio2Voice` objects with
+    /// their channel counts and per-destination matrices.  `None` is the
+    /// default route to the engine mastering voice.
+    pub(crate) output_voices: Option<Vec<OutputVoiceRoute>>,
 }
 
 /// A standalone wave object handed to the guest.
@@ -2214,6 +2660,114 @@ pub(crate) mod fixtures {
         out
     }
 
+    /// Build a minimal XSB with one complex cue whose interactive variation
+    /// table is bound to `variable_index`.  Each entry is
+    /// `(wave_index, var_min, var_max)` and gets its own simple sound record.
+    pub(crate) fn build_xsb_interactive(
+        bank_name: &str,
+        wavebank_name: &str,
+        cue_name: &str,
+        variable_index: i16,
+        entries: &[(u16, f32, f32)],
+        local_name: Option<&str>,
+    ) -> Vec<u8> {
+        let sound_count = entries.len() as u16;
+        const HEADER: u32 = 138;
+        let sound_offset = HEADER;
+        let cue_complex_offset = sound_offset + 12 * sound_count as u32;
+        let variation_offset = cue_complex_offset + 15;
+        let variation_length = 8 + 16 * sound_count as u32;
+        let wavebank_name_offset = variation_offset + variation_length;
+        let cue_name_index_offset = wavebank_name_offset + 64;
+        let cue_name_offset = cue_name_index_offset + 6;
+        let cue_name_end = cue_name_offset + cue_name.len() as u32 + 1;
+        let local_name_index_offset = cue_name_end;
+        let local_name_offset = local_name_index_offset + 6;
+        let end = match local_name {
+            Some(name) => local_name_offset + name.len() as u32 + 1,
+            None => cue_name_end,
+        };
+
+        let mut out = Vec::new();
+        w32(&mut out, SOUNDBANK_SIGNATURE);
+        w16(&mut out, 46);
+        w16(&mut out, SOUNDBANK_FORMAT_VERSION);
+        w16(&mut out, 0);
+        out.extend_from_slice(&[0u8; 8]);
+        out.push(1);
+        w16(&mut out, 0); // simple cues
+        w16(&mut out, 1); // complex cues
+        w16(&mut out, 0);
+        w16(&mut out, 1); // total cues
+        out.push(1); // wave banks
+        w16(&mut out, sound_count);
+        w16(&mut out, end as u16);
+        w16(&mut out, 0);
+        wi32(&mut out, -1); // simple cue offset
+        wi32(&mut out, cue_complex_offset as i32);
+        wi32(&mut out, -1); // cue name table
+        wi32(
+            &mut out,
+            if local_name.is_some() {
+                local_name_index_offset as i32
+            } else {
+                -1
+            },
+        ); // cue-local variable name index table
+        wi32(&mut out, variation_offset as i32);
+        wi32(&mut out, -1); // transition
+        wi32(&mut out, wavebank_name_offset as i32);
+        wi32(&mut out, -1); // hash
+        wi32(&mut out, cue_name_index_offset as i32);
+        wi32(&mut out, sound_offset as i32);
+        wstr64(&mut out, bank_name);
+        debug_assert_eq!(out.len(), HEADER as usize);
+
+        // Simple sound records, one per interactive entry.
+        for (wave_index, _, _) in entries {
+            out.push(0);
+            w16(&mut out, 0);
+            out.push(180);
+            w16(&mut out, 0);
+            out.push(255);
+            w16(&mut out, 0);
+            w16(&mut out, *wave_index);
+            out.push(0);
+        }
+
+        // Complex cue pointing at the variation table.
+        out.push(0); // flags: not single sound
+        w32(&mut out, variation_offset);
+        w32(&mut out, 0); // transition
+        out.push(255); // instance limit
+        w16(&mut out, 0);
+        w16(&mut out, 0);
+        out.push(0);
+
+        // Interactive variation table (the parser derives `code` from the
+        // table's absolute file offset).
+        w32(&mut out, sound_count as u32 | (3u32 << 19));
+        w16(&mut out, 0);
+        out.extend_from_slice(&variable_index.to_le_bytes());
+        for (index, (_, var_min, var_max)) in entries.iter().enumerate() {
+            w32(&mut out, sound_offset + 12 * index as u32);
+            wf32(&mut out, *var_min);
+            wf32(&mut out, *var_max);
+            w32(&mut out, 0); // reserved; the documented entry is 16 bytes
+        }
+
+        wstr64(&mut out, wavebank_name);
+        w32(&mut out, cue_name_offset);
+        w16(&mut out, 0);
+        wcstr(&mut out, cue_name);
+        if let Some(name) = local_name {
+            w32(&mut out, local_name_offset);
+            w16(&mut out, 0);
+            wcstr(&mut out, name);
+        }
+        out
+    }
+
     pub(crate) fn build_xgs() -> Vec<u8> {
         const CATEGORY_OFFSET: u32 = 80;
         const VARIABLE_OFFSET: u32 = CATEGORY_OFFSET + 2 * 10; // 100
@@ -2282,6 +2836,83 @@ pub(crate) mod fixtures {
         wcstr(&mut out, "SFX");
         wcstr(&mut out, "SpeedOfSound");
         out
+    }
+
+    /// Build an XGS whose category records carry the 11-byte release-curve
+    /// extension: a 200 ms fade-out on "Music" and the requested curve byte
+    /// (0 = linear amplitude, 1 = logarithmic amplitude).
+    pub(crate) fn build_xgs_curve(curve: u8) -> Vec<u8> {
+        const CATEGORY_OFFSET: u32 = 80;
+        const CATEGORY_STRIDE: u32 = 11;
+        const VARIABLE_OFFSET: u32 = CATEGORY_OFFSET + 2 * CATEGORY_STRIDE;
+        const CATEGORY_NAME_INDEX: u32 = VARIABLE_OFFSET + 13;
+        const VARIABLE_NAME_INDEX: u32 = CATEGORY_NAME_INDEX + 2 * 6;
+        const CATEGORY_NAMES: u32 = VARIABLE_NAME_INDEX + 6;
+        const VARIABLE_NAMES: u32 = CATEGORY_NAMES + 6 + 4;
+        let mut out = Vec::new();
+        w32(&mut out, XGS_SIGNATURE);
+        w16(&mut out, 46);
+        w16(&mut out, 42);
+        w16(&mut out, 0);
+        out.extend_from_slice(&[0u8; 8]);
+        out.push(3);
+        w16(&mut out, 2);
+        w16(&mut out, 1);
+        w16(&mut out, 0);
+        w16(&mut out, 0);
+        w16(&mut out, 0);
+        w16(&mut out, 0);
+        w16(&mut out, 0);
+        w32(&mut out, CATEGORY_OFFSET);
+        w32(&mut out, VARIABLE_OFFSET);
+        w32(&mut out, 0);
+        w32(&mut out, CATEGORY_NAME_INDEX);
+        w32(&mut out, 0);
+        w32(&mut out, VARIABLE_NAME_INDEX);
+        w32(&mut out, CATEGORY_NAMES);
+        w32(&mut out, VARIABLE_NAMES);
+        w32(&mut out, 0);
+        w32(&mut out, 0);
+        w32(&mut out, 0);
+        out.resize(CATEGORY_OFFSET as usize, 0);
+        for (fade_out, curve_byte) in [(200_u16, curve), (0_u16, 0_u8)] {
+            out.push(255);
+            w16(&mut out, 0);
+            w16(&mut out, fade_out);
+            out.push(0);
+            w16(&mut out, 0xFFFF);
+            out.push(180);
+            out.push(1);
+            out.push(curve_byte);
+        }
+        out.push(0x01);
+        wf32(&mut out, 343.0);
+        wf32(&mut out, 0.0);
+        wf32(&mut out, 1000.0);
+        out.resize(CATEGORY_NAME_INDEX as usize, 0);
+        w32(&mut out, CATEGORY_NAMES);
+        w16(&mut out, 0);
+        w32(&mut out, CATEGORY_NAMES + 6);
+        w16(&mut out, 0);
+        w32(&mut out, VARIABLE_NAMES);
+        w16(&mut out, 0);
+        out.resize(CATEGORY_NAMES as usize, 0);
+        wcstr(&mut out, "Music");
+        wcstr(&mut out, "SFX");
+        wcstr(&mut out, "SpeedOfSound");
+        out
+    }
+
+    /// A release curve with a controlled frame position, used by the shape
+    /// tests without a renderer.
+    pub(crate) fn release_at(curve: ReleaseCurve, remaining: u32, total: u32) -> f32 {
+        ReleaseFade {
+            total_frames: total,
+            remaining_frames: remaining,
+            start_gain: 1.0,
+            curve,
+        }
+        .gain()
     }
 }
 
@@ -2477,6 +3108,54 @@ mod tests {
     }
 
     #[test]
+    fn xsb_interactive_fixture_binds_variables_and_selects_ranges() {
+        let bytes = build_xsb_interactive(
+            "SoundBank",
+            "WaveBank",
+            "variableCue",
+            0,
+            &[(0, 0.0, 500.0), (1, 500.0, 1000.0)],
+            Some("CueSpeed"),
+        );
+        let bank = SoundBank::parse(&bytes).expect("interactive bank parses");
+        assert_eq!(bank.cues.len(), 1);
+        assert_eq!(bank.cues[0].local_variables, vec![0]);
+        assert_eq!(bank.cues[0].local_variable_names, vec!["CueSpeed"]);
+        assert_eq!(bank.variations.len(), 1);
+        assert_eq!(bank.variations[0].kind, VARIATION_TABLE_TYPE_INTERACTIVE);
+        assert_eq!(bank.variations[0].entries.len(), 2);
+        assert_eq!(
+            bank.variations[0].entries[0],
+            VariationEntry::Interactive {
+                sound_code: 138,
+                var_min: 0.0,
+                var_max: 500.0,
+            }
+        );
+        assert_eq!(
+            bank.variations[0].entries[1],
+            VariationEntry::Interactive {
+                sound_code: 150,
+                var_min: 500.0,
+                var_max: 1000.0,
+            }
+        );
+        assert_eq!(bank.sounds.len(), 2);
+        assert_eq!(bank.sounds[0].code, 138);
+        assert_eq!(bank.sounds[1].code, 150);
+        let lower = bank
+            .select_cue_with_variables(0, &[100.0])
+            .expect("lower selection");
+        assert_eq!(lower.variation_entry, Some(0));
+        assert_eq!(lower.sound.tracks[0].wave.wave_index, 0);
+        let upper = bank
+            .select_cue_with_variables(0, &[800.0])
+            .expect("upper selection");
+        assert_eq!(upper.variation_entry, Some(1));
+        assert_eq!(upper.sound.tracks[0].wave.wave_index, 1);
+    }
+
+    #[test]
     fn xsb_select_cue_rejects_bad_index() {
         let bytes = build_xsb(&XsbSpec {
             bank_name: "SoundBank",
@@ -2499,6 +3178,35 @@ mod tests {
         assert_eq!(settings.variables[0].name, "SpeedOfSound");
         assert!((settings.variables[0].initial - 343.0).abs() < 1.0e-6);
         assert!((settings.variables[0].max - 1000.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn xgs_parses_extended_release_curve_records() {
+        let settings = GlobalSettings::parse(&build_xgs_curve(1)).expect("curved XGS");
+        assert_eq!(settings.categories.len(), 2);
+        assert_eq!(settings.categories[0].fade_out_ms, 200);
+        assert_eq!(
+            settings.categories[0].release_curve,
+            ReleaseCurve::Logarithmic
+        );
+        assert_eq!(settings.categories[1].release_curve, ReleaseCurve::Linear);
+        let stock = GlobalSettings::parse(&build_xgs()).expect("stock XGS");
+        assert_eq!(stock.categories[0].release_curve, ReleaseCurve::Linear);
+    }
+
+    #[test]
+    fn release_curve_shapes_are_linear_and_logarithmic_amplitude() {
+        assert!((release_at(ReleaseCurve::Linear, 50, 100) - 0.5).abs() < 1.0e-6);
+        assert!((release_at(ReleaseCurve::Linear, 100, 100) - 1.0).abs() < 1.0e-6);
+        assert!(release_at(ReleaseCurve::Linear, 0, 100).abs() < 1.0e-6);
+        // Logarithmic amplitude reaches -60 dB at the end and is already
+        // below the linear curve at the halfway point.
+        let midpoint = release_at(ReleaseCurve::Logarithmic, 50, 100);
+        assert!((midpoint - 10.0_f32.powf(-1.5)).abs() < 1.0e-6);
+        assert!(midpoint < release_at(ReleaseCurve::Linear, 50, 100));
+        assert!((release_at(ReleaseCurve::Logarithmic, 100, 100) - 1.0).abs() < 1.0e-6);
+        assert!((release_at(ReleaseCurve::Logarithmic, 0, 100) - 0.001).abs() < 1.0e-6);
+        assert_eq!(release_at(ReleaseCurve::Linear, 0, 0), 0.0);
     }
 
     #[test]
@@ -2531,6 +3239,8 @@ mod tests {
                     instance_limit: 255,
                     paused: false,
                     visibility: 1,
+                    release_ms: 0,
+                    release_curve: ReleaseCurve::Linear,
                 },
                 CategoryState {
                     name: "Default".to_string(),
@@ -2540,6 +3250,8 @@ mod tests {
                     instance_limit: 255,
                     paused: false,
                     visibility: 1,
+                    release_ms: 0,
+                    release_curve: ReleaseCurve::Linear,
                 },
                 CategoryState {
                     name: "Music".to_string(),
@@ -2549,6 +3261,8 @@ mod tests {
                     instance_limit: 255,
                     paused: false,
                     visibility: 1,
+                    release_ms: 0,
+                    release_curve: ReleaseCurve::Linear,
                 },
             ],
             ..EngineState::default()

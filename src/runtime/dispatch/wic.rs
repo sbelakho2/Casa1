@@ -8,10 +8,9 @@
 //! transform chain (scaler/clipper/flip/converter) wraps a source and
 //! produces pixels through CopyPixels.  IWICBitmap::Lock hands out a real
 //! lock over the bitmap's live pixels, the decoder surface parses real PNG
-//! and baseline JPEG streams into frame-decode objects, and the encoder
-//! surface writes real PNG files.  Metadata handlers are still absent, so
-//! the metadata entry points answer WIC_E_CODECNOTHANDLED, and the _Proxy
-//! exports mirror their in-process counterparts.
+//! (palette/tRNS, 1/2/4/8/16-bit, Adam7) and baseline/progressive JPEG streams
+//! into frame-decode objects, the encoder surface writes real PNG and baseline
+//! JPEG files, and metadata query readers expose PNG text and JPEG EXIF tags.
 //!
 //! Layer contract: every export and method returns its HRESULT in EAX.
 
@@ -66,6 +65,7 @@ const WINCODEC_ERR_STREAMNOTAVAILABLE: u32 = 0x8898_2f8b;
 const WINCODEC_ERR_UNSUPPORTEDOPERATION: u32 = 0x8898_2f8d;
 const WINCODEC_ERR_BADIMAGE: u32 = 0x8898_2f80;
 const WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT: u32 = 0x8898_2f8c;
+const WINCODEC_ERR_PROPERTYNOTFOUND: u32 = 0x8898_2f90;
 
 /// The IWICBitmapLock flags (WICBitmapLockRead / WICBitmapLockWrite).
 const WIC_BITMAP_LOCK_READ: u32 = 1;
@@ -76,6 +76,7 @@ const WIC_BITMAP_LOCK_WRITE: u32 = 2;
 const WIC_DECODER_MAGIC: &[u8; 8] = b"WICDEC01";
 const WIC_ENCODER_MAGIC: &[u8; 8] = b"WICENC01";
 const WIC_FRAME_ENCODE_MAGIC: u32 = 0x5749_4346;
+const WIC_METADATA_READER_MAGIC: &[u8; 8] = b"WICMETA1";
 
 /// GUID_ContainerFormatPng {1b7cfaf4-713f-473c-bbcd-6137425faeaf}
 const GUID_CONTAINER_FORMAT_PNG: [u8; 16] = [
@@ -311,8 +312,7 @@ impl PeHostRuntime {
             HostThunk::WicDecoderGetFrameCount => self.wic_decoder_get_frame_count(state, memory),
             HostThunk::WicDecoderGetFrame => self.wic_decoder_get_frame(state, memory),
             HostThunk::WicDecoderUnsupported => {
-                state.set(Register::Rax, u64::from(WIC_E_CODECNOTHANDLED));
-                Ok(())
+                self.wic_decoder_get_metadata_query_reader(state, memory)
             }
             HostThunk::WicEncoderInitialize => self.wic_encoder_initialize(state, memory),
             HostThunk::WicEncoderCreateNewFrame => self.wic_encoder_create_new_frame(state, memory),
@@ -339,10 +339,7 @@ impl PeHostRuntime {
                 self.wic_frame_encode_write_source(state, memory)
             }
             HostThunk::WicFrameEncodeCommit => self.wic_frame_encode_commit(state, memory),
-            HostThunk::WicFrameEncodeUnsupported => {
-                state.set(Register::Rax, u64::from(WIC_E_NOTSUPPORTED));
-                Ok(())
-            }
+            HostThunk::WicFrameEncodeUnsupported => self.wic_frame_get_thumbnail(state, memory),
             HostThunk::WicScalerInitialize => self.wic_scaler_initialize(state, memory),
             HostThunk::WicScalerGetScaledWidth | HostThunk::WicScalerGetScaledHeight => {
                 self.wic_scaler_get_dimensions(state, memory)
@@ -674,13 +671,36 @@ impl PeHostRuntime {
 
     // ── The metadata helper exports ────────────────────────────────────────
 
-    /// `WICGetMetadataContentSize(guidFormatType, pIUnknown, pcbSize)` —
-    /// no metadata handlers are registered.
+    /// `WICGetMetadataContentSize(guidFormatType, pIUnknown, pcbSize)` and
+    /// `IWICMetadataQueryReader::GetMetadataByName` (the reader overload).
     pub(crate) fn dispatch_wic_get_metadata_content_size(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if let Some(reader) = self
+            .wic
+            .objects
+            .get(&this)
+            .filter(|object| object.profile.starts_with(WIC_METADATA_READER_MAGIC))
+        {
+            let entries = wic_metadata_deserialize(&reader.profile);
+            let name_pointer = guest_call_arg(state, memory, 1)?;
+            let value_out = guest_call_arg(state, memory, 2)?;
+            if value_out == 0 {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+            let name = read_utf16_string(memory, name_pointer).unwrap_or_default();
+            let Some(value) = wic_metadata_lookup(&entries, &name) else {
+                state.set(Register::Rax, u64::from(WINCODEC_ERR_PROPERTYNOTFOUND));
+                return Ok(());
+            };
+            self.wic_write_propvariant_string(memory, value_out, &value)?;
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let _format = guest_call_arg(state, memory, 0)?;
         let _unknown = guest_call_arg(state, memory, 1)?;
         let size_out = guest_call_arg(state, memory, 2)?;
@@ -742,12 +762,26 @@ impl PeHostRuntime {
     }
 
     /// `WICMatchMetadataContent(guidContainerFormat, pguidVendor, pIUnknown,
-    /// ppguidMetadataFormat)` — no metadata handlers are registered.
+    /// ppguidMetadataFormat)` and the reader's GetEnumerator overload.
     pub(crate) fn dispatch_wic_match_metadata_content(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if self
+            .wic
+            .objects
+            .get(&this)
+            .is_some_and(|object| object.profile.starts_with(WIC_METADATA_READER_MAGIC))
+        {
+            let out = guest_call_arg(state, memory, 1)?;
+            if out != 0 {
+                write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let _container = guest_call_arg(state, memory, 0)?;
         let _vendor = guest_call_arg(state, memory, 1)?;
         let _unknown = guest_call_arg(state, memory, 2)?;
@@ -760,13 +794,32 @@ impl PeHostRuntime {
     }
 
     /// `WICSerializeMetadataContent(guidContainerFormat,
-    /// guidMetadataFormat, pIUnknown, dwFlags, pIStream)` — no metadata
-    /// handlers are registered.
+    /// guidMetadataFormat, pIUnknown, dwFlags, pIStream)` and the reader's
+    /// GetLocation overload.
     pub(crate) fn dispatch_wic_serialize_metadata_content(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if self
+            .wic
+            .objects
+            .get(&this)
+            .is_some_and(|object| object.profile.starts_with(WIC_METADATA_READER_MAGIC))
+        {
+            let capacity = guest_call_arg_u32(state, memory, 1)?;
+            let buffer = guest_call_arg(state, memory, 2)?;
+            let actual = guest_call_arg(state, memory, 3)?;
+            if buffer != 0 && capacity > 0 {
+                write_utf16_string(memory, buffer, "", capacity as usize);
+            }
+            if actual != 0 {
+                write_guest_u32(memory, actual, 0).ok();
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let _container = guest_call_arg(state, memory, 0)?;
         let _format = guest_call_arg(state, memory, 1)?;
         let _unknown = guest_call_arg(state, memory, 2)?;
@@ -1221,7 +1274,7 @@ impl PeHostRuntime {
     }
 
     /// `IWICImagingFactory::CreateEncoder(guidContainerFormat,
-    /// pIUnknown, ppIEncoder)` — only the PNG container has an encoder.
+    /// pIUnknown, ppIEncoder)` — PNG and JPEG encoders.
     fn wic_factory_create_encoder(
         &mut self,
         state: &mut CpuState,
@@ -1235,7 +1288,7 @@ impl PeHostRuntime {
             return Ok(());
         }
         let container = read_guid(memory, container_ptr);
-        if container != GUID_CONTAINER_FORMAT_PNG {
+        if container != GUID_CONTAINER_FORMAT_PNG && container != GUID_CONTAINER_FORMAT_JPEG {
             write_guest_pointer(memory, out, 0, self.guest_arch).ok();
             state.set(Register::Rax, u64::from(WINCODEC_ERR_COMPONENTNOTFOUND));
             return Ok(());
@@ -1995,9 +2048,152 @@ impl PeHostRuntime {
             frame_state.pixel_format = GUID_PIXEL_FORMAT_32BPP_BGRA;
             frame_state.pixels = decoder.pixels.clone();
             frame_state.profile = wic_encode_dpi(dpi_x, dpi_y);
+            frame_state.source = this;
+            frame_state.component_type = decoder.component_type;
         }
         self.wic_write_out(memory, out, frame);
         state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// The container bytes and codec tag behind a decoder or a decode frame.
+    fn wic_codec_source(&self, this: u64) -> Option<(Vec<u8>, u32, [u8; 16])> {
+        let object = self.wic.objects.get(&this)?;
+        if object.profile.starts_with(WIC_DECODER_MAGIC) {
+            return Some((
+                object.stream.clone(),
+                object.component_type,
+                object.pixel_format,
+            ));
+        }
+        if object.kind == WicObjectKind::Bitmap {
+            let source = self.wic.objects.get(&object.source)?;
+            if source.profile.starts_with(WIC_DECODER_MAGIC) {
+                return Some((
+                    source.stream.clone(),
+                    source.component_type,
+                    source.pixel_format,
+                ));
+            }
+        }
+        None
+    }
+
+    /// `IWICBitmapDecoder::GetMetadataQueryReader` and the frame-decode
+    /// counterpart: build a real reader over the container's text/EXIF tags.
+    fn wic_decoder_get_metadata_query_reader(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some((bytes, codec, container)) = self.wic_codec_source(this) else {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(WIC_E_CODECNOTHANDLED));
+            return Ok(());
+        };
+        let entries = wic_image_metadata_entries(&bytes, codec);
+        let object = self.wic_alloc_object(
+            memory,
+            WicObjectKind::ComponentInfo,
+            wic_metadata_reader_methods(),
+        )?;
+        if object == 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            state.set(Register::Rax, 0x8007_000e);
+            return Ok(());
+        }
+        if let Some(reader) = self.wic.objects.get_mut(&object) {
+            reader.pixel_format = container;
+            reader.profile = wic_metadata_serialize(&entries);
+            reader.component_type = 0x4d45_5441;
+        }
+        self.wic_write_out(memory, out, object);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `GetThumbnail` for decoders and frame-decode objects.  The embedded
+    /// JPEG thumbnail from EXIF IFD1 (or a PNG eXIf chunk) is decoded into a
+    /// real bitmap; absent thumbnails answer WINCODEC_ERR_CODECNOTHANDLED.
+    fn wic_frame_get_thumbnail(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(object) = self.wic.objects.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        };
+        if object.component_type == WIC_FRAME_ENCODE_MAGIC
+            || object.profile.starts_with(WIC_ENCODER_MAGIC)
+        {
+            state.set(Register::Rax, u64::from(WIC_E_NOTSUPPORTED));
+            return Ok(());
+        }
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some((bytes, codec, _)) = self.wic_codec_source(this) else {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(WIC_E_CODECNOTHANDLED));
+            return Ok(());
+        };
+        let Some(thumbnail) = wic_image_thumbnail(&bytes, codec) else {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(WIC_E_CODECNOTHANDLED));
+            return Ok(());
+        };
+        let image = match wic_decode_image(&thumbnail) {
+            Ok(image) => image,
+            Err(code) => {
+                write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+                state.set(Register::Rax, u64::from(code));
+                return Ok(());
+            }
+        };
+        let bitmap = self.wic_alloc_object(memory, WicObjectKind::Bitmap, wic_bitmap_methods())?;
+        if bitmap == 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            state.set(Register::Rax, 0x8007_000e);
+            return Ok(());
+        }
+        if let Some(target) = self.wic.objects.get_mut(&bitmap) {
+            target.width = image.width;
+            target.height = image.height;
+            target.pixels = image.pixels;
+            target.pixel_format = GUID_PIXEL_FORMAT_32BPP_BGRA;
+            target.profile = wic_encode_dpi(image.dpi_x, image.dpi_y);
+            target.component_type = image.codec;
+        }
+        self.wic_write_out(memory, out, bitmap);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn wic_write_propvariant_string(
+        &mut self,
+        memory: &mut MemoryImage,
+        address: u64,
+        text: &str,
+    ) -> AppResult<()> {
+        if address == 0 {
+            return Ok(());
+        }
+        for offset in 0..24_u64 {
+            memory.write_u8(address + offset, 0);
+        }
+        memory.write_u16(address, 31);
+        let string = self.alloc_utf16_string(memory, text)?;
+        write_guest_pointer(memory, address + 8, string, self.guest_arch).ok();
         Ok(())
     }
 
@@ -2454,14 +2650,25 @@ impl PeHostRuntime {
             return Ok(());
         }
         let dpi = wic_decode_dpi(&frame);
-        let encoded =
-            match wic_encode_png(frame.width, frame.height, &frame.pixels[..expected], dpi) {
-                Ok(encoded) => encoded,
-                Err(code) => {
-                    state.set(Register::Rax, u64::from(code));
-                    return Ok(());
-                }
-            };
+        let container = self
+            .wic
+            .objects
+            .get(&frame.source)
+            .map(|encoder| encoder.pixel_format)
+            .unwrap_or(GUID_CONTAINER_FORMAT_PNG);
+        let encoded = match container {
+            GUID_CONTAINER_FORMAT_JPEG => {
+                wic_encode_jpeg(frame.width, frame.height, &frame.pixels[..expected], dpi)
+            }
+            _ => wic_encode_png(frame.width, frame.height, &frame.pixels[..expected], dpi),
+        };
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(code) => {
+                state.set(Register::Rax, u64::from(code));
+                return Ok(());
+            }
+        };
         let Some(encoder) = self.wic.objects.get_mut(&frame.source) else {
             state.set(Register::Rax, u64::from(WINCODEC_ERR_NOTINITIALIZED));
             return Ok(());
@@ -3360,6 +3567,7 @@ fn wic_read_rect(memory: &MemoryImage, pointer: u64) -> Option<[i32; 4]> {
 // ── The real image codecs (PNG / baseline JPEG) ───────────────────────────
 
 /// A decoded image in the runtime's canonical 32bpp BGRA layout.
+#[derive(Debug)]
 struct WicDecodedImage {
     width: u32,
     height: u32,
@@ -3411,6 +3619,15 @@ fn wic_png_paeth(a: u8, b: u8, c: u8) -> u8 {
 /// IEND, with chunk CRC validation.
 fn wic_decode_png(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
     const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    const ADAM7: [(usize, usize, usize, usize); 7] = [
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ];
     if bytes.len() < 8 || &bytes[..8] != SIGNATURE {
         return Err(WINCODEC_ERR_UNKNOWNIMAGEFORMAT);
     }
@@ -3418,9 +3635,14 @@ fn wic_decode_png(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
     let mut width = 0_u32;
     let mut height = 0_u32;
     let mut color_type = 0_u8;
+    let mut bit_depth = 0_u8;
+    let mut interlace = 0_u8;
     let mut seen_header = false;
     let mut seen_end = false;
+    let mut seen_idat = false;
     let mut idat = Vec::new();
+    let mut palette: Vec<[u8; 4]> = Vec::new();
+    let mut transparency: Vec<u8> = Vec::new();
     let mut dpi_x = WIC_DEFAULT_DPI;
     let mut dpi_y = WIC_DEFAULT_DPI;
     while position + 8 <= bytes.len() {
@@ -3460,30 +3682,77 @@ fn wic_decode_png(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                 seen_header = true;
                 width = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                 height = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-                let depth = data[8];
+                bit_depth = data[8];
                 color_type = data[9];
                 let compression = data[10];
                 let filter = data[11];
-                let interlace = data[12];
+                interlace = data[12];
                 if width == 0
                     || height == 0
                     || width > 1_000_000
                     || height > 1_000_000
-                    || depth != 8
                     || compression != 0
                     || filter != 0
-                    || interlace != 0
+                    || interlace > 1
                 {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                }
+                let depth_ok = match color_type {
+                    0 => matches!(bit_depth, 1 | 2 | 4 | 8 | 16),
+                    2 | 4 | 6 => matches!(bit_depth, 8 | 16),
+                    3 => matches!(bit_depth, 1 | 2 | 4 | 8),
+                    _ => false,
+                };
+                if !depth_ok {
                     return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
                 }
-                if !matches!(color_type, 0 | 2 | 4 | 6) {
-                    return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
+            }
+            b"PLTE" => {
+                if !seen_header || seen_idat || !palette.is_empty() {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                }
+                if matches!(color_type, 0 | 4)
+                    || length == 0
+                    || length % 3 != 0
+                    || length / 3 > WIC_PALETTE_MAX_COLORS as usize
+                {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                }
+                for color in data.chunks_exact(3) {
+                    palette.push([color[0], color[1], color[2], 255]);
+                }
+            }
+            b"tRNS" => {
+                if !seen_header || seen_idat || !transparency.is_empty() {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                }
+                match color_type {
+                    3 => {
+                        if palette.is_empty() || length == 0 || length > palette.len() {
+                            return Err(WINCODEC_ERR_BADIMAGE);
+                        }
+                        transparency = data.to_vec();
+                    }
+                    0 => {
+                        if length != 2 {
+                            return Err(WINCODEC_ERR_BADIMAGE);
+                        }
+                        transparency = data.to_vec();
+                    }
+                    2 => {
+                        if length != 6 {
+                            return Err(WINCODEC_ERR_BADIMAGE);
+                        }
+                        transparency = data.to_vec();
+                    }
+                    _ => return Err(WINCODEC_ERR_BADIMAGE),
                 }
             }
             b"IDAT" => {
                 if !seen_header {
                     return Err(WINCODEC_ERR_BADIMAGE);
                 }
+                seen_idat = true;
                 idat.extend_from_slice(data);
             }
             b"IEND" => {
@@ -3515,9 +3784,13 @@ fn wic_decode_png(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
     if !seen_header || !seen_end || idat.is_empty() {
         return Err(WINCODEC_ERR_BADIMAGE);
     }
+    if color_type == 3 && (palette.is_empty() || palette.len() > WIC_PALETTE_MAX_COLORS as usize) {
+        return Err(WINCODEC_ERR_BADIMAGE);
+    }
     let channels = match color_type {
         0 => 1_usize,
         2 => 3,
+        3 => 1,
         4 => 2,
         6 => 4,
         _ => return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION),
@@ -3529,13 +3802,47 @@ fn wic_decode_png(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
     if pixel_bytes > 256 * 1024 * 1024 {
         return Err(WINCODEC_ERR_BADIMAGE);
     }
-    let row_len = (width as usize)
-        .checked_mul(channels)
+    let bits_per_pixel = channels
+        .checked_mul(bit_depth as usize)
         .ok_or(WINCODEC_ERR_BADIMAGE)?;
-    let expected = row_len
-        .checked_add(1)
-        .and_then(|value| value.checked_mul(height as usize))
-        .ok_or(WINCODEC_ERR_BADIMAGE)?;
+    let filter_bytes = bits_per_pixel.div_ceil(8).max(1);
+    let passes: &[(usize, usize, usize, usize)] = if interlace == 1 {
+        &ADAM7
+    } else {
+        &[(0, 0, 1, 1)]
+    };
+    let mut expected = 0_usize;
+    for &(start_x, start_y, step_x, step_y) in passes {
+        let pass_width = if (width as usize) > start_x {
+            (width as usize - start_x).div_ceil(step_x)
+        } else {
+            0
+        };
+        let pass_height = if (height as usize) > start_y {
+            (height as usize - start_y).div_ceil(step_y)
+        } else {
+            0
+        };
+        if pass_width == 0 || pass_height == 0 {
+            continue;
+        }
+        let row_len = pass_width
+            .checked_mul(bits_per_pixel)
+            .and_then(|value| value.checked_add(7))
+            .map(|value| value / 8)
+            .ok_or(WINCODEC_ERR_BADIMAGE)?;
+        expected = expected
+            .checked_add(
+                row_len
+                    .checked_add(1)
+                    .and_then(|value| value.checked_mul(pass_height))
+                    .ok_or(WINCODEC_ERR_BADIMAGE)?,
+            )
+            .ok_or(WINCODEC_ERR_BADIMAGE)?;
+    }
+    if expected > 512 * 1024 * 1024 {
+        return Err(WINCODEC_ERR_BADIMAGE);
+    }
     let mut inflater = flate2::read::ZlibDecoder::new(idat.as_slice());
     let mut raw = Vec::with_capacity(expected);
     if inflater
@@ -3547,62 +3854,112 @@ fn wic_decode_png(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
     {
         return Err(WINCODEC_ERR_BADIMAGE);
     }
-    let mut previous = vec![0_u8; row_len];
-    let mut current = vec![0_u8; row_len];
     let mut pixels = vec![0_u8; width as usize * height as usize * 4];
-    for row in 0..height as usize {
-        let filter = raw[row * (row_len + 1)];
-        let source = &raw[row * (row_len + 1) + 1..(row + 1) * (row_len + 1)];
-        current.copy_from_slice(source);
-        for index in 0..row_len {
-            let left = if index >= channels {
-                current[index - channels]
-            } else {
-                0
-            };
-            let up = previous[index];
-            let up_left = if index >= channels {
-                previous[index - channels]
-            } else {
-                0
-            };
-            current[index] = match filter {
-                0 => current[index],
-                1 => current[index].wrapping_add(left),
-                2 => current[index].wrapping_add(up),
-                3 => current[index].wrapping_add(((u16::from(left) + u16::from(up)) / 2) as u8),
-                4 => current[index].wrapping_add(wic_png_paeth(left, up, up_left)),
-                _ => return Err(WINCODEC_ERR_BADIMAGE),
-            };
+    let mut cursor = 0_usize;
+    for &(start_x, start_y, step_x, step_y) in passes {
+        let pass_width = if (width as usize) > start_x {
+            (width as usize - start_x).div_ceil(step_x)
+        } else {
+            0
+        };
+        let pass_height = if (height as usize) > start_y {
+            (height as usize - start_y).div_ceil(step_y)
+        } else {
+            0
+        };
+        if pass_width == 0 || pass_height == 0 {
+            continue;
         }
-        let destination = row * width as usize * 4;
-        for column in 0..width as usize {
-            let source = column * channels;
-            let pixel = match color_type {
-                0 => {
-                    let gray = current[source];
-                    [gray, gray, gray, 255]
+        let row_len = (pass_width * bits_per_pixel).div_ceil(8);
+        let mut previous = vec![0_u8; row_len];
+        let mut current = vec![0_u8; row_len];
+        for row in 0..pass_height {
+            let filter = raw[cursor];
+            let source = &raw[cursor + 1..cursor + 1 + row_len];
+            cursor += row_len + 1;
+            current.copy_from_slice(source);
+            for index in 0..row_len {
+                let left = if index >= filter_bytes {
+                    current[index - filter_bytes]
+                } else {
+                    0
+                };
+                let up = previous[index];
+                let up_left = if index >= filter_bytes {
+                    previous[index - filter_bytes]
+                } else {
+                    0
+                };
+                current[index] = match filter {
+                    0 => current[index],
+                    1 => current[index].wrapping_add(left),
+                    2 => current[index].wrapping_add(up),
+                    3 => current[index].wrapping_add(((u16::from(left) + u16::from(up)) / 2) as u8),
+                    4 => current[index].wrapping_add(wic_png_paeth(left, up, up_left)),
+                    _ => return Err(WINCODEC_ERR_BADIMAGE),
+                };
+            }
+            for column in 0..pass_width {
+                let mut samples = [0_u16; 4];
+                for (channel, sample) in samples.iter_mut().enumerate().take(channels) {
+                    *sample = wic_png_sample(&current, column * channels + channel, bit_depth);
                 }
-                2 => {
-                    let red = current[source];
-                    let green = current[source + 1];
-                    let blue = current[source + 2];
-                    [blue, green, red, 255]
-                }
-                4 => {
-                    let gray = current[source];
-                    [gray, gray, gray, current[source + 1]]
-                }
-                _ => {
-                    let red = current[source];
-                    let green = current[source + 1];
-                    let blue = current[source + 2];
-                    [blue, green, red, current[source + 3]]
-                }
-            };
-            pixels[destination + column * 4..destination + column * 4 + 4].copy_from_slice(&pixel);
+                let pixel = match color_type {
+                    0 => {
+                        let gray = wic_png_scale8(samples[0], bit_depth);
+                        let alpha = if transparency.len() == 2
+                            && samples[0] == u16::from_be_bytes([transparency[0], transparency[1]])
+                        {
+                            0
+                        } else {
+                            255
+                        };
+                        [gray, gray, gray, alpha]
+                    }
+                    2 => {
+                        let transparent = transparency.len() == 6
+                            && samples[0] == u16::from_be_bytes([transparency[0], transparency[1]])
+                            && samples[1] == u16::from_be_bytes([transparency[2], transparency[3]])
+                            && samples[2] == u16::from_be_bytes([transparency[4], transparency[5]]);
+                        [
+                            wic_png_scale8(samples[2], bit_depth),
+                            wic_png_scale8(samples[1], bit_depth),
+                            wic_png_scale8(samples[0], bit_depth),
+                            if transparent { 0 } else { 255 },
+                        ]
+                    }
+                    3 => {
+                        let Some(color) = palette.get(samples[0] as usize) else {
+                            return Err(WINCODEC_ERR_BADIMAGE);
+                        };
+                        [
+                            color[2],
+                            color[1],
+                            color[0],
+                            transparency
+                                .get(samples[0] as usize)
+                                .copied()
+                                .unwrap_or(255),
+                        ]
+                    }
+                    4 => {
+                        let gray = wic_png_scale8(samples[0], bit_depth);
+                        [gray, gray, gray, wic_png_scale8(samples[1], bit_depth)]
+                    }
+                    _ => [
+                        wic_png_scale8(samples[2], bit_depth),
+                        wic_png_scale8(samples[1], bit_depth),
+                        wic_png_scale8(samples[0], bit_depth),
+                        wic_png_scale8(samples[3], bit_depth),
+                    ],
+                };
+                let x = start_x + column * step_x;
+                let y = start_y + row * step_y;
+                let destination = (y * width as usize + x) * 4;
+                pixels[destination..destination + 4].copy_from_slice(&pixel);
+            }
+            std::mem::swap(&mut previous, &mut current);
         }
-        std::mem::swap(&mut previous, &mut current);
     }
     Ok(WicDecodedImage {
         width,
@@ -3613,6 +3970,31 @@ fn wic_decode_png(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
         dpi_x,
         dpi_y,
     })
+}
+
+/// Extract one native-depth sample from a packed PNG scanline.
+fn wic_png_sample(row: &[u8], index: usize, depth: u8) -> u16 {
+    match depth {
+        8 => u16::from(row[index]),
+        16 => u16::from_be_bytes([row[index * 2], row[index * 2 + 1]]),
+        _ => {
+            let bit = index * depth as usize;
+            let shift = 8 - depth as usize - (bit % 8);
+            u16::from((row[bit / 8] >> shift) & ((1_u8 << depth) - 1))
+        }
+    }
+}
+
+/// Scale a native-depth PNG sample to 8 bits (16-bit keeps the high byte).
+fn wic_png_scale8(value: u16, depth: u8) -> u8 {
+    match depth {
+        16 => (value >> 8) as u8,
+        8 => value as u8,
+        _ => {
+            let maximum = u32::from((1_u16 << depth) - 1);
+            ((u32::from(value) * 255 + maximum / 2) / maximum) as u8
+        }
+    }
 }
 
 fn wic_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -3680,6 +4062,470 @@ fn wic_encode_png(
     Ok(out)
 }
 
+// ── Baseline JPEG encoder (SOF0, 4:2:0 for color) ─────────────────────────
+
+const WIC_JPEG_DC_LUMA_COUNTS: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+const WIC_JPEG_DC_LUMA_SYMBOLS: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const WIC_JPEG_DC_CHROMA_COUNTS: [u8; 16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+const WIC_JPEG_DC_CHROMA_SYMBOLS: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const WIC_JPEG_AC_LUMA_COUNTS: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d];
+const WIC_JPEG_AC_LUMA_SYMBOLS: [u8; 162] = [
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
+    0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
+    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+];
+const WIC_JPEG_AC_CHROMA_COUNTS: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
+const WIC_JPEG_AC_CHROMA_SYMBOLS: [u8; 162] = [
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0,
+    0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
+    0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5,
+    0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3,
+    0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
+    0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+];
+const WIC_JPEG_LUMA_QUANT: [u8; 64] = [
+    16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113,
+    92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
+];
+const WIC_JPEG_CHROMA_QUANT: [u8; 64] = [
+    17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99, 99, 99,
+    47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+];
+
+struct WicJpegBitWriter {
+    out: Vec<u8>,
+    buffer: u32,
+    count: u32,
+}
+
+impl WicJpegBitWriter {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            buffer: 0,
+            count: 0,
+        }
+    }
+
+    fn write_bits(&mut self, value: u32, count: u8) {
+        if count == 0 {
+            return;
+        }
+        self.buffer = (self.buffer << count) | (value & ((1_u32 << count) - 1));
+        self.count += u32::from(count);
+        while self.count >= 8 {
+            let shift = self.count - 8;
+            let byte = ((self.buffer >> shift) & 0xff) as u8;
+            self.out.push(byte);
+            if byte == 0xff {
+                self.out.push(0);
+            }
+            self.count -= 8;
+        }
+        self.buffer &= if self.count == 0 {
+            0
+        } else {
+            (1_u32 << self.count) - 1
+        };
+    }
+
+    fn flush(&mut self) {
+        if self.count > 0 {
+            let padding = 8 - self.count;
+            let byte = (((self.buffer << padding) | ((1_u32 << padding) - 1)) & 0xff) as u8;
+            self.out.push(byte);
+            if byte == 0xff {
+                self.out.push(0);
+            }
+            self.buffer = 0;
+            self.count = 0;
+        }
+    }
+}
+
+fn wic_jpeg_amplitude(value: i32, size: u8) -> u32 {
+    if value >= 0 {
+        value as u32
+    } else {
+        (value + (1_i32 << size) - 1) as u32
+    }
+}
+
+fn wic_jpeg_bit_length(value: i32) -> u8 {
+    let mut magnitude = value.unsigned_abs();
+    let mut length = 0_u8;
+    while magnitude != 0 {
+        length += 1;
+        magnitude >>= 1;
+    }
+    length
+}
+
+fn wic_jpeg_scaled_quant(table: &[u8; 64], quality: u32) -> [u16; 64] {
+    let quality = quality.clamp(1, 100);
+    let scale = if quality < 50 {
+        5000 / quality
+    } else {
+        200 - quality * 2
+    };
+    let mut out = [0_u16; 64];
+    for (slot, value) in out.iter_mut().zip(table.iter()) {
+        *slot = (((u32::from(*value) * scale + 50) / 100).clamp(1, 255)) as u16;
+    }
+    out
+}
+
+fn wic_jpeg_push_segment(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+    out.push(0xff);
+    out.push(marker);
+    out.extend_from_slice(&((payload.len() as u16 + 2).to_be_bytes()));
+    out.extend_from_slice(payload);
+}
+
+fn wic_jpeg_huffman_payload(class: u8, id: u8, counts: &[u8; 16], symbols: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(17 + symbols.len());
+    payload.push((class << 4) | id);
+    payload.extend_from_slice(counts);
+    payload.extend_from_slice(symbols);
+    payload
+}
+
+fn wic_jpeg_bgra_rgb(
+    bgra: &[u8],
+    width: usize,
+    height: usize,
+    x: isize,
+    y: isize,
+) -> (f32, f32, f32) {
+    let x = x.clamp(0, width as isize - 1) as usize;
+    let y = y.clamp(0, height as isize - 1) as usize;
+    let index = (y * width + x) * 4;
+    (
+        f32::from(bgra[index + 2]),
+        f32::from(bgra[index + 1]),
+        f32::from(bgra[index]),
+    )
+}
+
+fn wic_jpeg_rgb_to_ycc(red: f32, green: f32, blue: f32) -> (f32, f32, f32) {
+    (
+        0.299 * red + 0.587 * green + 0.114 * blue,
+        -0.168_736 * red - 0.331_264 * green + 0.5 * blue + 128.0,
+        0.5 * red - 0.418_688 * green - 0.081_312 * blue + 128.0,
+    )
+}
+
+struct WicJpegEncoderTables {
+    dc_luma: WicJpegHuffman,
+    ac_luma: WicJpegHuffman,
+    dc_chroma: WicJpegHuffman,
+    ac_chroma: WicJpegHuffman,
+}
+
+impl WicJpegEncoderTables {
+    fn build() -> Option<Self> {
+        Some(Self {
+            dc_luma: WicJpegHuffman::build(&WIC_JPEG_DC_LUMA_COUNTS, &WIC_JPEG_DC_LUMA_SYMBOLS)?,
+            ac_luma: WicJpegHuffman::build(&WIC_JPEG_AC_LUMA_COUNTS, &WIC_JPEG_AC_LUMA_SYMBOLS)?,
+            dc_chroma: WicJpegHuffman::build(
+                &WIC_JPEG_DC_CHROMA_COUNTS,
+                &WIC_JPEG_DC_CHROMA_SYMBOLS,
+            )?,
+            ac_chroma: WicJpegHuffman::build(
+                &WIC_JPEG_AC_CHROMA_COUNTS,
+                &WIC_JPEG_AC_CHROMA_SYMBOLS,
+            )?,
+        })
+    }
+}
+
+fn wic_jpeg_encode_block(
+    samples: &[f32; 64],
+    quant: &[u16; 64],
+    cosine: &[[f32; 8]; 8],
+    dc_table: &WicJpegHuffman,
+    ac_table: &WicJpegHuffman,
+    previous_dc: &mut i32,
+    writer: &mut WicJpegBitWriter,
+) -> bool {
+    let mut transformed = [0_f32; 64];
+    for v in 0..8 {
+        for u in 0..8 {
+            let mut sum = 0_f32;
+            for y in 0..8 {
+                for x in 0..8 {
+                    sum += samples[y * 8 + x] * cosine[x][u] * cosine[y][v];
+                }
+            }
+            transformed[v * 8 + u] = sum;
+        }
+    }
+    let mut block = [0_i32; 64];
+    for index in 0..64 {
+        let quantized = (transformed[index] / f32::from(quant[index])).round() as i32;
+        block[index] = if index == 0 {
+            quantized.clamp(-2047, 2047)
+        } else {
+            quantized.clamp(-1023, 1023)
+        };
+    }
+    let difference = block[0] - *previous_dc;
+    *previous_dc = block[0];
+    let size = wic_jpeg_bit_length(difference);
+    if !dc_table.write(size, writer) {
+        return false;
+    }
+    if size > 0 {
+        writer.write_bits(wic_jpeg_amplitude(difference, size), size);
+    }
+    let mut run = 0_u8;
+    for coefficient in 1..64 {
+        let value = block[WIC_JPEG_ZIGZAG[coefficient]];
+        if value == 0 {
+            run += 1;
+            continue;
+        }
+        while run >= 16 {
+            if !ac_table.write(0xf0, writer) {
+                return false;
+            }
+            run -= 16;
+        }
+        let size = wic_jpeg_bit_length(value);
+        let symbol = (run << 4) | size;
+        if !ac_table.write(symbol, writer) {
+            return false;
+        }
+        writer.write_bits(wic_jpeg_amplitude(value, size), size);
+        run = 0;
+    }
+    if run > 0 {
+        return ac_table.write(0x00, writer);
+    }
+    true
+}
+
+/// Encode a real baseline JPEG.  Color images use 4:2:0 sampling; the
+/// sampling parameter lets tests exercise 4:2:2 and 4:4:4 streams through the
+/// same encoder.
+fn wic_encode_jpeg_sampled(
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+    dpi: Option<(f64, f64)>,
+    sampling: (usize, usize),
+) -> std::result::Result<Vec<u8>, u32> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or(E_INVALIDARG)?;
+    if width == 0 || height == 0 || bgra.len() < expected {
+        return Err(E_INVALIDARG);
+    }
+    if width > 65535 || height > 65535 {
+        return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
+    }
+    let (sample_h, sample_v) = (sampling.0.clamp(1, 2), sampling.1.clamp(1, 2));
+    let Some(tables) = WicJpegEncoderTables::build() else {
+        return Err(WINCODEC_ERR_BADIMAGE);
+    };
+    let luma_quant = wic_jpeg_scaled_quant(&WIC_JPEG_LUMA_QUANT, 90);
+    let chroma_quant = wic_jpeg_scaled_quant(&WIC_JPEG_CHROMA_QUANT, 90);
+    let mut cosine = [[0_f32; 8]; 8];
+    for (x, row) in cosine.iter_mut().enumerate() {
+        for (u, value) in row.iter_mut().enumerate() {
+            let scale = if u == 0 {
+                std::f32::consts::FRAC_1_SQRT_2
+            } else {
+                1.0
+            };
+            *value =
+                0.5 * scale * (((2 * x + 1) as f32 * u as f32 * std::f32::consts::PI) / 16.0).cos();
+        }
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0xff, 0xd8]);
+    let (dpi_x, dpi_y) = dpi
+        .filter(|(x, y)| x.is_finite() && y.is_finite() && *x > 0.0 && *y > 0.0)
+        .unwrap_or((WIC_DEFAULT_DPI, WIC_DEFAULT_DPI));
+    let xdpi = (dpi_x.round() as u32).clamp(1, 65535) as u16;
+    let ydpi = (dpi_y.round() as u32).clamp(1, 65535) as u16;
+    let mut app0 = Vec::with_capacity(14);
+    app0.extend_from_slice(b"JFIF\0");
+    app0.extend_from_slice(&[1, 1, 1]);
+    app0.extend_from_slice(&xdpi.to_be_bytes());
+    app0.extend_from_slice(&ydpi.to_be_bytes());
+    app0.extend_from_slice(&[0, 0]);
+    wic_jpeg_push_segment(&mut out, 0xe0, &app0);
+    let mut quant_luma = vec![0_u8];
+    for coefficient in 0..64 {
+        quant_luma.push(luma_quant[WIC_JPEG_ZIGZAG[coefficient]] as u8);
+    }
+    wic_jpeg_push_segment(&mut out, 0xdb, &quant_luma);
+    let mut quant_chroma = vec![1_u8];
+    for coefficient in 0..64 {
+        quant_chroma.push(chroma_quant[WIC_JPEG_ZIGZAG[coefficient]] as u8);
+    }
+    wic_jpeg_push_segment(&mut out, 0xdb, &quant_chroma);
+    let mut frame = Vec::with_capacity(15);
+    frame.push(8);
+    frame.extend_from_slice(&(height as u16).to_be_bytes());
+    frame.extend_from_slice(&(width as u16).to_be_bytes());
+    frame.push(3);
+    frame.extend_from_slice(&[
+        1,
+        (sample_h << 4 | sample_v) as u8,
+        0,
+        2,
+        0x11,
+        1,
+        3,
+        0x11,
+        1,
+    ]);
+    wic_jpeg_push_segment(&mut out, 0xc0, &frame);
+    wic_jpeg_push_segment(
+        &mut out,
+        0xc4,
+        &wic_jpeg_huffman_payload(0, 0, &WIC_JPEG_DC_LUMA_COUNTS, &WIC_JPEG_DC_LUMA_SYMBOLS),
+    );
+    wic_jpeg_push_segment(
+        &mut out,
+        0xc4,
+        &wic_jpeg_huffman_payload(1, 0, &WIC_JPEG_AC_LUMA_COUNTS, &WIC_JPEG_AC_LUMA_SYMBOLS),
+    );
+    wic_jpeg_push_segment(
+        &mut out,
+        0xc4,
+        &wic_jpeg_huffman_payload(
+            0,
+            1,
+            &WIC_JPEG_DC_CHROMA_COUNTS,
+            &WIC_JPEG_DC_CHROMA_SYMBOLS,
+        ),
+    );
+    wic_jpeg_push_segment(
+        &mut out,
+        0xc4,
+        &wic_jpeg_huffman_payload(
+            1,
+            1,
+            &WIC_JPEG_AC_CHROMA_COUNTS,
+            &WIC_JPEG_AC_CHROMA_SYMBOLS,
+        ),
+    );
+    wic_jpeg_push_segment(&mut out, 0xda, &[3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0]);
+    let mcus_x = (width as usize).div_ceil(8 * sample_h);
+    let mcus_y = (height as usize).div_ceil(8 * sample_v);
+    let mut writer = WicJpegBitWriter::new();
+    let mut dc_luma = 0_i32;
+    let mut dc_chroma = [0_i32; 2];
+    for mcu_y in 0..mcus_y {
+        for mcu_x in 0..mcus_x {
+            for block_y in 0..sample_v {
+                for block_x in 0..sample_h {
+                    let mut samples = [0_f32; 64];
+                    for y in 0..8 {
+                        for x in 0..8 {
+                            let source_x = (mcu_x * 8 * sample_h + block_x * 8 + x) as isize;
+                            let source_y = (mcu_y * 8 * sample_v + block_y * 8 + y) as isize;
+                            let (red, green, blue) = wic_jpeg_bgra_rgb(
+                                bgra,
+                                width as usize,
+                                height as usize,
+                                source_x,
+                                source_y,
+                            );
+                            let (luma, _, _) = wic_jpeg_rgb_to_ycc(red, green, blue);
+                            samples[y * 8 + x] = luma - 128.0;
+                        }
+                    }
+                    if !wic_jpeg_encode_block(
+                        &samples,
+                        &luma_quant,
+                        &cosine,
+                        &tables.dc_luma,
+                        &tables.ac_luma,
+                        &mut dc_luma,
+                        &mut writer,
+                    ) {
+                        return Err(WINCODEC_ERR_BADIMAGE);
+                    }
+                }
+            }
+            for chroma in 0..2 {
+                let mut samples = [0_f32; 64];
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let mut red = 0_f32;
+                        let mut green = 0_f32;
+                        let mut blue = 0_f32;
+                        for dy in 0..sample_v {
+                            for dx in 0..sample_h {
+                                let source_x = (mcu_x * 8 * sample_h + x * sample_h + dx) as isize;
+                                let source_y = (mcu_y * 8 * sample_v + y * sample_v + dy) as isize;
+                                let (r, g, b) = wic_jpeg_bgra_rgb(
+                                    bgra,
+                                    width as usize,
+                                    height as usize,
+                                    source_x,
+                                    source_y,
+                                );
+                                red += r;
+                                green += g;
+                                blue += b;
+                            }
+                        }
+                        let count = (sample_h * sample_v) as f32;
+                        let (_, cb, cr) =
+                            wic_jpeg_rgb_to_ycc(red / count, green / count, blue / count);
+                        samples[y * 8 + x] = (if chroma == 0 { cb } else { cr }) - 128.0;
+                    }
+                }
+                if !wic_jpeg_encode_block(
+                    &samples,
+                    &chroma_quant,
+                    &cosine,
+                    &tables.dc_chroma,
+                    &tables.ac_chroma,
+                    &mut dc_chroma[chroma],
+                    &mut writer,
+                ) {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                }
+            }
+        }
+    }
+    writer.flush();
+    out.extend_from_slice(&writer.out);
+    out.extend_from_slice(&[0xff, 0xd9]);
+    Ok(out)
+}
+
+fn wic_encode_jpeg(
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+    dpi: Option<(f64, f64)>,
+) -> std::result::Result<Vec<u8>, u32> {
+    wic_encode_jpeg_sampled(width, height, bgra, dpi, (2, 2))
+}
+
 // ── Baseline JPEG (SOF0/SOF1 + SOS Huffman scan) ──────────────────────────
 
 const WIC_JPEG_ZIGZAG: [usize; 64] = [
@@ -3726,6 +4572,16 @@ impl WicJpegHuffman {
             }
         }
         None
+    }
+
+    fn write(&self, symbol: u8, writer: &mut WicJpegBitWriter) -> bool {
+        for &(code, length, candidate) in &self.entries {
+            if candidate == symbol {
+                writer.write_bits(u32::from(code), length);
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -3849,11 +4705,16 @@ struct WicJpegComponent {
     dc_table: usize,
     ac_table: usize,
     dc_prediction: i32,
+    /// Padded block stride (MCU-aligned) and height.
     blocks_x: usize,
     blocks_y: usize,
+    /// Blocks actually covering the component (non-interleaved scans).
+    actual_blocks_x: usize,
+    actual_blocks_y: usize,
     plane_width: usize,
     plane_height: usize,
     samples: Vec<u8>,
+    coefficients: Vec<[i32; 64]>,
 }
 
 fn wic_jpeg_idct(coefficients: &[i32; 64], cosine: &[[f32; 8]; 8], output: &mut [u8; 64]) {
@@ -3878,8 +4739,253 @@ fn wic_jpeg_idct(coefficients: &[i32; 64], cosine: &[[f32; 8]; 8], output: &mut 
     }
 }
 
-/// Decode a real baseline JPEG: SOF0/SOF1, DQT, DHT, DRI, SOS Huffman scan,
-/// dequantization, 2D IDCT, and nearest-neighbour chroma upsampling.
+#[derive(Clone, Copy)]
+struct WicJpegScanParams {
+    progressive: bool,
+    ss: usize,
+    se: usize,
+    ah: u8,
+    al: u8,
+}
+
+fn wic_jpeg_refine(coefficient: &mut i32, bit: u8, step: i32) {
+    if bit != 0 && (*coefficient & step) == 0 {
+        *coefficient += if *coefficient >= 0 { step } else { -step };
+    }
+}
+
+/// Decode one block of a baseline or progressive scan into quantized
+/// coefficients.  Progressive scans implement spectral selection (Ss/Se) and
+/// successive approximation (Ah/Al), including AC refinement and EOB runs.
+fn wic_jpeg_decode_block(
+    component: &mut WicJpegComponent,
+    block_index: usize,
+    bits: &mut WicJpegBits<'_>,
+    dc_table: &WicJpegHuffman,
+    ac_table: &WicJpegHuffman,
+    scan: WicJpegScanParams,
+    eob_run: &mut u32,
+) -> std::result::Result<(), u32> {
+    if block_index >= component.coefficients.len() {
+        return Err(WINCODEC_ERR_BADIMAGE);
+    }
+    if !scan.progressive {
+        let Some(category) = dc_table.decode(bits) else {
+            return Err(WINCODEC_ERR_BADIMAGE);
+        };
+        let difference = if category == 0 {
+            0
+        } else {
+            let Some(value) = bits.bits(u32::from(category)) else {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            };
+            wic_jpeg_extend(value, category)
+        };
+        component.dc_prediction += difference;
+        let dc = component.dc_prediction;
+        let block = &mut component.coefficients[block_index];
+        block[0] = dc;
+        let mut coefficient = 1_usize;
+        while coefficient < 64 {
+            let Some(run_size) = ac_table.decode(bits) else {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            };
+            let run = usize::from(run_size >> 4);
+            let size = run_size & 0x0f;
+            if size == 0 {
+                if run == 15 {
+                    coefficient += 16;
+                } else {
+                    break;
+                }
+            } else {
+                coefficient += run;
+                if coefficient >= 64 {
+                    break;
+                }
+                let Some(value) = bits.bits(u32::from(size)) else {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                };
+                block[WIC_JPEG_ZIGZAG[coefficient]] = wic_jpeg_extend(value, size);
+                coefficient += 1;
+            }
+        }
+        return Ok(());
+    }
+    if scan.ss == 0 {
+        if scan.ah == 0 {
+            let Some(category) = dc_table.decode(bits) else {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            };
+            let difference = if category == 0 {
+                0
+            } else {
+                let Some(value) = bits.bits(u32::from(category)) else {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                };
+                wic_jpeg_extend(value, category)
+            };
+            component.dc_prediction += difference;
+            component.coefficients[block_index][0] = component.dc_prediction << scan.al;
+        } else {
+            let Some(bit) = bits.bit() else {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            };
+            component.coefficients[block_index][0] |= i32::from(bit) << scan.al;
+        }
+        return Ok(());
+    }
+    if scan.ah == 0 {
+        let block = &mut component.coefficients[block_index];
+        if *eob_run > 0 {
+            *eob_run -= 1;
+            return Ok(());
+        }
+        let mut coefficient = scan.ss;
+        while coefficient <= scan.se && coefficient < 64 {
+            let Some(run_size) = ac_table.decode(bits) else {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            };
+            let run = usize::from(run_size >> 4);
+            let size = run_size & 0x0f;
+            if size == 0 {
+                if run == 15 {
+                    coefficient += 16;
+                    continue;
+                }
+                let mut run_length = 1_u32 << run;
+                if run > 0 {
+                    let Some(extra) = bits.bits(run as u32) else {
+                        return Err(WINCODEC_ERR_BADIMAGE);
+                    };
+                    run_length += extra;
+                }
+                *eob_run = run_length - 1;
+                break;
+            }
+            coefficient += run;
+            if coefficient > scan.se || coefficient >= 64 {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            }
+            let Some(value) = bits.bits(u32::from(size)) else {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            };
+            block[WIC_JPEG_ZIGZAG[coefficient]] = wic_jpeg_extend(value, size) << scan.al;
+            coefficient += 1;
+        }
+        return Ok(());
+    }
+    let step = 1_i32 << scan.al;
+    if *eob_run > 0 {
+        let block = &mut component.coefficients[block_index];
+        for coefficient in scan.ss..=scan.se {
+            let index = WIC_JPEG_ZIGZAG[coefficient];
+            if block[index] != 0 {
+                let Some(bit) = bits.bit() else {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                };
+                wic_jpeg_refine(&mut block[index], bit, step);
+            }
+        }
+        *eob_run -= 1;
+        return Ok(());
+    }
+    let mut coefficient = scan.ss;
+    while coefficient <= scan.se {
+        let Some(run_size) = ac_table.decode(bits) else {
+            return Err(WINCODEC_ERR_BADIMAGE);
+        };
+        let run = usize::from(run_size >> 4);
+        let size = run_size & 0x0f;
+        if size == 0 {
+            if run == 15 {
+                let mut zeros = 16_usize;
+                while coefficient <= scan.se && zeros > 0 {
+                    let index = WIC_JPEG_ZIGZAG[coefficient];
+                    if component.coefficients[block_index][index] != 0 {
+                        let Some(bit) = bits.bit() else {
+                            return Err(WINCODEC_ERR_BADIMAGE);
+                        };
+                        wic_jpeg_refine(&mut component.coefficients[block_index][index], bit, step);
+                    } else {
+                        zeros -= 1;
+                    }
+                    coefficient += 1;
+                }
+                continue;
+            }
+            let mut run_length = 1_u32 << run;
+            if run > 0 {
+                let Some(extra) = bits.bits(run as u32) else {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                };
+                run_length += extra;
+            }
+            *eob_run = run_length - 1;
+            while coefficient <= scan.se {
+                let index = WIC_JPEG_ZIGZAG[coefficient];
+                if component.coefficients[block_index][index] != 0 {
+                    let Some(bit) = bits.bit() else {
+                        return Err(WINCODEC_ERR_BADIMAGE);
+                    };
+                    wic_jpeg_refine(&mut component.coefficients[block_index][index], bit, step);
+                }
+                coefficient += 1;
+            }
+            return Ok(());
+        }
+        if size != 1 {
+            return Err(WINCODEC_ERR_BADIMAGE);
+        }
+        let Some(sign_bit) = bits.bit() else {
+            return Err(WINCODEC_ERR_BADIMAGE);
+        };
+        let sign = if sign_bit != 0 { step } else { -step };
+        let mut zeros = run;
+        loop {
+            if coefficient > scan.se {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            }
+            let index = WIC_JPEG_ZIGZAG[coefficient];
+            if component.coefficients[block_index][index] != 0 {
+                let Some(bit) = bits.bit() else {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                };
+                wic_jpeg_refine(&mut component.coefficients[block_index][index], bit, step);
+            } else if zeros > 0 {
+                zeros -= 1;
+            } else {
+                break;
+            }
+            coefficient += 1;
+        }
+        component.coefficients[block_index][WIC_JPEG_ZIGZAG[coefficient]] = sign;
+        coefficient += 1;
+    }
+    Ok(())
+}
+
+/// Find the next real marker at or after `start`, skipping stuffed bytes and
+/// restart markers.
+fn wic_jpeg_next_marker(bytes: &[u8], start: usize) -> usize {
+    let mut position = start;
+    while position + 1 < bytes.len() {
+        if bytes[position] == 0xff {
+            let next = bytes[position + 1];
+            if next == 0x00 || (0xd0..=0xd7).contains(&next) {
+                position += 2;
+                continue;
+            }
+            return position;
+        }
+        position += 1;
+    }
+    bytes.len()
+}
+
+/// Decode a real JPEG: baseline (SOF0/SOF1) or progressive (SOF2) Huffman
+/// scans, spectral selection/successive approximation, restart markers,
+/// 4:2:0/4:2:2/4:4:4 sampling, dequantization and 2D IDCT.
 fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
     if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
         return Err(WINCODEC_ERR_UNKNOWNIMAGEFORMAT);
@@ -3887,6 +4993,7 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
     let mut position = 2_usize;
     let mut width = 0_u32;
     let mut height = 0_u32;
+    let mut progressive = false;
     let mut components: Vec<WicJpegComponent> = Vec::new();
     let mut quant_tables = [[0_u16; 64]; 4];
     let mut quant_present = [false; 4];
@@ -3895,8 +5002,7 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
     let mut restart_interval = 0_usize;
     let mut dpi_x = WIC_DEFAULT_DPI;
     let mut dpi_y = WIC_DEFAULT_DPI;
-    let mut scan: Option<Vec<usize>> = None;
-    let mut decoded = false;
+    let mut scanned = false;
     while position < bytes.len() {
         if bytes[position] != 0xff {
             return Err(WINCODEC_ERR_BADIMAGE);
@@ -3944,7 +5050,14 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                     }
                 }
             }
-            0xc0 | 0xc1 => {
+            0xee => {
+                if segment.len() >= 12 && &segment[..5] == b"Adobe" && segment[11] == 2 {
+                    // YCCK (Adobe transform 2) is a four-component color
+                    // space; reject it rather than mis-render it as YCbCr.
+                    return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
+                }
+            }
+            0xc0 | 0xc1 | 0xc2 => {
                 if segment.len() < 6 || segment[0] != 8 {
                     return Err(if segment.len() < 6 {
                         WINCODEC_ERR_BADIMAGE
@@ -3952,6 +5065,10 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                         WINCODEC_ERR_UNSUPPORTEDOPERATION
                     });
                 }
+                if !components.is_empty() {
+                    return Err(WINCODEC_ERR_BADIMAGE);
+                }
+                progressive = marker == 0xc2;
                 height = u32::from(u16::from_be_bytes([segment[1], segment[2]]));
                 width = u32::from(u16::from_be_bytes([segment[3], segment[4]]));
                 let count = segment[5] as usize;
@@ -3964,6 +5081,10 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                     || segment.len() < 6 + count * 3
                 {
                     return Err(WINCODEC_ERR_BADIMAGE);
+                }
+                if count != 1 && count != 3 {
+                    // CMYK / YCCK and other multi-component color spaces.
+                    return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
                 }
                 components.clear();
                 for index in 0..count {
@@ -3985,14 +5106,18 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                         dc_prediction: 0,
                         blocks_x: 0,
                         blocks_y: 0,
+                        actual_blocks_x: 0,
+                        actual_blocks_y: 0,
                         plane_width: 0,
                         plane_height: 0,
                         samples: Vec::new(),
+                        coefficients: Vec::new(),
                     });
                 }
             }
-            0xc2 => return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION),
-            0xc3 | 0xc5..=0xcf => return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION),
+            0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
+                return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
+            }
             0xc4 => {
                 let mut cursor = 0_usize;
                 while cursor < segment.len() {
@@ -4001,7 +5126,7 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                     }
                     let class = segment[cursor] >> 4;
                     let identifier = usize::from(segment[cursor] & 0x0f);
-                    if identifier >= 4 {
+                    if identifier >= 4 || class > 1 {
                         return Err(WINCODEC_ERR_BADIMAGE);
                     }
                     cursor += 1;
@@ -4057,7 +5182,13 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                     } else {
                         return Err(WINCODEC_ERR_BADIMAGE);
                     }
-                    quant_tables[identifier] = table;
+                    // Re-order the zigzag-coded table into natural order so
+                    // coefficients can be dequantized by natural index.
+                    let mut natural = [0_u16; 64];
+                    for (index, slot) in table.iter().enumerate() {
+                        natural[WIC_JPEG_ZIGZAG[index]] = *slot;
+                    }
+                    quant_tables[identifier] = natural;
                     quant_present[identifier] = true;
                 }
             }
@@ -4068,9 +5199,6 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                 restart_interval = u16::from_be_bytes([segment[0], segment[1]]) as usize;
             }
             0xda => {
-                if decoded {
-                    return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
-                }
                 if segment.is_empty() || components.is_empty() {
                     return Err(WINCODEC_ERR_BADIMAGE);
                 }
@@ -4093,14 +5221,26 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                     order.push(component_index);
                 }
                 let tail = &segment[1 + count * 2..];
-                if tail.len() < 3 || tail[0] != 0 || tail[1] != 63 || tail[2] != 0 {
-                    return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
+                if tail.len() < 3 {
+                    return Err(WINCODEC_ERR_BADIMAGE);
                 }
-                if order.len() == 1 {
-                    let component = &components[order[0]];
-                    if component.h > 1 || component.v > 1 {
-                        return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
+                let ss = usize::from(tail[0]);
+                let se = usize::from(tail[1]);
+                let ah = tail[2] >> 4;
+                let al = tail[2] & 0x0f;
+                if progressive {
+                    if ss > se
+                        || se > 63
+                        || ah > 13
+                        || al > 13
+                        || (ss == 0 && se != 0)
+                        || (ss > 0 && count != 1)
+                        || (ah != 0 && ah != al + 1)
+                    {
+                        return Err(WINCODEC_ERR_BADIMAGE);
                     }
+                } else if ss != 0 || se != 63 || ah != 0 || al != 0 {
+                    return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
                 }
                 let max_h = components
                     .iter()
@@ -4119,30 +5259,57 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                     component.blocks_y = mcus_y * component.v;
                     component.plane_width = component.blocks_x * 8;
                     component.plane_height = component.blocks_y * 8;
-                    component.samples = vec![0_u8; component.plane_width * component.plane_height];
-                    component.dc_prediction = 0;
-                    if !quant_present[component.tq]
-                        || dc_tables[component.dc_table].is_none()
-                        || ac_tables[component.ac_table].is_none()
+                    let component_width = (width as usize * component.h).div_ceil(max_h);
+                    let component_height = (height as usize * component.v).div_ceil(max_v);
+                    component.actual_blocks_x = component_width.div_ceil(8).max(1);
+                    component.actual_blocks_y = component_height.div_ceil(8).max(1);
+                    if component.coefficients.is_empty() {
+                        component.coefficients =
+                            vec![[0_i32; 64]; component.blocks_x * component.blocks_y];
+                    }
+                    if !quant_present[component.tq] {
+                        return Err(WINCODEC_ERR_BADIMAGE);
+                    }
+                }
+                for &component_index in &order {
+                    let component = &components[component_index];
+                    let dc_ready = dc_tables[component.dc_table].is_some();
+                    let ac_ready = ac_tables[component.ac_table].is_some();
+                    if (progressive && ss == 0 && !dc_ready)
+                        || (progressive && ss > 0 && !ac_ready)
+                        || (!progressive && (!dc_ready || !ac_ready))
                     {
                         return Err(WINCODEC_ERR_BADIMAGE);
                     }
                 }
-                let mut cosine = [[0_f32; 8]; 8];
-                for (x, row) in cosine.iter_mut().enumerate() {
-                    for (u, value) in row.iter_mut().enumerate() {
-                        let scale = if u == 0 {
-                            std::f32::consts::FRAC_1_SQRT_2
-                        } else {
-                            1.0
-                        };
-                        *value = 0.5
-                            * scale
-                            * (((2 * x + 1) as f32 * u as f32 * std::f32::consts::PI) / 16.0).cos();
-                    }
+                let interleaved = count > 1;
+                let (scan_mcus_x, scan_mcus_y) = if interleaved {
+                    (mcus_x, mcus_y)
+                } else {
+                    (
+                        components[order[0]].actual_blocks_x,
+                        components[order[0]].actual_blocks_y,
+                    )
+                };
+                for component in components.iter_mut() {
+                    component.dc_prediction = 0;
                 }
+                let scan = WicJpegScanParams {
+                    progressive,
+                    ss,
+                    se,
+                    ah,
+                    al,
+                };
                 let mut bits = WicJpegBits::new(bytes, position + length);
-                let mcu_count = mcus_x * mcus_y;
+                let mut eob_run = 0_u32;
+                let empty_dc = WicJpegHuffman {
+                    entries: Vec::new(),
+                };
+                let empty_ac = WicJpegHuffman {
+                    entries: Vec::new(),
+                };
+                let mcu_count = scan_mcus_x * scan_mcus_y;
                 for mcu in 0..mcu_count {
                     if restart_interval > 0 && mcu > 0 && mcu % restart_interval == 0 {
                         if !bits.skip_restart() {
@@ -4151,100 +5318,51 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                         for component in components.iter_mut() {
                             component.dc_prediction = 0;
                         }
+                        eob_run = 0;
                     }
-                    let mcu_x = mcu % mcus_x;
-                    let mcu_y = mcu / mcus_x;
+                    let mcu_x = mcu % scan_mcus_x;
+                    let mcu_y = mcu / scan_mcus_x;
                     for &component_index in &order {
-                        let (h, v) = {
+                        let (h_blocks, v_blocks) = if interleaved {
                             let component = &components[component_index];
                             (component.h, component.v)
+                        } else {
+                            (1, 1)
                         };
-                        for block_y in 0..v {
-                            for block_x in 0..h {
-                                let component = &components[component_index];
-                                let Some(dc_table) = dc_tables[component.dc_table].as_ref() else {
-                                    return Err(WINCODEC_ERR_BADIMAGE);
-                                };
-                                let Some(ac_table) = ac_tables[component.ac_table].as_ref() else {
-                                    return Err(WINCODEC_ERR_BADIMAGE);
-                                };
-                                let Some(category) = dc_table.decode(&mut bits) else {
-                                    return Err(WINCODEC_ERR_BADIMAGE);
-                                };
-                                let difference = if category == 0 {
-                                    0
+                        for block_y in 0..v_blocks {
+                            for block_x in 0..h_blocks {
+                                let block_index = if interleaved {
+                                    let component = &components[component_index];
+                                    (mcu_y * component.v + block_y) * component.blocks_x
+                                        + mcu_x * component.h
+                                        + block_x
                                 } else {
-                                    let Some(value) = bits.bits(u32::from(category)) else {
-                                        return Err(WINCODEC_ERR_BADIMAGE);
-                                    };
-                                    wic_jpeg_extend(value, category)
+                                    mcu_y * components[component_index].blocks_x + mcu_x
                                 };
-                                let component = &mut components[component_index];
-                                component.dc_prediction += difference;
-                                let quant = &quant_tables[component.tq];
-                                let mut coefficients = [0_i32; 64];
-                                coefficients[0] = component.dc_prediction * i32::from(quant[0]);
-                                let mut coefficient = 1_usize;
-                                while coefficient < 64 {
-                                    let Some(run_size) = ac_table.decode(&mut bits) else {
-                                        return Err(WINCODEC_ERR_BADIMAGE);
-                                    };
-                                    let run = usize::from(run_size >> 4);
-                                    let size = run_size & 0x0f;
-                                    if size == 0 {
-                                        if run == 15 {
-                                            coefficient += 16;
-                                        } else {
-                                            break;
-                                        }
-                                    } else {
-                                        coefficient += run;
-                                        if coefficient >= 64 {
-                                            break;
-                                        }
-                                        let Some(value) = bits.bits(u32::from(size)) else {
-                                            return Err(WINCODEC_ERR_BADIMAGE);
-                                        };
-                                        let value = wic_jpeg_extend(value, size);
-                                        let natural = WIC_JPEG_ZIGZAG[coefficient];
-                                        coefficients[natural] =
-                                            value * i32::from(quant[coefficient]);
-                                        coefficient += 1;
-                                    }
-                                }
-                                let mut block = [0_u8; 64];
-                                wic_jpeg_idct(&coefficients, &cosine, &mut block);
-                                let destination_x = (mcu_x * h + block_x) * 8;
-                                let destination_y = (mcu_y * v + block_y) * 8;
-                                for row in 0..8 {
-                                    let start = (destination_y + row) * component.plane_width
-                                        + destination_x;
-                                    let end = start + 8;
-                                    if let Some(slot) = component.samples.get_mut(start..end) {
-                                        slot.copy_from_slice(&block[row * 8..row * 8 + 8]);
-                                    }
-                                }
+                                let (dc_table, ac_table) = {
+                                    let component = &components[component_index];
+                                    (
+                                        dc_tables[component.dc_table].as_ref().unwrap_or(&empty_dc),
+                                        ac_tables[component.ac_table].as_ref().unwrap_or(&empty_ac),
+                                    )
+                                };
+                                wic_jpeg_decode_block(
+                                    &mut components[component_index],
+                                    block_index,
+                                    &mut bits,
+                                    dc_table,
+                                    ac_table,
+                                    scan,
+                                    &mut eob_run,
+                                )?;
                             }
                         }
                     }
                 }
-                decoded = true;
-                scan = Some(order);
-                let mut search = bits.position;
-                if let Some(marker) = bits.marker_position {
-                    search = marker;
-                } else {
-                    while search + 1 < bytes.len() {
-                        if bytes[search] == 0xff
-                            && bytes[search + 1] != 0
-                            && !(0xd0..=0xd7).contains(&bytes[search + 1])
-                        {
-                            break;
-                        }
-                        search += 1;
-                    }
-                }
-                position = search;
+                scanned = true;
+                position = bits
+                    .marker_position
+                    .unwrap_or_else(|| wic_jpeg_next_marker(bytes, bits.position));
                 continue;
             }
             0xe1..=0xef | 0xfe => {}
@@ -4252,13 +5370,10 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
         }
         position += length;
     }
-    let Some(order) = scan else {
-        return Err(WINCODEC_ERR_BADIMAGE);
-    };
-    if !decoded || width == 0 || height == 0 {
+    if !scanned || width == 0 || height == 0 {
         return Err(WINCODEC_ERR_BADIMAGE);
     }
-    if order.len() != 3 && order.len() != 1 {
+    if components.len() != 1 && components.len() != 3 {
         return Err(WINCODEC_ERR_UNSUPPORTEDOPERATION);
     }
     let max_h = components
@@ -4271,12 +5386,51 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
         .map(|component| component.v)
         .max()
         .unwrap_or(1);
+    let mut cosine = [[0_f32; 8]; 8];
+    for (x, row) in cosine.iter_mut().enumerate() {
+        for (u, value) in row.iter_mut().enumerate() {
+            let scale = if u == 0 {
+                std::f32::consts::FRAC_1_SQRT_2
+            } else {
+                1.0
+            };
+            *value =
+                0.5 * scale * (((2 * x + 1) as f32 * u as f32 * std::f32::consts::PI) / 16.0).cos();
+        }
+    }
+    for component in components.iter_mut() {
+        if component.coefficients.is_empty() {
+            return Err(WINCODEC_ERR_BADIMAGE);
+        }
+        component.samples = vec![0_u8; component.plane_width * component.plane_height];
+        let quant = quant_tables[component.tq];
+        for block_y in 0..component.blocks_y {
+            for block_x in 0..component.blocks_x {
+                let source = &component.coefficients[block_y * component.blocks_x + block_x];
+                let mut coefficients = [0_i32; 64];
+                for (index, value) in coefficients.iter_mut().enumerate() {
+                    *value = source[index] * i32::from(quant[index]);
+                }
+                let mut block = [0_u8; 64];
+                wic_jpeg_idct(&coefficients, &cosine, &mut block);
+                let destination_x = block_x * 8;
+                let destination_y = block_y * 8;
+                for row in 0..8 {
+                    let start = (destination_y + row) * component.plane_width + destination_x;
+                    let end = start + 8;
+                    if let Some(slot) = component.samples.get_mut(start..end) {
+                        slot.copy_from_slice(&block[row * 8..row * 8 + 8]);
+                    }
+                }
+            }
+        }
+    }
     let mut pixels = vec![0_u8; width as usize * height as usize * 4];
     for y in 0..height as usize {
         for x in 0..width as usize {
             let (red, green, blue);
-            if order.len() == 1 {
-                let component = &components[order[0]];
+            if components.len() == 1 {
+                let component = &components[0];
                 let sample_x = (x * component.h / max_h).min(component.plane_width - 1);
                 let sample_y = (y * component.v / max_v).min(component.plane_height - 1);
                 let value = component.samples[sample_y * component.plane_width + sample_x] as f32;
@@ -4285,12 +5439,11 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
                 blue = value;
             } else {
                 let mut samples = [0_f32; 3];
-                for (index, &component_index) in order.iter().enumerate() {
-                    let component = &components[component_index];
+                for (index, slot) in samples.iter_mut().enumerate() {
+                    let component = &components[index];
                     let sample_x = (x * component.h / max_h).min(component.plane_width - 1);
                     let sample_y = (y * component.v / max_v).min(component.plane_height - 1);
-                    samples[index] =
-                        component.samples[sample_y * component.plane_width + sample_x] as f32;
+                    *slot = component.samples[sample_y * component.plane_width + sample_x] as f32;
                 }
                 let luminance = samples[0];
                 let cb = samples[1] - 128.0;
@@ -4315,6 +5468,435 @@ fn wic_decode_jpeg(bytes: &[u8]) -> std::result::Result<WicDecodedImage, u32> {
         dpi_x,
         dpi_y,
     })
+}
+
+// ── Metadata readers and embedded thumbnails ──────────────────────────────
+
+fn wic_metadata_serialize(entries: &[(String, String)]) -> Vec<u8> {
+    let mut out = WIC_METADATA_READER_MAGIC.to_vec();
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (key, value) in entries {
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    out
+}
+
+fn wic_metadata_deserialize(bytes: &[u8]) -> Vec<(String, String)> {
+    if !bytes.starts_with(WIC_METADATA_READER_MAGIC) {
+        return Vec::new();
+    }
+    let mut position = WIC_METADATA_READER_MAGIC.len();
+    let Some(count_bytes) = bytes.get(position..position + 4) else {
+        return Vec::new();
+    };
+    let count = u32::from_le_bytes([
+        count_bytes[0],
+        count_bytes[1],
+        count_bytes[2],
+        count_bytes[3],
+    ]) as usize;
+    position += 4;
+    let mut entries = Vec::new();
+    for _ in 0..count.min(4096) {
+        let Some(key_len_bytes) = bytes.get(position..position + 4) else {
+            break;
+        };
+        let key_len = u32::from_le_bytes([
+            key_len_bytes[0],
+            key_len_bytes[1],
+            key_len_bytes[2],
+            key_len_bytes[3],
+        ]) as usize;
+        position += 4;
+        let Some(key) = bytes.get(position..position + key_len) else {
+            break;
+        };
+        position += key_len;
+        let Some(value_len_bytes) = bytes.get(position..position + 4) else {
+            break;
+        };
+        let value_len = u32::from_le_bytes([
+            value_len_bytes[0],
+            value_len_bytes[1],
+            value_len_bytes[2],
+            value_len_bytes[3],
+        ]) as usize;
+        position += 4;
+        let Some(value) = bytes.get(position..position + value_len) else {
+            break;
+        };
+        position += value_len;
+        entries.push((
+            String::from_utf8_lossy(key).into_owned(),
+            String::from_utf8_lossy(value).into_owned(),
+        ));
+    }
+    entries
+}
+
+fn wic_exif_tag_name(tag: u16) -> Option<&'static str> {
+    Some(match tag {
+        271 => "Make",
+        272 => "Model",
+        274 => "Orientation",
+        305 => "Software",
+        306 => "DateTime",
+        315 => "Artist",
+        33432 => "Copyright",
+        36867 => "DateTimeOriginal",
+        36868 => "DateTimeDigitized",
+        _ => return None,
+    })
+}
+
+fn wic_metadata_normalize_name(name: &str) -> String {
+    let trimmed = name.trim_matches('\0').trim();
+    if let Some(start) = trimmed.rfind("{str=")
+        && let Some(end) = trimmed[start + 5..].find('}')
+    {
+        return trimmed[start + 5..start + 5 + end].to_string();
+    }
+    if let Some(start) = trimmed.rfind("{ushort=")
+        && let Some(end) = trimmed[start + 8..].find('}')
+        && let Ok(tag) = trimmed[start + 8..start + 8 + end].parse::<u16>()
+    {
+        return wic_exif_tag_name(tag)
+            .map(str::to_string)
+            .unwrap_or_else(|| tag.to_string());
+    }
+    trimmed.trim_start_matches('/').to_string()
+}
+
+fn wic_metadata_lookup(entries: &[(String, String)], name: &str) -> Option<String> {
+    if let Some((_, value)) = entries.iter().find(|(key, _)| key == name) {
+        return Some(value.clone());
+    }
+    let normalized = wic_metadata_normalize_name(name);
+    entries
+        .iter()
+        .find(|(key, _)| key == &normalized)
+        .map(|(_, value)| value.clone())
+}
+
+fn wic_png_chunks(bytes: &[u8], mut visit: impl FnMut(&[u8], &[u8])) {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return;
+    }
+    let mut position = 8_usize;
+    while position + 12 <= bytes.len() {
+        let length = u32::from_be_bytes([
+            bytes[position],
+            bytes[position + 1],
+            bytes[position + 2],
+            bytes[position + 3],
+        ]) as usize;
+        let Some(end) = position
+            .checked_add(12)
+            .and_then(|value| value.checked_add(length))
+        else {
+            break;
+        };
+        if end > bytes.len() {
+            break;
+        }
+        let kind = &bytes[position + 4..position + 8];
+        let data = &bytes[position + 8..position + 8 + length];
+        visit(kind, data);
+        if kind == b"IEND" {
+            break;
+        }
+        position = end;
+    }
+}
+
+fn wic_latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| char::from(*byte)).collect()
+}
+
+fn wic_png_inflate(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut inflater = flate2::read::ZlibDecoder::new(bytes);
+    let mut out = Vec::new();
+    inflater
+        .by_ref()
+        .take(16 * 1024 * 1024)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+fn wic_png_text_entries(bytes: &[u8]) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    wic_png_chunks(bytes, |kind, data| match kind {
+        b"tEXt" => {
+            let Some(split) = data.iter().position(|byte| *byte == 0) else {
+                return;
+            };
+            let key = wic_latin1(&data[..split]);
+            let value = wic_latin1(&data[split + 1..]);
+            if !key.is_empty() {
+                entries.push((key, value));
+            }
+        }
+        b"iTXt" => {
+            let Some(key_end) = data.iter().position(|byte| *byte == 0) else {
+                return;
+            };
+            let key = wic_latin1(&data[..key_end]);
+            let mut position = key_end + 1;
+            if position + 2 > data.len() {
+                return;
+            }
+            let compressed = data[position];
+            let method = data[position + 1];
+            position += 2;
+            let Some(language_end) = data[position..].iter().position(|byte| *byte == 0) else {
+                return;
+            };
+            position += language_end + 1;
+            let Some(translated_end) = data[position..].iter().position(|byte| *byte == 0) else {
+                return;
+            };
+            position += translated_end + 1;
+            let text = &data[position..];
+            let text = match (compressed, method) {
+                (0, _) => String::from_utf8_lossy(text).into_owned(),
+                (1, 0) => match wic_png_inflate(text) {
+                    Some(inflated) => String::from_utf8_lossy(&inflated).into_owned(),
+                    None => return,
+                },
+                _ => return,
+            };
+            if !key.is_empty() {
+                entries.push((key, text));
+            }
+        }
+        _ => {}
+    });
+    entries
+}
+
+fn wic_png_exif_chunk(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut exif = None;
+    wic_png_chunks(bytes, |kind, data| {
+        if kind == b"eXIf" && exif.is_none() {
+            exif = Some(data.to_vec());
+        }
+    });
+    exif
+}
+
+/// Locate the TIFF payload of the first APP1 Exif segment.
+fn wic_jpeg_exif(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return None;
+    }
+    let mut position = 2_usize;
+    while position + 4 <= bytes.len() {
+        if bytes[position] != 0xff {
+            return None;
+        }
+        while position < bytes.len() && bytes[position] == 0xff {
+            position += 1;
+        }
+        let marker = *bytes.get(position)?;
+        position += 1;
+        if marker == 0xd9 || marker == 0xda {
+            return None;
+        }
+        if marker == 0x01 || marker == 0xd8 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let length =
+            u16::from_be_bytes([*bytes.get(position)?, *bytes.get(position + 1)?]) as usize;
+        if length < 2 || position + length > bytes.len() {
+            return None;
+        }
+        let segment = &bytes[position + 2..position + length];
+        if marker == 0xe1 && segment.starts_with(b"Exif\0\0") {
+            return Some(&segment[6..]);
+        }
+        position += length;
+    }
+    None
+}
+
+fn wic_tiff_u16(bytes: &[u8], offset: usize, little: bool) -> Option<u16> {
+    let pair = bytes.get(offset..offset + 2)?;
+    Some(if little {
+        u16::from_le_bytes([pair[0], pair[1]])
+    } else {
+        u16::from_be_bytes([pair[0], pair[1]])
+    })
+}
+
+fn wic_tiff_u32(bytes: &[u8], offset: usize, little: bool) -> Option<u32> {
+    let quad = bytes.get(offset..offset + 4)?;
+    Some(if little {
+        u32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]])
+    } else {
+        u32::from_be_bytes([quad[0], quad[1], quad[2], quad[3]])
+    })
+}
+
+struct WicTiffEntry {
+    tag: u16,
+    kind: u16,
+    count: u32,
+    offset: usize,
+}
+
+fn wic_tiff_ifd(bytes: &[u8], offset: usize, little: bool) -> Option<(Vec<WicTiffEntry>, usize)> {
+    let count = wic_tiff_u16(bytes, offset, little)? as usize;
+    if count > 4096 {
+        return None;
+    }
+    let entries_start = offset + 2;
+    if entries_start + count * 12 + 4 > bytes.len() {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(count);
+    for index in 0..count {
+        let base = entries_start + index * 12;
+        entries.push(WicTiffEntry {
+            tag: wic_tiff_u16(bytes, base, little)?,
+            kind: wic_tiff_u16(bytes, base + 2, little)?,
+            count: wic_tiff_u32(bytes, base + 4, little)?,
+            offset: base,
+        });
+    }
+    let next = wic_tiff_u32(bytes, entries_start + count * 12, little)? as usize;
+    Some((entries, next))
+}
+
+fn wic_tiff_entry_data<'a>(
+    bytes: &'a [u8],
+    entry: &WicTiffEntry,
+    little: bool,
+) -> Option<&'a [u8]> {
+    let size = match entry.kind {
+        1 | 2 | 7 => 1_usize,
+        3 => 2,
+        4 | 9 => 4,
+        5 | 10 => 8,
+        _ => return None,
+    };
+    let total = size.checked_mul(entry.count as usize)?;
+    let offset = if total <= 4 {
+        entry.offset + 8
+    } else {
+        wic_tiff_u32(bytes, entry.offset + 8, little)? as usize
+    };
+    bytes.get(offset..offset.checked_add(total)?)
+}
+
+fn wic_tiff_entry_u32(bytes: &[u8], entry: &WicTiffEntry, little: bool) -> Option<u32> {
+    match entry.kind {
+        3 => Some(u32::from(wic_tiff_u16(bytes, entry.offset + 8, little)?)),
+        4 => wic_tiff_u32(bytes, entry.offset + 8, little),
+        _ => None,
+    }
+}
+
+fn wic_tiff_thumbnail(tiff: &[u8]) -> Option<Vec<u8>> {
+    if tiff.len() < 8 {
+        return None;
+    }
+    let little = match &tiff[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    if wic_tiff_u16(tiff, 2, little)? != 42 {
+        return None;
+    }
+    let ifd0 = wic_tiff_u32(tiff, 4, little)? as usize;
+    let (_, next_ifd) = wic_tiff_ifd(tiff, ifd0, little)?;
+    if next_ifd == 0 {
+        return None;
+    }
+    let (entries, _) = wic_tiff_ifd(tiff, next_ifd, little)?;
+    let mut offset = None;
+    let mut length = None;
+    for entry in &entries {
+        match entry.tag {
+            513 => offset = wic_tiff_entry_u32(tiff, entry, little),
+            514 => length = wic_tiff_entry_u32(tiff, entry, little),
+            _ => {}
+        }
+    }
+    let (offset, length) = (offset?, length?);
+    let start = offset as usize;
+    let end = start.checked_add(length as usize)?;
+    tiff.get(start..end).map(<[u8]>::to_vec)
+}
+
+fn wic_exif_metadata(bytes: &[u8]) -> (Vec<(String, String)>, Option<Vec<u8>>) {
+    let mut entries = Vec::new();
+    let Some(tiff) = wic_jpeg_exif(bytes) else {
+        return (entries, None);
+    };
+    if tiff.len() < 8 {
+        return (entries, None);
+    }
+    let little = match &tiff[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return (entries, None),
+    };
+    let magic = wic_tiff_u16(tiff, 2, little).unwrap_or(0);
+    if magic != 42 {
+        return (entries, None);
+    }
+    let Some(ifd0) = wic_tiff_u32(tiff, 4, little).map(|offset| offset as usize) else {
+        return (entries, None);
+    };
+    let Some((ifd0_entries, next_ifd)) = wic_tiff_ifd(tiff, ifd0, little) else {
+        return (entries, None);
+    };
+    for entry in &ifd0_entries {
+        let Some(name) = wic_exif_tag_name(entry.tag) else {
+            continue;
+        };
+        let Some(data) = wic_tiff_entry_data(tiff, entry, little) else {
+            continue;
+        };
+        if entry.kind == 2 {
+            let end = data
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(data.len());
+            entries.push((
+                name.to_string(),
+                String::from_utf8_lossy(&data[..end]).into_owned(),
+            ));
+        } else if let Some(value) = wic_tiff_entry_u32(tiff, entry, little) {
+            entries.push((name.to_string(), value.to_string()));
+        }
+    }
+    let mut thumbnail = None;
+    if next_ifd != 0 {
+        thumbnail = wic_tiff_thumbnail(tiff);
+    }
+    (entries, thumbnail)
+}
+
+fn wic_image_metadata_entries(bytes: &[u8], codec: u32) -> Vec<(String, String)> {
+    match codec {
+        1 => wic_png_text_entries(bytes),
+        2 => wic_exif_metadata(bytes).0,
+        _ => Vec::new(),
+    }
+}
+
+fn wic_image_thumbnail(bytes: &[u8], codec: u32) -> Option<Vec<u8>> {
+    match codec {
+        1 => wic_png_exif_chunk(bytes).and_then(|exif| wic_tiff_thumbnail(&exif)),
+        2 => wic_exif_metadata(bytes).1,
+        _ => None,
+    }
 }
 
 /// The effective (width, height) of a source-chain object: transformed
@@ -4698,6 +6280,9 @@ fn wic_decoder_methods() -> Vec<HostThunk> {
     methods.push(HostThunk::WicDecoderGetFrameCount);
     methods.push(HostThunk::WicDecoderGetFrame);
     methods.push(HostThunk::WicDecoderUnsupported);
+    methods.push(HostThunk::WicEncoderUnsupported);
+    methods.push(HostThunk::WicEncoderUnsupported);
+    methods.push(HostThunk::WicFrameEncodeUnsupported);
     methods
 }
 
@@ -4705,6 +6290,19 @@ fn wic_decoder_methods() -> Vec<HostThunk> {
 fn wic_frame_decode_methods() -> Vec<HostThunk> {
     let mut methods = unknown_preamble();
     wic_source_methods(&mut methods);
+    methods.push(HostThunk::WicDecoderUnsupported);
+    methods.push(HostThunk::WicEncoderUnsupported);
+    methods.push(HostThunk::WicFrameEncodeUnsupported);
+    methods
+}
+
+#[allow(dead_code)] // the metadata-query-reader vtable builder
+fn wic_metadata_reader_methods() -> Vec<HostThunk> {
+    let mut methods = unknown_preamble();
+    methods.push(HostThunk::WicSourceGetPixelFormat);
+    methods.push(HostThunk::WicGetMetadataContentSize);
+    methods.push(HostThunk::WicMatchMetadataContent);
+    methods.push(HostThunk::WicSerializeMetadataContent);
     methods
 }
 
@@ -6071,8 +7669,8 @@ mod tests {
                     HostThunk::WicFactoryCreateEncoder,
                     &[factory as u32, FORMAT as u32, ENCODER_OUT as u32]
                 ),
-                u64::from(WINCODEC_ERR_COMPONENTNOTFOUND),
-                "only the PNG encoder exists"
+                0,
+                "the JPEG encoder exists alongside PNG"
             );
             assert_eq!(
                 dispatch_x86(
@@ -6236,7 +7834,8 @@ mod tests {
             let stream = create_stream(&mut fixture, factory, &progressive);
             assert_eq!(
                 create_decoder_from_stream(&mut fixture, factory, stream).0,
-                u64::from(WINCODEC_ERR_UNSUPPORTEDOPERATION)
+                u64::from(WINCODEC_ERR_BADIMAGE),
+                "progressive JPEG without tables or scans"
             );
 
             // A valid decoder, then wrong-format accesses.
@@ -6331,5 +7930,789 @@ mod tests {
                 u64::from(WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT)
             );
         })
+    }
+
+    // ── Adversarial codec tests ────────────────────────────────────────────
+
+    const META_READER_OUT: u64 = 0x48_000;
+    const META_VALUE_OUT: u64 = 0x48_100;
+    const META_NAME: u64 = 0x49_000;
+    const THUMBNAIL_OUT: u64 = 0x4a_000;
+
+    fn build_png(
+        width: u32,
+        height: u32,
+        depth: u8,
+        color: u8,
+        interlace: u8,
+        extras: &[(&[u8; 4], Vec<u8>)],
+        raw: &[u8],
+    ) -> Vec<u8> {
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut header = Vec::with_capacity(13);
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&[depth, color, 0, 0, interlace]);
+        wic_png_chunk(&mut out, b"IHDR", &header);
+        for (kind, data) in extras {
+            wic_png_chunk(&mut out, kind, data);
+        }
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        wic_png_chunk(&mut out, b"IDAT", &compressed);
+        wic_png_chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    fn adam7_raw(width: usize, height: usize, value: impl Fn(usize, usize) -> u8) -> Vec<u8> {
+        const PASSES: [(usize, usize, usize, usize); 7] = [
+            (0, 0, 8, 8),
+            (4, 0, 8, 8),
+            (0, 4, 4, 8),
+            (2, 0, 4, 4),
+            (0, 2, 2, 4),
+            (1, 0, 2, 2),
+            (0, 1, 1, 2),
+        ];
+        let mut raw = Vec::new();
+        for &(start_x, start_y, step_x, step_y) in &PASSES {
+            if start_x >= width || start_y >= height {
+                continue;
+            }
+            let pass_width = (width - start_x).div_ceil(step_x);
+            let pass_height = (height - start_y).div_ceil(step_y);
+            for row in 0..pass_height {
+                raw.push(0);
+                for column in 0..pass_width {
+                    raw.push(value(start_x + column * step_x, start_y + row * step_y));
+                }
+            }
+        }
+        raw
+    }
+
+    fn png_text(keyword: &str, text: &str) -> Vec<u8> {
+        let mut data = keyword.as_bytes().to_vec();
+        data.push(0);
+        data.extend_from_slice(text.as_bytes());
+        data
+    }
+
+    fn png_itxt(keyword: &str, text: &str) -> Vec<u8> {
+        let mut data = keyword.as_bytes().to_vec();
+        data.push(0);
+        data.extend_from_slice(&[0, 0]);
+        data.push(0);
+        data.push(0);
+        data.extend_from_slice(text.as_bytes());
+        data
+    }
+
+    fn write_test_utf16(fixture: &mut Fixture, address: u64, text: &str) {
+        let mut bytes = Vec::new();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        fixture.memory.map_bytes(address, &bytes);
+    }
+
+    fn read_propvariant_string(fixture: &Fixture, address: u64) -> String {
+        assert_eq!(
+            read_guest_u16(&fixture.memory, address).unwrap(),
+            31,
+            "VT_LPWSTR"
+        );
+        let pointer = read_ptr(fixture, address + 8);
+        assert_ne!(pointer, 0);
+        read_utf16_string(&fixture.memory, pointer).unwrap()
+    }
+
+    fn metadata_reader_for(fixture: &mut Fixture, factory: u64, bytes: &[u8]) -> (u64, u64) {
+        let stream = create_stream(fixture, factory, bytes);
+        let (hr, decoder) = create_decoder_from_stream(fixture, factory, stream);
+        assert_eq!(hr, 0, "decoder creation");
+        fixture.memory.map_bytes(META_READER_OUT, &[0_u8; 8]);
+        assert_eq!(
+            dispatch_x86(
+                fixture,
+                HostThunk::WicDecoderUnsupported,
+                &[decoder as u32, META_READER_OUT as u32]
+            ),
+            0,
+            "GetMetadataQueryReader"
+        );
+        let reader = read_ptr(fixture, META_READER_OUT);
+        assert_ne!(reader, 0);
+        (decoder, reader)
+    }
+
+    fn metadata_query(fixture: &mut Fixture, reader: u64, name: &str) -> (u64, Option<String>) {
+        write_test_utf16(fixture, META_NAME, name);
+        fixture.memory.map_bytes(META_VALUE_OUT, &[0_u8; 24]);
+        let hr = dispatch_x86(
+            fixture,
+            HostThunk::WicGetMetadataContentSize,
+            &[reader as u32, META_NAME as u32, META_VALUE_OUT as u32],
+        );
+        let value = (hr == 0).then(|| read_propvariant_string(fixture, META_VALUE_OUT));
+        (hr, value)
+    }
+
+    fn exif_put_u16(out: &mut [u8], offset: usize, value: u16) {
+        out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn exif_put_u32(out: &mut [u8], offset: usize, value: u32) {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn exif_tiff(make: &str, model: &str, date: &str, thumbnail: &[u8]) -> Vec<u8> {
+        let ifd0_offset = 8_usize;
+        let ifd0_size = 2 + 3 * 12 + 4;
+        let strings_start = ifd0_offset + ifd0_size;
+        let make_offset = strings_start;
+        let model_offset = make_offset + make.len() + 1;
+        let date_offset = model_offset + model.len() + 1;
+        let ifd1_offset = date_offset + date.len() + 1;
+        let ifd1_size = 2 + 2 * 12 + 4;
+        let thumbnail_offset = ifd1_offset + ifd1_size;
+        let mut out = vec![0_u8; thumbnail_offset + thumbnail.len()];
+        out[..2].copy_from_slice(b"II");
+        exif_put_u16(&mut out, 2, 42);
+        exif_put_u32(&mut out, 4, ifd0_offset as u32);
+        exif_put_u16(&mut out, ifd0_offset, 3);
+        let entry = |index: usize| ifd0_offset + 2 + index * 12;
+        exif_put_u16(&mut out, entry(0), 271);
+        exif_put_u16(&mut out, entry(0) + 2, 2);
+        exif_put_u32(&mut out, entry(0) + 4, make.len() as u32 + 1);
+        exif_put_u32(&mut out, entry(0) + 8, make_offset as u32);
+        exif_put_u16(&mut out, entry(1), 272);
+        exif_put_u16(&mut out, entry(1) + 2, 2);
+        exif_put_u32(&mut out, entry(1) + 4, model.len() as u32 + 1);
+        exif_put_u32(&mut out, entry(1) + 8, model_offset as u32);
+        exif_put_u16(&mut out, entry(2), 306);
+        exif_put_u16(&mut out, entry(2) + 2, 2);
+        exif_put_u32(&mut out, entry(2) + 4, date.len() as u32 + 1);
+        exif_put_u32(&mut out, entry(2) + 8, date_offset as u32);
+        exif_put_u32(&mut out, ifd0_offset + 2 + 3 * 12, ifd1_offset as u32);
+        out[make_offset..make_offset + make.len()].copy_from_slice(make.as_bytes());
+        out[model_offset..model_offset + model.len()].copy_from_slice(model.as_bytes());
+        out[date_offset..date_offset + date.len()].copy_from_slice(date.as_bytes());
+        exif_put_u16(&mut out, ifd1_offset, 2);
+        exif_put_u16(&mut out, ifd1_offset + 2, 513);
+        exif_put_u16(&mut out, ifd1_offset + 4, 4);
+        exif_put_u32(&mut out, ifd1_offset + 6, 1);
+        exif_put_u32(&mut out, ifd1_offset + 10, thumbnail_offset as u32);
+        exif_put_u16(&mut out, ifd1_offset + 14, 514);
+        exif_put_u16(&mut out, ifd1_offset + 16, 4);
+        exif_put_u32(&mut out, ifd1_offset + 18, 1);
+        exif_put_u32(&mut out, ifd1_offset + 22, thumbnail.len() as u32);
+        out[thumbnail_offset..].copy_from_slice(thumbnail);
+        out
+    }
+
+    fn insert_exif(jpeg: &[u8], tiff: &[u8]) -> Vec<u8> {
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(tiff);
+        let mut segment = Vec::new();
+        wic_jpeg_push_segment(&mut segment, 0xe1, &payload);
+        let mut out = jpeg[..2].to_vec();
+        out.extend_from_slice(&segment);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    fn progressive_jpeg_fixture() -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8];
+        let mut quant = vec![0_u8];
+        quant.extend_from_slice(&[1_u8; 64]);
+        wic_jpeg_push_segment(&mut out, 0xdb, &quant);
+        wic_jpeg_push_segment(&mut out, 0xc2, &[8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+        let tables = WicJpegEncoderTables::build().expect("standard tables");
+        wic_jpeg_push_segment(
+            &mut out,
+            0xc4,
+            &wic_jpeg_huffman_payload(0, 0, &WIC_JPEG_DC_LUMA_COUNTS, &WIC_JPEG_DC_LUMA_SYMBOLS),
+        );
+        wic_jpeg_push_segment(
+            &mut out,
+            0xc4,
+            &wic_jpeg_huffman_payload(1, 0, &WIC_JPEG_AC_LUMA_COUNTS, &WIC_JPEG_AC_LUMA_SYMBOLS),
+        );
+        let mut writer = WicJpegBitWriter::new();
+        assert!(tables.dc_luma.write(3, &mut writer));
+        writer.write_bits(4, 3);
+        writer.flush();
+        wic_jpeg_push_segment(&mut out, 0xda, &[1, 1, 0, 0, 0, 0x01]);
+        out.extend_from_slice(&writer.out);
+        let mut writer = WicJpegBitWriter::new();
+        writer.write_bits(1, 1);
+        writer.flush();
+        wic_jpeg_push_segment(&mut out, 0xda, &[1, 1, 0, 0, 0, 0x10]);
+        out.extend_from_slice(&writer.out);
+        let mut writer = WicJpegBitWriter::new();
+        assert!(tables.ac_luma.write(0x01, &mut writer));
+        writer.write_bits(1, 1);
+        assert!(tables.ac_luma.write(0x00, &mut writer));
+        writer.flush();
+        wic_jpeg_push_segment(&mut out, 0xda, &[1, 1, 0, 1, 5, 0x01]);
+        out.extend_from_slice(&writer.out);
+        let mut writer = WicJpegBitWriter::new();
+        assert!(tables.ac_luma.write(0x00, &mut writer));
+        writer.write_bits(1, 1);
+        writer.flush();
+        wic_jpeg_push_segment(&mut out, 0xda, &[1, 1, 0, 1, 5, 0x10]);
+        out.extend_from_slice(&writer.out);
+        out.extend_from_slice(&[0xff, 0xd9]);
+        out
+    }
+
+    fn progressive_restart_fixture() -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8];
+        let mut quant = vec![0_u8];
+        quant.extend_from_slice(&[1_u8; 64]);
+        wic_jpeg_push_segment(&mut out, 0xdb, &quant);
+        wic_jpeg_push_segment(&mut out, 0xc2, &[8, 0, 8, 0, 16, 1, 1, 0x11, 0]);
+        let tables = WicJpegEncoderTables::build().expect("standard tables");
+        wic_jpeg_push_segment(
+            &mut out,
+            0xc4,
+            &wic_jpeg_huffman_payload(0, 0, &WIC_JPEG_DC_LUMA_COUNTS, &WIC_JPEG_DC_LUMA_SYMBOLS),
+        );
+        wic_jpeg_push_segment(
+            &mut out,
+            0xc4,
+            &wic_jpeg_huffman_payload(1, 0, &WIC_JPEG_AC_LUMA_COUNTS, &WIC_JPEG_AC_LUMA_SYMBOLS),
+        );
+        wic_jpeg_push_segment(&mut out, 0xdd, &[0, 1]);
+        wic_jpeg_push_segment(&mut out, 0xda, &[1, 1, 0, 0, 0, 0]);
+        let mut writer = WicJpegBitWriter::new();
+        assert!(tables.dc_luma.write(3, &mut writer));
+        writer.write_bits(4, 3);
+        writer.flush();
+        out.extend_from_slice(&writer.out);
+        out.extend_from_slice(&[0xff, 0xd0]);
+        let mut writer = WicJpegBitWriter::new();
+        assert!(tables.dc_luma.write(0, &mut writer));
+        writer.flush();
+        out.extend_from_slice(&writer.out);
+        wic_jpeg_push_segment(&mut out, 0xda, &[1, 1, 0, 1, 63, 0]);
+        let mut writer = WicJpegBitWriter::new();
+        assert!(tables.ac_luma.write(0, &mut writer));
+        writer.flush();
+        out.extend_from_slice(&writer.out);
+        out.extend_from_slice(&[0xff, 0xd0]);
+        let mut writer = WicJpegBitWriter::new();
+        assert!(tables.ac_luma.write(0, &mut writer));
+        writer.flush();
+        out.extend_from_slice(&writer.out);
+        out.extend_from_slice(&[0xff, 0xd9]);
+        out
+    }
+
+    fn jpeg_psnr(source: &[u8], decoded: &[u8], pixels: usize) -> f64 {
+        let mut error = 0_f64;
+        for index in 0..pixels {
+            for channel in 0..3 {
+                let difference = f64::from(source[index * 4 + channel])
+                    - f64::from(decoded[index * 4 + channel]);
+                error += difference * difference;
+            }
+        }
+        let mse = error / (pixels as f64 * 3.0);
+        if mse == 0.0 {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0_f64 * 255.0 / mse).log10()
+    }
+
+    #[test]
+    fn png_palette_trns_and_low_bit_depth_pixels() {
+        let palette = vec![255, 0, 0, 0, 255, 0, 0, 0, 255];
+        let png = build_png(
+            4,
+            1,
+            8,
+            3,
+            0,
+            &[(b"PLTE", palette), (b"tRNS", vec![0, 128])],
+            &[0, 0, 1, 2, 1],
+        );
+        let image = wic_decode_png(&png).expect("palette PNG");
+        assert_eq!(image.width, 4);
+        assert_eq!(
+            &image.pixels[..],
+            &[0, 0, 255, 0, 0, 255, 0, 128, 255, 0, 0, 255, 0, 255, 0, 128],
+            "palette colors with tRNS alpha"
+        );
+
+        let gray2 = build_png(4, 1, 2, 0, 0, &[], &[0, 0b0001_1011]);
+        let image = wic_decode_png(&gray2).expect("2-bit gray PNG");
+        assert_eq!(
+            image
+                .pixels
+                .chunks_exact(4)
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>(),
+            vec![0, 85, 170, 255],
+            "2-bit gray unpacking and scaling"
+        );
+
+        let gray4 = build_png(4, 1, 4, 0, 0, &[], &[0, 0x01, 0x23]);
+        let image = wic_decode_png(&gray4).expect("4-bit gray PNG");
+        assert_eq!(
+            image
+                .pixels
+                .chunks_exact(4)
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>(),
+            vec![0, 17, 34, 51],
+            "4-bit gray unpacking and scaling"
+        );
+
+        let gray1 = build_png(8, 1, 1, 0, 0, &[], &[0, 0b1010_1010]);
+        let image = wic_decode_png(&gray1).expect("1-bit gray PNG");
+        assert_eq!(
+            image
+                .pixels
+                .chunks_exact(4)
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>(),
+            vec![255, 0, 255, 0, 255, 0, 255, 0],
+            "1-bit gray unpacking"
+        );
+    }
+
+    #[test]
+    fn png_16_bit_samples_downsample_by_high_byte() {
+        let rgb = build_png(
+            2,
+            1,
+            16,
+            2,
+            0,
+            &[],
+            &[
+                0, 0x12, 0x34, 0xab, 0xcd, 0x00, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x01,
+            ],
+        );
+        let image = wic_decode_png(&rgb).expect("16-bit RGB PNG");
+        assert_eq!(
+            &image.pixels[..],
+            &[0x00, 0xab, 0x12, 255, 0x00, 0x80, 0xff, 255],
+            "16-bit RGB downsamples with correct scaling"
+        );
+
+        let gray = build_png(2, 1, 16, 0, 0, &[], &[0, 0x12, 0x34, 0xab, 0xcd]);
+        let image = wic_decode_png(&gray).expect("16-bit gray PNG");
+        assert_eq!(
+            &image.pixels[..],
+            &[0x12, 0x12, 0x12, 255, 0xab, 0xab, 0xab, 255]
+        );
+    }
+
+    #[test]
+    fn png_adam7_interlaced_pixels() {
+        let raw = adam7_raw(5, 5, |x, y| (x as u8) * 40 + y as u8 * 3);
+        let png = build_png(5, 5, 8, 0, 1, &[], &raw);
+        let image = wic_decode_png(&png).expect("Adam7 PNG");
+        for y in 0..5 {
+            for x in 0..5 {
+                let expected = (x as u8) * 40 + y as u8 * 3;
+                let pixel = &image.pixels[(y * 5 + x) * 4..(y * 5 + x) * 4 + 4];
+                assert_eq!(pixel, &[expected, expected, expected, 255], "pixel {x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn png_unknown_critical_chunk_and_bad_palette_index_are_rejected() {
+        let critical = build_png(1, 1, 8, 0, 0, &[(b"CRIT", Vec::new())], &[0, 7]);
+        assert_eq!(
+            wic_decode_png(&critical).unwrap_err(),
+            WINCODEC_ERR_UNSUPPORTEDOPERATION
+        );
+        let bad_index = build_png(1, 1, 8, 3, 0, &[(b"PLTE", vec![1, 2, 3])], &[0, 5]);
+        assert_eq!(
+            wic_decode_png(&bad_index).unwrap_err(),
+            WINCODEC_ERR_BADIMAGE
+        );
+    }
+
+    #[test]
+    fn progressive_jpeg_spectral_and_successive_approximation() {
+        let jpeg = progressive_jpeg_fixture();
+        let image = wic_decode_jpeg(&jpeg).expect("progressive JPEG");
+        let mut cosine = [[0_f32; 8]; 8];
+        for (x, row) in cosine.iter_mut().enumerate() {
+            for (u, value) in row.iter_mut().enumerate() {
+                let scale = if u == 0 {
+                    std::f32::consts::FRAC_1_SQRT_2
+                } else {
+                    1.0
+                };
+                *value = 0.5
+                    * scale
+                    * (((2 * x + 1) as f32 * u as f32 * std::f32::consts::PI) / 16.0).cos();
+            }
+        }
+        let mut coefficients = [0_i32; 64];
+        coefficients[0] = 9;
+        coefficients[1] = 3;
+        let mut expected = [0_u8; 64];
+        wic_jpeg_idct(&coefficients, &cosine, &mut expected);
+        for (index, value) in expected.iter().enumerate() {
+            assert_eq!(
+                &image.pixels[index * 4..index * 4 + 4],
+                &[*value, *value, *value, 255],
+                "progressive pixel {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn progressive_jpeg_restart_markers_across_scans() {
+        let jpeg = progressive_restart_fixture();
+        let image = wic_decode_jpeg(&jpeg).expect("progressive restart JPEG");
+        for y in 0..8 {
+            for x in 0..16 {
+                let expected = if x < 8 { 129 } else { 128 };
+                let pixel = &image.pixels[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4];
+                assert_eq!(pixel, &[expected, expected, expected, 255], "pixel {x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn jpeg_422_and_444_sampling_decode() {
+        let mut bgra = vec![0_u8; 32 * 8 * 4];
+        for y in 0..8 {
+            for x in 0..32 {
+                let index = (y * 32 + x) * 4;
+                if x < 16 {
+                    bgra[index..index + 4].copy_from_slice(&[0, 0, 255, 255]);
+                } else {
+                    bgra[index..index + 4].copy_from_slice(&[255, 0, 0, 255]);
+                }
+            }
+        }
+        let jpeg = wic_encode_jpeg_sampled(32, 8, &bgra, None, (2, 1)).expect("4:2:2 encode");
+        let image = wic_decode_jpeg(&jpeg).expect("4:2:2 decode");
+        for y in 0..8 {
+            for x in [3_usize, 4, 27, 28] {
+                let index = (y * 32 + x) * 4;
+                if x < 16 {
+                    assert!(image.pixels[index + 2] > 200, "red region {x},{y}");
+                    assert!(image.pixels[index] < 60, "red region blue {x},{y}");
+                } else {
+                    assert!(image.pixels[index] > 200, "blue region {x},{y}");
+                    assert!(image.pixels[index + 2] < 60, "blue region red {x},{y}");
+                }
+            }
+        }
+
+        let solid = [30_u8, 60, 90, 255].repeat(8 * 8);
+        let jpeg = wic_encode_jpeg_sampled(8, 8, &solid, None, (1, 1)).expect("4:4:4 encode");
+        let image = wic_decode_jpeg(&jpeg).expect("4:4:4 decode");
+        for pixel in image.pixels.chunks_exact(4) {
+            assert!((i32::from(pixel[0]) - 30).abs() <= 6);
+            assert!((i32::from(pixel[1]) - 60).abs() <= 6);
+            assert!((i32::from(pixel[2]) - 90).abs() <= 6);
+        }
+    }
+
+    #[test]
+    fn jpeg_encoder_round_trip_psnr_and_com_surface() {
+        let width = 32_u32;
+        let height = 24_u32;
+        let mut bgra = vec![0_u8; width as usize * height as usize * 4];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let index = (y * width as usize + x) * 4;
+                let red = (x * 255 / (width as usize - 1)) as u8;
+                let green = (y * 255 / (height as usize - 1)) as u8;
+                let blue = ((x + y) * 255 / (width as usize + height as usize - 2)) as u8;
+                bgra[index..index + 4].copy_from_slice(&[blue, green, red, 255]);
+            }
+        }
+        let jpeg = wic_encode_jpeg(width, height, &bgra, None).expect("JPEG encode");
+        assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+        assert!(jpeg.windows(2).any(|window| window == [0xff, 0xc0]));
+        let image = wic_decode_jpeg(&jpeg).expect("JPEG decode");
+        assert_eq!((image.width, image.height), (width, height));
+        let psnr = jpeg_psnr(&bgra, &image.pixels, width as usize * height as usize);
+        assert!(psnr > 30.0, "round-trip PSNR {psnr}");
+
+        with_big_stack(move || {
+            let mut fixture = x86_fixture("wic-jpeg-encode-com");
+            let factory = create_factory(&mut fixture);
+            fixture.memory.map_bytes(STREAM_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFactoryCreateStream,
+                    &[factory as u32, STREAM_OUT as u32]
+                ),
+                0
+            );
+            let stream = read_ptr(&fixture, STREAM_OUT);
+            fixture
+                .memory
+                .map_bytes(FORMAT, &GUID_CONTAINER_FORMAT_JPEG);
+            fixture.memory.map_bytes(ENCODER_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFactoryCreateEncoder,
+                    &[factory as u32, FORMAT as u32, ENCODER_OUT as u32]
+                ),
+                0
+            );
+            let encoder = read_ptr(&fixture, ENCODER_OUT);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicEncoderInitialize,
+                    &[encoder as u32, stream as u32, 0]
+                ),
+                0
+            );
+            fixture.memory.map_bytes(FRAME_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicEncoderCreateNewFrame,
+                    &[encoder as u32, FRAME_OUT as u32, 0]
+                ),
+                0
+            );
+            let frame = read_ptr(&fixture, FRAME_OUT);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeSetSize,
+                    &[frame as u32, width, height]
+                ),
+                0
+            );
+            fixture
+                .memory
+                .map_bytes(FORMAT, &GUID_PIXEL_FORMAT_32BPP_BGRA);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeSetPixelFormat,
+                    &[frame as u32, FORMAT as u32]
+                ),
+                0
+            );
+            fixture.memory.map_bytes(ENCODE_BYTES, &bgra);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeWritePixels,
+                    &[
+                        frame as u32,
+                        height,
+                        width * 4,
+                        bgra.len() as u32,
+                        ENCODE_BYTES as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeCommit,
+                    &[frame as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86(&mut fixture, HostThunk::WicEncoderCommit, &[encoder as u32]),
+                0
+            );
+            let encoded = fixture
+                .runtime
+                .wic
+                .objects
+                .get(&stream)
+                .expect("encoded stream")
+                .stream
+                .clone();
+            assert!(encoded.starts_with(&[0xff, 0xd8]));
+            assert!(encoded.windows(2).any(|window| window == [0xff, 0xc0]));
+            let decoded = wic_decode_jpeg(&encoded).expect("COM JPEG decodes");
+            let psnr = jpeg_psnr(&bgra, &decoded.pixels, width as usize * height as usize);
+            assert!(psnr > 28.0, "COM JPEG PSNR {psnr}");
+        });
+    }
+
+    #[test]
+    fn metadata_readers_expose_png_text_and_exif_tags() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-metadata-png");
+            let factory = create_factory(&mut fixture);
+            let png = build_png(
+                2,
+                2,
+                8,
+                6,
+                0,
+                &[
+                    (b"tEXt", png_text("Author", "Casa")),
+                    (b"iTXt", png_itxt("Comment", "wave-eight")),
+                ],
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 2, 3, 4, 5, 6, 7, 8, 9],
+            );
+            let (_, reader) = metadata_reader_for(&mut fixture, factory, &png);
+            fixture.memory.map_bytes(CONTAINER_OUT, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceGetPixelFormat,
+                    &[reader as u32, CONTAINER_OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                fixture.memory.read_bytes(CONTAINER_OUT, 16).unwrap(),
+                GUID_CONTAINER_FORMAT_PNG
+            );
+            assert_eq!(
+                metadata_query(&mut fixture, reader, "Author"),
+                (0, Some("Casa".to_string()))
+            );
+            assert_eq!(
+                metadata_query(&mut fixture, reader, "/tEXt/{str=Comment}"),
+                (0, Some("wave-eight".to_string()))
+            );
+            assert_eq!(
+                metadata_query(&mut fixture, reader, "Missing"),
+                (u64::from(WINCODEC_ERR_PROPERTYNOTFOUND), None)
+            );
+        });
+
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-metadata-jpeg");
+            let factory = create_factory(&mut fixture);
+            let thumbnail = wic_encode_jpeg(4, 4, &[10_u8, 20, 30, 255].repeat(16), None)
+                .expect("thumbnail encode");
+            let tiff = exif_tiff("CasaCam", "Model X", "2026:10:20 12:34:56", &thumbnail);
+            let main =
+                wic_encode_jpeg(8, 8, &[40_u8, 50, 60, 255].repeat(64), None).expect("main encode");
+            let jpeg = insert_exif(&main, &tiff);
+            let (decoder, reader) = metadata_reader_for(&mut fixture, factory, &jpeg);
+            assert_eq!(
+                metadata_query(&mut fixture, reader, "Make"),
+                (0, Some("CasaCam".to_string()))
+            );
+            assert_eq!(
+                metadata_query(&mut fixture, reader, "Model"),
+                (0, Some("Model X".to_string()))
+            );
+            assert_eq!(
+                metadata_query(&mut fixture, reader, "DateTime"),
+                (0, Some("2026:10:20 12:34:56".to_string()))
+            );
+            assert_eq!(
+                metadata_query(&mut fixture, reader, "/app1/ifd/{ushort=271}"),
+                (0, Some("CasaCam".to_string()))
+            );
+
+            let frame = decode_first_frame(&mut fixture, decoder);
+            fixture.memory.map_bytes(THUMBNAIL_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeUnsupported,
+                    &[frame as u32, THUMBNAIL_OUT as u32]
+                ),
+                0,
+                "embedded EXIF thumbnail"
+            );
+            let thumbnail_bitmap = read_ptr(&fixture, THUMBNAIL_OUT);
+            assert_ne!(thumbnail_bitmap, 0);
+            fixture.memory.map_bytes(LOCK_SIZE_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceGetSize,
+                    &[
+                        thumbnail_bitmap as u32,
+                        LOCK_SIZE_OUT as u32,
+                        (LOCK_SIZE_OUT + 4) as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&fixture.memory, LOCK_SIZE_OUT).unwrap(), 4);
+            assert_eq!(
+                read_guest_u32(&fixture.memory, LOCK_SIZE_OUT + 4).unwrap(),
+                4
+            );
+        });
+    }
+
+    #[test]
+    fn absent_metadata_and_thumbnail_use_documented_errors() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-metadata-absent");
+            let factory = create_factory(&mut fixture);
+            let png = build_png(1, 1, 8, 0, 0, &[], &[0, 128]);
+            let (decoder, reader) = metadata_reader_for(&mut fixture, factory, &png);
+            assert_eq!(
+                metadata_query(&mut fixture, reader, "Make"),
+                (u64::from(WINCODEC_ERR_PROPERTYNOTFOUND), None)
+            );
+            let frame = decode_first_frame(&mut fixture, decoder);
+            fixture.memory.map_bytes(THUMBNAIL_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeUnsupported,
+                    &[frame as u32, THUMBNAIL_OUT as u32]
+                ),
+                u64::from(WIC_E_CODECNOTHANDLED)
+            );
+            assert_eq!(read_ptr(&fixture, THUMBNAIL_OUT), 0);
+        });
+    }
+
+    #[test]
+    fn cmyk_ycck_and_malformed_streams_rejected() {
+        let mut cmyk = vec![0xff, 0xd8];
+        wic_jpeg_push_segment(
+            &mut cmyk,
+            0xc0,
+            &[
+                8, 0, 1, 0, 1, 4, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0, 4, 0x11, 0,
+            ],
+        );
+        cmyk.extend_from_slice(&[0xff, 0xd9]);
+        assert_eq!(
+            wic_decode_jpeg(&cmyk).unwrap_err(),
+            WINCODEC_ERR_UNSUPPORTEDOPERATION
+        );
+
+        let mut ycck = vec![0xff, 0xd8];
+        let mut adobe = b"Adobe".to_vec();
+        adobe.extend_from_slice(&[0, 100, 0, 0, 0, 0, 2]);
+        wic_jpeg_push_segment(&mut ycck, 0xee, &adobe);
+        ycck.extend_from_slice(&[0xff, 0xd9]);
+        assert_eq!(
+            wic_decode_jpeg(&ycck).unwrap_err(),
+            WINCODEC_ERR_UNSUPPORTEDOPERATION
+        );
+
+        let truncated = &progressive_jpeg_fixture()[..40];
+        assert_eq!(
+            wic_decode_jpeg(truncated).unwrap_err(),
+            WINCODEC_ERR_BADIMAGE
+        );
     }
 }
