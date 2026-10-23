@@ -84,9 +84,11 @@
 //!   real outcome is reported by the backend and the client-side contract is
 //!   enforced exactly as before.  What the host cannot provide is documented
 //!   honestly: non-default devices use the client-side contract (hog mode is
-//!   applied to the default output device), the negotiated hardware period
-//!   may be coarser than the requested `hnsPeriodicity`, and
-//!   offload/bitstream exclusivity is not backed.
+//!   applied per output device, the negotiated hardware period may be coarser
+//!   than the requested `hnsPeriodicity`, and offload/bitstream requests are
+//!   rejected with `AUDCLNT_E_NONOFFLOAD_MODE_ONLY` /
+//!   `AUDCLNT_E_RAW_MODE_UNSUPPORTED` because no backed host exposes a real
+//!   offload engine (see [`host_offload_capability`]).
 //! - Every activation outcome carries a real HRESULT: `S_OK` with the
 //!   activated endpoint object, `AUDCLNT_E_DEVICE_INVALIDATED` when the real
 //!   device list is genuinely empty or the requested endpoint does not exist,
@@ -102,6 +104,8 @@ use crate::audio::{SampleFormat, WaveFormat};
 use crate::real_audio::{RealAudioBackend, RealAudioDevice};
 use crate::runtime::HostThunk;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
@@ -175,6 +179,19 @@ pub const AUDCLNT_E_BUFFER_SIZE_ERROR: u32 = 0x8889_0016;
 pub const AUDCLNT_E_INVALID_DEVICE_PERIOD: u32 = 0x8889_0020;
 /// `AUDCLNT_E_INVALID_STREAM_FLAG` `AUDCLNT_ERR(0x021)`.
 pub const AUDCLNT_E_INVALID_STREAM_FLAG: u32 = 0x8889_0021;
+/// `AUDCLNT_E_OFFLOAD_MODE_ONLY` `AUDCLNT_ERR(0x025)` — the endpoint only
+/// supports hardware-offloaded streams.
+pub const AUDCLNT_E_OFFLOAD_MODE_ONLY: u32 = 0x8889_0025;
+/// `AUDCLNT_E_NONOFFLOAD_MODE_ONLY` `AUDCLNT_ERR(0x026)` — the endpoint (or
+/// the host audio engine behind it) supports non-offloaded streams only.
+/// This is the exact rejection for an offload request the host cannot back.
+pub const AUDCLNT_E_NONOFFLOAD_MODE_ONLY: u32 = 0x8889_0026;
+/// `AUDCLNT_E_RAW_MODE_UNSUPPORTED` `AUDCLNT_ERR(0x029)` — the audio engine
+/// cannot pass a raw (bitstream) stream through this endpoint.
+pub const AUDCLNT_E_RAW_MODE_UNSUPPORTED: u32 = 0x8889_0029;
+
+/// `AUDCLNT_STREAMOPTIONS_RAW` — the client asks for a bitstream/raw stream.
+pub const AUDCLNT_STREAMOPTIONS_RAW: u32 = 0x0000_0001;
 
 /// `AUDCLNT_S_BUFFER_EMPTY` `AUDCLNT_SUCCESS(0x001)` — no captured packet is
 /// available to read.
@@ -904,29 +921,46 @@ fn loopback_reset_cursor(pid: u32, key: &str) -> u64 {
 // to zero before the host stream is stopped, and stale callback frames from a
 // torn-down tap are rejected.
 
-/// Loopback clients currently holding the real system-output capture open.
+/// Loopback clients currently holding a real system-output capture open
+/// (all devices).
 static SYSTEM_LOOPBACK_USERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether the real system-output capture is currently in use.
-fn system_loopback_in_use() -> bool {
-    SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst) > 0
+/// Loopback clients per device key.  Each named render endpoint owns its own
+/// host capture, so releasing the last client of one device never stops
+/// another device's tap.
+static SYSTEM_LOOPBACK_DEVICE_USERS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn system_loopback_device_users() -> MutexGuard<'static, HashMap<String, usize>> {
+    SYSTEM_LOOPBACK_DEVICE_USERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Take a reference on the real system-output capture, starting it for the
-/// first user.  Returns `false` when the host cannot provide it; the caller
-/// then keeps the internal render-history fallback.
-fn acquire_system_loopback() -> bool {
-    if SYSTEM_LOOPBACK_USERS.fetch_add(1, Ordering::SeqCst) > 0 {
+/// Take a reference on the system-output capture of `device`, starting the
+/// device's tap/aggregate for its first user.  Returns `false` when the host
+/// cannot provide the capture for this endpoint; the caller then keeps this
+/// endpoint's render-history fallback (never another device's capture).
+fn acquire_system_loopback_for(device: &RealAudioDevice) -> bool {
+    let key = device.key.as_str();
+    SYSTEM_LOOPBACK_USERS.fetch_add(1, Ordering::SeqCst);
+    let first_for_device = {
+        let mut users = system_loopback_device_users();
+        let count = users.entry(key.to_string()).or_insert(0);
+        *count += 1;
+        *count == 1
+    };
+    if !first_for_device {
         return true;
     }
     let started = (|| {
         let mut guard = audio_client_backend();
         let backend = ensure_audio_client_backend(&mut guard)?;
-        match backend.start_system_loopback() {
+        match backend.start_system_loopback_for_device(device) {
             Ok(_) => Some(()),
             Err(error) => {
                 eprintln!(
-                    "[RealAudio] system loopback unavailable, using render history: {error:?}"
+                    "[RealAudio] system loopback unavailable for {key:?}, using render history: {error:?}"
                 );
                 None
             }
@@ -935,18 +969,36 @@ fn acquire_system_loopback() -> bool {
     if started.is_some() {
         true
     } else {
+        // The first user's failed start is the only way here, so the per-device
+        // entry must be removed (not merely decremented).
+        system_loopback_device_users().remove(key);
         SYSTEM_LOOPBACK_USERS.fetch_sub(1, Ordering::SeqCst);
         false
     }
 }
 
-/// Drop a reference on the real system-output capture, stopping it when the
-/// last loopback client releases it.
-fn release_system_loopback_reference() {
-    if SYSTEM_LOOPBACK_USERS.fetch_sub(1, Ordering::SeqCst) == 1 {
+/// Drop a reference on one device's system-output capture, stopping its host
+/// session when the last loopback client releases it.
+fn release_system_loopback_reference_for(key: &str) {
+    let last_for_device = {
+        let mut users = system_loopback_device_users();
+        if let Some(count) = users.get_mut(key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                users.remove(key);
+                true
+            } else {
+                false
+            }
+        } else {
+            false // coverage: unreachable — every release mirrors an acquire
+        }
+    };
+    SYSTEM_LOOPBACK_USERS.fetch_sub(1, Ordering::SeqCst);
+    if last_for_device {
         let mut guard = audio_client_backend();
         if let Some(backend) = guard.as_mut() {
-            backend.stop_system_loopback();
+            backend.stop_system_loopback_for(key);
         }
     }
 }
@@ -961,14 +1013,16 @@ fn system_loopback_available_for(state: &AudioClientState, capture_in_use: bool)
     let Some(backend) = guard.as_mut() else {
         return 0;
     };
-    if !backend.system_loopback_running() {
+    if !backend.system_loopback_running_for(&state.device.key) {
         return 0;
     }
-    let (_, source_rate) = backend.system_loopback_format().unwrap_or((
-        state.device.channels.max(1),
-        state.device.sample_rate.max(1),
-    ));
-    let source_frames = backend.system_loopback_available_frames() as u64;
+    let (_, source_rate) = backend
+        .system_loopback_format_for(&state.device.key)
+        .unwrap_or((
+            state.device.channels.max(1),
+            state.device.sample_rate.max(1),
+        ));
+    let source_frames = backend.system_loopback_available_frames_for(&state.device.key) as u64;
     let capture_rate = state
         .format
         .as_ref()
@@ -1664,6 +1718,10 @@ pub struct AudioClientState {
     pub client_category: u32,
     /// The `IAudioClient2::SetClientProperties` offload request.
     pub client_offload_requested: bool,
+    /// The `IAudioClient2::SetClientProperties` raw/bitstream request
+    /// (`AUDCLNT_STREAMOPTIONS_RAW`).  Rejected by the host, so an accepted
+    /// client always has this `false`.
+    pub client_raw_requested: bool,
     // ── Session (ISimpleAudioVolume / IAudioStreamVolume / session) state ──
     /// Session master volume (0.0..=1.0), applied to pushed output samples.
     pub session_volume: f32,
@@ -1756,7 +1814,7 @@ impl AudioClientState {
     /// as silence (`AUDCLNT_BUFFERFLAGS_SILENT`).
     fn capture_next_packet_frames(&self, pid: u32, now: Instant) -> u32 {
         if self.loopback {
-            if system_loopback_in_use() {
+            if self.system_loopback_held {
                 // Real system-output frames take priority.  With a running
                 // tap and no audio flowing, the capture clock paces silent
                 // packets instead of waiting for this runtime's render side.
@@ -2028,6 +2086,7 @@ pub(crate) fn register_audio_client_direction(
             capture_service_object: 0,
             client_category: 0,
             client_offload_requested: false,
+            client_raw_requested: false,
             session_volume: 1.0,
             session_muted: false,
             channel_volumes: Vec::new(),
@@ -2124,8 +2183,8 @@ pub(crate) fn release_audio_object(pid: u32, object: u64) {
             backend.stop_input_stream();
         }
     }
-    if stop_system_loopback {
-        release_system_loopback_reference();
+    if stop_system_loopback && let Some(state) = removed.as_ref() {
+        release_system_loopback_reference_for(&state.device.key);
     }
 }
 
@@ -2196,6 +2255,9 @@ pub(crate) struct AudioClientTestSnapshot {
     pub capture_outstanding_frames: u32,
     pub capture_input_active: bool,
     pub system_loopback_held: bool,
+    pub client_category: u32,
+    pub client_offload_requested: bool,
+    pub client_raw_requested: bool,
     pub loopback: bool,
     pub loopback_cursor: u64,
 }
@@ -2228,6 +2290,9 @@ pub(crate) fn test_client_snapshot(pid: u32, object: u64) -> Option<AudioClientT
             capture_outstanding_frames: state.capture_outstanding_frames,
             capture_input_active: state.capture_input_active,
             system_loopback_held: state.system_loopback_held,
+            client_category: state.client_category,
+            client_offload_requested: state.client_offload_requested,
+            client_raw_requested: state.client_raw_requested,
             loopback: state.loopback,
             loopback_cursor: state.loopback_cursor,
         })
@@ -2585,18 +2650,83 @@ pub(crate) fn get_device_period(pid: u32, object: u64) -> Result<(u64, u64), u32
     })
 }
 
-/// `IAudioClient2::SetClientProperties(pProperties)` — store the real client
-/// properties.  The host has no offload engine, so an offload request is
-/// recorded (and answered honestly by `IsOffloadCapable`).
+/// Whether the real host exposes a hardware offload/bitstream engine.
+///
+/// # Hardware boundary
+///
+/// The host stack is cpal/CoreAudio (and cpal/WASAPI on Windows).  Neither host
+/// API surfaces an offload-capable endpoint or a compressed/bitstream endpoint
+/// through the interfaces this runtime uses, so there is no real offload engine
+/// to wire.  Requests are therefore rejected with the documented WASAPI
+/// statuses below instead of being silently accepted.  When a host probe can
+/// prove offload support, this function is the single place to return `true`;
+/// `SetClientProperties` then records the request and `IsOffloadCapable`
+/// answers truthfully.
+pub(crate) fn host_offload_capability() -> bool {
+    #[cfg(test)]
+    {
+        TEST_HOST_OFFLOAD_CAPABILITY.load(Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Simulate a host that really exposes an offload engine (test wiring for the
+/// capability branch; the production hosts above always answer `false`).
+#[cfg(test)]
+static TEST_HOST_OFFLOAD_CAPABILITY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn set_test_host_offload_capability(capable: bool) {
+    TEST_HOST_OFFLOAD_CAPABILITY.store(capable, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+struct HostOffloadCapabilityGuard;
+
+#[cfg(test)]
+impl Drop for HostOffloadCapabilityGuard {
+    fn drop(&mut self) {
+        TEST_HOST_OFFLOAD_CAPABILITY.store(false, Ordering::SeqCst);
+    }
+}
+
+/// `IAudioClient2::SetClientProperties(pProperties)` — validate and store the
+/// real client properties.
+///
+/// A raw/bitstream request (`AUDCLNT_STREAMOPTIONS_RAW`) is rejected with
+/// `AUDCLNT_E_RAW_MODE_UNSUPPORTED` before any state is changed.  An offload
+/// request is rejected with `AUDCLNT_E_NONOFFLOAD_MODE_ONLY` unless the host
+/// really exposes an offload engine (it does not on the backed hosts), so a
+/// client can never believe an offload stream was accepted.  The raw error
+/// takes precedence when both are requested because it is the narrower
+/// capability.
 pub(crate) fn set_client_properties(
     pid: u32,
     object: u64,
     category: u32,
     offload_requested: bool,
+    raw_requested: bool,
 ) -> u32 {
+    if raw_requested || (offload_requested && !host_offload_capability()) {
+        // The endpoint must exist before its property request is judged; an
+        // unbound object is still a device error, exactly like the accepted
+        // property path.
+        if let Err(hr) = with_client_state(pid, object, "SetClientProperties", |_| Ok(())) {
+            return hr;
+        }
+        return if raw_requested {
+            AUDCLNT_E_RAW_MODE_UNSUPPORTED
+        } else {
+            AUDCLNT_E_NONOFFLOAD_MODE_ONLY
+        };
+    }
     let result = with_client_state(pid, object, "SetClientProperties", |state| {
         state.client_category = category;
         state.client_offload_requested = offload_requested;
+        state.client_raw_requested = raw_requested;
         Ok(AUDCLNT_S_OK)
     });
     match result {
@@ -2717,7 +2847,7 @@ pub(crate) fn start(pid: u32, object: u64) -> u32 {
             return Ok(AUDCLNT_S_FALSE);
         }
         if state.loopback {
-            state.system_loopback_held = acquire_system_loopback();
+            state.system_loopback_held = acquire_system_loopback_for(&state.device);
         }
         state.running = true;
         state.run_started = Some(Instant::now());
@@ -2752,7 +2882,7 @@ pub(crate) fn stop(pid: u32, object: u64) -> u32 {
         }
         if state.system_loopback_held {
             state.system_loopback_held = false;
-            release_system_loopback_reference();
+            release_system_loopback_reference_for(&state.device.key);
         }
         state.run_started = None;
         state.running = false;
@@ -3953,18 +4083,19 @@ pub(crate) fn capture_get_buffer(pid: u32, service_object: u64) -> Result<Captur
         .ok_or(AUDCLNT_E_NOT_INITIALIZED)?;
     let channels = format.channels.max(1) as usize;
     let sample_count = frames as usize * channels;
-    let (samples, real_frames) = if state.loopback && system_loopback_in_use() {
+    let (samples, real_frames) = if state.loopback && state.system_loopback_held {
         let mut source = Vec::new();
         let mut source_channels = format.channels;
         let mut source_rate = format.sample_rate;
         {
             let mut backend_guard = audio_client_backend();
             if let Some(backend) = backend_guard.as_mut()
-                && let Some((channels, rate)) = backend.system_loopback_format()
+                && let Some((channels, rate)) =
+                    backend.system_loopback_format_for(&state.device.key)
             {
                 source_channels = channels;
                 source_rate = rate;
-                source = backend.read_system_loopback_data();
+                source = backend.read_system_loopback_data_for(&state.device.key);
             }
         }
         let (samples, real_frames) = convert_loopback_frames(
@@ -4589,11 +4720,12 @@ mod tests {
         fn with_capability(capability: SystemLoopbackBackend) -> Self {
             let lock = crate::real_audio::lock_system_loopback_tests();
             SYSTEM_LOOPBACK_USERS.store(0, Ordering::SeqCst);
+            system_loopback_device_users().clear();
             crate::real_audio::set_test_system_loopback_capability(Some(capability));
             {
                 let mut guard = audio_client_backend();
                 if let Some(backend) = guard.as_mut() {
-                    backend.stop_system_loopback();
+                    backend.stop_all_system_loopbacks();
                 }
             }
             Self { _lock: lock }
@@ -4603,7 +4735,7 @@ mod tests {
             let mut guard = audio_client_backend();
             ensure_audio_client_backend(&mut guard)
                 .expect("test audio backend")
-                .install_test_system_loopback(channels, sample_rate)
+                .install_test_system_loopback_for(&test_device().key, channels, sample_rate)
         }
     }
 
@@ -4612,11 +4744,12 @@ mod tests {
             {
                 let mut guard = audio_client_backend();
                 if let Some(backend) = guard.as_mut() {
-                    backend.stop_system_loopback();
+                    backend.stop_all_system_loopbacks();
                 }
             }
             crate::real_audio::set_test_system_loopback_capability(None);
             SYSTEM_LOOPBACK_USERS.store(0, Ordering::SeqCst);
+            system_loopback_device_users().clear();
         }
     }
 
@@ -4630,7 +4763,13 @@ mod tests {
         guard
             .as_mut()
             .expect("test audio backend")
-            .push_test_system_loopback_frames(generation, channels, sample_rate, samples)
+            .push_test_system_loopback_frames_for(
+                &test_device().key,
+                generation,
+                channels,
+                sample_rate,
+                samples,
+            )
     }
 
     fn loopback_capture_service(
@@ -4890,36 +5029,38 @@ mod tests {
         assert_eq!(set_event_handle(pid, object, 0xE8), AUDCLNT_S_OK);
         assert_eq!(start(pid, object), AUDCLNT_S_OK);
 
-        let mut frames = 0;
-        for _ in 0..200 {
-            frames = capture_next_packet_size(pid, service).expect("packet size");
-            if frames > 0 {
-                break;
+        let packet = loop {
+            match capture_get_buffer(pid, service) {
+                Ok(packet) => break packet,
+                Err(AUDCLNT_S_BUFFER_EMPTY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => panic!("the capture clock paced an unexpected error: {error:#x}"),
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert!(frames > 0, "the capture clock must pace a silent packet");
-        let packet = capture_get_buffer(pid, service).expect("silent packet");
+        };
+        assert!(
+            packet.frames > 0,
+            "the capture clock must pace a silent packet"
+        );
         assert_eq!(packet.flags, AUDCLNT_BUFFERFLAGS_SILENT);
-        assert_eq!(packet.frames, frames);
         assert!(
             packet.samples.iter().all(|sample| *sample == 0.0),
             "no audio flowing means an all-zero silent packet"
         );
         assert!(packet.frames as usize <= 800);
         assert_eq!(packet.channels, format.channels);
-        capture_release_buffer(pid, service, frames, 0).expect("release silent packet");
+        capture_release_buffer(pid, service, packet.frames, 0).expect("release silent packet");
         assert_eq!(stop(pid, object), AUDCLNT_S_OK);
         release_audio_object(pid, object);
         release_audio_object(pid, service);
         drop(guard);
     }
 
-    fn backend_system_loopback_running() -> bool {
+    fn backend_system_loopback_running_for(key: &str) -> bool {
         let mut guard = audio_client_backend();
         guard
             .as_mut()
-            .is_some_and(|backend| backend.system_loopback_running())
+            .is_some_and(|backend| backend.system_loopback_running_for(key))
     }
 
     #[test]
@@ -4943,22 +5084,23 @@ mod tests {
     fn system_loopback_shared_users_release_only_on_the_last_stop() {
         let guard = LoopbackTestGuard::with_capability(SystemLoopbackBackend::CoreAudioProcessTap);
         let _generation = guard.install(2, 48_000);
-        assert!(acquire_system_loopback());
+        let device = test_device();
+        assert!(acquire_system_loopback_for(&device));
         assert!(
-            acquire_system_loopback(),
+            acquire_system_loopback_for(&device),
             "the second user shares the live capture"
         );
         assert_eq!(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 2);
-        release_system_loopback_reference();
+        release_system_loopback_reference_for(&device.key);
         assert_eq!(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 1);
         assert!(
-            backend_system_loopback_running(),
+            backend_system_loopback_running_for(&device.key),
             "the capture stays up while a user remains"
         );
-        release_system_loopback_reference();
+        release_system_loopback_reference_for(&device.key);
         assert_eq!(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 0);
         assert!(
-            !backend_system_loopback_running(),
+            !backend_system_loopback_running_for(&device.key),
             "the last release tears the capture down"
         );
     }
@@ -5031,13 +5173,13 @@ mod tests {
         assert_eq!(start(pid, object), AUDCLNT_S_OK);
         assert!(push_system_frames(generation, 2, 8_000, &[0.25; 4]));
         assert_eq!(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 1);
-        assert!(backend_system_loopback_running());
+        assert!(backend_system_loopback_running_for(&device.key));
         // The guest releases the endpoint without Stop: the held system
         // capture reference must be dropped exactly once.
         release_audio_object(pid, object);
         assert_eq!(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 0);
         assert!(
-            !backend_system_loopback_running(),
+            !backend_system_loopback_running_for(&device.key),
             "releasing the last running loopback client stops the tap"
         );
         release_audio_object(pid, service);
@@ -5082,7 +5224,7 @@ mod tests {
             backend_guard
                 .as_mut()
                 .expect("test backend")
-                .stop_system_loopback();
+                .stop_system_loopback_for(&test_device().key);
         }
         assert!(
             !push_system_frames(first_generation, 2, 48_000, &[0.5; 8]),
@@ -5097,8 +5239,14 @@ mod tests {
         assert!(push_system_frames(second_generation, 2, 48_000, &[0.5; 8]));
         let mut backend_guard = audio_client_backend();
         let backend = backend_guard.as_mut().expect("test backend");
-        assert_eq!(backend.system_loopback_available_frames(), 4);
-        assert_eq!(backend.read_system_loopback_data(), vec![0.5; 8]);
+        assert_eq!(
+            backend.system_loopback_available_frames_for(&test_device().key),
+            4
+        );
+        assert_eq!(
+            backend.read_system_loopback_data_for(&test_device().key),
+            vec![0.5; 8]
+        );
     }
 
     #[test]
@@ -5151,6 +5299,75 @@ mod tests {
     // -----------------------------------------------------------------------
     // Exclusive mode — client-side buffer/period/format constraints
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn client_properties_reject_offload_and_raw_with_pinned_statuses() {
+        let pid = 0x7d40;
+        let object = 0x9_540;
+        let device = test_device();
+        register_audio_client(pid, object, device, IID_IAUDIO_CLIENT_2);
+        assert_eq!(
+            host_offload_capability(),
+            false,
+            "the backed hosts expose no real offload engine"
+        );
+        // The host-capability branch is wired: a host that proves offload
+        // support accepts and records the request.
+        let _offload_guard = HostOffloadCapabilityGuard;
+        set_test_host_offload_capability(true);
+        assert_eq!(
+            set_client_properties(pid, object, 3, true, false),
+            AUDCLNT_S_OK
+        );
+        let snapshot = test_client_snapshot(pid, object).expect("snapshot");
+        assert_eq!(snapshot.client_category, 3);
+        assert_eq!(snapshot.client_offload_requested, true);
+        assert_eq!(snapshot.client_raw_requested, false);
+        set_test_host_offload_capability(false);
+        assert_eq!(
+            set_client_properties(pid, object, 3, true, false),
+            AUDCLNT_E_NONOFFLOAD_MODE_ONLY,
+            "offload without a host engine is rejected, never silently accepted"
+        );
+        let snapshot = test_client_snapshot(pid, object).expect("snapshot");
+        assert_eq!(
+            snapshot.client_category, 3,
+            "a rejected request leaves the previously accepted state untouched"
+        );
+        assert_eq!(snapshot.client_offload_requested, true);
+        assert_eq!(
+            set_client_properties(pid, object, 3, false, true),
+            AUDCLNT_E_RAW_MODE_UNSUPPORTED,
+            "bitstream/raw requests are rejected with the raw-mode status"
+        );
+        let snapshot = test_client_snapshot(pid, object).expect("snapshot");
+        assert_eq!(snapshot.client_category, 3);
+        assert_eq!(snapshot.client_raw_requested, false);
+        assert_eq!(
+            set_client_properties(pid, object, 3, true, true),
+            AUDCLNT_E_RAW_MODE_UNSUPPORTED,
+            "raw is the narrower capability and takes precedence"
+        );
+        assert_eq!(
+            set_client_properties(pid, object, 3, false, false),
+            AUDCLNT_S_OK
+        );
+        let snapshot = test_client_snapshot(pid, object).expect("snapshot");
+        assert_eq!(snapshot.client_category, 3);
+        assert_eq!(snapshot.client_offload_requested, false);
+        assert_eq!(snapshot.client_raw_requested, false);
+        assert_eq!(
+            set_client_properties(pid + 1, object, 3, false, false),
+            AUDCLNT_E_DEVICE_INVALIDATED,
+            "an unbound endpoint is a device error"
+        );
+        assert_eq!(
+            set_client_properties(pid + 1, object, 3, false, true),
+            AUDCLNT_E_DEVICE_INVALIDATED,
+            "an unbound endpoint is validated before the raw rejection"
+        );
+        release_audio_object(pid, object);
+    }
 
     #[test]
     fn exclusive_mode_enforces_buffer_and_period_constraints() {

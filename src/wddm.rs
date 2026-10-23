@@ -32,12 +32,20 @@ pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 /// STATUS_ACCESS_DENIED.
 pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+/// STATUS_BUFFER_TOO_SMALL (a display-mode or gamma buffer was too small).
+pub const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 /// STATUS_OBJECT_NAME_COLLISION (duplicate allocation identity).
 pub const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 /// STATUS_NOT_SUPPORTED (a documented but unmodelled query class).
 pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+/// STATUS_INVALID_DEVICE_STATE (an adapter power/PnP transition is illegal).
+pub const STATUS_INVALID_DEVICE_STATE: u32 = 0xC000_0184;
 /// STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER.
 pub const STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER: u32 = 0xC01E_0002;
+/// STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE.
+pub const STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE: u32 = 0xC01E_0003;
+/// STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET (unknown output/VidPn target).
+pub const STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET: u32 = 0xC01E_0004;
 /// STATUS_GRAPHICS_GPU_EXCEPTION_ON_DEVICE (the submitted command buffer failed).
 pub const STATUS_GRAPHICS_GPU_EXCEPTION_ON_DEVICE: u32 = 0xC01E_0200;
 /// STATUS_GRAPHICS_PRESENT_INVALID_WINDOW (unknown or destroyed swapchain).
@@ -144,10 +152,63 @@ const MAX_RENDER_BYTES: u64 = 1 << 20;
 
 /// Documented `D3DKMT_QUERYSTATISTICS_TYPE` values.
 pub const D3DKMT_QUERYSTATISTICS_ADAPTER: u32 = 0;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS` — counters for one guest process.
+pub const D3DKMT_QUERYSTATISTICS_PROCESS: u32 = 1;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS_ADAPTER` — process counters on one adapter.
+pub const D3DKMT_QUERYSTATISTICS_PROCESS_ADAPTER: u32 = 2;
+/// `D3DKMT_QUERYSTATISTICS_SEGMENT` — one segment's real usage and budget.
+pub const D3DKMT_QUERYSTATISTICS_SEGMENT: u32 = 3;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT` — one process on one segment.
+pub const D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT: u32 = 4;
 /// `D3DKMT_QUERYSTATISTICS_NODE`.
 pub const D3DKMT_QUERYSTATISTICS_NODE: u32 = 5;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS_NODE` — one process on one render node.
+pub const D3DKMT_QUERYSTATISTICS_PROCESS_NODE: u32 = 6;
+/// `D3DKMT_QUERYSTATISTICS_VIDPNSOURCE` (unbacked: no per-source ledger).
+pub const D3DKMT_QUERYSTATISTICS_VIDPNSOURCE: u32 = 7;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS_VIDPNSOURCE` (unbacked).
+pub const D3DKMT_QUERYSTATISTICS_PROCESS_VIDPNSOURCE: u32 = 8;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP` — process counters per segment group.
+pub const D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP: u32 = 9;
+/// `D3DKMT_QUERYSTATISTICS_HISTOGRAM` (unbacked: no physical histogram bins).
+pub const D3DKMT_QUERYSTATISTICS_HISTOGRAM: u32 = 10;
 /// `D3DKMT_QUERYSTATISTICS_ADAPTER2`.
 pub const D3DKMT_QUERYSTATISTICS_ADAPTER2: u32 = 11;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS_ADAPTER2` (alias of the PROCESS_ADAPTER counters).
+pub const D3DKMT_QUERYSTATISTICS_PROCESS_ADAPTER2: u32 = 12;
+/// `D3DKMT_QUERYSTATISTICS_SEGMENT2` (alias of the SEGMENT counters).
+pub const D3DKMT_QUERYSTATISTICS_SEGMENT2: u32 = 13;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT2` (alias of PROCESS_SEGMENT).
+pub const D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT2: u32 = 14;
+/// `D3DKMT_QUERYSTATISTICS_NODE2` (alias of the NODE counters).
+pub const D3DKMT_QUERYSTATISTICS_NODE2: u32 = 15;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS_NODE2` (alias of PROCESS_NODE).
+pub const D3DKMT_QUERYSTATISTICS_PROCESS_NODE2: u32 = 16;
+/// `D3DKMT_QUERYSTATISTICS_VIDPNSOURCE2` (unbacked).
+pub const D3DKMT_QUERYSTATISTICS_VIDPNSOURCE2: u32 = 17;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS_VIDPNSOURCE2` (unbacked).
+pub const D3DKMT_QUERYSTATISTICS_PROCESS_VIDPNSOURCE2: u32 = 18;
+/// `D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP2` (alias of the group counters).
+pub const D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP2: u32 = 19;
+/// `D3DKMT_QUERYSTATISTICS_GLOBAL` — aggregate counters over every adapter.
+pub const D3DKMT_QUERYSTATISTICS_GLOBAL: u32 = 20;
+/// Sentinel used by scoped statistics for an absent segment/node scope.
+pub const NO_SUBOBJECT: u32 = u32::MAX;
+
+/// Entries in each channel of a `D3DKMT_GAMMARAMP`.
+pub const GAMMA_RAMP_ENTRIES: usize = 256;
+/// `D3DKMT_GAMMARAMPTYPE` identity (the output keeps its default ramp).
+pub const GAMMA_RAMP_TYPE_IDENTITY: u32 = 0;
+/// `D3DKMT_GAMMARAMPTYPE` ramp (256 entries per channel are supplied).
+pub const GAMMA_RAMP_TYPE_RAMP: u32 = 1;
+/// Largest cursor edge accepted by the synthetic cursor plane.
+pub const MAX_CURSOR_DIMENSION: u32 = 256;
+/// The GPU power component ordinal exposed by the Metal personality.
+pub const POWER_COMPONENT_GPU: u32 = 0;
+/// `D3DKMT_POWER_COMPONENT_STATE` D0 (fully on).
+pub const POWER_STATE_D0: u32 = 0;
+/// `D3DKMT_POWER_COMPONENT_STATE` D3 (off).
+pub const POWER_STATE_D3: u32 = 3;
 
 /// A WDDM allocation segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -378,6 +439,156 @@ pub struct DisplayModeInfo {
     pub refresh_denominator: u32,
 }
 
+/// One output/VidPn target exposed by `D3DKMTEnumOutputs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WddmOutputInfo {
+    /// Dense output ordinal (`hOutput` in the KMT surface).
+    pub output_id: u32,
+    /// VidPn source that drives this output.
+    pub vidpn_source_id: u32,
+    /// VidPn target that owns this output.
+    pub vidpn_target_id: u32,
+    /// Output name from the GPU backend (or the deterministic offscreen name).
+    pub name: String,
+    /// Horizontal DPI.
+    pub dpi_x: u32,
+    /// Vertical DPI.
+    pub dpi_y: u32,
+    /// Modes supported by this output, deduplicated.
+    pub modes: Vec<DisplayModeInfo>,
+}
+
+/// A stored gamma ramp (256 entries per channel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GammaRamp {
+    /// `GAMMA_RAMP_TYPE_IDENTITY` or `GAMMA_RAMP_TYPE_RAMP`.
+    pub ramp_type: u32,
+    /// Red channel.
+    pub red: Vec<u16>,
+    /// Green channel.
+    pub green: Vec<u16>,
+    /// Blue channel.
+    pub blue: Vec<u16>,
+}
+
+/// Cursor plane state for one output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WddmCursorState {
+    /// Output the cursor is attached to.
+    pub output_id: u32,
+    /// Whether the cursor is visible.
+    pub visible: bool,
+    /// X position in output pixels.
+    pub x: i32,
+    /// Y position in output pixels.
+    pub y: i32,
+    /// Cursor width in pixels (zero when no shape is set).
+    pub width: u32,
+    /// Cursor height in pixels (zero when no shape is set).
+    pub height: u32,
+    /// Hot spot X (must be `< width` when a shape is set).
+    pub hot_x: u32,
+    /// Hot spot Y (must be `< height` when a shape is set).
+    pub hot_y: u32,
+    /// ARGB pixels (`width * height` entries).
+    pub pixels: Vec<u32>,
+}
+
+/// Adapter PnP/power state and the D0 callback counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WddmPowerState {
+    /// Whether `D3DKMTPnPStart` has run.
+    pub pnp_started: bool,
+    /// Power component ordinal (always `POWER_COMPONENT_GPU`).
+    pub component: u32,
+    /// `POWER_STATE_D0` or `POWER_STATE_D3`.
+    pub power_state: u32,
+    /// KMDF `EvtDeviceD0Entry` callbacks delivered.
+    pub d0_entry_count: u64,
+    /// KMDF `EvtDeviceD0Exit` callbacks delivered.
+    pub d0_exit_count: u64,
+}
+
+/// Driver-island PnP callback delivered when the adapter enters/leaves D0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WddmPnpEvent {
+    /// KMDF `EvtDeviceD0Entry` for this adapter.
+    EvtDeviceD0Entry {
+        /// Adapter identity.
+        adapter_id: u64,
+    },
+    /// KMDF `EvtDeviceD0Exit` for this adapter.
+    EvtDeviceD0Exit {
+        /// Adapter identity.
+        adapter_id: u64,
+    },
+}
+
+/// Per-process statistics (`D3DKMT_QUERYSTATISTICS_PROCESS` and scoped variants).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WddmProcessStatistics {
+    /// Guest process identity.
+    pub process_id: u64,
+    /// Live allocations owned by the process.
+    pub allocation_count: u64,
+    /// Sum of the process's allocation sizes.
+    pub allocated_bytes: u64,
+    /// Resident bytes (the process's committed physical memory).
+    pub committed_bytes: u64,
+    /// Allocations with a non-zero residency count.
+    pub resident_count: u64,
+    /// Sum of resident allocation sizes.
+    pub resident_bytes: u64,
+    /// Live contexts owned by the process.
+    pub context_count: u64,
+    /// Render submissions completed through the process's contexts.
+    pub render_count: u64,
+    /// Bytes filled by those render submissions.
+    pub render_bytes: u64,
+    /// Segment scope, or `NO_SUBOBJECT`.
+    pub segment_id: u32,
+    /// Node scope, or `NO_SUBOBJECT`.
+    pub node_ordinal: u32,
+    /// Budget of the scoped segment (zero when not segment-scoped).
+    pub segment_budget: u64,
+    /// Used bytes of the scoped segment (zero when not segment-scoped).
+    pub segment_used: u64,
+}
+
+/// Per-segment statistics (`D3DKMT_QUERYSTATISTICS_SEGMENT`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WddmSegmentStatistics {
+    /// Segment identity.
+    pub segment_id: u32,
+    /// Real budget for this segment.
+    pub budget: u64,
+    /// Bytes currently resident in this segment.
+    pub used: u64,
+    /// Live allocations charged to this segment.
+    pub allocation_count: u64,
+    /// Sum of allocation sizes charged to this segment.
+    pub allocated_bytes: u64,
+    /// Resident bytes in this segment.
+    pub committed_bytes: u64,
+    /// Allocations with a non-zero residency count.
+    pub resident_count: u64,
+    /// Sum of resident allocation sizes.
+    pub resident_bytes: u64,
+}
+
+/// Result of a typed `D3DKMT_QUERYSTATISTICS` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WddmStatisticsSnapshot {
+    /// Adapter-wide or global counters.
+    Adapter(WddmStatistics),
+    /// Process (optionally segment/node-scoped) counters.
+    Process(WddmProcessStatistics),
+    /// Segment counters.
+    Segment(WddmSegmentStatistics),
+    /// Render-node counters.
+    Node(WddmNodeStatistics),
+}
+
 /// `D3DKMT_QUERYSTATISTICS_NODE` counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WddmNodeStatistics {
@@ -464,6 +675,12 @@ struct AdapterRecord {
     segments: Vec<SegmentRecord>,
     device_objects: BTreeSet<u64>,
     private_driver_formats: BTreeMap<u32, u32>,
+    gamma_ramps: BTreeMap<u32, GammaRamp>,
+    cursors: BTreeMap<u32, WddmCursorState>,
+    pnp_started: bool,
+    power_state: u32,
+    d0_entry_count: u64,
+    d0_exit_count: u64,
 }
 
 struct DeviceObjectRecord {
@@ -497,6 +714,7 @@ struct AllocationRef {
 struct ContextRecord {
     device_object: u64,
     adapter_id: u64,
+    owner_process: u64,
     node_ordinal: u32,
     priority: u32,
     context_id: u64,
@@ -609,6 +827,7 @@ impl WddmState {
 pub struct WddmSubsystem {
     state: Mutex<WddmState>,
     backend: Mutex<GraphicsBackend>,
+    pnp_hook: Mutex<Option<Arc<dyn Fn(WddmPnpEvent) + Send + Sync>>>,
 }
 
 impl WddmSubsystem {
@@ -656,12 +875,19 @@ impl WddmSubsystem {
                     ],
                     device_objects: BTreeSet::new(),
                     private_driver_formats: BTreeMap::new(),
+                    gamma_ramps: BTreeMap::new(),
+                    cursors: BTreeMap::new(),
+                    pnp_started: false,
+                    power_state: POWER_STATE_D3,
+                    d0_entry_count: 0,
+                    d0_exit_count: 0,
                 },
             );
         }
         Self {
             state: Mutex::new(state),
             backend: Mutex::new(GraphicsBackend::new()),
+            pnp_hook: Mutex::new(None),
         }
     }
 
@@ -813,24 +1039,296 @@ impl WddmSubsystem {
         Ok(handle)
     }
 
-    /// `D3DKMTGetDisplayModeList`: the backend's real output modes, deduped.
+    /// `D3DKMTGetDisplayModeList`: the union of every output's real modes.
     pub fn d3dkmt_display_modes(&self, adapter: AdapterHandle) -> WddmResult<Vec<DisplayModeInfo>> {
-        {
-            let state = self.state();
-            require_adapter(&state, adapter)?;
-        }
+        let outputs = self.d3dkmt_enum_outputs(adapter)?;
         let mut modes = BTreeSet::new();
-        for output in self.backend().outputs() {
-            for mode in &output.modes {
-                modes.insert(DisplayModeInfo {
-                    width: mode.width,
-                    height: mode.height,
-                    refresh_numerator: mode.refresh_numerator,
-                    refresh_denominator: mode.refresh_denominator,
-                });
-            }
+        for output in &outputs {
+            modes.extend(output.modes.iter().copied());
         }
         Ok(modes.into_iter().collect())
+    }
+
+    /// `D3DKMTEnumOutputs`: the output/VidPn topology of one adapter.
+    ///
+    /// The backend's real output table is used verbatim; a headless backend
+    /// without outputs answers the deterministic offscreen display table.
+    pub fn d3dkmt_enum_outputs(&self, adapter: AdapterHandle) -> WddmResult<Vec<WddmOutputInfo>> {
+        let state = self.state();
+        require_adapter(&state, adapter)?;
+        let outputs = self.backend().outputs().to_vec();
+        Ok(output_table(&outputs))
+    }
+
+    /// `D3DKMTEnumOutputs` for one output ordinal.
+    pub fn d3dkmt_output_info(
+        &self,
+        adapter: AdapterHandle,
+        output_id: u32,
+    ) -> WddmResult<WddmOutputInfo> {
+        let outputs = self.d3dkmt_enum_outputs(adapter)?;
+        outputs.get(output_id as usize).cloned().ok_or_else(|| {
+            WddmError::new(
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET,
+                "VidPn target/output does not exist on this adapter",
+            )
+        })
+    }
+
+    /// `D3DKMTGetDisplayModeList2`: one VidPn target's real modes.
+    pub fn d3dkmt_output_display_modes(
+        &self,
+        adapter: AdapterHandle,
+        output_id: u32,
+    ) -> WddmResult<Vec<DisplayModeInfo>> {
+        Ok(self.d3dkmt_output_info(adapter, output_id)?.modes)
+    }
+
+    /// `D3DKMTGetDisplayModeList` addressed by VidPn source id.
+    pub fn d3dkmt_source_display_modes(
+        &self,
+        adapter: AdapterHandle,
+        vidpn_source_id: u32,
+    ) -> WddmResult<Vec<DisplayModeInfo>> {
+        let (source_id, _target_id) = self.d3dkmt_vidpn_source_target(adapter, vidpn_source_id)?;
+        Ok(self
+            .d3dkmt_enum_outputs(adapter)?
+            .into_iter()
+            .find(|output| output.vidpn_source_id == source_id)
+            .map(|output| output.modes)
+            .unwrap_or_default())
+    }
+
+    /// VidPn source/target identity pair for a source id.
+    pub fn d3dkmt_vidpn_source_target(
+        &self,
+        adapter: AdapterHandle,
+        vidpn_source_id: u32,
+    ) -> WddmResult<(u32, u32)> {
+        let outputs = self.d3dkmt_enum_outputs(adapter)?;
+        outputs
+            .iter()
+            .find(|output| output.vidpn_source_id == vidpn_source_id)
+            .map(|output| (output.vidpn_source_id, output.vidpn_target_id))
+            .ok_or_else(|| {
+                WddmError::new(
+                    STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE,
+                    "VidPn source does not exist on this adapter",
+                )
+            })
+    }
+
+    /// `D3DKMTSetGammaRamp`: store one output's identity or 256-entry ramp.
+    pub fn d3dkmt_set_gamma_ramp(
+        &self,
+        adapter: AdapterHandle,
+        output_id: u32,
+        ramp_type: u32,
+        red: &[u16],
+        green: &[u16],
+        blue: &[u16],
+    ) -> WddmResult<()> {
+        let mut state = self.state();
+        let adapter_id = require_adapter(&state, adapter)?;
+        let outputs = output_table(self.backend().outputs());
+        if output_id as usize >= outputs.len() {
+            return failed(
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET,
+                "VidPn target/output does not exist on this adapter",
+            );
+        }
+        let ramp = match ramp_type {
+            GAMMA_RAMP_TYPE_IDENTITY => {
+                if !red.is_empty() || !green.is_empty() || !blue.is_empty() {
+                    return failed(
+                        STATUS_INVALID_PARAMETER,
+                        "identity gamma ramp takes no entries",
+                    );
+                }
+                identity_gamma_ramp()
+            }
+            GAMMA_RAMP_TYPE_RAMP => {
+                if red.len() != GAMMA_RAMP_ENTRIES
+                    || green.len() != GAMMA_RAMP_ENTRIES
+                    || blue.len() != GAMMA_RAMP_ENTRIES
+                {
+                    return failed(
+                        STATUS_INVALID_PARAMETER,
+                        "gamma ramp requires exactly 256 entries per channel",
+                    );
+                }
+                GammaRamp {
+                    ramp_type,
+                    red: red.to_vec(),
+                    green: green.to_vec(),
+                    blue: blue.to_vec(),
+                }
+            }
+            _ => {
+                return failed(STATUS_INVALID_PARAMETER, "unknown gamma ramp type");
+            }
+        };
+        state
+            .adapters
+            .get_mut(&adapter_id)
+            .expect("adapter validated above")
+            .gamma_ramps
+            .insert(output_id, ramp);
+        Ok(())
+    }
+
+    /// `D3DKMTGetGammaRamp`: read the stored ramp (identity by default).
+    pub fn d3dkmt_get_gamma_ramp(
+        &self,
+        adapter: AdapterHandle,
+        output_id: u32,
+    ) -> WddmResult<GammaRamp> {
+        let state = self.state();
+        let adapter_id = require_adapter(&state, adapter)?;
+        let outputs = output_table(self.backend().outputs());
+        if output_id as usize >= outputs.len() {
+            return failed(
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET,
+                "VidPn target/output does not exist on this adapter",
+            );
+        }
+        Ok(state
+            .adapters
+            .get(&adapter_id)
+            .expect("adapter validated above")
+            .gamma_ramps
+            .get(&output_id)
+            .cloned()
+            .unwrap_or_else(identity_gamma_ramp))
+    }
+
+    /// `D3DKMTSetCursorPosition`: position the cursor inside the output.
+    pub fn d3dkmt_set_cursor_position(
+        &self,
+        adapter: AdapterHandle,
+        output_id: u32,
+        x: i32,
+        y: i32,
+    ) -> WddmResult<()> {
+        let mut state = self.state();
+        let adapter_id = require_adapter(&state, adapter)?;
+        let outputs = output_table(self.backend().outputs());
+        let output = outputs.get(output_id as usize).ok_or_else(|| {
+            WddmError::new(
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET,
+                "VidPn target/output does not exist on this adapter",
+            )
+        })?;
+        let (max_width, max_height) = output.modes.iter().fold((0_u32, 0_u32), |acc, mode| {
+            (acc.0.max(mode.width), acc.1.max(mode.height))
+        });
+        if x < 0 || y < 0 || x as u32 >= max_width || y as u32 >= max_height {
+            return failed(
+                STATUS_INVALID_PARAMETER,
+                "cursor position is outside the output bounds",
+            );
+        }
+        let cursor = state
+            .adapters
+            .get_mut(&adapter_id)
+            .expect("adapter validated above")
+            .cursors
+            .entry(output_id)
+            .or_insert_with(|| default_cursor(output_id));
+        cursor.x = x;
+        cursor.y = y;
+        Ok(())
+    }
+
+    /// `D3DKMTSetCursor`: store one output's cursor shape and visibility.
+    pub fn d3dkmt_set_cursor(
+        &self,
+        adapter: AdapterHandle,
+        output_id: u32,
+        visible: bool,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        pixels: &[u32],
+    ) -> WddmResult<()> {
+        let mut state = self.state();
+        let adapter_id = require_adapter(&state, adapter)?;
+        let outputs = output_table(self.backend().outputs());
+        if output_id as usize >= outputs.len() {
+            return failed(
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET,
+                "VidPn target/output does not exist on this adapter",
+            );
+        }
+        if width > MAX_CURSOR_DIMENSION || height > MAX_CURSOR_DIMENSION {
+            return failed(
+                STATUS_INVALID_PARAMETER,
+                "cursor dimensions exceed the maximum supported edge",
+            );
+        }
+        if width == 0 || height == 0 {
+            if visible || !pixels.is_empty() {
+                return failed(
+                    STATUS_INVALID_PARAMETER,
+                    "zero-sized cursor cannot be visible or carry pixels",
+                );
+            }
+        } else {
+            if hot_x >= width || hot_y >= height {
+                return failed(
+                    STATUS_INVALID_PARAMETER,
+                    "cursor hot spot is outside the cursor shape",
+                );
+            }
+            let expected = u64::from(width) * u64::from(height);
+            if pixels.len() as u64 != expected {
+                return failed(
+                    STATUS_INVALID_PARAMETER,
+                    "cursor pixel count does not match width * height",
+                );
+            }
+        }
+        let cursor = state
+            .adapters
+            .get_mut(&adapter_id)
+            .expect("adapter validated above")
+            .cursors
+            .entry(output_id)
+            .or_insert_with(|| default_cursor(output_id));
+        cursor.output_id = output_id;
+        cursor.visible = visible;
+        cursor.width = width;
+        cursor.height = height;
+        cursor.hot_x = hot_x;
+        cursor.hot_y = hot_y;
+        cursor.pixels = pixels.to_vec();
+        Ok(())
+    }
+
+    /// Stored cursor state for one output (defaults when never set).
+    pub fn cursor_state(
+        &self,
+        adapter: AdapterHandle,
+        output_id: u32,
+    ) -> WddmResult<WddmCursorState> {
+        let state = self.state();
+        let adapter_id = require_adapter(&state, adapter)?;
+        let outputs = output_table(self.backend().outputs());
+        if output_id as usize >= outputs.len() {
+            return failed(
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET,
+                "VidPn target/output does not exist on this adapter",
+            );
+        }
+        Ok(state
+            .adapters
+            .get(&adapter_id)
+            .expect("adapter validated above")
+            .cursors
+            .get(&output_id)
+            .cloned()
+            .unwrap_or_else(|| default_cursor(output_id)))
     }
 
     /// `D3DKMTSetDisplayPrivateDriverFormat`: persist the format per VidPn source.
@@ -842,10 +1340,10 @@ impl WddmSubsystem {
     ) -> WddmResult<()> {
         let mut state = self.state();
         let adapter_id = require_adapter(&state, adapter)?;
-        let source_count = self.backend().outputs().len() as u32;
+        let source_count = output_table(self.backend().outputs()).len() as u32;
         if vidpn_source_id >= source_count {
             return failed(
-                STATUS_INVALID_PARAMETER,
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE,
                 "VidPn source does not exist on this adapter",
             );
         }
@@ -897,6 +1395,159 @@ impl WddmSubsystem {
         }
         state.adapter_handles.remove(&adapter);
         Ok(())
+    }
+
+    /// Install the driver island's KMDF `EvtDeviceD0Entry`/`D0Exit` sink.
+    ///
+    /// The hook is delivered for every real D0 transition (PnP start/stop or
+    /// `D3DKMTPowerComponent`) after the facade state has changed.
+    pub fn install_pnp_hooks(&self, hook: Arc<dyn Fn(WddmPnpEvent) + Send + Sync>) {
+        *self
+            .pnp_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// `D3DKMTPnPStart`: bring the adapter's PnP device up and enter D0.
+    pub fn d3dkmt_pnp_start(&self, adapter: AdapterHandle) -> WddmResult<()> {
+        let event = {
+            let mut state = self.state();
+            let adapter_id = require_adapter(&state, adapter)?;
+            let record = state
+                .adapters
+                .get_mut(&adapter_id)
+                .expect("adapter validated above");
+            if record.pnp_started {
+                return failed(
+                    STATUS_INVALID_DEVICE_STATE,
+                    "adapter PnP device is already started",
+                );
+            }
+            record.pnp_started = true;
+            record.power_state = POWER_STATE_D0;
+            record.d0_entry_count += 1;
+            WddmPnpEvent::EvtDeviceD0Entry { adapter_id }
+        };
+        self.notify_pnp(event);
+        Ok(())
+    }
+
+    /// `D3DKMTPnPStop`: leave D0 (when entered) and stop the PnP device.
+    pub fn d3dkmt_pnp_stop(&self, adapter: AdapterHandle) -> WddmResult<()> {
+        let event = {
+            let mut state = self.state();
+            let adapter_id = require_adapter(&state, adapter)?;
+            let record = state
+                .adapters
+                .get_mut(&adapter_id)
+                .expect("adapter validated above");
+            if !record.pnp_started {
+                return failed(
+                    STATUS_INVALID_DEVICE_STATE,
+                    "adapter PnP device is not started",
+                );
+            }
+            let was_on = record.power_state == POWER_STATE_D0;
+            record.pnp_started = false;
+            record.power_state = POWER_STATE_D3;
+            if was_on {
+                record.d0_exit_count += 1;
+            }
+            was_on.then_some(WddmPnpEvent::EvtDeviceD0Exit { adapter_id })
+        };
+        if let Some(event) = event {
+            self.notify_pnp(event);
+        }
+        Ok(())
+    }
+
+    /// `D3DKMTPowerComponent`: transition the GPU component between D0 and D3.
+    pub fn d3dkmt_power_component(
+        &self,
+        adapter: AdapterHandle,
+        component: u32,
+        power_state: u32,
+    ) -> WddmResult<()> {
+        if component != POWER_COMPONENT_GPU {
+            return failed(
+                STATUS_INVALID_PARAMETER,
+                "power component ordinal does not exist",
+            );
+        }
+        if power_state != POWER_STATE_D0 && power_state != POWER_STATE_D3 {
+            return failed(
+                STATUS_INVALID_PARAMETER,
+                "power component state is outside D0..D3",
+            );
+        }
+        let event = {
+            let mut state = self.state();
+            let adapter_id = require_adapter(&state, adapter)?;
+            let record = state
+                .adapters
+                .get_mut(&adapter_id)
+                .expect("adapter validated above");
+            if !record.pnp_started {
+                return failed(
+                    STATUS_INVALID_DEVICE_STATE,
+                    "power transition on a stopped PnP device",
+                );
+            }
+            if record.power_state == power_state {
+                return failed(
+                    STATUS_INVALID_DEVICE_STATE,
+                    "power component is already in the requested state",
+                );
+            }
+            record.power_state = power_state;
+            if power_state == POWER_STATE_D0 {
+                record.d0_entry_count += 1;
+                WddmPnpEvent::EvtDeviceD0Entry { adapter_id }
+            } else {
+                record.d0_exit_count += 1;
+                WddmPnpEvent::EvtDeviceD0Exit { adapter_id }
+            }
+        };
+        self.notify_pnp(event);
+        Ok(())
+    }
+
+    /// Adapter PnP/power state and the observed D0 callback counts.
+    pub fn power_state(&self, adapter: AdapterHandle) -> WddmResult<WddmPowerState> {
+        let state = self.state();
+        let adapter_id = require_adapter(&state, adapter)?;
+        let record = state
+            .adapters
+            .get(&adapter_id)
+            .expect("adapter validated above");
+        Ok(WddmPowerState {
+            pnp_started: record.pnp_started,
+            component: POWER_COMPONENT_GPU,
+            power_state: record.power_state,
+            d0_entry_count: record.d0_entry_count,
+            d0_exit_count: record.d0_exit_count,
+        })
+    }
+
+    /// Driver-island load hook: PnP start plus `EvtDeviceD0Entry`.
+    pub fn driver_island_loaded(&self, adapter: AdapterHandle) -> WddmResult<()> {
+        self.d3dkmt_pnp_start(adapter)
+    }
+
+    /// Driver-island unload hook: `EvtDeviceD0Exit` (when in D0) plus PnP stop.
+    pub fn driver_island_unloaded(&self, adapter: AdapterHandle) -> WddmResult<()> {
+        self.d3dkmt_pnp_stop(adapter)
+    }
+
+    fn notify_pnp(&self, event: WddmPnpEvent) {
+        let hook = self
+            .pnp_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(event);
+        }
     }
 
     /// `D3DKMTCreateDevice`.
@@ -1894,11 +2545,13 @@ impl WddmSubsystem {
         }
         let mut state = self.state();
         let object_id = require_device(&state, request.device)?;
-        let adapter_id = state
-            .device_objects
-            .get(&object_id)
-            .expect("device object present for live handle")
-            .adapter_id;
+        let (adapter_id, owner_process) = {
+            let device = state
+                .device_objects
+                .get(&object_id)
+                .expect("device object present for live handle");
+            (device.adapter_id, device.owner_process)
+        };
         let context_id = state.next_context;
         state.next_context += 1;
         let handle = ContextHandle(state.alloc_handle());
@@ -1907,6 +2560,7 @@ impl WddmSubsystem {
             ContextRecord {
                 device_object: object_id,
                 adapter_id,
+                owner_process,
                 node_ordinal: request.node_ordinal,
                 priority: request.priority,
                 context_id,
@@ -2095,41 +2749,220 @@ impl WddmSubsystem {
         })
     }
 
-    /// `D3DKMTQueryStatistics` for the documented ADAPTER/ADAPTER2/NODE types.
+    /// `D3DKMTQueryStatistics` for the adapter/node counters.
+    ///
+    /// `node_ordinal` doubles as the legacy sub-object selector: process
+    /// classes use it as the guest process id and segment classes as the
+    /// segment id. Scoped process+segment/node classes require the extended
+    /// descriptor and are reached through [`Self::d3dkmt_query_statistics_typed`].
     pub fn d3dkmt_query_statistics_for(
         &self,
         adapter: AdapterHandle,
         query_type: u32,
         node_ordinal: u32,
     ) -> WddmResult<WddmStatistics> {
-        if query_type == D3DKMT_QUERYSTATISTICS_NODE {
-            let node = self.d3dkmt_query_node_statistics(adapter, node_ordinal)?;
-            return Ok(WddmStatistics {
+        let snapshot = self.d3dkmt_query_statistics_typed(
+            adapter,
+            query_type,
+            u64::from(node_ordinal),
+            node_ordinal,
+        )?;
+        Ok(match snapshot {
+            WddmStatisticsSnapshot::Adapter(statistics) => statistics,
+            WddmStatisticsSnapshot::Process(process) => WddmStatistics {
+                allocation_count: process.allocation_count,
+                allocated_bytes: process.allocated_bytes,
+                resident_count: process.resident_count,
+                resident_bytes: process.resident_bytes,
+                context_count: process.context_count,
+                render_count: process.render_count,
+                render_bytes: process.render_bytes,
+                ..WddmStatistics::default()
+            },
+            WddmStatisticsSnapshot::Segment(segment) => WddmStatistics {
+                allocation_count: segment.allocation_count,
+                allocated_bytes: segment.allocated_bytes,
+                resident_count: segment.resident_count,
+                resident_bytes: segment.resident_bytes,
+                ..WddmStatistics::default()
+            },
+            WddmStatisticsSnapshot::Node(node) => WddmStatistics {
                 allocation_count: node.allocation_count,
                 allocated_bytes: node.allocated_bytes,
                 render_count: node.render_count,
                 render_bytes: node.render_bytes,
                 context_count: node.context_count,
                 ..WddmStatistics::default()
-            });
-        }
-        if query_type != D3DKMT_QUERYSTATISTICS_ADAPTER
-            && query_type != D3DKMT_QUERYSTATISTICS_ADAPTER2
-        {
-            if query_type > 19 {
-                return failed(
-                    STATUS_INVALID_PARAMETER,
-                    "query statistics type is not a documented D3DKMT type",
-                );
+            },
+        })
+    }
+
+    /// Typed `D3DKMT_QUERYSTATISTICS` over the modelable documented classes.
+    ///
+    /// `sub_object_id` is the node ordinal for NODE classes, the segment id for
+    /// SEGMENT classes and the VidPn-independent segment group for group
+    /// classes. Process classes use `process_id`.
+    pub fn d3dkmt_query_statistics_typed(
+        &self,
+        adapter: AdapterHandle,
+        query_type: u32,
+        process_id: u64,
+        sub_object_id: u32,
+    ) -> WddmResult<WddmStatisticsSnapshot> {
+        match query_type {
+            D3DKMT_QUERYSTATISTICS_ADAPTER | D3DKMT_QUERYSTATISTICS_ADAPTER2 => {
+                let state = self.state();
+                let adapter_id = require_adapter(&state, adapter)?;
+                Ok(WddmStatisticsSnapshot::Adapter(statistics_for_adapter(
+                    &state, adapter_id,
+                )))
             }
-            return failed(
+            D3DKMT_QUERYSTATISTICS_PROCESS
+            | D3DKMT_QUERYSTATISTICS_PROCESS_ADAPTER
+            | D3DKMT_QUERYSTATISTICS_PROCESS_ADAPTER2 => Ok(WddmStatisticsSnapshot::Process(
+                self.d3dkmt_query_process_statistics(adapter, process_id)?,
+            )),
+            D3DKMT_QUERYSTATISTICS_SEGMENT | D3DKMT_QUERYSTATISTICS_SEGMENT2 => {
+                Ok(WddmStatisticsSnapshot::Segment(
+                    self.d3dkmt_query_segment_statistics(adapter, sub_object_id)?,
+                ))
+            }
+            D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT | D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT2 => Ok(
+                WddmStatisticsSnapshot::Process(self.d3dkmt_query_process_segment_statistics(
+                    adapter,
+                    process_id,
+                    sub_object_id,
+                )?),
+            ),
+            D3DKMT_QUERYSTATISTICS_NODE | D3DKMT_QUERYSTATISTICS_NODE2 => {
+                Ok(WddmStatisticsSnapshot::Node(
+                    self.d3dkmt_query_node_statistics(adapter, sub_object_id)?,
+                ))
+            }
+            D3DKMT_QUERYSTATISTICS_PROCESS_NODE | D3DKMT_QUERYSTATISTICS_PROCESS_NODE2 => {
+                Ok(WddmStatisticsSnapshot::Process(
+                    self.d3dkmt_query_process_node_statistics(adapter, process_id, sub_object_id)?,
+                ))
+            }
+            D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP
+            | D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP2 => Ok(WddmStatisticsSnapshot::Process(
+                self.d3dkmt_query_process_segment_group_statistics(
+                    adapter,
+                    process_id,
+                    sub_object_id,
+                )?,
+            )),
+            D3DKMT_QUERYSTATISTICS_GLOBAL => {
+                let state = self.state();
+                require_adapter(&state, adapter)?;
+                Ok(WddmStatisticsSnapshot::Adapter(statistics_for_scope(
+                    &state, None,
+                )))
+            }
+            D3DKMT_QUERYSTATISTICS_VIDPNSOURCE
+            | D3DKMT_QUERYSTATISTICS_PROCESS_VIDPNSOURCE
+            | D3DKMT_QUERYSTATISTICS_HISTOGRAM
+            | D3DKMT_QUERYSTATISTICS_VIDPNSOURCE2
+            | D3DKMT_QUERYSTATISTICS_PROCESS_VIDPNSOURCE2 => failed(
                 STATUS_NOT_SUPPORTED,
-                "query statistics type is not modelled by the Metal personality",
+                "query statistics class has no real backing on the Metal personality",
+            ),
+            _ => failed(
+                STATUS_INVALID_PARAMETER,
+                "query statistics type is not a documented D3DKMT type",
+            ),
+        }
+    }
+
+    /// `D3DKMT_QUERYSTATISTICS_PROCESS` counters for one guest process.
+    pub fn d3dkmt_query_process_statistics(
+        &self,
+        adapter: AdapterHandle,
+        process_id: u64,
+    ) -> WddmResult<WddmProcessStatistics> {
+        let state = self.state();
+        let adapter_id = require_adapter(&state, adapter)?;
+        Ok(process_statistics(
+            &state, adapter_id, process_id, None, None,
+        ))
+    }
+
+    /// `D3DKMT_QUERYSTATISTICS_SEGMENT` counters for one segment.
+    pub fn d3dkmt_query_segment_statistics(
+        &self,
+        adapter: AdapterHandle,
+        segment_id: u32,
+    ) -> WddmResult<WddmSegmentStatistics> {
+        let state = self.state();
+        let adapter_id = require_adapter(&state, adapter)?;
+        segment_statistics(&state, adapter_id, segment_id)
+    }
+
+    /// `D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT` counters.
+    pub fn d3dkmt_query_process_segment_statistics(
+        &self,
+        adapter: AdapterHandle,
+        process_id: u64,
+        segment_id: u32,
+    ) -> WddmResult<WddmProcessStatistics> {
+        let state = self.state();
+        let adapter_id = require_adapter(&state, adapter)?;
+        let segment = segment_statistics(&state, adapter_id, segment_id)?;
+        let mut statistics =
+            process_statistics(&state, adapter_id, process_id, Some(segment_id), None);
+        statistics.segment_budget = segment.budget;
+        statistics.segment_used = segment.used;
+        Ok(statistics)
+    }
+
+    /// `D3DKMT_QUERYSTATISTICS_PROCESS_NODE` counters.
+    pub fn d3dkmt_query_process_node_statistics(
+        &self,
+        adapter: AdapterHandle,
+        process_id: u64,
+        node_ordinal: u32,
+    ) -> WddmResult<WddmProcessStatistics> {
+        if node_ordinal >= RENDER_NODE_COUNT {
+            return failed(
+                STATUS_INVALID_PARAMETER,
+                "statistics node ordinal does not exist",
             );
         }
         let state = self.state();
         let adapter_id = require_adapter(&state, adapter)?;
-        Ok(statistics_for_adapter(&state, adapter_id))
+        Ok(process_statistics(
+            &state,
+            adapter_id,
+            process_id,
+            None,
+            Some(node_ordinal),
+        ))
+    }
+
+    /// `D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP` counters.
+    ///
+    /// The Metal personality exposes one segment per memory group, so a group
+    /// query is the matching segment's real counters filtered to the process.
+    pub fn d3dkmt_query_process_segment_group_statistics(
+        &self,
+        adapter: AdapterHandle,
+        process_id: u64,
+        segment_group: u32,
+    ) -> WddmResult<WddmProcessStatistics> {
+        let state = self.state();
+        let adapter_id = require_adapter(&state, adapter)?;
+        let segment = segment_statistics(&state, adapter_id, segment_group)?;
+        let mut statistics =
+            process_statistics(&state, adapter_id, process_id, Some(segment_group), None);
+        statistics.segment_budget = segment.budget;
+        statistics.segment_used = segment.used;
+        Ok(statistics)
+    }
+
+    /// `D3DKMT_QUERYSTATISTICS_GLOBAL` aggregate over every adapter.
+    pub fn d3dkmt_query_global_statistics(&self) -> WddmStatistics {
+        let state = self.state();
+        statistics_for_scope(&state, None)
     }
 
     /// `D3DKMT_QUERYSTATISTICS_NODE` counters for render node 0.
@@ -2137,6 +2970,15 @@ impl WddmSubsystem {
         &self,
         adapter: AdapterHandle,
         node_ordinal: u32,
+    ) -> WddmResult<WddmNodeStatistics> {
+        self.node_statistics(adapter, node_ordinal, None)
+    }
+
+    fn node_statistics(
+        &self,
+        adapter: AdapterHandle,
+        node_ordinal: u32,
+        process_id: Option<u64>,
     ) -> WddmResult<WddmNodeStatistics> {
         if node_ordinal >= RENDER_NODE_COUNT {
             return failed(
@@ -2150,35 +2992,34 @@ impl WddmSubsystem {
             .contexts
             .values()
             .filter(|context| {
-                context.adapter_id == adapter_id && context.node_ordinal == node_ordinal
+                context.adapter_id == adapter_id
+                    && context.node_ordinal == node_ordinal
+                    && process_id.is_none_or(|process| context.owner_process == process)
             })
             .count() as u64;
         let (render_count, render_bytes) = state
             .contexts
             .values()
             .filter(|context| {
-                context.adapter_id == adapter_id && context.node_ordinal == node_ordinal
+                context.adapter_id == adapter_id
+                    && context.node_ordinal == node_ordinal
+                    && process_id.is_none_or(|process| context.owner_process == process)
             })
             .fold((0_u64, 0_u64), |(count, bytes), context| {
                 (count + context.submit_count, bytes + context.submit_bytes)
             });
+        let allocation_objects = state.allocation_objects.values().filter(|object| {
+            object.adapter_id == adapter_id
+                && process_id.is_none_or(|process| object.owner_process == process)
+        });
         let node = WddmNodeStatistics {
             node_ordinal,
             context_count,
             render_count,
             render_bytes,
             last_effective_priority: state.statistics.last_effective_priority,
-            allocation_count: state
-                .allocation_objects
-                .values()
-                .filter(|object| object.adapter_id == adapter_id)
-                .count() as u64,
-            allocated_bytes: state
-                .allocation_objects
-                .values()
-                .filter(|object| object.adapter_id == adapter_id)
-                .map(|object| object.size)
-                .sum(),
+            allocation_count: allocation_objects.clone().count() as u64,
+            allocated_bytes: allocation_objects.map(|object| object.size).sum(),
         };
         Ok(node)
     }
@@ -2321,46 +3162,19 @@ impl WddmSubsystem {
     /// `D3DKMTQueryStatistics`: live object/memory counts plus backend counters.
     pub fn d3dkmt_query_statistics(&self) -> WddmStatistics {
         let state = self.state();
-        WddmStatistics {
-            present_count: state.statistics.present_count,
-            refresh_count: state.statistics.refresh_count,
-            flip_count: state.statistics.flip_count,
-            allocation_count: state.allocation_objects.len() as u64,
-            allocated_bytes: state
-                .allocation_objects
-                .values()
-                .map(|object| object.size)
-                .sum(),
-            resident_count: state
-                .allocation_objects
-                .values()
-                .filter(|object| object.residency > 0)
-                .count() as u64,
-            resident_bytes: state
-                .allocation_objects
-                .values()
-                .filter(|object| object.residency > 0)
-                .map(|object| object.size)
-                .sum(),
-            signal_count: state.statistics.signal_count,
-            wait_count: state.statistics.wait_count,
-            timeout_count: state.statistics.timeout_count,
-            last_frame_time_ns: state.statistics.last_frame_time_ns,
-            last_displayed_frame_index: state.statistics.last_displayed_frame_index,
-            render_count: state.statistics.render_count,
-            render_bytes: state.statistics.render_bytes,
-            context_count: state.contexts.len() as u64,
-            keyed_mutex_acquire_count: state.statistics.keyed_mutex_acquire_count,
-            keyed_mutex_timeout_count: state.statistics.keyed_mutex_timeout_count,
-        }
+        statistics_for_scope(&state, None)
     }
 }
 
 fn statistics_for_adapter(state: &WddmState, adapter_id: u64) -> WddmStatistics {
+    statistics_for_scope(state, Some(adapter_id))
+}
+
+fn statistics_for_scope(state: &WddmState, adapter_id: Option<u64>) -> WddmStatistics {
     let allocation_objects = state
         .allocation_objects
         .values()
-        .filter(|object| object.adapter_id == adapter_id);
+        .filter(|object| adapter_id.is_none_or(|adapter| object.adapter_id == adapter));
     WddmStatistics {
         present_count: state.statistics.present_count,
         refresh_count: state.statistics.refresh_count,
@@ -2385,10 +3199,190 @@ fn statistics_for_adapter(state: &WddmState, adapter_id: u64) -> WddmStatistics 
         context_count: state
             .contexts
             .values()
-            .filter(|context| context.adapter_id == adapter_id)
+            .filter(|context| adapter_id.is_none_or(|adapter| context.adapter_id == adapter))
             .count() as u64,
         keyed_mutex_acquire_count: state.statistics.keyed_mutex_acquire_count,
         keyed_mutex_timeout_count: state.statistics.keyed_mutex_timeout_count,
+    }
+}
+
+fn process_statistics(
+    state: &WddmState,
+    adapter_id: u64,
+    process_id: u64,
+    segment: Option<u32>,
+    node_ordinal: Option<u32>,
+) -> WddmProcessStatistics {
+    let allocation_objects = state.allocation_objects.values().filter(|object| {
+        object.adapter_id == adapter_id
+            && object.owner_process == process_id
+            && segment.is_none_or(|segment| object.segment.0 == segment)
+    });
+    let contexts = state.contexts.values().filter(|context| {
+        context.adapter_id == adapter_id
+            && context.owner_process == process_id
+            && node_ordinal.is_none_or(|node| context.node_ordinal == node)
+    });
+    let allocation_count = allocation_objects.clone().count() as u64;
+    let allocated_bytes = allocation_objects.clone().map(|object| object.size).sum();
+    let committed_bytes = allocation_objects
+        .clone()
+        .filter(|object| object.residency > 0)
+        .map(|object| object.size)
+        .sum();
+    let resident_count = allocation_objects
+        .clone()
+        .filter(|object| object.residency > 0)
+        .count() as u64;
+    let resident_bytes = allocation_objects
+        .filter(|object| object.residency > 0)
+        .map(|object| object.size)
+        .sum();
+    WddmProcessStatistics {
+        process_id,
+        allocation_count,
+        allocated_bytes,
+        committed_bytes,
+        resident_count,
+        resident_bytes,
+        context_count: contexts.clone().count() as u64,
+        render_count: contexts.clone().map(|context| context.submit_count).sum(),
+        render_bytes: contexts.map(|context| context.submit_bytes).sum(),
+        segment_id: segment.unwrap_or(NO_SUBOBJECT),
+        node_ordinal: node_ordinal.unwrap_or(NO_SUBOBJECT),
+        segment_budget: 0,
+        segment_used: 0,
+    }
+}
+
+fn segment_statistics(
+    state: &WddmState,
+    adapter_id: u64,
+    segment_id: u32,
+) -> WddmResult<WddmSegmentStatistics> {
+    let segment = state
+        .adapters
+        .get(&adapter_id)
+        .and_then(|adapter| adapter.segments.get(segment_id as usize))
+        .ok_or_else(|| {
+            WddmError::new(
+                STATUS_INVALID_PARAMETER,
+                "statistics segment id does not exist",
+            )
+        })?;
+    let allocation_objects = state
+        .allocation_objects
+        .values()
+        .filter(|object| object.adapter_id == adapter_id && object.segment.0 == segment_id);
+    Ok(WddmSegmentStatistics {
+        segment_id,
+        budget: segment.budget,
+        used: segment.used,
+        allocation_count: allocation_objects.clone().count() as u64,
+        allocated_bytes: allocation_objects.clone().map(|object| object.size).sum(),
+        committed_bytes: allocation_objects
+            .clone()
+            .filter(|object| object.residency > 0)
+            .map(|object| object.size)
+            .sum(),
+        resident_count: allocation_objects
+            .clone()
+            .filter(|object| object.residency > 0)
+            .count() as u64,
+        resident_bytes: allocation_objects
+            .filter(|object| object.residency > 0)
+            .map(|object| object.size)
+            .sum(),
+    })
+}
+
+fn display_mode_info(mode: &gfx::DisplayMode) -> DisplayModeInfo {
+    DisplayModeInfo {
+        width: mode.width,
+        height: mode.height,
+        refresh_numerator: mode.refresh_numerator,
+        refresh_denominator: mode.refresh_denominator,
+    }
+}
+
+fn dedup_modes(modes: &[gfx::DisplayMode]) -> Vec<DisplayModeInfo> {
+    modes
+        .iter()
+        .map(display_mode_info)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Deterministic headless display table used when the backend has no output.
+fn offscreen_modes() -> Vec<DisplayModeInfo> {
+    [
+        (640, 480),
+        (800, 600),
+        (1024, 768),
+        (1280, 720),
+        (1920, 1080),
+    ]
+    .into_iter()
+    .map(|(width, height)| DisplayModeInfo {
+        width,
+        height,
+        refresh_numerator: 60_000,
+        refresh_denominator: 1_000,
+    })
+    .collect()
+}
+
+fn output_table(outputs: &[gfx::OutputInfo]) -> Vec<WddmOutputInfo> {
+    if outputs.is_empty() {
+        return vec![WddmOutputInfo {
+            output_id: 0,
+            vidpn_source_id: 0,
+            vidpn_target_id: 0,
+            name: "Offscreen Display".to_string(),
+            dpi_x: 96,
+            dpi_y: 96,
+            modes: offscreen_modes(),
+        }];
+    }
+    outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| WddmOutputInfo {
+            output_id: index as u32,
+            vidpn_source_id: index as u32,
+            vidpn_target_id: index as u32,
+            name: output.name.clone(),
+            dpi_x: output.dpi_x,
+            dpi_y: output.dpi_y,
+            modes: dedup_modes(&output.modes),
+        })
+        .collect()
+}
+
+fn identity_gamma_ramp() -> GammaRamp {
+    let channel: Vec<u16> = (0..GAMMA_RAMP_ENTRIES)
+        .map(|index| index as u16 * 257)
+        .collect();
+    GammaRamp {
+        ramp_type: GAMMA_RAMP_TYPE_IDENTITY,
+        red: channel.clone(),
+        green: channel.clone(),
+        blue: channel,
+    }
+}
+
+fn default_cursor(output_id: u32) -> WddmCursorState {
+    WddmCursorState {
+        output_id,
+        visible: false,
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        hot_x: 0,
+        hot_y: 0,
+        pixels: Vec::new(),
     }
 }
 
@@ -2534,7 +3528,7 @@ fn wait_for_shared_event(event: &metal::SharedEvent, value: u64, timeout_ms: u64
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2563,13 +3557,42 @@ mod tests {
         adapter: AdapterHandle,
         shareable: bool,
     ) -> DeviceHandle {
+        create_device_owned(subsystem, adapter, shareable, 7)
+    }
+
+    fn create_device_owned(
+        subsystem: &WddmSubsystem,
+        adapter: AdapterHandle,
+        shareable: bool,
+        owner_process: u64,
+    ) -> DeviceHandle {
         subsystem
             .d3dkmt_create_device(CreateDeviceRequest {
                 adapter,
                 shareable,
-                owner_process: 7,
+                owner_process,
             })
             .expect("create device")
+    }
+
+    fn create_allocation_owned(
+        subsystem: &WddmSubsystem,
+        device: DeviceHandle,
+        size: u64,
+        segment: SegmentId,
+        resource_id: u64,
+        owner_process: u64,
+    ) -> AllocationHandle {
+        subsystem
+            .d3dkmt_create_allocation(CreateAllocationRequest {
+                device,
+                size,
+                segment,
+                resource_id,
+                shareable: true,
+                owner_process,
+            })
+            .expect("create allocation")
     }
 
     fn create_allocation(
@@ -4390,7 +5413,7 @@ mod tests {
                 .d3dkmt_set_display_private_driver_format(display, u32::MAX, 7)
                 .unwrap_err()
                 .status(),
-            STATUS_INVALID_PARAMETER
+            STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE
         );
         assert_eq!(
             subsystem
@@ -4472,7 +5495,7 @@ mod tests {
         let adapter = open_adapter(&subsystem);
         assert_eq!(
             subsystem
-                .d3dkmt_query_statistics_for(adapter, 1, 0)
+                .d3dkmt_query_statistics_for(adapter, D3DKMT_QUERYSTATISTICS_HISTOGRAM, 0)
                 .unwrap_err()
                 .status(),
             STATUS_NOT_SUPPORTED
@@ -4790,6 +5813,927 @@ mod tests {
                 STATUS_GRAPHICS_GPU_EXCEPTION_ON_DEVICE,
                 "Metal blit command buffer did not complete",
             ))
+        );
+    }
+
+    #[test]
+    fn wddm_statistics_process_segment_aliases_and_unsupported_classes_are_exact() {
+        let subsystem = subsystem();
+        let adapter = open_adapter(&subsystem);
+        let budget = subsystem
+            .d3dkmt_query_adapter_info(adapter)
+            .expect("adapter info")
+            .segments[0]
+            .budget;
+        let device = create_device(&subsystem, adapter, false);
+        let foreign_device = create_device_owned(&subsystem, adapter, false, 9);
+        let first = create_allocation_owned(&subsystem, device, 100, SEGMENT_LOCAL, 1, 7);
+        let second = create_allocation_owned(&subsystem, device, 300, SEGMENT_LOCAL, 2, 7);
+        let foreign =
+            create_allocation_owned(&subsystem, foreign_device, 500, SEGMENT_NON_LOCAL, 1, 9);
+        assert_eq!(subsystem.d3dkmt_make_resident(first, 7), Ok(1));
+        assert_eq!(subsystem.d3dkmt_make_resident(first, 7), Ok(2));
+        assert_eq!(subsystem.d3dkmt_make_resident(foreign, 9), Ok(1));
+        let context = create_context(&subsystem, device, 4);
+        subsystem
+            .d3dkmt_render(RenderRequest {
+                device,
+                context,
+                allocations: vec![first],
+                fill_value: 0x11,
+                fence: None,
+            })
+            .expect("render for process statistics");
+
+        let process = subsystem
+            .d3dkmt_query_process_statistics(adapter, 7)
+            .expect("process statistics");
+        assert_eq!(process.process_id, 7);
+        assert_eq!(process.allocation_count, 2);
+        assert_eq!(process.allocated_bytes, 400);
+        assert_eq!(process.committed_bytes, 100);
+        assert_eq!(process.resident_count, 1);
+        assert_eq!(process.resident_bytes, 100);
+        assert_eq!(process.context_count, 1);
+        assert_eq!(process.render_count, 1);
+        assert_eq!(process.render_bytes, 100);
+        assert_eq!(process.segment_id, NO_SUBOBJECT);
+        assert_eq!(process.node_ordinal, NO_SUBOBJECT);
+        assert_eq!(process.segment_budget, 0);
+        assert_eq!(process.segment_used, 0);
+
+        let foreign_process = subsystem
+            .d3dkmt_query_process_statistics(adapter, 9)
+            .expect("foreign process statistics");
+        assert_eq!(foreign_process.allocation_count, 1);
+        assert_eq!(foreign_process.allocated_bytes, 500);
+        assert_eq!(foreign_process.committed_bytes, 500);
+        assert_eq!(foreign_process.resident_count, 1);
+        assert_eq!(foreign_process.resident_bytes, 500);
+        assert_eq!(foreign_process.context_count, 0);
+        assert_eq!(foreign_process.render_count, 0);
+        assert_eq!(foreign_process.render_bytes, 0);
+
+        let local = subsystem
+            .d3dkmt_query_segment_statistics(adapter, 0)
+            .expect("local segment statistics");
+        assert_eq!(local.segment_id, 0);
+        assert_eq!(local.budget, budget);
+        assert_eq!(local.used, 100);
+        assert_eq!(local.allocation_count, 2);
+        assert_eq!(local.allocated_bytes, 400);
+        assert_eq!(local.committed_bytes, 100);
+        assert_eq!(local.resident_count, 1);
+        assert_eq!(local.resident_bytes, 100);
+        let non_local = subsystem
+            .d3dkmt_query_segment_statistics(adapter, 1)
+            .expect("non-local segment statistics");
+        assert_eq!(non_local.segment_id, 1);
+        assert_eq!(non_local.used, 500);
+        assert_eq!(non_local.allocation_count, 1);
+        assert_eq!(non_local.allocated_bytes, 500);
+        assert_eq!(non_local.committed_bytes, 500);
+        assert_eq!(non_local.resident_count, 1);
+        assert_eq!(non_local.resident_bytes, 500);
+
+        let scoped = subsystem
+            .d3dkmt_query_process_segment_statistics(adapter, 7, 0)
+            .expect("process segment statistics");
+        assert_eq!(scoped.process_id, 7);
+        assert_eq!(scoped.segment_id, 0);
+        assert_eq!(scoped.allocation_count, 2);
+        assert_eq!(scoped.allocated_bytes, 400);
+        assert_eq!(scoped.committed_bytes, 100);
+        assert_eq!(scoped.resident_count, 1);
+        assert_eq!(scoped.resident_bytes, 100);
+        assert_eq!(scoped.segment_budget, budget);
+        assert_eq!(scoped.segment_used, 100);
+        let other_segment = subsystem
+            .d3dkmt_query_process_segment_statistics(adapter, 7, 1)
+            .expect("process on an unused segment");
+        assert_eq!(other_segment.allocation_count, 0);
+        assert_eq!(other_segment.allocated_bytes, 0);
+        assert_eq!(other_segment.committed_bytes, 0);
+        assert_eq!(other_segment.resident_count, 0);
+        assert_eq!(other_segment.segment_used, 500);
+
+        let noded = subsystem
+            .d3dkmt_query_process_node_statistics(adapter, 7, RENDER_NODE_ORDINAL)
+            .expect("process node statistics");
+        assert_eq!(noded.process_id, 7);
+        assert_eq!(noded.node_ordinal, RENDER_NODE_ORDINAL);
+        assert_eq!(noded.segment_id, NO_SUBOBJECT);
+        assert_eq!(noded.allocation_count, 2);
+        assert_eq!(noded.render_count, 1);
+        assert_eq!(noded.render_bytes, 100);
+        assert_eq!(noded.context_count, 1);
+        let idle_process = subsystem
+            .d3dkmt_query_process_node_statistics(adapter, 9, RENDER_NODE_ORDINAL)
+            .expect("foreign process node statistics");
+        assert_eq!(idle_process.context_count, 0);
+        assert_eq!(idle_process.render_count, 0);
+
+        let grouped = subsystem
+            .d3dkmt_query_process_segment_group_statistics(adapter, 7, 0)
+            .expect("process segment group statistics");
+        assert_eq!(grouped.segment_id, 0);
+        assert_eq!(grouped.allocation_count, 2);
+        assert_eq!(grouped.committed_bytes, 100);
+        assert_eq!(grouped.segment_budget, budget);
+        assert_eq!(grouped.segment_used, 100);
+
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(adapter, D3DKMT_QUERYSTATISTICS_ADAPTER2, 0, 0)
+                .expect("adapter2 alias"),
+            subsystem
+                .d3dkmt_query_statistics_typed(adapter, D3DKMT_QUERYSTATISTICS_ADAPTER, 0, 0)
+                .expect("adapter")
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(
+                    adapter,
+                    D3DKMT_QUERYSTATISTICS_PROCESS_ADAPTER2,
+                    7,
+                    0
+                )
+                .expect("process adapter2 alias"),
+            subsystem
+                .d3dkmt_query_statistics_typed(
+                    adapter,
+                    D3DKMT_QUERYSTATISTICS_PROCESS_ADAPTER,
+                    7,
+                    0
+                )
+                .expect("process adapter")
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(adapter, D3DKMT_QUERYSTATISTICS_SEGMENT2, 0, 0)
+                .expect("segment2 alias"),
+            subsystem
+                .d3dkmt_query_statistics_typed(adapter, D3DKMT_QUERYSTATISTICS_SEGMENT, 0, 0)
+                .expect("segment")
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(
+                    adapter,
+                    D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT2,
+                    7,
+                    0
+                )
+                .expect("process segment2 alias"),
+            subsystem
+                .d3dkmt_query_statistics_typed(
+                    adapter,
+                    D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT,
+                    7,
+                    0
+                )
+                .expect("process segment")
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(adapter, D3DKMT_QUERYSTATISTICS_NODE2, 0, 0)
+                .expect("node2 alias"),
+            subsystem
+                .d3dkmt_query_statistics_typed(adapter, D3DKMT_QUERYSTATISTICS_NODE, 0, 0)
+                .expect("node")
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(adapter, D3DKMT_QUERYSTATISTICS_PROCESS_NODE2, 7, 0)
+                .expect("process node2 alias"),
+            subsystem
+                .d3dkmt_query_statistics_typed(adapter, D3DKMT_QUERYSTATISTICS_PROCESS_NODE, 7, 0)
+                .expect("process node")
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(
+                    adapter,
+                    D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP2,
+                    7,
+                    0
+                )
+                .expect("group2 alias"),
+            subsystem
+                .d3dkmt_query_statistics_typed(
+                    adapter,
+                    D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP,
+                    7,
+                    0
+                )
+                .expect("group")
+        );
+
+        for query_type in [
+            D3DKMT_QUERYSTATISTICS_VIDPNSOURCE,
+            D3DKMT_QUERYSTATISTICS_PROCESS_VIDPNSOURCE,
+            D3DKMT_QUERYSTATISTICS_HISTOGRAM,
+            D3DKMT_QUERYSTATISTICS_VIDPNSOURCE2,
+            D3DKMT_QUERYSTATISTICS_PROCESS_VIDPNSOURCE2,
+        ] {
+            let unsupported = subsystem
+                .d3dkmt_query_statistics_typed(adapter, query_type, 7, 0)
+                .unwrap_err();
+            assert_eq!(unsupported.status(), STATUS_NOT_SUPPORTED);
+            assert_eq!(
+                unsupported.detail(),
+                "query statistics class has no real backing on the Metal personality"
+            );
+        }
+        let undocumented = subsystem
+            .d3dkmt_query_statistics_typed(adapter, 21, 7, 0)
+            .unwrap_err();
+        assert_eq!(undocumented.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            undocumented.detail(),
+            "query statistics type is not a documented D3DKMT type"
+        );
+        let missing_segment = subsystem
+            .d3dkmt_query_segment_statistics(adapter, 2)
+            .unwrap_err();
+        assert_eq!(missing_segment.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            missing_segment.detail(),
+            "statistics segment id does not exist"
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_process_segment_statistics(adapter, 7, 2)
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(
+                    adapter,
+                    D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT,
+                    7,
+                    2,
+                )
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_process_node_statistics(adapter, 7, RENDER_NODE_COUNT)
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(
+                    adapter,
+                    D3DKMT_QUERYSTATISTICS_PROCESS_NODE,
+                    7,
+                    RENDER_NODE_COUNT,
+                )
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_process_segment_group_statistics(adapter, 7, 2)
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(
+                    adapter,
+                    D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP,
+                    7,
+                    2,
+                )
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(AdapterHandle(0xFFFF_FFFF), 0, 0, 0)
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+        );
+
+        let legacy_process = subsystem
+            .d3dkmt_query_statistics_for(adapter, D3DKMT_QUERYSTATISTICS_PROCESS, 7)
+            .expect("legacy process statistics");
+        assert_eq!(legacy_process.allocation_count, 2);
+        assert_eq!(legacy_process.allocated_bytes, 400);
+        assert_eq!(legacy_process.resident_count, 1);
+        assert_eq!(legacy_process.resident_bytes, 100);
+        assert_eq!(legacy_process.context_count, 1);
+        assert_eq!(legacy_process.render_count, 1);
+        let legacy_segment = subsystem
+            .d3dkmt_query_statistics_for(adapter, D3DKMT_QUERYSTATISTICS_SEGMENT, 0)
+            .expect("legacy segment statistics");
+        assert_eq!(legacy_segment.allocation_count, 2);
+        assert_eq!(legacy_segment.allocated_bytes, 400);
+        assert_eq!(legacy_segment.resident_count, 1);
+        assert_eq!(legacy_segment.resident_bytes, 100);
+
+        let global = subsystem.d3dkmt_query_global_statistics();
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_statistics_typed(adapter, D3DKMT_QUERYSTATISTICS_GLOBAL, 0, 0,)
+                .expect("typed global statistics"),
+            WddmStatisticsSnapshot::Adapter(global)
+        );
+        assert_eq!(global.allocation_count, 3);
+        assert_eq!(global.allocated_bytes, 900);
+        assert_eq!(global.resident_count, 2);
+        assert_eq!(global.resident_bytes, 600);
+        assert_eq!(global.context_count, 1);
+        assert_eq!(global.render_count, 1);
+        assert_eq!(global.render_bytes, 100);
+        assert_eq!(
+            subsystem
+                .allocation_info(second)
+                .expect("second allocation info")
+                .size,
+            300
+        );
+    }
+
+    #[test]
+    fn wddm_statistics_residency_destroy_and_budget_failures_are_exact() {
+        let subsystem = subsystem();
+        let adapter = open_adapter(&subsystem);
+        let budget = subsystem
+            .d3dkmt_query_adapter_info(adapter)
+            .expect("adapter info")
+            .segments[0]
+            .budget;
+        let device = create_device(&subsystem, adapter, false);
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_process_statistics(adapter, 7)
+                .expect("empty process statistics"),
+            WddmProcessStatistics {
+                process_id: 7,
+                segment_id: NO_SUBOBJECT,
+                node_ordinal: NO_SUBOBJECT,
+                ..WddmProcessStatistics::default()
+            }
+        );
+        let allocation = create_allocation_owned(&subsystem, device, 64, SEGMENT_LOCAL, 1, 7);
+        assert_eq!(subsystem.d3dkmt_make_resident(allocation, 7), Ok(1));
+        let over_budget = create_allocation_owned(
+            &subsystem,
+            device,
+            budget.saturating_add(1),
+            SEGMENT_LOCAL,
+            2,
+            7,
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_make_resident(over_budget, 7)
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_NO_VIDEO_MEMORY
+        );
+        let after_failure = subsystem
+            .d3dkmt_query_process_statistics(adapter, 7)
+            .expect("process statistics after budget failure");
+        assert_eq!(after_failure.allocation_count, 2);
+        assert_eq!(after_failure.committed_bytes, 64);
+        assert_eq!(after_failure.resident_count, 1);
+        assert_eq!(after_failure.resident_bytes, 64);
+        let after_failure_segment = subsystem
+            .d3dkmt_query_segment_statistics(adapter, 0)
+            .expect("segment after budget failure");
+        assert_eq!(after_failure_segment.used, 64);
+        assert_eq!(after_failure_segment.committed_bytes, 64);
+        assert_eq!(after_failure_segment.resident_count, 1);
+        assert_eq!(after_failure_segment.resident_bytes, 64);
+
+        assert_eq!(subsystem.d3dkmt_evict(allocation, 7), Ok(0));
+        let evicted = subsystem
+            .d3dkmt_query_process_statistics(adapter, 7)
+            .expect("process statistics after eviction");
+        assert_eq!(evicted.allocation_count, 2);
+        assert_eq!(evicted.allocated_bytes, budget.saturating_add(65));
+        assert_eq!(evicted.committed_bytes, 0);
+        assert_eq!(evicted.resident_count, 0);
+        assert_eq!(evicted.resident_bytes, 0);
+        let evicted_segment = subsystem
+            .d3dkmt_query_segment_statistics(adapter, 0)
+            .expect("segment after eviction");
+        assert_eq!(evicted_segment.used, 0);
+        assert_eq!(evicted_segment.committed_bytes, 0);
+        assert_eq!(evicted_segment.resident_count, 0);
+
+        assert_eq!(subsystem.d3dkmt_make_resident(allocation, 7), Ok(1));
+        assert_eq!(subsystem.d3dkmt_destroy_allocation(allocation), Ok(()));
+        assert_eq!(subsystem.d3dkmt_destroy_allocation(over_budget), Ok(()));
+        let destroyed = subsystem
+            .d3dkmt_query_process_statistics(adapter, 7)
+            .expect("process statistics after destroy");
+        assert_eq!(destroyed.allocation_count, 0);
+        assert_eq!(destroyed.allocated_bytes, 0);
+        assert_eq!(destroyed.committed_bytes, 0);
+        let destroyed_segment = subsystem
+            .d3dkmt_query_segment_statistics(adapter, 0)
+            .expect("segment after destroy");
+        assert_eq!(destroyed_segment.used, 0);
+        assert_eq!(destroyed_segment.allocation_count, 0);
+        assert_eq!(destroyed_segment.allocated_bytes, 0);
+        let idle = subsystem
+            .d3dkmt_query_process_statistics(adapter, 0xDEAD_BEEF)
+            .expect("unknown process statistics");
+        assert_eq!(
+            idle,
+            WddmProcessStatistics {
+                process_id: 0xDEAD_BEEF,
+                segment_id: NO_SUBOBJECT,
+                node_ordinal: NO_SUBOBJECT,
+                ..WddmProcessStatistics::default()
+            }
+        );
+        assert_eq!(subsystem.d3dkmt_destroy_device(device), Ok(()));
+        assert_eq!(subsystem.d3dkmt_query_global_statistics().context_count, 0);
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_segment_statistics(AdapterHandle(0xFFFF_FFFF), 0)
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+        );
+    }
+
+    #[test]
+    fn wddm_display_outputs_gamma_cursor_and_vidpn_ids_reject_invalid_targets() {
+        let subsystem = subsystem();
+        let adapter = open_adapter(&subsystem);
+        let outputs = subsystem
+            .d3dkmt_enum_outputs(adapter)
+            .expect("output enumeration");
+        assert!(!outputs.is_empty());
+        for (index, output) in outputs.iter().enumerate() {
+            assert_eq!(output.output_id, index as u32);
+            assert_eq!(output.vidpn_source_id, index as u32);
+            assert_eq!(output.vidpn_target_id, index as u32);
+            assert!(!output.modes.is_empty());
+        }
+        assert_eq!(
+            subsystem
+                .d3dkmt_output_display_modes(adapter, 0)
+                .expect("output modes"),
+            outputs[0].modes
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_source_display_modes(adapter, 0)
+                .expect("source modes"),
+            outputs[0].modes
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_vidpn_source_target(adapter, 0)
+                .expect("source/target"),
+            (0, 0)
+        );
+        let invalid_output = subsystem.d3dkmt_output_info(adapter, u32::MAX).unwrap_err();
+        assert_eq!(
+            invalid_output.status(),
+            STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+        );
+        assert_eq!(
+            invalid_output.detail(),
+            "VidPn target/output does not exist on this adapter"
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_output_display_modes(adapter, u32::MAX)
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+        );
+        let invalid_source = subsystem
+            .d3dkmt_source_display_modes(adapter, u32::MAX)
+            .unwrap_err();
+        assert_eq!(
+            invalid_source.status(),
+            STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE
+        );
+        assert_eq!(
+            invalid_source.detail(),
+            "VidPn source does not exist on this adapter"
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_vidpn_source_target(adapter, u32::MAX)
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_enum_outputs(AdapterHandle(0xFFFF_FFFF))
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+        );
+
+        let fallback = output_table(&[]);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].output_id, 0);
+        assert_eq!(fallback[0].vidpn_source_id, 0);
+        assert_eq!(fallback[0].vidpn_target_id, 0);
+        assert_eq!(fallback[0].name, "Offscreen Display");
+        assert_eq!(fallback[0].dpi_x, 96);
+        assert_eq!(fallback[0].modes, offscreen_modes());
+        assert_eq!(offscreen_modes().len(), 5);
+        assert_eq!(
+            offscreen_modes()[4],
+            DisplayModeInfo {
+                width: 1920,
+                height: 1080,
+                refresh_numerator: 60_000,
+                refresh_denominator: 1_000,
+            }
+        );
+
+        let identity = subsystem
+            .d3dkmt_get_gamma_ramp(adapter, 0)
+            .expect("default gamma ramp");
+        assert_eq!(identity, identity_gamma_ramp());
+        assert_eq!(identity.red[0], 0);
+        assert_eq!(identity.red[255], 65_535);
+        assert_eq!(identity.green[128], 128_u16 * 257);
+        assert_eq!(identity.blue[255], 65_535);
+
+        let red: Vec<u16> = (0..GAMMA_RAMP_ENTRIES).map(|value| value as u16).collect();
+        let green: Vec<u16> = (0..GAMMA_RAMP_ENTRIES)
+            .map(|value| (255 - value) as u16)
+            .collect();
+        let blue: Vec<u16> = (0..GAMMA_RAMP_ENTRIES)
+            .map(|value| (value * 2) as u16)
+            .collect();
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_gamma_ramp(adapter, 0, GAMMA_RAMP_TYPE_RAMP, &red, &green, &blue)
+                .expect("store gamma ramp"),
+            ()
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_get_gamma_ramp(adapter, 0)
+                .expect("stored gamma ramp"),
+            GammaRamp {
+                ramp_type: GAMMA_RAMP_TYPE_RAMP,
+                red: red.clone(),
+                green: green.clone(),
+                blue: blue.clone(),
+            }
+        );
+        let short = subsystem
+            .d3dkmt_set_gamma_ramp(adapter, 0, GAMMA_RAMP_TYPE_RAMP, &red[..255], &green, &blue)
+            .unwrap_err();
+        assert_eq!(short.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            short.detail(),
+            "gamma ramp requires exactly 256 entries per channel"
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_gamma_ramp(adapter, 0, GAMMA_RAMP_TYPE_RAMP, &red, &green[..1], &blue,)
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_gamma_ramp(adapter, 0, 9, &red, &green, &blue)
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        let identity_with_data = subsystem
+            .d3dkmt_set_gamma_ramp(adapter, 0, GAMMA_RAMP_TYPE_IDENTITY, &red, &[], &[])
+            .unwrap_err();
+        assert_eq!(identity_with_data.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            identity_with_data.detail(),
+            "identity gamma ramp takes no entries"
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_gamma_ramp(adapter, u32::MAX, GAMMA_RAMP_TYPE_IDENTITY, &[], &[], &[])
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_get_gamma_ramp(adapter, u32::MAX)
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_gamma_ramp(adapter, 0, GAMMA_RAMP_TYPE_IDENTITY, &[], &[], &[])
+                .expect("reset identity ramp"),
+            ()
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_get_gamma_ramp(adapter, 0)
+                .expect("identity ramp readback"),
+            identity_gamma_ramp()
+        );
+
+        let max_width = outputs[0]
+            .modes
+            .iter()
+            .map(|mode| mode.width)
+            .max()
+            .expect("output mode");
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_cursor_position(adapter, 0, 0, 0)
+                .expect("cursor position"),
+            ()
+        );
+        let positioned = subsystem.cursor_state(adapter, 0).expect("cursor state");
+        assert_eq!(positioned.x, 0);
+        assert_eq!(positioned.y, 0);
+        assert_eq!(positioned.visible, false);
+        let out_of_bounds = subsystem
+            .d3dkmt_set_cursor_position(adapter, 0, max_width as i32, 0)
+            .unwrap_err();
+        assert_eq!(out_of_bounds.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            out_of_bounds.detail(),
+            "cursor position is outside the output bounds"
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_cursor_position(adapter, 0, -1, 0)
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_cursor_position(adapter, 0, 0, -1)
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_cursor_position(adapter, u32::MAX, 0, 0)
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_cursor(adapter, 0, true, 2, 2, 0, 0, &[1, 2, 3, 4])
+                .expect("cursor shape"),
+            ()
+        );
+        let shaped = subsystem.cursor_state(adapter, 0).expect("shaped cursor");
+        assert_eq!(shaped.visible, true);
+        assert_eq!(shaped.width, 2);
+        assert_eq!(shaped.height, 2);
+        assert_eq!(shaped.hot_x, 0);
+        assert_eq!(shaped.hot_y, 0);
+        assert_eq!(shaped.pixels, vec![1, 2, 3, 4]);
+        let zero_visible = subsystem
+            .d3dkmt_set_cursor(adapter, 0, true, 0, 0, 0, 0, &[])
+            .unwrap_err();
+        assert_eq!(zero_visible.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            zero_visible.detail(),
+            "zero-sized cursor cannot be visible or carry pixels"
+        );
+        let oversized = subsystem
+            .d3dkmt_set_cursor(adapter, 0, true, MAX_CURSOR_DIMENSION + 1, 1, 0, 0, &[])
+            .unwrap_err();
+        assert_eq!(oversized.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            oversized.detail(),
+            "cursor dimensions exceed the maximum supported edge"
+        );
+        let bad_hotspot = subsystem
+            .d3dkmt_set_cursor(adapter, 0, true, 2, 2, 2, 0, &[1, 2, 3, 4])
+            .unwrap_err();
+        assert_eq!(bad_hotspot.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            bad_hotspot.detail(),
+            "cursor hot spot is outside the cursor shape"
+        );
+        let wrong_pixels = subsystem
+            .d3dkmt_set_cursor(adapter, 0, true, 2, 2, 0, 0, &[1, 2, 3])
+            .unwrap_err();
+        assert_eq!(wrong_pixels.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            wrong_pixels.detail(),
+            "cursor pixel count does not match width * height"
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_cursor(adapter, u32::MAX, false, 0, 0, 0, 0, &[])
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_set_cursor(adapter, 0, false, 0, 0, 0, 0, &[])
+                .expect("disable cursor"),
+            ()
+        );
+        let disabled = subsystem.cursor_state(adapter, 0).expect("disabled cursor");
+        assert_eq!(disabled.visible, false);
+        assert_eq!(disabled.width, 0);
+        assert_eq!(disabled.pixels, Vec::<u32>::new());
+        assert_eq!(
+            subsystem
+                .cursor_state(adapter, u32::MAX)
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+        );
+    }
+
+    #[test]
+    fn wddm_pnp_power_transitions_reject_misuse_and_invoke_d0_hooks() {
+        let subsystem = subsystem();
+        let adapter = open_adapter(&subsystem);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        subsystem.install_pnp_hooks(Arc::new(move |event| {
+            sink.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event);
+        }));
+        assert_eq!(
+            subsystem.power_state(adapter).expect("initial power state"),
+            WddmPowerState {
+                pnp_started: false,
+                component: POWER_COMPONENT_GPU,
+                power_state: POWER_STATE_D3,
+                d0_entry_count: 0,
+                d0_exit_count: 0,
+            }
+        );
+        let stopped = subsystem.d3dkmt_pnp_stop(adapter).unwrap_err();
+        assert_eq!(stopped.status(), STATUS_INVALID_DEVICE_STATE);
+        assert_eq!(stopped.detail(), "adapter PnP device is not started");
+        let cold_power = subsystem
+            .d3dkmt_power_component(adapter, POWER_COMPONENT_GPU, POWER_STATE_D0)
+            .unwrap_err();
+        assert_eq!(cold_power.status(), STATUS_INVALID_DEVICE_STATE);
+        assert_eq!(
+            cold_power.detail(),
+            "power transition on a stopped PnP device"
+        );
+        let bad_component = subsystem
+            .d3dkmt_power_component(adapter, 1, POWER_STATE_D0)
+            .unwrap_err();
+        assert_eq!(bad_component.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            bad_component.detail(),
+            "power component ordinal does not exist"
+        );
+        let bad_state = subsystem
+            .d3dkmt_power_component(adapter, POWER_COMPONENT_GPU, 2)
+            .unwrap_err();
+        assert_eq!(bad_state.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            bad_state.detail(),
+            "power component state is outside D0..D3"
+        );
+
+        assert_eq!(subsystem.driver_island_loaded(adapter), Ok(()));
+        assert_eq!(
+            subsystem.power_state(adapter).expect("loaded power state"),
+            WddmPowerState {
+                pnp_started: true,
+                component: POWER_COMPONENT_GPU,
+                power_state: POWER_STATE_D0,
+                d0_entry_count: 1,
+                d0_exit_count: 0,
+            }
+        );
+        let started_twice = subsystem.d3dkmt_pnp_start(adapter).unwrap_err();
+        assert_eq!(started_twice.status(), STATUS_INVALID_DEVICE_STATE);
+        assert_eq!(
+            started_twice.detail(),
+            "adapter PnP device is already started"
+        );
+        let same_power = subsystem
+            .d3dkmt_power_component(adapter, POWER_COMPONENT_GPU, POWER_STATE_D0)
+            .unwrap_err();
+        assert_eq!(same_power.status(), STATUS_INVALID_DEVICE_STATE);
+        assert_eq!(
+            same_power.detail(),
+            "power component is already in the requested state"
+        );
+        assert_eq!(
+            subsystem.d3dkmt_power_component(adapter, POWER_COMPONENT_GPU, POWER_STATE_D3),
+            Ok(())
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_power_component(adapter, POWER_COMPONENT_GPU, POWER_STATE_D3)
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_DEVICE_STATE
+        );
+        assert_eq!(
+            subsystem.d3dkmt_power_component(adapter, POWER_COMPONENT_GPU, POWER_STATE_D0),
+            Ok(())
+        );
+        assert_eq!(
+            subsystem.d3dkmt_power_component(adapter, POWER_COMPONENT_GPU, POWER_STATE_D3),
+            Ok(())
+        );
+        assert_eq!(subsystem.driver_island_unloaded(adapter), Ok(()));
+        let stopped_again = subsystem.d3dkmt_pnp_stop(adapter).unwrap_err();
+        assert_eq!(stopped_again.status(), STATUS_INVALID_DEVICE_STATE);
+        assert_eq!(
+            subsystem.power_state(adapter).expect("parked power state"),
+            WddmPowerState {
+                pnp_started: false,
+                component: POWER_COMPONENT_GPU,
+                power_state: POWER_STATE_D3,
+                d0_entry_count: 2,
+                d0_exit_count: 2,
+            }
+        );
+        assert_eq!(subsystem.driver_island_loaded(adapter), Ok(()));
+        assert_eq!(subsystem.driver_island_unloaded(adapter), Ok(()));
+        assert_eq!(
+            subsystem.power_state(adapter).expect("final power state"),
+            WddmPowerState {
+                pnp_started: false,
+                component: POWER_COMPONENT_GPU,
+                power_state: POWER_STATE_D3,
+                d0_entry_count: 3,
+                d0_exit_count: 3,
+            }
+        );
+        assert_eq!(
+            *events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![
+                WddmPnpEvent::EvtDeviceD0Entry { adapter_id: 0 },
+                WddmPnpEvent::EvtDeviceD0Exit { adapter_id: 0 },
+                WddmPnpEvent::EvtDeviceD0Entry { adapter_id: 0 },
+                WddmPnpEvent::EvtDeviceD0Exit { adapter_id: 0 },
+                WddmPnpEvent::EvtDeviceD0Entry { adapter_id: 0 },
+                WddmPnpEvent::EvtDeviceD0Exit { adapter_id: 0 },
+            ]
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_pnp_start(AdapterHandle(0xFFFF_FFFF))
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_pnp_stop(AdapterHandle(0xFFFF_FFFF))
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_power_component(
+                    AdapterHandle(0xFFFF_FFFF),
+                    POWER_COMPONENT_GPU,
+                    POWER_STATE_D0,
+                )
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+        );
+        assert_eq!(
+            subsystem
+                .power_state(AdapterHandle(0xFFFF_FFFF))
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
         );
     }
 }

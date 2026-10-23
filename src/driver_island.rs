@@ -97,6 +97,22 @@ const SERVICE_AUTO_START: u32 = 2;
 const SERVICE_DEMAND_START: u32 = 3;
 /// `SERVICE_DISABLED`.
 const SERVICE_DISABLED: u32 = 4;
+/// `IRP_MN_START_DEVICE`.
+const IRP_MN_START_DEVICE: u8 = 0x00;
+/// `IRP_MN_REMOVE_DEVICE`.
+const IRP_MN_REMOVE_DEVICE: u8 = 0x02;
+/// `IRP_MN_STOP_DEVICE`.
+const IRP_MN_STOP_DEVICE: u8 = 0x04;
+/// `IRP_MN_SET_POWER` (the only power minor the island model implements).
+const IRP_MN_SET_POWER: u8 = 0x02;
+/// `DevicePowerState` — the only `POWER_STATE_TYPE` the island accepts.
+const POWER_STATE_TYPE_DEVICE: u32 = 1;
+/// `WdfPowerDeviceD0`.
+const WDF_POWER_DEVICE_D0: u32 = 1;
+/// `WdfPowerDeviceD3`.
+const WDF_POWER_DEVICE_D3: u32 = 4;
+/// `WdfPowerDeviceD3Final`, the previous state reported to the first D0Entry.
+const WDF_POWER_DEVICE_D3_FINAL: u32 = 5;
 
 /// `STATUS_IMAGE_ALREADY_LOADED` — the service is already loaded.
 const STATUS_IMAGE_ALREADY_LOADED: i32 = 0xC000_010Eu32 as i32;
@@ -157,6 +173,9 @@ enum PendingPurpose {
     IoDispatch {
         request: u64,
     },
+    FileDispatch {
+        request: u64,
+    },
     IoTargetSend {
         pending: Box<PendingIoTargetSend>,
     },
@@ -164,6 +183,37 @@ enum PendingPurpose {
         remaining: Vec<GuestCallback>,
         dispatch_next: bool,
     },
+    PnpSequence {
+        device: u64,
+        irp_guest: u64,
+        current_required: bool,
+        remaining: VecDeque<PnpStep>,
+        rollback: VecDeque<GuestCallback>,
+        failure_status: Option<i32>,
+        final_state: PnpFinalState,
+    },
+}
+
+/// One guest callback in a PnP/power transition.  `required` callbacks fail
+/// the transition when they return a negative NTSTATUS; informational ones
+/// (void framework callbacks) only record their execution.
+#[derive(Debug, Clone)]
+struct PnpStep {
+    entry: u64,
+    args: Vec<u64>,
+    label: &'static str,
+    required: bool,
+    rollback: Vec<GuestCallback>,
+}
+
+/// Device state applied when every step of a PnP/power transition succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PnpFinalState {
+    Started,
+    Stopped,
+    Removed,
+    PowerD0,
+    PowerD3,
 }
 
 struct PendingIoTargetSend {
@@ -184,12 +234,42 @@ struct PendingIoTargetSend {
 }
 
 /// One real (guest-visible) KMDF object.
+/// `WDF_PNPPOWER_EVENT_CALLBACKS` subset the framework invokes through the
+/// island.  Only callbacks a driver actually registers are non-zero.
+#[derive(Debug, Clone, Copy, Default)]
+struct KmdfPnpPowerCallbacks {
+    prepare_hardware: u64,
+    release_hardware: u64,
+    d0_entry: u64,
+    d0_exit: u64,
+    self_managed_io_init: u64,
+    self_managed_io_suspend: u64,
+    self_managed_io_restart: u64,
+    self_managed_io_fini: u64,
+}
+
+/// `WDF_FILEOBJECT_CONFIG` subset: the cleanup/close callbacks that map onto
+/// `IRP_MJ_CLEANUP` and `IRP_MJ_CLOSE`.
+#[derive(Debug, Clone, Copy, Default)]
+struct KmdfFileObjectConfig {
+    evt_file_cleanup: u64,
+    evt_file_close: u64,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct KmdfDeviceInit {
     device_type: u32,
     io_type: u32,
     name: Option<String>,
+    pnp_power: KmdfPnpPowerCallbacks,
+    file_object: KmdfFileObjectConfig,
+    is_pdo: bool,
+    parent_device: Option<u64>,
+    device_id: Option<String>,
+    hardware_ids: Vec<String>,
+    compatible_ids: Vec<String>,
+    instance_id: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -199,6 +279,32 @@ struct KmdfDevice {
     casak: ObjectId,
     name: String,
     context_guest: u64,
+    pnp_power: KmdfPnpPowerCallbacks,
+    file_cleanup: u64,
+    file_close: u64,
+    file_object: u64,
+    power_state: u32,
+    started: bool,
+    removed: bool,
+    device_id: Option<String>,
+    hardware_ids: Vec<String>,
+    compatible_ids: Vec<String>,
+    instance_id: Option<String>,
+}
+
+/// One `WDFMEMORY` allocation: the framework object owns this guest buffer.
+#[derive(Debug, Clone)]
+struct KmdfMemory {
+    buffer: u64,
+    size: usize,
+}
+
+/// One `WDFSTRING` allocation: an owned copy of the source `UNICODE_STRING`.
+#[derive(Debug, Clone)]
+struct KmdfString {
+    buffer: u64,
+    length: u16,
+    maximum: u16,
 }
 
 #[allow(dead_code)]
@@ -265,6 +371,9 @@ enum KmdfObjectKind {
     Request,
     WaitLock,
     IoTarget,
+    FileObject,
+    Memory,
+    String,
 }
 
 impl KmdfObjectKind {
@@ -279,6 +388,9 @@ impl KmdfObjectKind {
             Self::Request => (0x80, 8),
             Self::WaitLock => (0x20, 8),
             Self::IoTarget => (0x80, 8),
+            Self::FileObject => (0x40, 8),
+            Self::Memory => (0x40, 8),
+            Self::String => (0x20, 8),
         }
     }
 }
@@ -344,6 +456,8 @@ struct KmdfState {
     iotargets: BTreeMap<u64, KmdfIoTarget>,
     objects: BTreeMap<u64, KmdfObject>,
     wait_locks: BTreeMap<u64, KmdfWaitLock>,
+    memories: BTreeMap<u64, KmdfMemory>,
+    strings: BTreeMap<u64, KmdfString>,
     framework_dispatch: u64,
     framework_dispatches: BTreeMap<u8, u64>,
     current_irp_guest: u64,
@@ -358,6 +472,13 @@ struct KmdfState {
     write_dispatches: u64,
     cleanup_dispatches: u64,
     close_dispatches: u64,
+    file_cleanup_dispatches: u64,
+    file_close_dispatches: u64,
+    pnp_start_dispatches: u64,
+    pnp_stop_dispatches: u64,
+    pnp_remove_dispatches: u64,
+    power_d0_dispatches: u64,
+    power_d3_dispatches: u64,
     queued_dispatches: u64,
     manual_retrievals: u64,
     cancel_dispatches: u64,
@@ -471,6 +592,36 @@ pub enum DriverShim {
     WdfEvtIoCleanupDispatch,
     /// Framework-installed `IRP_MJ_CLOSE` dispatch.
     WdfEvtIoCloseDispatch,
+    /// KMDF subset: `WdfDeviceInitSetPnpPowerEventCallbacks`.
+    WdfDeviceInitSetPnpPowerEventCallbacks,
+    /// KMDF subset: `WdfDeviceInitSetFileObjectConfig`.
+    WdfDeviceInitSetFileObjectConfig,
+    /// KMDF subset: `WdfMemoryCreate`.
+    WdfMemoryCreate,
+    /// KMDF subset: `WdfMemoryCreatePreallocated`.
+    WdfMemoryCreatePreallocated,
+    /// KMDF subset: `WdfMemoryGetBuffer`.
+    WdfMemoryGetBuffer,
+    /// KMDF subset: `WdfStringCreate`.
+    WdfStringCreate,
+    /// KMDF subset: `WdfStringGetUnicodeString`.
+    WdfStringGetUnicodeString,
+    /// KMDF subset: `WdfDeviceEnqueueRequest`.
+    WdfDeviceEnqueueRequest,
+    /// KMDF subset: `WdfPdoInitAllocate`.
+    WdfPdoInitAllocate,
+    /// KMDF subset: `WdfPdoInitAssignDeviceID`.
+    WdfPdoInitAssignDeviceID,
+    /// KMDF subset: `WdfPdoInitAssignInstanceID`.
+    WdfPdoInitAssignInstanceID,
+    /// KMDF subset: `WdfPdoInitAddHardwareID`.
+    WdfPdoInitAddHardwareID,
+    /// KMDF subset: `WdfPdoInitAddCompatibleID`.
+    WdfPdoInitAddCompatibleID,
+    /// Framework-installed `IRP_MJ_PNP` dispatch.
+    WdfEvtPnpDispatch,
+    /// Framework-installed `IRP_MJ_POWER` dispatch.
+    WdfEvtPowerDispatch,
 }
 
 impl DriverShim {
@@ -524,6 +675,23 @@ impl DriverShim {
             "wdfioqueuepurge" => Some(Self::WdfIoQueuePurge),
             "wdfioqueuepurgesynchronously" => Some(Self::WdfIoQueuePurgeSynchronously),
             "wdfioqueuestart" => Some(Self::WdfIoQueueStart),
+            "wdfdeviceinitsetpnppowereventcallbacks" => {
+                Some(Self::WdfDeviceInitSetPnpPowerEventCallbacks)
+            }
+            "wdfdeviceinitsetfileobjectconfig" => Some(Self::WdfDeviceInitSetFileObjectConfig),
+            "wdfmemorycreate" => Some(Self::WdfMemoryCreate),
+            "wdfmemorycreatepreallocated" => Some(Self::WdfMemoryCreatePreallocated),
+            "wdfmemorygetbuffer" => Some(Self::WdfMemoryGetBuffer),
+            "wdfmemorydelete" => Some(Self::WdfObjectDelete),
+            "wdfstringcreate" => Some(Self::WdfStringCreate),
+            "wdfstringgetunicodestring" => Some(Self::WdfStringGetUnicodeString),
+            "wdfstringdelete" => Some(Self::WdfObjectDelete),
+            "wdfdeviceenqueuerequest" => Some(Self::WdfDeviceEnqueueRequest),
+            "wdfpdoinitallocate" => Some(Self::WdfPdoInitAllocate),
+            "wdfpdoinitassigndeviceid" => Some(Self::WdfPdoInitAssignDeviceID),
+            "wdfpdoinitassigninstanceid" => Some(Self::WdfPdoInitAssignInstanceID),
+            "wdfpdoinitaddhardwareid" => Some(Self::WdfPdoInitAddHardwareID),
+            "wdfpdoinitaddcompatibleid" => Some(Self::WdfPdoInitAddCompatibleID),
             _ => None,
         }
     }
@@ -576,7 +744,22 @@ impl DriverShim {
             | Self::WdfEvtIoWriteDispatch
             | Self::WdfEvtIoDeviceControlDispatch
             | Self::WdfEvtIoCleanupDispatch
-            | Self::WdfEvtIoCloseDispatch => 8,
+            | Self::WdfEvtIoCloseDispatch
+            | Self::WdfEvtPnpDispatch
+            | Self::WdfEvtPowerDispatch => 8,
+            Self::WdfDeviceInitSetPnpPowerEventCallbacks
+            | Self::WdfDeviceInitSetFileObjectConfig => 8,
+            Self::WdfMemoryCreate => 24,
+            Self::WdfMemoryCreatePreallocated => 16,
+            Self::WdfMemoryGetBuffer => 8,
+            Self::WdfStringCreate => 12,
+            Self::WdfStringGetUnicodeString => 8,
+            Self::WdfDeviceEnqueueRequest => 8,
+            Self::WdfPdoInitAllocate => 4,
+            Self::WdfPdoInitAssignDeviceID
+            | Self::WdfPdoInitAssignInstanceID
+            | Self::WdfPdoInitAddHardwareID
+            | Self::WdfPdoInitAddCompatibleID => 8,
         }
     }
 }
@@ -626,6 +809,7 @@ struct IslandState {
     irp_guests: BTreeMap<IrpId, u64>,
     symbolic_links: Vec<(String, String)>,
     kmdf: KmdfState,
+    removed_device_objects: BTreeSet<u64>,
     arena: IslandArena,
 }
 
@@ -728,10 +912,10 @@ impl DriverIsland {
             return Err(AppError::new(
                 ReasonCode::RcImportMissing,
                 format!(
-                    "unresolved driver imports: {}",
+                    "unsupported or unresolved driver imports: {}",
                     unresolved
                         .iter()
-                        .map(|(dll, symbol, _)| format!("{dll}!{symbol}"))
+                        .map(|(dll, symbol, set)| format!("{set:?}:{dll}!{symbol}"))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -793,6 +977,7 @@ impl DriverIsland {
             irp_guests: BTreeMap::new(),
             symbolic_links: Vec::new(),
             kmdf: KmdfState::default(),
+            removed_device_objects: BTreeSet::new(),
             arena: IslandArena {
                 cursor: arena_base,
                 end: arena_base + ARENA_SIZE,
@@ -1331,6 +1516,7 @@ impl DriverIsland {
     /// invoke the driver's real `MajorFunction` guest code with the guest IRP
     /// pointer.  Returns `(NTSTATUS, Information)`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_irp(
         &self,
         runtime: &mut PeHostRuntime,
@@ -1344,14 +1530,105 @@ impl DriverIsland {
         output_len: u32,
         byte_offset: u64,
     ) -> AppResult<(i32, usize)> {
+        self.dispatch_irp_inner(
+            runtime,
+            memory,
+            device_guest,
+            major,
+            0,
+            None,
+            io_control_code,
+            input_ptr,
+            input_len,
+            output_ptr,
+            output_len,
+            byte_offset,
+        )
+    }
+
+    /// Deliver one real `IRP_MJ_PNP` IRP with `minor` to the device's PnP
+    /// handler (the framework dispatch for a KMDF device).
+    #[allow(dead_code)]
+    pub(crate) fn dispatch_pnp(
+        &self,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        device_guest: u64,
+        minor: u8,
+    ) -> AppResult<(i32, usize)> {
+        self.dispatch_irp_inner(
+            runtime,
+            memory,
+            device_guest,
+            IrpMajorFunction::Pnp,
+            minor,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+
+    /// Deliver one real `IRP_MJ_POWER`/`IRP_MN_SET_POWER` IRP that asks the
+    /// device to enter `power_state` (`WdfPowerDeviceD0`/`WdfPowerDeviceD3`).
+    #[allow(dead_code)]
+    pub(crate) fn set_device_power(
+        &self,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        device_guest: u64,
+        power_state: u32,
+    ) -> AppResult<(i32, usize)> {
+        self.dispatch_irp_inner(
+            runtime,
+            memory,
+            device_guest,
+            IrpMajorFunction::Power,
+            IRP_MN_SET_POWER,
+            Some(power_state),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_irp_inner(
+        &self,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        device_guest: u64,
+        major: IrpMajorFunction,
+        minor: u8,
+        power_state: Option<u32>,
+        io_control_code: u32,
+        input_ptr: u64,
+        input_len: u32,
+        output_ptr: u64,
+        output_len: u32,
+        byte_offset: u64,
+    ) -> AppResult<(i32, usize)> {
         let inner = self.inner.clone();
         let (arch, default_dispatch, irp, irp_guest, stack_guest, system_buffer_guest, handler) = {
             let mut state = inner.borrow_mut();
+            if state.removed_device_objects.contains(&device_guest) {
+                return Ok((STATUS_INVALID_DEVICE_REQUEST, 0));
+            }
             let Some(casak_device) = state.device_ids.get(&device_guest).copied() else {
                 return Ok((STATUS_INVALID_HANDLE, 0));
             };
-            let buffer_len = input_len.max(output_len) as usize;
-            let parameters = IrpParameterBlock::new(major, 0, input_len as usize);
+            let buffer_len = if matches!(major, IrpMajorFunction::Pnp | IrpMajorFunction::Power) {
+                0
+            } else {
+                input_len.max(output_len) as usize
+            };
+            let parameters = IrpParameterBlock::new(major, minor, input_len as usize);
             let irp = match state.io.allocate_irp(casak_device, parameters) {
                 Ok(irp) => irp,
                 Err(status) => return Ok((status, 0)),
@@ -1459,6 +1736,8 @@ impl DriverIsland {
             device_guest,
             output_ptr,
             major,
+            minor,
+            power_state,
             io_control_code,
             input_len,
             output_len,
@@ -1543,6 +1822,7 @@ fn io_stack_location_size(arch: GuestArch) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn build_guest_irp(
     memory: &mut MemoryImage,
     arch: GuestArch,
@@ -1552,6 +1832,8 @@ fn build_guest_irp(
     device_object: u64,
     user_buffer: u64,
     major: IrpMajorFunction,
+    minor: u8,
+    power_state: Option<u32>,
     io_control_code: u32,
     input_length: u32,
     output_length: u32,
@@ -1586,12 +1868,16 @@ fn build_guest_irp(
     write_guest_pointer(memory, irp + stack_pointer_offset, stack, arch)?;
 
     memory.write_u8(stack, major.code());
-    memory.write_u8(stack + 1, 0);
+    memory.write_u8(stack + 1, minor);
     memory.write_u8(stack + 2, 0);
     memory.write_u8(stack + 3, 0);
     match arch {
         GuestArch::X64 => {
             match major {
+                IrpMajorFunction::Power => {
+                    memory.write_u32(stack + 0x08, POWER_STATE_TYPE_DEVICE);
+                    memory.write_u32(stack + 0x10, power_state.unwrap_or(WDF_POWER_DEVICE_D0));
+                }
                 IrpMajorFunction::DeviceControl => {
                     memory.write_u32(stack + 0x08, output_length);
                     memory.write_u32(stack + 0x10, input_length);
@@ -1609,6 +1895,10 @@ fn build_guest_irp(
         }
         GuestArch::X86 => {
             match major {
+                IrpMajorFunction::Power => {
+                    memory.write_u32(stack + 0x04, POWER_STATE_TYPE_DEVICE);
+                    memory.write_u32(stack + 0x08, power_state.unwrap_or(WDF_POWER_DEVICE_D0));
+                }
                 IrpMajorFunction::DeviceControl => {
                     memory.write_u32(stack + 0x04, output_length);
                     memory.write_u32(stack + 0x08, input_length);
@@ -1776,6 +2066,39 @@ impl IslandState {
             DriverShim::WdfEvtIoCloseDispatch => {
                 return self.wdf_dispatch(IrpMajorFunction::Close, state, memory);
             }
+            DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks => {
+                self.wdf_device_init_set_pnp_power_callbacks(state, memory)?
+            }
+            DriverShim::WdfDeviceInitSetFileObjectConfig => {
+                self.wdf_device_init_set_file_object_config(state, memory)?
+            }
+            DriverShim::WdfMemoryCreate => self.wdf_memory_create(state, memory, false)?,
+            DriverShim::WdfMemoryCreatePreallocated => {
+                self.wdf_memory_create(state, memory, true)?
+            }
+            DriverShim::WdfMemoryGetBuffer => self.wdf_memory_get_buffer(state, memory)?,
+            DriverShim::WdfStringCreate => self.wdf_string_create(state, memory)?,
+            DriverShim::WdfStringGetUnicodeString => {
+                self.wdf_string_get_unicode_string(state, memory)?
+            }
+            DriverShim::WdfDeviceEnqueueRequest => {
+                return self.wdf_device_enqueue_request(state, memory);
+            }
+            DriverShim::WdfPdoInitAllocate => self.wdf_pdo_init_allocate(state, memory)?,
+            DriverShim::WdfPdoInitAssignDeviceID => {
+                self.wdf_pdo_init_set_id(state, memory, false)?
+            }
+            DriverShim::WdfPdoInitAssignInstanceID => {
+                self.wdf_pdo_init_set_id(state, memory, true)?
+            }
+            DriverShim::WdfPdoInitAddHardwareID => {
+                self.wdf_pdo_init_add_id(state, memory, false)?
+            }
+            DriverShim::WdfPdoInitAddCompatibleID => {
+                self.wdf_pdo_init_add_id(state, memory, true)?
+            }
+            DriverShim::WdfEvtPnpDispatch => return self.wdf_pnp_dispatch(state, memory),
+            DriverShim::WdfEvtPowerDispatch => return self.wdf_power_dispatch(state, memory),
         }
         Ok(None)
     }
@@ -1811,6 +2134,70 @@ impl IslandState {
                 self.kmdf.current_request = 0;
                 set_status(state, status);
                 return self.dispatch_next_queued(memory);
+            }
+            PendingPurpose::FileDispatch { request } => {
+                self.complete_kmdf_request(memory, request, STATUS_SUCCESS, 0)?;
+                self.kmdf.current_request = 0;
+                set_status(state, STATUS_SUCCESS);
+                return self.dispatch_next_queued(memory);
+            }
+            PendingPurpose::PnpSequence {
+                device,
+                irp_guest,
+                current_required,
+                mut remaining,
+                mut rollback,
+                failure_status,
+                final_state,
+            } => {
+                let mut failure = failure_status;
+                if failure.is_none() && current_required && callback_status < 0 {
+                    failure = Some(callback_status);
+                }
+                if let Some(status) = failure {
+                    if let Some(call) = rollback.pop_front() {
+                        return Ok(Some(PendingGuestCall {
+                            entry: call.entry,
+                            args: call.args,
+                            label: call.label,
+                            purpose: PendingPurpose::PnpSequence {
+                                device,
+                                irp_guest,
+                                current_required: false,
+                                remaining: VecDeque::new(),
+                                rollback,
+                                failure_status: Some(status),
+                                final_state,
+                            },
+                        }));
+                    }
+                    self.purge_deleted_objects();
+                    self.write_irp_status(memory, irp_guest, status, 0)?;
+                    set_status(state, status);
+                    return Ok(None);
+                }
+                if let Some(next) = remaining.pop_front() {
+                    let rollback = VecDeque::from(next.rollback.clone());
+                    let current_required = next.required;
+                    return Ok(Some(PendingGuestCall {
+                        entry: next.entry,
+                        args: next.args,
+                        label: next.label,
+                        purpose: PendingPurpose::PnpSequence {
+                            device,
+                            irp_guest,
+                            current_required,
+                            remaining,
+                            rollback,
+                            failure_status: None,
+                            final_state,
+                        },
+                    }));
+                }
+                self.apply_pnp_final_state(device, final_state);
+                self.purge_deleted_objects();
+                self.write_irp_status(memory, irp_guest, STATUS_SUCCESS, 0)?;
+                set_status(state, STATUS_SUCCESS);
             }
             PendingPurpose::Callbacks {
                 mut remaining,
@@ -2086,6 +2473,8 @@ impl IslandState {
         }
         self.kmdf.device_inits.remove(&handle);
         self.kmdf.iotargets.remove(&handle);
+        self.kmdf.memories.remove(&handle);
+        self.kmdf.strings.remove(&handle);
         if let Some(lock) = self.kmdf.wait_locks.remove(&handle) {
             let (gate, wake) = &*lock.gate;
             if let Ok(mut locked) = gate.lock() {
@@ -2597,6 +2986,8 @@ impl IslandState {
                 DriverShim::WdfEvtIoCleanupDispatch,
             ),
             (IrpMajorFunction::Close, DriverShim::WdfEvtIoCloseDispatch),
+            (IrpMajorFunction::Pnp, DriverShim::WdfEvtPnpDispatch),
+            (IrpMajorFunction::Power, DriverShim::WdfEvtPowerDispatch),
         ];
         // `WdfDriverInitNoDispatchOverride` leaves the driver's own
         // MajorFunction table untouched.
@@ -2645,6 +3036,14 @@ impl IslandState {
                 device_type: 0,
                 io_type: 0,
                 name: None,
+                pnp_power: KmdfPnpPowerCallbacks::default(),
+                file_object: KmdfFileObjectConfig::default(),
+                is_pdo: false,
+                parent_device: None,
+                device_id: None,
+                hardware_ids: Vec::new(),
+                compatible_ids: Vec::new(),
+                instance_id: None,
             },
         );
         Ok(Some(PendingGuestCall {
@@ -2764,11 +3163,14 @@ impl IslandState {
             .get(&handle)
             .is_some_and(|object| object.parent.is_none())
         {
-            let driver = self.kmdf.driver_handle;
+            let parent = init
+                .parent_device
+                .filter(|parent| self.kmdf.devices.contains_key(parent))
+                .unwrap_or(self.kmdf.driver_handle);
             if let Some(object) = self.kmdf.objects.get_mut(&handle) {
-                object.parent = Some(driver);
+                object.parent = Some(parent);
             }
-            if let Some(object) = self.kmdf.objects.get_mut(&driver) {
+            if let Some(object) = self.kmdf.objects.get_mut(&parent) {
                 object.children.insert(handle);
             }
         }
@@ -2785,6 +3187,17 @@ impl IslandState {
                 casak,
                 name,
                 context_guest,
+                pnp_power: init.pnp_power,
+                file_cleanup: init.file_object.evt_file_cleanup,
+                file_close: init.file_object.evt_file_close,
+                file_object: 0,
+                power_state: WDF_POWER_DEVICE_D3,
+                started: false,
+                removed: false,
+                device_id: init.device_id,
+                hardware_ids: init.hardware_ids,
+                compatible_ids: init.compatible_ids,
+                instance_id: init.instance_id,
             },
         );
         self.kmdf.devices_by_object.insert(guest, handle);
@@ -3119,14 +3532,40 @@ impl IslandState {
             state.set(Register::Rax, 0);
             return Ok(());
         };
+        if type_info == 0 {
+            state.set(Register::Rax, object.context_guest);
+            return Ok(());
+        }
+        let type_info_size = match self.arch {
+            GuestArch::X64 => 0x18,
+            GuestArch::X86 => 0x0C,
+        };
+        let type_size = if crate::host_thunks::validate_guest_pointer(
+            memory,
+            type_info,
+            type_info_size,
+        )
+        .is_ok()
+        {
+            self.context_type_size(memory, type_info)?
+        } else {
+            0
+        };
         let extra = object
             .extra_contexts
             .iter()
-            .find_map(|(registered_type, context, _)| {
-                (type_info == 0 || *registered_type == type_info).then_some(*context)
+            .find_map(|(registered_type, context, size)| {
+                (*registered_type == type_info && *size >= type_size).then_some(*context)
             });
-        let context = extra.unwrap_or(object.context_guest);
-        state.set(Register::Rax, context);
+        if let Some(context) = extra {
+            state.set(Register::Rax, context);
+            return Ok(());
+        }
+        if type_size > object.context_size {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        state.set(Register::Rax, object.context_guest);
         Ok(())
     }
 
@@ -3319,6 +3758,35 @@ impl IslandState {
         Ok(())
     }
 
+    /// Lazily create the single `WDFFILEOBJECT` the island associates with
+    /// this device's cleanup/close IRPs.
+    fn ensure_file_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        device_handle: u64,
+    ) -> AppResult<u64> {
+        if let Some(existing) = self
+            .kmdf
+            .devices
+            .get(&device_handle)
+            .map(|device| device.file_object)
+            .filter(|object| *object != 0)
+        {
+            return Ok(existing);
+        }
+        let object = self.create_kmdf_object(memory, KmdfObjectKind::FileObject, 0)?;
+        if let Some(device) = self.kmdf.objects.get_mut(&device_handle) {
+            device.children.insert(object);
+        }
+        if let Some(file) = self.kmdf.objects.get_mut(&object) {
+            file.parent = Some(device_handle);
+        }
+        if let Some(device) = self.kmdf.devices.get_mut(&device_handle) {
+            device.file_object = object;
+        }
+        Ok(object)
+    }
+
     fn choose_queue(&self, device_handle: u64) -> Option<u64> {
         self.kmdf
             .queues
@@ -3446,10 +3914,15 @@ impl IslandState {
             .get(&handle)
             .map(|object| object.context_guest)
             .unwrap_or(handle + 0x80);
+        let parent = if queue_handle != 0 {
+            queue_handle
+        } else {
+            device_handle
+        };
         if let Some(object) = self.kmdf.objects.get_mut(&handle) {
-            object.parent = Some(queue_handle);
+            object.parent = Some(parent);
         }
-        if let Some(object) = self.kmdf.objects.get_mut(&queue_handle) {
+        if let Some(object) = self.kmdf.objects.get_mut(&parent) {
             object.children.insert(handle);
         }
         self.kmdf.requests.insert(
@@ -3466,7 +3939,7 @@ impl IslandState {
                 status: STATUS_SUCCESS,
                 information: 0,
                 context_guest,
-                queue: Some(queue_handle),
+                queue: (queue_handle != 0).then_some(queue_handle),
                 outer_irp_guest,
                 major,
                 target: None,
@@ -3493,6 +3966,55 @@ impl IslandState {
             set_status(state, STATUS_INVALID_DEVICE_REQUEST);
             return Ok(None);
         };
+        let file_callback = self
+            .kmdf
+            .devices
+            .get(&device_handle)
+            .map_or(0, |device| match major {
+                IrpMajorFunction::Cleanup => device.file_cleanup,
+                IrpMajorFunction::Close => device.file_close,
+                _ => 0,
+            });
+        if file_callback != 0 {
+            let request = match self.new_kmdf_request(
+                memory,
+                device_handle,
+                0,
+                major,
+                0,
+                0,
+                0,
+                0,
+                0,
+                irp_guest,
+            )? {
+                Ok(request) => request,
+                Err(status) => {
+                    self.write_outer_irp_status(memory, status, 0)?;
+                    set_status(state, status);
+                    return Ok(None);
+                }
+            };
+            let file_object = self.ensure_file_object(memory, device_handle)?;
+            if major == IrpMajorFunction::Cleanup {
+                self.kmdf.file_cleanup_dispatches += 1;
+            } else {
+                self.kmdf.file_close_dispatches += 1;
+            }
+            self.kmdf.current_request = request;
+            self.write_outer_irp_status(memory, STATUS_PENDING, 0)?;
+            set_status(state, STATUS_PENDING);
+            return Ok(Some(PendingGuestCall {
+                entry: file_callback,
+                args: vec![device_handle, request, file_object],
+                label: if major == IrpMajorFunction::Cleanup {
+                    "EvtFileCleanup"
+                } else {
+                    "EvtFileClose"
+                },
+                purpose: PendingPurpose::FileDispatch { request },
+            }));
+        }
         let Some(queue_handle) = self.choose_queue(device_handle) else {
             self.write_outer_irp_status(memory, STATUS_INVALID_DEVICE_REQUEST, 0)?;
             set_status(state, STATUS_INVALID_DEVICE_REQUEST);
@@ -4121,6 +4643,8 @@ impl IslandState {
             device.object_guest,
             output_ptr,
             IrpMajorFunction::DeviceControl,
+            0,
+            None,
             io_control,
             input.len() as u32,
             output_len as u32,
@@ -4404,6 +4928,863 @@ impl IslandState {
         write_guest_pointer(memory, context_out, context_guest, self.arch)?;
         set_status(state, STATUS_SUCCESS);
         Ok(())
+    }
+
+    /// Parse `WDF_PNPPOWER_EVENT_CALLBACKS` for a device-init handle.  The
+    /// `Size` member bounds which callbacks are honored, exactly like the
+    /// forward-compatible KMDF structure contract.
+    fn wdf_device_init_set_pnp_power_callbacks(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let init = guest_arg(state, memory, 0)?;
+        let callbacks = guest_arg(state, memory, 1)?;
+        if !self.kmdf.device_inits.contains_key(&init)
+            || callbacks == 0
+            || crate::host_thunks::validate_guest_pointer(memory, callbacks, 4).is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let size = memory.read_u32(callbacks)? as u64;
+        if size < 4 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let pointer = self.arch.pointer_bytes() as u64;
+        let offsets: [u64; 8] = match self.arch {
+            GuestArch::X64 => [0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x50],
+            GuestArch::X86 => [0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x28],
+        };
+        let mut parsed = KmdfPnpPowerCallbacks::default();
+        let read = |offset: u64| -> AppResult<u64> {
+            if size >= offset + pointer {
+                read_guest_pointer(memory, callbacks + offset, self.arch)
+            } else {
+                Ok(0)
+            }
+        };
+        parsed.prepare_hardware = read(offsets[0])?;
+        parsed.release_hardware = read(offsets[1])?;
+        parsed.d0_entry = read(offsets[2])?;
+        parsed.d0_exit = read(offsets[3])?;
+        parsed.self_managed_io_init = read(offsets[4])?;
+        parsed.self_managed_io_suspend = read(offsets[5])?;
+        parsed.self_managed_io_restart = read(offsets[6])?;
+        parsed.self_managed_io_fini = read(offsets[7])?;
+        let init = self
+            .kmdf
+            .device_inits
+            .get_mut(&init)
+            .expect("device init was validated above");
+        init.pnp_power = parsed;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    /// Parse `WDF_FILEOBJECT_CONFIG`: EvtFileCleanup/EvtFileClose map onto
+    /// `IRP_MJ_CLEANUP`/`IRP_MJ_CLOSE` dispatch.
+    fn wdf_device_init_set_file_object_config(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let init = guest_arg(state, memory, 0)?;
+        let config = guest_arg(state, memory, 1)?;
+        let _attributes = guest_arg(state, memory, 2)?;
+        if !self.kmdf.device_inits.contains_key(&init)
+            || config == 0
+            || crate::host_thunks::validate_guest_pointer(memory, config, 4).is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let size = memory.read_u32(config)? as u64;
+        let minimum = match self.arch {
+            GuestArch::X64 => 0x10,
+            GuestArch::X86 => 0x08,
+        };
+        if size < minimum {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let pointer = self.arch.pointer_bytes() as u64;
+        let (close_offset, cleanup_offset) = match self.arch {
+            GuestArch::X64 => (0x10, 0x18),
+            GuestArch::X86 => (0x08, 0x0C),
+        };
+        let evt_file_close = if size >= close_offset + pointer {
+            read_guest_pointer(memory, config + close_offset, self.arch)?
+        } else {
+            0
+        };
+        let evt_file_cleanup = if size >= cleanup_offset + pointer {
+            read_guest_pointer(memory, config + cleanup_offset, self.arch)?
+        } else {
+            0
+        };
+        let init = self
+            .kmdf
+            .device_inits
+            .get_mut(&init)
+            .expect("device init was validated above");
+        init.file_object = KmdfFileObjectConfig {
+            evt_file_cleanup,
+            evt_file_close,
+        };
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    /// `WdfMemoryCreate`/`WdfMemoryCreatePreallocated`: allocate a framework
+    /// memory object over real guest bytes.
+    fn wdf_memory_create(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        preallocated: bool,
+    ) -> AppResult<()> {
+        let pointer = self.arch.pointer_bytes() as u64;
+        let (attributes, pool_type, supplied_buffer, size, memory_out, buffer_out) = if preallocated
+        {
+            (
+                guest_arg(state, memory, 0)?,
+                0,
+                guest_arg(state, memory, 1)?,
+                guest_arg(state, memory, 2)? as usize,
+                guest_arg(state, memory, 3)?,
+                0,
+            )
+        } else {
+            (
+                guest_arg(state, memory, 0)?,
+                guest_arg(state, memory, 1)? as u32,
+                u64::MAX,
+                guest_arg(state, memory, 3)? as usize,
+                guest_arg(state, memory, 4)?,
+                guest_arg(state, memory, 5)?,
+            )
+        };
+        let out_valid = memory_out != 0
+            && crate::host_thunks::validate_guest_pointer(memory, memory_out, pointer as usize)
+                .is_ok();
+        let buffer_out_valid = preallocated
+            || (buffer_out != 0
+                && crate::host_thunks::validate_guest_pointer(
+                    memory,
+                    buffer_out,
+                    pointer as usize,
+                )
+                .is_ok());
+        if !out_valid || !buffer_out_valid {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        if (!preallocated && pool_type > 1) || size > 0x10_0000 {
+            set_status(
+                state,
+                if pool_type > 1 && !preallocated {
+                    STATUS_INVALID_PARAMETER
+                } else {
+                    STATUS_INSUFFICIENT_RESOURCES
+                },
+            );
+            return Ok(());
+        }
+        let buffer = if preallocated {
+            if size > 0
+                && (supplied_buffer == 0
+                    || crate::host_thunks::validate_guest_pointer(memory, supplied_buffer, size)
+                        .is_err())
+            {
+                set_status(state, STATUS_INVALID_PARAMETER);
+                return Ok(());
+            }
+            supplied_buffer
+        } else {
+            let buffer = self.arena.alloc(memory, size.max(1), 8)?;
+            memory.map_bytes(buffer, &vec![0_u8; size.max(1)]);
+            buffer
+        };
+        let handle = self.create_kmdf_object(memory, KmdfObjectKind::Memory, attributes)?;
+        self.kmdf
+            .memories
+            .insert(handle, KmdfMemory { buffer, size });
+        write_guest_pointer(memory, memory_out, handle, self.arch)?;
+        if !preallocated {
+            write_guest_pointer(memory, buffer_out, buffer, self.arch)?;
+        }
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    /// `WdfMemoryGetBuffer`.
+    fn wdf_memory_get_buffer(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let handle = guest_arg(state, memory, 0)?;
+        let size_out = guest_arg(state, memory, 1)?;
+        let Some(record) = self.kmdf.memories.get(&handle).cloned() else {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        };
+        if size_out != 0
+            && crate::host_thunks::validate_guest_pointer(
+                memory,
+                size_out,
+                self.arch.pointer_bytes(),
+            )
+            .is_err()
+        {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        if size_out != 0 {
+            write_guest_pointer(memory, size_out, record.size as u64, self.arch)?;
+        }
+        state.set(Register::Rax, record.buffer);
+        Ok(())
+    }
+
+    /// `WdfStringCreate`: copy a caller `UNICODE_STRING` into a WDFSTRING.
+    fn wdf_string_create(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let source = guest_arg(state, memory, 0)?;
+        let attributes = guest_arg(state, memory, 1)?;
+        let string_out = guest_arg(state, memory, 2)?;
+        if string_out == 0
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                string_out,
+                self.arch.pointer_bytes(),
+            )
+            .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let Some(text) = self.read_valid_unicode_string(memory, source) else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        let length = (text.encode_utf16().count() * 2) as u16;
+        let bytes = length as usize;
+        let buffer = self.arena.alloc(memory, bytes.max(2), 2)?;
+        memory.map_bytes(buffer, &vec![0_u8; bytes.max(2)]);
+        for (index, unit) in text.encode_utf16().enumerate() {
+            memory.write_u16(buffer + index as u64 * 2, unit);
+        }
+        let handle = self.create_kmdf_object(memory, KmdfObjectKind::String, attributes)?;
+        self.kmdf.strings.insert(
+            handle,
+            KmdfString {
+                buffer,
+                length,
+                maximum: length.saturating_add(2),
+            },
+        );
+        write_guest_pointer(memory, string_out, handle, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    /// `WdfStringGetUnicodeString`.
+    fn wdf_string_get_unicode_string(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let handle = guest_arg(state, memory, 0)?;
+        let destination = guest_arg(state, memory, 1)?;
+        if destination == 0
+            || crate::host_thunks::validate_guest_pointer(
+                memory,
+                destination,
+                unicode_string_size(self.arch),
+            )
+            .is_err()
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let Some(record) = self.kmdf.strings.get(&handle).cloned() else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        write_unicode_string_header(
+            memory,
+            destination,
+            record.length,
+            record.maximum,
+            record.buffer,
+            self.arch,
+        )?; // coverage: unreachable — write_unicode_string_header only performs infallible MemoryImage writes
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    /// Validate and read a `UNICODE_STRING` without converting a malformed
+    /// descriptor into an internal guest-memory error.
+    fn read_valid_unicode_string(&self, memory: &MemoryImage, address: u64) -> Option<String> {
+        if address == 0 {
+            return Some(String::new());
+        }
+        if crate::host_thunks::validate_guest_pointer(
+            memory,
+            address,
+            unicode_string_size(self.arch),
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let length = memory.read_u16(address).ok()? as usize;
+        let maximum = memory.read_u16(address + 2).ok()? as usize;
+        if length % 2 != 0 || length > maximum || length > 0x800 {
+            return None;
+        }
+        let buffer = read_guest_pointer(
+            memory,
+            address + unicode_string_buffer_offset(self.arch),
+            self.arch,
+        )
+        .ok()?;
+        if length > 0
+            && (buffer == 0
+                || crate::host_thunks::validate_guest_pointer(memory, buffer, length).is_err())
+        {
+            return None;
+        }
+        read_unicode_string(memory, address, self.arch)
+            .ok()
+            .map(|(text, _, _)| text)
+    }
+
+    /// `WdfPdoInitAllocate`: mint a PDO device-init owned by `parent`.
+    fn wdf_pdo_init_allocate(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let parent = guest_arg(state, memory, 0)?;
+        if !self.kmdf.devices.contains_key(&parent) {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        }
+        let init = self.create_kmdf_object(memory, KmdfObjectKind::DeviceInit, 0)?;
+        if let Some(object) = self.kmdf.objects.get_mut(&init) {
+            object.parent = Some(parent);
+        }
+        if let Some(object) = self.kmdf.objects.get_mut(&parent) {
+            object.children.insert(init);
+        }
+        self.kmdf.device_inits.insert(
+            init,
+            KmdfDeviceInit {
+                device_type: 0,
+                io_type: 0,
+                name: None,
+                pnp_power: KmdfPnpPowerCallbacks::default(),
+                file_object: KmdfFileObjectConfig::default(),
+                is_pdo: true,
+                parent_device: Some(parent),
+                device_id: None,
+                hardware_ids: Vec::new(),
+                compatible_ids: Vec::new(),
+                instance_id: None,
+            },
+        );
+        state.set(Register::Rax, init);
+        Ok(())
+    }
+
+    /// `WdfPdoInitAssignDeviceID`/`WdfPdoInitAssignInstanceID`.
+    fn wdf_pdo_init_set_id(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        instance: bool,
+    ) -> AppResult<()> {
+        let init = guest_arg(state, memory, 0)?;
+        let string = guest_arg(state, memory, 1)?;
+        let Some(text) = self.read_valid_unicode_string(memory, string) else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        if text.is_empty() || text.len() > 0x100 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let Some(record) = self.kmdf.device_inits.get_mut(&init) else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        if !record.is_pdo {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        if instance {
+            record.instance_id = Some(text);
+        } else {
+            record.device_id = Some(text);
+        }
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    /// `WdfPdoInitAddHardwareID`/`WdfPdoInitAddCompatibleID`.
+    fn wdf_pdo_init_add_id(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        compatible: bool,
+    ) -> AppResult<()> {
+        let init = guest_arg(state, memory, 0)?;
+        let string = guest_arg(state, memory, 1)?;
+        let Some(text) = self.read_valid_unicode_string(memory, string) else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        if text.is_empty() || text.len() > 0x100 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let Some(record) = self.kmdf.device_inits.get_mut(&init) else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        if !record.is_pdo {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let list = if compatible {
+            &mut record.compatible_ids
+        } else {
+            &mut record.hardware_ids
+        };
+        if list.len() >= 16 {
+            set_status(state, STATUS_INSUFFICIENT_RESOURCES);
+            return Ok(());
+        }
+        list.push(text);
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    /// `WdfDeviceEnqueueRequest`: place a driver-created request on the
+    /// device's queue and dispatch it when the queue rules allow.
+    fn wdf_device_enqueue_request(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let device_handle = guest_arg(state, memory, 0)?;
+        let request_handle = guest_arg(state, memory, 1)?;
+        if !self.kmdf.devices.contains_key(&device_handle) {
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        }
+        let Some(request) = self.kmdf.requests.get(&request_handle).cloned() else {
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        };
+        if request.completed || request.queue.is_some() {
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        }
+        let Some(queue_handle) = self.choose_queue(device_handle) else {
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        };
+        let queue = self
+            .kmdf
+            .queues
+            .get(&queue_handle)
+            .cloned()
+            .expect("queue was selected from the queue map");
+        let entry = Self::queue_callback(&queue, request.major);
+        if entry == 0 {
+            self.complete_kmdf_request(memory, request_handle, STATUS_INVALID_DEVICE_REQUEST, 0)?;
+            set_status(state, STATUS_INVALID_DEVICE_REQUEST);
+            return Ok(None);
+        }
+        if let Some(request) = self.kmdf.requests.get_mut(&request_handle) {
+            request.queue = Some(queue_handle);
+        }
+        let defer = queue.stopped
+            || queue.dispatch_type == 2
+            || (queue.dispatch_type == 0 && !queue.in_flight.is_empty());
+        if defer {
+            if let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) {
+                queue.queued.push_back(request_handle);
+            }
+            self.kmdf.queued_dispatches += 1;
+            set_status(state, STATUS_SUCCESS);
+            return Ok(None);
+        }
+        if let Some(queue) = self.kmdf.queues.get_mut(&queue_handle) {
+            queue.in_flight.insert(request_handle);
+        }
+        self.kmdf.current_request = request_handle;
+        let request = self
+            .kmdf
+            .requests
+            .get(&request_handle)
+            .cloned()
+            .expect("request was validated above");
+        set_status(state, STATUS_SUCCESS);
+        Ok(Some(Self::callback_call(
+            queue_handle,
+            request_handle,
+            &request,
+            entry,
+            "EvtIoDeviceControl",
+        )))
+    }
+
+    /// `IRP_MJ_PNP` framework dispatch.
+    fn wdf_pnp_dispatch(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let irp_guest = guest_arg(state, memory, 0)?;
+        let device_object = guest_arg(state, memory, 1)?;
+        let Some(device) = self.kmdf.devices_by_object.get(&device_object).copied() else {
+            return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let Some(minor) = self.irp_minor(memory, irp_guest) else {
+            return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let (pnp, started, power_state) = self
+            .kmdf
+            .devices
+            .get(&device)
+            .map(|record| (record.pnp_power, record.started, record.power_state))
+            .expect("a device object always maps to a live device");
+        let mut steps = VecDeque::new();
+        let final_state = match minor {
+            IRP_MN_START_DEVICE => {
+                self.kmdf.pnp_start_dispatches += 1;
+                if started {
+                    return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST);
+                }
+                let release = GuestCallback {
+                    entry: pnp.release_hardware,
+                    args: vec![device],
+                    label: "EvtDeviceReleaseHardware",
+                };
+                let d0_exit = GuestCallback {
+                    entry: pnp.d0_exit,
+                    args: vec![device, u64::from(WDF_POWER_DEVICE_D3)],
+                    label: "EvtDeviceD0Exit",
+                };
+                if pnp.prepare_hardware != 0 {
+                    steps.push_back(PnpStep {
+                        entry: pnp.prepare_hardware,
+                        args: vec![device, 0, 0],
+                        label: "EvtDevicePrepareHardware",
+                        required: true,
+                        rollback: Vec::new(),
+                    });
+                }
+                if pnp.d0_entry != 0 {
+                    steps.push_back(PnpStep {
+                        entry: pnp.d0_entry,
+                        args: vec![device, u64::from(WDF_POWER_DEVICE_D3_FINAL)],
+                        label: "EvtDeviceD0Entry",
+                        required: true,
+                        rollback: if release.entry != 0 {
+                            vec![release.clone()]
+                        } else {
+                            Vec::new()
+                        },
+                    });
+                }
+                if pnp.self_managed_io_init != 0 {
+                    steps.push_back(PnpStep {
+                        entry: pnp.self_managed_io_init,
+                        args: vec![device],
+                        label: "EvtDeviceSelfManagedIoInit",
+                        required: true,
+                        rollback: [d0_exit, release]
+                            .into_iter()
+                            .filter(|callback| callback.entry != 0)
+                            .collect(),
+                    });
+                }
+                PnpFinalState::Started
+            }
+            IRP_MN_STOP_DEVICE => {
+                self.kmdf.pnp_stop_dispatches += 1;
+                if !started || power_state != WDF_POWER_DEVICE_D0 {
+                    return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST);
+                }
+                if pnp.self_managed_io_fini != 0 {
+                    steps.push_back(PnpStep {
+                        entry: pnp.self_managed_io_fini,
+                        args: vec![device],
+                        label: "EvtDeviceSelfManagedIoFini",
+                        required: false,
+                        rollback: Vec::new(),
+                    });
+                }
+                if pnp.d0_exit != 0 {
+                    steps.push_back(PnpStep {
+                        entry: pnp.d0_exit,
+                        args: vec![device, u64::from(WDF_POWER_DEVICE_D3)],
+                        label: "EvtDeviceD0Exit",
+                        required: true,
+                        rollback: Vec::new(),
+                    });
+                }
+                if pnp.release_hardware != 0 {
+                    steps.push_back(PnpStep {
+                        entry: pnp.release_hardware,
+                        args: vec![device],
+                        label: "EvtDeviceReleaseHardware",
+                        required: true,
+                        rollback: Vec::new(),
+                    });
+                }
+                PnpFinalState::Stopped
+            }
+            IRP_MN_REMOVE_DEVICE => {
+                self.kmdf.pnp_remove_dispatches += 1;
+                let object_guest = self
+                    .kmdf
+                    .devices
+                    .get(&device)
+                    .expect("device was resolved above")
+                    .object_guest;
+                if started {
+                    if pnp.self_managed_io_fini != 0 {
+                        steps.push_back(PnpStep {
+                            entry: pnp.self_managed_io_fini,
+                            args: vec![device],
+                            label: "EvtDeviceSelfManagedIoFini",
+                            required: false,
+                            rollback: Vec::new(),
+                        });
+                    }
+                    if pnp.d0_exit != 0 {
+                        steps.push_back(PnpStep {
+                            entry: pnp.d0_exit,
+                            args: vec![device, u64::from(WDF_POWER_DEVICE_D3)],
+                            label: "EvtDeviceD0Exit",
+                            required: false,
+                            rollback: Vec::new(),
+                        });
+                    }
+                    if pnp.release_hardware != 0 {
+                        steps.push_back(PnpStep {
+                            entry: pnp.release_hardware,
+                            args: vec![device],
+                            label: "EvtDeviceReleaseHardware",
+                            required: false,
+                            rollback: Vec::new(),
+                        });
+                    }
+                }
+                if let Some(record) = self.kmdf.devices.get_mut(&device) {
+                    record.removed = true;
+                }
+                self.removed_device_objects.insert(object_guest);
+                let mut callbacks = Vec::new();
+                self.collect_delete_callbacks(device, &mut callbacks);
+                for callback in callbacks {
+                    steps.push_back(PnpStep {
+                        entry: callback.entry,
+                        args: callback.args,
+                        label: callback.label,
+                        required: false,
+                        rollback: Vec::new(),
+                    });
+                }
+                PnpFinalState::Removed
+            }
+            _ => return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST),
+        };
+        self.begin_pnp_sequence(state, memory, device, irp_guest, steps, final_state)
+    }
+
+    fn irp_minor(&self, memory: &MemoryImage, irp_guest: u64) -> Option<u8> {
+        let stack = self.irp_stack_location(memory, irp_guest)?;
+        memory.read_u8(stack + 1).ok()
+    }
+
+    fn irp_stack_location(&self, memory: &MemoryImage, irp_guest: u64) -> Option<u64> {
+        if irp_guest == 0 {
+            return None;
+        }
+        let offset = match self.arch {
+            GuestArch::X64 => 0x98,
+            GuestArch::X86 => 0x4C,
+        };
+        read_guest_pointer(memory, irp_guest + offset, self.arch)
+            .ok()
+            .filter(|stack| *stack != 0)
+    }
+
+    /// `IRP_MJ_POWER` framework dispatch for `IRP_MN_SET_POWER`.
+    fn wdf_power_dispatch(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let irp_guest = guest_arg(state, memory, 0)?;
+        let device_object = guest_arg(state, memory, 1)?;
+        let Some(device) = self.kmdf.devices_by_object.get(&device_object).copied() else {
+            return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let Some(stack) = self.irp_stack_location(memory, irp_guest) else {
+            return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let minor = memory.read_u8(stack + 1)?;
+        let (type_offset, state_offset) = match self.arch {
+            GuestArch::X64 => (0x08u64, 0x10u64),
+            GuestArch::X86 => (0x04u64, 0x08u64),
+        };
+        let power_type = memory.read_u32(stack + type_offset)?;
+        let target = memory.read_u32(stack + state_offset)?;
+        if minor != IRP_MN_SET_POWER || power_type != POWER_STATE_TYPE_DEVICE {
+            return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let (pnp, started, power_state) = self
+            .kmdf
+            .devices
+            .get(&device)
+            .map(|record| (record.pnp_power, record.started, record.power_state))
+            .expect("a device object always maps to a live device");
+        let mut steps = VecDeque::new();
+        let final_state = match target {
+            WDF_POWER_DEVICE_D0 => {
+                self.kmdf.power_d0_dispatches += 1;
+                if !started || power_state == WDF_POWER_DEVICE_D0 {
+                    return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST);
+                }
+                if pnp.d0_entry != 0 {
+                    steps.push_back(PnpStep {
+                        entry: pnp.d0_entry,
+                        args: vec![device, u64::from(WDF_POWER_DEVICE_D3)],
+                        label: "EvtDeviceD0Entry",
+                        required: true,
+                        rollback: Vec::new(),
+                    });
+                }
+                if pnp.self_managed_io_restart != 0 {
+                    steps.push_back(PnpStep {
+                        entry: pnp.self_managed_io_restart,
+                        args: vec![device],
+                        label: "EvtDeviceSelfManagedIoRestart",
+                        required: false,
+                        rollback: Vec::new(),
+                    });
+                }
+                PnpFinalState::PowerD0
+            }
+            WDF_POWER_DEVICE_D3 => {
+                self.kmdf.power_d3_dispatches += 1;
+                if !started || power_state != WDF_POWER_DEVICE_D0 {
+                    return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST);
+                }
+                if pnp.self_managed_io_suspend != 0 {
+                    steps.push_back(PnpStep {
+                        entry: pnp.self_managed_io_suspend,
+                        args: vec![device],
+                        label: "EvtDeviceSelfManagedIoSuspend",
+                        required: false,
+                        rollback: Vec::new(),
+                    });
+                }
+                if pnp.d0_exit != 0 {
+                    steps.push_back(PnpStep {
+                        entry: pnp.d0_exit,
+                        args: vec![device, u64::from(WDF_POWER_DEVICE_D3)],
+                        label: "EvtDeviceD0Exit",
+                        required: true,
+                        rollback: Vec::new(),
+                    });
+                }
+                PnpFinalState::PowerD3
+            }
+            _ => return self.fail_pnp(state, memory, irp_guest, STATUS_INVALID_DEVICE_REQUEST),
+        };
+        self.begin_pnp_sequence(state, memory, device, irp_guest, steps, final_state)
+    }
+
+    fn fail_pnp(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        irp_guest: u64,
+        status: i32,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        self.write_irp_status(memory, irp_guest, status, 0)?;
+        set_status(state, status);
+        Ok(None)
+    }
+
+    fn begin_pnp_sequence(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        device: u64,
+        irp_guest: u64,
+        mut steps: VecDeque<PnpStep>,
+        final_state: PnpFinalState,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        if let Some(first) = steps.pop_front() {
+            let rollback = VecDeque::from(first.rollback.clone());
+            let current_required = first.required;
+            return Ok(Some(PendingGuestCall {
+                entry: first.entry,
+                args: first.args,
+                label: first.label,
+                purpose: PendingPurpose::PnpSequence {
+                    device,
+                    irp_guest,
+                    current_required,
+                    remaining: steps,
+                    rollback,
+                    failure_status: None,
+                    final_state,
+                },
+            }));
+        }
+        self.apply_pnp_final_state(device, final_state);
+        self.purge_deleted_objects();
+        self.write_irp_status(memory, irp_guest, STATUS_SUCCESS, 0)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(None)
+    }
+
+    fn apply_pnp_final_state(&mut self, device: u64, final_state: PnpFinalState) {
+        if final_state == PnpFinalState::Removed {
+            return;
+        }
+        let record = self
+            .kmdf
+            .devices
+            .get_mut(&device)
+            .expect("a PnP final state is applied only while the device exists");
+        if final_state == PnpFinalState::Started {
+            record.started = true;
+            record.power_state = WDF_POWER_DEVICE_D0;
+        } else if final_state == PnpFinalState::Stopped {
+            record.started = false;
+            record.power_state = WDF_POWER_DEVICE_D3;
+        } else if final_state == PnpFinalState::PowerD0 {
+            record.power_state = WDF_POWER_DEVICE_D0;
+        } else if final_state == PnpFinalState::PowerD3 {
+            record.power_state = WDF_POWER_DEVICE_D3;
+        }
     }
 }
 
@@ -6904,6 +8285,342 @@ mod tests {
             hint_rva += (2 + symbol.len() + 1 + 1) as u32 & !1;
         }
         assert!(hint_rva <= 0x2500, "hint table overruns: {hint_rva:#x}");
+        file
+    }
+
+    // ---- PnP/power KMDF fixture -------------------------------------------
+    //
+    // A single-device KMDF image whose EvtDriverDeviceAdd registers
+    // WDF_PNPPOWER_EVENT_CALLBACKS and WDF_FILEOBJECT_CONFIG.  Every callback
+    // increments a guest counter; status callbacks return P_FAIL_STATUS when
+    // their bit is set in P_FAIL_MASK, so tests can inject failures at each
+    // transition step.
+
+    const P_TEXT_RVA: u32 = 0x1000;
+    const P_ENTRY_RVA: u32 = 0x1000;
+    const P_ADD_RVA: u32 = 0x1100;
+    const P_PREPARE_RVA: u32 = 0x1200;
+    const P_RELEASE_RVA: u32 = 0x1240;
+    const P_D0ENTRY_RVA: u32 = 0x1280;
+    const P_D0EXIT_RVA: u32 = 0x12C0;
+    const P_SELFINIT_RVA: u32 = 0x1300;
+    const P_SELFFINI_RVA: u32 = 0x1340;
+    const P_SUSPEND_RVA: u32 = 0x1380;
+    const P_RESTART_RVA: u32 = 0x13C0;
+    const P_CLEANUP_RVA: u32 = 0x1400;
+    const P_DESTROY_RVA: u32 = 0x1440;
+    const P_FCLEANUP_RVA: u32 = 0x1480;
+    const P_FCLOSE_RVA: u32 = 0x14C0;
+    const P_RDATA_RVA: u32 = 0x2000;
+    const P_DATA_RVA: u32 = 0x3000;
+    const P_IMPORT_RVA: u32 = 0x2100;
+    const P_ILT_RVA: u32 = 0x2140;
+    const P_IAT_RVA: u32 = 0x2180;
+    const P_DLL_RVA: u32 = 0x21C0;
+    const P_HINT_RVA: u32 = 0x21E0;
+    const P_IMAGE_BASE: u64 = 0x1_4000_0000;
+
+    const P_PNP_CONFIG: u32 = 0x3070;
+    const P_FILE_CONFIG: u32 = 0x30D0;
+    const P_DEV_ATTRS: u32 = 0x3100;
+    const P_FAIL_MASK: u32 = 0x3160;
+    const P_FAIL_STATUS: u32 = 0x3164;
+    const P_PREPARE_COUNT: u32 = 0x3168;
+    const P_RELEASE_COUNT: u32 = 0x316C;
+    const P_D0ENTRY_COUNT: u32 = 0x3170;
+    const P_D0EXIT_COUNT: u32 = 0x3174;
+    const P_SELFINIT_COUNT: u32 = 0x3178;
+    const P_SELFFINI_COUNT: u32 = 0x317C;
+    const P_SUSPEND_COUNT: u32 = 0x3180;
+    const P_RESTART_COUNT: u32 = 0x3184;
+    const P_CLEANUP_COUNT: u32 = 0x3188;
+    const P_DESTROY_COUNT: u32 = 0x318C;
+    const P_FCLEANUP_COUNT: u32 = 0x3190;
+    const P_FCLOSE_COUNT: u32 = 0x3194;
+    const P_LAST_PREV: u32 = 0x3198;
+    const P_LAST_TARGET: u32 = 0x319C;
+    const P_CLEANUP_AFTER_DESTROY: u32 = 0x31A0;
+    const P_DESTROY_AFTER_CLEANUP: u32 = 0x31A4;
+    const P_DEVICE_OUT: u32 = 0x31A8;
+    const P_DRIVER_OUT: u32 = 0x31B0;
+    const P_DEVINIT: u32 = 0x31B8;
+    const P_DRIVER_CONFIG: u32 = 0x31C0;
+
+    const P_IAT_DRIVER: u32 = P_IAT_RVA;
+    const P_IAT_SET_PNP: u32 = P_IAT_RVA + 8;
+    const P_IAT_SET_FILE: u32 = P_IAT_RVA + 16;
+    const P_IAT_DEVICE: u32 = P_IAT_RVA + 24;
+    const P_IMPORTS: [&str; 4] = [
+        "WdfDriverCreate",
+        "WdfDeviceInitSetPnpPowerEventCallbacks",
+        "WdfDeviceInitSetFileObjectConfig",
+        "WdfDeviceCreate",
+    ];
+
+    fn pnp_data_rva(address: u32) -> usize {
+        0x1C00 + (address - P_DATA_RVA) as usize
+    }
+
+    fn pnp_copy(file: &mut [u8], rva: u32, code: &[u8]) {
+        let offset = 0x400 + (rva - P_TEXT_RVA) as usize;
+        file[offset..offset + code.len()].copy_from_slice(code);
+    }
+
+    fn pnp_status_callback(count: u32, fail_bit: u32, store_arg: Option<u32>, rva: u32) -> Vec<u8> {
+        let mut code = CodeBuilder::default();
+        if let Some(target) = store_arg {
+            code.raw(&[0x89, 0x15]);
+            code.disp(target);
+        }
+        code.inc_dword(count);
+        code.raw(&[0x8B, 0x05]);
+        code.disp(P_FAIL_MASK);
+        code.raw(&[0xA9]);
+        code.raw(&fail_bit.to_le_bytes());
+        code.raw(&[0x74, 0x07]);
+        code.raw(&[0x8B, 0x05]);
+        code.disp(P_FAIL_STATUS);
+        code.raw(&[0xC3]);
+        code.raw(&[0x31, 0xC0, 0xC3]);
+        code.finish(rva)
+    }
+
+    fn pnp_void_callback(count: u32, rva: u32) -> Vec<u8> {
+        let mut code = CodeBuilder::default();
+        code.inc_dword(count);
+        code.raw(&[0xC3]);
+        code.finish(rva)
+    }
+
+    /// Cleanup/destroy stubs that record the other callback's counter, so the
+    /// test can pin the post-order cascade exactly.
+    fn pnp_order_callback(other_count: u32, flag: u32, count: u32, rva: u32) -> Vec<u8> {
+        let mut code = CodeBuilder::default();
+        code.raw(&[0x8B, 0x05]);
+        code.disp(other_count);
+        code.raw(&[0x89, 0x05]);
+        code.disp(flag);
+        code.inc_dword(count);
+        code.raw(&[0xC3]);
+        code.finish(rva)
+    }
+
+    fn build_kmdf_pnp_driver() -> Vec<u8> {
+        let mut file = vec![0_u8; 0x2C00];
+        file[0..2].copy_from_slice(&0x5A4D_u16.to_le_bytes());
+        put_u32(&mut file, 0x3C, 0x80);
+        file[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let coff = 0x84;
+        put_u16(&mut file, coff, 0x8664);
+        put_u16(&mut file, coff + 2, 3);
+        put_u16(&mut file, coff + 16, 0xF0);
+        put_u16(&mut file, coff + 18, 0x0022);
+        let optional = coff + 20;
+        put_u16(&mut file, optional, 0x020B);
+        put_u32(&mut file, optional + 4, 0x1000);
+        put_u32(&mut file, optional + 8, 0x1800);
+        put_u32(&mut file, optional + 16, P_ENTRY_RVA);
+        put_u32(&mut file, optional + 20, P_TEXT_RVA);
+        put_u64(&mut file, optional + 24, P_IMAGE_BASE);
+        put_u32(&mut file, optional + 32, 0x1000);
+        put_u32(&mut file, optional + 36, 0x200);
+        put_u16(&mut file, optional + 48, 6);
+        put_u32(&mut file, optional + 56, 0x4000);
+        put_u32(&mut file, optional + 60, 0x400);
+        put_u16(&mut file, optional + 68, 1);
+        put_u32(&mut file, optional + 108, 16);
+        let directories = optional + 112;
+        put_u32(&mut file, directories + 8, P_IMPORT_RVA);
+        put_u32(&mut file, directories + 12, 0x28);
+
+        let section_table = optional + 0xF0;
+        let mut write_section = |index: usize,
+                                 name: &[u8; 8],
+                                 virtual_size: u32,
+                                 rva: u32,
+                                 raw_size: u32,
+                                 raw: u32,
+                                 characteristics: u32| {
+            let entry = section_table + index * 40;
+            file[entry..entry + 8].copy_from_slice(name);
+            put_u32(&mut file, entry + 8, virtual_size);
+            put_u32(&mut file, entry + 12, rva);
+            put_u32(&mut file, entry + 16, raw_size);
+            put_u32(&mut file, entry + 20, raw);
+            put_u32(&mut file, entry + 36, characteristics);
+        };
+        write_section(
+            0,
+            b".text\0\0\0",
+            0x1000,
+            P_TEXT_RVA,
+            0x1000,
+            0x400,
+            0x6000_0020,
+        );
+        write_section(
+            1,
+            b".rdata\0\0",
+            0x800,
+            P_RDATA_RVA,
+            0x800,
+            0x1400,
+            0x4000_0040,
+        );
+        write_section(
+            2,
+            b".data\0\0\0",
+            0x1000,
+            P_DATA_RVA,
+            0x1000,
+            0x1C00,
+            0xC000_0040,
+        );
+
+        let mut entry = CodeBuilder::default();
+        entry.raw(&[0x49, 0x89, 0xD3]); // mov r11,rdx (RegistryPath)
+        entry.raw(&[0x48, 0x8D, 0x05]);
+        entry.disp(P_DRIVER_CONFIG);
+        entry.raw(&[0xC7, 0x00]);
+        entry.raw(&0x28_u32.to_le_bytes());
+        entry.raw(&[0x48, 0x8D, 0x15]);
+        entry.disp(P_ADD_RVA);
+        entry.raw(&[0x48, 0x89, 0x50, 0x08]);
+        entry.raw(&[0x4C, 0x89, 0xDA]); // rdx = RegistryPath
+        entry.raw(&[0x45, 0x31, 0xC0]); // xor r8d,r8d
+        entry.raw(&[0x4C, 0x8D, 0x0D]);
+        entry.disp(P_DRIVER_CONFIG);
+        entry.raw(&[0x48, 0x83, 0xEC, 0x28]);
+        entry.raw(&[0x48, 0x8D, 0x05]);
+        entry.disp(P_DRIVER_OUT);
+        entry.raw(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+        entry.call_iat(P_IAT_DRIVER);
+        entry.raw(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        let entry = entry.finish(P_ENTRY_RVA);
+        pnp_copy(&mut file, P_ENTRY_RVA, &entry);
+
+        let mut add = CodeBuilder::default();
+        add.raw(&[0x48, 0x89, 0x15]); // mov [rip+disp], rdx (DeviceInit)
+        add.disp(P_DEVINIT);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(P_DEVINIT);
+        add.raw(&[0x48, 0x8D, 0x15]);
+        add.disp(P_PNP_CONFIG);
+        add.call_iat(P_IAT_SET_PNP);
+        add.raw(&[0x85, 0xC0, 0x79, 0x01, 0xC3]);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(P_DEVINIT);
+        add.raw(&[0x48, 0x8D, 0x15]);
+        add.disp(P_FILE_CONFIG);
+        add.raw(&[0x45, 0x31, 0xC0]);
+        add.call_iat(P_IAT_SET_FILE);
+        add.raw(&[0x85, 0xC0, 0x79, 0x01, 0xC3]);
+        add.raw(&[0x48, 0x8B, 0x0D]);
+        add.disp(P_DEVINIT);
+        add.raw(&[0x48, 0x8D, 0x15]);
+        add.disp(P_DEV_ATTRS);
+        add.raw(&[0x4C, 0x8D, 0x05]);
+        add.disp(P_DEVICE_OUT);
+        add.call_iat(P_IAT_DEVICE);
+        add.raw(&[0xC3]);
+        let add = add.finish(P_ADD_RVA);
+        assert!(add.len() <= 0x80, "pnp device add is {} bytes", add.len());
+        pnp_copy(&mut file, P_ADD_RVA, &add);
+
+        for (count, bit, store, rva) in [
+            (P_PREPARE_COUNT, 1, None, P_PREPARE_RVA),
+            (P_RELEASE_COUNT, 16, None, P_RELEASE_RVA),
+            (P_D0ENTRY_COUNT, 2, Some(P_LAST_PREV), P_D0ENTRY_RVA),
+            (P_D0EXIT_COUNT, 8, Some(P_LAST_TARGET), P_D0EXIT_RVA),
+            (P_SELFINIT_COUNT, 4, None, P_SELFINIT_RVA),
+            (P_SUSPEND_COUNT, 32, None, P_SUSPEND_RVA),
+            (P_RESTART_COUNT, 64, None, P_RESTART_RVA),
+        ] {
+            let code = pnp_status_callback(count, bit, store, rva);
+            pnp_copy(&mut file, rva, &code);
+        }
+        for (count, rva) in [
+            (P_SELFFINI_COUNT, P_SELFFINI_RVA),
+            (P_FCLEANUP_COUNT, P_FCLEANUP_RVA),
+            (P_FCLOSE_COUNT, P_FCLOSE_RVA),
+        ] {
+            let code = pnp_void_callback(count, rva);
+            pnp_copy(&mut file, rva, &code);
+        }
+        let code = pnp_order_callback(
+            P_DESTROY_COUNT,
+            P_CLEANUP_AFTER_DESTROY,
+            P_CLEANUP_COUNT,
+            P_CLEANUP_RVA,
+        );
+        pnp_copy(&mut file, P_CLEANUP_RVA, &code);
+        let code = pnp_order_callback(
+            P_CLEANUP_COUNT,
+            P_DESTROY_AFTER_CLEANUP,
+            P_DESTROY_COUNT,
+            P_DESTROY_RVA,
+        );
+        pnp_copy(&mut file, P_DESTROY_RVA, &code);
+
+        let data = |address: u32| pnp_data_rva(address);
+        put_u32(&mut file, data(P_PNP_CONFIG), 0x58);
+        for (offset, rva) in [
+            (0x08u32, P_PREPARE_RVA),
+            (0x10, P_RELEASE_RVA),
+            (0x18, P_D0ENTRY_RVA),
+            (0x20, P_D0EXIT_RVA),
+            (0x28, P_SELFINIT_RVA),
+            (0x30, P_SUSPEND_RVA),
+            (0x38, P_RESTART_RVA),
+            (0x50, P_SELFFINI_RVA),
+        ] {
+            put_u64(
+                &mut file,
+                data(P_PNP_CONFIG) + offset as usize,
+                P_IMAGE_BASE + u64::from(rva),
+            );
+        }
+        put_u32(&mut file, data(P_FILE_CONFIG), 0x20);
+        put_u64(
+            &mut file,
+            data(P_FILE_CONFIG) + 0x10,
+            P_IMAGE_BASE + u64::from(P_FCLOSE_RVA),
+        );
+        put_u64(
+            &mut file,
+            data(P_FILE_CONFIG) + 0x18,
+            P_IMAGE_BASE + u64::from(P_FCLEANUP_RVA),
+        );
+        put_u32(&mut file, data(P_DEV_ATTRS), 0x38);
+        put_u64(
+            &mut file,
+            data(P_DEV_ATTRS) + 0x08,
+            P_IMAGE_BASE + u64::from(P_CLEANUP_RVA),
+        );
+        put_u64(
+            &mut file,
+            data(P_DEV_ATTRS) + 0x10,
+            P_IMAGE_BASE + u64::from(P_DESTROY_RVA),
+        );
+
+        let rva = |address: u32| 0x1400 + (address - P_RDATA_RVA) as usize;
+        let descriptor = rva(P_IMPORT_RVA);
+        put_u32(&mut file, descriptor, P_ILT_RVA);
+        put_u32(&mut file, descriptor + 12, P_DLL_RVA);
+        put_u32(&mut file, descriptor + 16, P_IAT_RVA);
+        file[rva(P_DLL_RVA)..rva(P_DLL_RVA) + 10].copy_from_slice(b"WdfLdr.sys");
+        file[rva(P_DLL_RVA) + 10] = 0;
+        let mut hint_rva = P_HINT_RVA;
+        for (index, symbol) in P_IMPORTS.iter().enumerate() {
+            put_u64(&mut file, rva(P_ILT_RVA) + index * 8, u64::from(hint_rva));
+            put_u64(&mut file, rva(P_IAT_RVA) + index * 8, u64::from(hint_rva));
+            let offset = rva(hint_rva);
+            put_u16(&mut file, offset, 0);
+            file[offset + 2..offset + 2 + symbol.len()].copy_from_slice(symbol.as_bytes());
+            file[offset + 2 + symbol.len()] = 0;
+            hint_rva += (2 + symbol.len() + 1 + 1) as u32 & !1;
+        }
+        assert!(hint_rva <= 0x2400, "pnp hint table overruns: {hint_rva:#x}");
         file
     }
 
@@ -10064,7 +11781,7 @@ mod tests {
                 assert_eq!(state.kmdf.driver_pool_tag, 0x2146_4457);
                 assert_eq!(state.kmdf.driver_init_flags, 0);
                 assert_ne!(state.kmdf.evt_driver_unload, 0);
-                assert_eq!(state.kmdf.framework_dispatches.len(), 5);
+                assert_eq!(state.kmdf.framework_dispatches.len(), 7);
             }
             assert_eq!(
                 dispatch_nt_thunk(
@@ -11069,6 +12786,21 @@ mod tests {
             (DriverShim::WdfEvtIoDeviceControlDispatch, 8),
             (DriverShim::WdfEvtIoCleanupDispatch, 8),
             (DriverShim::WdfEvtIoCloseDispatch, 8),
+            (DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks, 8),
+            (DriverShim::WdfDeviceInitSetFileObjectConfig, 8),
+            (DriverShim::WdfMemoryCreate, 24),
+            (DriverShim::WdfMemoryCreatePreallocated, 16),
+            (DriverShim::WdfMemoryGetBuffer, 8),
+            (DriverShim::WdfStringCreate, 12),
+            (DriverShim::WdfStringGetUnicodeString, 8),
+            (DriverShim::WdfDeviceEnqueueRequest, 8),
+            (DriverShim::WdfPdoInitAllocate, 4),
+            (DriverShim::WdfPdoInitAssignDeviceID, 8),
+            (DriverShim::WdfPdoInitAssignInstanceID, 8),
+            (DriverShim::WdfPdoInitAddHardwareID, 8),
+            (DriverShim::WdfPdoInitAddCompatibleID, 8),
+            (DriverShim::WdfEvtPnpDispatch, 8),
+            (DriverShim::WdfEvtPowerDispatch, 8),
         ];
         for (shim, want) in expected {
             assert_eq!(
@@ -15246,6 +16978,1723 @@ mod tests {
         });
     }
 
+    const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
+
+    fn pnp_u32(memory: &MemoryImage, base: u64, rva: u32) -> u32 {
+        memory
+            .read_u32(base + u64::from(rva))
+            .expect("pnp fixture dword")
+    }
+
+    fn pnp_set_failure(memory: &mut MemoryImage, base: u64, mask: u32, status: i32) {
+        memory.write_u32(base + u64::from(P_FAIL_MASK), mask);
+        memory.write_u32(base + u64::from(P_FAIL_STATUS), status as u32);
+    }
+
+    fn pnp_load(
+        service: &str,
+    ) -> (
+        Box<PeHostRuntime>,
+        TempDir,
+        MemoryImage,
+        DriverIsland,
+        u64,
+        u64,
+    ) {
+        let image = build_kmdf_pnp_driver();
+        let (runtime, directory, memory, island) = load_staged_island_x64(&image, service);
+        let base = island.image_base();
+        let device = island
+            .created_devices()
+            .into_iter()
+            .next()
+            .expect("pnp fixture device")
+            .guest_pointer;
+        (runtime, directory, memory, island, base, device)
+    }
+
+    #[test]
+    fn pnp_invalid_minors_repeated_start_stop_and_remove_after_remove_reject() {
+        with_big_stack(|| {
+            let (mut runtime, _dir, mut memory, island, base, device) = pnp_load("CasaPnpLife");
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_STOP_DEVICE)
+                    .expect("stop before start")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3)
+                    .expect("D3 before start")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D0)
+                    .expect("D0 before start")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, 0x01)
+                    .expect("query-remove minor")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, 2)
+                    .expect("D2 power state")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island
+                    .dispatch_irp(
+                        &mut runtime,
+                        &mut memory,
+                        device,
+                        IrpMajorFunction::Power,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .expect("non-set-power minor")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(pnp_u32(&memory, base, P_PREPARE_COUNT), 0);
+
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("start")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_PREPARE_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_SELFINIT_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_RELEASE_COUNT), 0);
+            assert_eq!(
+                pnp_u32(&memory, base, P_LAST_PREV),
+                WDF_POWER_DEVICE_D3_FINAL
+            );
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("repeated start")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(pnp_u32(&memory, base, P_PREPARE_COUNT), 1);
+
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3)
+                    .expect("D3")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_SUSPEND_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_D0EXIT_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_LAST_TARGET), WDF_POWER_DEVICE_D3);
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3)
+                    .expect("repeated D3")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_STOP_DEVICE)
+                    .expect("stop while D3")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D0)
+                    .expect("D0")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 2);
+            assert_eq!(pnp_u32(&memory, base, P_LAST_PREV), WDF_POWER_DEVICE_D3);
+            assert_eq!(pnp_u32(&memory, base, P_RESTART_COUNT), 1);
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D0)
+                    .expect("repeated D0")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_STOP_DEVICE)
+                    .expect("stop")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_SELFFINI_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_D0EXIT_COUNT), 2);
+            assert_eq!(pnp_u32(&memory, base, P_RELEASE_COUNT), 1);
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_STOP_DEVICE)
+                    .expect("repeated stop")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3)
+                    .expect("D3 after stop")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("restart after stop")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_REMOVE_DEVICE)
+                    .expect("remove")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_SELFFINI_COUNT), 2);
+            assert_eq!(pnp_u32(&memory, base, P_RELEASE_COUNT), 2);
+            assert_eq!(pnp_u32(&memory, base, P_CLEANUP_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_DESTROY_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_CLEANUP_AFTER_DESTROY), 0);
+            assert_eq!(pnp_u32(&memory, base, P_DESTROY_AFTER_CLEANUP), 1);
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_REMOVE_DEVICE)
+                    .expect("repeated remove")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("start after remove")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(island.device_count(), 0);
+            assert!(island.created_devices()[0].deleted);
+        });
+    }
+
+    #[test]
+    fn pnp_start_callback_failures_roll_back_and_never_become_ready() {
+        with_big_stack(|| {
+            let (mut runtime, _dir, mut memory, island, base, device) =
+                pnp_load("CasaPnpStartFail");
+            pnp_set_failure(&mut memory, base, 1, STATUS_INSUFFICIENT_RESOURCES);
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("prepare hardware failure")
+                    .0,
+                STATUS_INSUFFICIENT_RESOURCES
+            );
+            assert_eq!(pnp_u32(&memory, base, P_PREPARE_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 0);
+            assert_eq!(pnp_u32(&memory, base, P_RELEASE_COUNT), 0);
+            assert_eq!(pnp_u32(&memory, base, P_SELFINIT_COUNT), 0);
+            {
+                let handle = island.kmdf_device_handles()[0];
+                let state = island.inner.borrow();
+                let record = state.kmdf.devices.get(&handle).expect("device");
+                assert_eq!(record.started, false);
+                assert_eq!(record.power_state, WDF_POWER_DEVICE_D3);
+            }
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_STOP_DEVICE)
+                    .expect("stop after failed start")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+
+            pnp_set_failure(&mut memory, base, 2, STATUS_UNSUCCESSFUL);
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("D0Entry failure")
+                    .0,
+                STATUS_UNSUCCESSFUL
+            );
+            assert_eq!(pnp_u32(&memory, base, P_PREPARE_COUNT), 2);
+            assert_eq!(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_RELEASE_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_SELFINIT_COUNT), 0);
+            {
+                let handle = island.kmdf_device_handles()[0];
+                let state = island.inner.borrow();
+                let record = state.kmdf.devices.get(&handle).expect("device");
+                assert_eq!(record.started, false);
+                assert_eq!(record.power_state, WDF_POWER_DEVICE_D3);
+            }
+
+            pnp_set_failure(&mut memory, base, 4, STATUS_ACCESS_DENIED);
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("self-managed IO failure")
+                    .0,
+                STATUS_ACCESS_DENIED
+            );
+            assert_eq!(pnp_u32(&memory, base, P_PREPARE_COUNT), 3);
+            assert_eq!(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 2);
+            assert_eq!(pnp_u32(&memory, base, P_SELFINIT_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_D0EXIT_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_RELEASE_COUNT), 2);
+            {
+                let handle = island.kmdf_device_handles()[0];
+                let state = island.inner.borrow();
+                let record = state.kmdf.devices.get(&handle).expect("device");
+                assert_eq!(record.started, false);
+                assert_eq!(record.power_state, WDF_POWER_DEVICE_D3);
+            }
+
+            pnp_set_failure(&mut memory, base, 0, 0);
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("start after rollbacks")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 3);
+            assert_eq!(pnp_u32(&memory, base, P_SELFINIT_COUNT), 2);
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3)
+                    .expect("power down")
+                    .0,
+                STATUS_SUCCESS
+            );
+            pnp_set_failure(&mut memory, base, 2, STATUS_UNSUCCESSFUL);
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D0)
+                    .expect("D0 failure")
+                    .0,
+                STATUS_UNSUCCESSFUL
+            );
+            assert_eq!(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 4);
+            assert_eq!(pnp_u32(&memory, base, P_RESTART_COUNT), 0);
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3)
+                    .expect("D3 after failed D0")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            pnp_set_failure(&mut memory, base, 0, 0);
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D0)
+                    .expect("D0 recovery")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_LAST_PREV), WDF_POWER_DEVICE_D3);
+            assert_eq!(pnp_u32(&memory, base, P_RESTART_COUNT), 1);
+        });
+    }
+
+    #[test]
+    fn pnp_file_cleanup_and_device_cleanup_destroy_ordering_reject_out_of_order() {
+        with_big_stack(|| {
+            let (mut runtime, _dir, mut memory, island, base, device) = pnp_load("CasaPnpOrder");
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("start")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island
+                    .dispatch_irp(
+                        &mut runtime,
+                        &mut memory,
+                        device,
+                        IrpMajorFunction::Cleanup,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .expect("file cleanup")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_FCLEANUP_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_FCLOSE_COUNT), 0);
+            assert_eq!(
+                island
+                    .dispatch_irp(
+                        &mut runtime,
+                        &mut memory,
+                        device,
+                        IrpMajorFunction::Close,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .expect("file close")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_FCLOSE_COUNT), 1);
+            {
+                let handle = island.kmdf_device_handles()[0];
+                let state = island.inner.borrow();
+                let object = state.kmdf.objects.get(&handle).expect("device object");
+                assert_ne!(object.evt_cleanup, 0);
+                assert_ne!(object.evt_destroy, 0);
+            }
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_REMOVE_DEVICE)
+                    .expect("remove")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_CLEANUP_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_DESTROY_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_CLEANUP_AFTER_DESTROY), 0);
+            assert_eq!(pnp_u32(&memory, base, P_DESTROY_AFTER_CLEANUP), 1);
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.kmdf.file_cleanup_dispatches, 1);
+                assert_eq!(state.kmdf.file_close_dispatches, 1);
+                assert!(state.kmdf.devices.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn pnp_malformed_callback_config_and_unsupported_framework_import_reject() {
+        with_big_stack(|| {
+            let (mut runtime, _dir, mut memory, island, _base, device) =
+                pnp_load("CasaPnpMalformed");
+            let init = *island
+                .inner
+                .borrow()
+                .kmdf
+                .device_inits
+                .keys()
+                .next()
+                .expect("fixture device init");
+            let config = 0x41_000;
+            memory.map_bytes(config, &[0_u8; 0x40]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks,
+                    &[init, 0],
+                )
+                .expect("null callback table"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks,
+                    &[0xDEAD, config],
+                )
+                .expect("stale device init"),
+                STATUS_INVALID_PARAMETER
+            );
+            memory.write_u32(config, 0);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks,
+                    &[init, config],
+                )
+                .expect("zero-size callback table"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetFileObjectConfig,
+                    &[init, 0, 0],
+                )
+                .expect("null file config"),
+                STATUS_INVALID_PARAMETER
+            );
+            memory.write_u32(config, 0);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetFileObjectConfig,
+                    &[init, config, 0],
+                )
+                .expect("zero-size file config"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceEnqueueRequest,
+                    &[0xDEAD, 0xBEEF],
+                )
+                .expect("stale enqueue device"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            let request_out = 0x42_000;
+            memory.map_bytes(request_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, 0, request_out],
+                )
+                .expect("request create"),
+                STATUS_SUCCESS
+            );
+            let request = memory.read_u64(request_out).expect("request handle");
+            let device_handle = island.kmdf_device_handles()[0];
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceEnqueueRequest,
+                    &[device_handle, request],
+                )
+                .expect("enqueue without a queue"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceEnqueueRequest,
+                    &[device, 0xDEAD],
+                )
+                .expect("stale request"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+        });
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _dir, mut memory, island) =
+                load_staged_island_x64(&image, "CasaPnpNoCallbacks");
+            let device = island.created_devices()[0].guest_pointer;
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_REMOVE_DEVICE)
+                    .expect("remove without callbacks"),
+                (STATUS_SUCCESS, 0)
+            );
+            assert_eq!(island.device_count(), 0);
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_REMOVE_DEVICE)
+                    .expect("repeated remove without callbacks")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+        });
+        with_big_stack(|| {
+            let mut image = build_kmdf_pnp_driver();
+            image[0x1642..0x1660].fill(0);
+            image[0x1642..0x1649].copy_from_slice(b"WdfFoo\0");
+            let (mut runtime, _directory) = test_runtime();
+            let mut memory = MemoryImage::default();
+            let error = DriverIsland::load_and_start_named(
+                &image,
+                "CasaPnpUnsupported",
+                &mut runtime,
+                &mut memory,
+            )
+            .expect_err("an unsupported framework import must reject the image");
+            assert_eq!(error.code, ReasonCode::RcImportMissing);
+            assert!(
+                error.message.contains("Kmdf:WdfLdr.sys!WdfFoo"),
+                "{}",
+                error.message
+            );
+        });
+    }
+
+    #[test]
+    fn wdf_memory_string_and_typed_context_sizing_errors_reject() {
+        with_big_stack(|| {
+            assert!(matches!(
+                DriverShim::for_import("WdfMemoryCreate"),
+                Some(DriverShim::WdfMemoryCreate)
+            ));
+            assert!(matches!(
+                DriverShim::for_import("WdfMemoryDelete"),
+                Some(DriverShim::WdfObjectDelete)
+            ));
+            assert!(matches!(
+                DriverShim::for_import("WdfStringCreate"),
+                Some(DriverShim::WdfStringCreate)
+            ));
+            assert!(matches!(
+                DriverShim::for_import("WdfStringDelete"),
+                Some(DriverShim::WdfObjectDelete)
+            ));
+            assert!(matches!(
+                DriverShim::for_import("WdfDeviceEnqueueRequest"),
+                Some(DriverShim::WdfDeviceEnqueueRequest)
+            ));
+            assert!(matches!(
+                DriverShim::for_import("WdfPdoInitAllocate"),
+                Some(DriverShim::WdfPdoInitAllocate)
+            ));
+            assert!(matches!(
+                DriverShim::for_import("WdfPdoInitSetEventCallbacks"),
+                None
+            ));
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _dir, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfMem");
+            let device = island.kmdf_device_handles()[0];
+            let memory_out = 0x41_000;
+            let buffer_out = 0x41_008;
+            let size_out = 0x41_010;
+            memory.map_bytes(0x41_000, &[0_u8; 0x20]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryCreate,
+                    &[0, 2, 0x2146_4457, 0x10, memory_out, buffer_out],
+                )
+                .expect("invalid pool type"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryCreate,
+                    &[0, 0, 0x2146_4457, 0x20_0000, memory_out, buffer_out],
+                )
+                .expect("oversized memory"),
+                STATUS_INSUFFICIENT_RESOURCES
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryCreate,
+                    &[0, 0, 0x2146_4457, 0x10, 0, buffer_out],
+                )
+                .expect("null memory out"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryCreate,
+                    &[0, 0, 0x2146_4457, 0x10, memory_out, 0xDEAD_0000],
+                )
+                .expect("invalid buffer out"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryCreatePreallocated,
+                    &[0, 0xDEAD_0000, 0x10, memory_out],
+                )
+                .expect("invalid preallocated buffer"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryCreate,
+                    &[0, 0, 0x2146_4457, 0x80, memory_out, buffer_out],
+                )
+                .expect("memory create"),
+                STATUS_SUCCESS
+            );
+            let handle = memory.read_u64(memory_out).expect("memory handle");
+            let buffer = memory.read_u64(buffer_out).expect("memory buffer");
+            assert_ne!(buffer, 0);
+            assert_eq!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryGetBuffer,
+                    &[handle, size_out],
+                )
+                .expect("memory buffer"),
+                buffer
+            );
+            assert_eq!(memory.read_u64(size_out).expect("memory size"), 0x80);
+            assert_eq!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryGetBuffer,
+                    &[handle, 0],
+                )
+                .expect("memory buffer without size"),
+                buffer
+            );
+            assert_eq!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryGetBuffer,
+                    &[0xDEAD, size_out],
+                )
+                .expect("stale memory handle"),
+                0
+            );
+            assert_eq!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryGetBuffer,
+                    &[handle, 0xDEAD_0000],
+                )
+                .expect("invalid size out"),
+                0
+            );
+            let preallocated = 0x43_000;
+            memory.map_bytes(preallocated, &[0_u8; 0x20]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryCreatePreallocated,
+                    &[0, preallocated, 0x10, memory_out],
+                )
+                .expect("preallocated memory"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectDelete,
+                    &[handle],
+                )
+                .expect("delete memory"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfMemoryGetBuffer,
+                    &[handle, size_out],
+                )
+                .expect("deleted memory"),
+                0
+            );
+
+            let source = guest_unicode_string(&mut memory, 0x44_000, "WdfStr");
+            let string_out = 0x45_000;
+            let destination = 0x45_100;
+            memory.map_bytes(string_out, &[0_u8; 8]);
+            memory.map_bytes(destination, &[0_u8; 16]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfStringCreate,
+                    &[0xDEAD_0000, 0, string_out],
+                )
+                .expect("invalid source string"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfStringCreate,
+                    &[0, 0, string_out],
+                )
+                .expect("null source string"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfStringCreate,
+                    &[source, 0, 0],
+                )
+                .expect("null string out"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfStringCreate,
+                    &[source, 0, string_out],
+                )
+                .expect("string create"),
+                STATUS_SUCCESS
+            );
+            let string = memory.read_u64(string_out).expect("string handle");
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfStringGetUnicodeString,
+                    &[string, destination],
+                )
+                .expect("string readback"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u16(destination).expect("length"), 12);
+            assert_eq!(memory.read_u16(destination + 2).expect("maximum"), 14);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfStringGetUnicodeString,
+                    &[0xDEAD, destination],
+                )
+                .expect("stale string"),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfStringGetUnicodeString,
+                    &[string, 0],
+                )
+                .expect("null string destination"),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let type_info = 0x46_000;
+            memory.map_bytes(type_info, &[0_u8; 0x30]);
+            memory.write_u32(type_info, 0x18);
+            memory.write_u64(type_info + 0x10, 0x1000);
+            assert_eq!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectGetTypedContext,
+                    &[device, type_info],
+                )
+                .expect("oversized typed context"),
+                0
+            );
+            memory.write_u64(type_info + 0x10, 0x80);
+            assert_ne!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectGetTypedContext,
+                    &[device, type_info],
+                )
+                .expect("sized typed context"),
+                0
+            );
+            assert_ne!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectGetTypedContext,
+                    &[device, 0],
+                )
+                .expect("untyped context"),
+                0
+            );
+            let odd = 0x47_000;
+            memory.map_bytes(odd, &[0_u8; 0x20]);
+            memory.write_u16(odd, 3);
+            memory.write_u16(odd + 2, 8);
+            memory.write_u64(odd + 8, 0x47_100);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfStringCreate,
+                    &[odd, 0, string_out],
+                )
+                .expect("odd unicode length"),
+                STATUS_INVALID_PARAMETER
+            );
+            let overlong = 0x48_000;
+            memory.map_bytes(overlong, &[0_u8; 0x20]);
+            memory.write_u16(overlong, 4);
+            memory.write_u16(overlong + 2, 2);
+            memory.write_u64(overlong + 8, 0x48_100);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfStringCreate,
+                    &[overlong, 0, string_out],
+                )
+                .expect("length beyond maximum"),
+                STATUS_INVALID_PARAMETER
+            );
+            let missing = 0x49_000;
+            memory.map_bytes(missing, &[0_u8; 0x20]);
+            memory.write_u16(missing, 4);
+            memory.write_u16(missing + 2, 4);
+            memory.write_u64(missing + 8, 0);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfStringCreate,
+                    &[missing, 0, string_out],
+                )
+                .expect("null unicode buffer"),
+                STATUS_INVALID_PARAMETER
+            );
+            let extra_type = 0x4A_000;
+            let extra_out = 0x4A_100;
+            memory.map_bytes(extra_type, &[0_u8; 0x20]);
+            memory.map_bytes(extra_out, &[0_u8; 8]);
+            memory.write_u32(extra_type, 0x18);
+            memory.write_u64(extra_type + 0x10, 0x20);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectAllocateContext,
+                    &[device, extra_type, extra_out],
+                )
+                .expect("allocate extra context"),
+                STATUS_SUCCESS
+            );
+            let extra = memory.read_u64(extra_out).expect("extra context");
+            assert_ne!(extra, 0);
+            assert_eq!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectGetTypedContext,
+                    &[device, extra_type],
+                )
+                .expect("typed extra context"),
+                extra
+            );
+            let device_object = island
+                .inner
+                .borrow()
+                .kmdf
+                .devices
+                .get(&device)
+                .expect("device")
+                .object_guest;
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfEvtPnpDispatch,
+                    &[0, device_object],
+                )
+                .expect("pnp without an IRP"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfEvtPowerDispatch,
+                    &[0, device_object],
+                )
+                .expect("power without an IRP"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfEvtPnpDispatch,
+                    &[0x1234, 0xDEAD],
+                )
+                .expect("pnp for an unknown device"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfEvtPowerDispatch,
+                    &[0x1234, 0xDEAD],
+                )
+                .expect("power for an unknown device"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+        });
+    }
+
+    #[test]
+    fn wdf_device_enqueue_request_rejects_double_enqueue_and_dispatch_edges() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _dir, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfEnqueue");
+            let device = island.kmdf_device_handles()[0];
+            let queue = *island
+                .inner
+                .borrow()
+                .kmdf
+                .queues
+                .keys()
+                .next()
+                .expect("fixture queue");
+            let base = island.image_base();
+            let request_out = 0x41_000;
+            let output = 0x42_000;
+            memory.map_bytes(request_out, &[0_u8; 8]);
+            memory.map_bytes(output, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, 0, request_out],
+                )
+                .expect("request create"),
+                STATUS_SUCCESS
+            );
+            let request = memory.read_u64(request_out).expect("request");
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestFormatRequestForIoctl,
+                    &[request, 0, 0x0022_0004, 0, 0, output, 4, 0],
+                )
+                .expect("format request"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceEnqueueRequest,
+                    &[device, request],
+                )
+                .expect("enqueue"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                memory
+                    .read_u32(base + u64::from(K_IOCTL_MARKER_RVA))
+                    .expect("ioctl marker"),
+                0x0022_0004
+            );
+            assert_eq!(
+                island.kmdf_request_state(request),
+                Some((true, STATUS_SUCCESS, 4, 0))
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceEnqueueRequest,
+                    &[device, request],
+                )
+                .expect("double enqueue"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceEnqueueRequest,
+                    &[0xDEAD, request],
+                )
+                .expect("stale enqueue device"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceEnqueueRequest,
+                    &[device, 0xDEAD],
+                )
+                .expect("stale enqueue request"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStop,
+                    &[queue, 0, 0],
+                )
+                .expect("stop queue"),
+                STATUS_SUCCESS
+            );
+            memory.map_bytes(request_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, 0, request_out],
+                )
+                .expect("deferred request create"),
+                STATUS_SUCCESS
+            );
+            let deferred = memory.read_u64(request_out).expect("deferred request");
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestFormatRequestForIoctl,
+                    &[deferred, 0, 0x0022_0004, 0, 0, output, 4, 0],
+                )
+                .expect("deferred format"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceEnqueueRequest,
+                    &[device, deferred],
+                )
+                .expect("deferred enqueue"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island.kmdf_request_state(deferred).map(|state| state.0),
+                Some(false)
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueRetrieveNextRequest,
+                    &[queue, request_out],
+                )
+                .expect("retrieve deferred"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u64(request_out).expect("retrieved"), deferred);
+
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueStart,
+                    &[queue],
+                )
+                .expect("start queue"),
+                STATUS_SUCCESS
+            );
+            set_queue_callbacks(&island, queue, |record| {
+                record.callbacks.default = 0;
+                record.callbacks.device_control = 0;
+            });
+            memory.map_bytes(request_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfRequestCreate,
+                    &[0, 0, request_out],
+                )
+                .expect("callbackless request create"),
+                STATUS_SUCCESS
+            );
+            let callbackless = memory.read_u64(request_out).expect("callbackless request");
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceEnqueueRequest,
+                    &[device, callbackless],
+                )
+                .expect("callbackless enqueue"),
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island.kmdf_request_state(callbackless).map(|state| state.1),
+                Some(STATUS_INVALID_DEVICE_REQUEST)
+            );
+        });
+    }
+
+    #[test]
+    fn wdf_pdo_init_rejects_malformed_ids_and_invalid_parent() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver(true, false, false);
+            let (mut runtime, _dir, mut memory, island) =
+                load_staged_island_x64(&image, "CasaWdfPdo");
+            let device = island.kmdf_device_handles()[0];
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAllocate,
+                    &[0xDEAD],
+                )
+                .expect("stale parent"),
+                STATUS_INVALID_HANDLE
+            );
+            let init = call_island_shim_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::WdfPdoInitAllocate,
+                &[device],
+            )
+            .expect("pdo init");
+            assert_ne!(init, 0);
+            let ordinary_init = *island
+                .inner
+                .borrow()
+                .kmdf
+                .device_inits
+                .keys()
+                .find(|handle| **handle != init)
+                .expect("ordinary device init");
+            let device_id = guest_unicode_string(&mut memory, 0x43_000, "CasaPnpDev");
+            let hardware_id = guest_unicode_string(&mut memory, 0x44_000, "CasaPnpHw");
+            let instance_id = guest_unicode_string(&mut memory, 0x45_000, "Instance1");
+            let empty = guest_unicode_string(&mut memory, 0x46_000, "");
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAssignDeviceID,
+                    &[0xDEAD, device_id],
+                )
+                .expect("stale pdo init"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAssignDeviceID,
+                    &[ordinary_init, device_id],
+                )
+                .expect("non-pdo init"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAssignDeviceID,
+                    &[init, 0xDEAD_0000],
+                )
+                .expect("invalid device id string"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAssignDeviceID,
+                    &[init, empty],
+                )
+                .expect("empty device id"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAssignDeviceID,
+                    &[init, device_id],
+                )
+                .expect("device id"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAddHardwareID,
+                    &[init, 0xDEAD_0000],
+                )
+                .expect("invalid hardware id string"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAddHardwareID,
+                    &[init, empty],
+                )
+                .expect("empty hardware id"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAddHardwareID,
+                    &[0xDEAD, hardware_id],
+                )
+                .expect("stale hardware id init"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAddHardwareID,
+                    &[ordinary_init, hardware_id],
+                )
+                .expect("non-pdo hardware id"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAddCompatibleID,
+                    &[ordinary_init, hardware_id],
+                )
+                .expect("non-pdo compatible id"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAssignInstanceID,
+                    &[init, instance_id],
+                )
+                .expect("instance id"),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAddCompatibleID,
+                    &[init, hardware_id],
+                )
+                .expect("compatible id"),
+                STATUS_SUCCESS
+            );
+            for _ in 0..16 {
+                assert_eq!(
+                    call_island_shim(
+                        &island,
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::WdfPdoInitAddHardwareID,
+                        &[init, hardware_id],
+                    )
+                    .expect("hardware id"),
+                    STATUS_SUCCESS
+                );
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfPdoInitAddHardwareID,
+                    &[init, hardware_id],
+                )
+                .expect("hardware id overflow"),
+                STATUS_INSUFFICIENT_RESOURCES
+            );
+            let device_out = 0x47_000;
+            memory.map_bytes(device_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceCreate,
+                    &[0xDEAD, 0, device_out],
+                )
+                .expect("stale pdo create"),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceCreate,
+                    &[init, 0, device_out],
+                )
+                .expect("pdo device create"),
+                STATUS_SUCCESS
+            );
+            let created = memory.read_u64(device_out).expect("pdo handle");
+            let state = island.inner.borrow();
+            let record = state.kmdf.devices.get(&created).expect("pdo device");
+            assert_eq!(record.device_id.as_deref(), Some("CasaPnpDev"));
+            assert_eq!(record.hardware_ids.len(), 16);
+            assert_eq!(record.compatible_ids.len(), 1);
+            assert_eq!(record.instance_id.as_deref(), Some("Instance1"));
+            assert_eq!(record.power_state, WDF_POWER_DEVICE_D3);
+            assert!(!record.started);
+        });
+    }
+
+    #[test]
+    fn pnp_x86_callbacks_power_and_sized_context_reject_stale_edges() {
+        with_big_stack(|| {
+            let image = build_kmdf_driver_pe32();
+            let (mut runtime, _dir, mut memory, island) =
+                load_staged_island_x86(&image, "CasaPnpX86");
+            let init = *island
+                .inner
+                .borrow()
+                .kmdf
+                .device_inits
+                .keys()
+                .next()
+                .expect("x86 device init");
+            let device = island.created_devices()[0].guest_pointer;
+            let config = 0x41_000;
+            memory.map_bytes(config, &[0_u8; 0x40]);
+            memory.write_u32(config, 4);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks,
+                    &[init, config],
+                )
+                .expect("short x86 pnp callbacks"),
+                STATUS_SUCCESS
+            );
+            {
+                let state = island.inner.borrow();
+                let parsed = state.kmdf.device_inits.get(&init).expect("init").pnp_power;
+                assert_eq!(parsed.prepare_hardware, 0);
+                assert_eq!(parsed.self_managed_io_fini, 0);
+            }
+            memory.write_u32(config, 0x2C);
+            for (index, offset) in [0x04u32, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C]
+                .iter()
+                .enumerate()
+            {
+                memory.write_u32(config + u64::from(*offset), 0x1000 + index as u32 * 0x10);
+            }
+            memory.write_u32(config + 0x28, 0x2000);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks,
+                    &[init, config],
+                )
+                .expect("full x86 pnp callbacks"),
+                STATUS_SUCCESS
+            );
+            {
+                let state = island.inner.borrow();
+                let parsed = state.kmdf.device_inits.get(&init).expect("init").pnp_power;
+                assert_eq!(parsed.prepare_hardware, 0x1000);
+                assert_eq!(parsed.release_hardware, 0x1010);
+                assert_eq!(parsed.d0_entry, 0x1020);
+                assert_eq!(parsed.d0_exit, 0x1030);
+                assert_eq!(parsed.self_managed_io_init, 0x1040);
+                assert_eq!(parsed.self_managed_io_suspend, 0x1050);
+                assert_eq!(parsed.self_managed_io_restart, 0x1060);
+                assert_eq!(parsed.self_managed_io_fini, 0x2000);
+            }
+            let file_config = 0x42_000;
+            memory.map_bytes(file_config, &[0_u8; 0x20]);
+            memory.write_u32(file_config, 8);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetFileObjectConfig,
+                    &[init, file_config, 0],
+                )
+                .expect("short x86 file config"),
+                STATUS_SUCCESS
+            );
+            {
+                let state = island.inner.borrow();
+                let parsed = state
+                    .kmdf
+                    .device_inits
+                    .get(&init)
+                    .expect("init")
+                    .file_object;
+                assert_eq!(parsed.evt_file_cleanup, 0);
+                assert_eq!(parsed.evt_file_close, 0);
+            }
+            memory.write_u32(file_config, 0x18);
+            memory.write_u32(file_config + 0x08, 0x3000);
+            memory.write_u32(file_config + 0x0C, 0x3010);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfDeviceInitSetFileObjectConfig,
+                    &[init, file_config, 0],
+                )
+                .expect("full x86 file config"),
+                STATUS_SUCCESS
+            );
+            {
+                let state = island.inner.borrow();
+                let parsed = state
+                    .kmdf
+                    .device_inits
+                    .get(&init)
+                    .expect("init")
+                    .file_object;
+                assert_eq!(parsed.evt_file_close, 0x3000);
+                assert_eq!(parsed.evt_file_cleanup, 0x3010);
+            }
+            let device_handle = island.kmdf_device_handles()[0];
+            let type_info = 0x43_000;
+            memory.map_bytes(type_info, &[0_u8; 0x20]);
+            memory.write_u32(type_info, 0x10);
+            memory.write_u32(type_info + 0x08, 0x1000);
+            assert_eq!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectGetTypedContext,
+                    &[device_handle, type_info],
+                )
+                .expect("oversized x86 typed context"),
+                0
+            );
+            memory.write_u32(type_info + 0x08, 0x40);
+            assert_ne!(
+                call_island_shim_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfObjectGetTypedContext,
+                    &[device_handle, type_info],
+                )
+                .expect("sized x86 typed context"),
+                0
+            );
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3)
+                    .expect("x86 D3 before start")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("x86 start")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3)
+                    .expect("x86 D3")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island
+                    .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D0)
+                    .expect("x86 D0")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_STOP_DEVICE)
+                    .expect("x86 stop")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_STOP_DEVICE)
+                    .expect("repeated x86 stop")
+                    .0,
+                STATUS_INVALID_DEVICE_REQUEST
+            );
+        });
+    }
+
+    #[test]
+    fn pnp_start_without_release_and_cleanup_without_hardware_roll_back() {
+        with_big_stack(|| {
+            let (mut runtime, _dir, mut memory, island, base, device) =
+                pnp_load("CasaPnpRollbackEdges");
+            let handle = island.kmdf_device_handles()[0];
+            {
+                let mut state = island.inner.borrow_mut();
+                let record = state.kmdf.devices.get_mut(&handle).expect("device");
+                record.pnp_power.prepare_hardware = 0;
+                record.pnp_power.release_hardware = 0;
+                record.pnp_power.self_managed_io_init = 0;
+            }
+            assert_eq!(
+                island
+                    .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE)
+                    .expect("start without prepare/release/self-io")
+                    .0,
+                STATUS_SUCCESS
+            );
+            assert_eq!(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 1);
+            assert_eq!(pnp_u32(&memory, base, P_PREPARE_COUNT), 0);
+            assert_eq!(pnp_u32(&memory, base, P_SELFINIT_COUNT), 0);
+            assert_eq!(pnp_u32(&memory, base, P_RELEASE_COUNT), 0);
+        });
+        with_big_stack(|| {
+            let image = build_kmdf_full_driver(0, false);
+            let (mut runtime, _dir, mut memory, island) =
+                load_staged_island_x64(&image, "CasaPnpStaleFileDevice");
+            let handles = island.kmdf_device_handles();
+            let stale_handle = handles[1];
+            let (object, casak) = {
+                let state = island.inner.borrow();
+                let record = state.kmdf.devices.get(&stale_handle).expect("device");
+                (record.object_guest, record.casak)
+            };
+            {
+                let mut state = island.inner.borrow_mut();
+                state
+                    .kmdf
+                    .devices
+                    .get_mut(&stale_handle)
+                    .expect("device")
+                    .file_cleanup = 0x1234;
+                state.io.delete_device(casak).expect("delete stale device");
+            }
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfEvtIoCleanupDispatch,
+                    &[0, object],
+                )
+                .expect("file dispatch for a deleted device"),
+                crate::casak::io::STATUS_DELETE_PENDING
+            );
+        });
+    }
+
     #[test]
     fn kmdf_dispatch_arena_exhaustion_rejects_with_io_error() {
         with_big_stack(|| {
@@ -15260,6 +18709,20 @@ mod tests {
                 .keys()
                 .next()
                 .expect("device object");
+            {
+                let mut state = island.inner.borrow_mut();
+                let handle = *state
+                    .kmdf
+                    .devices_by_object
+                    .get(&device_object)
+                    .expect("device handle");
+                state
+                    .kmdf
+                    .devices
+                    .get_mut(&handle)
+                    .expect("device")
+                    .file_cleanup = 0x1234;
+            }
             let saved_cursor = {
                 let mut state = island.inner.borrow_mut();
                 let saved = state.arena.cursor;
@@ -15274,6 +18737,19 @@ mod tests {
                 &[0, device_object],
             )
             .expect_err("exhausted arena must reject request creation");
+            assert_eq!(error.code, ReasonCode::RcIo);
+            assert_eq!(
+                error.message.contains("driver island arena exhausted"),
+                true
+            );
+            let error = call_island_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::WdfEvtIoCleanupDispatch,
+                &[0, device_object],
+            )
+            .expect_err("exhausted arena must reject file request creation");
             assert_eq!(error.code, ReasonCode::RcIo);
             assert_eq!(
                 error.message.contains("driver island arena exhausted"),

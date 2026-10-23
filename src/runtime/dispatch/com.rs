@@ -38,6 +38,11 @@ const MK_E_NOOBJECT: u32 = 0x8004_01E5;
 const MK_E_EXCEEDEDDEADLINE: u32 = 0x8004_01E1;
 const MK_E_UNAVAILABLE: u32 = 0x8004_01E3;
 const MK_E_REDUCED_TO_SELF: u32 = 0x8004_0109;
+const INET_E_INVALID_URL: u32 = 0x800C_0002;
+const INET_E_CANNOT_CONNECT: u32 = 0x800C_0004;
+const INET_E_OBJECT_NOT_FOUND: u32 = 0x800C_0006;
+const INET_E_DOWNLOAD_FAILURE: u32 = 0x800C_0008;
+const INET_E_UNKNOWN_PROTOCOL: u32 = 0x800C_000D;
 const BINDSPEED_INDEFINITE: u32 = 0;
 const BINDSPEED_MODERATE: u32 = 1;
 const BINDSPEED_IMMEDIATE: u32 = 2;
@@ -6197,8 +6202,10 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `ITypeInfo::GetMops(memid, pBstrMops)` — registered interfaces carry
-    /// no marshaling-op string; known members answer S_OK with a NULL BSTR.
+    /// `ITypeInfo::GetMops(memid, pBstrMops)` — the registered tables carry
+    /// no marshaling-op strings, so a known member (or MEMBERID_NIL for the
+    /// type-level entry) answers S_OK with a NULL BSTR, exactly like a real
+    /// type library without MOPS records.  A NULL output is E_INVALIDARG.
     fn com_type_info_get_mops(
         &mut self,
         state: &mut CpuState,
@@ -6207,13 +6214,19 @@ impl PeHostRuntime {
         let this = guest_call_arg(state, memory, 0)?;
         let memid = self.com_arg_i32(state, memory, 1);
         let out = guest_call_arg(state, memory, 2)?;
-        if out != 0 {
-            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
         }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
         let Some(info) = self.com_type_infos.get(&this).cloned() else {
             state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
             return Ok(());
         };
+        if memid == MEMBERID_NIL {
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         if let Some(type_index) = Self::com_msft_typeinfo_index(&info.table) {
             let found = self
                 .com_msft_typelib(info.owner)
@@ -6280,17 +6293,25 @@ impl PeHostRuntime {
     }
 
     /// `ITypeInfo::GetTypeComp(ppTComp)` — the containing type component.
+    /// Only a live ITypeInfo has one; a NULL output is E_INVALIDARG.
     fn com_type_info_get_type_comp(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
         let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if !self.com_type_infos.contains_key(&this) {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        }
         let type_comp = self.alloc_com_type_comp_object(memory)?;
         self.add_ref_guest_object(type_comp)?;
-        if out != 0 {
-            write_guest_pointer(memory, out, type_comp, self.guest_arch).ok();
-        }
+        write_guest_pointer(memory, out, type_comp, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -6822,13 +6843,23 @@ impl PeHostRuntime {
 
     /// `ITypeComp::Bind` / `ITypeComp::BindType` — resolve a registered type
     /// name to its real ITypeInfo, and a member name to its ITypeInfo plus
-    /// FUNCDESC.  Unknown names answer TYPE_E_ELEMENTNOTFOUND.
+    /// FUNCDESC.  Unknown names answer TYPE_E_ELEMENTNOTFOUND; a dead type
+    /// component or a NULL ppTInfo is rejected before any name lookup.
     fn com_type_comp_bind(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
         bind_type_only: bool,
     ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if !self
+            .com_type_infos
+            .get(&this)
+            .is_some_and(|info| info.table == COM_TYPECOMP_MARKER)
+        {
+            state.set(Register::Rax, u64::from(TYPE_E_ELEMENTNOTFOUND));
+            return Ok(());
+        }
         let name_ptr = guest_call_arg(state, memory, 1)?;
         let _hash = guest_call_arg_u32(state, memory, 2)?;
         let (tinfo_out, desc_out) = if bind_type_only {
@@ -6839,9 +6870,11 @@ impl PeHostRuntime {
                 guest_call_arg(state, memory, 5)?,
             )
         };
-        if tinfo_out != 0 {
-            write_guest_pointer(memory, tinfo_out, 0, self.guest_arch).ok();
+        if tinfo_out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
         }
+        write_guest_pointer(memory, tinfo_out, 0, self.guest_arch).ok();
         if desc_out != 0 {
             write_guest_pointer(memory, desc_out, 0, self.guest_arch).ok();
         }
@@ -7271,6 +7304,11 @@ impl PeHostRuntime {
             ));
         }
         if lower.starts_with("http:") || lower.starts_with("https:") {
+            // The URL moniker needs a complete URL: the scheme alone (or an
+            // empty authority) is MK_E_SYNTAX, exactly like the real parser.
+            if url::Url::parse(name).is_err() {
+                return None;
+            }
             return Some((
                 crate::runtime::state::ComMonikerState {
                     kind: crate::runtime::state::ComMonikerKind::Url,
@@ -7419,7 +7457,9 @@ impl PeHostRuntime {
                     None => (MK_E_NOOBJECT, 0),
                 }
             }
-            crate::runtime::state::ComMonikerKind::Url => (MK_E_NOOBJECT, 0),
+            crate::runtime::state::ComMonikerKind::Url => {
+                self.com_bind_url_object(memory, &state.payload)?
+            }
         };
         if hr != S_OK {
             return Ok((hr, 0));
@@ -7458,6 +7498,17 @@ impl PeHostRuntime {
         let Some(state) = self.com_monikers.get(&first).cloned() else {
             return Ok((MK_E_NOOBJECT, 0));
         };
+        if state.kind == crate::runtime::state::ComMonikerKind::Url {
+            let bytes = match self.com_url_fetch(&state.payload) {
+                Ok(bytes) => bytes,
+                Err(hr) => return Ok((hr, 0)),
+            };
+            let object = self.alloc_com_stream_object(memory, bytes, "download", None)?;
+            if chain.len() == 1 {
+                return Ok((S_OK, object));
+            }
+            return Ok((MK_E_NOOBJECT, 0));
+        }
         if state.kind != crate::runtime::state::ComMonikerKind::File
             || state.payload.starts_with(COM_ITEM_PREFIX)
         {
@@ -7548,6 +7599,102 @@ impl PeHostRuntime {
             .insert(object, moniker_state.display_name.clone());
         self.com_monikers.insert(object, moniker_state);
         Ok(object)
+    }
+
+    /// Fetch one http(s) URL through the runtime's WinHTTP stack (the URL
+    /// moniker transport), returning the response bytes or the URLMON
+    /// HRESULT for an invalid scheme, connect failure or HTTP error status.
+    fn com_url_fetch(&mut self, text: &str) -> std::result::Result<Vec<u8>, u32> {
+        let parsed = match url::Url::parse(text) {
+            Ok(parsed) => parsed,
+            Err(_) => return Err(INET_E_INVALID_URL),
+        };
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(INET_E_UNKNOWN_PROTOCOL);
+        }
+        let secure = parsed.scheme() == "https";
+        let host = parsed.host_str().unwrap_or_default().to_string();
+        let port = parsed
+            .port_or_known_default()
+            .unwrap_or(if secure { 443 } else { 80 });
+        let mut target = parsed.path().to_string();
+        if let Some(query) = parsed.query() {
+            target.push('?');
+            target.push_str(query);
+        }
+        let session = self
+            .winhttp
+            .win_http_open(Some("Casa1-URLMoniker"), 0, None, None);
+        // A freshly created session always connects; an invalid handle
+        // surfaces as a send failure below (the honest INET_E_CANNOT_CONNECT).
+        let connection = self
+            .winhttp
+            .win_http_connect(session, &host, port, secure)
+            .unwrap_or_default();
+        let request = self
+            .winhttp
+            .win_http_open_request(connection, "GET", &target, None)
+            .unwrap_or_default();
+        let result = self.com_url_fetch_request(request);
+        let _ = self.winhttp.win_http_close_handle(request);
+        let _ = self.winhttp.win_http_close_handle(connection);
+        let _ = self.winhttp.win_http_close_handle(session);
+        result
+    }
+
+    fn com_url_fetch_request(&mut self, request: u64) -> std::result::Result<Vec<u8>, u32> {
+        if self
+            .winhttp
+            .win_http_send_request(request, None, None)
+            .is_err()
+        {
+            return Err(INET_E_CANNOT_CONNECT);
+        }
+        let status = self.winhttp.request_status_code(request);
+        if status >= 400 {
+            return Err(if status == 404 {
+                INET_E_OBJECT_NOT_FOUND
+            } else {
+                INET_E_DOWNLOAD_FAILURE
+            });
+        }
+        let mut body = Vec::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = self
+                .winhttp
+                .win_http_read_data(request, &mut buffer)
+                .map_err(|_| INET_E_DOWNLOAD_FAILURE)?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&buffer[..read as usize]);
+        }
+        Ok(body)
+    }
+
+    fn com_bind_url_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        url: &str,
+    ) -> AppResult<(u32, u64)> {
+        if url.is_empty() {
+            return Ok((INET_E_INVALID_URL, 0));
+        }
+        let bytes = match self.com_url_fetch(url) {
+            Ok(bytes) => bytes,
+            Err(hr) => return Ok((hr, 0)),
+        };
+        match ole_embedded_clsid(&bytes) {
+            Some(clsid) => {
+                let clsid_text = Self::guid_bytes_to_string(&clsid);
+                match self.try_create_com_object(memory, &clsid_text, IID_IUNKNOWN, 0)? {
+                    Some(object) => Ok((S_OK, object)),
+                    None => Ok((REGDB_E_CLASSNOTREG, 0)),
+                }
+            }
+            None => Ok((MK_E_NOOBJECT, 0)),
+        }
     }
 
     pub(crate) fn dispatch_com_moniker_bind_to_object(
@@ -7650,9 +7797,17 @@ impl PeHostRuntime {
                 Ok(())
             }
             ComMonikerKind::Url => {
-                // The runtime models no URL object handlers: the honest
-                // MK_E_NOOBJECT (a real bind would need a protocol handler).
-                state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+                let url = self
+                    .com_monikers
+                    .get(&this)
+                    .map(|moniker| moniker.payload.clone())
+                    .unwrap_or_default();
+                let (hr, object) = self.com_bind_url_object(memory, &url)?;
+                if hr == S_OK {
+                    self.add_ref_guest_object(object)?;
+                    write_guest_pointer(memory, out, object, self.guest_arch).ok();
+                }
+                state.set(Register::Rax, u64::from(hr));
                 Ok(())
             }
         }
@@ -7697,7 +7852,29 @@ impl PeHostRuntime {
             return Ok(());
         }
         if kind == ComMonikerKind::Url {
-            state.set(Register::Rax, u64::from(MK_E_NOOBJECT));
+            let wants_stream = riid == COM_IID_ISTREAM
+                || riid == COM_IID_ISEQUENTIALSTREAM
+                || Self::com_iid_is_iunknown(&riid);
+            if !wants_stream {
+                state.set(Register::Rax, u64::from(E_NOINTERFACE));
+                return Ok(());
+            }
+            let url = self
+                .com_monikers
+                .get(&this)
+                .map(|moniker| moniker.payload.clone())
+                .unwrap_or_default();
+            let bytes = match self.com_url_fetch(&url) {
+                Ok(bytes) => bytes,
+                Err(hr) => {
+                    state.set(Register::Rax, u64::from(hr));
+                    return Ok(());
+                }
+            };
+            let stream = self.alloc_com_stream_object(memory, bytes, "download", None)?;
+            self.add_ref_guest_object(stream)?;
+            write_guest_pointer(memory, out, stream, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
             return Ok(());
         }
         let Some(host_path) = self
@@ -10181,6 +10358,8 @@ fn ole_embedded_clsid(bytes: &[u8]) -> Option<[u8; 16]> {
 mod tests {
     use super::super::test_support::{Fixture, dispatch_x86, with_big_stack, x86_fixture};
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     const OUT: u64 = 0x41_000;
     const BUF: u64 = 0x41_100;
@@ -10233,6 +10412,46 @@ mod tests {
             .runtime
             .alloc_com_automation_server(&mut fixture.memory, "ICasa1Automation")
             .unwrap()
+    }
+
+    /// Serve `requests` one-shot HTTP/1.1 responses on a loopback port and
+    /// return the `/download.bin` URL for the listener.
+    fn http_server(
+        status: &'static str,
+        body: Vec<u8>,
+        requests: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let address = listener.local_addr().expect("loopback address");
+        let handle = std::thread::spawn(move || {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().expect("accept loopback");
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).expect("write headers");
+                stream.write_all(&body).expect("write body");
+                stream.flush().expect("flush response");
+            }
+        });
+        (format!("http://{address}/download.bin"), handle)
+    }
+
+    fn closed_loopback_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind closed port");
+        let address = listener.local_addr().expect("closed address");
+        drop(listener);
+        format!("http://{address}/unreachable")
+    }
+
+    fn embedded_clsid_document(clsid: [u8; 16]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 0x60];
+        bytes[..8].copy_from_slice(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+        bytes[0x50..0x60].copy_from_slice(&clsid);
+        bytes
     }
 
     // ── Streams ─────────────────────────────────────────────────────────────
@@ -11749,6 +11968,519 @@ mod tests {
             "IMoniker::ComposeWith"
         );
         guest_ptr(fixture, OUT)
+    }
+
+    // ── URL monikers ───────────────────────────────────────────────────────
+
+    #[test]
+    fn url_moniker_parse_rejects_malformed_and_unsupported_names() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-url-parse");
+            for text in [
+                "http:",
+                "https:",
+                "http://",
+                "https://",
+                "http://exa mple.com/x",
+                "ftp://127.0.0.1/x",
+                "unknown://host/x",
+            ] {
+                write_utf16(&mut fixture, NAME, text);
+                fixture.memory.map_bytes(OUT, &[0xaa_u8; 8]);
+                assert_eq!(
+                    dispatch_x86(
+                        &mut fixture,
+                        HostThunk::MkParseDisplayName,
+                        &[0, NAME as u32, COOKIE as u32, OUT as u32]
+                    ),
+                    u64::from(MK_E_SYNTAX),
+                    "MkParseDisplayName({text})"
+                );
+                assert_eq!(guest_ptr(&fixture, OUT), 0, "no moniker for {text}");
+            }
+
+            // https is accepted and round-trips through GetDisplayName.
+            let https = parse_moniker(&mut fixture, "https://example.invalid/a?b=c");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, https, 14, &[https as u32, 0, 0, OUT as u32]),
+                S_OK
+            );
+            let name = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, name).unwrap(),
+                "https://example.invalid/a?b=c"
+            );
+        })
+    }
+
+    #[test]
+    fn url_moniker_bind_storage_fetches_over_loopback_and_pins_urlmon_errors() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-url-bind");
+            let body = b"url-moniker-payload".to_vec();
+            let (base, server) = http_server("200 OK", body.clone(), 2);
+            let url = format!("{base}?token=1");
+            let moniker = parse_moniker(&mut fixture, &url);
+
+            // GetDisplayName keeps the exact parsed URL; the URL moniker is
+            // in the system-moniker family.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    14,
+                    &[moniker as u32, 0, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            let display = guest_ptr(&fixture, OUT);
+            assert_eq!(read_utf16_string(&fixture.memory, display).unwrap(), url);
+            fixture.memory.map_bytes(OUT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 16, &[moniker as u32, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 7);
+
+            // IMoniker::ParseDisplayName round-trips the same URL and
+            // compares equal to the original moniker.
+            write_utf16(&mut fixture, NAME, &url);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    15,
+                    &[moniker as u32, 0, 0, NAME as u32, COOKIE as u32, OUT as u32,]
+                ),
+                S_OK,
+                "IMoniker::ParseDisplayName(URL)"
+            );
+            let reparsed = guest_ptr(&fixture, OUT);
+            assert_ne!(reparsed, 0);
+            assert_eq!(
+                fixture.memory.read_u32(COOKIE).unwrap(),
+                url.encode_utf16().count() as u32
+            );
+            fixture.memory.map_bytes(STAT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    reparsed,
+                    13,
+                    &[reparsed as u32, moniker as u32, STAT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+
+            // IStorage is not the URL stream surface.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTORAGE);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    9,
+                    &[moniker as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+
+            // BindToStorage(IStream) returns the real fetched bytes.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    9,
+                    &[moniker as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK,
+                "BindToStorage(IStream)"
+            );
+            let stream = guest_ptr(&fixture, OUT);
+            assert_ne!(stream, 0);
+            fixture.memory.map_bytes(BUF, &[0_u8; 32]);
+            let read_out = OUT + 8;
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    3,
+                    &[
+                        stream as u32,
+                        BUF as u32,
+                        body.len() as u32,
+                        read_out as u32,
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                fixture.memory.read_u32(read_out).unwrap(),
+                body.len() as u32
+            );
+            assert_eq!(fixture.memory.read_bytes(BUF, body.len()).unwrap(), body);
+
+            // No embedded CLSID: the URL has no object handler.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    8,
+                    &[moniker as u32, 0, 0, 0, OUT as u32]
+                ),
+                MK_E_NOOBJECT
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+            server.join().unwrap();
+
+            // A closed loopback port is a WinHTTP connect failure in both
+            // bind directions.
+            let unreachable = parse_moniker(&mut fixture, &closed_loopback_url());
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    unreachable,
+                    9,
+                    &[unreachable as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                INET_E_CANNOT_CONNECT,
+                "BindToStorage(unreachable)"
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    unreachable,
+                    8,
+                    &[unreachable as u32, 0, 0, 0, OUT as u32]
+                ),
+                INET_E_CANNOT_CONNECT,
+                "BindToObject(unreachable)"
+            );
+
+            // HTTP status failures keep their exact URLMON codes.
+            let (not_found, server404) = http_server("404 Not Found", b"gone".to_vec(), 1);
+            let missing = parse_moniker(&mut fixture, &not_found);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    missing,
+                    9,
+                    &[missing as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                INET_E_OBJECT_NOT_FOUND,
+                "BindToStorage(404)"
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+            server404.join().unwrap();
+
+            let (failure, server500) = http_server("500 Internal Error", b"oops".to_vec(), 1);
+            let broken = parse_moniker(&mut fixture, &failure);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    broken,
+                    9,
+                    &[broken as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                INET_E_DOWNLOAD_FAILURE,
+                "BindToStorage(500)"
+            );
+            server500.join().unwrap();
+
+            // Directly-constructed URL monikers surface the two transport
+            // validation errors: no URL and a non-HTTP scheme.
+            for (payload, expected) in [
+                ("", INET_E_INVALID_URL),
+                ("ftp://127.0.0.1/x", INET_E_UNKNOWN_PROTOCOL),
+            ] {
+                let bad = fixture
+                    .runtime
+                    .alloc_com_moniker_object(
+                        &mut fixture.memory,
+                        crate::runtime::state::ComMonikerState {
+                            kind: crate::runtime::state::ComMonikerKind::Url,
+                            display_name: payload.to_string(),
+                            payload: payload.to_string(),
+                            host_path: None,
+                        },
+                    )
+                    .unwrap();
+                write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+                fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        bad,
+                        9,
+                        &[bad as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                    ),
+                    expected,
+                    "BindToStorage({payload})"
+                );
+                fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+                assert_eq!(
+                    call_slot(&mut fixture, bad, 8, &[bad as u32, 0, 0, 0, OUT as u32]),
+                    expected,
+                    "BindToObject({payload})"
+                );
+            }
+        })
+    }
+
+    #[test]
+    fn url_moniker_bind_to_object_uses_embedded_clsid_handlers() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-url-object");
+            let automation_clsid =
+                PeHostRuntime::parse_guid_string(COM_AUTOMATION_SERVER_CLSID).unwrap();
+            let (known_url, known_server) =
+                http_server("200 OK", embedded_clsid_document(automation_clsid), 1);
+            let moniker = parse_moniker(&mut fixture, &known_url);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IUNKNOWN);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    8,
+                    &[moniker as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK,
+                "BindToObject(embedded automation CLSID)"
+            );
+            let object = guest_ptr(&fixture, OUT);
+            assert!(fixture.runtime.com_servers.contains_key(&object));
+            known_server.join().unwrap();
+
+            let (unknown_url, unknown_server) =
+                http_server("200 OK", embedded_clsid_document([0xAB_u8; 16]), 1);
+            let moniker = parse_moniker(&mut fixture, &unknown_url);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    8,
+                    &[moniker as u32, 0, 0, 0, OUT as u32]
+                ),
+                REGDB_E_CLASSNOTREG,
+                "BindToObject(unregistered embedded CLSID)"
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+            unknown_server.join().unwrap();
+        })
+    }
+
+    #[test]
+    fn url_moniker_compose_enum_reduce_and_composite_bind_chain() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-url-chain");
+            let body = b"chain-payload".to_vec();
+            let (base, server) = http_server("200 OK", body.clone(), 3);
+            let url = parse_moniker(&mut fixture, &base);
+            let item = parse_moniker(&mut fixture, "item:download");
+            let composite = compose_monikers(&mut fixture, url, item);
+            assert_ne!(composite, 0);
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    composite,
+                    14,
+                    &[composite as u32, 0, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            let display = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, display).unwrap(),
+                format!("{base}!item:download")
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(&mut fixture, composite, 16, &[composite as u32, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 1);
+
+            // Enum walks the real component chain in both directions.
+            for (forward, expected) in [(1_u32, [url, item]), (0_u32, [item, url])] {
+                fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        composite,
+                        12,
+                        &[composite as u32, forward, OUT as u32]
+                    ),
+                    S_OK,
+                    "IMoniker::Enum"
+                );
+                let enumerator = guest_ptr(&fixture, OUT);
+                fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+                let fetched = OUT + 0x20;
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        enumerator,
+                        3,
+                        &[enumerator as u32, 2, BUF as u32, fetched as u32]
+                    ),
+                    S_OK
+                );
+                assert_eq!(fixture.memory.read_u32(fetched).unwrap(), 2);
+                assert_eq!(guest_ptr(&fixture, BUF), expected[0]);
+                assert_eq!(guest_ptr(&fixture, BUF + 4), expected[1]);
+            }
+
+            // Multi-component chains reduce to themselves.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    composite,
+                    10,
+                    &[composite as u32, 0, 0, 0, OUT as u32]
+                ),
+                MK_E_REDUCED_TO_SELF
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+
+            // URL+item storage binds fetch the URL, but a stream has no item
+            // container.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    composite,
+                    9,
+                    &[composite as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                MK_E_NOOBJECT,
+                "URL+item BindToStorage"
+            );
+
+            // URL+item object binds fetch the URL too; plain content has no
+            // embedded object handler.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    composite,
+                    8,
+                    &[composite as u32, 0, 0, 0, OUT as u32]
+                ),
+                MK_E_NOOBJECT,
+                "URL+item BindToObject"
+            );
+
+            // A one-component URL composite binds to the URL IStream.
+            let single = fixture
+                .runtime
+                .alloc_com_moniker_object(
+                    &mut fixture.memory,
+                    crate::runtime::state::ComMonikerState {
+                        kind: crate::runtime::state::ComMonikerKind::Url,
+                        display_name: base.clone(),
+                        payload: format!("{COM_COMPOSITE_PREFIX}{url}"),
+                        host_path: None,
+                    },
+                )
+                .unwrap();
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    single,
+                    9,
+                    &[single as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK,
+                "single-component URL BindToStorage"
+            );
+            let stream = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 32]);
+            let read_out = OUT + 8;
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    3,
+                    &[
+                        stream as u32,
+                        BUF as u32,
+                        body.len() as u32,
+                        read_out as u32,
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_bytes(BUF, body.len()).unwrap(), body);
+            server.join().unwrap();
+
+            // A URL-first chain carries the URL transport failure out of the
+            // composite bind unchanged.
+            let unreachable = parse_moniker(&mut fixture, &closed_loopback_url());
+            let unreachable_chain = compose_monikers(&mut fixture, unreachable, item);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    unreachable_chain,
+                    9,
+                    &[unreachable_chain as u32, 0, 0, IID_PTR as u32, OUT as u32,]
+                ),
+                INET_E_CANNOT_CONNECT,
+                "unreachable URL+item BindToStorage"
+            );
+
+            // Item-first and class-first chains cannot produce a storage.
+            let item_first = compose_monikers(&mut fixture, item, url);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    item_first,
+                    9,
+                    &[item_first as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                MK_E_NOOBJECT,
+                "item-first BindToStorage"
+            );
+            let class = parse_moniker(
+                &mut fixture,
+                &format!("clsid:{COM_AUTOMATION_SERVER_CLSID}"),
+            );
+            let class_composite = compose_monikers(&mut fixture, class, item);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    class_composite,
+                    9,
+                    &[class_composite as u32, 0, 0, IID_PTR as u32, OUT as u32]
+                ),
+                MK_E_NOOBJECT,
+                "class-first BindToStorage"
+            );
+        })
     }
 
     #[test]
@@ -17824,6 +18556,130 @@ mod tests {
             );
             assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
             assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 1);
+        })
+    }
+
+    #[test]
+    fn type_info_mops_and_type_comp_reject_null_dead_and_member_edges() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-typeinfo-edges");
+            let type_info = fixture
+                .runtime
+                .alloc_com_type_info_object(&mut fixture.memory, "ICasa1Automation", 0, 0)
+                .unwrap();
+
+            // GetMops requires its BSTR output.  MEMBERID_NIL addresses the
+            // type-level entry, which carries no MOPS string.
+            assert_eq!(
+                call_slot(&mut fixture, type_info, 17, &[type_info as u32, 1, 0]),
+                E_INVALIDARG
+            );
+            fixture.memory.map_bytes(OUT, &[0xff_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_info,
+                    17,
+                    &[type_info as u32, u32::MAX, OUT as u32]
+                ),
+                S_OK,
+                "GetMops(MEMBERID_NIL)"
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+            assert_eq!(
+                call_slot(&mut fixture, type_info, 17, &[0xDEAD_0000, 1, OUT as u32]),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            // GetTypeComp needs a live ITypeInfo and an output.
+            assert_eq!(
+                call_slot(&mut fixture, type_info, 4, &[type_info as u32, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, type_info, 4, &[0xDEAD_0000, OUT as u32]),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, type_info, 4, &[type_info as u32, OUT as u32]),
+                S_OK
+            );
+            let type_comp = guest_ptr(&fixture, OUT);
+            write_utf16(&mut fixture, NAME, "Value");
+
+            // Bind rejects a dead type component and a NULL ppTInfo before
+            // it performs the name lookup.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_comp,
+                    3,
+                    &[0xDEAD_0000, NAME as u32, 0, 0, OUT as u32, (OUT + 4) as u32,]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_comp,
+                    3,
+                    &[type_comp as u32, NAME as u32, 0, 0, 0, (OUT + 4) as u32]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_comp,
+                    3,
+                    &[
+                        type_comp as u32,
+                        NAME as u32,
+                        0,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32,
+                    ]
+                ),
+                S_OK,
+                "Bind(member)"
+            );
+            let info = guest_ptr(&fixture, OUT);
+            let desc = guest_ptr(&fixture, OUT + 4);
+            assert_ne!(info, 0);
+            assert_ne!(desc, 0);
+
+            // BindType rejects a dead component, a NULL ppTInfo, and the
+            // member name (only registered type names bind).
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_comp,
+                    4,
+                    &[0xDEAD_0000, NAME as u32, 0, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_comp,
+                    4,
+                    &[type_comp as u32, NAME as u32, 0, 0]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    type_comp,
+                    4,
+                    &[type_comp as u32, NAME as u32, 0, OUT as u32]
+                ),
+                TYPE_E_ELEMENTNOTFOUND,
+                "BindType(member name)"
+            );
         })
     }
 

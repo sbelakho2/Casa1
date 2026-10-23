@@ -89,6 +89,13 @@
  "activation_resolution_list_without_default_is_no_devices": [
   "( resolve_audio_activation_device(&devices, None), Err(AudioActivationDeviceFailure::NoDevices) )"
  ],
+ "activation_resolution_named_endpoint_mismatch_is_exact_never_default": [
+  "( resolve_audio_activation_device( &devices, Some( r\"\\?\\SWD#MMDEVAPI#{0.0.0.00000000}.{Studio Display|2|48000}#{e6327cad-dcec-4949-ae8a-991e976a79d2}\" ), ), Ok(hdmi.clone()) )",
+  "( resolve_audio_activation_device( &[hdmi.clone()], Some(r\"\\?\\SWD#MMDEVAPI#{0.0.0.00000000}.{studio display}\"), ), Ok(hdmi.clone()) )",
+  "( resolve_audio_activation_device( &devices, Some(r\"\\?\\SWD#MMDEVAPI#{0.0.0.00000000}.{Missing Output}\"), ), Err(AudioActivationDeviceFailure::UnknownDevicePath) )",
+  "( resolve_audio_activation_device( &[ sample_device(3, \"Studio Display\", false), sample_device(4, \"Studio Display\", false), ], Some(r\"\\?\\SWD#MMDEVAPI#{0.0.0.00000000}.{studio display}\"), ), Err(AudioActivationDeviceFailure::UnknownDevicePath) )",
+  "(default.is_default, true)"
+ ],
  "activation_unsupported_riid_completes_with_nointerface_never_success": [
   "(hr, u64::from(ACTIVATION_S_OK))",
   "(marker_count(&memory), 0, \"handler must not run inline\")",
@@ -235,6 +242,30 @@
   "( &animated.pixels[..], &[ 0, 0, 255, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255 ], \"the default image is the canvas and the animation frame replaces its first pixel\" )",
   "( wic_decode_png_frame(&apng, 2).unwrap_err(), WINCODEC_ERR_FRAMEMISSING, \"default image plus one animation frame is the whole stream\" )",
   "( wic_decode_png_frame(&truncated, 1).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a truncated fdAT zlib stream is rejected\" )"
+ ],
+ "apng_encoder_commit_rejects_writer_errors_and_unavailable_stream": [
+  "( writer_set(&mut fixture, writer, name, &prop), u64::from(E_INVALIDARG), \"invalid {name}={value} is rejected by the writer\" )",
+  "( writer_set(&mut fixture, writer, \"FrameDelay0\", &indexed), 0, \"an indexed per-frame name is accepted\" )",
+  "(writer_remove(&mut fixture, writer, \"FrameDelay0\"), 0)",
+  "( dispatch_x86( &mut fixture, HostThunk::WicFrameEncodeCommit, &[frame as u32] ), 0 )",
+  "( dispatch_x86( &mut fixture, HostThunk::WicFrameEncodeCommit, &[second as u32] ), 0 )",
+  "( dispatch_x86(&mut fixture, HostThunk::WicEncoderCommit, &[encoder as u32]), u64::from(WINCODEC_ERR_BADIMAGE), \"metadata captured from the writer is revalidated at encoder commit\" )"
+ ],
+ "apng_encoder_rejects_invalid_frame_counts_delays_disposal_blend_and_colors": [
+  "( wic_encode_apng(1, 1, &[], None, &[]).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"an empty animation is rejected\" )",
+  "( wic_encode_apng(0, 1, &[frame], None, &[]).unwrap_err(), E_INVALIDARG, \"a zero-width animation is rejected\" )",
+  "( wic_encode_apng(1, 0, &[frame], None, &[]).unwrap_err(), E_INVALIDARG, \"a zero-height animation is rejected\" )",
+  "( wic_encode_apng(1, 1, &[invalid], None, &[]).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"invalid delay/disposal/blend is rejected\" )",
+  "( wic_encode_apng(1, 1, &[short_frame], None, &[]).unwrap_err(), E_INVALIDARG, \"a short frame buffer is rejected\" )",
+  "( wic_encode_apng(1, 1, &[frame], None, &metadata).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"invalid animation/color metadata is rejected: {metadata:?}\" )"
+ ],
+ "apng_encoder_round_trip_rejects_sequence_frame_and_pixel_mismatches": [
+  "( dispatch_x86( &mut fixture, HostThunk::WicFrameEncodeCommit, &[frame0 as u32] ), 0 )",
+  "( dispatch_x86( &mut fixture, HostThunk::WicFrameEncodeCommit, &[frame1 as u32] ), 0 )",
+  "( dispatch_x86( &mut fixture, HostThunk::WicFrameEncodeCommit, &[frame2 as u32] ), 0 )",
+  "( dispatch_x86(&mut fixture, HostThunk::WicEncoderCommit, &[encoder as u32]), 0 )",
+  "(info.frames.len(), 3, \"exact APNG frame count\")",
+  "( info.frames .iter() .map(|frame| (frame.delay_ms, frame.dispose, frame.blend)) .collect::<Vec<_>>(), vec![(100, 0, 0), (25, 1, 1), (250, 2, 0)], \"exact delays/disposal/blend round-trip\" )"
  ],
  "apng_malformed_chunks_sequences_and_frame_bounds_rejected": [
   "( bad(&[(b\"IDAT\", raw.clone()), (b\"acTL\", apng_actl(1, 0)),]), WINCODEC_ERR_BADIMAGE, \"acTL after IDAT is invalid\" )",
@@ -648,6 +679,14 @@
   "( client.add_player_to_group(group, client_id), DPNERR_DUPLICATECOMMAND )",
   "( client.add_players_to_group(4242, &[client_id]), DPNERR_INVALIDGROUP )",
   "( client.add_players_to_group(group, &[999]), DPNERR_INVALIDPLAYER )"
+ ],
+ "client_properties_reject_offload_and_raw_with_pinned_statuses": [
+  "( host_offload_capability(), false, \"the backed hosts expose no real offload engine\" )",
+  "( set_client_properties(pid, object, 3, true, false), AUDCLNT_S_OK )",
+  "(snapshot.client_category, 3)",
+  "(snapshot.client_offload_requested, true)",
+  "(snapshot.client_raw_requested, false)",
+  "( set_client_properties(pid, object, 3, true, false), AUDCLNT_E_NONOFFLOAD_MODE_ONLY, \"offload without a host engine is rejected, never silently accepted\" )"
  ],
  "client_receive_loop_rejects_incomplete_fragments_and_reports_relay_failure": [
   "( completions, vec![(77, 0xBEEF, DPNERR_CONNECTIONLOST), (78, 0xBEE0, S_OK)] )",
@@ -1302,6 +1341,13 @@
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTOpenDevice, &[open] ), 0 )",
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTDestroyDevice, &[destroy] ), 0 )"
  ],
+ "d3d8thk_display_gamma_cursor_pnp_and_mode_buffer_errors_are_exact": [
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTEnumOutputs, &[outputs] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTEnumOutputs, &[outputs] ), STATUS_INVALID_PARAMETER )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTEnumOutputs, &[outputs] ), STATUS_BUFFER_TOO_SMALL )",
+  "(load_u32(&memory, outputs + 4), output_count)",
+  "(load_u32(&memory, at), index as u32)"
+ ],
  "d3d8thk_enum_adapters_rejects_null_and_short_buffers": [
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTEnumAdapters, &[info] ), 0 )",
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTEnumAdapters, &[info] ), STATUS_INVALID_PARAMETER )",
@@ -1336,6 +1382,14 @@
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTWaitForSynchronizationObject, &[wait] ), STATUS_TIMEOUT )",
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTSignalSynchronizationObject2, &[signal] ), STATUS_INVALID_HANDLE )"
  ],
+ "d3d8thk_statistics_process_segment_aliases_and_unsupported_classes_are_exact": [
+  "( wddm().d3dkmt_make_resident(AllocationHandle(allocation), guest_pid), Ok(1) )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateContext, &[context_descriptor] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTRender, &[render] ), 0 )",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTQueryStatistics, &[process] ), 0 )",
+  "(load_u64(&memory, process + 16), guest_pid)",
+  "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTQueryStatistics, &[unknown_process] ), 0 )"
+ ],
  "d3d8thk_sync_wait_rejects_backwards_signal_and_times_out_exactly_once": [
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateSynchronizationObject, &[descriptor] ), STATUS_INVALID_HANDLE )",
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTCreateSynchronizationObject, &[descriptor] ), STATUS_NOT_SUPPORTED )",
@@ -1343,6 +1397,14 @@
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTWaitForSynchronizationObject, &[wait] ), STATUS_TIMEOUT )",
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTWaitForSynchronizationObject, &[wait_short] ), STATUS_TIMEOUT )",
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTSignalSynchronizationObject, &[signal] ), 0 )"
+ ],
+ "d3d8thk_unknown_kmt_imports_are_rejected_and_new_names_are_mapped": [
+  "(resolve(\"D3DKMTEnumOutputs\"), \"enum-outputs\")",
+  "(resolve(\"D3DKMTGetDisplayModeList2\"), \"display-mode-list2\")",
+  "(resolve(\"D3DKMTGetGammaRamp\"), \"get-gamma-ramp\")",
+  "(resolve(\"D3DKMTPnPStart\"), \"pnp-start\")",
+  "(resolve(\"D3DKMTPnPStop\"), \"pnp-stop\")",
+  "(resolve(\"D3DKMTPowerComponent\"), \"power-component\")"
  ],
  "d3d8thk_unknown_kmt_types_and_unimplemented_thunks_return_exact_status": [
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTQueryAdapterInfo, &[query] ), STATUS_NOT_SUPPORTED )",
@@ -1721,6 +1783,14 @@
  ],
  "device_period_info_uses_the_live_device_when_present": [
   "(info.stream_latency_hns, info.default_period_hns)"
+ ],
+ "device_resolution_list_failures_are_device_unavailable": [
+  "( backend.start_system_loopback_for_device(&device), Err(SystemLoopbackFailure::DeviceUnavailable) )",
+  "( backend.start_system_loopback_for_device(&device), Err(SystemLoopbackFailure::DeviceUnavailable), \"an empty device enumeration cannot resolve the named endpoint\" )",
+  "( backend.start_system_loopback_for_device(&device), Err(SystemLoopbackFailure::DeviceUnavailable), \"an implausible device count is rejected, never truncated\" )",
+  "( backend.start_system_loopback_for_device(&device), Err(SystemLoopbackFailure::DeviceUnavailable), \"a failed device-list read is exact, never the default tap\" )",
+  "( backend.start_system_loopback_for_device(&device), Err(SystemLoopbackFailure::DeviceUnavailable), \"a device without a readable name cannot be the named endpoint\" )",
+  "( backend.start_system_loopback_for_device(&device), Ok(SystemLoopbackBackend::CoreAudioProcessTap) )"
  ],
  "device_stack_attach_detach_walks_and_rejects_cycles": [
   "(manager.attach_device(middle, lower).unwrap(), lower)",
@@ -2716,6 +2786,9 @@
   "( dispatch_x86_thunk( &mut runtime, &mut memory, enum_device, &[dev_info_set as u32, 1, dev_data as u32] ), 1, \"SetupDiEnumDeviceInfo enumerates device 1\" )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, enum_device, &[dev_info_set as u32, 2, dev_data as u32] ), 0, \"SetupDiEnumDeviceInfo past the end fails\" )"
  ],
+ "exclusive_buffer_pin_missing_device_lease_drops_cleanly": [
+  "( backend.hog_mode_held(stale), true, \"the emulator lease is left for the hotplug teardown to drop\" )"
+ ],
  "exclusive_mode_buffer_pin_failure_is_reported_but_keeps_hog": [
   "( backend.exclusive_client_hog_mode(client), Some(HogModeOutcome::Acquired) )"
  ],
@@ -2746,9 +2819,6 @@
  ],
  "exclusive_mode_missing_default_output_reports_hog_unavailable": [
   "( backend.exclusive_client_hog_mode(client), Some(HogModeOutcome::Unavailable), \"a host with no default output cannot provide hog mode\" )"
- ],
- "exclusive_mode_non_default_device_reports_hog_unavailable": [
-  "( backend.exclusive_client_hog_mode(client), Some(HogModeOutcome::Unavailable), \"hog mode is only attempted on the default output device\" )"
  ],
  "exclusive_mode_second_client_failure_keeps_the_first_hog": [
   "( backend.hog_mode_held(20), true, \"a failed second client must not release the first client's hog\" )",
@@ -3412,6 +3482,14 @@
   "( store.resident_flat_page_count(), 0, \"a page above the flat window must not consume flat residency\" )",
   "(memory.read_u8(address).unwrap(), 0x7E)",
   "(memory.read_u8(address + 4095).unwrap(), 0x42)"
+ ],
+ "hog_lease_conflict_across_two_devices_is_denied_without_leaking": [
+  "( backend.exclusive_client_hog_mode(first), Some(HogModeOutcome::Acquired) )",
+  "( backend.exclusive_client_hog_mode(second), Some(HogModeOutcome::Acquired), \"hog mode is per device, so both devices can be held\" )",
+  "(platform::fake::hog_owner_for(3), our_pid)",
+  "(platform::fake::hog_owner_for(21), our_pid)",
+  "( backend.exclusive_client_hog_mode(conflicted), Some(HogModeOutcome::Denied { owner_pid: 1_234 }) )",
+  "(backend.hog_mode_held(20), true)"
  ],
  "hog_mode_already_held_reacquire_is_rejected_and_pins_the_rate": [
   "(outcome, HogModeOutcome::AlreadyHeld)",
@@ -4403,7 +4481,7 @@
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS )",
   "(state.kmdf.driver_pool_tag, 0x2146_4457)",
   "(state.kmdf.driver_init_flags, 0)",
-  "(state.kmdf.framework_dispatches.len(), 5)",
+  "(state.kmdf.framework_dispatches.len(), 7)",
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtUnloadDriver, &[service_path], ), STATUS_SUCCESS )",
   "(unloaded.inner.borrow().kmdf.driver_unload_calls, 1)"
  ],
@@ -6129,6 +6207,14 @@
   "( dispatch_x86( &mut fixture, HostThunk::WicFactoryCreateEncoder, &[factory as u32, FORMAT as u32, ENCODER_OUT as u32] ), 0, \"the JPEG encoder exists alongside PNG\" )",
   "( dispatch_x86( &mut fixture, HostThunk::WicEncoderCreateNewFrame, &[encoder as u32, FRAME_OUT as u32, 0] ), 0 )"
  ],
+ "png_encoder_color_metadata_rejects_invalid_values_and_round_trips_exactly": [
+  "( image.pixels, vec![10, 20, 30, 255], \"sRGB keeps the BGRA samples exact\" )",
+  "( chunks .iter() .find(|(kind, _)| kind == b\"gAMA\") .map(|(_, data)| data.clone()), Some(45455_u32.to_be_bytes().to_vec()), \"gAMA value\" )",
+  "( chunks .iter() .find(|(kind, _)| kind == b\"sRGB\") .map(|(_, data)| data.clone()), Some(vec![0]), \"sRGB intent\" )",
+  "(&iccp[..4], b\"ICC\\0\")",
+  "(iccp[4], 0)",
+  "(wic_png_inflate(&iccp[5..]).expect(\"profile\"), profile)"
+ ],
  "png_encoder_rejects_invalid_dimensions_and_short_pixels": [
   "( wic_encode_png(0, 1, &[], None, &[]).unwrap_err(), E_INVALIDARG )",
   "( wic_encode_png(1, 1, &[0, 0, 0], None, &[]).unwrap_err(), E_INVALIDARG, \"a short pixel buffer is rejected\" )"
@@ -6191,6 +6277,54 @@
  "png_unknown_critical_chunk_and_bad_palette_index_are_rejected": [
   "( wic_decode_png(&critical).unwrap_err(), WINCODEC_ERR_UNSUPPORTEDOPERATION )",
   "( wic_decode_png(&bad_index).unwrap_err(), WINCODEC_ERR_BADIMAGE )"
+ ],
+ "pnp_file_cleanup_and_device_cleanup_destroy_ordering_reject_out_of_order": [
+  "( island .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE) .expect(\"start\") .0, STATUS_SUCCESS )",
+  "( island .dispatch_irp( &mut runtime, &mut memory, device, IrpMajorFunction::Cleanup, 0, 0, 0, 0, 0, 0, ) .expect(\"file cleanup\") .0, STATUS_SUCCESS )",
+  "(pnp_u32(&memory, base, P_FCLEANUP_COUNT), 1)",
+  "(pnp_u32(&memory, base, P_FCLOSE_COUNT), 0)",
+  "( island .dispatch_irp( &mut runtime, &mut memory, device, IrpMajorFunction::Close, 0, 0, 0, 0, 0, 0, ) .expect(\"file close\") .0, STATUS_SUCCESS )",
+  "(pnp_u32(&memory, base, P_FCLOSE_COUNT), 1)"
+ ],
+ "pnp_invalid_minors_repeated_start_stop_and_remove_after_remove_reject": [
+  "( island .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_STOP_DEVICE) .expect(\"stop before start\") .0, STATUS_INVALID_DEVICE_REQUEST )",
+  "( island .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3) .expect(\"D3 before start\") .0, STATUS_INVALID_DEVICE_REQUEST )",
+  "( island .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D0) .expect(\"D0 before start\") .0, STATUS_INVALID_DEVICE_REQUEST )",
+  "( island .dispatch_pnp(&mut runtime, &mut memory, device, 0x01) .expect(\"query-remove minor\") .0, STATUS_INVALID_DEVICE_REQUEST )",
+  "( island .set_device_power(&mut runtime, &mut memory, device, 2) .expect(\"D2 power state\") .0, STATUS_INVALID_DEVICE_REQUEST )",
+  "( island .dispatch_irp( &mut runtime, &mut memory, device, IrpMajorFunction::Power, 0, 0, 0, 0, 0, 0, ) .expect(\"non-set-power minor\") .0, STATUS_INVALID_DEVICE_REQUEST )"
+ ],
+ "pnp_malformed_callback_config_and_unsupported_framework_import_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks, &[init, 0], ) .expect(\"null callback table\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks, &[0xDEAD, config], ) .expect(\"stale device init\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks, &[init, config], ) .expect(\"zero-size callback table\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceInitSetFileObjectConfig, &[init, 0, 0], ) .expect(\"null file config\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceInitSetFileObjectConfig, &[init, config, 0], ) .expect(\"zero-size file config\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceEnqueueRequest, &[0xDEAD, 0xBEEF], ) .expect(\"stale enqueue device\"), STATUS_INVALID_DEVICE_REQUEST )"
+ ],
+ "pnp_start_callback_failures_roll_back_and_never_become_ready": [
+  "( island .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE) .expect(\"prepare hardware failure\") .0, STATUS_INSUFFICIENT_RESOURCES )",
+  "(pnp_u32(&memory, base, P_PREPARE_COUNT), 1)",
+  "(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 0)",
+  "(pnp_u32(&memory, base, P_RELEASE_COUNT), 0)",
+  "(pnp_u32(&memory, base, P_SELFINIT_COUNT), 0)",
+  "(record.started, false)"
+ ],
+ "pnp_start_without_release_and_cleanup_without_hardware_roll_back": [
+  "( island .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE) .expect(\"start without prepare/release/self-io\") .0, STATUS_SUCCESS )",
+  "(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 1)",
+  "(pnp_u32(&memory, base, P_PREPARE_COUNT), 0)",
+  "(pnp_u32(&memory, base, P_SELFINIT_COUNT), 0)",
+  "(pnp_u32(&memory, base, P_RELEASE_COUNT), 0)",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfEvtIoCleanupDispatch, &[0, object], ) .expect(\"file dispatch for a deleted device\"), crate::casak::io::STATUS_DELETE_PENDING )"
+ ],
+ "pnp_x86_callbacks_power_and_sized_context_reject_stale_edges": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks, &[init, config], ) .expect(\"short x86 pnp callbacks\"), STATUS_SUCCESS )",
+  "(parsed.prepare_hardware, 0)",
+  "(parsed.self_managed_io_fini, 0)",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceInitSetPnpPowerEventCallbacks, &[init, config], ) .expect(\"full x86 pnp callbacks\"), STATUS_SUCCESS )",
+  "(parsed.prepare_hardware, 0x1000)",
+  "(parsed.release_hardware, 0x1010)"
  ],
  "pool_accounting_exhaustion_and_double_free": [
   "(pool.used_bytes(), 48)",
@@ -7578,6 +7712,10 @@
   "(result.is_none(), true)",
   "( guard.is_none(), true, \"a failed init never installs a backend\" )"
  ],
+ "system_loopback_both_backends_fail_with_the_last_status": [
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::StreamStart(-1)), \"the last attempted backend's exact status is reported\" )",
+  "(platform::fake::sck_counts(), (0, 0, 1, 5))"
+ ],
  "system_loopback_buffer_list_edge_shapes_are_pinned": [
   "( audio_buffer_list_to_interleaved(ptr::null()), (Vec::new(), 0) )",
   "( audio_buffer_list_to_interleaved(&zero as *const _), (Vec::new(), 0) )",
@@ -7614,6 +7752,10 @@
   "( classify_system_loopback_failure(SystemLoopbackFailure::StreamStart(0), -1), SystemLoopbackFailure::StreamStart(-1) )",
   "( classify_system_loopback_failure(SystemLoopbackFailure::FormatUnavailable, -1), SystemLoopbackFailure::FormatUnavailable )"
  ],
+ "system_loopback_forced_off_fallback_is_unavailable": [
+  "( system_loopback_candidates(), Vec::<SystemLoopbackBackend>::new(), \"CASA1_SYSTEM_LOOPBACK=off disables every backend, including fallbacks\" )",
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::Unavailable) )"
+ ],
  "system_loopback_format_mismatch_capture_is_converted_to_the_client_format": [
   "( commit_initialize(pid, object, &plan, &format, 0x7_000, 4410), AUDCLNT_S_OK )",
   "(start(pid, object), AUDCLNT_S_OK)",
@@ -7637,9 +7779,16 @@
   "(set_event_handle(pid, object, 0xE8), AUDCLNT_S_OK)",
   "(start(pid, object), AUDCLNT_S_OK)",
   "(packet.flags, AUDCLNT_BUFFERFLAGS_SILENT)",
-  "(packet.frames, frames)",
   "(packet.channels, format.channels)",
   "(stop(pid, object), AUDCLNT_S_OK)"
+ ],
+ "system_loopback_named_device_tap_target_mismatch_is_exact": [
+  "( backend.start_system_loopback_for_device(&device), Ok(SystemLoopbackBackend::CoreAudioProcessTap) )",
+  "( platform::fake::tap_targets(), vec![4], \"the tap/aggregate is created for the activation's named device\" )",
+  "(backend.system_loopback_available_frames_for(&device.key), 1)",
+  "(platform::fake::destroy_counts(), (1, 1, 1))",
+  "( backend.start_system_loopback_for_device(&missing), Err(SystemLoopbackFailure::DeviceUnavailable), \"an unresolvable named endpoint fails exactly, never falls back to the default tap\" )",
+  "( platform::fake::tap_targets(), vec![4], \"no tap is created for the unresolvable endpoint\" )"
  ],
  "system_loopback_null_tap_uid_is_a_failure": [
   "( backend.start_system_loopback(), Err(SystemLoopbackFailure::ObjectUnavailable) )",
@@ -7669,8 +7818,49 @@
   "(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 1)",
   "(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 0)"
  ],
- "system_loopback_sck_fallback_is_unavailable": [
-  "( platform::start_screen_capture_kit(shared, 1).err(), Some(SystemLoopbackFailure::Unavailable) )"
+ "system_loopback_screen_capture_coremedia_failure_drops_frames": [
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::ScreenCaptureKit) )",
+  "(backend.system_loopback_available_frames(), 0)",
+  "(platform::fake::sck_block_releases(), 0)"
+ ],
+ "system_loopback_screen_capture_empty_and_second_read_failure_are_pinned": [
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::ScreenCaptureKit) )",
+  "( backend.system_loopback_available_frames(), 0, \"an empty CMSampleBuffer is ignored without stopping capture\" )",
+  "( backend.system_loopback_available_frames(), 0, \"a failed second CoreMedia read yields no frames\" )",
+  "( platform::fake::sck_block_releases(), 1, \"a retained block buffer is released on the failure path\" )"
+ ],
+ "system_loopback_screen_capture_ingests_cmsamplebuffers_and_tears_down": [
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::ScreenCaptureKit) )",
+  "(platform::fake::sck_configuration(), (48_000, 2))",
+  "(backend.system_loopback_format(), Some((2, 48_000)))",
+  "(backend.system_loopback_available_frames(), 2)",
+  "( backend.read_system_loopback_data(), vec![0.25, 0.75, 0.5, 0.5] )",
+  "( platform::fake::sck_counts(), (1, 1, 1, 5), \"start/stop release the stream, output and retained content exactly once\" )"
+ ],
+ "system_loopback_screen_capture_planar_conversion_edges_are_pinned": [
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::ScreenCaptureKit) )",
+  "( backend.read_system_loopback_data(), vec![0.25, 0.75, 0.5, 0.5], \"non-interleaved CMSampleBuffer channels are interleaved\" )"
+ ],
+ "system_loopback_screen_capture_short_buffer_is_rejected": [
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::ScreenCaptureKit) )",
+  "( backend.system_loopback_available_frames(), 0, \"a short CMSampleBuffer yields no whole frames\" )",
+  "( platform::fake::sck_block_releases(), 1, \"the retained block buffer is released even for a short buffer\" )"
+ ],
+ "system_loopback_screen_capture_stage_failures_are_pinned": [
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::ObjectUnavailable) )",
+  "(platform::fake::sck_counts(), (0, 0, 0, 1))",
+  "(platform::fake::sck_counts(), (0, 0, 0, 2))",
+  "(platform::fake::sck_counts(), (0, 0, 0, 4))"
+ ],
+ "system_loopback_screen_capture_start_failure_unwinds_exactly": [
+  "( backend.start_system_loopback(), Err(SystemLoopbackFailure::StreamStart(-1)) )",
+  "( platform::fake::sck_counts(), (0, 0, 1, 5), \"a failed start removes the output and releases output/stream/content\" )"
+ ],
+ "system_loopback_screen_capture_teardown_race_rejects_stale_frames": [
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::ScreenCaptureKit) )",
+  "(backend.system_loopback_available_frames(), 1)",
+  "( backend.system_loopback_available_frames(), 0, \"a callback racing teardown cannot leak stale frames\" )",
+  "(backend.read_system_loopback_data(), Vec::<f32>::new())"
  ],
  "system_loopback_shared_users_release_only_on_the_last_stop": [
   "(SYSTEM_LOOPBACK_USERS.load(Ordering::SeqCst), 2)",
@@ -7690,8 +7880,8 @@
   "(sink.dropped_frames, 1_000)"
  ],
  "system_loopback_stale_generation_frames_are_rejected_across_teardown": [
-  "(backend.system_loopback_available_frames(), 4)",
-  "(backend.read_system_loopback_data(), vec![0.5; 8])",
+  "( backend.system_loopback_available_frames_for(&test_device().key), 4 )",
+  "( backend.read_system_loopback_data_for(&test_device().key), vec![0.5; 8] )",
   "(second_generation, first_generation)"
  ],
  "system_loopback_stale_generation_is_rejected_after_test_session_teardown": [
@@ -7701,6 +7891,11 @@
   "( status.backend, Some(SystemLoopbackBackend::CoreAudioProcessTap) )",
   "(status.channels, 2)",
   "(status.sample_rate, 8_000)"
+ ],
+ "system_loopback_stop_all_teardowns_every_device_tap": [
+  "( backend.start_system_loopback_for_device(&first), Ok(SystemLoopbackBackend::CoreAudioProcessTap) )",
+  "( backend.start_system_loopback_for_device(&second), Ok(SystemLoopbackBackend::CoreAudioProcessTap) )",
+  "(platform::fake::destroy_counts(), (2, 2, 2))"
  ],
  "system_loopback_stopped_user_and_missing_backend_report_zero": [
   "( system_loopback_available_for(state, false), 0, \"an unused capture reports no frames without touching the backend\" )",
@@ -7726,9 +7921,20 @@
  "system_loopback_tap_exclusion_invalid_zero_process_is_a_noop": [
   "(exclude_own_process(ptr::null_mut(), 0), ())"
  ],
+ "system_loopback_tap_failure_falls_back_to_screen_capture_kit": [
+  "( backend.start_system_loopback(), Ok(SystemLoopbackBackend::ScreenCaptureKit), \"tap failure falls back to the next available backend\" )",
+  "(platform::fake::sck_counts().0, 1)",
+  "(backend.system_loopback_available_frames(), 1)"
+ ],
  "system_loopback_tap_format_unavailable_is_pinned": [
   "( backend.start_system_loopback(), Err(SystemLoopbackFailure::FormatUnavailable) )",
   "(platform::fake::destroy_counts(), (1, 0, 0))"
+ ],
+ "system_loopback_two_devices_stop_independently": [
+  "( backend.start_system_loopback_for_device(&first), Ok(SystemLoopbackBackend::CoreAudioProcessTap) )",
+  "( backend.start_system_loopback_for_device(&second), Ok(SystemLoopbackBackend::CoreAudioProcessTap) )",
+  "(platform::fake::tap_targets(), vec![3, 4])",
+  "(platform::fake::destroy_counts(), (2, 2, 2))"
  ],
  "system_time_and_timer_resolution_domains_are_consistent": [
   "( read_u64(&session.read_guest(ft_ptr, 8), 0), read_u64(&session.read_guest(win32_ft_ptr, 8), 0) )",
@@ -9278,8 +9484,16 @@
   "( fixture.memory.read_bytes(dispatch_attrs, 16).unwrap(), COM_IID_IDISPATCH.to_vec(), \"referenced ITypeInfo is IDispatch\" )",
   "(fixture.memory.read_u32(dispatch_attrs + 40).unwrap(), 3)"
  ],
+ "type_info_mops_and_type_comp_reject_null_dead_and_member_edges": [
+  "( call_slot(&mut fixture, type_info, 17, &[type_info as u32, 1, 0]), E_INVALIDARG )",
+  "( call_slot( &mut fixture, type_info, 17, &[type_info as u32, u32::MAX, OUT as u32] ), S_OK, \"GetMops(MEMBERID_NIL)\" )",
+  "(guest_ptr(&fixture, OUT), 0)",
+  "( call_slot(&mut fixture, type_info, 17, &[0xDEAD_0000, 1, OUT as u32]), TYPE_E_ELEMENTNOTFOUND )",
+  "( call_slot(&mut fixture, type_info, 4, &[type_info as u32, 0]), E_INVALIDARG )",
+  "( call_slot(&mut fixture, type_info, 4, &[0xDEAD_0000, OUT as u32]), TYPE_E_ELEMENTNOTFOUND )"
+ ],
  "typed_statistics_reject_unknown_unsupported_types_and_node_bounds": [
-  "( subsystem .d3dkmt_query_statistics_for(adapter, 1, 0) .unwrap_err() .status(), STATUS_NOT_SUPPORTED )",
+  "( subsystem .d3dkmt_query_statistics_for(adapter, D3DKMT_QUERYSTATISTICS_HISTOGRAM, 0) .unwrap_err() .status(), STATUS_NOT_SUPPORTED )",
   "( subsystem .d3dkmt_query_statistics_for(adapter, 99, 0) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
   "( subsystem .d3dkmt_query_statistics_for(adapter, D3DKMT_QUERYSTATISTICS_NODE, 1) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
   "( subsystem .d3dkmt_query_statistics_for( AdapterHandle(0xFFFF_FFFF), D3DKMT_QUERYSTATISTICS_ADAPTER, 0, ) .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
@@ -9369,12 +9583,39 @@
  "upload_streamer_wrap_around": [
   "(offset, 0)"
  ],
+ "url_moniker_bind_storage_fetches_over_loopback_and_pins_urlmon_errors": [
+  "( call_slot( &mut fixture, moniker, 14, &[moniker as u32, 0, 0, OUT as u32] ), S_OK )",
+  "(read_utf16_string(&fixture.memory, display).unwrap(), url)",
+  "( call_slot(&mut fixture, moniker, 16, &[moniker as u32, OUT as u32]), S_OK )",
+  "(fixture.memory.read_u32(OUT).unwrap(), 7)",
+  "( call_slot( &mut fixture, moniker, 15, &[moniker as u32, 0, 0, NAME as u32, COOKIE as u32, OUT as u32,] ), S_OK, \"IMoniker::ParseDisplayName(URL)\" )",
+  "( fixture.memory.read_u32(COOKIE).unwrap(), url.encode_utf16().count() as u32 )"
+ ],
+ "url_moniker_bind_to_object_uses_embedded_clsid_handlers": [
+  "( call_slot( &mut fixture, moniker, 8, &[moniker as u32, 0, 0, IID_PTR as u32, OUT as u32] ), S_OK, \"BindToObject(embedded automation CLSID)\" )",
+  "( call_slot( &mut fixture, moniker, 8, &[moniker as u32, 0, 0, 0, OUT as u32] ), REGDB_E_CLASSNOTREG, \"BindToObject(unregistered embedded CLSID)\" )",
+  "(guest_ptr(&fixture, OUT), 0)"
+ ],
+ "url_moniker_compose_enum_reduce_and_composite_bind_chain": [
+  "( call_slot( &mut fixture, composite, 14, &[composite as u32, 0, 0, OUT as u32] ), S_OK )",
+  "( read_utf16_string(&fixture.memory, display).unwrap(), format!(\"{base}!item:download\") )",
+  "( call_slot(&mut fixture, composite, 16, &[composite as u32, OUT as u32]), S_OK )",
+  "(fixture.memory.read_u32(OUT).unwrap(), 1)",
+  "( call_slot( &mut fixture, composite, 12, &[composite as u32, forward, OUT as u32] ), S_OK, \"IMoniker::Enum\" )",
+  "( call_slot( &mut fixture, enumerator, 3, &[enumerator as u32, 2, BUF as u32, fetched as u32] ), S_OK )"
+ ],
+ "url_moniker_parse_rejects_malformed_and_unsupported_names": [
+  "( dispatch_x86( &mut fixture, HostThunk::MkParseDisplayName, &[0, NAME as u32, COOKIE as u32, OUT as u32] ), u64::from(MK_E_SYNTAX), \"MkParseDisplayName({text})\" )",
+  "(guest_ptr(&fixture, OUT), 0, \"no moniker for {text}\")",
+  "( call_slot(&mut fixture, https, 14, &[https as u32, 0, 0, OUT as u32]), S_OK )",
+  "( read_utf16_string(&fixture.memory, name).unwrap(), \"https://example.invalid/a?b=c\" )"
+ ],
  "urlmon_bind_ctx_moniker_and_status_callback_dispatch": [
   "(result, 0)",
-  "( read_utf16_string(&memory, moniker_addr).expect(\"moniker url\"), \"http://example.com/game\" )",
+  "( read_utf16_string(&memory, name).expect(\"moniker url\"), \"http://example.com/game\" )",
   "(result, 0x8007_0057)",
   "(runtime.last_error, ERROR_INVALID_PARAMETER)",
-  "( read_utf16_string(&memory, bind_ctx).expect(\"bind ctx tag\"), \"AsyncBindCtx\" )"
+  "(result, 0x8004_01E4)"
  ],
  "user32_dialog_item_rejects_invalid_parent_and_id": [
   "( user32 .get_dlg_item(0xDEAD_BEEF, 1) .expect(\"unknown parent is not an error\"), None, \"an unknown parent must not materialize a dialog item\" )",
@@ -9546,6 +9787,14 @@
   "(errors[0].status(), STATUS_INVALID_PARAMETER)",
   "( errors[0].detail(), \"render fence value was overtaken during submission\" )"
  ],
+ "wddm_display_outputs_gamma_cursor_and_vidpn_ids_reject_invalid_targets": [
+  "(output.output_id, index as u32)",
+  "(output.vidpn_source_id, index as u32)",
+  "(output.vidpn_target_id, index as u32)",
+  "( subsystem .d3dkmt_output_display_modes(adapter, 0) .expect(\"output modes\"), outputs[0].modes )",
+  "( subsystem .d3dkmt_source_display_modes(adapter, 0) .expect(\"source modes\"), outputs[0].modes )",
+  "( subsystem .d3dkmt_vidpn_source_target(adapter, 0) .expect(\"source/target\"), (0, 0) )"
+ ],
  "wddm_keyed_mutex_infinite_wait_race_acquires_after_release": [
   "( subsystem .d3dkmt_acquire_keyed_mutex(mutex, 0x4321, 0, 7) .expect(\"owner acquire\"), () )",
   "( subsystem.d3dkmt_release_keyed_mutex(mutex, 0x4321, 7), Ok(()) )",
@@ -9562,6 +9811,14 @@
   "(subsystem.d3dkmt_destroy_allocation(alias), Ok(()))",
   "(subsystem.d3dkmt_destroy_allocation(allocation), Ok(()))"
  ],
+ "wddm_pnp_power_transitions_reject_misuse_and_invoke_d0_hooks": [
+  "( subsystem.power_state(adapter).expect(\"initial power state\"), WddmPowerState { pnp_started: false, component: POWER_COMPONENT_GPU, power_state: POWER_STATE_D3, d0_entry_count: 0, d0_exit_count: 0, } )",
+  "(stopped.status(), STATUS_INVALID_DEVICE_STATE)",
+  "(stopped.detail(), \"adapter PnP device is not started\")",
+  "(cold_power.status(), STATUS_INVALID_DEVICE_STATE)",
+  "( cold_power.detail(), \"power transition on a stopped PnP device\" )",
+  "(bad_component.status(), STATUS_INVALID_PARAMETER)"
+ ],
  "wddm_render_submit_failure_returns_gpu_exception_status": [
   "( completion_status(metal::MTLCommandBufferStatus::Error), Err(WddmError::new( STATUS_GRAPHICS_GPU_EXCEPTION_ON_DEVICE, \"Metal blit command buffer did not complete\", )) )"
  ],
@@ -9572,6 +9829,22 @@
   "(node.allocated_bytes, 256)",
   "(node.render_count, 1)",
   "(node.render_bytes, 256)"
+ ],
+ "wddm_statistics_process_segment_aliases_and_unsupported_classes_are_exact": [
+  "(subsystem.d3dkmt_make_resident(first, 7), Ok(1))",
+  "(subsystem.d3dkmt_make_resident(first, 7), Ok(2))",
+  "(subsystem.d3dkmt_make_resident(foreign, 9), Ok(1))",
+  "(process.process_id, 7)",
+  "(process.allocation_count, 2)",
+  "(process.allocated_bytes, 400)"
+ ],
+ "wddm_statistics_residency_destroy_and_budget_failures_are_exact": [
+  "( subsystem .d3dkmt_query_process_statistics(adapter, 7) .expect(\"empty process statistics\"), WddmProcessStatistics { process_id: 7, segment_id: NO_SUBOBJECT, node_ordinal: NO_SUBOBJECT, ..WddmProcessStatistics::default() } )",
+  "(subsystem.d3dkmt_make_resident(allocation, 7), Ok(1))",
+  "( subsystem .d3dkmt_make_resident(over_budget, 7) .unwrap_err() .status(), STATUS_GRAPHICS_NO_VIDEO_MEMORY )",
+  "(after_failure.allocation_count, 2)",
+  "(after_failure.committed_bytes, 64)",
+  "(after_failure.resident_count, 1)"
  ],
  "wddm_sync_array_wait_timeout_and_infinite_race_are_exact": [
   "( subsystem.d3dkmt_signal_synchronization_object(sync, 1), Ok(()) )",
@@ -9588,6 +9861,30 @@
   "(memory.read_u16(text + 2).unwrap(), 6)",
   "(memory.read_u64(text + 8).unwrap(), text)",
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfWaitLockCreate, &[attrs, lock_out], ) .expect(\"wait lock with stale parent\"), STATUS_SUCCESS )"
+ ],
+ "wdf_device_enqueue_request_rejects_double_enqueue_and_dispatch_edges": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, 0, request_out], ) .expect(\"request create\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestFormatRequestForIoctl, &[request, 0, 0x0022_0004, 0, 0, output, 4, 0], ) .expect(\"format request\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceEnqueueRequest, &[device, request], ) .expect(\"enqueue\"), STATUS_SUCCESS )",
+  "( memory .read_u32(base + u64::from(K_IOCTL_MARKER_RVA)) .expect(\"ioctl marker\"), 0x0022_0004 )",
+  "( island.kmdf_request_state(request), Some((true, STATUS_SUCCESS, 4, 0)) )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceEnqueueRequest, &[device, request], ) .expect(\"double enqueue\"), STATUS_INVALID_DEVICE_REQUEST )"
+ ],
+ "wdf_memory_string_and_typed_context_sizing_errors_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCreate, &[0, 2, 0x2146_4457, 0x10, memory_out, buffer_out], ) .expect(\"invalid pool type\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCreate, &[0, 0, 0x2146_4457, 0x20_0000, memory_out, buffer_out], ) .expect(\"oversized memory\"), STATUS_INSUFFICIENT_RESOURCES )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCreate, &[0, 0, 0x2146_4457, 0x10, 0, buffer_out], ) .expect(\"null memory out\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCreate, &[0, 0, 0x2146_4457, 0x10, memory_out, 0xDEAD_0000], ) .expect(\"invalid buffer out\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCreatePreallocated, &[0, 0xDEAD_0000, 0x10, memory_out], ) .expect(\"invalid preallocated buffer\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCreate, &[0, 0, 0x2146_4457, 0x80, memory_out, buffer_out], ) .expect(\"memory create\"), STATUS_SUCCESS )"
+ ],
+ "wdf_pdo_init_rejects_malformed_ids_and_invalid_parent": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfPdoInitAllocate, &[0xDEAD], ) .expect(\"stale parent\"), STATUS_INVALID_HANDLE )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfPdoInitAssignDeviceID, &[0xDEAD, device_id], ) .expect(\"stale pdo init\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfPdoInitAssignDeviceID, &[ordinary_init, device_id], ) .expect(\"non-pdo init\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfPdoInitAssignDeviceID, &[init, 0xDEAD_0000], ) .expect(\"invalid device id string\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfPdoInitAssignDeviceID, &[init, empty], ) .expect(\"empty device id\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfPdoInitAssignDeviceID, &[init, device_id], ) .expect(\"device id\"), STATUS_SUCCESS )"
  ],
  "wdf_request_iotarget_edges_reject_stale_devices_and_invalid_driver_objects": [
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device_a, out], ) .expect(\"request create\"), STATUS_SUCCESS )",

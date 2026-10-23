@@ -5375,8 +5375,11 @@ pub enum HostThunk {
     D3DKMTDestroySwapchain,
     D3DKMTDestroySynchronizationObject,
     D3DKMTEnumAdapters,
+    D3DKMTEnumOutputs,
     D3DKMTEvict,
     D3DKMTGetDisplayModeList,
+    D3DKMTGetDisplayModeList2,
+    D3DKMTGetGammaRamp,
     D3DKMTMakeResident,
     D3DKMTOpenAdapterFromDeviceName,
     D3DKMTOpenAdapterFromGdiDisplayName,
@@ -5387,6 +5390,9 @@ pub enum HostThunk {
     D3DKMTOpenKeyedMutex2,
     D3DKMTOpenResource,
     D3DKMTOpenResource2,
+    D3DKMTPnPStart,
+    D3DKMTPnPStop,
+    D3DKMTPowerComponent,
     D3DKMTPresent,
     D3DKMTQueryAdapterInfo,
     D3DKMTReleaseKeyedMutex,
@@ -5396,7 +5402,10 @@ pub enum HostThunk {
     D3DKMTQuerySwapChainInfo,
     D3DKMTRender,
     D3DKMTSetAllocationPriority,
+    D3DKMTSetCursor,
+    D3DKMTSetCursorPosition,
     D3DKMTSetDisplayPrivateDriverFormat,
+    D3DKMTSetGammaRamp,
     D3DKMTSignalSynchronizationObject,
     D3DKMTSignalSynchronizationObject2,
     D3DKMTWaitForSynchronizationObject,
@@ -29403,7 +29412,7 @@ impl PeHostRuntime {
             ref thunk @ (HostThunk::BasicClassAddRef | HostThunk::BasicClassGetIDsOfNames | HostThunk::BasicClassInvoke | HostThunk::BasicClassQueryInterface | HostThunk::BasicClassRelease | HostThunk::BasicDispatchInvoke | HostThunk::DllCall | HostThunk::DllFunc | HostThunk::DllMain | HostThunk::DllProc) => {
                 self.dispatch_msvbvm(thunk, state, memory)?;
             }
-            ref thunk @ (HostThunk::D3DKMTAcquireKeyedMutex | HostThunk::D3DKMTAcquireKeyedMutex2 | HostThunk::D3DKMTCloseAdapter | HostThunk::D3DKMTCreateAllocation | HostThunk::D3DKMTCreateContext | HostThunk::D3DKMTCreateDevice | HostThunk::D3DKMTCreateSwapChain | HostThunk::D3DKMTCreateSynchronizationObject | HostThunk::D3DKMTDestroyAllocation | HostThunk::D3DKMTDestroyContext | HostThunk::D3DKMTDestroyDevice | HostThunk::D3DKMTDestroySwapchain | HostThunk::D3DKMTDestroySynchronizationObject | HostThunk::D3DKMTEnumAdapters | HostThunk::D3DKMTEvict | HostThunk::D3DKMTGetDisplayModeList | HostThunk::D3DKMTMakeResident | HostThunk::D3DKMTOpenAdapterFromDeviceName | HostThunk::D3DKMTOpenAdapterFromGdiDisplayName | HostThunk::D3DKMTOpenAdapterFromHdc | HostThunk::D3DKMTOpenAdapterFromLuid | HostThunk::D3DKMTOpenDevice | HostThunk::D3DKMTOpenKeyedMutex | HostThunk::D3DKMTOpenKeyedMutex2 | HostThunk::D3DKMTOpenResource | HostThunk::D3DKMTOpenResource2 | HostThunk::D3DKMTPresent | HostThunk::D3DKMTQueryAdapterInfo | HostThunk::D3DKMTQueryAllocationResidency | HostThunk::D3DKMTQueryStatistics | HostThunk::D3DKMTQuerySwapChainInfo | HostThunk::D3DKMTReleaseKeyedMutex | HostThunk::D3DKMTReleaseKeyedMutex2 | HostThunk::D3DKMTRender | HostThunk::D3DKMTSetAllocationPriority | HostThunk::D3DKMTSetDisplayPrivateDriverFormat | HostThunk::D3DKMTSignalSynchronizationObject | HostThunk::D3DKMTSignalSynchronizationObject2 | HostThunk::D3DKMTWaitForSynchronizationObject | HostThunk::D3DKMTWaitForSynchronizationObject2) => {
+            ref thunk @ (HostThunk::D3DKMTAcquireKeyedMutex | HostThunk::D3DKMTAcquireKeyedMutex2 | HostThunk::D3DKMTCloseAdapter | HostThunk::D3DKMTCreateAllocation | HostThunk::D3DKMTCreateContext | HostThunk::D3DKMTCreateDevice | HostThunk::D3DKMTCreateSwapChain | HostThunk::D3DKMTCreateSynchronizationObject | HostThunk::D3DKMTDestroyAllocation | HostThunk::D3DKMTDestroyContext | HostThunk::D3DKMTDestroyDevice | HostThunk::D3DKMTDestroySwapchain | HostThunk::D3DKMTDestroySynchronizationObject | HostThunk::D3DKMTEnumAdapters | HostThunk::D3DKMTEnumOutputs | HostThunk::D3DKMTEvict | HostThunk::D3DKMTGetDisplayModeList | HostThunk::D3DKMTGetDisplayModeList2 | HostThunk::D3DKMTGetGammaRamp | HostThunk::D3DKMTMakeResident | HostThunk::D3DKMTOpenAdapterFromDeviceName | HostThunk::D3DKMTOpenAdapterFromGdiDisplayName | HostThunk::D3DKMTOpenAdapterFromHdc | HostThunk::D3DKMTOpenAdapterFromLuid | HostThunk::D3DKMTOpenDevice | HostThunk::D3DKMTOpenKeyedMutex | HostThunk::D3DKMTOpenKeyedMutex2 | HostThunk::D3DKMTOpenResource | HostThunk::D3DKMTOpenResource2 | HostThunk::D3DKMTPnPStart | HostThunk::D3DKMTPnPStop | HostThunk::D3DKMTPowerComponent | HostThunk::D3DKMTPresent | HostThunk::D3DKMTQueryAdapterInfo | HostThunk::D3DKMTQueryAllocationResidency | HostThunk::D3DKMTQueryStatistics | HostThunk::D3DKMTQuerySwapChainInfo | HostThunk::D3DKMTReleaseKeyedMutex | HostThunk::D3DKMTReleaseKeyedMutex2 | HostThunk::D3DKMTRender | HostThunk::D3DKMTSetAllocationPriority | HostThunk::D3DKMTSetCursor | HostThunk::D3DKMTSetCursorPosition | HostThunk::D3DKMTSetDisplayPrivateDriverFormat | HostThunk::D3DKMTSetGammaRamp | HostThunk::D3DKMTSignalSynchronizationObject | HostThunk::D3DKMTSignalSynchronizationObject2 | HostThunk::D3DKMTWaitForSynchronizationObject | HostThunk::D3DKMTWaitForSynchronizationObject2) => {
                 self.dispatch_d3d8thk(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::JetAttachDatabase | HostThunk::JetBeginTransaction | HostThunk::JetCloseDatabase | HostThunk::JetCloseTable | HostThunk::JetCommitTransaction | HostThunk::JetCreateDatabase | HostThunk::JetDetachDatabase | HostThunk::JetGetTableColumnInfo | HostThunk::JetInit | HostThunk::JetOpenDatabase | HostThunk::JetOpenTable | HostThunk::JetRollback | HostThunk::JetTerm) => {
@@ -63178,20 +63187,37 @@ impl PeHostRuntime {
                     read_utf16_string(memory, url_ptr)?
                 };
                 if moniker_out == 0 {
-                    state.set(Register::Rax, 0x80070057);
+                    state.set(Register::Rax, 0x8007_0057);
                     self.last_error = 0x57;
-                } else {
-                    // Allocate a thin moniker record (just stores the URL string)
-                    let data = self.alloc_utf16_string(memory, &url)?;
-                    write_guest_pointer(memory, moniker_out, data, self.guest_arch)?;
-                    state.set(Register::Rax, 0);
+                } else if url.is_empty() {
+                    write_guest_pointer(memory, moniker_out, 0, self.guest_arch)?;
+                    state.set(Register::Rax, 0x8004_01E4);
                     self.last_error = 0;
-                    self.push_trace(
-                        "urlmon",
-                        "CreateURLMoniker",
-                        BTreeMap::from([("url".to_string(), json!(url))]),
-                        json!(0),
-                    );
+                } else {
+                    let moniker_state = crate::runtime::state::ComMonikerState {
+                        kind: crate::runtime::state::ComMonikerKind::Url,
+                        display_name: url.clone(),
+                        payload: url.clone(),
+                        host_path: None,
+                    };
+                    match self.alloc_com_moniker_object(memory, moniker_state) {
+                        Ok(moniker) => {
+                            write_guest_pointer(memory, moniker_out, moniker, self.guest_arch)?;
+                            state.set(Register::Rax, 0);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "urlmon",
+                                "CreateURLMoniker",
+                                BTreeMap::from([("url".to_string(), json!(url))]),
+                                json!(0),
+                            );
+                        }
+                        Err(_) => {
+                            write_guest_pointer(memory, moniker_out, 0, self.guest_arch)?;
+                            state.set(Register::Rax, u64::from(0x8007_000Eu32));
+                            self.last_error = 0x0E;
+                        }
+                    }
                 }
             }
             HostThunk::CreateAsyncBindCtx => {
@@ -79470,8 +79496,13 @@ impl PeHostRuntime {
         } else if !crate::audio_activation::has_audio_client(self.guest_pid, object) {
             state.set(Register::Rax, u64::from(AUDCLNT_E_DEVICE_INVALIDATED));
         } else {
-            // The host has no hardware offload engine: report FALSE.
-            write_u32(memory, out, 0);
+            // Honest host answer: TRUE only when a real offload engine is
+            // exposed by the backed host (never on the current hosts).
+            write_u32(
+                memory,
+                out,
+                u32::from(crate::audio_activation::host_offload_capability()),
+            );
             state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
         }
         self.last_error = 0;
@@ -79510,7 +79541,29 @@ impl PeHostRuntime {
         }
         let offload_requested = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) != 0;
         let category = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        let hr = set_client_properties(self.guest_pid, object, category, offload_requested);
+        // `AUDCLNT_STREAMOPTIONS Options` follows the 12-byte prefix when the
+        // guest supplies the Windows 8.1+ `AudioClientProperties` size
+        // (16 bytes: cbSize, bIsOffload, eCategory, Options).
+        let options = if cb_size >= 16 {
+            match memory.read_bytes(properties + 12, 4) {
+                Ok(options) => u32::from_le_bytes([options[0], options[1], options[2], options[3]]),
+                Err(_) => {
+                    state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+                    self.last_error = 0;
+                    return Ok(());
+                }
+            }
+        } else {
+            0
+        };
+        let raw_requested = options & crate::audio_activation::AUDCLNT_STREAMOPTIONS_RAW != 0;
+        let hr = set_client_properties(
+            self.guest_pid,
+            object,
+            category,
+            offload_requested,
+            raw_requested,
+        );
         state.set(Register::Rax, u64::from(hr));
         self.last_error = 0;
         Ok(())
@@ -89075,10 +89128,21 @@ impl HostThunk {
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTEnumAdapters" => {
                 Self::D3DKMTEnumAdapters
             }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTEnumOutputs" => {
+                Self::D3DKMTEnumOutputs
+            }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
                 if name == "D3DKMTGetDisplayModeList" =>
             {
                 Self::D3DKMTGetDisplayModeList
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTGetDisplayModeList2" =>
+            {
+                Self::D3DKMTGetDisplayModeList2
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTGetGammaRamp" => {
+                Self::D3DKMTGetGammaRamp
             }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
                 if name == "D3DKMTOpenAdapterFromHdc" =>
@@ -89101,6 +89165,17 @@ impl HostThunk {
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTOpenResource2" => {
                 Self::D3DKMTOpenResource2
             }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTPnPStart" => {
+                Self::D3DKMTPnPStart
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTPnPStop" => {
+                Self::D3DKMTPnPStop
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTPowerComponent" =>
+            {
+                Self::D3DKMTPowerComponent
+            }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTPresent" => {
                 Self::D3DKMTPresent
             }
@@ -89122,10 +89197,21 @@ impl HostThunk {
             {
                 Self::D3DKMTSetAllocationPriority
             }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTSetCursor" => {
+                Self::D3DKMTSetCursor
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTSetCursorPosition" =>
+            {
+                Self::D3DKMTSetCursorPosition
+            }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
                 if name == "D3DKMTSetDisplayPrivateDriverFormat" =>
             {
                 Self::D3DKMTSetDisplayPrivateDriverFormat
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTSetGammaRamp" => {
+                Self::D3DKMTSetGammaRamp
             }
             ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetAttachDatabase" => {
                 Self::JetAttachDatabase
@@ -111216,13 +111302,15 @@ mod tests {
             let create_bind_ctx = runtime.alloc_host_thunk(HostThunk::CreateAsyncBindCtx);
             let register_callback = runtime.alloc_host_thunk(HostThunk::RegisterBindStatusCallback);
 
-            // CreateURLMoniker stores the URL in guest memory and writes the
-            // moniker record pointer into the out slot.
+            // CreateURLMoniker returns a real guest IMoniker object whose
+            // GetDisplayName round-trips the URL.
             let url_ptr = runtime
                 .alloc_utf16_string(&mut memory, "http://example.com/game")
                 .expect("url");
             let moniker_out = 0x41_000;
-            memory.map_bytes(moniker_out as u64, &[0; 4]);
+            let display_out = 0x41_020;
+            memory.map_bytes(moniker_out as u64, &[0; 8]);
+            memory.map_bytes(display_out as u64, &[0; 8]);
             let result = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
@@ -111230,10 +111318,21 @@ mod tests {
                 &[0, url_ptr as u32, moniker_out],
             );
             assert_eq!(result, 0);
-            let moniker_addr = memory.read_u32(moniker_out as u64).expect("moniker out") as u64;
-            assert_ne!(moniker_addr, 0, "a moniker record must be produced");
+            let moniker_addr = memory.read_u64(moniker_out as u64).expect("moniker out");
+            assert_ne!(moniker_addr, 0, "a moniker object must be produced");
+            let vtable = memory.read_u64(moniker_addr).expect("moniker vtable");
+            assert_ne!(vtable, 0, "the moniker must have a real vtable");
+            let display = runtime.alloc_host_thunk(HostThunk::MonikerGetDisplayName);
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                display,
+                &[moniker_addr as u32, 0, 0, display_out as u32],
+            );
+            assert_eq!(result, 0);
+            let name = memory.read_u64(display_out).expect("display out");
             assert_eq!(
-                read_utf16_string(&memory, moniker_addr).expect("moniker url"),
+                read_utf16_string(&memory, name).expect("moniker url"),
                 "http://example.com/game"
             );
             // A NULL moniker out pointer fails with E_INVALIDARG.
@@ -111245,6 +111344,19 @@ mod tests {
             );
             assert_eq!(result, 0x8007_0057);
             assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+            // An empty URL is a syntax error and writes a NULL moniker.
+            let empty_ptr = runtime
+                .alloc_utf16_string(&mut memory, "")
+                .expect("empty url");
+            memory.map_bytes(moniker_out as u64, &[0; 8]);
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_moniker,
+                &[0, empty_ptr as u32, moniker_out],
+            );
+            assert_eq!(result, 0x8004_01E4);
+            assert_eq!(memory.read_u64(moniker_out as u64).expect("moniker out"), 0);
 
             // CreateAsyncBindCtx writes a bind-context record into the out slot.
             let bind_ctx_out = 0x41_010;
@@ -121352,6 +121464,75 @@ mod tests {
                 &[endpoint as u32, props as u32],
             );
             assert_eq!(hr, 0);
+
+            // The Windows 8.1+ 16-byte property block carries
+            // AUDCLNT_STREAMOPTIONS at offset 12.  An offload request is
+            // rejected with the exact non-offload status (the host has no
+            // offload engine), and a raw/bitstream request with the exact raw
+            // status; neither is silently accepted.
+            let wide_props = AUDIO_CLIENT_OUT_ADDR + 16;
+            memory.map_bytes(
+                wide_props,
+                &[
+                    16, 0, 0, 0, // cbSize
+                    1, 0, 0, 0, // bIsOffload = TRUE
+                    3, 0, 0, 0, // eCategory = AudioCategory_Media
+                    0, 0, 0, 0, // Options = 0
+                ],
+            );
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientSetClientProperties,
+                &[endpoint as u32, wide_props as u32],
+            );
+            assert_eq!(
+                hr,
+                u64::from(crate::audio_activation::AUDCLNT_E_NONOFFLOAD_MODE_ONLY),
+                "offload without a host engine is rejected exactly"
+            );
+            memory.map_bytes(
+                wide_props,
+                &[
+                    16, 0, 0, 0, // cbSize
+                    0, 0, 0, 0, // bIsOffload = FALSE
+                    3, 0, 0, 0, // eCategory = AudioCategory_Media
+                    1, 0, 0, 0, // Options = AUDCLNT_STREAMOPTIONS_RAW
+                ],
+            );
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientSetClientProperties,
+                &[endpoint as u32, wide_props as u32],
+            );
+            assert_eq!(
+                hr,
+                u64::from(crate::audio_activation::AUDCLNT_E_RAW_MODE_UNSUPPORTED),
+                "bitstream/raw is rejected exactly"
+            );
+            // A 16-byte property size whose Options field is unmapped is a
+            // pointer error, never a partial read or silent acceptance.
+            let truncated_props = AUDIO_CLIENT_OUT_ADDR + 40;
+            memory.map_bytes(
+                truncated_props,
+                &[
+                    16, 0, 0, 0, // cbSize says 16
+                    0, 0, 0, 0, // bIsOffload = FALSE
+                    3, 0, 0, 0, // eCategory
+                ],
+            );
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientSetClientProperties,
+                &[endpoint as u32, truncated_props as u32],
+            );
+            assert_eq!(
+                hr,
+                u64::from(crate::audio_activation::AUDCLNT_E_POINTER),
+                "an unavailable Options field is AUDCLNT_E_POINTER"
+            );
 
             // IAudioClient3::InitializeSharedAudioStream — a real shared-mode
             // initialization at the requested period in frames.

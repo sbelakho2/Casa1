@@ -39,11 +39,27 @@
 //! - wait-2: `{ hDevice, ObjectCount, Objects ptr, Values ptr, TimeoutNs u64 }`.
 //! - display-mode list: `{ hAdapter, ModeCount in/out, Modes ptr, Flags u32 }`
 //!   with 20-byte entries `{ width, height, refresh_num, refresh_den, flags }`.
+//! - output enumeration: `{ hAdapter, OutputCount in/out, Outputs ptr, Flags u32 }`
+//!   with 24-byte entries
+//!   `{ output_id, source_id, target_id, dpi_x, dpi_y, mode_count }`.
+//! - per-source display-mode list: `{ hAdapter, VidPnSourceId, ModeCount in/out,
+//!   pad, Modes ptr, Flags u32 }` with the same 20-byte mode entries.
+//! - gamma ramp: `{ hAdapter, OutputId, Type, EntryCount, RampPtr }`; type 1
+//!   carries 256 `u16` red entries, then green, then blue (1536 bytes).
+//! - cursor position: `{ hAdapter, OutputId, X i32, Y i32 }`.
+//! - cursor shape: `{ hAdapter, OutputId, Visible, Width, Height, HotX, HotY,
+//!   pad, PixelsPtr }` with `width * height` `u32` ARGB pixels.
+//! - PnP start/stop: `{ hAdapter }`; power component:
+//!   `{ hAdapter, Component, PowerState }`.
 //! - allocation priority: `{ hDevice, AllocationCount, Allocations ptr, Priority u32 }`.
 //! - private driver format: `{ hAdapter, VidPnSourceId, Attribute u32 }`.
-//! - statistics: `{ Size u32 (120), Type u32, hAdapter u32, NodeOrdinal u32,
+//! - statistics: `{ Size u32 (120 or 136), Type u32, hAdapter u32,
+//!   NodeOrdinal u32, [ProcessId u64, SegmentId u32, SegmentGroup u32 for 136],
 //!   13 u64 counters }` using the documented `D3DKMT_QUERYSTATISTICS_TYPE`
-//!   values 0 (ADAPTER), 5 (NODE), and 11 (ADAPTER2).
+//!   values. In the 120-byte form `NodeOrdinal` doubles as the PROCESS process
+//!   id, the SEGMENT segment id and the NODE ordinal. The 136-byte form is
+//!   required for process+segment, process+node and process+segment-group
+//!   classes and carries the full `u64` process id.
 //!
 //! Layer contract: every export returns its NTSTATUS in EAX (0 =
 //! STATUS_SUCCESS).
@@ -53,9 +69,20 @@ use crate::host_thunks::write_guest_bytes_checked;
 use crate::wddm::{
     AdapterHandle, AllocationDesc, AllocationHandle, ContextHandle, CreateAllocationsRequest,
     CreateContextRequest, CreateDeviceRequest, CreateSwapChainRequest,
-    D3DKMT_QUERYSTATISTICS_ADAPTER, D3DKMT_QUERYSTATISTICS_ADAPTER2, D3DKMT_QUERYSTATISTICS_NODE,
-    DeviceHandle, KeyedMutexHandle, Luid, MAX_KMT_ARRAY, MAX_SCHEDULING_PRIORITY, PresentRequest,
-    RenderRequest, SegmentId, SwapChainHandle, SyncObjectHandle, WddmSubsystem,
+    D3DKMT_QUERYSTATISTICS_PROCESS_NODE, D3DKMT_QUERYSTATISTICS_PROCESS_NODE2,
+    D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT, D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP,
+    D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP2, D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT2,
+    D3DKMT_QUERYSTATISTICS_SEGMENT, D3DKMT_QUERYSTATISTICS_SEGMENT2, DeviceHandle,
+    GAMMA_RAMP_ENTRIES, GAMMA_RAMP_TYPE_RAMP, KeyedMutexHandle, Luid, MAX_KMT_ARRAY,
+    MAX_SCHEDULING_PRIORITY, PresentRequest, RenderRequest, SegmentId, SwapChainHandle,
+    SyncObjectHandle, WddmStatisticsSnapshot, WddmSubsystem,
+};
+#[cfg(test)]
+use crate::wddm::{
+    D3DKMT_QUERYSTATISTICS_ADAPTER, D3DKMT_QUERYSTATISTICS_ADAPTER2,
+    D3DKMT_QUERYSTATISTICS_HISTOGRAM, D3DKMT_QUERYSTATISTICS_NODE, D3DKMT_QUERYSTATISTICS_NODE2,
+    D3DKMT_QUERYSTATISTICS_PROCESS, D3DKMT_QUERYSTATISTICS_VIDPNSOURCE, GAMMA_RAMP_TYPE_IDENTITY,
+    MAX_CURSOR_DIMENSION, POWER_COMPONENT_GPU, POWER_STATE_D0, POWER_STATE_D3, WddmPnpEvent,
 };
 use std::sync::OnceLock;
 
@@ -79,8 +106,17 @@ const STATUS_ACCESS_DENIED: u32 = 0xc000_0022;
 const STATUS_OBJECT_NAME_COLLISION: u32 = 0xc000_0035;
 /// STATUS_NOT_SUPPORTED.
 const STATUS_NOT_SUPPORTED: u32 = 0xc000_00bb;
+/// STATUS_INVALID_DEVICE_STATE.
+#[cfg(test)]
+const STATUS_INVALID_DEVICE_STATE: u32 = 0xc000_0184;
 /// STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER.
 const STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER: u32 = 0xc01e_0002;
+/// STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE.
+#[cfg(test)]
+const STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE: u32 = 0xc01e_0003;
+/// STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET.
+#[cfg(test)]
+const STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET: u32 = 0xc01e_0004;
 /// STATUS_GRAPHICS_PRESENT_INVALID_WINDOW.
 #[cfg(test)]
 const STATUS_GRAPHICS_PRESENT_INVALID_WINDOW: u32 = 0xc01e_000f;
@@ -103,9 +139,14 @@ const REGISTRY_INFO_SIZE: u32 = 4 * 260 * 2;
 /// Synthetic `D3DKMT_QUERYSTATISTICS` descriptor size (16-byte header plus a
 /// 104-byte counter union for the documented ADAPTER/ADAPTER2/NODE types).
 const STATISTICS_SIZE: u32 = 120;
+/// Extended statistics descriptor: 32-byte header (process/segment ids) plus
+/// the same 104-byte counter union.
+const STATISTICS_EXTENDED_SIZE: u32 = 136;
 /// Synthetic display-mode entry: width, height, refresh numerator/denominator,
 /// and flags.
 const DISPLAY_MODE_SIZE: u64 = 20;
+/// Synthetic output entry: output/source/target ids, DPI and mode count.
+const OUTPUT_ENTRY_SIZE: u64 = 24;
 /// `D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME.DeviceName` length in `WCHAR`s.
 const GDI_DISPLAY_NAME_UNITS: usize = 32;
 /// `D3DKMT_OPENADAPTERFROMDEVICENAME.DeviceName` length in `WCHAR`s.
@@ -261,6 +302,17 @@ impl PeHostRuntime {
             HostThunk::D3DKMTGetDisplayModeList => {
                 self.d3d8thk_get_display_mode_list(state, memory)
             }
+            HostThunk::D3DKMTGetDisplayModeList2 => {
+                self.d3d8thk_get_display_mode_list2(state, memory)
+            }
+            HostThunk::D3DKMTEnumOutputs => self.d3d8thk_enum_outputs(state, memory),
+            HostThunk::D3DKMTSetGammaRamp => self.d3d8thk_set_gamma_ramp(state, memory),
+            HostThunk::D3DKMTGetGammaRamp => self.d3d8thk_get_gamma_ramp(state, memory),
+            HostThunk::D3DKMTSetCursorPosition => self.d3d8thk_set_cursor_position(state, memory),
+            HostThunk::D3DKMTSetCursor => self.d3d8thk_set_cursor(state, memory),
+            HostThunk::D3DKMTPnPStart => self.d3d8thk_pnp_start(state, memory),
+            HostThunk::D3DKMTPnPStop => self.d3d8thk_pnp_stop(state, memory),
+            HostThunk::D3DKMTPowerComponent => self.d3d8thk_power_component(state, memory),
             HostThunk::D3DKMTSetAllocationPriority => {
                 self.d3d8thk_set_allocation_priority(state, memory)
             }
@@ -778,6 +830,224 @@ impl PeHostRuntime {
         kmt_write_u32(memory, info + 4, required)
     }
 
+    fn d3d8thk_get_display_mode_list2(
+        &self,
+        state: &CpuState,
+        memory: &mut MemoryImage,
+    ) -> KmtResult<()> {
+        let arch = self.guest_arch;
+        let ps = arch.pointer_bytes() as u64;
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let adapter = AdapterHandle(kmt_read_u32(memory, info)?);
+        let source = kmt_read_u32(memory, info + 4)?;
+        let capacity = kmt_read_u32(memory, info + 8)?;
+        let list = kmt_read_pointer(memory, info + 16, arch)?;
+        let _flags = kmt_read_u32(memory, info + 16 + ps)?;
+        let modes = kmt_facade(wddm().d3dkmt_source_display_modes(adapter, source))?;
+        let required = modes.len() as u32;
+        if list == 0 || capacity < required {
+            kmt_write_u32(memory, info + 8, required)?;
+            return Err(STATUS_BUFFER_TOO_SMALL);
+        }
+        for (index, mode) in modes.iter().enumerate() {
+            let at = list + index as u64 * DISPLAY_MODE_SIZE;
+            kmt_write_u32(memory, at, mode.width)?;
+            kmt_write_u32(memory, at + 4, mode.height)?;
+            kmt_write_u32(memory, at + 8, mode.refresh_numerator)?;
+            kmt_write_u32(memory, at + 12, mode.refresh_denominator)?;
+            kmt_write_u32(memory, at + 16, 0)?;
+        }
+        kmt_write_u32(memory, info + 8, required)
+    }
+
+    fn d3d8thk_enum_outputs(&self, state: &CpuState, memory: &mut MemoryImage) -> KmtResult<()> {
+        let arch = self.guest_arch;
+        let ps = arch.pointer_bytes() as u64;
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let adapter = AdapterHandle(kmt_read_u32(memory, info)?);
+        let capacity = kmt_read_u32(memory, info + 4)?;
+        let list = kmt_read_pointer(memory, info + 8, arch)?;
+        let _flags = kmt_read_u32(memory, info + 8 + ps)?;
+        let outputs = kmt_facade(wddm().d3dkmt_enum_outputs(adapter))?;
+        let required = outputs.len() as u32;
+        if list == 0 {
+            if capacity != 0 {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            return kmt_write_u32(memory, info + 4, required);
+        }
+        if capacity < required {
+            kmt_write_u32(memory, info + 4, required)?;
+            return Err(STATUS_BUFFER_TOO_SMALL);
+        }
+        for (index, output) in outputs.iter().enumerate() {
+            let at = list + index as u64 * OUTPUT_ENTRY_SIZE;
+            kmt_write_u32(memory, at, output.output_id)?;
+            kmt_write_u32(memory, at + 4, output.vidpn_source_id)?;
+            kmt_write_u32(memory, at + 8, output.vidpn_target_id)?;
+            kmt_write_u32(memory, at + 12, output.dpi_x)?;
+            kmt_write_u32(memory, at + 16, output.dpi_y)?;
+            kmt_write_u32(memory, at + 20, output.modes.len() as u32)?;
+        }
+        kmt_write_u32(memory, info + 4, required)
+    }
+
+    fn d3d8thk_set_gamma_ramp(&self, state: &CpuState, memory: &mut MemoryImage) -> KmtResult<()> {
+        let arch = self.guest_arch;
+        let ps = arch.pointer_bytes() as u64;
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let adapter = AdapterHandle(kmt_read_u32(memory, info)?);
+        let output = kmt_read_u32(memory, info + 4)?;
+        let ramp_type = kmt_read_u32(memory, info + 8)?;
+        let entries = kmt_read_u32(memory, info + 12)?;
+        let ramp = kmt_read_pointer(memory, info + 16, arch)?;
+        let _pad = kmt_read_u32(memory, info + 16 + ps)?;
+        if ramp_type == GAMMA_RAMP_TYPE_RAMP {
+            if entries as usize != GAMMA_RAMP_ENTRIES {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            if ramp == 0 {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            let mut red = Vec::with_capacity(GAMMA_RAMP_ENTRIES);
+            let mut green = Vec::with_capacity(GAMMA_RAMP_ENTRIES);
+            let mut blue = Vec::with_capacity(GAMMA_RAMP_ENTRIES);
+            for index in 0..GAMMA_RAMP_ENTRIES as u64 {
+                red.push(
+                    read_guest_u16(memory, ramp + index * 2).map_err(|_| kmt_invalid_pointer())?,
+                );
+                green.push(
+                    read_guest_u16(memory, ramp + GAMMA_RAMP_ENTRIES as u64 * 2 + index * 2)
+                        .map_err(|_| kmt_invalid_pointer())?,
+                );
+                blue.push(
+                    read_guest_u16(memory, ramp + GAMMA_RAMP_ENTRIES as u64 * 4 + index * 2)
+                        .map_err(|_| kmt_invalid_pointer())?,
+                );
+            }
+            kmt_facade(
+                wddm().d3dkmt_set_gamma_ramp(adapter, output, ramp_type, &red, &green, &blue),
+            )
+        } else {
+            if entries != 0 {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            kmt_facade(wddm().d3dkmt_set_gamma_ramp(adapter, output, ramp_type, &[], &[], &[]))
+        }
+    }
+
+    fn d3d8thk_get_gamma_ramp(&self, state: &CpuState, memory: &mut MemoryImage) -> KmtResult<()> {
+        let arch = self.guest_arch;
+        let ps = arch.pointer_bytes() as u64;
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let adapter = AdapterHandle(kmt_read_u32(memory, info)?);
+        let output = kmt_read_u32(memory, info + 4)?;
+        let ramp_type = kmt_read_u32(memory, info + 8)?;
+        let capacity = kmt_read_u32(memory, info + 12)?;
+        let ramp = kmt_read_pointer(memory, info + 16, arch)?;
+        let _pad = kmt_read_u32(memory, info + 16 + ps)?;
+        let stored = kmt_facade(wddm().d3dkmt_get_gamma_ramp(adapter, output))?;
+        if ramp_type == 0 {
+            return kmt_write_u32(memory, info + 12, 0);
+        }
+        if ramp_type != GAMMA_RAMP_TYPE_RAMP {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if capacity as usize != GAMMA_RAMP_ENTRIES {
+            kmt_write_u32(memory, info + 12, GAMMA_RAMP_ENTRIES as u32)?;
+            return Err(STATUS_BUFFER_TOO_SMALL);
+        }
+        if ramp == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        for (index, value) in stored.red.iter().enumerate() {
+            write_guest_u16(memory, ramp + index as u64 * 2, *value)
+                .map_err(|_| kmt_invalid_pointer())?;
+        }
+        for (index, value) in stored.green.iter().enumerate() {
+            write_guest_u16(
+                memory,
+                ramp + GAMMA_RAMP_ENTRIES as u64 * 2 + index as u64 * 2,
+                *value,
+            )
+            .map_err(|_| kmt_invalid_pointer())?;
+        }
+        for (index, value) in stored.blue.iter().enumerate() {
+            write_guest_u16(
+                memory,
+                ramp + GAMMA_RAMP_ENTRIES as u64 * 4 + index as u64 * 2,
+                *value,
+            )
+            .map_err(|_| kmt_invalid_pointer())?;
+        }
+        kmt_write_u32(memory, info + 12, GAMMA_RAMP_ENTRIES as u32)
+    }
+
+    fn d3d8thk_set_cursor_position(
+        &self,
+        state: &CpuState,
+        memory: &mut MemoryImage,
+    ) -> KmtResult<()> {
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let adapter = AdapterHandle(kmt_read_u32(memory, info)?);
+        let output = kmt_read_u32(memory, info + 4)?;
+        let x = kmt_read_u32(memory, info + 8)? as i32;
+        let y = kmt_read_u32(memory, info + 12)? as i32;
+        kmt_facade(wddm().d3dkmt_set_cursor_position(adapter, output, x, y))
+    }
+
+    fn d3d8thk_set_cursor(&self, state: &CpuState, memory: &mut MemoryImage) -> KmtResult<()> {
+        let arch = self.guest_arch;
+        let ps = arch.pointer_bytes() as u64;
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let adapter = AdapterHandle(kmt_read_u32(memory, info)?);
+        let output = kmt_read_u32(memory, info + 4)?;
+        let visible = kmt_read_u32(memory, info + 8)? != 0;
+        let width = kmt_read_u32(memory, info + 12)?;
+        let height = kmt_read_u32(memory, info + 16)?;
+        let hot_x = kmt_read_u32(memory, info + 20)?;
+        let hot_y = kmt_read_u32(memory, info + 24)?;
+        let pixels_ptr = kmt_read_pointer(memory, info + 32, arch)?;
+        let _pad = kmt_read_u32(memory, info + 32 + ps)?;
+        let count = u64::from(width) * u64::from(height);
+        if count > 0 && pixels_ptr == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut pixels = Vec::new();
+        if count > 0 {
+            pixels.reserve(count as usize);
+            for index in 0..count {
+                pixels.push(
+                    read_guest_u32(memory, pixels_ptr + index * 4)
+                        .map_err(|_| kmt_invalid_pointer())?,
+                );
+            }
+        }
+        kmt_facade(wddm().d3dkmt_set_cursor(
+            adapter, output, visible, width, height, hot_x, hot_y, &pixels,
+        ))
+    }
+
+    fn d3d8thk_pnp_start(&self, state: &CpuState, memory: &mut MemoryImage) -> KmtResult<()> {
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let adapter = AdapterHandle(kmt_read_u32(memory, info)?);
+        kmt_facade(wddm().d3dkmt_pnp_start(adapter))
+    }
+
+    fn d3d8thk_pnp_stop(&self, state: &CpuState, memory: &mut MemoryImage) -> KmtResult<()> {
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let adapter = AdapterHandle(kmt_read_u32(memory, info)?);
+        kmt_facade(wddm().d3dkmt_pnp_stop(adapter))
+    }
+
+    fn d3d8thk_power_component(&self, state: &CpuState, memory: &mut MemoryImage) -> KmtResult<()> {
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let adapter = AdapterHandle(kmt_read_u32(memory, info)?);
+        let component = kmt_read_u32(memory, info + 4)?;
+        let power_state = kmt_read_u32(memory, info + 8)?;
+        kmt_facade(wddm().d3dkmt_power_component(adapter, component, power_state))
+    }
+
     fn d3d8thk_set_allocation_priority(
         &self,
         state: &CpuState,
@@ -1073,31 +1343,51 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
     ) -> KmtResult<()> {
         let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
-        if kmt_read_u32(memory, info)? != STATISTICS_SIZE {
+        let size = kmt_read_u32(memory, info)?;
+        if size != STATISTICS_SIZE && size != STATISTICS_EXTENDED_SIZE {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let query_type = kmt_read_u32(memory, info + 4)?;
         let adapter = AdapterHandle(kmt_read_u32(memory, info + 8)?);
         let node_ordinal = kmt_read_u32(memory, info + 12)?;
-        let statistics =
-            kmt_facade(wddm().d3dkmt_query_statistics_for(adapter, query_type, node_ordinal))?;
-        let counters = match query_type {
-            D3DKMT_QUERYSTATISTICS_NODE => [
-                statistics.render_count,
-                statistics.render_bytes,
-                statistics.context_count,
-                u64::from(node_ordinal),
-                statistics.allocation_count,
-                statistics.allocated_bytes,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ],
-            D3DKMT_QUERYSTATISTICS_ADAPTER | D3DKMT_QUERYSTATISTICS_ADAPTER2 => [
+        let extended = size == STATISTICS_EXTENDED_SIZE;
+        if !extended
+            && matches!(
+                query_type,
+                D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT
+                    | D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT2
+                    | D3DKMT_QUERYSTATISTICS_PROCESS_NODE
+                    | D3DKMT_QUERYSTATISTICS_PROCESS_NODE2
+                    | D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP
+                    | D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP2
+            )
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let (process_id, segment_id, segment_group, counters_at) = if extended {
+            (
+                kmt_read_u64(memory, info + 16)?,
+                kmt_read_u32(memory, info + 24)?,
+                kmt_read_u32(memory, info + 28)?,
+                32_u64,
+            )
+        } else {
+            (u64::from(node_ordinal), node_ordinal, node_ordinal, 16_u64)
+        };
+        let sub_object = match query_type {
+            D3DKMT_QUERYSTATISTICS_SEGMENT
+            | D3DKMT_QUERYSTATISTICS_SEGMENT2
+            | D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT
+            | D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT2 => segment_id,
+            D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP
+            | D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP2 => segment_group,
+            _ => node_ordinal,
+        };
+        let snapshot = kmt_facade(
+            wddm().d3dkmt_query_statistics_typed(adapter, query_type, process_id, sub_object),
+        )?;
+        let counters = match snapshot {
+            WddmStatisticsSnapshot::Adapter(statistics) => [
                 statistics.present_count,
                 statistics.refresh_count,
                 statistics.flip_count,
@@ -1112,14 +1402,58 @@ impl PeHostRuntime {
                 statistics.last_displayed_frame_index,
                 statistics.context_count,
             ],
-            _ => return Err(STATUS_NOT_SUPPORTED), // coverage: unreachable — the facade returns Ok only for NODE, ADAPTER and ADAPTER2, which are exactly the arms above
+            WddmStatisticsSnapshot::Process(statistics) => [
+                statistics.process_id,
+                statistics.allocation_count,
+                statistics.allocated_bytes,
+                statistics.committed_bytes,
+                statistics.resident_count,
+                statistics.resident_bytes,
+                statistics.context_count,
+                statistics.render_count,
+                statistics.render_bytes,
+                u64::from(statistics.segment_id),
+                u64::from(statistics.node_ordinal),
+                statistics.segment_budget,
+                statistics.segment_used,
+            ],
+            WddmStatisticsSnapshot::Segment(statistics) => [
+                u64::from(statistics.segment_id),
+                statistics.budget,
+                statistics.used,
+                statistics.allocation_count,
+                statistics.allocated_bytes,
+                statistics.committed_bytes,
+                statistics.resident_count,
+                statistics.resident_bytes,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            WddmStatisticsSnapshot::Node(statistics) => [
+                statistics.render_count,
+                statistics.render_bytes,
+                statistics.context_count,
+                u64::from(statistics.node_ordinal),
+                statistics.allocation_count,
+                statistics.allocated_bytes,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
         };
         let mut bytes = [0_u8; 104];
         for (index, counter) in counters.iter().enumerate() {
             let at = index * 8;
             bytes[at..at + 8].copy_from_slice(&counter.to_le_bytes());
         }
-        kmt_write_bytes(memory, info + 16, &bytes)
+        kmt_write_bytes(memory, info + counters_at, &bytes)
     }
 }
 
@@ -1131,6 +1465,7 @@ fn kmt_facade<T>(result: crate::wddm::WddmResult<T>) -> KmtResult<T> {
 mod tests {
     use super::*;
     use crate::ge::{GameEnvironment, GeArch};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
@@ -1541,6 +1876,51 @@ mod tests {
         store_u32(memory, descriptor + 8, sync_interval);
         store_u32(memory, descriptor + 12, flags);
         descriptor
+    }
+
+    fn statistics_descriptor(
+        memory: &mut MemoryImage,
+        size: u32,
+        query_type: u32,
+        adapter: u32,
+        node_ordinal: u32,
+        process_id: u64,
+        segment_id: u32,
+    ) -> u64 {
+        let info = SCRATCH + 0x2000;
+        store_u32(memory, info, size);
+        store_u32(memory, info + 4, query_type);
+        store_u32(memory, info + 8, adapter);
+        store_u32(memory, info + 12, node_ordinal);
+        if size == STATISTICS_EXTENDED_SIZE {
+            store_u64(memory, info + 16, process_id);
+            store_u32(memory, info + 24, segment_id);
+            store_u32(memory, info + 28, 0);
+        }
+        info
+    }
+
+    fn gamma_ramp_descriptor(
+        memory: &mut MemoryImage,
+        adapter: u32,
+        output: u32,
+        ramp_type: u32,
+        entries: u32,
+        ramp: u64,
+    ) -> u64 {
+        let info = SCRATCH + 0x2600;
+        store_u32(memory, info, adapter);
+        store_u32(memory, info + 4, output);
+        store_u32(memory, info + 8, ramp_type);
+        store_u32(memory, info + 12, entries);
+        store_ptr(memory, info + 16, ramp, GuestArch::X86);
+        store_u32(memory, info + 20, 0);
+        info
+    }
+
+    fn load_ramp_channel(memory: &MemoryImage, base: u64, channel: u64) -> u16 {
+        read_guest_u16(memory, base + channel * GAMMA_RAMP_ENTRIES as u64 * 2)
+            .expect("gamma ramp entry")
     }
 
     #[test]
@@ -3537,7 +3917,7 @@ mod tests {
                     HostThunk::D3DKMTSetDisplayPrivateDriverFormat,
                     &[format]
                 ),
-                STATUS_INVALID_PARAMETER
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE
             );
             store_u32(&mut memory, format + 4, 0);
             assert_eq!(
@@ -3552,7 +3932,11 @@ mod tests {
 
             let statistics = SCRATCH + 0x1700;
             store_u32(&mut memory, statistics, STATISTICS_SIZE);
-            store_u32(&mut memory, statistics + 4, 1);
+            store_u32(
+                &mut memory,
+                statistics + 4,
+                D3DKMT_QUERYSTATISTICS_HISTOGRAM,
+            );
             store_u32(&mut memory, statistics + 8, adapter);
             assert_eq!(
                 call_status(
@@ -4530,5 +4914,1035 @@ mod tests {
                 STATUS_TIMEOUT
             );
         });
+    }
+
+    #[test]
+    fn d3d8thk_statistics_process_segment_aliases_and_unsupported_classes_are_exact() {
+        with_big_stack(|| {
+            let (mut runtime, _directory) = test_runtime(GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            map_scratch(&mut memory);
+            let ps = pointer_size(&runtime);
+            let guest_pid = u64::from(runtime.guest_pid);
+            let adapter = open_adapter(&mut runtime, &mut memory);
+            let device = create_device(&mut runtime, &mut memory, adapter, false);
+            let allocation = create_allocation(&mut runtime, &mut memory, device, 1, 4096, 0, true);
+            assert_eq!(
+                wddm().d3dkmt_make_resident(AllocationHandle(allocation), guest_pid),
+                Ok(1)
+            );
+            let context_descriptor = SCRATCH + 0x2100;
+            store_u32(&mut memory, context_descriptor, device);
+            store_u32(&mut memory, context_descriptor + 4, 0);
+            store_u32(&mut memory, context_descriptor + 8, 1);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTCreateContext,
+                    &[context_descriptor]
+                ),
+                0
+            );
+            let context = load_u32(&memory, context_descriptor + 12);
+            let render_list = SCRATCH + 0x2140;
+            store_u32(&mut memory, render_list, allocation);
+            let render = SCRATCH + 0x2180;
+            store_u32(&mut memory, render, device);
+            store_u32(&mut memory, render + 4, context);
+            store_ptr(&mut memory, render + 8, render_list, GuestArch::X86);
+            store_u32(&mut memory, render + 8 + ps, 1);
+            store_u32(&mut memory, render + 12 + ps, 0x22);
+            store_u32(&mut memory, render + 16 + ps, 0);
+            store_u64(&mut memory, render + 32, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTRender,
+                    &[render]
+                ),
+                0
+            );
+
+            let process = statistics_descriptor(
+                &mut memory,
+                STATISTICS_SIZE,
+                D3DKMT_QUERYSTATISTICS_PROCESS,
+                adapter,
+                runtime.guest_pid,
+                0,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[process]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, process + 16), guest_pid);
+            assert!(load_u64(&memory, process + 24) >= 1, "process allocations");
+            assert!(load_u64(&memory, process + 32) >= 4096, "process commit");
+            assert!(load_u64(&memory, process + 48) >= 1, "process residency");
+            assert!(load_u64(&memory, process + 64) >= 1, "process contexts");
+            assert!(load_u64(&memory, process + 72) >= 1, "process renders");
+
+            let unknown_process = statistics_descriptor(
+                &mut memory,
+                STATISTICS_SIZE,
+                D3DKMT_QUERYSTATISTICS_PROCESS,
+                adapter,
+                0xDEAD_BEEF,
+                0,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[unknown_process]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, unknown_process + 16), 0xDEAD_BEEF);
+            for index in 1..9 {
+                assert_eq!(load_u64(&memory, unknown_process + 16 + index * 8), 0);
+            }
+            assert_eq!(load_u64(&memory, unknown_process + 16 + 9 * 8), 0xFFFF_FFFF);
+            assert_eq!(
+                load_u64(&memory, unknown_process + 16 + 10 * 8),
+                0xFFFF_FFFF
+            );
+            assert_eq!(load_u64(&memory, unknown_process + 16 + 11 * 8), 0);
+            assert_eq!(load_u64(&memory, unknown_process + 16 + 12 * 8), 0);
+
+            let wide_process = statistics_descriptor(
+                &mut memory,
+                STATISTICS_EXTENDED_SIZE,
+                D3DKMT_QUERYSTATISTICS_PROCESS,
+                adapter,
+                0,
+                0x1_0000_0007,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[wide_process]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, wide_process + 32), 0x1_0000_0007);
+            for index in 1..9 {
+                assert_eq!(load_u64(&memory, wide_process + 32 + index * 8), 0);
+            }
+            assert_eq!(load_u64(&memory, wide_process + 32 + 9 * 8), 0xFFFF_FFFF);
+            assert_eq!(load_u64(&memory, wide_process + 32 + 10 * 8), 0xFFFF_FFFF);
+            assert_eq!(load_u64(&memory, wide_process + 32 + 11 * 8), 0);
+            assert_eq!(load_u64(&memory, wide_process + 32 + 12 * 8), 0);
+
+            let adapter_info = wddm()
+                .d3dkmt_query_adapter_info(AdapterHandle(adapter))
+                .expect("adapter info");
+            let budget = adapter_info.segments[0].budget;
+            let segment = statistics_descriptor(
+                &mut memory,
+                STATISTICS_SIZE,
+                D3DKMT_QUERYSTATISTICS_SEGMENT,
+                adapter,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[segment]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, segment + 16), 0);
+            assert_eq!(load_u64(&memory, segment + 24), budget);
+            assert!(load_u64(&memory, segment + 32) <= budget, "segment used");
+            assert!(load_u64(&memory, segment + 40) >= 1, "segment allocations");
+            let segment2 = statistics_descriptor(
+                &mut memory,
+                STATISTICS_SIZE,
+                D3DKMT_QUERYSTATISTICS_SEGMENT2,
+                adapter,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[segment2]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, segment2 + 16), 0);
+            assert_eq!(load_u64(&memory, segment2 + 24), budget);
+
+            let node = statistics_descriptor(
+                &mut memory,
+                STATISTICS_SIZE,
+                D3DKMT_QUERYSTATISTICS_NODE,
+                adapter,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[node]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, node + 40), 0);
+            assert!(load_u64(&memory, node + 32) >= 1, "node contexts");
+            assert!(load_u64(&memory, node + 16) >= 1, "node renders");
+            let node2 = statistics_descriptor(
+                &mut memory,
+                STATISTICS_SIZE,
+                D3DKMT_QUERYSTATISTICS_NODE2,
+                adapter,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[node2]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, node2 + 40), 0);
+            assert!(load_u64(&memory, node2 + 32) >= 1, "node2 contexts");
+
+            let legacy_scoped = statistics_descriptor(
+                &mut memory,
+                STATISTICS_SIZE,
+                D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT,
+                adapter,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[legacy_scoped]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let scoped = statistics_descriptor(
+                &mut memory,
+                STATISTICS_EXTENDED_SIZE,
+                D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT,
+                adapter,
+                0,
+                guest_pid,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[scoped]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, scoped + 32), guest_pid);
+            assert!(load_u64(&memory, scoped + 40) >= 1, "scoped allocations");
+            assert_eq!(load_u64(&memory, scoped + 32 + 9 * 8), 0);
+            assert_eq!(load_u64(&memory, scoped + 32 + 10 * 8), 0xFFFF_FFFF);
+            assert_eq!(load_u64(&memory, scoped + 32 + 11 * 8), budget);
+            let noded = statistics_descriptor(
+                &mut memory,
+                STATISTICS_EXTENDED_SIZE,
+                D3DKMT_QUERYSTATISTICS_PROCESS_NODE,
+                adapter,
+                0,
+                guest_pid,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[noded]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, noded + 32), guest_pid);
+            assert_eq!(load_u64(&memory, noded + 32 + 10 * 8), 0);
+            assert!(
+                load_u64(&memory, noded + 32 + 6 * 8) >= 1,
+                "process contexts"
+            );
+            let grouped = statistics_descriptor(
+                &mut memory,
+                STATISTICS_EXTENDED_SIZE,
+                D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP,
+                adapter,
+                0,
+                guest_pid,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[grouped]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, grouped + 32), guest_pid);
+            assert_eq!(load_u64(&memory, grouped + 32 + 9 * 8), 0);
+            assert_eq!(load_u64(&memory, grouped + 32 + 11 * 8), budget);
+
+            for query_type in [
+                D3DKMT_QUERYSTATISTICS_HISTOGRAM,
+                D3DKMT_QUERYSTATISTICS_VIDPNSOURCE,
+            ] {
+                let unsupported = statistics_descriptor(
+                    &mut memory,
+                    STATISTICS_SIZE,
+                    query_type,
+                    adapter,
+                    0,
+                    0,
+                    0,
+                );
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTQueryStatistics,
+                        &[unsupported]
+                    ),
+                    STATUS_NOT_SUPPORTED
+                );
+            }
+            let undocumented =
+                statistics_descriptor(&mut memory, STATISTICS_SIZE, 99, adapter, 0, 0, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[undocumented]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let wrong_size = statistics_descriptor(
+                &mut memory,
+                STATISTICS_EXTENDED_SIZE + 1,
+                D3DKMT_QUERYSTATISTICS_ADAPTER,
+                adapter,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[wrong_size]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let bad_adapter = statistics_descriptor(
+                &mut memory,
+                STATISTICS_SIZE,
+                D3DKMT_QUERYSTATISTICS_ADAPTER,
+                0xFFFF_FFFF,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTQueryStatistics,
+                    &[bad_adapter]
+                ),
+                STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+            );
+        });
+    }
+
+    #[test]
+    fn d3d8thk_display_gamma_cursor_pnp_and_mode_buffer_errors_are_exact() {
+        with_big_stack(|| {
+            let (mut runtime, _directory) = test_runtime(GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            map_scratch(&mut memory);
+            let ps = pointer_size(&runtime);
+            let adapter = open_adapter(&mut runtime, &mut memory);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&events);
+            wddm().install_pnp_hooks(Arc::new(move |event| {
+                sink.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            }));
+
+            let outputs = SCRATCH + 0x2200;
+            let output_list = SCRATCH + 0x2300;
+            store_u32(&mut memory, outputs, adapter);
+            store_u32(&mut memory, outputs + 4, 0);
+            store_ptr(&mut memory, outputs + 8, 0, GuestArch::X86);
+            store_u32(&mut memory, outputs + 12, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEnumOutputs,
+                    &[outputs]
+                ),
+                0
+            );
+            let output_count = load_u32(&memory, outputs + 4);
+            assert!(output_count >= 1, "backend exposes display outputs");
+            store_u32(&mut memory, outputs + 4, 1);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEnumOutputs,
+                    &[outputs]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_u32(&mut memory, outputs + 4, output_count - 1);
+            store_ptr(&mut memory, outputs + 8, output_list, GuestArch::X86);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEnumOutputs,
+                    &[outputs]
+                ),
+                STATUS_BUFFER_TOO_SMALL
+            );
+            assert_eq!(load_u32(&memory, outputs + 4), output_count);
+            store_u32(&mut memory, outputs + 4, output_count);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEnumOutputs,
+                    &[outputs]
+                ),
+                0
+            );
+            for index in 0..output_count as u64 {
+                let at = output_list + index * OUTPUT_ENTRY_SIZE;
+                assert_eq!(load_u32(&memory, at), index as u32);
+                assert_eq!(load_u32(&memory, at + 4), index as u32);
+                assert_eq!(load_u32(&memory, at + 8), index as u32);
+                assert!(load_u32(&memory, at + 20) >= 1);
+            }
+            store_u32(&mut memory, outputs, 0xFFFF_FFFF);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEnumOutputs,
+                    &[outputs]
+                ),
+                STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+            );
+
+            let modes2 = SCRATCH + 0x2400;
+            let mode_list = SCRATCH + 0x2480;
+            store_u32(&mut memory, modes2, adapter);
+            store_u32(&mut memory, modes2 + 4, 0);
+            store_u32(&mut memory, modes2 + 8, 0);
+            store_u32(&mut memory, modes2 + 12, 0);
+            store_ptr(&mut memory, modes2 + 16, 0, GuestArch::X86);
+            store_u32(&mut memory, modes2 + 16 + ps, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetDisplayModeList2,
+                    &[modes2]
+                ),
+                STATUS_BUFFER_TOO_SMALL
+            );
+            let mode_count = load_u32(&memory, modes2 + 8);
+            assert!(mode_count >= 1, "source exposes display modes");
+            store_u32(&mut memory, modes2 + 8, mode_count - 1);
+            store_ptr(&mut memory, modes2 + 16, mode_list, GuestArch::X86);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetDisplayModeList2,
+                    &[modes2]
+                ),
+                STATUS_BUFFER_TOO_SMALL
+            );
+            assert_eq!(load_u32(&memory, modes2 + 8), mode_count);
+            store_u32(&mut memory, modes2 + 8, mode_count);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetDisplayModeList2,
+                    &[modes2]
+                ),
+                0
+            );
+            assert_ne!(load_u32(&memory, mode_list), 0);
+            assert_ne!(load_u32(&memory, mode_list + 4), 0);
+            assert_ne!(load_u32(&memory, mode_list + 12), 0);
+            store_u32(&mut memory, modes2 + 4, u32::MAX);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetDisplayModeList2,
+                    &[modes2]
+                ),
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE
+            );
+            store_u32(&mut memory, modes2 + 4, 0);
+            store_u32(&mut memory, modes2, 0xFFFF_FFFF);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetDisplayModeList2,
+                    &[modes2]
+                ),
+                STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+            );
+
+            let ramp = SCRATCH + 0x2800;
+            let readback = SCRATCH + 0x2E00;
+            for index in 0..GAMMA_RAMP_ENTRIES {
+                write_guest_u16(&mut memory, ramp + index as u64 * 2, index as u16)
+                    .expect("red ramp entry");
+                write_guest_u16(
+                    &mut memory,
+                    ramp + GAMMA_RAMP_ENTRIES as u64 * 2 + index as u64 * 2,
+                    (255 - index) as u16,
+                )
+                .expect("green ramp entry");
+                write_guest_u16(
+                    &mut memory,
+                    ramp + GAMMA_RAMP_ENTRIES as u64 * 4 + index as u64 * 2,
+                    (index * 2) as u16,
+                )
+                .expect("blue ramp entry");
+            }
+            let short_ramp =
+                gamma_ramp_descriptor(&mut memory, adapter, 0, GAMMA_RAMP_TYPE_RAMP, 255, ramp);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetGammaRamp,
+                    &[short_ramp]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let null_ramp = gamma_ramp_descriptor(
+                &mut memory,
+                adapter,
+                0,
+                GAMMA_RAMP_TYPE_RAMP,
+                GAMMA_RAMP_ENTRIES as u32,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetGammaRamp,
+                    &[null_ramp]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let bad_type = gamma_ramp_descriptor(&mut memory, adapter, 0, 2, 0, ramp);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetGammaRamp,
+                    &[bad_type]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let identity_with_data =
+                gamma_ramp_descriptor(&mut memory, adapter, 0, GAMMA_RAMP_TYPE_IDENTITY, 1, ramp);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetGammaRamp,
+                    &[identity_with_data]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let bad_output =
+                gamma_ramp_descriptor(&mut memory, adapter, 99, GAMMA_RAMP_TYPE_IDENTITY, 0, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetGammaRamp,
+                    &[bad_output]
+                ),
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+            );
+            let set_ramp = gamma_ramp_descriptor(
+                &mut memory,
+                adapter,
+                0,
+                GAMMA_RAMP_TYPE_RAMP,
+                GAMMA_RAMP_ENTRIES as u32,
+                ramp,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetGammaRamp,
+                    &[set_ramp]
+                ),
+                0
+            );
+            let short_readback =
+                gamma_ramp_descriptor(&mut memory, adapter, 0, GAMMA_RAMP_TYPE_RAMP, 255, readback);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetGammaRamp,
+                    &[short_readback]
+                ),
+                STATUS_BUFFER_TOO_SMALL
+            );
+            assert_eq!(
+                load_u32(&memory, short_readback + 12),
+                GAMMA_RAMP_ENTRIES as u32
+            );
+            let null_readback = gamma_ramp_descriptor(
+                &mut memory,
+                adapter,
+                0,
+                GAMMA_RAMP_TYPE_RAMP,
+                GAMMA_RAMP_ENTRIES as u32,
+                0,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetGammaRamp,
+                    &[null_readback]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let get_ramp = gamma_ramp_descriptor(
+                &mut memory,
+                adapter,
+                0,
+                GAMMA_RAMP_TYPE_RAMP,
+                GAMMA_RAMP_ENTRIES as u32,
+                readback,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetGammaRamp,
+                    &[get_ramp]
+                ),
+                0
+            );
+            assert_eq!(load_u32(&memory, get_ramp + 12), GAMMA_RAMP_ENTRIES as u32);
+            assert_eq!(load_ramp_channel(&memory, readback, 0), 0);
+            assert_eq!(load_ramp_channel(&memory, readback, 1), 255);
+            assert_eq!(load_ramp_channel(&memory, readback, 2), 0);
+            assert_eq!(
+                read_guest_u16(&memory, readback + 255 * 2).expect("last red entry"),
+                255
+            );
+            let identity_read =
+                gamma_ramp_descriptor(&mut memory, adapter, 0, GAMMA_RAMP_TYPE_IDENTITY, 99, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetGammaRamp,
+                    &[identity_read]
+                ),
+                0
+            );
+            assert_eq!(load_u32(&memory, identity_read + 12), 0);
+            let bad_read_type = gamma_ramp_descriptor(&mut memory, adapter, 0, 2, 0, readback);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetGammaRamp,
+                    &[bad_read_type]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let bad_read_output = gamma_ramp_descriptor(
+                &mut memory,
+                adapter,
+                99,
+                GAMMA_RAMP_TYPE_RAMP,
+                GAMMA_RAMP_ENTRIES as u32,
+                readback,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTGetGammaRamp,
+                    &[bad_read_output]
+                ),
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+            );
+
+            let output_info = wddm()
+                .d3dkmt_output_info(AdapterHandle(adapter), 0)
+                .expect("output info");
+            let max_width = output_info
+                .modes
+                .iter()
+                .map(|mode| mode.width)
+                .max()
+                .expect("display mode");
+            let position = SCRATCH + 0x2500;
+            store_u32(&mut memory, position, adapter);
+            store_u32(&mut memory, position + 4, 0);
+            store_u32(&mut memory, position + 8, max_width);
+            store_u32(&mut memory, position + 12, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetCursorPosition,
+                    &[position]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_u32(&mut memory, position + 8, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetCursorPosition,
+                    &[position]
+                ),
+                0
+            );
+            store_u32(&mut memory, position + 4, 99);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetCursorPosition,
+                    &[position]
+                ),
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+            );
+
+            let pixels = SCRATCH + 0x3400;
+            for index in 0..257_u64 {
+                store_u32(&mut memory, pixels + index * 4, index as u32);
+            }
+            let cursor = SCRATCH + 0x2540;
+            store_u32(&mut memory, cursor, adapter);
+            store_u32(&mut memory, cursor + 4, 0);
+            store_u32(&mut memory, cursor + 8, 1);
+            store_u32(&mut memory, cursor + 12, 2);
+            store_u32(&mut memory, cursor + 16, 2);
+            store_u32(&mut memory, cursor + 20, 0);
+            store_u32(&mut memory, cursor + 24, 0);
+            store_u32(&mut memory, cursor + 28, 0);
+            store_ptr(&mut memory, cursor + 32, pixels, GuestArch::X86);
+            store_u32(&mut memory, cursor + 32 + ps, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetCursor,
+                    &[cursor]
+                ),
+                0
+            );
+            store_ptr(&mut memory, cursor + 32, 0, GuestArch::X86);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetCursor,
+                    &[cursor]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_ptr(&mut memory, cursor + 32, pixels, GuestArch::X86);
+            store_u32(&mut memory, cursor + 20, 2);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetCursor,
+                    &[cursor]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_u32(&mut memory, cursor + 20, 0);
+            store_u32(&mut memory, cursor + 12, MAX_CURSOR_DIMENSION + 1);
+            store_u32(&mut memory, cursor + 16, 1);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetCursor,
+                    &[cursor]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_u32(&mut memory, cursor + 12, 0);
+            store_u32(&mut memory, cursor + 16, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetCursor,
+                    &[cursor]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_u32(&mut memory, cursor + 8, 0);
+            store_ptr(&mut memory, cursor + 32, 0, GuestArch::X86);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetCursor,
+                    &[cursor]
+                ),
+                0
+            );
+            store_u32(&mut memory, cursor + 4, 99);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSetCursor,
+                    &[cursor]
+                ),
+                STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET
+            );
+
+            let pnp = SCRATCH + 0x2580;
+            store_u32(&mut memory, pnp, adapter);
+            assert_eq!(
+                call_status(&mut runtime, &mut memory, HostThunk::D3DKMTPnPStop, &[pnp]),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            let power = SCRATCH + 0x2590;
+            store_u32(&mut memory, power, adapter);
+            store_u32(&mut memory, power + 4, POWER_COMPONENT_GPU);
+            store_u32(&mut memory, power + 8, POWER_STATE_D0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTPowerComponent,
+                    &[power]
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            store_u32(&mut memory, power + 4, 1);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTPowerComponent,
+                    &[power]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_u32(&mut memory, power + 4, POWER_COMPONENT_GPU);
+            store_u32(&mut memory, power + 8, 2);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTPowerComponent,
+                    &[power]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_status(&mut runtime, &mut memory, HostThunk::D3DKMTPnPStart, &[pnp]),
+                0
+            );
+            assert_eq!(
+                call_status(&mut runtime, &mut memory, HostThunk::D3DKMTPnPStart, &[pnp]),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            store_u32(&mut memory, power + 8, POWER_STATE_D0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTPowerComponent,
+                    &[power]
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            assert_eq!(
+                call_status(&mut runtime, &mut memory, HostThunk::D3DKMTPnPStop, &[pnp]),
+                0
+            );
+            assert_eq!(
+                call_status(&mut runtime, &mut memory, HostThunk::D3DKMTPnPStart, &[pnp]),
+                0
+            );
+            store_u32(&mut memory, power + 8, POWER_STATE_D3);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTPowerComponent,
+                    &[power]
+                ),
+                0
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTPowerComponent,
+                    &[power]
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            assert_eq!(
+                call_status(&mut runtime, &mut memory, HostThunk::D3DKMTPnPStop, &[pnp]),
+                0
+            );
+            assert_eq!(
+                call_status(&mut runtime, &mut memory, HostThunk::D3DKMTPnPStop, &[pnp]),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            store_u32(&mut memory, pnp, 0xFFFF_FFFF);
+            assert_eq!(
+                call_status(&mut runtime, &mut memory, HostThunk::D3DKMTPnPStart, &[pnp]),
+                STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+            );
+            assert_eq!(
+                call_status(&mut runtime, &mut memory, HostThunk::D3DKMTPnPStop, &[pnp]),
+                STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+            );
+            store_u32(&mut memory, power, 0xFFFF_FFFF);
+            store_u32(&mut memory, power + 4, POWER_COMPONENT_GPU);
+            store_u32(&mut memory, power + 8, POWER_STATE_D0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTPowerComponent,
+                    &[power]
+                ),
+                STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
+            );
+            assert_eq!(
+                *events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                vec![
+                    WddmPnpEvent::EvtDeviceD0Entry { adapter_id: 0 },
+                    WddmPnpEvent::EvtDeviceD0Exit { adapter_id: 0 },
+                    WddmPnpEvent::EvtDeviceD0Entry { adapter_id: 0 },
+                    WddmPnpEvent::EvtDeviceD0Exit { adapter_id: 0 },
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn d3d8thk_unknown_kmt_imports_are_rejected_and_new_names_are_mapped() {
+        use crate::pe::{ExportSymbol, ExportTarget, ImportSymbol, ResolvedImport};
+
+        fn resolve(name: &str) -> &'static str {
+            let symbol = ImportSymbol::ByName {
+                hint: 0,
+                name: name.to_string(),
+            };
+            let import = ResolvedImport {
+                requested_module: "d3d8thk.dll".to_string(),
+                resolved_module: "d3d8thk.dll".to_string(),
+                symbol,
+                iat_rva: 0,
+                export: ExportSymbol {
+                    ordinal: 0,
+                    name: Some(name.to_string()),
+                    target: ExportTarget::Rva(0),
+                },
+            };
+            match HostThunk::from_import(&import) {
+                HostThunk::D3DKMTEnumOutputs => "enum-outputs",
+                HostThunk::D3DKMTGetDisplayModeList2 => "display-mode-list2",
+                HostThunk::D3DKMTGetGammaRamp => "get-gamma-ramp",
+                HostThunk::D3DKMTPnPStart => "pnp-start",
+                HostThunk::D3DKMTPnPStop => "pnp-stop",
+                HostThunk::D3DKMTPowerComponent => "power-component",
+                HostThunk::D3DKMTSetCursor => "set-cursor",
+                HostThunk::D3DKMTSetCursorPosition => "set-cursor-position",
+                HostThunk::D3DKMTSetGammaRamp => "set-gamma-ramp",
+                HostThunk::Unsupported { .. } => "unsupported",
+                _ => "other",
+            }
+        }
+
+        assert_eq!(resolve("D3DKMTEnumOutputs"), "enum-outputs");
+        assert_eq!(resolve("D3DKMTGetDisplayModeList2"), "display-mode-list2");
+        assert_eq!(resolve("D3DKMTGetGammaRamp"), "get-gamma-ramp");
+        assert_eq!(resolve("D3DKMTPnPStart"), "pnp-start");
+        assert_eq!(resolve("D3DKMTPnPStop"), "pnp-stop");
+        assert_eq!(resolve("D3DKMTPowerComponent"), "power-component");
+        assert_eq!(resolve("D3DKMTSetCursor"), "set-cursor");
+        assert_eq!(resolve("D3DKMTSetCursorPosition"), "set-cursor-position");
+        assert_eq!(resolve("D3DKMTSetGammaRamp"), "set-gamma-ramp");
+        assert_eq!(resolve("D3DKMTNotARealEntryPoint"), "unsupported");
     }
 }

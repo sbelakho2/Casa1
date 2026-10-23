@@ -17,6 +17,7 @@
 use super::super::*;
 use super::unknown_preamble;
 use crate::runtime::state::{GuestObjectKind, WicObjectKind, WicObjectState};
+use base64::Engine as _;
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 
@@ -703,7 +704,7 @@ impl PeHostRuntime {
                 return Ok(());
             }
             let name = read_utf16_string(memory, name_pointer).unwrap_or_default();
-            let Some((_, canonical)) = wic_metadata_tag_for_name(&name) else {
+            let Some(canonical) = wic_metadata_writer_name(&name) else {
                 state.set(Register::Rax, u64::from(WINCODEC_ERR_PROPERTYNOTFOUND));
                 return Ok(());
             };
@@ -724,7 +725,7 @@ impl PeHostRuntime {
                 }
                 value = orientation.to_string();
             }
-            if value.len() > 4096 {
+            if value.len() > 4096 || !wic_metadata_writer_value(&canonical, &value) {
                 state.set(Register::Rax, u64::from(E_INVALIDARG));
                 return Ok(());
             }
@@ -734,9 +735,9 @@ impl PeHostRuntime {
                 .get(&this)
                 .map(|writer| wic_metadata_deserialize(&writer.profile))
                 .unwrap_or_default();
-            match entries.iter_mut().find(|(key, _)| key == canonical) {
+            match entries.iter_mut().find(|(key, _)| key == &canonical) {
                 Some((_, slot)) => *slot = value,
-                None => entries.push((canonical.to_string(), value)),
+                None => entries.push((canonical, value)),
             }
             if let Some(writer) = self.wic.objects.get_mut(&this) {
                 writer.profile = wic_metadata_serialize_as(WIC_METADATA_WRITER_MAGIC, &entries);
@@ -879,7 +880,7 @@ impl PeHostRuntime {
                 return Ok(());
             }
             let name = read_utf16_string(memory, name_pointer).unwrap_or_default();
-            let Some((_, canonical)) = wic_metadata_tag_for_name(&name) else {
+            let Some(canonical) = wic_metadata_writer_name(&name) else {
                 state.set(Register::Rax, u64::from(WINCODEC_ERR_PROPERTYNOTFOUND));
                 return Ok(());
             };
@@ -889,7 +890,7 @@ impl PeHostRuntime {
                 .get(&this)
                 .map(|writer| wic_metadata_deserialize(&writer.profile))
                 .unwrap_or_default();
-            let Some(index) = entries.iter().position(|(key, _)| key == canonical) else {
+            let Some(index) = entries.iter().position(|(key, _)| key == &canonical) else {
                 state.set(Register::Rax, u64::from(WINCODEC_ERR_PROPERTYNOTFOUND));
                 return Ok(());
             };
@@ -2565,6 +2566,7 @@ impl PeHostRuntime {
                     Some(frames[0].2),
                     &frames[0].4,
                 ),
+                GUID_CONTAINER_FORMAT_PNG if frames.len() > 1 => wic_encode_png_animation(&frames),
                 _ => wic_encode_png(width, height, &frames[0].3, Some(frames[0].2), &frames[0].4),
             };
             match encoded {
@@ -6626,15 +6628,128 @@ fn wic_exif_tiff_from_metadata(metadata: &[(String, String)]) -> Option<Vec<u8>>
     Some(out)
 }
 
-/// Encode real PNG bytes (8-bit RGBA, filter 0 scanlines, a real zlib stream,
-/// chunk CRCs) from the runtime's BGRA pixels.  Writable metadata is stored in
-/// an eXIf chunk; the encoder never emits APNG animation chunks.
-fn wic_encode_png(
+#[derive(Clone, Copy)]
+struct WicApngFrame<'a> {
+    bgra: &'a [u8],
+    delay_ms: u32,
+    dispose: u8,
+    blend: u8,
+}
+
+struct WicPngColorMetadata {
+    gamma: Option<u32>,
+    srgb: Option<u8>,
+    iccp: Option<Vec<u8>>,
+}
+
+fn wic_png_metadata_value<'a>(metadata: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    metadata
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn wic_png_animation_value<'a>(
+    metadata: &'a [(String, String)],
+    name: &str,
+    index: usize,
+) -> Option<&'a str> {
+    wic_png_metadata_value(metadata, name).or_else(|| {
+        let indexed = format!("{name}{index}");
+        wic_png_metadata_value(metadata, &indexed)
+    })
+}
+
+fn wic_png_animation_u32(
+    metadata: &[(String, String)],
+    name: &str,
+    index: usize,
+    default: u32,
+) -> std::result::Result<u32, u32> {
+    match wic_png_animation_value(metadata, name, index) {
+        Some(value) => value.parse::<u32>().map_err(|_| WINCODEC_ERR_BADIMAGE),
+        None => Ok(default),
+    }
+}
+
+fn wic_png_animation_u8(
+    metadata: &[(String, String)],
+    name: &str,
+    index: usize,
+    default: u8,
+) -> std::result::Result<u8, u32> {
+    match wic_png_animation_value(metadata, name, index) {
+        Some(value) => value.parse::<u8>().map_err(|_| WINCODEC_ERR_BADIMAGE),
+        None => Ok(default),
+    }
+}
+
+fn wic_png_color_metadata(
+    metadata: &[(String, String)],
+) -> std::result::Result<WicPngColorMetadata, u32> {
+    let gamma = match wic_png_metadata_value(metadata, "gAMA") {
+        Some(value) => {
+            let gamma = value.parse::<u32>().map_err(|_| WINCODEC_ERR_BADIMAGE)?;
+            if gamma == 0 {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            }
+            Some(gamma)
+        }
+        None => None,
+    };
+    let srgb = match wic_png_metadata_value(metadata, "sRGB") {
+        Some(value) => {
+            let intent = value.parse::<u8>().map_err(|_| WINCODEC_ERR_BADIMAGE)?;
+            if intent > 3 {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            }
+            Some(intent)
+        }
+        None => None,
+    };
+    let iccp = match wic_png_metadata_value(metadata, "iCCP") {
+        Some(value) => {
+            let profile = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map_err(|_| WINCODEC_ERR_BADIMAGE)?;
+            if profile.is_empty() {
+                return Err(WINCODEC_ERR_BADIMAGE);
+            }
+            Some(profile)
+        }
+        None => None,
+    };
+    Ok(WicPngColorMetadata { gamma, srgb, iccp })
+}
+
+fn wic_png_write_color_chunks(
+    out: &mut Vec<u8>,
+    color: &WicPngColorMetadata,
+) -> std::result::Result<(), u32> {
+    if let Some(gamma) = color.gamma {
+        wic_png_chunk(out, b"gAMA", &gamma.to_be_bytes());
+    }
+    if let Some(intent) = color.srgb {
+        wic_png_chunk(out, b"sRGB", &[intent]);
+    }
+    if let Some(profile) = &color.iccp {
+        let mut payload = b"ICC\0".to_vec();
+        payload.push(0);
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(profile)
+            .map_err(|_| WINCODEC_ERR_BADIMAGE)?;
+        payload.extend_from_slice(&encoder.finish().map_err(|_| WINCODEC_ERR_BADIMAGE)?);
+        wic_png_chunk(out, b"iCCP", &payload);
+    }
+    Ok(())
+}
+
+fn wic_png_compress_scanlines(
     width: u32,
     height: u32,
     bgra: &[u8],
-    dpi: Option<(f64, f64)>,
-    metadata: &[(String, String)],
 ) -> std::result::Result<Vec<u8>, u32> {
     let expected = (width as usize)
         .checked_mul(height as usize)
@@ -6658,14 +6773,10 @@ fn wic_encode_png(
     }
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&raw).map_err(|_| WINCODEC_ERR_BADIMAGE)?;
-    let compressed = encoder.finish().map_err(|_| WINCODEC_ERR_BADIMAGE)?;
-    let mut out = Vec::with_capacity(compressed.len() + 96);
-    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-    let mut header = Vec::with_capacity(13);
-    header.extend_from_slice(&width.to_be_bytes());
-    header.extend_from_slice(&height.to_be_bytes());
-    header.extend_from_slice(&[8, 6, 0, 0, 0]);
-    wic_png_chunk(&mut out, b"IHDR", &header);
+    encoder.finish().map_err(|_| WINCODEC_ERR_BADIMAGE)
+}
+
+fn wic_png_write_physical_chunk(out: &mut Vec<u8>, dpi: Option<(f64, f64)>) {
     if let Some((dpi_x, dpi_y)) = dpi
         && dpi_x.is_finite()
         && dpi_y.is_finite()
@@ -6676,8 +6787,128 @@ fn wic_encode_png(
         physical.extend_from_slice(&((dpi_x / 0.0254).round() as u32).to_be_bytes());
         physical.extend_from_slice(&((dpi_y / 0.0254).round() as u32).to_be_bytes());
         physical.push(1);
-        wic_png_chunk(&mut out, b"pHYs", &physical);
+        wic_png_chunk(out, b"pHYs", &physical);
     }
+}
+
+/// Encode a multi-frame APNG: the first frame is both the default image
+/// (IDAT) and the first animation frame, and every following frame carries
+/// an fcTL/fdAT pair with strictly increasing sequence numbers.
+fn wic_encode_apng(
+    width: u32,
+    height: u32,
+    frames: &[WicApngFrame<'_>],
+    dpi: Option<(f64, f64)>,
+    metadata: &[(String, String)],
+) -> std::result::Result<Vec<u8>, u32> {
+    if frames.is_empty() {
+        return Err(WINCODEC_ERR_BADIMAGE);
+    }
+    if width == 0 || height == 0 {
+        return Err(E_INVALIDARG);
+    }
+    let color = wic_png_color_metadata(metadata)?;
+    let loop_count = match wic_png_metadata_value(metadata, "LoopCount") {
+        Some(value) => value.parse::<u32>().map_err(|_| WINCODEC_ERR_BADIMAGE)?,
+        None => 0,
+    };
+    let mut compressed = Vec::with_capacity(frames.len());
+    for frame in frames {
+        if frame.delay_ms == 0
+            || frame.delay_ms > u32::from(u16::MAX)
+            || frame.dispose > 2
+            || frame.blend > 1
+        {
+            return Err(WINCODEC_ERR_BADIMAGE);
+        }
+        compressed.push(wic_png_compress_scanlines(width, height, frame.bgra)?);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]);
+    wic_png_chunk(&mut out, b"IHDR", &header);
+    wic_png_write_color_chunks(&mut out, &color)?;
+    wic_png_write_physical_chunk(&mut out, dpi);
+    if let Some(exif) = wic_exif_tiff_from_metadata(metadata) {
+        wic_png_chunk(&mut out, b"eXIf", &exif);
+    }
+    let mut actl = (frames.len() as u32).to_be_bytes().to_vec();
+    actl.extend_from_slice(&loop_count.to_be_bytes());
+    wic_png_chunk(&mut out, b"acTL", &actl);
+    let mut sequence = 0_u32;
+    for (index, (frame, data)) in frames.iter().zip(compressed.iter()).enumerate() {
+        let mut control = sequence.to_be_bytes().to_vec();
+        control.extend_from_slice(&width.to_be_bytes());
+        control.extend_from_slice(&height.to_be_bytes());
+        control.extend_from_slice(&0_u32.to_be_bytes());
+        control.extend_from_slice(&0_u32.to_be_bytes());
+        control.extend_from_slice(&(frame.delay_ms as u16).to_be_bytes());
+        control.extend_from_slice(&1000_u16.to_be_bytes());
+        control.push(frame.dispose);
+        control.push(frame.blend);
+        wic_png_chunk(&mut out, b"fcTL", &control);
+        sequence = sequence.wrapping_add(1);
+        if index == 0 {
+            wic_png_chunk(&mut out, b"IDAT", data);
+        } else {
+            let mut payload = sequence.to_be_bytes().to_vec();
+            payload.extend_from_slice(data);
+            wic_png_chunk(&mut out, b"fdAT", &payload);
+            sequence = sequence.wrapping_add(1);
+        }
+    }
+    wic_png_chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+fn wic_encode_png_animation(
+    frames: &[(u32, u32, (f64, f64), Vec<u8>, Vec<(String, String)>)],
+) -> std::result::Result<Vec<u8>, u32> {
+    let Some((width, height, dpi, _, metadata)) = frames.first() else {
+        return Err(WINCODEC_ERR_BADIMAGE);
+    };
+    let mut animation = Vec::with_capacity(frames.len());
+    for (index, (_, _, _, pixels, frame_metadata)) in frames.iter().enumerate() {
+        let delay_ms = wic_png_animation_u32(frame_metadata, "FrameDelay", index, 100)?;
+        let dispose = wic_png_animation_u8(frame_metadata, "FrameDisposal", index, 0)?;
+        let blend = wic_png_animation_u8(frame_metadata, "FrameBlend", index, 0)?;
+        if dispose > 2 || blend > 1 {
+            return Err(WINCODEC_ERR_BADIMAGE);
+        }
+        animation.push(WicApngFrame {
+            bgra: pixels,
+            delay_ms,
+            dispose,
+            blend,
+        });
+    }
+    wic_encode_apng(*width, *height, &animation, Some(*dpi), metadata)
+}
+
+/// Encode real PNG bytes (8-bit RGBA, filter 0 scanlines, a real zlib stream,
+/// chunk CRCs) from the runtime's BGRA pixels.  Writable metadata is stored in
+/// an eXIf chunk and the color-management entries become gAMA/sRGB/iCCP.
+fn wic_encode_png(
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+    dpi: Option<(f64, f64)>,
+    metadata: &[(String, String)],
+) -> std::result::Result<Vec<u8>, u32> {
+    let compressed = wic_png_compress_scanlines(width, height, bgra)?;
+    let color = wic_png_color_metadata(metadata)?;
+    let mut out = Vec::with_capacity(compressed.len() + 96);
+    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]);
+    wic_png_chunk(&mut out, b"IHDR", &header);
+    wic_png_write_color_chunks(&mut out, &color)?;
+    wic_png_write_physical_chunk(&mut out, dpi);
     if let Some(exif) = wic_exif_tiff_from_metadata(metadata) {
         wic_png_chunk(&mut out, b"eXIf", &exif);
     }
@@ -8890,6 +9121,61 @@ fn wic_metadata_normalize_name(name: &str) -> String {
     trimmed.trim_start_matches('/').to_string()
 }
 
+const WIC_CONTAINER_METADATA_NAMES: [&str; 11] = [
+    "FrameDelay",
+    "FrameDisposal",
+    "FrameBlend",
+    "FrameLeft",
+    "FrameTop",
+    "FrameWidth",
+    "FrameHeight",
+    "FrameCount",
+    "LoopCount",
+    "gAMA",
+    "sRGB",
+];
+
+fn wic_metadata_container_name(name: &str) -> Option<String> {
+    let normalized = wic_metadata_normalize_name(name);
+    for base in WIC_CONTAINER_METADATA_NAMES {
+        if normalized == base {
+            return Some(base.to_string());
+        }
+        if let Some(suffix) = normalized.strip_prefix(base)
+            && !suffix.is_empty()
+            && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Some(format!("{base}{suffix}"));
+        }
+    }
+    if let Some(value) = normalized.strip_prefix("iCCP")
+        && (value.is_empty() || value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Some(format!("iCCP{value}"));
+    }
+    None
+}
+
+fn wic_metadata_writer_name(name: &str) -> Option<String> {
+    wic_metadata_container_name(name)
+        .or_else(|| wic_metadata_tag_for_name(name).map(|(_, canonical)| canonical.to_string()))
+}
+
+fn wic_metadata_writer_value(name: &str, value: &str) -> bool {
+    let base = name.trim_end_matches(|character: char| character.is_ascii_digit());
+    match base {
+        "FrameDelay" => value
+            .parse::<u32>()
+            .is_ok_and(|value| (1..=u32::from(u16::MAX)).contains(&value)),
+        "FrameDisposal" => value.parse::<u8>().is_ok_and(|value| value <= 2),
+        "FrameBlend" => value.parse::<u8>().is_ok_and(|value| value <= 1),
+        "FrameCount" | "LoopCount" => value.parse::<u32>().is_ok(),
+        "gAMA" => value.parse::<u32>().is_ok_and(|value| value > 0),
+        "sRGB" => value.parse::<u8>().is_ok_and(|value| value <= 3),
+        _ => true,
+    }
+}
+
 fn wic_metadata_lookup(entries: &[(String, String)], name: &str) -> Option<String> {
     if let Some((_, value)) = entries.iter().find(|(key, _)| key == name) {
         return Some(value.clone());
@@ -9068,6 +9354,20 @@ fn wic_png_text_entries(bytes: &[u8]) -> Vec<(String, String)> {
         }
         b"sRGB" if data.len() == 1 => {
             entries.push(("sRGB".to_string(), data[0].to_string()));
+        }
+        b"iCCP" => {
+            let Some(separator) = data.iter().position(|byte| *byte == 0) else {
+                return;
+            };
+            if separator > 0
+                && data.get(separator + 1) == Some(&0)
+                && let Some(profile) = wic_png_inflate(&data[separator + 2..])
+            {
+                entries.push((
+                    "iCCP".to_string(),
+                    base64::engine::general_purpose::STANDARD.encode(profile),
+                ));
+            }
         }
         _ => {}
     });
@@ -20477,6 +20777,579 @@ mod tests {
             WINCODEC_ERR_BADIMAGE,
             "a short fdAT is invalid"
         );
+    }
+
+    fn apng_test_chunks(bytes: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG signature");
+        let mut chunks = Vec::new();
+        let mut position = 8_usize;
+        while position + 12 <= bytes.len() {
+            let length = u32::from_be_bytes([
+                bytes[position],
+                bytes[position + 1],
+                bytes[position + 2],
+                bytes[position + 3],
+            ]) as usize;
+            let kind: [u8; 4] = bytes[position + 4..position + 8]
+                .try_into()
+                .expect("chunk kind");
+            let data = bytes[position + 8..position + 8 + length].to_vec();
+            let stored = u32::from_be_bytes([
+                bytes[position + 8 + length],
+                bytes[position + 9 + length],
+                bytes[position + 10 + length],
+                bytes[position + 11 + length],
+            ]);
+            let mut crc_input = kind.to_vec();
+            crc_input.extend_from_slice(&data);
+            assert_eq!(
+                wic_png_crc32(&crc_input),
+                stored,
+                "every emitted chunk CRC matches"
+            );
+            let done = &kind == b"IEND";
+            chunks.push((kind, data));
+            if done {
+                break;
+            }
+            position += 12 + length;
+        }
+        chunks
+    }
+
+    fn apng_test_new_frame(
+        fixture: &mut Fixture,
+        encoder: u64,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+    ) -> u64 {
+        fixture.memory.map_bytes(FRAME_OUT, &[0_u8; 8]);
+        assert_eq!(
+            dispatch_x86(
+                fixture,
+                HostThunk::WicEncoderCreateNewFrame,
+                &[encoder as u32, FRAME_OUT as u32, 0]
+            ),
+            0
+        );
+        let frame = read_ptr(fixture, FRAME_OUT);
+        assert_ne!(frame, 0);
+        assert_eq!(
+            dispatch_x86(
+                fixture,
+                HostThunk::WicFrameEncodeSetSize,
+                &[frame as u32, width, height]
+            ),
+            0
+        );
+        fixture
+            .memory
+            .map_bytes(FORMAT, &GUID_PIXEL_FORMAT_32BPP_BGRA);
+        assert_eq!(
+            dispatch_x86(
+                fixture,
+                HostThunk::WicFrameEncodeSetPixelFormat,
+                &[frame as u32, FORMAT as u32]
+            ),
+            0
+        );
+        fixture.memory.map_bytes(ENCODE_BYTES, bgra);
+        assert_eq!(
+            dispatch_x86(
+                fixture,
+                HostThunk::WicFrameEncodeWritePixels,
+                &[
+                    frame as u32,
+                    height,
+                    width * 4,
+                    bgra.len() as u32,
+                    ENCODE_BYTES as u32,
+                ]
+            ),
+            0
+        );
+        frame
+    }
+
+    fn apng_test_set_metadata(fixture: &mut Fixture, frame: u64, entries: &[(&str, &str)]) {
+        let writer = writer_for_frame(fixture, frame);
+        for (name, value) in entries {
+            let prop = prop_string(fixture, value);
+            assert_eq!(
+                writer_set(fixture, writer, name, &prop),
+                0,
+                "metadata {name}={value} is accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn apng_encoder_rejects_invalid_frame_counts_delays_disposal_blend_and_colors() {
+        let pixel = [0_u8, 0, 255, 255];
+        let frame = WicApngFrame {
+            bgra: &pixel,
+            delay_ms: 100,
+            dispose: 0,
+            blend: 0,
+        };
+        assert_eq!(
+            wic_encode_apng(1, 1, &[], None, &[]).unwrap_err(),
+            WINCODEC_ERR_BADIMAGE,
+            "an empty animation is rejected"
+        );
+        assert_eq!(
+            wic_encode_apng(0, 1, &[frame], None, &[]).unwrap_err(),
+            E_INVALIDARG,
+            "a zero-width animation is rejected"
+        );
+        assert_eq!(
+            wic_encode_apng(1, 0, &[frame], None, &[]).unwrap_err(),
+            E_INVALIDARG,
+            "a zero-height animation is rejected"
+        );
+        for invalid in [
+            WicApngFrame {
+                delay_ms: 0,
+                ..frame
+            },
+            WicApngFrame {
+                delay_ms: u32::from(u16::MAX) + 1,
+                ..frame
+            },
+            WicApngFrame {
+                dispose: 3,
+                ..frame
+            },
+            WicApngFrame { blend: 2, ..frame },
+        ] {
+            assert_eq!(
+                wic_encode_apng(1, 1, &[invalid], None, &[]).unwrap_err(),
+                WINCODEC_ERR_BADIMAGE,
+                "invalid delay/disposal/blend is rejected"
+            );
+        }
+        let short = [0_u8; 3];
+        let short_frame = WicApngFrame {
+            bgra: &short,
+            ..frame
+        };
+        assert_eq!(
+            wic_encode_apng(1, 1, &[short_frame], None, &[]).unwrap_err(),
+            E_INVALIDARG,
+            "a short frame buffer is rejected"
+        );
+        for metadata in [
+            vec![("LoopCount".to_string(), "not-a-number".to_string())],
+            vec![("gAMA".to_string(), "0".to_string())],
+            vec![("gAMA".to_string(), "not-a-number".to_string())],
+            vec![("sRGB".to_string(), "4".to_string())],
+            vec![("sRGB".to_string(), "not-a-number".to_string())],
+            vec![("iCCP".to_string(), "!!!".to_string())],
+            vec![("iCCP".to_string(), String::new())],
+        ] {
+            assert_eq!(
+                wic_encode_apng(1, 1, &[frame], None, &metadata).unwrap_err(),
+                WINCODEC_ERR_BADIMAGE,
+                "invalid animation/color metadata is rejected: {metadata:?}"
+            );
+        }
+        assert_eq!(
+            wic_encode_png_animation(&[]).unwrap_err(),
+            WINCODEC_ERR_BADIMAGE,
+            "an empty frame list is rejected by the animation adapter"
+        );
+        let pixels = vec![0_u8, 0, 255, 255];
+        let default_frames = vec![
+            (1, 1, (96.0, 96.0), pixels.clone(), Vec::new()),
+            (1, 1, (96.0, 96.0), pixels.clone(), Vec::new()),
+        ];
+        let defaults = wic_encode_png_animation(&default_frames).expect("default animation");
+        let defaults = wic_png_parse(&defaults).expect("default APNG");
+        assert_eq!(
+            defaults
+                .frames
+                .iter()
+                .map(|frame| (frame.delay_ms, frame.dispose, frame.blend))
+                .collect::<Vec<_>>(),
+            vec![(100, 0, 0), (100, 0, 0)],
+            "missing per-frame options use the documented defaults"
+        );
+        for (name, value) in [
+            ("FrameDelay", "not-a-number"),
+            ("FrameDisposal", "not-a-number"),
+            ("FrameBlend", "not-a-number"),
+        ] {
+            let frames = vec![
+                (
+                    1,
+                    1,
+                    (96.0, 96.0),
+                    pixels.clone(),
+                    vec![(name.to_string(), value.to_string())],
+                ),
+                (1, 1, (96.0, 96.0), pixels.clone(), Vec::new()),
+            ];
+            assert_eq!(
+                wic_encode_png_animation(&frames).unwrap_err(),
+                WINCODEC_ERR_BADIMAGE,
+                "invalid {name}={value} captured in a frame profile is rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn apng_encoder_round_trip_rejects_sequence_frame_and_pixel_mismatches() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-apng-encode");
+            let factory = create_factory(&mut fixture);
+            let red = [0_u8, 0, 255, 255].repeat(4);
+            let (stream, encoder, frame0) = setup_encode_frame(
+                &mut fixture,
+                factory,
+                &GUID_CONTAINER_FORMAT_PNG,
+                2,
+                2,
+                &red,
+            );
+            let profile = [0x01_u8, 0x02, 0x03, 0xFE];
+            let profile_text = base64::engine::general_purpose::STANDARD.encode(profile);
+            apng_test_set_metadata(
+                &mut fixture,
+                frame0,
+                &[
+                    ("FrameDelay", "100"),
+                    ("FrameDisposal", "0"),
+                    ("FrameBlend", "0"),
+                    ("LoopCount", "7"),
+                    ("gAMA", "45455"),
+                    ("sRGB", "0"),
+                    ("iCCP", &profile_text),
+                    ("Orientation", "6"),
+                ],
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeCommit,
+                    &[frame0 as u32]
+                ),
+                0
+            );
+            let green = [0_u8, 255, 0, 255].repeat(4);
+            let frame1 = apng_test_new_frame(&mut fixture, encoder, 2, 2, &green);
+            apng_test_set_metadata(
+                &mut fixture,
+                frame1,
+                &[
+                    ("FrameDelay1", "25"),
+                    ("FrameDisposal1", "1"),
+                    ("FrameBlend1", "1"),
+                ],
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeCommit,
+                    &[frame1 as u32]
+                ),
+                0
+            );
+            let blue = [255_u8, 0, 0, 255].repeat(4);
+            let frame2 = apng_test_new_frame(&mut fixture, encoder, 2, 2, &blue);
+            apng_test_set_metadata(
+                &mut fixture,
+                frame2,
+                &[
+                    ("FrameDelay", "250"),
+                    ("FrameDisposal", "2"),
+                    ("FrameBlend", "0"),
+                ],
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeCommit,
+                    &[frame2 as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86(&mut fixture, HostThunk::WicEncoderCommit, &[encoder as u32]),
+                0
+            );
+            let encoded = fixture
+                .runtime
+                .wic
+                .objects
+                .get(&stream)
+                .expect("encoded stream")
+                .stream
+                .clone();
+            let info = wic_png_parse(&encoded).expect("APNG parse");
+            assert_eq!(info.frames.len(), 3, "exact APNG frame count");
+            assert_eq!(
+                info.frames
+                    .iter()
+                    .map(|frame| (frame.delay_ms, frame.dispose, frame.blend))
+                    .collect::<Vec<_>>(),
+                vec![(100, 0, 0), (25, 1, 1), (250, 2, 0)],
+                "exact delays/disposal/blend round-trip"
+            );
+            assert_eq!(wic_image_frame_count(&encoded), 3);
+            assert_eq!(
+                wic_png_orientation(&encoded),
+                6,
+                "the eXIf orientation chunk survives APNG encoding"
+            );
+            for (index, expected) in [[0_u8, 0, 255, 255], [0, 255, 0, 255], [255, 0, 0, 255]]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    wic_decode_png_frame(&encoded, index as u32)
+                        .expect("APNG frame")
+                        .pixels,
+                    expected.repeat(4),
+                    "exact pixel round-trip for frame {index}"
+                );
+            }
+            assert_eq!(
+                wic_decode_png_frame(&encoded, 3).unwrap_err(),
+                WINCODEC_ERR_FRAMEMISSING,
+                "a frame index past the animation is rejected"
+            );
+            let chunks = apng_test_chunks(&encoded);
+            let chunk_data = |kind: &[u8; 4]| {
+                chunks
+                    .iter()
+                    .find(|(chunk, _)| chunk == kind)
+                    .map(|(_, data)| data.clone())
+                    .expect("chunk present")
+            };
+            assert_eq!(chunk_data(b"gAMA"), 45455_u32.to_be_bytes().to_vec());
+            assert_eq!(chunk_data(b"sRGB"), vec![0]);
+            let iccp = chunk_data(b"iCCP");
+            assert_eq!(&iccp[..4], b"ICC\0", "iCCP profile name");
+            assert_eq!(iccp[4], 0, "iCCP compression method");
+            assert_eq!(
+                wic_png_inflate(&iccp[5..]).expect("iCCP payload"),
+                profile,
+                "the ICC profile payload round-trips"
+            );
+            assert_eq!(
+                chunk_data(b"acTL"),
+                apng_actl(3, 7),
+                "acTL frame count and loop count"
+            );
+            let sequences: Vec<u32> = chunks
+                .iter()
+                .filter(|(kind, _)| kind == b"fcTL" || kind == b"fdAT")
+                .map(|(_, data)| u32::from_be_bytes([data[0], data[1], data[2], data[3]]))
+                .collect();
+            assert_eq!(sequences, vec![0, 1, 2, 3, 4], "strict chunk sequence");
+            let actl_index = chunks.iter().position(|(kind, _)| kind == b"acTL").unwrap();
+            let fctl_index = chunks.iter().position(|(kind, _)| kind == b"fcTL").unwrap();
+            let idat_index = chunks.iter().position(|(kind, _)| kind == b"IDAT").unwrap();
+            assert!(
+                actl_index < fctl_index && fctl_index < idat_index,
+                "acTL/fcTL precede the default-image IDAT"
+            );
+            let entries = wic_image_metadata_entries(&encoded, 1);
+            for expected in [
+                ("FrameCount", "3"),
+                ("FrameDelay0", "100"),
+                ("FrameDelay1", "25"),
+                ("FrameDelay2", "250"),
+                ("FrameDisposal0", "0"),
+                ("FrameDisposal1", "1"),
+                ("FrameDisposal2", "2"),
+                ("FrameBlend0", "0"),
+                ("FrameBlend1", "1"),
+                ("FrameBlend2", "0"),
+                ("gAMA", "45455"),
+                ("sRGB", "0"),
+            ] {
+                assert!(
+                    entries.contains(&(expected.0.to_string(), expected.1.to_string())),
+                    "decoded metadata carries {expected:?}"
+                );
+            }
+            assert!(
+                entries.contains(&("iCCP".to_string(), profile_text)),
+                "decoded metadata carries the ICC profile"
+            );
+        })
+    }
+
+    #[test]
+    fn apng_encoder_commit_rejects_writer_errors_and_unavailable_stream() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-apng-commit");
+            let factory = create_factory(&mut fixture);
+            let pixel = [0_u8, 0, 255, 255];
+            let (_, encoder, frame) = setup_encode_frame(
+                &mut fixture,
+                factory,
+                &GUID_CONTAINER_FORMAT_PNG,
+                1,
+                1,
+                &pixel,
+            );
+            let writer = writer_for_frame(&mut fixture, frame);
+            for (name, value) in [
+                ("FrameDelay", "0"),
+                ("FrameDelay", "70000"),
+                ("FrameDelay", "not-a-number"),
+                ("FrameDisposal", "3"),
+                ("FrameBlend", "2"),
+                ("LoopCount", "not-a-number"),
+                ("gAMA", "0"),
+                ("sRGB", "4"),
+            ] {
+                let prop = prop_string(&mut fixture, value);
+                assert_eq!(
+                    writer_set(&mut fixture, writer, name, &prop),
+                    u64::from(E_INVALIDARG),
+                    "invalid {name}={value} is rejected by the writer"
+                );
+            }
+            let indexed = prop_string(&mut fixture, "100");
+            assert_eq!(
+                writer_set(&mut fixture, writer, "FrameDelay0", &indexed),
+                0,
+                "an indexed per-frame name is accepted"
+            );
+            assert_eq!(writer_remove(&mut fixture, writer, "FrameDelay0"), 0);
+            if let Some(state) = fixture.runtime.wic.objects.get_mut(&writer) {
+                state.profile = wic_metadata_serialize_as(
+                    WIC_METADATA_WRITER_MAGIC,
+                    &[
+                        ("FrameDelay".to_string(), "100".to_string()),
+                        ("FrameBlend".to_string(), "2".to_string()),
+                    ],
+                );
+            }
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeCommit,
+                    &[frame as u32]
+                ),
+                0
+            );
+            let second = apng_test_new_frame(&mut fixture, encoder, 1, 1, &pixel);
+            apng_test_set_metadata(&mut fixture, second, &[("FrameDelay", "100")]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeCommit,
+                    &[second as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86(&mut fixture, HostThunk::WicEncoderCommit, &[encoder as u32]),
+                u64::from(WINCODEC_ERR_BADIMAGE),
+                "metadata captured from the writer is revalidated at encoder commit"
+            );
+        });
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-apng-no-stream");
+            let factory = create_factory(&mut fixture);
+            let pixel = [0_u8, 0, 255, 255];
+            let (stream, encoder, frame) = setup_encode_frame(
+                &mut fixture,
+                factory,
+                &GUID_CONTAINER_FORMAT_PNG,
+                1,
+                1,
+                &pixel,
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFrameEncodeCommit,
+                    &[frame as u32]
+                ),
+                0
+            );
+            assert!(fixture.runtime.wic.objects.remove(&stream).is_some());
+            assert_eq!(
+                dispatch_x86(&mut fixture, HostThunk::WicEncoderCommit, &[encoder as u32]),
+                u64::from(WINCODEC_ERR_STREAMNOTAVAILABLE),
+                "a commit without its destination stream is rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn png_encoder_color_metadata_rejects_invalid_values_and_round_trips_exactly() {
+        let profile = [0x01_u8, 0x02, 0x03, 0xFE];
+        let profile_text = base64::engine::general_purpose::STANDARD.encode(profile);
+        let metadata = vec![
+            ("gAMA".to_string(), "45455".to_string()),
+            ("sRGB".to_string(), "0".to_string()),
+            ("iCCP".to_string(), profile_text.clone()),
+        ];
+        let encoded =
+            wic_encode_png(1, 1, &[10, 20, 30, 255], Some((96.0, 96.0)), &metadata).expect("PNG");
+        let image = wic_decode_png(&encoded).expect("decode color-managed PNG");
+        assert_eq!(
+            image.pixels,
+            vec![10, 20, 30, 255],
+            "sRGB keeps the BGRA samples exact"
+        );
+        let chunks = apng_test_chunks(&encoded);
+        assert_eq!(
+            chunks
+                .iter()
+                .find(|(kind, _)| kind == b"gAMA")
+                .map(|(_, data)| data.clone()),
+            Some(45455_u32.to_be_bytes().to_vec()),
+            "gAMA value"
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .find(|(kind, _)| kind == b"sRGB")
+                .map(|(_, data)| data.clone()),
+            Some(vec![0]),
+            "sRGB intent"
+        );
+        let iccp = chunks
+            .iter()
+            .find(|(kind, _)| kind == b"iCCP")
+            .map(|(_, data)| data.clone())
+            .expect("iCCP chunk");
+        assert_eq!(&iccp[..4], b"ICC\0");
+        assert_eq!(iccp[4], 0);
+        assert_eq!(wic_png_inflate(&iccp[5..]).expect("profile"), profile);
+        let entries = wic_image_metadata_entries(&encoded, 1);
+        assert!(entries.contains(&("gAMA".to_string(), "45455".to_string())));
+        assert!(entries.contains(&("sRGB".to_string(), "0".to_string())));
+        assert!(entries.contains(&("iCCP".to_string(), profile_text)));
+        let malformed = png_container(1, 1, 8, 6, &[(b"iCCP", b"ICC".to_vec())]);
+        let entries = wic_image_metadata_entries(&malformed, 1);
+        assert!(
+            !entries.iter().any(|(name, _)| name == "iCCP"),
+            "an iCCP chunk without a profile-name terminator is not exposed"
+        );
+        for (name, value) in [
+            ("gAMA", "0"),
+            ("gAMA", "not-a-number"),
+            ("sRGB", "4"),
+            ("sRGB", "not-a-number"),
+            ("iCCP", "!!!"),
+            ("iCCP", ""),
+        ] {
+            let metadata = vec![(name.to_string(), value.to_string())];
+            assert_eq!(
+                wic_encode_png(1, 1, &[10, 20, 30, 255], None, &metadata).unwrap_err(),
+                WINCODEC_ERR_BADIMAGE,
+                "invalid {name}={value} is rejected"
+            );
+        }
     }
 
     #[test]

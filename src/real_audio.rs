@@ -119,6 +119,10 @@ pub enum SystemLoopbackFailure {
     StreamStart(i32),
     /// The tap's stream format is not the backed 32-bit float shape.
     FormatUnavailable,
+    /// The activation named a specific output endpoint that the host cannot
+    /// resolve to a real capture device.  The caller keeps that endpoint's
+    /// render-history fallback; it must never substitute the default device.
+    DeviceUnavailable,
 }
 
 /// Pure capability classification (testable without touching the host).
@@ -151,6 +155,78 @@ pub fn classify_system_loopback_failure(
         SystemLoopbackFailure::StreamStart(_) => SystemLoopbackFailure::StreamStart(status),
         other => other,
     }
+}
+
+#[cfg(test)]
+static TEST_SCREEN_CAPTURE_KIT_AVAILABLE: Mutex<Option<bool>> = Mutex::new(None);
+
+/// Force the ScreenCaptureKit availability probe for a test.  Tests default to
+/// unavailable so a fake-host test never touches the real Screen Recording
+/// path unless it explicitly asks for it.
+#[cfg(test)]
+pub(crate) fn set_test_screen_capture_kit_available(available: Option<bool>) {
+    *TEST_SCREEN_CAPTURE_KIT_AVAILABLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = available;
+}
+
+#[cfg(test)]
+fn test_screen_capture_kit_available() -> bool {
+    TEST_SCREEN_CAPTURE_KIT_AVAILABLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or(false)
+}
+
+/// The ordered system-capture backends to try, best first.
+///
+/// CoreAudio process taps are preferred (they need no Screen Recording TCC and
+/// expose the real host format); ScreenCaptureKit is the fallback when taps
+/// are unavailable or fail to start.  `CASA1_SYSTEM_LOOPBACK=off` yields no
+/// candidates.  Every attempted backend gets its own failure status; the caller
+/// reports the last attempted backend's failure.
+pub(crate) fn system_loopback_candidates() -> Vec<SystemLoopbackBackend> {
+    let forced_off = std::env::var("CASA1_SYSTEM_LOOPBACK")
+        .map(|value| {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("off") || value == "0"
+        })
+        .unwrap_or(false);
+    if forced_off {
+        return Vec::new();
+    }
+    #[cfg(test)]
+    {
+        return match test_system_loopback_capability_override() {
+            Some(SystemLoopbackBackend::Unavailable) => Vec::new(),
+            Some(SystemLoopbackBackend::CoreAudioProcessTap) => {
+                let mut candidates = vec![SystemLoopbackBackend::CoreAudioProcessTap];
+                if test_screen_capture_kit_available() {
+                    candidates.push(SystemLoopbackBackend::ScreenCaptureKit);
+                }
+                candidates
+            }
+            Some(SystemLoopbackBackend::ScreenCaptureKit) => {
+                vec![SystemLoopbackBackend::ScreenCaptureKit]
+            }
+            None => real_system_loopback_candidates(),
+        };
+    }
+    #[cfg(not(test))]
+    {
+        real_system_loopback_candidates()
+    }
+}
+
+fn real_system_loopback_candidates() -> Vec<SystemLoopbackBackend> {
+    let mut candidates = Vec::new();
+    if process_tap_available() {
+        candidates.push(SystemLoopbackBackend::CoreAudioProcessTap);
+    }
+    if screen_capture_kit_available() {
+        candidates.push(SystemLoopbackBackend::ScreenCaptureKit);
+    }
+    candidates
 }
 
 /// Probe the host for a real system-output capture backend.
@@ -204,7 +280,14 @@ fn process_tap_available() -> bool {
 
 #[cfg(target_os = "macos")]
 fn screen_capture_kit_available() -> bool {
-    platform::screen_capture_kit_available()
+    #[cfg(test)]
+    {
+        test_screen_capture_kit_available()
+    }
+    #[cfg(not(test))]
+    {
+        platform::screen_capture_kit_available()
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -592,8 +675,16 @@ pub fn resolve_audio_capture_activation_device(
 /// - The `DEVINTERFACE_AUDIO_RENDER` interface id (the documented way to ask
 ///   for the default render device by GUID string) → the default render
 ///   device.
-/// - `DEVINTERFACE_AUDIO_CAPTURE` or any other endpoint instance path → the
-///   endpoint does not exist on this runtime's real device list.
+/// - `DEVINTERFACE_AUDIO_CAPTURE` → `UnknownDevicePath` on the render
+///   activation surface.
+/// - Any other endpoint instance path resolves to the one enumerated render
+///   device whose stable [`RealAudioDevice::key`] or friendly name appears in
+///   the path.  cpal exposes no endpoint GUID, so the stable key is the real
+///   host identity available to this runtime.  A path that matches no device,
+///   or that matches more than one (an ambiguous friendly-name fragment), is
+///   `UnknownDevicePath`; it never silently falls back to the default device.
+///   A named endpoint therefore does **not** require the list to contain a
+///   default device.
 pub fn resolve_audio_activation_device(
     devices: &[RealAudioDevice],
     device_interface_path: Option<&str>,
@@ -614,20 +705,43 @@ pub fn resolve_audio_activation_device(
             .trim_start_matches('{')
             .trim_end_matches('}'),
     );
-    let Some(default) = devices.iter().find(|device| device.is_default) else {
-        // No default render endpoint (the list may be empty, or every real
-        // device lacks the default flag).
-        return Err(AudioActivationDeviceFailure::NoDevices);
-    };
-    if asks_default {
-        return Ok(default.clone());
-    }
     if asks_capture {
         // The capture interface id never resolves on the render activation
         // surface.
         return Err(AudioActivationDeviceFailure::UnknownDevicePath);
     }
-    Err(AudioActivationDeviceFailure::UnknownDevicePath)
+    if asks_default {
+        let Some(default) = devices.iter().find(|device| device.is_default) else {
+            // No default render endpoint (the list may be empty, or every real
+            // device lacks the default flag).
+            return Err(AudioActivationDeviceFailure::NoDevices);
+        };
+        return Ok(default.clone());
+    }
+
+    let path_lower = normalized.to_ascii_lowercase();
+    let key_matches: Vec<&RealAudioDevice> = devices
+        .iter()
+        .filter(|device| {
+            let key = device.key.trim().to_ascii_lowercase();
+            !key.is_empty() && path_lower.contains(&key)
+        })
+        .collect();
+    let matches = if key_matches.is_empty() {
+        devices
+            .iter()
+            .filter(|device| {
+                let name = device.name.trim().to_ascii_lowercase();
+                !name.is_empty() && path_lower.contains(&name)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        key_matches
+    };
+    match matches.as_slice() {
+        [device] => Ok((*device).clone()),
+        _ => Err(AudioActivationDeviceFailure::UnknownDevicePath),
+    }
 }
 
 /// Manages real audio output streams via `cpal`.
@@ -655,8 +769,14 @@ pub struct RealAudioBackend {
     input_stream: Option<cpal::Stream>,
     /// Shared buffer for captured audio data from the input stream callback.
     capture_buffer: Arc<Mutex<VecDeque<f32>>>,
-    /// The live real system-output capture (process tap / ScreenCaptureKit).
+    /// The live real system-output capture for the process-global/default
+    /// target (key `""`; used by callers that do not name a device).
     system_loopback: Option<SystemLoopbackSession>,
+    /// Live per-device system-output captures, keyed by
+    /// [`RealAudioDevice::key`].  A loopback activation that names a render
+    /// endpoint gets that endpoint's tap/aggregate instead of the default
+    /// device's global capture.
+    device_loopbacks: HashMap<String, SystemLoopbackSession>,
     /// Generation counter for system-loopback sessions (stale callbacks are
     /// rejected by generation).
     next_system_loopback_generation: u64,
@@ -726,6 +846,7 @@ impl RealAudioBackend {
             input_stream: None,
             capture_buffer: Arc::new(Mutex::new(VecDeque::new())),
             system_loopback: None,
+            device_loopbacks: HashMap::new(),
             next_system_loopback_generation: 1,
             hog_devices: HashMap::new(),
         })
@@ -1798,33 +1919,89 @@ impl RealAudioBackend {
     pub fn start_system_loopback(
         &mut self,
     ) -> Result<SystemLoopbackBackend, SystemLoopbackFailure> {
-        if let Some(session) = self.system_loopback.as_ref() {
+        self.start_keyed_system_loopback(String::new(), None)
+    }
+
+    /// Start real system-output capture for a specific render endpoint.
+    ///
+    /// The process tap/aggregate is created for `device` (not the default
+    /// device); the ScreenCaptureKit backend captures the system mix and has
+    /// no per-device selector.  If the named device cannot be resolved on the
+    /// host, `DeviceUnavailable` is returned and the caller keeps that
+    /// endpoint's render-history fallback — it never substitutes the default
+    /// device's capture.
+    pub fn start_system_loopback_for_device(
+        &mut self,
+        device: &RealAudioDevice,
+    ) -> Result<SystemLoopbackBackend, SystemLoopbackFailure> {
+        self.start_keyed_system_loopback(device.key.clone(), Some(device.clone()))
+    }
+
+    fn start_keyed_system_loopback(
+        &mut self,
+        key: String,
+        target: Option<RealAudioDevice>,
+    ) -> Result<SystemLoopbackBackend, SystemLoopbackFailure> {
+        if let Some(session) = self.loopback_session(&key) {
             return Ok(session.backend);
         }
         #[cfg(test)]
         if let Some(reason) = take_forced_system_loopback_failure() {
             return Err(reason);
         }
-        let backend = system_loopback_capability();
-        if backend == SystemLoopbackBackend::Unavailable {
+        let candidates = system_loopback_candidates();
+        if candidates.is_empty() {
             return Err(SystemLoopbackFailure::Unavailable);
         }
-        let generation = self.next_system_loopback_generation.max(1);
-        self.next_system_loopback_generation = generation.wrapping_add(1).max(1);
-        let shared = Arc::new(Mutex::new(SystemLoopbackSink::new(generation, 2, 48_000)));
-        let session = match backend {
-            #[cfg(target_os = "macos")]
-            SystemLoopbackBackend::CoreAudioProcessTap => {
-                platform::start_process_tap(Arc::clone(&shared), generation)?
+        let mut last_error = None;
+        for backend in candidates {
+            let generation = self.next_system_loopback_generation.max(1);
+            self.next_system_loopback_generation = generation.wrapping_add(1).max(1);
+            // A failed attempt must not leak frames into the next backend's
+            // session, so every attempt gets its own sink/generation.
+            let shared = Arc::new(Mutex::new(SystemLoopbackSink::new(generation, 2, 48_000)));
+            let started = match backend {
+                #[cfg(target_os = "macos")]
+                SystemLoopbackBackend::CoreAudioProcessTap => {
+                    platform::start_process_tap(Arc::clone(&shared), generation, target.as_ref())
+                }
+                #[cfg(target_os = "macos")]
+                SystemLoopbackBackend::ScreenCaptureKit => {
+                    platform::start_screen_capture_kit(Arc::clone(&shared), generation)
+                }
+                _ => Err(SystemLoopbackFailure::Unavailable),
+            };
+            match started {
+                Ok(session) => {
+                    self.insert_loopback_session(key, session);
+                    return Ok(backend);
+                }
+                Err(SystemLoopbackFailure::DeviceUnavailable) => {
+                    // A named endpoint that cannot be resolved must never be
+                    // replaced by another device's capture (ScreenCaptureKit
+                    // would capture the system mix instead of this endpoint).
+                    return Err(SystemLoopbackFailure::DeviceUnavailable);
+                }
+                Err(error) => last_error = Some(error),
             }
-            #[cfg(target_os = "macos")]
-            SystemLoopbackBackend::ScreenCaptureKit => {
-                platform::start_screen_capture_kit(Arc::clone(&shared), generation)?
-            }
-            _ => return Err(SystemLoopbackFailure::Unavailable),
-        };
-        self.system_loopback = Some(session);
-        Ok(backend)
+        }
+        Err(last_error.unwrap_or(SystemLoopbackFailure::Unavailable))
+    }
+
+    fn loopback_session(&self, key: &str) -> Option<&SystemLoopbackSession> {
+        if key.is_empty() {
+            self.system_loopback.as_ref()
+        } else {
+            self.device_loopbacks.get(key)
+        }
+    }
+
+    fn insert_loopback_session(&mut self, key: String, session: SystemLoopbackSession) {
+        if key.is_empty() {
+            self.system_loopback = Some(session);
+        } else {
+            self.device_loopbacks.insert(key, session);
+        }
     }
 
     /// Stop real system-output capture and invalidate any in-flight callback.
@@ -1834,20 +2011,51 @@ impl RealAudioBackend {
     /// host stop synchronizes the callback, so no stale frame is ever handed
     /// to a later capture client.
     pub fn stop_system_loopback(&mut self) {
-        if let Some(mut session) = self.system_loopback.take() {
+        self.stop_system_loopback_for("");
+    }
+
+    /// Stop the system-output capture of one device key (empty = the
+    /// process-global/default session).
+    pub fn stop_system_loopback_for(&mut self, key: &str) {
+        let session = if key.is_empty() {
+            self.system_loopback.take()
+        } else {
+            self.device_loopbacks.remove(key)
+        };
+        if let Some(mut session) = session {
             session.stop();
+        }
+    }
+
+    /// Stop every live system-output capture (all device taps + the global
+    /// session).
+    pub fn stop_all_system_loopbacks(&mut self) {
+        self.stop_system_loopback_for("");
+        let keys: Vec<String> = self.device_loopbacks.keys().cloned().collect();
+        for key in keys {
+            self.stop_system_loopback_for(&key);
         }
     }
 
     /// Whether real system-output capture is currently running.
     pub fn system_loopback_running(&self) -> bool {
-        self.system_loopback.is_some()
+        self.system_loopback_running_for("")
+    }
+
+    /// Whether the system-output capture of one device key is running.
+    pub fn system_loopback_running_for(&self, key: &str) -> bool {
+        self.loopback_session(key).is_some()
     }
 
     /// The real capture format `(channels, sample_rate)` of the live system
     /// loopback, when running.
     pub fn system_loopback_format(&self) -> Option<(u16, u32)> {
-        let session = self.system_loopback.as_ref()?;
+        self.system_loopback_format_for("")
+    }
+
+    /// The real capture format of one device key's live capture.
+    pub fn system_loopback_format_for(&self, key: &str) -> Option<(u16, u32)> {
+        let session = self.loopback_session(key)?;
         let sink = session
             .shared
             .lock()
@@ -1857,7 +2065,12 @@ impl RealAudioBackend {
 
     /// Frames currently buffered by the real system-output capture.
     pub fn system_loopback_available_frames(&self) -> u32 {
-        let Some(session) = self.system_loopback.as_ref() else {
+        self.system_loopback_available_frames_for("")
+    }
+
+    /// Frames currently buffered by one device key's live capture.
+    pub fn system_loopback_available_frames_for(&self, key: &str) -> u32 {
+        let Some(session) = self.loopback_session(key) else {
             return 0;
         };
         let sink = session
@@ -1870,7 +2083,12 @@ impl RealAudioBackend {
     /// Drain the real captured system frames (interleaved f32 in the capture
     /// format reported by [`Self::system_loopback_format`]).
     pub fn read_system_loopback_data(&mut self) -> Vec<f32> {
-        let Some(session) = self.system_loopback.as_ref() else {
+        self.read_system_loopback_data_for("")
+    }
+
+    /// Drain the captured frames of one device key's live capture.
+    pub fn read_system_loopback_data_for(&mut self, key: &str) -> Vec<f32> {
+        let Some(session) = self.loopback_session(key) else {
             return Vec::new();
         };
         let mut sink = session
@@ -1882,8 +2100,13 @@ impl RealAudioBackend {
 
     /// Observable system-loopback state.
     pub fn system_loopback_status(&self) -> SystemLoopbackSnapshot {
+        self.system_loopback_status_for("")
+    }
+
+    /// Observable state of one device key's system-output capture.
+    pub fn system_loopback_status_for(&self, key: &str) -> SystemLoopbackSnapshot {
         let capability = system_loopback_capability();
-        let Some(session) = self.system_loopback.as_ref() else {
+        let Some(session) = self.loopback_session(key) else {
             return SystemLoopbackSnapshot {
                 capability,
                 running: false,
@@ -1917,7 +2140,18 @@ impl RealAudioBackend {
     /// exercises the real loopback delivery path without TCC/hardware).
     #[cfg(test)]
     pub(crate) fn install_test_system_loopback(&mut self, channels: u16, sample_rate: u32) -> u64 {
-        self.stop_system_loopback();
+        self.install_test_system_loopback_for("", channels, sample_rate)
+    }
+
+    /// Install an in-process system-loopback session for one device key.
+    #[cfg(test)]
+    pub(crate) fn install_test_system_loopback_for(
+        &mut self,
+        key: &str,
+        channels: u16,
+        sample_rate: u32,
+    ) -> u64 {
+        self.stop_system_loopback_for(key);
         let generation = self.next_system_loopback_generation.max(1);
         self.next_system_loopback_generation = generation.wrapping_add(1).max(1);
         let shared = Arc::new(Mutex::new(SystemLoopbackSink::new(
@@ -1925,12 +2159,15 @@ impl RealAudioBackend {
             channels,
             sample_rate,
         )));
-        self.system_loopback = Some(SystemLoopbackSession {
-            backend: SystemLoopbackBackend::CoreAudioProcessTap,
-            generation,
-            shared,
-            stop: Some(Box::new(|| {})),
-        });
+        self.insert_loopback_session(
+            key.to_string(),
+            SystemLoopbackSession {
+                backend: SystemLoopbackBackend::CoreAudioProcessTap,
+                generation,
+                shared,
+                stop: Some(Box::new(|| {})),
+            },
+        );
         generation
     }
 
@@ -1943,7 +2180,26 @@ impl RealAudioBackend {
         sample_rate: u32,
         interleaved: &[f32],
     ) -> bool {
-        let Some(session) = self.system_loopback.as_ref() else {
+        self.push_test_system_loopback_frames_for(
+            "",
+            generation,
+            channels,
+            sample_rate,
+            interleaved,
+        )
+    }
+
+    /// Publish frames through one device key's live test/system sink.
+    #[cfg(test)]
+    pub(crate) fn push_test_system_loopback_frames_for(
+        &mut self,
+        key: &str,
+        generation: u64,
+        channels: u16,
+        sample_rate: u32,
+        interleaved: &[f32],
+    ) -> bool {
+        let Some(session) = self.loopback_session(key) else {
             return false;
         };
         let mut sink = session
@@ -1957,23 +2213,21 @@ impl RealAudioBackend {
     // CoreAudio hog mode (true exclusive access)
     // -----------------------------------------------------------------------
 
-    /// Acquire hog mode for an exclusive-mode open on the default output
-    /// device, pinning the exact client sample rate.  Non-default devices (and
-    /// non-macOS hosts) report `Unavailable` and keep the client-side
-    /// exclusive contract.
+    /// Acquire hog mode for an exclusive-mode open on the bound output device,
+    /// pinning the exact client sample rate.
+    ///
+    /// Hog mode is a per-device CoreAudio property, so two devices can be held
+    /// independently: a denial/failure on one device never releases another
+    /// device's lease.  Non-macOS hosts report `Unavailable` and keep the
+    /// client-side exclusive contract.
     fn acquire_hog_mode(&mut self, device_id: DeviceId, sample_rate: u32) -> HogModeOutcome {
-        let is_default = self
-            .devices
-            .get(&device_id)
-            .map(|device| device.is_default)
-            .unwrap_or(false);
-        if !is_default {
+        let Some(device) = self.devices.get(&device_id).cloned() else {
             return HogModeOutcome::Unavailable;
-        }
+        };
         #[cfg(target_os = "macos")]
         {
             let our_pid = std::process::id() as i32;
-            let Some(mut driver) = platform::CoreAudioHogDriver::open_default_output() else {
+            let Some(mut driver) = platform::CoreAudioHogDriver::open_output(&device) else {
                 return HogModeOutcome::Unavailable;
             };
             let outcome = acquire_exclusive_hog_with(&mut driver, our_pid, sample_rate);
@@ -1984,7 +2238,7 @@ impl RealAudioBackend {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = sample_rate;
+            let _ = (device, sample_rate);
             HogModeOutcome::Unavailable
         }
     }
@@ -1995,10 +2249,15 @@ impl RealAudioBackend {
             return;
         }
         #[cfg(target_os = "macos")]
-        if let Some(mut driver) = platform::CoreAudioHogDriver::open_default_output()
-            && let Err(status) = driver.set_buffer_frame_size(frames.max(1))
         {
-            eprintln!("[RealAudio] exclusive buffer-size pin failed: OSStatus {status}");
+            let Some(device) = self.devices.get(&device_id) else {
+                return;
+            };
+            if let Some(mut driver) = platform::CoreAudioHogDriver::open_output(device)
+                && let Err(status) = driver.set_buffer_frame_size(frames.max(1))
+            {
+                eprintln!("[RealAudio] exclusive buffer-size pin failed: OSStatus {status}");
+            }
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (device_id, frames);
@@ -2021,10 +2280,14 @@ impl RealAudioBackend {
             return;
         }
         #[cfg(target_os = "macos")]
-        if let Some(mut driver) = platform::CoreAudioHogDriver::open_default_output()
-            && let Err(status) = driver.release_hog()
         {
-            eprintln!("[RealAudio] hog-mode release failed: OSStatus {status}");
+            let device = self.devices.get(&device_id).cloned();
+            if let Some(device) = device
+                && let Some(mut driver) = platform::CoreAudioHogDriver::open_output(&device)
+                && let Err(status) = driver.release_hog()
+            {
+                eprintln!("[RealAudio] hog-mode release failed: OSStatus {status}");
+            }
         }
         #[cfg(not(target_os = "macos"))]
         let _ = device_id;
@@ -5092,10 +5355,13 @@ mod platform {
     const SCOPE_GLOBAL: u32 = 0x676c_6f62; // 'glob'
     const SYSTEM_OBJECT: u32 = 1;
     const HW_DEFAULT_OUTPUT_DEVICE: u32 = 0x644f_7574; // 'dOut'
+    const HW_DEVICES: u32 = 0x6465_7623; // 'dev#'
     const HW_TRANSLATE_PID_TO_PROCESS_OBJECT: u32 = 0x6964_3270; // 'id2p'
     const DEVICE_HOG_MODE: u32 = 0x6f69_6e6b; // 'oink'
     const DEVICE_NOMINAL_SAMPLE_RATE: u32 = 0x6e73_7274; // 'nsrt'
     const DEVICE_BUFFER_FRAME_SIZE: u32 = 0x6673_697a; // 'fsiz'
+    const DEVICE_UID: u32 = 0x7569_6420; // 'uid '
+    const DEVICE_NAME: u32 = 0x6c6e_616d; // 'lnam'
     const TAP_FORMAT: u32 = 0x7466_6d74; // 'tfmt'
     const TAP_UID: u32 = 0x7475_6964; // 'tuid'
     const FORMAT_LINEAR_PCM: u32 = 0x6c70_636d; // 'lpcm'
@@ -5103,6 +5369,7 @@ mod platform {
     const AGGREGATE_DEVICE_UID_KEY: &str = "uid";
     const AGGREGATE_DEVICE_PRIVATE_KEY: &str = "private";
     const AGGREGATE_DEVICE_TAP_LIST_KEY: &str = "taps";
+    const AGGREGATE_DEVICE_SUB_DEVICE_LIST_KEY: &str = "subdevices";
     const SUB_TAP_UID_KEY: &str = "uid";
 
     #[repr(C)]
@@ -5159,6 +5426,13 @@ mod platform {
         u32,
         *const c_void,
     ) -> OsStatus;
+    type GetPropertyDataSizeFn = unsafe extern "C" fn(
+        AudioObjectId,
+        *const AudioObjectPropertyAddress,
+        u32,
+        *const c_void,
+        *mut u32,
+    ) -> OsStatus;
     type CreateAggregateFn = unsafe extern "C" fn(*const c_void, *mut AudioObjectId) -> OsStatus;
     type DestroyAggregateFn = unsafe extern "C" fn(AudioObjectId) -> OsStatus;
     type CreateIoProcWithBlockFn = unsafe extern "C" fn(
@@ -5174,6 +5448,7 @@ mod platform {
 
     struct CoreAudioApi {
         get_property_data: GetPropertyDataFn,
+        get_property_data_size: GetPropertyDataSizeFn,
         set_property_data: SetPropertyDataFn,
         create_aggregate: CreateAggregateFn,
         destroy_aggregate: DestroyAggregateFn,
@@ -5218,6 +5493,8 @@ mod platform {
             unsafe {
                 let get_property_data: GetPropertyDataFn =
                     std::mem::transmute(symbol(handle, b"AudioObjectGetPropertyData\0")?);
+                let get_property_data_size: GetPropertyDataSizeFn =
+                    std::mem::transmute(symbol(handle, b"AudioObjectGetPropertyDataSize\0")?);
                 let set_property_data: SetPropertyDataFn =
                     std::mem::transmute(symbol(handle, b"AudioObjectSetPropertyData\0")?);
                 let create_aggregate: CreateAggregateFn =
@@ -5240,6 +5517,7 @@ mod platform {
                         .map(|symbol| std::mem::transmute(symbol));
                 Some(CoreAudioApi {
                     get_property_data,
+                    get_property_data_size,
                     set_property_data,
                     create_aggregate,
                     destroy_aggregate,
@@ -5342,6 +5620,81 @@ mod platform {
         (status == 0 && object != 0).then_some(object)
     }
 
+    /// Enumerate the host's CoreAudio device objects (`kAudioHardwarePropertyDevices`).
+    unsafe fn list_devices(api: &CoreAudioApi) -> Option<Vec<AudioObjectId>> {
+        let address = property_address(HW_DEVICES);
+        let mut size = 0_u32;
+        let status = unsafe {
+            (api.get_property_data_size)(SYSTEM_OBJECT, &address, 0, ptr::null(), &mut size)
+        };
+        if status != 0 || size == 0 {
+            return None;
+        }
+        let capacity = size as usize / std::mem::size_of::<AudioObjectId>();
+        if capacity == 0 || capacity > 1024 {
+            return None;
+        }
+        let mut devices = vec![0_u32; capacity];
+        let mut written = size;
+        let status = unsafe {
+            (api.get_property_data)(
+                SYSTEM_OBJECT,
+                &address,
+                0,
+                ptr::null(),
+                &mut written,
+                devices.as_mut_ptr() as *mut c_void,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let count = (written as usize / std::mem::size_of::<AudioObjectId>()).min(capacity);
+        devices.truncate(count);
+        Some(devices)
+    }
+
+    unsafe fn device_name(api: &CoreAudioApi, device: AudioObjectId) -> Option<String> {
+        let value: CFStringRef = unsafe { get_property(api, device, DEVICE_NAME) }.ok()?;
+        if value.is_null() {
+            return None;
+        }
+        let name = unsafe { CFString::wrap_under_get_rule(value) };
+        Some(name.to_string())
+    }
+
+    unsafe fn device_uid(api: &CoreAudioApi, device: AudioObjectId) -> Option<CFString> {
+        let value: CFStringRef = unsafe { get_property(api, device, DEVICE_UID) }.ok()?;
+        (!value.is_null()).then(|| unsafe { CFString::wrap_under_get_rule(value) })
+    }
+
+    /// Resolve the real CoreAudio device object for an enumerated backend
+    /// device.
+    ///
+    /// The default device uses `kAudioHardwarePropertyDefaultOutputDevice`.
+    /// A named device is matched by its real `kAudioObjectPropertyName`; a
+    /// missing or ambiguous name is `None` (never the default device), so a
+    /// per-device tap can fail exactly instead of silently capturing the wrong
+    /// endpoint.
+    unsafe fn resolve_output_device(
+        api: &CoreAudioApi,
+        device: &RealAudioDevice,
+    ) -> Option<AudioObjectId> {
+        if device.is_default {
+            let default: AudioObjectId =
+                unsafe { get_property(api, SYSTEM_OBJECT, HW_DEFAULT_OUTPUT_DEVICE) }.ok()?;
+            return (default != 0).then_some(default);
+        }
+        let matches: Vec<AudioObjectId> = unsafe { list_devices(api) }?
+            .into_iter()
+            .filter(|object| unsafe { device_name(api, *object) }.is_some_and(|n| n == device.name))
+            .collect();
+        match matches.as_slice() {
+            [object] => Some(*object),
+            _ => None,
+        }
+    }
+
     unsafe fn query_tap_format(api: &CoreAudioApi, tap: AudioObjectId) -> Option<(u16, u32)> {
         let format: AudioStreamBasicDescription =
             unsafe { get_property(api, tap, TAP_FORMAT) }.ok()?;
@@ -5413,7 +5766,17 @@ mod platform {
         Some(description)
     }
 
-    fn aggregate_composition(tap_uid: &CFString) -> CFDictionary<CFString, CFType> {
+    /// Build the aggregate-device composition for `tap_uid`.
+    ///
+    /// `device_uid` is the real CoreAudio UID of the render endpoint named by
+    /// the activation.  `CATapDescription` itself has no per-device selector
+    /// (process taps are per-process), so the endpoint is targeted through the
+    /// aggregate's `subdevices` list; the tap remains the aggregate's tap.  A
+    /// `None` UID keeps the legacy process-global/default composition.
+    fn aggregate_composition(
+        tap_uid: &CFString,
+        device_uid: Option<&CFString>,
+    ) -> CFDictionary<CFString, CFType> {
         let tap_entry = CFDictionary::<CFString, CFType>::from_CFType_pairs(&[(
             CFString::new(SUB_TAP_UID_KEY),
             tap_uid.as_CFType(),
@@ -5426,7 +5789,7 @@ mod platform {
             "Casa1-System-Loopback-{}-{serial}",
             std::process::id()
         ));
-        CFDictionary::from_CFType_pairs(&[
+        let mut pairs = vec![
             (
                 CFString::new(AGGREGATE_DEVICE_UID_KEY),
                 aggregate_uid.as_CFType(),
@@ -5439,7 +5802,20 @@ mod platform {
                 CFString::new(AGGREGATE_DEVICE_TAP_LIST_KEY),
                 tap_list.as_CFType(),
             ),
-        ])
+        ];
+        let sub_devices;
+        if let Some(device_uid) = device_uid {
+            let entry = CFDictionary::<CFString, CFType>::from_CFType_pairs(&[(
+                CFString::new(SUB_TAP_UID_KEY),
+                device_uid.as_CFType(),
+            )]);
+            sub_devices = CFArray::<CFType>::from_CFTypes(&[entry.as_CFType()]);
+            pairs.push((
+                CFString::new(AGGREGATE_DEVICE_SUB_DEVICE_LIST_KEY),
+                sub_devices.as_CFType(),
+            ));
+        }
+        CFDictionary::from_CFType_pairs(&pairs)
     }
 
     /// Interleave one host `AudioBufferList` of 32-bit floats.
@@ -5504,6 +5880,7 @@ mod platform {
     pub(super) fn start_process_tap(
         shared: Arc<Mutex<SystemLoopbackSink>>,
         generation: u64,
+        target: Option<&RealAudioDevice>,
     ) -> Result<SystemLoopbackSession, SystemLoopbackFailure> {
         let api = coreaudio_api().ok_or(SystemLoopbackFailure::Unavailable)?;
         let create_tap = api
@@ -5512,6 +5889,25 @@ mod platform {
         let destroy_tap = api
             .destroy_process_tap
             .ok_or(SystemLoopbackFailure::Unavailable)?;
+        // Resolve the named render endpoint before creating anything: a tap
+        // must never be created for the default device when the activation
+        // named a different endpoint.
+        let target_device = match target {
+            Some(device) => Some(
+                unsafe { resolve_output_device(api, device) }
+                    .ok_or(SystemLoopbackFailure::DeviceUnavailable)?,
+            ),
+            None => None,
+        };
+        let target_uid = match target_device {
+            Some(object) => Some(
+                unsafe { device_uid(api, object) }
+                    .ok_or(SystemLoopbackFailure::DeviceUnavailable)?,
+            ),
+            None => None,
+        };
+        #[cfg(test)]
+        fake::record_tap_target(target.map(|device| device.id));
         let own_process = unsafe { translate_pid(api, std::process::id() as i32) }.unwrap_or(0);
         let description =
             objc::rc::autoreleasepool(|| unsafe { create_tap_description(own_process) })
@@ -5537,7 +5933,7 @@ mod platform {
             }
             return Err(SystemLoopbackFailure::ObjectUnavailable);
         };
-        let composition = aggregate_composition(&tap_uid);
+        let composition = aggregate_composition(&tap_uid, target_uid.as_ref());
         let mut aggregate: AudioObjectId = 0;
         let status = unsafe {
             (api.create_aggregate)(
@@ -5628,6 +6024,7 @@ mod platform {
     }
 
     impl CoreAudioHogDriver {
+        #[cfg(test)]
         pub(crate) fn open_default_output() -> Option<Self> {
             let api = coreaudio_api()?;
             let device: AudioObjectId =
@@ -5635,6 +6032,19 @@ mod platform {
             (device != 0).then_some(Self {
                 api,
                 device,
+                pid: std::process::id() as i32,
+            })
+        }
+
+        /// Resolve the real CoreAudio device object for `device` and open the
+        /// per-device hog driver.  Hog mode is a device property, so this is
+        /// the same operation for the default and any named output endpoint.
+        pub(crate) fn open_output(device: &RealAudioDevice) -> Option<Self> {
+            let api = coreaudio_api()?;
+            let object = unsafe { resolve_output_device(api, device) }?;
+            (object != 0).then_some(Self {
+                api,
+                device: object,
                 pid: std::process::id() as i32,
             })
         }
@@ -5686,7 +6096,13 @@ mod platform {
     }
 
     /// ScreenCaptureKit audio capture (`SCStream.capturesAudio`).
-    #[cfg(not(test))]
+    ///
+    /// The Objective-C/SCStream side is behind [`SckHost`].  Production uses
+    /// the real `SCShareableContent`/`SCStream`/CoreMedia stack; tests install
+    /// a deterministic fake host that drives the exact same orchestration,
+    /// CMSampleBuffer retrieval and `SystemLoopbackSink` ingestion path
+    /// (including short buffers, CoreMedia status failures, retained block
+    /// buffers, ordered start/teardown and fallback selection).
     mod sck {
         use super::*;
 
@@ -5695,11 +6111,44 @@ mod platform {
         const START_TIMEOUT: Duration = Duration::from_secs(4);
         const STOP_TIMEOUT: Duration = Duration::from_secs(2);
         const FLAG_AUDIO_BUFFER_LIST_ASSURE_16_BYTE_ALIGNMENT: u32 = 1 << 0;
+        const SCK_SAMPLE_RATE: u32 = 48_000;
+        const SCK_CHANNELS: u16 = 2;
 
-        struct SckContext {
+        /// The live ingestion state shared by the host callback and teardown.
+        #[derive(Clone)]
+        pub(super) struct SckOutputContext {
             shared: Arc<Mutex<SystemLoopbackSink>>,
             generation: u64,
             sample_rate: u32,
+        }
+
+        impl SckOutputContext {
+            fn new(
+                shared: Arc<Mutex<SystemLoopbackSink>>,
+                generation: u64,
+                sample_rate: u32,
+            ) -> Self {
+                Self {
+                    shared,
+                    generation,
+                    sample_rate,
+                }
+            }
+
+            /// Publish one CMSampleBuffer's converted frames.
+            ///
+            /// Runs on the host audio thread: a contended sink lock drops this
+            /// callback's frames instead of stalling capture, and a stale
+            /// generation (teardown raced the callback) is rejected by the
+            /// sink.
+            pub(super) fn ingest(&self, channels: u16, samples: &[f32]) {
+                if samples.is_empty() {
+                    return;
+                }
+                if let Ok(mut sink) = self.shared.try_lock() {
+                    let _ = sink.ingest(self.generation, channels, self.sample_rate, samples);
+                }
+            }
         }
 
         type SampleBufferAudioBufferListFn = unsafe extern "C" fn(
@@ -5713,159 +6162,22 @@ mod platform {
             *mut *mut c_void,
         ) -> OsStatus;
 
-        fn sample_buffer_api() -> Option<SampleBufferAudioBufferListFn> {
-            static API: OnceLock<usize> = OnceLock::new();
-            let pointer = *API.get_or_init(|| unsafe {
-                let handle = libc::dlopen(
-                    c"/System/Library/Frameworks/CoreMedia.framework/CoreMedia".as_ptr(),
-                    libc::RTLD_LAZY | libc::RTLD_LOCAL,
-                );
-                if handle.is_null() {
-                    return 0;
-                }
-                symbol(
-                    handle,
-                    b"CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer\0",
-                )
-                .map(|symbol| symbol as usize)
-                .unwrap_or(0)
-            });
-            (pointer != 0).then(|| unsafe {
-                std::mem::transmute::<usize, SampleBufferAudioBufferListFn>(pointer)
-            })
-        }
-
-        unsafe fn empty_array() -> Option<*mut Object> {
-            let class = Class::get("NSArray")?;
-            let array: *mut Object = unsafe { msg_send![class, array] };
-            (!array.is_null()).then_some(array)
-        }
-
-        unsafe fn shareable_content() -> Option<*mut Object> {
-            let class = Class::get("SCShareableContent")?;
-            let (sender, receiver) = mpsc::channel::<(usize, usize)>();
-            let block =
-                block::ConcreteBlock::new(move |content: *mut Object, error: *mut Object| {
-                    let _ = sender.send((content as usize, error as usize));
-                });
-            let block = block.copy();
-            let block_ptr = &*block as *const _ as *const c_void;
-            let _: () =
-                unsafe { msg_send![class, getShareableContentWithCompletionHandler: block_ptr] };
-            match receiver.recv_timeout(CONTENT_TIMEOUT) {
-                Ok((content, error)) if content != 0 && error == 0 => {
-                    let retained: *mut Object =
-                        unsafe { msg_send![content as *mut Object, retain] };
-                    (!retained.is_null()).then_some(retained)
-                }
-                _ => None,
-            }
-        }
-
-        unsafe fn first_display(content: *mut Object) -> Option<*mut Object> {
-            let displays: *mut Object = unsafe { msg_send![content, displays] };
-            if displays.is_null() {
-                return None;
-            }
-            let count: usize = unsafe { msg_send![displays, count] };
-            if count == 0 {
-                return None;
-            }
-            let display: *mut Object = unsafe { msg_send![displays, objectAtIndex: 0] };
-            (!display.is_null()).then_some(display)
-        }
-
-        unsafe fn create_filter(display: *mut Object) -> Option<*mut Object> {
-            let class = Class::get("SCContentFilter")?;
-            let excluded = unsafe { empty_array() }?;
-            let alloc: *mut Object = unsafe { msg_send![class, alloc] };
-            if alloc.is_null() {
-                return None;
-            }
-            let filter: *mut Object =
-                unsafe { msg_send![alloc, initWithDisplay: display excludingWindows: excluded] };
-            (!filter.is_null()).then_some(filter)
-        }
-
-        unsafe fn create_configuration(sample_rate: u32, channels: u16) -> Option<*mut Object> {
-            let class = Class::get("SCStreamConfiguration")?;
-            let config: *mut Object = unsafe { msg_send![class, new] };
-            if config.is_null() {
-                return None;
-            }
-            let _: () = unsafe { msg_send![config, setCapturesAudio: 1i8] };
-            let _: () = unsafe { msg_send![config, setExcludesCurrentProcessAudio: 1i8] };
-            let _: () = unsafe { msg_send![config, setSampleRate: sample_rate.max(1) as i64] };
-            let _: () = unsafe { msg_send![config, setChannelCount: channels.max(1) as i64] };
-            let _: () = unsafe { msg_send![config, setWidth: 2usize] };
-            let _: () = unsafe { msg_send![config, setHeight: 2usize] };
-            Some(config)
-        }
-
-        extern "C" fn did_output(
-            this: &mut Object,
-            _cmd: Sel,
-            _stream: *mut Object,
+        /// Retrieve a CMSampleBuffer's `AudioBufferList` and convert it to
+        /// interleaved f32.
+        ///
+        /// This is the exact production ingestion path: a size query followed
+        /// by the real retrieval call, a retained block buffer released on
+        /// every path, then the shared AudioBufferList conversion (single
+        /// interleaved buffer or N non-interleaved channel buffers).  A short
+        /// or dangling buffer yields no whole frames; a CoreMedia status
+        /// failure yields no samples.  Tests inject `get_buffers` and the
+        /// release callback, so failure/short-buffer/retained-buffer behavior
+        /// is executed without a live Screen Recording session.
+        pub(super) unsafe fn sample_buffer_to_interleaved_with(
+            get_buffers: SampleBufferAudioBufferListFn,
+            release_block: unsafe extern "C" fn(*mut c_void),
             sample_buffer: *mut c_void,
-            output_type: i64,
-        ) {
-            if output_type != OUTPUT_TYPE_AUDIO || sample_buffer.is_null() {
-                return;
-            }
-            let context_pointer = unsafe { *this.get_ivar::<usize>("casa_context") };
-            if context_pointer == 0 {
-                return;
-            }
-            let context = unsafe { &*(context_pointer as *const SckContext) };
-            let (samples, channels) = unsafe { sample_buffer_to_interleaved(sample_buffer) };
-            if samples.is_empty() {
-                return;
-            }
-            if let Ok(mut sink) = context.shared.try_lock() {
-                let _ = sink.ingest(context.generation, channels, context.sample_rate, &samples);
-            }
-        }
-
-        extern "C" fn dealloc(this: &mut Object, _cmd: Sel) {
-            unsafe {
-                let pointer = *this.get_ivar::<usize>("casa_context");
-                if pointer != 0 {
-                    drop(Box::from_raw(pointer as *mut SckContext));
-                    this.set_ivar("casa_context", 0usize);
-                }
-                let _: () = msg_send![super(this, class!(NSObject)), dealloc];
-            }
-        }
-
-        fn output_class() -> Option<&'static Class> {
-            static CLASS: OnceLock<usize> = OnceLock::new();
-            let pointer = *CLASS.get_or_init(|| {
-                let Some(superclass) = Class::get("NSObject") else {
-                    return 0;
-                };
-                let Some(mut declaration) = ClassDecl::new("Casa1SCStreamOutput", superclass)
-                else {
-                    return 0;
-                };
-                declaration.add_ivar::<usize>("casa_context");
-                unsafe {
-                    declaration.add_method(
-                        sel!(stream:didOutputSampleBuffer:ofType:),
-                        did_output
-                            as extern "C" fn(&mut Object, Sel, *mut Object, *mut c_void, i64),
-                    );
-                    declaration
-                        .add_method(sel!(dealloc), dealloc as extern "C" fn(&mut Object, Sel));
-                }
-                declaration.register() as *const Class as usize
-            });
-            (pointer != 0).then(|| unsafe { &*(pointer as *const Class) })
-        }
-
-        unsafe fn sample_buffer_to_interleaved(sample_buffer: *mut c_void) -> (Vec<f32>, u16) {
-            let Some(get_buffers) = sample_buffer_api() else {
-                return (Vec::new(), 0);
-            };
+        ) -> (Vec<f32>, u16) {
             let mut needed = 0usize;
             let _status = unsafe {
                 get_buffers(
@@ -5899,108 +6211,384 @@ mod platform {
                 )
             };
             if status != 0 {
+                if !block_buffer.is_null() {
+                    unsafe { release_block(block_buffer) };
+                }
                 return (Vec::new(), 0);
             }
             let result = unsafe { audio_buffer_list_to_interleaved(list) };
             if !block_buffer.is_null() {
-                unsafe {
-                    CFRelease(block_buffer);
-                }
+                unsafe { release_block(block_buffer) };
             }
             result
+        }
+
+        /// The host operations the ScreenCaptureKit capture orchestration
+        /// needs.  Handles are opaque host objects; the production impl maps
+        /// them to Objective-C pointers and the fake maps them to synthetic
+        /// entries.
+        pub(super) trait SckHost: Sync + 'static {
+            fn shareable_content(&self) -> Option<usize>;
+            fn first_display(&self, content: usize) -> Option<usize>;
+            fn create_filter(&self, display: usize) -> Option<usize>;
+            fn create_configuration(&self, sample_rate: u32, channels: u16) -> Option<usize>;
+            fn create_stream(&self, filter: usize, configuration: usize) -> Option<usize>;
+            fn create_output(&self, context: Box<SckOutputContext>) -> Option<usize>;
+            fn add_output(&self, stream: usize, output: usize) -> bool;
+            fn start_capture(&self, stream: usize) -> bool;
+            fn stop_capture(&self, stream: usize);
+            fn remove_output(&self, stream: usize, output: usize);
+            fn release(&self, handle: usize);
+        }
+
+        fn start_with_host(
+            host: &'static dyn SckHost,
+            shared: Arc<Mutex<SystemLoopbackSink>>,
+            generation: u64,
+        ) -> Result<SystemLoopbackSession, SystemLoopbackFailure> {
+            let content = host
+                .shareable_content()
+                .ok_or(SystemLoopbackFailure::Unavailable)?;
+            let Some(display) = host.first_display(content) else {
+                host.release(content);
+                return Err(SystemLoopbackFailure::ObjectUnavailable);
+            };
+            let Some(filter) = host.create_filter(display) else {
+                host.release(content);
+                return Err(SystemLoopbackFailure::ObjectUnavailable);
+            };
+            let Some(configuration) = host.create_configuration(SCK_SAMPLE_RATE, SCK_CHANNELS)
+            else {
+                host.release(filter);
+                host.release(content);
+                return Err(SystemLoopbackFailure::ObjectUnavailable);
+            };
+            let Some(stream) = host.create_stream(filter, configuration) else {
+                host.release(filter);
+                host.release(configuration);
+                host.release(content);
+                return Err(SystemLoopbackFailure::ObjectUnavailable);
+            };
+            host.release(filter);
+            host.release(configuration);
+            let context = Box::new(SckOutputContext::new(
+                Arc::clone(&shared),
+                generation,
+                SCK_SAMPLE_RATE,
+            ));
+            let Some(output) = host.create_output(context) else {
+                host.release(stream);
+                host.release(content);
+                return Err(SystemLoopbackFailure::ObjectUnavailable);
+            };
+            if !host.add_output(stream, output) {
+                host.release(output);
+                host.release(stream);
+                host.release(content);
+                return Err(SystemLoopbackFailure::StreamStart(-1));
+            }
+            if !host.start_capture(stream) {
+                host.remove_output(stream, output);
+                host.release(output);
+                host.release(stream);
+                host.release(content);
+                return Err(SystemLoopbackFailure::StreamStart(-1));
+            }
+            {
+                let mut sink = shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                sink.channels = SCK_CHANNELS;
+                sink.sample_rate = SCK_SAMPLE_RATE;
+            }
+            let stop = Box::new(move || {
+                host.stop_capture(stream);
+                host.remove_output(stream, output);
+                host.release(output);
+                host.release(stream);
+                host.release(content);
+            });
+            Ok(SystemLoopbackSession {
+                backend: SystemLoopbackBackend::ScreenCaptureKit,
+                generation,
+                shared,
+                stop: Some(stop),
+            })
         }
 
         pub(super) fn start(
             shared: Arc<Mutex<SystemLoopbackSink>>,
             generation: u64,
         ) -> Result<SystemLoopbackSession, SystemLoopbackFailure> {
-            unsafe {
-                let content = shareable_content().ok_or(SystemLoopbackFailure::Unavailable)?;
-                let display =
-                    first_display(content).ok_or(SystemLoopbackFailure::ObjectUnavailable)?;
-                let filter =
-                    create_filter(display).ok_or(SystemLoopbackFailure::ObjectUnavailable)?;
-                let channels = 2u16;
-                let sample_rate = 48_000u32;
-                let configuration = create_configuration(sample_rate, channels)
-                    .ok_or(SystemLoopbackFailure::ObjectUnavailable)?;
-                let stream_class =
-                    Class::get("SCStream").ok_or(SystemLoopbackFailure::Unavailable)?;
-                let alloc: *mut Object = msg_send![stream_class, alloc];
-                let stream: *mut Object = msg_send![alloc, initWithFilter: filter configuration: configuration delegate: ptr::null::<Object>()];
-                let _: () = msg_send![filter, release];
-                let _: () = msg_send![configuration, release];
-                if stream.is_null() {
-                    let _: () = msg_send![content, release];
-                    return Err(SystemLoopbackFailure::ObjectUnavailable);
-                }
+            #[cfg(test)]
+            {
+                start_with_host(super::fake::sck_host(), shared, generation)
+            }
+            #[cfg(not(test))]
+            {
+                start_with_host(&objc::OBJC_HOST, shared, generation)
+            }
+        }
 
-                let Some(output_class) = output_class() else {
-                    let _: () = msg_send![stream, release];
-                    let _: () = msg_send![content, release];
-                    return Err(SystemLoopbackFailure::Unavailable);
-                };
-                let output: *mut Object = msg_send![output_class, alloc];
-                let context = Box::into_raw(Box::new(SckContext {
-                    shared: Arc::clone(&shared),
-                    generation,
-                    sample_rate,
-                }));
-                (&mut *output).set_ivar("casa_context", context as usize);
-                let output: *mut Object = msg_send![output, init];
-                let mut error: *mut Object = ptr::null_mut();
-                let added: bool = msg_send![stream, addStreamOutput: output type: OUTPUT_TYPE_AUDIO sampleHandlerQueue: ptr::null::<c_void>() error: &mut error];
-                if !added {
-                    let _: () = msg_send![output, release];
-                    let _: () = msg_send![stream, release];
-                    let _: () = msg_send![content, release];
-                    return Err(SystemLoopbackFailure::StreamStart(-1));
-                }
+        #[cfg(not(test))]
+        mod objc {
+            use super::*;
 
-                let (sender, receiver) = mpsc::channel::<usize>();
-                let block = block::ConcreteBlock::new(move |error: *mut Object| {
-                    let _ = sender.send(error as usize);
+            pub(super) static OBJC_HOST: ObjcSckHost = ObjcSckHost;
+
+            pub(super) struct ObjcSckHost;
+
+            fn sample_buffer_api() -> Option<SampleBufferAudioBufferListFn> {
+                static API: OnceLock<usize> = OnceLock::new();
+                let pointer = *API.get_or_init(|| unsafe {
+                    let handle = libc::dlopen(
+                        c"/System/Library/Frameworks/CoreMedia.framework/CoreMedia".as_ptr(),
+                        libc::RTLD_LAZY | libc::RTLD_LOCAL,
+                    );
+                    if handle.is_null() {
+                        return 0;
+                    }
+                    symbol(
+                        handle,
+                        b"CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer\0",
+                    )
+                    .map(|symbol| symbol as usize)
+                    .unwrap_or(0)
                 });
+                (pointer != 0).then(|| unsafe {
+                    std::mem::transmute::<usize, SampleBufferAudioBufferListFn>(pointer)
+                })
+            }
+
+            unsafe fn empty_array() -> Option<*mut Object> {
+                let class = Class::get("NSArray")?;
+                let array: *mut Object = unsafe { msg_send![class, array] };
+                (!array.is_null()).then_some(array)
+            }
+
+            unsafe fn shareable_content() -> Option<*mut Object> {
+                let class = Class::get("SCShareableContent")?;
+                let (sender, receiver) = mpsc::channel::<(usize, usize)>();
+                let block =
+                    block::ConcreteBlock::new(move |content: *mut Object, error: *mut Object| {
+                        let _ = sender.send((content as usize, error as usize));
+                    });
                 let block = block.copy();
                 let block_ptr = &*block as *const _ as *const c_void;
-                let _: () = msg_send![stream, startCaptureWithCompletionHandler: block_ptr];
-                match receiver.recv_timeout(START_TIMEOUT) {
-                    Ok(0) => {}
-                    _ => {
-                        let _: () = msg_send![stream, removeStreamOutput: output type: OUTPUT_TYPE_AUDIO error: ptr::null_mut::<*mut Object>()];
-                        let _: () = msg_send![output, release];
-                        let _: () = msg_send![stream, release];
-                        let _: () = msg_send![content, release];
-                        return Err(SystemLoopbackFailure::StreamStart(-1));
+                let _: () = unsafe {
+                    msg_send![class, getShareableContentWithCompletionHandler: block_ptr]
+                };
+                match receiver.recv_timeout(CONTENT_TIMEOUT) {
+                    Ok((content, error)) if content != 0 && error == 0 => {
+                        let retained: *mut Object =
+                            unsafe { msg_send![content as *mut Object, retain] };
+                        (!retained.is_null()).then_some(retained)
+                    }
+                    _ => None,
+                }
+            }
+
+            unsafe fn first_display(content: *mut Object) -> Option<*mut Object> {
+                let displays: *mut Object = unsafe { msg_send![content, displays] };
+                if displays.is_null() {
+                    return None;
+                }
+                let count: usize = unsafe { msg_send![displays, count] };
+                if count == 0 {
+                    return None;
+                }
+                let display: *mut Object = unsafe { msg_send![displays, objectAtIndex: 0] };
+                (!display.is_null()).then_some(display)
+            }
+
+            unsafe fn create_filter(display: *mut Object) -> Option<*mut Object> {
+                let class = Class::get("SCContentFilter")?;
+                let excluded = unsafe { empty_array() }?;
+                let alloc: *mut Object = unsafe { msg_send![class, alloc] };
+                if alloc.is_null() {
+                    return None;
+                }
+                let filter: *mut Object = unsafe {
+                    msg_send![alloc, initWithDisplay: display excludingWindows: excluded]
+                };
+                (!filter.is_null()).then_some(filter)
+            }
+
+            unsafe fn create_configuration(sample_rate: u32, channels: u16) -> Option<*mut Object> {
+                let class = Class::get("SCStreamConfiguration")?;
+                let config: *mut Object = unsafe { msg_send![class, new] };
+                if config.is_null() {
+                    return None;
+                }
+                let _: () = unsafe { msg_send![config, setCapturesAudio: 1i8] };
+                let _: () = unsafe { msg_send![config, setExcludesCurrentProcessAudio: 1i8] };
+                let _: () = unsafe { msg_send![config, setSampleRate: sample_rate.max(1) as i64] };
+                let _: () = unsafe { msg_send![config, setChannelCount: channels.max(1) as i64] };
+                let _: () = unsafe { msg_send![config, setWidth: 2usize] };
+                let _: () = unsafe { msg_send![config, setHeight: 2usize] };
+                Some(config)
+            }
+
+            extern "C" fn did_output(
+                this: &mut Object,
+                _cmd: Sel,
+                _stream: *mut Object,
+                sample_buffer: *mut c_void,
+                output_type: i64,
+            ) {
+                if output_type != OUTPUT_TYPE_AUDIO || sample_buffer.is_null() {
+                    return;
+                }
+                let context_pointer = unsafe { *this.get_ivar::<usize>("casa_context") };
+                if context_pointer == 0 {
+                    return;
+                }
+                let context = unsafe { &*(context_pointer as *const SckOutputContext) };
+                let (samples, channels) = unsafe { sample_buffer_to_interleaved(sample_buffer) };
+                context.ingest(channels, &samples);
+            }
+
+            extern "C" fn dealloc(this: &mut Object, _cmd: Sel) {
+                unsafe {
+                    let pointer = *this.get_ivar::<usize>("casa_context");
+                    if pointer != 0 {
+                        drop(Box::from_raw(pointer as *mut SckOutputContext));
+                        this.set_ivar("casa_context", 0usize);
+                    }
+                    let _: () = msg_send![super(this, class!(NSObject)), dealloc];
+                }
+            }
+
+            fn output_class() -> Option<&'static Class> {
+                static CLASS: OnceLock<usize> = OnceLock::new();
+                let pointer = *CLASS.get_or_init(|| {
+                    let Some(superclass) = Class::get("NSObject") else {
+                        return 0;
+                    };
+                    let Some(mut declaration) = ClassDecl::new("Casa1SCStreamOutput", superclass)
+                    else {
+                        return 0;
+                    };
+                    declaration.add_ivar::<usize>("casa_context");
+                    unsafe {
+                        declaration.add_method(
+                            sel!(stream:didOutputSampleBuffer:ofType:),
+                            did_output
+                                as extern "C" fn(&mut Object, Sel, *mut Object, *mut c_void, i64),
+                        );
+                        declaration
+                            .add_method(sel!(dealloc), dealloc as extern "C" fn(&mut Object, Sel));
+                    }
+                    declaration.register() as *const Class as usize
+                });
+                (pointer != 0).then(|| unsafe { &*(pointer as *const Class) })
+            }
+
+            unsafe fn sample_buffer_to_interleaved(sample_buffer: *mut c_void) -> (Vec<f32>, u16) {
+                let Some(get_buffers) = sample_buffer_api() else {
+                    return (Vec::new(), 0);
+                };
+                unsafe {
+                    sample_buffer_to_interleaved_with(
+                        get_buffers,
+                        release_retained_block,
+                        sample_buffer,
+                    )
+                }
+            }
+
+            unsafe extern "C" fn release_retained_block(block: *mut c_void) {
+                unsafe { CFRelease(block) };
+            }
+
+            impl SckHost for ObjcSckHost {
+                fn shareable_content(&self) -> Option<usize> {
+                    unsafe { shareable_content() }.map(|content| content as usize)
+                }
+
+                fn first_display(&self, content: usize) -> Option<usize> {
+                    unsafe { first_display(content as *mut Object) }.map(|display| display as usize)
+                }
+
+                fn create_filter(&self, display: usize) -> Option<usize> {
+                    unsafe { create_filter(display as *mut Object) }.map(|filter| filter as usize)
+                }
+
+                fn create_configuration(&self, sample_rate: u32, channels: u16) -> Option<usize> {
+                    unsafe { create_configuration(sample_rate, channels) }
+                        .map(|configuration| configuration as usize)
+                }
+
+                fn create_stream(&self, filter: usize, configuration: usize) -> Option<usize> {
+                    unsafe {
+                        let stream_class = Class::get("SCStream")?;
+                        let alloc: *mut Object = msg_send![stream_class, alloc];
+                        let stream: *mut Object = msg_send![alloc, initWithFilter: filter as *mut Object configuration: configuration as *mut Object delegate: ptr::null::<Object>()];
+                        (!stream.is_null()).then_some(stream as usize)
                     }
                 }
 
-                let stream_address = stream as usize;
-                let output_address = output as usize;
-                let content_address = content as usize;
-                let stop = Box::new(move || {
-                    let stream = stream_address as *mut Object;
-                    let output = output_address as *mut Object;
-                    let content = content_address as *mut Object;
-                    let (sender, receiver) = mpsc::channel::<usize>();
-                    let block = block::ConcreteBlock::new(move |error: *mut Object| {
-                        let _ = sender.send(error as usize);
-                    });
-                    let block = block.copy();
-                    let block_ptr = &*block as *const _ as *const c_void;
-                    let _: () = msg_send![stream, stopCaptureWithCompletionHandler: block_ptr];
-                    let _ = receiver.recv_timeout(STOP_TIMEOUT);
-                    let _: () = msg_send![stream, removeStreamOutput: output type: OUTPUT_TYPE_AUDIO error: ptr::null_mut::<*mut Object>()];
-                    let _: () = msg_send![output, release];
-                    let _: () = msg_send![stream, release];
-                    let _: () = msg_send![content, release];
-                });
-                Ok(SystemLoopbackSession {
-                    backend: SystemLoopbackBackend::ScreenCaptureKit,
-                    generation,
-                    shared,
-                    stop: Some(stop),
-                })
+                fn create_output(&self, context: Box<SckOutputContext>) -> Option<usize> {
+                    unsafe {
+                        let Some(output_class) = output_class() else {
+                            return None;
+                        };
+                        let output: *mut Object = msg_send![output_class, alloc];
+                        if output.is_null() {
+                            return None;
+                        }
+                        let context = Box::into_raw(context);
+                        (&mut *output).set_ivar("casa_context", context as usize);
+                        let output: *mut Object = msg_send![output, init];
+                        (!output.is_null()).then_some(output as usize)
+                    }
+                }
+
+                fn add_output(&self, stream: usize, output: usize) -> bool {
+                    unsafe {
+                        let mut error: *mut Object = ptr::null_mut();
+                        let added: bool = msg_send![stream as *mut Object, addStreamOutput: output as *mut Object type: OUTPUT_TYPE_AUDIO sampleHandlerQueue: ptr::null::<c_void>() error: &mut error];
+                        added
+                    }
+                }
+
+                fn start_capture(&self, stream: usize) -> bool {
+                    unsafe {
+                        let (sender, receiver) = mpsc::channel::<usize>();
+                        let block = block::ConcreteBlock::new(move |error: *mut Object| {
+                            let _ = sender.send(error as usize);
+                        });
+                        let block = block.copy();
+                        let block_ptr = &*block as *const _ as *const c_void;
+                        let _: () = msg_send![stream as *mut Object, startCaptureWithCompletionHandler: block_ptr];
+                        matches!(receiver.recv_timeout(START_TIMEOUT), Ok(0))
+                    }
+                }
+
+                fn stop_capture(&self, stream: usize) {
+                    unsafe {
+                        let (sender, receiver) = mpsc::channel::<usize>();
+                        let block = block::ConcreteBlock::new(move |error: *mut Object| {
+                            let _ = sender.send(error as usize);
+                        });
+                        let block = block.copy();
+                        let block_ptr = &*block as *const _ as *const c_void;
+                        let _: () = msg_send![stream as *mut Object, stopCaptureWithCompletionHandler: block_ptr];
+                        let _ = receiver.recv_timeout(STOP_TIMEOUT);
+                    }
+                }
+
+                fn remove_output(&self, stream: usize, output: usize) {
+                    unsafe {
+                        let _: () = msg_send![stream as *mut Object, removeStreamOutput: output as *mut Object type: OUTPUT_TYPE_AUDIO error: ptr::null_mut::<*mut Object>()];
+                    }
+                }
+
+                fn release(&self, handle: usize) {
+                    unsafe {
+                        let _: () = msg_send![handle as *mut Object, release];
+                    }
+                }
             }
         }
     }
@@ -6020,12 +6608,14 @@ mod platform {
         static IOPROC_STATUS: AtomicI32 = AtomicI32::new(0);
         static START_STATUS: AtomicI32 = AtomicI32::new(0);
         static FORMAT_VALID: AtomicBool = AtomicBool::new(true);
-        static HOG_OWNER: AtomicI32 = AtomicI32::new(-1);
         static SET_HOG_STATUS: AtomicI32 = AtomicI32::new(0);
         static SET_RATE_STATUS: AtomicI32 = AtomicI32::new(0);
         static SET_BUFFER_STATUS: AtomicI32 = AtomicI32::new(0);
         static DEFAULT_DEVICE: AtomicU32 = AtomicU32::new(3);
         static FAIL_SELECTOR: AtomicU32 = AtomicU32::new(0);
+        static FAIL_DEVICE_LIST_SIZE: AtomicBool = AtomicBool::new(false);
+        static FAIL_DEVICE_LIST_READ: AtomicBool = AtomicBool::new(false);
+        static NULL_DEVICE_NAME: AtomicBool = AtomicBool::new(false);
         static NULL_TAP_UID: AtomicBool = AtomicBool::new(false);
         static SAMPLES: Mutex<Vec<f32>> = Mutex::new(Vec::new());
         static SAMPLE_CHANNELS: AtomicU32 = AtomicU32::new(2);
@@ -6033,8 +6623,78 @@ mod platform {
         static DESTROYED_AGGREGATE: AtomicU32 = AtomicU32::new(0);
         static DESTROYED_IOPROC: AtomicU32 = AtomicU32::new(0);
         static FAKE_UID: OnceLock<usize> = OnceLock::new();
+        /// CoreAudio device objects returned by `kAudioHardwarePropertyDevices`.
+        /// Object 3 is the default output; object 4 is a second output so
+        /// per-device hog leases and tap targeting are adversarially testable.
+        static DEVICE_OBJECTS: Mutex<Vec<AudioObjectId>> = Mutex::new(Vec::new());
+        static HOG_OWNERS: std::sync::LazyLock<Mutex<HashMap<AudioObjectId, i32>>> =
+            std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+        static SET_HOG_STATUSES: std::sync::LazyLock<Mutex<HashMap<AudioObjectId, i32>>> =
+            std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+        static SET_RATE_STATUSES: std::sync::LazyLock<Mutex<HashMap<AudioObjectId, i32>>> =
+            std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+        static SET_BUFFER_STATUSES: std::sync::LazyLock<Mutex<HashMap<AudioObjectId, i32>>> =
+            std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+        static TAP_TARGETS: Mutex<Vec<DeviceId>> = Mutex::new(Vec::new());
 
-        fn lock<T>(mutex: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+        pub(crate) fn set_device_objects(objects: &[AudioObjectId]) {
+            *lock(&DEVICE_OBJECTS) = objects.to_vec();
+        }
+
+        pub(crate) fn tap_targets() -> Vec<DeviceId> {
+            lock(&TAP_TARGETS).clone()
+        }
+
+        pub(crate) fn record_tap_target(target: Option<DeviceId>) {
+            let mut targets = lock(&TAP_TARGETS);
+            targets.extend(target);
+        }
+
+        pub(crate) fn set_hog_owner(object: AudioObjectId, owner: i32) {
+            lock(&HOG_OWNERS).insert(object, owner);
+        }
+
+        pub(crate) fn hog_owner_for(object: AudioObjectId) -> i32 {
+            lock(&HOG_OWNERS).get(&object).copied().unwrap_or(-1)
+        }
+
+        pub(crate) fn set_device_statuses(
+            object: AudioObjectId,
+            set_hog: i32,
+            set_rate: i32,
+            set_buffer: i32,
+        ) {
+            lock(&SET_HOG_STATUSES).insert(object, set_hog);
+            lock(&SET_RATE_STATUSES).insert(object, set_rate);
+            lock(&SET_BUFFER_STATUSES).insert(object, set_buffer);
+        }
+
+        fn fake_device_string(object: AudioObjectId, uid: bool) -> CFStringRef {
+            let text = if uid {
+                format!("Fake-UID-{object}")
+            } else {
+                format!("Fake Device {object}")
+            };
+            let value = CFString::new(&text);
+            let pointer = value.as_concrete_TypeRef() as usize;
+            std::mem::forget(value);
+            pointer as CFStringRef
+        }
+
+        fn write_array<T: Copy>(out: *mut c_void, size: *mut u32, values: &[T]) {
+            if !size.is_null() {
+                unsafe {
+                    *size = std::mem::size_of_val(values) as u32;
+                }
+            }
+            if !out.is_null() && !values.is_empty() {
+                unsafe {
+                    ptr::copy_nonoverlapping(values.as_ptr(), out as *mut T, values.len());
+                }
+            }
+        }
+
+        fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
             mutex
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6061,6 +6721,33 @@ mod platform {
                 pointer
             });
             pointer as CFStringRef
+        }
+
+        unsafe extern "C" fn fake_get_size(
+            object: AudioObjectId,
+            address: *const AudioObjectPropertyAddress,
+            _qualifier_size: u32,
+            _qualifier: *const c_void,
+            size: *mut u32,
+        ) -> OsStatus {
+            if address.is_null() || size.is_null() {
+                return -50;
+            }
+            let selector = unsafe { (*address).selector };
+            if selector == HW_DEVICES && object == SYSTEM_OBJECT {
+                if FAIL_DEVICE_LIST_SIZE.load(Ordering::SeqCst)
+                    || FAIL_SELECTOR.load(Ordering::SeqCst) == HW_DEVICES
+                {
+                    return -4;
+                }
+                let devices = lock(&DEVICE_OBJECTS);
+                unsafe {
+                    *size = (devices.len() * std::mem::size_of::<AudioObjectId>()) as u32;
+                }
+                0
+            } else {
+                -4
+            }
         }
 
         unsafe extern "C" fn fake_get(
@@ -6112,15 +6799,38 @@ mod platform {
                     unsafe { write_out(out, size, uid) };
                     0
                 }
-                DEVICE_HOG_MODE if object == 3 => {
-                    unsafe { write_out(out, size, HOG_OWNER.load(Ordering::SeqCst)) };
+                HW_DEVICES if object == SYSTEM_OBJECT => {
+                    if FAIL_DEVICE_LIST_READ.load(Ordering::SeqCst) {
+                        return -4;
+                    }
+                    let devices = lock(&DEVICE_OBJECTS);
+                    write_array(out, size, devices.as_slice());
                     0
                 }
-                DEVICE_NOMINAL_SAMPLE_RATE if object == 3 => {
+                DEVICE_NAME => {
+                    let name = if NULL_DEVICE_NAME.load(Ordering::SeqCst) {
+                        ptr::null()
+                    } else {
+                        fake_device_string(object, false)
+                    };
+                    unsafe { write_out(out, size, name) };
+                    0
+                }
+                DEVICE_UID => {
+                    let uid = fake_device_string(object, true);
+                    unsafe { write_out(out, size, uid) };
+                    0
+                }
+                DEVICE_HOG_MODE => {
+                    let owner = lock(&HOG_OWNERS).get(&object).copied().unwrap_or(-1);
+                    unsafe { write_out(out, size, owner) };
+                    0
+                }
+                DEVICE_NOMINAL_SAMPLE_RATE => {
                     unsafe { write_out(out, size, 48_000.0f64) };
                     0
                 }
-                DEVICE_BUFFER_FRAME_SIZE if object == 3 => {
+                DEVICE_BUFFER_FRAME_SIZE => {
                     unsafe { write_out(out, size, 128u32) };
                     0
                 }
@@ -6141,23 +6851,30 @@ mod platform {
             }
             let selector = unsafe { (*address).selector };
             match selector {
-                DEVICE_HOG_MODE if object == 3 => {
-                    let status = SET_HOG_STATUS.load(Ordering::SeqCst);
+                DEVICE_HOG_MODE => {
+                    let status = lock(&SET_HOG_STATUSES)
+                        .get(&object)
+                        .copied()
+                        .unwrap_or_else(|| SET_HOG_STATUS.load(Ordering::SeqCst));
                     if status == 0 {
                         let requested = unsafe { *(data as *const i32) };
-                        let owner = HOG_OWNER.load(Ordering::SeqCst);
+                        let mut owners = lock(&HOG_OWNERS);
+                        let owner = owners.get(&object).copied().unwrap_or(-1);
                         // CoreAudio treats setting hog mode to the current
                         // owner as a release, and to a free device as an
                         // acquire.
-                        HOG_OWNER.store(
-                            if owner == requested { -1 } else { requested },
-                            Ordering::SeqCst,
-                        );
+                        owners.insert(object, if owner == requested { -1 } else { requested });
                     }
                     status
                 }
-                DEVICE_NOMINAL_SAMPLE_RATE if object == 3 => SET_RATE_STATUS.load(Ordering::SeqCst),
-                DEVICE_BUFFER_FRAME_SIZE if object == 3 => SET_BUFFER_STATUS.load(Ordering::SeqCst),
+                DEVICE_NOMINAL_SAMPLE_RATE => lock(&SET_RATE_STATUSES)
+                    .get(&object)
+                    .copied()
+                    .unwrap_or_else(|| SET_RATE_STATUS.load(Ordering::SeqCst)),
+                DEVICE_BUFFER_FRAME_SIZE => lock(&SET_BUFFER_STATUSES)
+                    .get(&object)
+                    .copied()
+                    .unwrap_or_else(|| SET_BUFFER_STATUS.load(Ordering::SeqCst)),
                 _ => -4,
             }
         }
@@ -6288,20 +7005,43 @@ mod platform {
             IOPROC_STATUS.store(0, Ordering::SeqCst);
             START_STATUS.store(0, Ordering::SeqCst);
             FORMAT_VALID.store(true, Ordering::SeqCst);
-            HOG_OWNER.store(-1, Ordering::SeqCst);
             SET_HOG_STATUS.store(0, Ordering::SeqCst);
             SET_RATE_STATUS.store(0, Ordering::SeqCst);
             SET_BUFFER_STATUS.store(0, Ordering::SeqCst);
             DEFAULT_DEVICE.store(3, Ordering::SeqCst);
             FAIL_SELECTOR.store(0, Ordering::SeqCst);
+            FAIL_DEVICE_LIST_SIZE.store(false, Ordering::SeqCst);
+            FAIL_DEVICE_LIST_READ.store(false, Ordering::SeqCst);
+            NULL_DEVICE_NAME.store(false, Ordering::SeqCst);
             NULL_TAP_UID.store(false, Ordering::SeqCst);
             SAMPLE_CHANNELS.store(2, Ordering::SeqCst);
             DESTROYED_TAP.store(0, Ordering::SeqCst);
             DESTROYED_AGGREGATE.store(0, Ordering::SeqCst);
             DESTROYED_IOPROC.store(0, Ordering::SeqCst);
             lock(&SAMPLES).clear();
+            *lock(&DEVICE_OBJECTS) = vec![3, 4];
+            lock(&HOG_OWNERS).clear();
+            lock(&SET_HOG_STATUSES).clear();
+            lock(&SET_RATE_STATUSES).clear();
+            lock(&SET_BUFFER_STATUSES).clear();
+            lock(&TAP_TARGETS).clear();
+            SCK_STAGE.store(0, Ordering::SeqCst);
+            SCK_SAMPLE_STATUS.store(0, Ordering::SeqCst);
+            SCK_SECOND_STATUS.store(0, Ordering::SeqCst);
+            SCK_ZERO_SIZE.store(false, Ordering::SeqCst);
+            SCK_RETAIN_BLOCK.store(false, Ordering::SeqCst);
+            SCK_BLOCK_RELEASES.store(0, Ordering::SeqCst);
+            SCK_STARTED.store(0, Ordering::SeqCst);
+            SCK_STOPPED.store(0, Ordering::SeqCst);
+            SCK_REMOVED.store(0, Ordering::SeqCst);
+            SCK_RELEASES.store(0, Ordering::SeqCst);
+            *lock(&SCK_CONFIG) = (0, 0);
+            lock(&SCK_BUFFERS).clear();
+            lock(&SCK_CONTEXTS).clear();
+            *lock(&SCK_LAST_CONTEXT) = None;
             let api = CoreAudioApi {
                 get_property_data: fake_get,
+                get_property_data_size: fake_get_size,
                 set_property_data: fake_set,
                 create_aggregate: fake_create_aggregate,
                 destroy_aggregate: fake_destroy_aggregate,
@@ -6321,6 +7061,8 @@ mod platform {
             *TEST_CORE_AUDIO_API
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            lock(&SCK_CONTEXTS).clear();
+            *lock(&SCK_LAST_CONTEXT) = None;
         }
 
         pub(crate) fn set_tap_status(status: i32) {
@@ -6354,14 +7096,14 @@ mod platform {
             set_rate_status: i32,
             set_buffer_status: i32,
         ) {
-            HOG_OWNER.store(owner, Ordering::SeqCst);
+            set_hog_owner(3, owner);
             SET_HOG_STATUS.store(set_hog_status, Ordering::SeqCst);
             SET_RATE_STATUS.store(set_rate_status, Ordering::SeqCst);
             SET_BUFFER_STATUS.store(set_buffer_status, Ordering::SeqCst);
         }
 
         pub(crate) fn hog_owner() -> i32 {
-            HOG_OWNER.load(Ordering::SeqCst)
+            hog_owner_for(3)
         }
 
         pub(crate) fn set_default_device(device: u32) {
@@ -6382,6 +7124,263 @@ mod platform {
                 DESTROYED_AGGREGATE.load(Ordering::SeqCst),
                 DESTROYED_IOPROC.load(Ordering::SeqCst),
             )
+        }
+
+        // ── Deterministic fake ScreenCaptureKit host ────────────────────────
+
+        struct FakeSckBuffer {
+            channels: u16,
+            samples: Vec<f32>,
+            byte_len: u32,
+        }
+
+        static SCK_STAGE: AtomicU32 = AtomicU32::new(0);
+        static SCK_SAMPLE_STATUS: AtomicI32 = AtomicI32::new(0);
+        static SCK_SECOND_STATUS: AtomicI32 = AtomicI32::new(0);
+        static SCK_ZERO_SIZE: AtomicBool = AtomicBool::new(false);
+        static SCK_RETAIN_BLOCK: AtomicBool = AtomicBool::new(false);
+        static SCK_BLOCK_RELEASES: AtomicU32 = AtomicU32::new(0);
+        static SCK_STARTED: AtomicU32 = AtomicU32::new(0);
+        static SCK_STOPPED: AtomicU32 = AtomicU32::new(0);
+        static SCK_REMOVED: AtomicU32 = AtomicU32::new(0);
+        static SCK_RELEASES: AtomicU32 = AtomicU32::new(0);
+        static SCK_CONFIG: Mutex<(u32, u16)> = Mutex::new((0, 0));
+        static SCK_BUFFERS: Mutex<Vec<FakeSckBuffer>> = Mutex::new(Vec::new());
+        static SCK_CONTEXTS: std::sync::LazyLock<
+            Mutex<HashMap<usize, Box<sck::SckOutputContext>>>,
+        > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+        static SCK_LAST_CONTEXT: Mutex<Option<sck::SckOutputContext>> = Mutex::new(None);
+
+        struct FakeSckHost;
+        static FAKE_SCK_HOST: FakeSckHost = FakeSckHost;
+
+        pub(super) fn sck_host() -> &'static dyn sck::SckHost {
+            &FAKE_SCK_HOST
+        }
+
+        pub(crate) fn set_sck_stage(stage: u32) {
+            SCK_STAGE.store(stage, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_sck_samples(samples: Vec<f32>, channels: u16) {
+            let byte_len = (samples.len() * std::mem::size_of::<f32>()) as u32;
+            *lock(&SCK_BUFFERS) = vec![FakeSckBuffer {
+                channels: channels.max(1),
+                samples,
+                byte_len,
+            }];
+        }
+
+        pub(crate) fn set_sck_planar(channels: Vec<Vec<f32>>) {
+            *lock(&SCK_BUFFERS) = channels
+                .into_iter()
+                .map(|samples| FakeSckBuffer {
+                    channels: 1,
+                    byte_len: (samples.len() * std::mem::size_of::<f32>()) as u32,
+                    samples,
+                })
+                .collect();
+        }
+
+        pub(crate) fn set_sck_short_buffer(byte_len: u32) {
+            let mut buffers = lock(&SCK_BUFFERS);
+            if let Some(buffer) = buffers.first_mut() {
+                buffer.byte_len = byte_len;
+            }
+        }
+
+        pub(crate) fn set_sck_sample_status(status: i32) {
+            SCK_SAMPLE_STATUS.store(status, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_sck_second_status(status: i32) {
+            SCK_SECOND_STATUS.store(status, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_device_list_size_failure(fail: bool) {
+            FAIL_DEVICE_LIST_SIZE.store(fail, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_device_list_read_failure(fail: bool) {
+            FAIL_DEVICE_LIST_READ.store(fail, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_null_device_name(fail: bool) {
+            NULL_DEVICE_NAME.store(fail, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_sck_zero_size() {
+            SCK_ZERO_SIZE.store(true, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_sck_retain_block(retain: bool) {
+            SCK_RETAIN_BLOCK.store(retain, Ordering::SeqCst);
+        }
+
+        pub(crate) fn sck_counts() -> (u32, u32, u32, u32) {
+            (
+                SCK_STARTED.load(Ordering::SeqCst),
+                SCK_STOPPED.load(Ordering::SeqCst),
+                SCK_REMOVED.load(Ordering::SeqCst),
+                SCK_RELEASES.load(Ordering::SeqCst),
+            )
+        }
+
+        pub(crate) fn sck_block_releases() -> u32 {
+            SCK_BLOCK_RELEASES.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn sck_configuration() -> (u32, u16) {
+            *lock(&SCK_CONFIG)
+        }
+
+        pub(crate) fn deliver_last_sck() -> bool {
+            let context = lock(&SCK_LAST_CONTEXT).clone();
+            context.is_some_and(|context| fake_sck_deliver(&context))
+        }
+
+        unsafe extern "C" fn fake_sck_get_buffers(
+            _sample_buffer: *mut c_void,
+            needed: *mut usize,
+            list: *mut AudioBufferList,
+            _capacity: usize,
+            _a: *const c_void,
+            _b: *const c_void,
+            _flags: u32,
+            block_buffer: *mut *mut c_void,
+        ) -> OsStatus {
+            if needed.is_null() {
+                return -50;
+            }
+            if list.is_null() {
+                let status = SCK_SAMPLE_STATUS.load(Ordering::SeqCst);
+                if status != 0 {
+                    return status;
+                }
+                if SCK_ZERO_SIZE.load(Ordering::SeqCst) {
+                    unsafe { *needed = 0 };
+                    return 0;
+                }
+                let buffers = lock(&SCK_BUFFERS);
+                unsafe {
+                    *needed = if buffers.is_empty() {
+                        0
+                    } else {
+                        std::mem::size_of::<u32>()
+                            + buffers.len() * std::mem::size_of::<AudioBuffer>()
+                    };
+                }
+                return 0;
+            }
+            let second_status = SCK_SECOND_STATUS.load(Ordering::SeqCst);
+            if second_status != 0 {
+                if !block_buffer.is_null() && SCK_RETAIN_BLOCK.load(Ordering::SeqCst) {
+                    unsafe { *block_buffer = 0x1 as *mut c_void };
+                }
+                return second_status;
+            }
+            let buffers = lock(&SCK_BUFFERS);
+            unsafe {
+                (*list).number_buffers = buffers.len() as u32;
+                let out = ptr::addr_of_mut!((*list).buffers) as *mut AudioBuffer;
+                for (index, buffer) in buffers.iter().enumerate() {
+                    *out.add(index) = AudioBuffer {
+                        number_channels: buffer.channels as u32,
+                        data_byte_size: buffer.byte_len,
+                        data: buffer.samples.as_ptr() as *mut c_void,
+                    };
+                }
+                if !block_buffer.is_null() {
+                    *block_buffer = if SCK_RETAIN_BLOCK.load(Ordering::SeqCst) {
+                        0x1 as *mut c_void
+                    } else {
+                        ptr::null_mut()
+                    };
+                }
+            }
+            0
+        }
+
+        unsafe extern "C" fn fake_sck_release_block(_block: *mut c_void) {
+            SCK_BLOCK_RELEASES.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn fake_sck_deliver(context: &sck::SckOutputContext) -> bool {
+            let (samples, channels) = unsafe {
+                sck::sample_buffer_to_interleaved_with(
+                    fake_sck_get_buffers,
+                    fake_sck_release_block,
+                    7 as *mut c_void,
+                )
+            };
+            context.ingest(channels, &samples);
+            !samples.is_empty()
+        }
+
+        impl sck::SckHost for FakeSckHost {
+            fn shareable_content(&self) -> Option<usize> {
+                (SCK_STAGE.load(Ordering::SeqCst) != 1).then_some(1)
+            }
+
+            fn first_display(&self, _content: usize) -> Option<usize> {
+                (SCK_STAGE.load(Ordering::SeqCst) != 2).then_some(2)
+            }
+
+            fn create_filter(&self, _display: usize) -> Option<usize> {
+                (SCK_STAGE.load(Ordering::SeqCst) != 3).then_some(3)
+            }
+
+            fn create_configuration(&self, sample_rate: u32, channels: u16) -> Option<usize> {
+                if SCK_STAGE.load(Ordering::SeqCst) == 4 {
+                    return None;
+                }
+                *lock(&SCK_CONFIG) = (sample_rate, channels);
+                Some(4)
+            }
+
+            fn create_stream(&self, _filter: usize, _configuration: usize) -> Option<usize> {
+                (SCK_STAGE.load(Ordering::SeqCst) != 5).then_some(5)
+            }
+
+            fn create_output(&self, context: Box<sck::SckOutputContext>) -> Option<usize> {
+                if SCK_STAGE.load(Ordering::SeqCst) == 6 {
+                    return None;
+                }
+                *lock(&SCK_LAST_CONTEXT) = Some((*context).clone());
+                lock(&SCK_CONTEXTS).insert(6, context);
+                Some(6)
+            }
+
+            fn add_output(&self, _stream: usize, _output: usize) -> bool {
+                SCK_STAGE.load(Ordering::SeqCst) != 7
+            }
+
+            fn start_capture(&self, _stream: usize) -> bool {
+                if SCK_STAGE.load(Ordering::SeqCst) == 8 {
+                    return false;
+                }
+                SCK_STARTED.fetch_add(1, Ordering::SeqCst);
+                let context = lock(&SCK_CONTEXTS);
+                if let Some(context) = context.get(&6) {
+                    fake_sck_deliver(context);
+                }
+                true
+            }
+
+            fn stop_capture(&self, _stream: usize) {
+                SCK_STOPPED.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn remove_output(&self, _stream: usize, _output: usize) {
+                SCK_REMOVED.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn release(&self, handle: usize) {
+                SCK_RELEASES.fetch_add(1, Ordering::SeqCst);
+                if handle == 6 {
+                    lock(&SCK_CONTEXTS).remove(&6);
+                }
+            }
         }
 
         #[test]
@@ -6475,21 +7474,6 @@ mod platform {
                 };
                 assert_eq!(audio_buffer_list_to_interleaved(list), (Vec::new(), 0));
             }
-        }
-    }
-
-    #[cfg(test)]
-    mod sck {
-        use super::*;
-
-        /// The production ScreenCaptureKit path is compiled out of the test
-        /// binary (it needs Screen Recording TCC and a live display); the tap
-        /// pipeline is exercised against the fake CoreAudio host instead.
-        pub(super) fn start(
-            _shared: Arc<Mutex<SystemLoopbackSink>>,
-            _generation: u64,
-        ) -> Result<SystemLoopbackSession, SystemLoopbackFailure> {
-            Err(SystemLoopbackFailure::Unavailable)
         }
     }
 }
@@ -6976,6 +7960,52 @@ mod tests {
     }
 
     #[test]
+    fn activation_resolution_named_endpoint_mismatch_is_exact_never_default() {
+        let default = sample_device(1, "Built-in Speakers", true);
+        let hdmi = sample_device(2, "Studio Display", false);
+        let devices = vec![default.clone(), hdmi.clone()];
+        // The stable device key in the endpoint instance path resolves the
+        // named endpoint, not the default.
+        assert_eq!(
+            resolve_audio_activation_device(
+                &devices,
+                Some(
+                    r"\?\SWD#MMDEVAPI#{0.0.0.00000000}.{Studio Display|2|48000}#{e6327cad-dcec-4949-ae8a-991e976a79d2}"
+                ),
+            ),
+            Ok(hdmi.clone())
+        );
+        // A friendly-name path also resolves, even without a default device.
+        assert_eq!(
+            resolve_audio_activation_device(
+                &[hdmi.clone()],
+                Some(r"\?\SWD#MMDEVAPI#{0.0.0.00000000}.{studio display}"),
+            ),
+            Ok(hdmi.clone())
+        );
+        // An unknown named path never falls back to the default device.
+        assert_eq!(
+            resolve_audio_activation_device(
+                &devices,
+                Some(r"\?\SWD#MMDEVAPI#{0.0.0.00000000}.{Missing Output}"),
+            ),
+            Err(AudioActivationDeviceFailure::UnknownDevicePath)
+        );
+        // An ambiguous friendly-name fragment is rejected exactly.
+        assert_eq!(
+            resolve_audio_activation_device(
+                &[
+                    sample_device(3, "Studio Display", false),
+                    sample_device(4, "Studio Display", false),
+                ],
+                Some(r"\?\SWD#MMDEVAPI#{0.0.0.00000000}.{studio display}"),
+            ),
+            Err(AudioActivationDeviceFailure::UnknownDevicePath)
+        );
+        assert_eq!(default.is_default, true);
+    }
+
+    #[test]
     fn backend_activation_resolution_matches_pure_resolver() {
         // Capability gate: needs the real audio host to enumerate.
         let backend = match RealAudioBackend::new() {
@@ -7093,6 +8123,7 @@ mod tests {
     impl Drop for FakeHostGuard {
         fn drop(&mut self) {
             set_test_system_loopback_capability(None);
+            set_test_screen_capture_kit_available(None);
             platform::fake::clear();
         }
     }
@@ -7242,12 +8273,478 @@ mod tests {
     }
 
     #[test]
-    fn system_loopback_sck_fallback_is_unavailable() {
-        let shared = Arc::new(Mutex::new(SystemLoopbackSink::new(1, 2, 48_000)));
+    fn system_loopback_forced_off_fallback_is_unavailable() {
+        let _host = FakeHostGuard::new();
+        // SAFETY: the sanctioned runner executes one test per process.
+        unsafe { std::env::set_var("CASA1_SYSTEM_LOOPBACK", "off") };
         assert_eq!(
-            platform::start_screen_capture_kit(shared, 1).err(),
-            Some(SystemLoopbackFailure::Unavailable)
+            system_loopback_candidates(),
+            Vec::<SystemLoopbackBackend>::new(),
+            "CASA1_SYSTEM_LOOPBACK=off disables every backend, including fallbacks"
         );
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::Unavailable)
+        );
+        unsafe { std::env::remove_var("CASA1_SYSTEM_LOOPBACK") };
+    }
+
+    #[test]
+    fn system_loopback_stop_all_teardowns_every_device_tap() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_samples(vec![0.25, 0.75], 2);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 3, true);
+        fake_device(&mut backend, 4, false);
+        let first = backend.device_info(3).expect("default fake").clone();
+        let second = backend.device_info(4).expect("second fake").clone();
+        assert_eq!(
+            backend.start_system_loopback_for_device(&first),
+            Ok(SystemLoopbackBackend::CoreAudioProcessTap)
+        );
+        assert_eq!(
+            backend.start_system_loopback_for_device(&second),
+            Ok(SystemLoopbackBackend::CoreAudioProcessTap)
+        );
+        backend.stop_all_system_loopbacks();
+        assert!(!backend.system_loopback_running_for(&first.key));
+        assert!(!backend.system_loopback_running_for(&second.key));
+        assert_eq!(platform::fake::destroy_counts(), (2, 2, 2));
+    }
+
+    #[test]
+    fn exclusive_buffer_pin_missing_device_lease_drops_cleanly() {
+        let _host = FakeHostGuard::new();
+        let backend = RealAudioBackend::new().expect("backend");
+        let stale = 999_999;
+        // A lease can outlive its device snapshot (hotplug race).  Pinning the
+        // buffer must return without touching a host device or panicking.
+        let mut backend = backend;
+        backend.hog_devices.insert(stale, std::process::id() as i32);
+        backend.pin_exclusive_buffer_frames(stale, 64);
+        assert_eq!(
+            backend.hog_mode_held(stale),
+            true,
+            "the emulator lease is left for the hotplug teardown to drop"
+        );
+    }
+
+    #[test]
+    fn device_resolution_list_failures_are_device_unavailable() {
+        let _host = FakeHostGuard::new();
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 4, false);
+        let device = backend.device_info(4).expect("fake device").clone();
+        platform::fake::set_device_list_size_failure(true);
+        assert_eq!(
+            backend.start_system_loopback_for_device(&device),
+            Err(SystemLoopbackFailure::DeviceUnavailable)
+        );
+        platform::fake::set_device_list_size_failure(false);
+        platform::fake::set_device_objects(&[]);
+        assert_eq!(
+            backend.start_system_loopback_for_device(&device),
+            Err(SystemLoopbackFailure::DeviceUnavailable),
+            "an empty device enumeration cannot resolve the named endpoint"
+        );
+        platform::fake::set_device_objects(&vec![3; 1025]);
+        assert_eq!(
+            backend.start_system_loopback_for_device(&device),
+            Err(SystemLoopbackFailure::DeviceUnavailable),
+            "an implausible device count is rejected, never truncated"
+        );
+        platform::fake::set_device_objects(&[3, 4]);
+        platform::fake::set_device_list_read_failure(true);
+        assert_eq!(
+            backend.start_system_loopback_for_device(&device),
+            Err(SystemLoopbackFailure::DeviceUnavailable),
+            "a failed device-list read is exact, never the default tap"
+        );
+        platform::fake::set_device_list_read_failure(false);
+        platform::fake::set_null_device_name(true);
+        assert_eq!(
+            backend.start_system_loopback_for_device(&device),
+            Err(SystemLoopbackFailure::DeviceUnavailable),
+            "a device without a readable name cannot be the named endpoint"
+        );
+        platform::fake::set_null_device_name(false);
+        assert_eq!(
+            backend.start_system_loopback_for_device(&device),
+            Ok(SystemLoopbackBackend::CoreAudioProcessTap)
+        );
+        backend.stop_system_loopback_for(&device.key);
+    }
+
+    #[test]
+    fn system_loopback_screen_capture_empty_and_second_read_failure_are_pinned() {
+        let _host = FakeHostGuard::new();
+        set_test_system_loopback_capability(Some(SystemLoopbackBackend::ScreenCaptureKit));
+        platform::fake::set_sck_samples(Vec::new(), 2);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::ScreenCaptureKit)
+        );
+        assert_eq!(
+            backend.system_loopback_available_frames(),
+            0,
+            "an empty CMSampleBuffer is ignored without stopping capture"
+        );
+        backend.stop_system_loopback();
+
+        platform::fake::set_sck_samples(vec![0.25, 0.75], 2);
+        platform::fake::set_sck_second_status(-1);
+        platform::fake::set_sck_retain_block(true);
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::ScreenCaptureKit)
+        );
+        assert_eq!(
+            backend.system_loopback_available_frames(),
+            0,
+            "a failed second CoreMedia read yields no frames"
+        );
+        assert_eq!(
+            platform::fake::sck_block_releases(),
+            1,
+            "a retained block buffer is released on the failure path"
+        );
+        backend.stop_system_loopback();
+        platform::fake::set_sck_retain_block(false);
+        platform::fake::set_sck_second_status(0);
+    }
+
+    #[test]
+    fn system_loopback_screen_capture_ingests_cmsamplebuffers_and_tears_down() {
+        let _host = FakeHostGuard::new();
+        set_test_system_loopback_capability(Some(SystemLoopbackBackend::ScreenCaptureKit));
+        platform::fake::set_sck_samples(vec![0.25, 0.75, 0.5, 0.5], 2);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::ScreenCaptureKit)
+        );
+        assert_eq!(platform::fake::sck_configuration(), (48_000, 2));
+        assert_eq!(backend.system_loopback_format(), Some((2, 48_000)));
+        assert_eq!(backend.system_loopback_available_frames(), 2);
+        assert_eq!(
+            backend.read_system_loopback_data(),
+            vec![0.25, 0.75, 0.5, 0.5]
+        );
+        backend.stop_system_loopback();
+        assert_eq!(
+            platform::fake::sck_counts(),
+            (1, 1, 1, 5),
+            "start/stop release the stream, output and retained content exactly once"
+        );
+        assert!(!backend.system_loopback_running());
+    }
+
+    #[test]
+    fn system_loopback_screen_capture_planar_conversion_edges_are_pinned() {
+        let _host = FakeHostGuard::new();
+        set_test_system_loopback_capability(Some(SystemLoopbackBackend::ScreenCaptureKit));
+        platform::fake::set_sck_planar(vec![vec![0.25, 0.5], vec![0.75, 0.5]]);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::ScreenCaptureKit)
+        );
+        assert_eq!(
+            backend.read_system_loopback_data(),
+            vec![0.25, 0.75, 0.5, 0.5],
+            "non-interleaved CMSampleBuffer channels are interleaved"
+        );
+        backend.stop_system_loopback();
+    }
+
+    #[test]
+    fn system_loopback_screen_capture_short_buffer_is_rejected() {
+        let _host = FakeHostGuard::new();
+        set_test_system_loopback_capability(Some(SystemLoopbackBackend::ScreenCaptureKit));
+        platform::fake::set_sck_samples(vec![0.25, 0.75, 0.5, 0.5], 2);
+        platform::fake::set_sck_short_buffer(6);
+        platform::fake::set_sck_retain_block(true);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::ScreenCaptureKit)
+        );
+        assert_eq!(
+            backend.system_loopback_available_frames(),
+            0,
+            "a short CMSampleBuffer yields no whole frames"
+        );
+        assert_eq!(
+            platform::fake::sck_block_releases(),
+            1,
+            "the retained block buffer is released even for a short buffer"
+        );
+        backend.stop_system_loopback();
+    }
+
+    #[test]
+    fn system_loopback_screen_capture_coremedia_failure_drops_frames() {
+        let _host = FakeHostGuard::new();
+        set_test_system_loopback_capability(Some(SystemLoopbackBackend::ScreenCaptureKit));
+        platform::fake::set_sck_sample_status(-1);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::ScreenCaptureKit)
+        );
+        assert_eq!(backend.system_loopback_available_frames(), 0);
+        assert_eq!(platform::fake::sck_block_releases(), 0);
+        backend.stop_system_loopback();
+    }
+
+    #[test]
+    fn system_loopback_screen_capture_start_failure_unwinds_exactly() {
+        let _host = FakeHostGuard::new();
+        set_test_system_loopback_capability(Some(SystemLoopbackBackend::ScreenCaptureKit));
+        platform::fake::set_sck_stage(8);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::StreamStart(-1))
+        );
+        assert_eq!(
+            platform::fake::sck_counts(),
+            (0, 0, 1, 5),
+            "a failed start removes the output and releases output/stream/content"
+        );
+        assert!(!backend.system_loopback_running());
+    }
+
+    #[test]
+    fn system_loopback_screen_capture_stage_failures_are_pinned() {
+        let _host = FakeHostGuard::new();
+        set_test_system_loopback_capability(Some(SystemLoopbackBackend::ScreenCaptureKit));
+        let mut backend = RealAudioBackend::new().expect("backend");
+        platform::fake::set_sck_stage(2);
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::ObjectUnavailable)
+        );
+        assert_eq!(platform::fake::sck_counts(), (0, 0, 0, 1));
+        platform::fake::set_sck_stage(3);
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::ObjectUnavailable)
+        );
+        assert_eq!(platform::fake::sck_counts(), (0, 0, 0, 2));
+        platform::fake::set_sck_stage(4);
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::ObjectUnavailable)
+        );
+        assert_eq!(platform::fake::sck_counts(), (0, 0, 0, 4));
+        platform::fake::set_sck_stage(5);
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::ObjectUnavailable)
+        );
+        assert_eq!(platform::fake::sck_counts(), (0, 0, 0, 7));
+        platform::fake::set_sck_stage(6);
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::ObjectUnavailable)
+        );
+        assert_eq!(platform::fake::sck_counts(), (0, 0, 0, 11));
+        platform::fake::set_sck_stage(7);
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::StreamStart(-1))
+        );
+        assert_eq!(platform::fake::sck_counts(), (0, 0, 0, 16));
+    }
+
+    #[test]
+    fn system_loopback_screen_capture_teardown_race_rejects_stale_frames() {
+        let _host = FakeHostGuard::new();
+        set_test_system_loopback_capability(Some(SystemLoopbackBackend::ScreenCaptureKit));
+        platform::fake::set_sck_samples(vec![0.25, 0.75], 2);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::ScreenCaptureKit)
+        );
+        assert_eq!(backend.system_loopback_available_frames(), 1);
+        backend.stop_system_loopback();
+        assert!(
+            platform::fake::deliver_last_sck(),
+            "the fake host can deliver the torn-down output's buffer"
+        );
+        assert_eq!(
+            backend.system_loopback_available_frames(),
+            0,
+            "a callback racing teardown cannot leak stale frames"
+        );
+        assert_eq!(backend.read_system_loopback_data(), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn system_loopback_tap_failure_falls_back_to_screen_capture_kit() {
+        let _host = FakeHostGuard::new();
+        set_test_screen_capture_kit_available(Some(true));
+        platform::fake::set_tap_status(-50);
+        platform::fake::set_sck_samples(vec![0.5, 0.5], 2);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Ok(SystemLoopbackBackend::ScreenCaptureKit),
+            "tap failure falls back to the next available backend"
+        );
+        assert_eq!(platform::fake::sck_counts().0, 1);
+        assert_eq!(backend.system_loopback_available_frames(), 1);
+        backend.stop_system_loopback();
+        set_test_screen_capture_kit_available(None);
+    }
+
+    #[test]
+    fn system_loopback_both_backends_fail_with_the_last_status() {
+        let _host = FakeHostGuard::new();
+        set_test_screen_capture_kit_available(Some(true));
+        platform::fake::set_tap_status(-50);
+        platform::fake::set_sck_stage(8);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        assert_eq!(
+            backend.start_system_loopback(),
+            Err(SystemLoopbackFailure::StreamStart(-1)),
+            "the last attempted backend's exact status is reported"
+        );
+        assert_eq!(platform::fake::sck_counts(), (0, 0, 1, 5));
+        set_test_screen_capture_kit_available(None);
+    }
+
+    #[test]
+    fn system_loopback_named_device_tap_target_mismatch_is_exact() {
+        let _host = FakeHostGuard::new();
+        set_test_screen_capture_kit_available(Some(true));
+        platform::fake::set_samples(vec![0.25, 0.75], 2);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 4, false);
+        let device = backend.device_info(4).expect("fake device").clone();
+        assert_eq!(
+            backend.start_system_loopback_for_device(&device),
+            Ok(SystemLoopbackBackend::CoreAudioProcessTap)
+        );
+        assert_eq!(
+            platform::fake::tap_targets(),
+            vec![4],
+            "the tap/aggregate is created for the activation's named device"
+        );
+        assert!(backend.system_loopback_running_for(&device.key));
+        assert_eq!(backend.system_loopback_available_frames_for(&device.key), 1);
+        backend.stop_system_loopback_for(&device.key);
+        assert_eq!(platform::fake::destroy_counts(), (1, 1, 1));
+        assert!(!backend.system_loopback_running_for(&device.key));
+
+        let mut missing = device.clone();
+        missing.key = "Missing Device|2|48000".to_string();
+        missing.name = "Missing Device".to_string();
+        assert_eq!(
+            backend.start_system_loopback_for_device(&missing),
+            Err(SystemLoopbackFailure::DeviceUnavailable),
+            "an unresolvable named endpoint fails exactly, never falls back to the default tap"
+        );
+        assert_eq!(
+            platform::fake::tap_targets(),
+            vec![4],
+            "no tap is created for the unresolvable endpoint"
+        );
+        assert_eq!(
+            platform::fake::sck_counts().0,
+            0,
+            "an unresolvable named endpoint must not fall through to system capture"
+        );
+        assert_eq!(platform::fake::destroy_counts(), (1, 1, 1));
+    }
+
+    #[test]
+    fn system_loopback_two_devices_stop_independently() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_samples(vec![0.25, 0.75], 2);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 3, true);
+        fake_device(&mut backend, 4, false);
+        let first = backend.device_info(3).expect("default fake").clone();
+        let second = backend.device_info(4).expect("second fake").clone();
+        assert_eq!(
+            backend.start_system_loopback_for_device(&first),
+            Ok(SystemLoopbackBackend::CoreAudioProcessTap)
+        );
+        assert_eq!(
+            backend.start_system_loopback_for_device(&second),
+            Ok(SystemLoopbackBackend::CoreAudioProcessTap)
+        );
+        assert_eq!(platform::fake::tap_targets(), vec![3, 4]);
+        backend.stop_system_loopback_for(&first.key);
+        assert!(!backend.system_loopback_running_for(&first.key));
+        assert!(
+            backend.system_loopback_running_for(&second.key),
+            "stopping one device's tap never stops another device's tap"
+        );
+        backend.stop_system_loopback_for(&second.key);
+        assert_eq!(platform::fake::destroy_counts(), (2, 2, 2));
+    }
+
+    #[test]
+    fn hog_lease_conflict_across_two_devices_is_denied_without_leaking() {
+        let _host = FakeHostGuard::new();
+        platform::fake::set_device_objects(&[3, 21]);
+        let mut backend = RealAudioBackend::new().expect("backend");
+        fake_device(&mut backend, 20, true);
+        fake_device(&mut backend, 21, false);
+        let our_pid = std::process::id() as i32;
+        force_next_exclusive_stream_open(Some(Ok(64)));
+        let first = backend
+            .open_wasapi_client_exclusive(20, exclusive_test_format())
+            .expect("default exclusive client");
+        assert_eq!(
+            backend.exclusive_client_hog_mode(first),
+            Some(HogModeOutcome::Acquired)
+        );
+        force_next_exclusive_stream_open(Some(Ok(64)));
+        let second = backend
+            .open_wasapi_client_exclusive(21, exclusive_test_format())
+            .expect("second-device exclusive client");
+        assert_eq!(
+            backend.exclusive_client_hog_mode(second),
+            Some(HogModeOutcome::Acquired),
+            "hog mode is per device, so both devices can be held"
+        );
+        assert_eq!(platform::fake::hog_owner_for(3), our_pid);
+        assert_eq!(platform::fake::hog_owner_for(21), our_pid);
+
+        // Another process owns the second device: the conflict is denied
+        // without touching the first device's lease.
+        platform::fake::set_hog_owner(21, 1_234);
+        platform::fake::set_device_statuses(21, -50, 0, 0);
+        force_next_exclusive_stream_open(Some(Ok(64)));
+        let conflicted = backend
+            .open_wasapi_client_exclusive(21, exclusive_test_format())
+            .expect("client-side exclusive open still succeeds");
+        assert_eq!(
+            backend.exclusive_client_hog_mode(conflicted),
+            Some(HogModeOutcome::Denied { owner_pid: 1_234 })
+        );
+        assert_eq!(backend.hog_mode_held(20), true);
+        assert_eq!(backend.hog_mode_held(21), true);
+
+        backend.close_stream(21);
+        assert_eq!(
+            backend.hog_mode_held(20),
+            true,
+            "releasing the second device leaves the first lease intact"
+        );
+        assert_eq!(backend.hog_mode_held(21), false);
+        assert_eq!(platform::fake::hog_owner_for(3), our_pid);
+        backend.close_stream(20);
+        assert_eq!(platform::fake::hog_owner_for(3), -1);
+        assert_eq!(platform::fake::hog_owner_for(21), 1_234);
+        platform::fake::set_hog_owner(21, -1);
     }
 
     #[test]
@@ -7347,9 +8844,10 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_mode_non_default_device_reports_hog_unavailable() {
+    fn exclusive_mode_non_default_device_acquires_its_own_hog() {
         let _host = FakeHostGuard::new();
         platform::fake::set_hog(-1, 0, 0, 0);
+        platform::fake::set_device_objects(&[3, 18]);
         let mut backend = RealAudioBackend::new().expect("backend");
         fake_device(&mut backend, 18, false);
         force_next_exclusive_stream_open(Some(Ok(64)));
@@ -7358,11 +8856,13 @@ mod tests {
             .expect("client-side exclusive open");
         assert_eq!(
             backend.exclusive_client_hog_mode(client),
-            Some(HogModeOutcome::Unavailable),
-            "hog mode is only attempted on the default output device"
+            Some(HogModeOutcome::Acquired),
+            "hog mode is a per-device property and is attempted on named outputs"
         );
-        assert!(!backend.hog_mode_held(18));
+        assert!(backend.hog_mode_held(18));
+        assert_eq!(platform::fake::hog_owner_for(18), std::process::id() as i32);
         backend.close_stream(18);
+        assert_eq!(platform::fake::hog_owner_for(18), -1);
     }
 
     #[test]
