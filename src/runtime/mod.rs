@@ -1095,6 +1095,176 @@ const CRT_QSORT_MAX_COUNT: usize = 1 << 20;
 
 type U64Map<V> = HashMap<u64, V, U64IdentityBuildHasher>;
 
+/// One directly-patched guest IAT slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IatPatchEntry {
+    /// Guest virtual address of the IAT slot.
+    pub slot_va: u64,
+    /// Main image base used to turn `iat_rva` back into a slot address.
+    pub selected_base: u64,
+    /// IAT RVA inside the selected image.
+    pub iat_rva: u32,
+    pub module: String,
+    pub symbol: ImportSymbol,
+    /// Thunk address written by normal import binding.
+    pub bound_value: u64,
+    /// Value currently installed in the slot by the patch table.
+    pub patched_value: u64,
+    pub module_handle: u64,
+}
+
+/// Registry of stable guest IAT slots that currently contain a direct host
+/// thunk address.  The guest IAT itself stays in guest memory and remains
+/// readable/writable; this table mirrors the writes so a replaced thunk can be
+/// propagated and a module unload can invalidate (re-arm) the slot.
+#[derive(Debug, Clone, Default)]
+pub struct IatPatchTable {
+    entries: BTreeMap<u64, IatPatchEntry>,
+    patched_targets: BTreeSet<u64>,
+    pub(crate) patched: u64,
+    pub(crate) dispatch_bypasses: u64,
+    pub(crate) repatched: u64,
+    pub(crate) invalidated: u64,
+}
+
+/// Public view of the IAT patch counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IatMetrics {
+    pub patched: u64,
+    pub dispatch_bypasses: u64,
+    pub repatched: u64,
+    pub invalidated: u64,
+    /// Explicit audit metric aliases.
+    pub iat_patched: u64,
+    pub iat_dispatch_bypasses: u64,
+}
+
+impl IatPatchTable {
+    /// Record or replace a patch.  Returns true when the slot was newly
+    /// patched (an idempotent re-record returns false).
+    pub fn patch(&mut self, entry: IatPatchEntry) -> bool {
+        let slot = entry.slot_va;
+        let target = entry.patched_value;
+        if let Some(previous) = self.entries.get_mut(&slot) {
+            if previous.patched_value != target {
+                self.patched_targets.remove(&previous.patched_value);
+                self.patched_targets.insert(target);
+                previous.patched_value = target;
+                previous.bound_value = entry.bound_value;
+                previous.module = entry.module;
+                previous.symbol = entry.symbol;
+                previous.module_handle = entry.module_handle;
+            }
+            return false;
+        }
+        self.patched_targets.insert(target);
+        self.entries.insert(slot, entry);
+        self.patched += 1;
+        true
+    }
+
+    pub fn unpatch(&mut self, slot_va: u64) -> Option<IatPatchEntry> {
+        let entry = self.entries.remove(&slot_va)?;
+        self.patched_targets.remove(&entry.patched_value);
+        Some(entry)
+    }
+
+    /// Replace every slot that still holds `old` with `new`.  Returns the
+    /// affected slot addresses so the caller can write guest memory.
+    pub fn repatch(&mut self, old: u64, new: u64) -> Vec<u64> {
+        let mut slots = Vec::new();
+        for entry in self.entries.values_mut() {
+            if entry.patched_value == old {
+                entry.patched_value = new;
+                slots.push(entry.slot_va);
+            }
+        }
+        if self.patched_targets.remove(&old) {
+            self.patched_targets.insert(new);
+        }
+        self.repatched += slots.len() as u64;
+        slots
+    }
+
+    /// Slots bound to a module handle, in ascending slot order.
+    pub fn slots_for_module(&self, handle: u64) -> Vec<u64> {
+        self.entries
+            .values()
+            .filter(|entry| entry.module_handle == handle)
+            .map(|entry| entry.slot_va)
+            .collect()
+    }
+
+    /// Slots whose current patched target is `target`.
+    pub fn slots_for_target(&self, target: u64) -> Vec<u64> {
+        self.entries
+            .values()
+            .filter(|entry| entry.patched_value == target)
+            .map(|entry| entry.slot_va)
+            .collect()
+    }
+
+    /// Replace one slot's patched target (the caller has verified the guest
+    /// slot still holds the old value).
+    pub fn set_patched_value(&mut self, slot_va: u64, new: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(&slot_va) else {
+            return false;
+        };
+        let old = entry.patched_value;
+        if old == new {
+            return false;
+        }
+        entry.patched_value = new;
+        self.patched_targets.remove(&old);
+        self.patched_targets.insert(new);
+        self.repatched += 1;
+        true
+    }
+
+    pub fn is_patched_target(&self, target: u64) -> bool {
+        self.patched_targets.contains(&target)
+    }
+
+    pub fn record_dispatch(&mut self, target: u64) -> bool {
+        if self.patched_targets.contains(&target) {
+            self.dispatch_bypasses += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn entry(&self, slot_va: u64) -> Option<&IatPatchEntry> {
+        self.entries.get(&slot_va)
+    }
+
+    pub fn symbol_name(entry: &IatPatchEntry) -> String {
+        match &entry.symbol {
+            ImportSymbol::ByName { name, .. } => name.clone(),
+            ImportSymbol::ByOrdinal { ordinal } => format!("ordinal#{ordinal}"),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn metrics(&self) -> IatMetrics {
+        IatMetrics {
+            patched: self.patched,
+            dispatch_bypasses: self.dispatch_bypasses,
+            repatched: self.repatched,
+            invalidated: self.invalidated,
+            iat_patched: self.patched,
+            iat_dispatch_bypasses: self.dispatch_bypasses,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct U64IdentityBuildHasher;
 
@@ -4525,6 +4695,22 @@ pub enum HostThunk {
     NtDuplicateObject,
     /// `NtQueryObject` — ntdll!NtQueryObject
     NtQueryObject,
+    /// `NtOpenDirectoryObject` — ntdll!NtOpenDirectoryObject
+    NtOpenDirectoryObject,
+    /// `NtQueryDirectoryObject` — ntdll!NtQueryDirectoryObject
+    NtQueryDirectoryObject,
+    /// `NtQueryVolumeInformationFile` — ntdll!NtQueryVolumeInformationFile
+    NtQueryVolumeInformationFile,
+    /// `NtAttestationChallenge` — Casa1 extension: issue a nonce challenge
+    NtAttestationChallenge,
+    /// `NtAttestationQuote` — Casa1 extension: sign a build measurement
+    NtAttestationQuote,
+    /// `NtAttestationVerify` — Casa1 extension: verify a quote
+    NtAttestationVerify,
+    /// `NtAttestationEnrollProvider` — Casa1 extension: enroll a provider key
+    NtAttestationEnrollProvider,
+    /// `NtAttestationRevokeProvider` — Casa1 extension: revoke a provider
+    NtAttestationRevokeProvider,
     /// `NtCreateEvent` — ntdll!NtCreateEvent
     NtCreateEvent,
     /// `NtSetEvent` — ntdll!NtSetEvent
@@ -4691,6 +4877,9 @@ pub enum HostThunk {
     DragFinish,
     /// L8 — URL moniker binding
     CreateURLMoniker,
+    CheckRemoteDebuggerPresent,
+    GetSystemFirmwareTable,
+    GetVolumeInformationW,
     CreateAsyncBindCtx,
     RegisterBindStatusCallback,
     // ── Phase L: COM vtable method thunks ──────────────────────────────────
@@ -5054,6 +5243,40 @@ pub enum HostThunk {
     GetCorSystemDirectory,
     GetRequestedRuntimeInfo,
     LoadLibraryShim,
+    // ── CLR meta host / ICLRRuntimeInfo / IEnumUnknown methods ────────────
+    ClrMetaHostQueryInterface,
+    ClrMetaHostAddRef,
+    ClrMetaHostRelease,
+    ClrMetaHostGetRuntime,
+    ClrMetaHostGetVersionFromFile,
+    ClrMetaHostEnumerateInstalledRuntimes,
+    ClrMetaHostEnumerateLoadedRuntimes,
+    ClrMetaHostRequestRuntimeLoadedNotification,
+    ClrMetaHostQueryLegacyV2RuntimeBinding,
+    ClrMetaHostExitProcess,
+    ClrRuntimeInfoQueryInterface,
+    ClrRuntimeInfoAddRef,
+    ClrRuntimeInfoRelease,
+    ClrRuntimeInfoGetVersionString,
+    ClrRuntimeInfoGetRuntimeDirectory,
+    ClrRuntimeInfoIsLoaded,
+    ClrRuntimeInfoLoadErrorString,
+    ClrRuntimeInfoLoadLibrary,
+    ClrRuntimeInfoGetProcAddress,
+    ClrRuntimeInfoGetInterface,
+    ClrEnumUnknownQueryInterface,
+    ClrEnumUnknownAddRef,
+    ClrEnumUnknownRelease,
+    ClrEnumUnknownNext,
+    ClrEnumUnknownSkip,
+    ClrEnumUnknownReset,
+    ClrEnumUnknownClone,
+    ClrRuntimeLoadedCallbackThreadSet,
+    ClrRuntimeLoadedCallbackThreadUnset,
+    ClrHostExport {
+        runtime_version: String,
+        symbol: String,
+    },
     DirectDrawCreate,
     DirectDrawCreateEx,
     DirectDrawEnumerateW,
@@ -6458,6 +6681,17 @@ pub fn execute_with_options(
         }
     };
 
+    // A managed (.NET) image carries a CLI header (data directory 14).  Run
+    // it on the real CoreCLR host installed on this machine instead of
+    // executing IL bytes as native code.
+    if image
+        .data_directories
+        .get(14)
+        .is_some_and(|directory| directory.virtual_address != 0 && directory.size != 0)
+    {
+        return execute_managed_image(program, args, env, dtm);
+    }
+
     let mut runtime = PeHostRuntime::new(
         ge.clone(),
         dtm,
@@ -6552,6 +6786,7 @@ pub fn execute_with_options(
     if !bound_ok {
         runtime.bind_imports(mapped.selected_base, &mut memory, &resolved_imports)?;
     }
+    runtime.record_iat_bindings(mapped.selected_base, &mut memory, &resolved_imports);
     let _ = std::fs::write("/tmp/casa1_diag.txt", "2:imports bound\n");
 
     // ── Phase M2: Bind delay-load import thunks for lazy resolution ──────────
@@ -8430,19 +8665,37 @@ pub fn execute_with_options(
             // tier so the block is recompiled with the real optimizer
             // (constant folding at Tier1, loop unrolling at Tier2) instead of
             // returning identical Tier0 code.
+            let promotion_start = cached_block.start_rip;
+            let promotion = runtime.tiered_compiler.record_execution(promotion_start);
+            let function_blocks = if promotion == Some(crate::jit::CompilationTier::Tier2) {
+                collect_tier2_function_blocks(&runtime.basic_block_cache, promotion_start)
+            } else {
+                None
+            };
             if let Some(jit) = runtime.jit_runtime.as_mut() {
-                let block_start = cached_block.start_rip;
-                if let Some(tier) = runtime.tiered_compiler.record_execution(block_start) {
-                    let ir = &cached_block.translated.ir;
-                    if jit
-                        .get_or_compile_at_tier(ir, block_start, engine.config.arch, tier, None)
-                        .is_ok()
+                let mut promoted_function = false;
+                if let Some(blocks) = function_blocks.as_ref() {
+                    if let Ok(Some(_)) =
+                        jit.get_or_compile_function_tier2(blocks, engine.config.arch)
                     {
-                        // Sync updated unwind info to the SEH subsystem so that
-                        // RtlVirtualUnwind can find newly compiled JIT blocks.
-                        if jit.is_unwind_dirty() {
-                            jit.unwind_table.register_with_seh(&mut runtime.seh);
-                        }
+                        promoted_function = true;
+                    }
+                }
+                if let Some(tier) = promotion {
+                    if !promoted_function {
+                        let ir = &cached_block.translated.ir;
+                        let _ = jit.get_or_compile_at_tier(
+                            ir,
+                            promotion_start,
+                            engine.config.arch,
+                            tier,
+                            None,
+                        );
+                    }
+                    // Sync updated unwind info to the SEH subsystem so that
+                    // RtlVirtualUnwind can find newly compiled JIT blocks.
+                    if jit.is_unwind_dirty() {
+                        jit.unwind_table.register_with_seh(&mut runtime.seh);
                     }
                 }
             }
@@ -10470,6 +10723,50 @@ fn finalize_execution(
         termination,
         termination_detail,
         jit_telemetry,
+    })
+}
+
+/// Execute a managed (.NET) image on the real CoreCLR runtime installed on the
+/// host.  .NET (Core) images with a runtime configuration run natively through
+/// `dotnet exec`; Framework-only images fail with the runtime's real error.
+fn execute_managed_image(
+    program: &Path,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    dtm: bool,
+) -> AppResult<PeExecutionResult> {
+    let mut command = std::process::Command::new("dotnet");
+    command.arg("exec").arg(program).args(args);
+    command.current_dir(program.parent().unwrap_or_else(|| Path::new(".")));
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().map_err(|error| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!(
+                "no .NET runtime is available to execute the managed image {}",
+                program.display()
+            ),
+            &error,
+        )
+        .with_hint("install a .NET runtime (dotnet) or use an image targeting it")
+    })?;
+    let exit_code = output.status.code().unwrap_or(-1);
+    Ok(PeExecutionResult {
+        synthetic_pid: synthetic_pid(dtm),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code,
+        guest_exceptions: Vec::new(),
+        gfx_frames: Vec::new(),
+        perf: Vec::new(),
+        trace_events: Vec::new(),
+        milestones: crate::steam_milestones::snapshot_milestones(),
+        provenance: crate::steam_milestones::RunProvenance::from_env(),
+        termination: ExecutionTermination::GuestExit { code: exit_code },
+        termination_detail: None,
+        jit_telemetry: JitTelemetry::default(),
     })
 }
 
@@ -13589,6 +13886,9 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<Option<Option<i32>>> {
+        // A call that arrives at a directly-patched IAT thunk has bypassed the
+        // generic name-resolution path.
+        self.iat_patches.record_dispatch(thunk_address);
         // Fast-thunk hot path: if a fast-thunk ARM64 trampoline has been
         // registered for this thunk address, call it directly. This skips
         // the dispatch_import match entirely for JIT-compiled call sites
@@ -28702,6 +29002,16 @@ impl PeHostRuntime {
                             }
                 }
 
+                if released {
+                    let last_reference = self
+                        .dll_info_table
+                        .get(&handle)
+                        .is_none_or(|info| info.load_count == 0);
+                    if last_reference {
+                        self.invalidate_module_iat(handle, memory)?;
+                    }
+                }
+
                 state.set(Register::Rax, u64::from(released));
                 self.last_error = if released { 0 } else { ERROR_INVALID_HANDLE };
                 self.push_trace(
@@ -29361,7 +29671,42 @@ impl PeHostRuntime {
             ref thunk @ (HostThunk::AmGetErrorTextW | HostThunk::DshowClassFactoryCreateInstance | HostThunk::DshowClassFactoryLockServer | HostThunk::DshowFilterGraphRenderFile | HostThunk::DshowFilterGraphRender) => {
                 self.dispatch_dshow(thunk, state, memory)?;
             }
-            ref thunk @ (HostThunk::ClrCreateInstance | HostThunk::CorBindToRuntime | HostThunk::CorBindToRuntimeEx | HostThunk::GetCorSystemDirectory | HostThunk::GetRequestedRuntimeInfo | HostThunk::LoadLibraryShim) => {
+            ref thunk @ (HostThunk::ClrCreateInstance
+            | HostThunk::CorBindToRuntime
+            | HostThunk::CorBindToRuntimeEx
+            | HostThunk::GetCorSystemDirectory
+            | HostThunk::GetRequestedRuntimeInfo
+            | HostThunk::LoadLibraryShim
+            | HostThunk::ClrMetaHostQueryInterface
+            | HostThunk::ClrMetaHostAddRef
+            | HostThunk::ClrMetaHostRelease
+            | HostThunk::ClrMetaHostGetRuntime
+            | HostThunk::ClrMetaHostGetVersionFromFile
+            | HostThunk::ClrMetaHostEnumerateInstalledRuntimes
+            | HostThunk::ClrMetaHostEnumerateLoadedRuntimes
+            | HostThunk::ClrMetaHostRequestRuntimeLoadedNotification
+            | HostThunk::ClrMetaHostQueryLegacyV2RuntimeBinding
+            | HostThunk::ClrMetaHostExitProcess
+            | HostThunk::ClrRuntimeInfoQueryInterface
+            | HostThunk::ClrRuntimeInfoAddRef
+            | HostThunk::ClrRuntimeInfoRelease
+            | HostThunk::ClrRuntimeInfoGetVersionString
+            | HostThunk::ClrRuntimeInfoGetRuntimeDirectory
+            | HostThunk::ClrRuntimeInfoIsLoaded
+            | HostThunk::ClrRuntimeInfoLoadErrorString
+            | HostThunk::ClrRuntimeInfoLoadLibrary
+            | HostThunk::ClrRuntimeInfoGetProcAddress
+            | HostThunk::ClrRuntimeInfoGetInterface
+            | HostThunk::ClrEnumUnknownQueryInterface
+            | HostThunk::ClrEnumUnknownAddRef
+            | HostThunk::ClrEnumUnknownRelease
+            | HostThunk::ClrEnumUnknownNext
+            | HostThunk::ClrEnumUnknownSkip
+            | HostThunk::ClrEnumUnknownReset
+            | HostThunk::ClrEnumUnknownClone
+            | HostThunk::ClrRuntimeLoadedCallbackThreadSet
+            | HostThunk::ClrRuntimeLoadedCallbackThreadUnset
+            | HostThunk::ClrHostExport { .. }) => {
                 self.dispatch_mscoree(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::DirectDrawCreate | HostThunk::DirectDrawCreateEx | HostThunk::DirectDrawEnumerateW | HostThunk::DirectDrawEnumerateExW | HostThunk::DirectDrawGetCaps | HostThunk::DirectDrawSetCooperativeLevel | HostThunk::DirectDrawSetDisplayMode | HostThunk::DirectDrawCreateSurface | HostThunk::DirectDrawEnumSurfaces | HostThunk::DirectDrawGetVerticalBlankStatus | HostThunk::DirectDrawSurfaceBlt | HostThunk::DirectDrawSurfaceFlip | HostThunk::DirectDrawSurfaceLock | HostThunk::DirectDrawSurfaceUnlock | HostThunk::DirectDrawSurfaceGetSurfaceDesc | HostThunk::D3dPerfBeginEvent | HostThunk::D3dPerfEndEvent | HostThunk::D3dPerfGetStatus | HostThunk::D3dPerfQueryRepeatFrame | HostThunk::D3dPerfSetMarker | HostThunk::D3dPerfSetOptions | HostThunk::DebugSetLevel | HostThunk::DebugSetMute | HostThunk::D3d10CreateDevice | HostThunk::D3d10CreateDeviceAndSwapChain | HostThunk::D3d10CoreCreateDevice | HostThunk::D3d10CoreCreateLayeredDevice | HostThunk::D3d10CoreGetSupportedVersions | HostThunk::D3d10CoreRegisterLayers | HostThunk::D3d10Level9CreateDevice | HostThunk::D3d10Level9GetSupportedVersions | HostThunk::D3d10CreateEffectFromMemory | HostThunk::D3d10CreateStateBlock | HostThunk::D3dCreateBlob | HostThunk::D3dBlobGetBufferPointer | HostThunk::D3dBlobGetBufferSize | HostThunk::D3dCompile | HostThunk::D3dCompile2 | HostThunk::D3dCompileFromFile | HostThunk::D3dDisassemble | HostThunk::D3dGetBlobPart | HostThunk::D3dGetTraceInstructionOffsets | HostThunk::D3dLoadModule | HostThunk::D3dReflect | HostThunk::D3dSetBlobPart | HostThunk::D3dSetTraceInstructionOffsets | HostThunk::D3dStripShader | HostThunk::D3dCreateLinker | HostThunk::D3dx11CompileFromFile | HostThunk::D3dx11CompileFromFileW | HostThunk::D3dx11CreateAsyncShaderResourceViewProcessor | HostThunk::D3dx11CreateShaderResourceViewFromFile | HostThunk::D3dx11CreateShaderResourceViewFromFileW | HostThunk::D3dx11CreateTextureFromFileW | HostThunk::D3dx11CreateTextureFromMemory | HostThunk::D3dx11FilterTexture | HostThunk::D3dx11GetImageInfoFromFile | HostThunk::D3dx11GetImageInfoFromFileW | HostThunk::D3dx11LoadTextureFromTexture | HostThunk::D3dx11SaveTextureToFileW | HostThunk::D3dx11SaveTextureToMemory) => {
@@ -32246,7 +32591,122 @@ impl PeHostRuntime {
                 // IsDebuggerPresent() — the runtime's debugger flag (the
                 // model of the PEB BeingDebugged byte).  The guest runs
                 // undebugged unless a debugger attaches.
-                state.set(Register::Rax, u64::from(self.debugger_present));
+                state.set(
+                    Register::Rax,
+                    u64::from(self.anticheat.debug.is_debugger_present()),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::CheckRemoteDebuggerPresent => {
+                let process_handle = guest_call_arg(state, memory, 0)?;
+                let out = guest_call_arg(state, memory, 1)?;
+                if out == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else if process_handle == 0 {
+                    write_u32(memory, out, 0);
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                } else {
+                    let present = self.anticheat.debug.check_remote_debugger_present();
+                    write_u32(memory, out, u32::from(present));
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::GetSystemFirmwareTable => {
+                let provider = guest_call_arg_u32(state, memory, 0)?;
+                let table_id = guest_call_arg_u32(state, memory, 1)?;
+                let buffer = guest_call_arg(state, memory, 2)?;
+                let size = guest_call_arg_u32(state, memory, 3)?;
+                let identity = crate::hardware_identity::host_identity();
+                match crate::hardware_identity::firmware_table(identity, provider, table_id, &mut []) {
+                    Err(crate::hardware_identity::IdentityError::BufferTooSmall { required }) => {
+                        if buffer == 0 || (size as usize) < required {
+                            state.set(Register::Rax, required as u64);
+                            self.last_error = ERROR_INSUFFICIENT_BUFFER;
+                        } else {
+                            let mut bytes = vec![0_u8; size as usize];
+                            match crate::hardware_identity::firmware_table(
+                                identity,
+                                provider,
+                                table_id,
+                                &mut bytes,
+                            ) {
+                                Ok(written) => {
+                                    memory.map_bytes(buffer, &bytes[..written]);
+                                    state.set(Register::Rax, written as u64);
+                                    self.last_error = 0;
+                                }
+                                Err(_) => {
+                                    state.set(Register::Rax, 0);
+                                    self.last_error = ERROR_NOT_SUPPORTED;
+                                }
+                            }
+                        }
+                    }
+                    Err(crate::hardware_identity::IdentityError::FactAbsent(_))
+                    | Err(crate::hardware_identity::IdentityError::UnsupportedHost) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_NOT_SUPPORTED;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    }
+                    Ok(written) => {
+                        state.set(Register::Rax, written as u64);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetVolumeInformationW => {
+                const ERROR_NOT_READY: u32 = 21;
+                let root = guest_call_arg(state, memory, 0)?;
+                let name_ptr = guest_call_arg(state, memory, 1)?;
+                let name_size = guest_call_arg_u32(state, memory, 2)?;
+                let serial_out = guest_call_arg(state, memory, 3)?;
+                let max_component_out = guest_call_arg(state, memory, 4)?;
+                let flags_out = guest_call_arg(state, memory, 5)?;
+                let fs_ptr = guest_call_arg(state, memory, 6)?;
+                let fs_size = guest_call_arg_u32(state, memory, 7)?;
+                let identity = crate::hardware_identity::host_identity();
+                let Some(volume) = identity.disks.first() else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_NOT_READY;
+                    return Ok(None);
+                };
+                if root == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                if name_ptr != 0 && name_size != 0 {
+                    let _ = write_utf16_buffer(
+                        memory,
+                        name_ptr,
+                        name_size as usize,
+                        &volume.volume_name,
+                    );
+                }
+                if fs_ptr != 0 && fs_size != 0 {
+                    let _ = write_utf16_buffer(
+                        memory,
+                        fs_ptr,
+                        fs_size as usize,
+                        &volume.filesystem,
+                    );
+                }
+                if serial_out != 0 {
+                    write_u32(memory, serial_out, volume.volume_serial);
+                }
+                if max_component_out != 0 {
+                    write_u32(memory, max_component_out, 255);
+                }
+                if flags_out != 0 {
+                    write_u32(memory, flags_out, 0);
+                }
+                state.set(Register::Rax, 1);
                 self.last_error = 0;
             }
             HostThunk::InitOnceBeginInitialize => {
@@ -41880,7 +42340,7 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
-                    let counter = self.win32.query_performance_counter();
+                    let counter = self.anticheat.clock.query_performance_counter() as u64;
                     write_u64(memory, counter_ptr, counter);
                     state.set(Register::Rax, 1);
                     self.last_error = 0;
@@ -41898,7 +42358,7 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
-                    let frequency = self.win32.query_performance_frequency();
+                    let frequency = self.anticheat.clock.query_performance_frequency() as u64;
                     write_u64(memory, frequency_ptr, frequency);
                     state.set(Register::Rax, 1);
                     self.last_error = 0;
@@ -42358,9 +42818,8 @@ impl PeHostRuntime {
             }
             HostThunk::GetSystemTimePreciseAsFileTime => {
                 let file_time_ptr = guest_call_arg(state, memory, 0)?;
-                // The same single derivation as GetSystemTimeAsFileTime /
-                // NtQuerySystemTime.
-                let ticks = guest_filetime_ticks(&self.win32);
+                // The same single monotonic clock as the other timing APIs.
+                let ticks = self.anticheat.clock.system_time_precise_file_time();
                 if file_time_ptr != 0 {
                     write_u64(memory, file_time_ptr, ticks);
                 }
@@ -42397,13 +42856,13 @@ impl PeHostRuntime {
                 );
             }
             HostThunk::GetTickCount => {
-                let milliseconds = self.win32.get_tick_count64() & u32::MAX as u64;
+                let milliseconds = self.anticheat.clock.tick_count64() & u32::MAX as u64;
                 state.set(Register::Rax, milliseconds);
                 self.last_error = 0;
                 self.push_trace("time", "GetTickCount", BTreeMap::new(), json!(milliseconds));
             }
             HostThunk::GetTickCount64 => {
-                let milliseconds = self.win32.get_tick_count64();
+                let milliseconds = self.anticheat.clock.tick_count64();
                 state.set(Register::Rax, milliseconds);
                 self.last_error = 0;
                 self.push_trace("time", "GetTickCount64", BTreeMap::new(), json!(milliseconds));
@@ -56120,6 +56579,30 @@ impl PeHostRuntime {
             HostThunk::NtQueryObject => {
                 self.dispatch_nt_query_object(state, memory)?;
             }
+            HostThunk::NtOpenDirectoryObject => {
+                self.dispatch_nt_open_directory_object(state, memory)?;
+            }
+            HostThunk::NtQueryDirectoryObject => {
+                self.dispatch_nt_query_directory_object(state, memory)?;
+            }
+            HostThunk::NtQueryVolumeInformationFile => {
+                self.dispatch_nt_query_volume_information_file(state, memory)?;
+            }
+            HostThunk::NtAttestationChallenge => {
+                self.dispatch_nt_attestation_challenge(state, memory)?;
+            }
+            HostThunk::NtAttestationQuote => {
+                self.dispatch_nt_attestation_quote(state, memory)?;
+            }
+            HostThunk::NtAttestationVerify => {
+                self.dispatch_nt_attestation_verify(state, memory)?;
+            }
+            HostThunk::NtAttestationEnrollProvider => {
+                self.dispatch_nt_attestation_enroll_provider(state, memory)?;
+            }
+            HostThunk::NtAttestationRevokeProvider => {
+                self.dispatch_nt_attestation_revoke_provider(state, memory)?;
+            }
             HostThunk::NtCreateEvent => {
                 self.dispatch_nt_create_event(state, memory)?;
             }
@@ -56334,7 +56817,11 @@ impl PeHostRuntime {
                 self.dispatch_ldr_load_dll(state, memory)?;
             }
             HostThunk::LdrUnloadDll => {
+                let handle = guest_call_arg(state, memory, 0)?;
                 self.dispatch_ldr_unload_dll(state, memory)?;
+                if !self.module_handles.values().any(|value| *value == handle) {
+                    self.invalidate_module_iat(handle, memory)?;
+                }
             }
             HostThunk::LdrGetDllHandle => {
                 self.dispatch_ldr_get_dll_handle(state, memory)?;
@@ -56352,7 +56839,15 @@ impl PeHostRuntime {
                 self.dispatch_ldr_add_ref_dll(state, memory)?;
             }
             HostThunk::LdrRemoveRefDll => {
+                let handle = guest_call_arg(state, memory, 0)?;
                 self.dispatch_ldr_remove_ref_dll(state, memory)?;
+                let last_reference = self
+                    .dll_info_table
+                    .get(&handle)
+                    .is_none_or(|info| info.load_count == 0);
+                if last_reference {
+                    self.invalidate_module_iat(handle, memory)?;
+                }
             }
             // -- Phase 2.1: libcef.dll CEF dispatch arms --------------------------
             HostThunk::CefInitialize => {
@@ -57274,6 +57769,10 @@ impl PeHostRuntime {
                 let _locale = read_utf16_string(memory, locale_ptr).unwrap_or_default();
                 let _authority = read_utf16_string(memory, authority_ptr).unwrap_or_default();
                 eprintln!("WbemLocator::ConnectServer(server={server:?})");
+                // Mirror the stable install identity into the guest registry so
+                // a WMI consumer, a RegQueryValueEx reader and the firmware
+                // table all observe the same MachineGuid/ProductId.
+                let _ = crate::hardware_identity::sync_install_identity_to_registry(self.win32.ge());
                 if out_ptr != 0 {
                     let services_obj = self.alloc_wbem_services_object(memory)?;
                     write_guest_pointer(memory, out_ptr, services_obj, self.guest_arch)?;
@@ -62709,6 +63208,14 @@ impl PeHostRuntime {
                 //    DelayLoadResolve trampoline entirely.
                 let slot_va = selected_base + u64::from(iat_rva);
                 write_guest_pointer(memory, slot_va, resolved_addr, self.guest_arch)?;
+                self.record_iat_resolution(
+                    &resolved_module,
+                    symbol.clone(),
+                    iat_rva,
+                    selected_base,
+                    resolved_addr,
+                    memory,
+                );
 
                 emit_live_ui_debug(format!(
                     "DelayLoadResolve: patched IAT slot {:#x} -> {:#x} for {}!{:?}",
@@ -64480,7 +64987,10 @@ impl PeHostRuntime {
         ir: &[crate::cpu::IrInstruction],
         label: &str,
     ) -> AppResult<bool> {
-        match engine.execute_with_jit(state, memory, ir, self.jit_runtime.as_mut()) {
+        crate::jit::set_pe_runtime_pointer(self as *mut PeHostRuntime as *mut libc::c_void);
+        let result = engine.execute_with_jit(state, memory, ir, self.jit_runtime.as_mut());
+        crate::jit::set_pe_runtime_pointer(std::ptr::null_mut());
+        match result {
             Ok(_) => Ok(false),
             Err(error) => {
                 if self.try_deliver_x86_access_violation(state, memory, &error, label)? {
@@ -65420,9 +65930,164 @@ impl PeHostRuntime {
         let _ = (self, thunk_address);
     }
 
+    /// Mirror the direct thunk addresses that the loader just wrote into the
+    /// guest IAT.  The guest image remains the source of truth (readable and
+    /// writable); the table is used to re-resolve and invalidate entries when
+    /// a thunk changes or a module unloads.
+    pub(crate) fn record_iat_bindings(
+        &mut self,
+        selected_base: u64,
+        memory: &mut MemoryImage,
+        imports: &[ResolvedImport],
+    ) {
+        let arch = self.guest_arch;
+        for import in imports {
+            let slot_va = selected_base.wrapping_add(u64::from(import.iat_rva));
+            let Ok(value) = read_guest_pointer(memory, slot_va, arch) else {
+                continue;
+            };
+            if value == 0 {
+                continue;
+            }
+            // Re-assert the direct host-thunk address in the guest IAT.  This
+            // is idempotent after the loader's normal binding, but it makes the
+            // patch an explicit, observable guest-memory write.
+            if write_guest_pointer(memory, slot_va, value, arch).is_err() {
+                continue;
+            }
+            if let Some(thunk) = self.host_thunks.get(&value)
+                && let Some(api) = crate::jit::InlineApi::from_thunk(thunk)
+            {
+                crate::jit::register_inline_api_target(value, api);
+            }
+            let module_handle = self
+                .module_handles
+                .iter()
+                .find(|(name, _)| {
+                    normalize_module_name(name) == normalize_module_name(&import.resolved_module)
+                })
+                .map(|(_, handle)| *handle)
+                .unwrap_or(0);
+            self.iat_patches.patch(IatPatchEntry {
+                slot_va,
+                selected_base,
+                iat_rva: import.iat_rva,
+                module: import.resolved_module.clone(),
+                symbol: import.symbol.clone(),
+                bound_value: value,
+                patched_value: value,
+                module_handle,
+            });
+        }
+    }
+
+    /// Record a delay-load resolution (the first call has just overwritten the
+    /// slot with the resolved host address).
+    pub(crate) fn record_iat_resolution(
+        &mut self,
+        resolved_module: &str,
+        symbol: ImportSymbol,
+        iat_rva: u32,
+        selected_base: u64,
+        resolved_value: u64,
+        memory: &MemoryImage,
+    ) {
+        let slot_va = selected_base.wrapping_add(u64::from(iat_rva));
+        let bound_value =
+            read_guest_pointer(memory, slot_va, self.guest_arch).unwrap_or(resolved_value);
+        let module_handle = self
+            .module_handles
+            .iter()
+            .find(|(name, _)| normalize_module_name(name) == normalize_module_name(resolved_module))
+            .map(|(_, handle)| *handle)
+            .unwrap_or(0);
+        self.iat_patches.patch(IatPatchEntry {
+            slot_va,
+            selected_base,
+            iat_rva,
+            module: resolved_module.to_string(),
+            symbol,
+            bound_value,
+            patched_value: resolved_value,
+            module_handle,
+        });
+    }
+
+    /// Propagate a replaced host thunk into every still-patched IAT slot.
+    /// Slots the guest itself rewrote are left untouched (the IAT is guest
+    /// memory and guest writes win).
+    #[allow(dead_code)]
+    pub fn re_resolve_iat_thunk(
+        &mut self,
+        old_thunk: u64,
+        new_thunk: u64,
+        memory: &mut MemoryImage,
+    ) -> AppResult<usize> {
+        let slots = self.iat_patches.slots_for_target(old_thunk);
+        let arch = self.guest_arch;
+        let mut written = 0;
+        for slot in slots {
+            let Ok(current) = read_guest_pointer(memory, slot, arch) else {
+                continue;
+            };
+            // Guest writes win: a slot the guest changed is left alone and the
+            // tracking entry keeps describing the value actually in memory.
+            if current != old_thunk {
+                continue;
+            }
+            self.iat_patches.set_patched_value(slot, new_thunk);
+            write_guest_pointer(memory, slot, new_thunk, arch)?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Invalidate every patched slot that belongs to `module_handle`.  The slot
+    /// is re-armed with a fresh `DelayLoadResolve` thunk, so the next call
+    /// re-resolves the module instead of jumping into unloaded code.
+    pub(crate) fn invalidate_module_iat(
+        &mut self,
+        module_handle: u64,
+        memory: &mut MemoryImage,
+    ) -> AppResult<usize> {
+        let slots = self.iat_patches.slots_for_module(module_handle);
+        let arch = self.guest_arch;
+        let mut invalidated = 0;
+        for slot in slots {
+            let Some(entry) = self.iat_patches.entry(slot).cloned() else {
+                continue;
+            };
+            let Ok(current) = read_guest_pointer(memory, slot, arch) else {
+                continue;
+            };
+            if current != entry.patched_value {
+                continue;
+            }
+            let resolver = self.alloc_host_thunk(HostThunk::DelayLoadResolve {
+                resolved_module: entry.module.clone(),
+                symbol: entry.symbol.clone(),
+                iat_rva: entry.iat_rva,
+                selected_base: entry.selected_base,
+            });
+            write_guest_pointer(memory, slot, resolver, arch)?;
+            self.iat_patches.unpatch(slot);
+            self.iat_patches.invalidated += 1;
+            invalidated += 1;
+        }
+        Ok(invalidated)
+    }
+
+    #[allow(dead_code)]
+    pub fn iat_metrics(&self) -> IatMetrics {
+        self.iat_patches.metrics()
+    }
+
     fn alloc_host_thunk(&mut self, thunk: HostThunk) -> u64 {
         let address = self.next_thunk_address;
         self.next_thunk_address += 0x10;
+        if let Some(api) = crate::jit::InlineApi::from_thunk(&thunk) {
+            crate::jit::register_inline_api_target(address, api);
+        }
         self.host_thunks.insert(address, thunk);
         // Register a fast-thunk ARM64 trampoline so JIT-compiled code and
         // the dispatch hot path can call the host function directly without
@@ -65501,1658 +66166,6 @@ impl PeHostRuntime {
             self.tls_slots.insert(slot, value);
         }
         Ok(())
-    }
-
-    // ── Patch 6b: CRT errno / doserrno model ──────────────────────────────────
-    // The errno int lives in guest memory at a stable per-thread address.  For
-    // x86 guests the address is stored in a dedicated TLS vector slot (found
-    // with the same first-free search as `TlsAlloc`, so it never collides with
-    // guest-allocated slots), which `prepare_guest_thread_entry` re-creates
-    // per thread.  For x64 guests (no TLS vector) a single stable allocation is
-    // used.  `_errno`/`_doserrno` return this address; the guest reads and
-    // writes the int through it directly.
-    fn allocate_crt_tls_storage(&mut self, memory: &mut MemoryImage, seed: u32) -> AppResult<u32> {
-        let storage = self.alloc_u32(memory, seed)?;
-        let slot = (1_u32..4096)
-            .find(|candidate| !self.tls_slots.contains_key(candidate))
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    "CRT TLS slot space exhausted (4096 slots)",
-                )
-            })?;
-        self.tls_slots.insert(slot, storage);
-        self.sync_guest_tls_slot(memory, slot, storage)?;
-        Ok(slot)
-    }
-
-    fn crt_tls_storage(&self, memory: &MemoryImage, slot: u32) -> AppResult<u64> {
-        if self.tls_vector_ptr != 0 && slot != 0 {
-            let slot_address = self
-                .tls_vector_ptr
-                .wrapping_add(slot as u64 * self.guest_arch.pointer_bytes() as u64);
-            return read_guest_pointer(memory, slot_address, self.guest_arch);
-        }
-        Ok(0)
-    }
-
-    /// Guest pointer to the current thread's errno int (allocating it on first
-    /// use).  Fresh storage is seeded with the host-side mirror so values set
-    /// via `set_crt_errno` before the slot was allocated are not lost.
-    fn crt_errno_ptr(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        if self.crt_errno_slot == 0 {
-            if self.tls_vector_ptr == 0 {
-                if self.crt_errno_storage == 0 {
-                    self.crt_errno_storage = self.alloc_u32(memory, self.crt_errno_value as u32)?;
-                }
-                return Ok(self.crt_errno_storage);
-            }
-            self.crt_errno_slot =
-                self.allocate_crt_tls_storage(memory, self.crt_errno_value as u32)?;
-        }
-        let ptr = self.crt_tls_storage(memory, self.crt_errno_slot)?;
-        if ptr != 0 {
-            return Ok(ptr);
-        }
-        let storage = self.alloc_u32(memory, self.crt_errno_value as u32)?;
-        self.tls_slots.insert(self.crt_errno_slot, storage);
-        self.sync_guest_tls_slot(memory, self.crt_errno_slot, storage)?;
-        Ok(storage)
-    }
-
-    /// Guest pointer to the current thread's doserrno int (allocating it on
-    /// first use).  Fresh storage is seeded with the host-side mirror.
-    fn crt_doserrno_ptr(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        if self.crt_doserrno_slot == 0 {
-            if self.tls_vector_ptr == 0 {
-                if self.crt_doserrno_storage == 0 {
-                    self.crt_doserrno_storage =
-                        self.alloc_u32(memory, self.crt_doserrno_value as u32)?;
-                }
-                return Ok(self.crt_doserrno_storage);
-            }
-            self.crt_doserrno_slot =
-                self.allocate_crt_tls_storage(memory, self.crt_doserrno_value as u32)?;
-        }
-        let ptr = self.crt_tls_storage(memory, self.crt_doserrno_slot)?;
-        if ptr != 0 {
-            return Ok(ptr);
-        }
-        let storage = self.alloc_u32(memory, self.crt_doserrno_value as u32)?;
-        self.tls_slots.insert(self.crt_doserrno_slot, storage);
-        self.sync_guest_tls_slot(memory, self.crt_doserrno_slot, storage)?;
-        Ok(storage)
-    }
-
-    /// Host-side helper used by failing CRT thunks: records `value` as the
-    /// current thread's errno, both in the guest-visible int (if the TLS
-    /// storage is initialised) and in the host mirror.  CRT functions do NOT
-    /// set GetLastError.
-    fn write_crt_errno_value(&self, memory: &mut MemoryImage, ptr: u64, value: i32) {
-        if ptr != 0 {
-            memory.map_bytes(ptr, &value.to_le_bytes());
-        }
-    }
-
-    fn set_crt_errno(&mut self, memory: &mut MemoryImage, value: i32) {
-        self.crt_errno_value = value;
-        if self.tls_vector_ptr != 0 && self.crt_errno_slot != 0 {
-            let ptr = self
-                .crt_tls_storage(memory, self.crt_errno_slot)
-                .unwrap_or(0);
-            if ptr != 0 {
-                self.write_crt_errno_value(memory, ptr, value);
-                return;
-            }
-        }
-        self.write_crt_errno_value(memory, self.crt_errno_storage, value);
-    }
-
-    /// Host-side helper mirroring `set_crt_errno` for `_doserrno`.
-    fn set_crt_doserrno(&mut self, memory: &mut MemoryImage, value: i32) {
-        self.crt_doserrno_value = value;
-        if self.tls_vector_ptr != 0 && self.crt_doserrno_slot != 0 {
-            let ptr = self
-                .crt_tls_storage(memory, self.crt_doserrno_slot)
-                .unwrap_or(0);
-            if ptr != 0 {
-                self.write_crt_errno_value(memory, ptr, value);
-                return;
-            }
-        }
-        self.write_crt_errno_value(memory, self.crt_doserrno_storage, value);
-    }
-
-    /// Current errno value for the running thread (guest storage wins when
-    /// present — the guest may have written to the `_errno()` int directly).
-    fn crt_errno_get(&mut self, memory: &mut MemoryImage) -> i32 {
-        let mut value = self.crt_errno_value;
-        let ptr = if self.tls_vector_ptr != 0 && self.crt_errno_slot != 0 {
-            self.crt_tls_storage(memory, self.crt_errno_slot).ok()
-        } else if self.crt_errno_storage != 0 {
-            Some(self.crt_errno_storage)
-        } else {
-            None
-        };
-        if let Some(ptr) = ptr
-            && ptr != 0
-            && let Ok(bytes) = memory.read_bytes(ptr, 4)
-        {
-            value = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        }
-        self.crt_errno_value = value;
-        value
-    }
-
-    /// Invoke the guest's `_invalid_parameter_handler` (installed via
-    /// `_set_invalid_parameter_handler`) with the standard "noinfo" argument
-    /// list (expression, function, file, line, reserved), then — because the
-    /// Windows CRT terminates after a returning handler — report that the
-    /// guest should be aborted.  With no handler installed the guest is
-    /// aborted immediately (emulating the default Watson/abort behavior).
-    ///
-    /// Returns `true` when the caller must terminate the guest (abort).
-    fn raise_invalid_parameter(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-        expression: u64,
-        file: u64,
-        line: u32,
-    ) -> AppResult<bool> {
-        if self.invalid_parameter_handler != 0 {
-            let handler = self.invalid_parameter_handler;
-            let _ = self.execute_guest_callback(
-                state,
-                memory,
-                handler,
-                &[expression, 0, file, u64::from(line), 0],
-                "invalid_parameter_handler",
-            )?;
-        }
-        Ok(true)
-    }
-
-    /// Convenience: raise the invalid-parameter handler and set errno; used by
-    /// the `*_s` family when the caller MUST be aborted on return.
-    fn crt_invalid_parameter(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-        errno_value: i32,
-    ) -> AppResult<Option<i32>> {
-        // Steam run instrumentation (no behavior change): record the first
-        // CRT invalid-parameter invocation for the run.
-        crate::steam_milestones::record_first_failure(
-            crate::steam_milestones::FailureCategory::Crt,
-            state.rip as u32,
-            self.win32.current_thread_id(),
-            Some("_invalid_parameter_handler".to_string()),
-            Some(errno_value.unsigned_abs()),
-            "CRT invalid-parameter handler invoked".to_string(),
-            None,
-            None,
-        );
-        self.set_crt_errno(memory, errno_value);
-        if self.raise_invalid_parameter(state, memory, 0, 0, 0)? {
-            state.set(Register::Rax, errno_value as u64);
-            return Ok(Some(134)); // abort()
-        }
-        Ok(None)
-    }
-
-    /// Patch 6c: raise the MSVC C++ exception (0xE06D7363) through the guest
-    /// SEH chain — the `_CxxThrowException` shape the `_X*` / `std::_Throw_*`
-    /// helpers use.  A handler claiming the exception resumes the caller with
-    /// the code as the result; an unhandled throw terminates the process with
-    /// the exception code (Windows semantics), recording the throw-info token
-    /// for the report.
-    fn crt_raise_cpp_exception(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-        api_name: &str,
-        throw_info: u64,
-    ) -> AppResult<Option<i32>> {
-        let code = 0xE06D_7363;
-        let handled = if self.guest_arch == GuestArch::X86 {
-            self.dispatch_x86_exception(state, memory, code, throw_info, api_name, &[])?
-        } else if self.guest_arch == GuestArch::X64 {
-            let ctx = crate::seh::X64Context {
-                rax: state.gpr[0],
-                rcx: state.gpr[1],
-                rdx: state.gpr[2],
-                rbx: state.gpr[3],
-                rsp: state.gpr[4],
-                rbp: state.gpr[5],
-                rsi: state.gpr[6],
-                rdi: state.gpr[7],
-                r8: state.gpr[8],
-                r9: state.gpr[9],
-                r10: state.gpr[10],
-                r11: state.gpr[11],
-                r12: state.gpr[12],
-                r13: state.gpr[13],
-                r14: state.gpr[14],
-                r15: state.gpr[15],
-                rip: state.rip,
-                xmm: {
-                    let mut xmm = [crate::seh::Xmm128::default(); 16];
-                    for (i, slot) in xmm.iter_mut().enumerate() {
-                        *slot = crate::seh::Xmm128 {
-                            low: state.xmm[i].low,
-                            high: state.xmm[i].high,
-                        };
-                    }
-                    xmm
-                },
-            };
-            let mem_ref: &MemoryImage = memory;
-            let stack_reader =
-                |addr: u64, buf: &mut [u8]| -> bool { mem_ref.read_into(addr, buf).is_ok() };
-            self.seh
-                .dispatch(code, 0, &ctx, self.mapped_image_base, &stack_reader)
-                .is_ok()
-        } else {
-            false
-        };
-        if handled {
-            // A handler claimed the throw: the caller resumes with the code.
-            state.set(Register::Rax, u64::from(code));
-            self.last_error = 0;
-            Ok(None)
-        } else {
-            // Unhandled C++ throw: terminate the process with the exception
-            // code (the structured termination is GuestException).
-            self.unhandled_guest_exception = Some(code);
-            self.emit_event(crate::runtime_events::RuntimeEvent::GuestException {
-                code,
-                guest_pc: state.rip,
-                thread_id: self.win32.current_thread_id(),
-            });
-            crate::steam_milestones::record_first_failure(
-                crate::steam_milestones::FailureCategory::Crt,
-                state.rip as u32,
-                self.win32.current_thread_id(),
-                Some(api_name.to_string()),
-                Some(code),
-                format!("unhandled C++ exception from {api_name}"),
-                None,
-                Some(format!("{{\"throw_info\":{throw_info:#x}}}")),
-            );
-            state.set(Register::Rax, u64::from(code));
-            self.process_exit_requested = Some(code);
-            Ok(Some(code as i32))
-        }
-    }
-
-    // ── Patch 6b: CRT FILE* model ─────────────────────────────────────────────
-    /// Allocate a guest FILE block (zeroed 0x80 bytes, mirroring the
-    /// `__acrt_iob_func` blocks) and register host state for it.  The fd is
-    /// written at offset 0x10 (the `_iobuf::_file` field offset on x86) so
-    /// `_fileno` and guest code reading the struct directly agree.  The block
-    /// is carved from the guest heap so `fclose` can free it (see
-    /// `crt_close_stream`); repeated fopen/fclose cycles therefore do not
-    /// leak guest memory.
-    fn crt_alloc_file(&mut self, memory: &mut MemoryImage, state: &CrtFileState) -> AppResult<u64> {
-        let file_ptr = self.alloc_heap(memory, 0x80, true)?;
-        memory.map_bytes(file_ptr + 0x10, &state.handle.to_le_bytes());
-        self.crt_files.insert(file_ptr, state.clone());
-        Ok(file_ptr)
-    }
-
-    fn crt_stream_state(&self, stream: u64) -> Option<CrtFileState> {
-        self.crt_files.get(&stream).cloned()
-    }
-
-    /// True when `stream` is one of the standard iob streams (stdin/stdout/
-    /// stderr).  Returns the stream index (0/1/2) when it is.
-    fn crt_iob_index(&self, stream: u64) -> Option<usize> {
-        self.globals
-            .iob_streams
-            .iter()
-            .position(|iob| *iob == stream)
-    }
-
-    /// The win32 handle for a stream, or None for the iob streams / unknown
-    /// streams.
-    fn crt_stream_handle(&self, stream: u64) -> Option<u32> {
-        self.crt_stream_state(stream).map(|state| state.handle)
-    }
-
-    fn crt_close_stream(&mut self, stream: u64) -> AppResult<bool> {
-        if let Some(state) = self.crt_files.remove(&stream) {
-            let _ = self.win32.close_handle(state.handle);
-            // Free the guest FILE block (0x80-byte heap allocation) so
-            // repeated fopen/fclose cycles do not leak guest memory.
-            self.heap_allocations.remove(&stream);
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    // ── Patch 6b: printf engine ───────────────────────────────────────────────
-    /// Parse a UCRT `__stdio_common_*` format specification starting at the
-    /// `%` in a wide format string and render one conversion.  `va` is the
-    /// x86-cdecl vararg cursor; `out` receives the rendered bytes.
-    #[allow(clippy::too_many_arguments)]
-    fn crt_render_conversion(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-        format: &[u16],
-        index: &mut usize,
-        va: &mut CrtVaReader,
-        out: &mut Vec<u8>,
-        guest_arch: GuestArch,
-    ) -> AppResult<()> {
-        let mut flags_minus = false;
-        let mut flags_plus = false;
-        let mut flags_zero = false;
-        let mut flags_space = false;
-        let mut flags_hash = false;
-        *index += 1;
-        while *index < format.len() {
-            match format[*index] {
-                0x2D => flags_minus = true,
-                0x2B => flags_plus = true,
-                0x30 => flags_zero = true,
-                0x20 => flags_space = true,
-                0x23 => flags_hash = true,
-                _ => break,
-            }
-            *index += 1;
-        }
-        let mut width: i32 = -1;
-        while *index < format.len() && (format[*index] as u8).is_ascii_digit() {
-            width = width
-                .max(0)
-                .saturating_mul(10)
-                .saturating_add(i32::from(format[*index] - b'0' as u16));
-            *index += 1;
-        }
-        let mut precision: i32 = -1;
-        if *index < format.len() && format[*index] == 0x2E {
-            *index += 1;
-            precision = 0;
-            while *index < format.len() && (format[*index] as u8).is_ascii_digit() {
-                precision = precision
-                    .saturating_mul(10)
-                    .saturating_add(i32::from(format[*index] - b'0' as u16));
-                *index += 1;
-            }
-        }
-        let mut length = CrtLengthModifier::None;
-        if *index < format.len() {
-            match format[*index] {
-                0x68 => {
-                    *index += 1;
-                    if *index < format.len() && format[*index] == 0x68 {
-                        length = CrtLengthModifier::Hh;
-                        *index += 1;
-                    } else {
-                        length = CrtLengthModifier::H;
-                    }
-                }
-                0x6C => {
-                    *index += 1;
-                    if *index < format.len() && format[*index] == 0x6C {
-                        length = CrtLengthModifier::Ll;
-                        *index += 1;
-                    } else {
-                        length = CrtLengthModifier::L;
-                    }
-                }
-                0x49 => {
-                    // I64
-                    if *index + 2 < format.len()
-                        && format[*index + 1] == 0x36
-                        && format[*index + 2] == 0x34
-                    {
-                        length = CrtLengthModifier::Ll;
-                        *index += 3;
-                    } else {
-                        *index += 1;
-                    }
-                }
-                0x77 => {
-                    length = CrtLengthModifier::L;
-                    *index += 1;
-                }
-                _ => {}
-            }
-        }
-        let conversion = *format.get(*index).unwrap_or(&0);
-        *index += 1;
-
-        let pad =
-            |rendered: &mut Vec<u8>, width: i32, flags_minus: bool, flags_zero: bool| -> Vec<u8> {
-                let width = width.max(rendered.len() as i32) as usize;
-                if flags_minus {
-                    let mut padded = rendered.clone();
-                    padded.resize(width, b' ');
-                    padded
-                } else {
-                    let mut padded = vec![b' '; width];
-                    let start = width - rendered.len();
-                    if flags_zero {
-                        // Zero padding must only fill the DIGIT region: the sign
-                        // ('-', '+', ' ') and hex prefix ("0x"/"0X") stay at the
-                        // front, so "%05d" of -12 → "-0012" (not "-0-12") and
-                        // "%#08x" of 0xCAFE → "0x00cafe" (not "00xcafe").
-                        let mut head: Vec<u8> = Vec::new();
-                        let mut digits = rendered.as_slice();
-                        if let Some(&first) = rendered.first()
-                            && matches!(first, b'-' | b'+' | b' ')
-                        {
-                            head.push(first);
-                            digits = &rendered[1..];
-                        }
-                        if digits.starts_with(b"0x") || digits.starts_with(b"0X") {
-                            head.extend_from_slice(&digits[..2]);
-                            digits = &digits[2..];
-                        }
-                        let digit_start = start + head.len();
-                        for slot in padded.iter_mut().take(digit_start).skip(head.len()) {
-                            *slot = b'0';
-                        }
-                        padded[..head.len()].copy_from_slice(&head);
-                        padded[digit_start..].copy_from_slice(digits);
-                    } else {
-                        padded[start..].copy_from_slice(rendered);
-                    }
-                    padded
-                }
-            };
-
-        let sign_prefix =
-            |rendered: &mut Vec<u8>, negative: bool, flags_plus: bool, flags_space: bool| {
-                if negative {
-                    rendered.insert(0, b'-');
-                } else if flags_plus {
-                    rendered.insert(0, b'+');
-                } else if flags_space {
-                    rendered.insert(0, b' ');
-                }
-            };
-
-        let hex_digit = |digit: u8, upper: bool| -> u8 {
-            if digit < 10 {
-                b'0' + digit
-            } else if upper {
-                b'A' + digit - 10
-            } else {
-                b'a' + digit - 10
-            }
-        };
-
-        match conversion {
-            0x64 | 0x69 => {
-                // %d %i — signed integer
-                let (value, negative) = match length {
-                    CrtLengthModifier::None | CrtLengthModifier::L => {
-                        let raw = va.read_u32(memory)? as i32;
-                        (raw.unsigned_abs() as u64, raw < 0)
-                    }
-                    CrtLengthModifier::H => {
-                        let raw = (va.read_u32(memory)? as u16 as i16) as i32;
-                        (raw.unsigned_abs() as u64, raw < 0)
-                    }
-                    CrtLengthModifier::Hh => {
-                        let raw = (va.read_u32(memory)? as u8 as i8) as i32;
-                        (raw.unsigned_abs() as u64, raw < 0)
-                    }
-                    CrtLengthModifier::Ll => {
-                        let raw = va.read_u64(memory)? as i64;
-                        (raw.unsigned_abs(), raw < 0)
-                    }
-                };
-                let mut digits = Vec::new();
-                let mut remaining = value;
-                if remaining == 0 {
-                    digits.push(b'0');
-                }
-                while remaining > 0 {
-                    digits.push(b'0' + (remaining % 10) as u8);
-                    remaining /= 10;
-                }
-                digits.reverse();
-                if precision >= 0 {
-                    while digits.len() < precision as usize {
-                        digits.insert(0, b'0');
-                    }
-                    if precision == 0 && value == 0 {
-                        digits.clear();
-                    }
-                }
-                let mut rendered = digits;
-                if !(rendered.is_empty() && precision == 0 && value == 0) {
-                    sign_prefix(&mut rendered, negative, flags_plus, flags_space);
-                }
-                out.extend(pad(
-                    &mut rendered,
-                    width,
-                    flags_minus,
-                    precision < 0 && flags_zero,
-                ));
-            }
-            0x75 => {
-                let value = match length {
-                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32(memory)? as u64,
-                    CrtLengthModifier::H => u64::from(va.read_u32(memory)? as u16),
-                    CrtLengthModifier::Hh => u64::from(va.read_u32(memory)? as u8),
-                    CrtLengthModifier::Ll => va.read_u64(memory)?,
-                };
-                let mut digits = Vec::new();
-                let mut remaining = value;
-                if remaining == 0 {
-                    digits.push(b'0');
-                }
-                while remaining > 0 {
-                    digits.push(b'0' + (remaining % 10) as u8);
-                    remaining /= 10;
-                }
-                digits.reverse();
-                if precision >= 0 {
-                    while digits.len() < precision as usize {
-                        digits.insert(0, b'0');
-                    }
-                    if precision == 0 && value == 0 {
-                        digits.clear();
-                    }
-                }
-                let mut rendered = digits;
-                if flags_space && !flags_plus && !rendered.is_empty() {
-                    rendered.insert(0, b' ');
-                }
-                out.extend(pad(
-                    &mut rendered,
-                    width,
-                    flags_minus,
-                    precision < 0 && flags_zero,
-                ));
-            }
-            0x78 | 0x58 => {
-                let value = match length {
-                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32(memory)? as u64,
-                    CrtLengthModifier::H => u64::from(va.read_u32(memory)? as u16),
-                    CrtLengthModifier::Hh => u64::from(va.read_u32(memory)? as u8),
-                    CrtLengthModifier::Ll => va.read_u64(memory)?,
-                };
-                let upper = conversion == 0x58;
-                let mut digits = Vec::new();
-                let mut remaining = value;
-                if remaining == 0 {
-                    digits.push(b'0');
-                }
-                while remaining > 0 {
-                    digits.push(hex_digit((remaining % 16) as u8, upper));
-                    remaining /= 16;
-                }
-                digits.reverse();
-                if precision >= 0 {
-                    while digits.len() < precision as usize {
-                        digits.insert(0, b'0');
-                    }
-                    if precision == 0 && value == 0 {
-                        digits.clear();
-                    }
-                }
-                let mut rendered = digits;
-                if flags_hash && value != 0 {
-                    rendered.insert(0, if upper { b'X' } else { b'x' });
-                    rendered.insert(0, b'0');
-                }
-                out.extend(pad(
-                    &mut rendered,
-                    width,
-                    flags_minus,
-                    precision < 0 && flags_zero,
-                ));
-            }
-            0x6F => {
-                let value = match length {
-                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32(memory)? as u64,
-                    CrtLengthModifier::H => u64::from(va.read_u32(memory)? as u16),
-                    CrtLengthModifier::Hh => u64::from(va.read_u32(memory)? as u8),
-                    CrtLengthModifier::Ll => va.read_u64(memory)?,
-                };
-                let mut digits = Vec::new();
-                let mut remaining = value;
-                if remaining == 0 {
-                    digits.push(b'0');
-                }
-                while remaining > 0 {
-                    digits.push(b'0' + (remaining % 8) as u8);
-                    remaining /= 8;
-                }
-                digits.reverse();
-                if precision >= 0 {
-                    while digits.len() < precision as usize {
-                        digits.insert(0, b'0');
-                    }
-                    if precision == 0 && value == 0 {
-                        digits.clear();
-                    }
-                }
-                let mut rendered = digits;
-                if flags_hash && value != 0 && !rendered.starts_with(b"0") {
-                    rendered.insert(0, b'0');
-                }
-                out.extend(pad(
-                    &mut rendered,
-                    width,
-                    flags_minus,
-                    precision < 0 && flags_zero,
-                ));
-            }
-            0x63 => {
-                let raw = va.read_u32(memory)?;
-                if length == CrtLengthModifier::L {
-                    // %lc — wide char (2-byte unit), converted to UTF-8.
-                    let ch = char::from_u32(u32::from(raw as u16)).unwrap_or('\u{FFFD}');
-                    let mut encoded = [0_u8; 4];
-                    let mut bytes = ch.encode_utf8(&mut encoded).as_bytes().to_vec();
-                    out.extend(pad(&mut bytes, width, flags_minus, false));
-                } else {
-                    // %c / %hc — narrow char.
-                    out.extend(pad(&mut [raw as u8].to_vec(), width, flags_minus, false));
-                }
-            }
-            0x73 => {
-                // %s / %hs — narrow (ANSI) guest string; %ls — wide string
-                // (2-byte units).  NULL prints "(null)" per UCRT.
-                let ptr = va.read_pointer(memory)?;
-                let max = if precision >= 0 {
-                    precision as usize
-                } else {
-                    usize::MAX
-                };
-                if length == CrtLengthModifier::L {
-                    if ptr == 0 {
-                        out.extend(pad(&mut b"(null)".to_vec(), width, flags_minus, false));
-                    } else {
-                        let wide = read_utf16_string(memory, ptr)?;
-                        let wide_units = wide.encode_utf16().collect::<Vec<_>>();
-                        let mut bytes = self
-                            .win32
-                            .wide_char_to_multi_byte(DEFAULT_ANSI_CODE_PAGE, &wide_units)
-                            .unwrap_or_else(|_| wide.as_bytes().to_vec());
-                        if precision >= 0 {
-                            bytes.truncate(precision as usize);
-                        }
-                        out.extend(pad(&mut bytes, width, flags_minus, false));
-                    }
-                } else {
-                    let mut rendered = if ptr == 0 {
-                        b"(null)".to_vec()
-                    } else {
-                        read_c_string_limit(memory, ptr, max)?
-                    };
-                    if precision >= 0 {
-                        rendered.truncate(precision as usize);
-                    }
-                    out.extend(pad(&mut rendered, width, flags_minus, false));
-                }
-            }
-            0x53 => {
-                // %S — wide guest string, narrowed to the ANSI page.  NULL
-                // prints "(null)" per UCRT.
-                let ptr = va.read_pointer(memory)?;
-                if ptr == 0 {
-                    out.extend(pad(&mut b"(null)".to_vec(), width, flags_minus, false));
-                } else {
-                    let wide = read_utf16_string(memory, ptr)?;
-                    let wide_units = wide.encode_utf16().collect::<Vec<_>>();
-                    let mut bytes = self
-                        .win32
-                        .wide_char_to_multi_byte(DEFAULT_ANSI_CODE_PAGE, &wide_units)
-                        .unwrap_or_else(|_| wide.as_bytes().to_vec());
-                    if precision >= 0 {
-                        bytes.truncate(precision as usize);
-                    }
-                    out.extend(pad(&mut bytes, width, flags_minus, false));
-                }
-            }
-            0x6E => {
-                // %n — writes the count of chars emitted so far into the
-                // int* argument (%hn → short, %hhn → char).  A NULL target is
-                // EINVAL + invalid-parameter handler per UCRT.
-                let target = va.read_pointer(memory)?;
-                if target == 0 {
-                    self.set_crt_errno(memory, EINVAL);
-                    let _ = self.raise_invalid_parameter(state, memory, 0, 0, 0);
-                    return Ok(());
-                }
-                let count = out.len() as u64;
-                match length {
-                    CrtLengthModifier::Hh => memory.write_u8(target, count as u8),
-                    CrtLengthModifier::H => memory.write_u16(target, count as u16),
-                    _ => write_u32(memory, target, count as u32),
-                }
-            }
-            0x70 => {
-                let ptr = va.read_pointer(memory)?;
-                let digits = if guest_arch == GuestArch::X64 { 16 } else { 8 };
-                let mut rendered = format!("{:0width$X}", ptr, width = digits).into_bytes();
-                out.extend(pad(&mut rendered, width, flags_minus, true));
-            }
-            0x25 => {
-                out.push(b'%');
-            }
-            0x66 | 0x65 | 0x67 | 0x46 | 0x45 | 0x47 => {
-                let value = va.read_f64(memory)?;
-                let precision_explicit = precision >= 0;
-                let precision = if precision < 0 { 6 } else { precision };
-                let uppercase = conversion == 0x46 || conversion == 0x45 || conversion == 0x47;
-                let negative = value.is_sign_negative() && value != 0.0;
-                let magnitude = value.abs();
-                let conversion_lower = char::from_u32(u32::from(conversion))
-                    .map(|ch| ch.to_ascii_lowercase() as u32)
-                    .unwrap_or(u32::from(conversion));
-                let mut rendered = match conversion_lower {
-                    0x66 => crt_format_fixed(magnitude, precision),
-                    0x65 => crt_format_exponential(magnitude, precision, uppercase),
-                    _ => crt_format_general(magnitude, precision, uppercase, flags_hash),
-                };
-                if flags_hash && !rendered.contains(&b'.') {
-                    rendered.push(b'.');
-                }
-                if negative {
-                    rendered.insert(0, b'-');
-                } else if flags_plus {
-                    rendered.insert(0, b'+');
-                } else if flags_space {
-                    rendered.insert(0, b' ');
-                }
-                out.extend(pad(
-                    &mut rendered,
-                    width,
-                    flags_minus,
-                    !precision_explicit && flags_zero,
-                ));
-            }
-            _ => {
-                // Unknown conversion: UCRT renders the '%' and the offending
-                // character literally.  This deliberately covers %a (hex
-                // float) and the %z/%t length prefixes, which are
-                // DOCUMENTED-UNSUPPORTED in this engine: they are left
-                // literal rather than silently mis-rendered.
-                out.push(b'%');
-                if conversion != 0 {
-                    let mut bytes = [0_u8; 2];
-                    let mut encoded = [0_u8; 4];
-                    let s = char::from_u32(u32::from(conversion)).unwrap_or('\u{FFFD}');
-                    let n = s.encode_utf8(&mut encoded).len();
-                    bytes[..n].copy_from_slice(&encoded[..n]);
-                    out.extend_from_slice(&bytes[..n]);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Shared printf engine: renders the wide format with the x86-cdecl
-    /// vararg list at `argptr` and returns the produced narrow bytes.
-    fn crt_vfprintf_render(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-        format_ptr: u64,
-        argptr: u64,
-    ) -> AppResult<Vec<u8>> {
-        if format_ptr == 0 {
-            self.set_crt_errno(memory, EINVAL);
-            return Ok(Vec::new());
-        }
-        let wide = read_utf16_string(memory, format_ptr)?;
-        let format_units = wide.encode_utf16().collect::<Vec<_>>();
-        let mut va = CrtVaReader::new(argptr, self.guest_arch);
-        let mut out = Vec::new();
-        let mut index = 0_usize;
-        while index < format_units.len() {
-            if format_units[index] == 0x25 {
-                self.crt_render_conversion(
-                    &mut *memory,
-                    state,
-                    &format_units,
-                    &mut index,
-                    &mut va,
-                    &mut out,
-                    self.guest_arch,
-                )?;
-            } else {
-                let mut encoded = [0_u8; 4];
-                if let Some(ch) = char::from_u32(u32::from(format_units[index])) {
-                    out.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
-                }
-                index += 1;
-            }
-        }
-        Ok(out)
-    }
-
-    /// Deliver rendered printf output to a stream: iob streams go to the
-    /// runtime stdout/stderr buffers; CRT-opened FILE* streams go through the
-    /// win32 handle; a NULL stream is treated as stdout (best-effort).
-    fn crt_vfprintf_deliver(
-        &mut self,
-        memory: &mut MemoryImage,
-        stream: u64,
-        bytes: &[u8],
-    ) -> AppResult<u64> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        if stream == 0 || self.crt_iob_index(stream).is_some() {
-            let text = String::from_utf8_lossy(bytes);
-            if self.crt_iob_index(stream) == Some(2) {
-                self.stderr.push_str(&text);
-            } else {
-                self.stdout.push_str(&text);
-            }
-            return Ok(bytes.len() as u64);
-        }
-        if let Some(state) = self.crt_stream_state(stream) {
-            if !state.writable {
-                self.set_crt_errno(memory, EBADF);
-                return Ok((EOF as i64) as u64);
-            }
-            if state.append {
-                let _ =
-                    self.win32
-                        .set_file_pointer_ex(state.handle, 0, crate::win32::SeekOrigin::End);
-            }
-            match self.win32.write_file(state.handle, bytes) {
-                Ok(_) => Ok(bytes.len() as u64),
-                Err(_) => {
-                    self.set_crt_errno(memory, EIO);
-                    Ok((EOF as i64) as u64)
-                }
-            }
-        } else {
-            self.set_crt_errno(memory, EBADF);
-            Ok((EOF as i64) as u64)
-        }
-    }
-
-    // ── Patch 6c: msvcrt narrow printf / sprintf / sscanf ───────────────────
-    /// Render a NARROW (ANSI) printf format through the shared UCRT format
-    /// engine: the narrow format is widened to UTF-16 units and rendered with
-    /// the exact same conversion machinery as `crt_vfprintf_render` (the C
-    /// locale is ASCII-compatible, so byte-widening is faithful).
-    fn crt_vfprintf_render_narrow(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-        format_ptr: u64,
-        argptr: u64,
-    ) -> AppResult<Vec<u8>> {
-        if format_ptr == 0 {
-            self.set_crt_errno(memory, EINVAL);
-            return Ok(Vec::new());
-        }
-        let bytes = read_c_string_limit(memory, format_ptr, usize::MAX)?;
-        let format_units = bytes
-            .iter()
-            .map(|byte| u16::from(*byte))
-            .collect::<Vec<_>>();
-        let mut va = CrtVaReader::new(argptr, self.guest_arch);
-        let mut out = Vec::new();
-        let mut index = 0_usize;
-        while index < format_units.len() {
-            if format_units[index] == 0x25 {
-                self.crt_render_conversion(
-                    &mut *memory,
-                    state,
-                    &format_units,
-                    &mut index,
-                    &mut va,
-                    &mut out,
-                    self.guest_arch,
-                )?;
-            } else {
-                let mut encoded = [0_u8; 4];
-                if let Some(ch) = char::from_u32(u32::from(format_units[index])) {
-                    out.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
-                }
-                index += 1;
-            }
-        }
-        Ok(out)
-    }
-
-    /// `sscanf` core: scan the NARROW input per the NARROW format, assigning
-    /// through the vararg out-params (the shared `CrtVaReader`).  Returns the
-    /// number of assigned items, or -1 (EOF) when an input failure occurs
-    /// before the first assignment.  Integer conversions reuse
-    /// `crt_parse_strtol_full`; float conversions reuse `crt_parse_strtod`.
-    fn crt_sscanf_impl(
-        &mut self,
-        memory: &mut MemoryImage,
-        input_ptr: u64,
-        format_ptr: u64,
-        argptr: u64,
-    ) -> AppResult<i32> {
-        if input_ptr == 0 || format_ptr == 0 {
-            self.set_crt_errno(memory, EINVAL);
-            return Ok(-1);
-        }
-        let input = read_c_string_limit(memory, input_ptr, usize::MAX)?;
-        let format = read_c_string_limit(memory, format_ptr, usize::MAX)?;
-        let mut va = CrtVaReader::new(argptr, self.guest_arch);
-        let mut pos = 0_usize;
-        let mut f = 0_usize;
-        let mut assigned = 0_i32;
-        let mut input_failure = false;
-        let skip_ws = |input: &[u8], pos: usize| -> usize {
-            let mut pos = pos;
-            while pos < input.len() && input[pos].is_ascii_whitespace() {
-                pos += 1;
-            }
-            pos
-        };
-        while f < format.len() {
-            let directive = format[f];
-            match directive {
-                b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C => {
-                    pos = skip_ws(&input, pos);
-                    f += 1;
-                }
-                b'%' => {
-                    let mut f2 = f + 1;
-                    let suppress = f2 < format.len() && format[f2] == b'*';
-                    if suppress {
-                        f2 += 1;
-                    }
-                    let mut width: Option<usize> = None;
-                    while f2 < format.len() && format[f2].is_ascii_digit() {
-                        width = Some(
-                            width
-                                .unwrap_or(0)
-                                .saturating_mul(10)
-                                .saturating_add(usize::from(format[f2] - b'0')),
-                        );
-                        f2 += 1;
-                    }
-                    let mut length = CrtLengthModifier::None;
-                    if f2 < format.len() {
-                        match format[f2] {
-                            b'h' => {
-                                f2 += 1;
-                                if f2 < format.len() && format[f2] == b'h' {
-                                    length = CrtLengthModifier::Hh;
-                                    f2 += 1;
-                                } else {
-                                    length = CrtLengthModifier::H;
-                                }
-                            }
-                            b'l' => {
-                                f2 += 1;
-                                if f2 < format.len() && format[f2] == b'l' {
-                                    length = CrtLengthModifier::Ll;
-                                    f2 += 1;
-                                } else {
-                                    length = CrtLengthModifier::L;
-                                }
-                            }
-                            b'L' => {
-                                // long double: scanned as double (the runtime
-                                // has no extended-precision model).
-                                length = CrtLengthModifier::L;
-                                f2 += 1;
-                            }
-                            _ => {}
-                        }
-                    }
-                    let Some(&conv) = format.get(f2) else {
-                        break;
-                    };
-                    f2 += 1;
-                    let max = width.unwrap_or(usize::MAX);
-                    match conv {
-                        b'%' => {
-                            if pos < input.len() && input[pos] == b'%' {
-                                pos += 1;
-                            } else {
-                                input_failure = true;
-                                break;
-                            }
-                        }
-                        b'n' => {
-                            // %n stores the count of characters consumed so
-                            // far; it never counts as an assignment.
-                            if !suppress {
-                                let target = va.read_pointer(memory)?;
-                                if target != 0 {
-                                    match length {
-                                        CrtLengthModifier::Hh => memory.write_u8(target, pos as u8),
-                                        CrtLengthModifier::H => {
-                                            memory.write_u16(target, pos as u16)
-                                        }
-                                        CrtLengthModifier::L | CrtLengthModifier::Ll => {
-                                            memory.write_u64(target, pos as u64)
-                                        }
-                                        CrtLengthModifier::None => {
-                                            write_u32(memory, target, pos as u32)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        b'c' => {
-                            // %c matches exactly `width` (default 1) chars
-                            // INCLUDING whitespace; no NUL is appended.
-                            let take = max.min(input.len().saturating_sub(pos));
-                            if take == 0 {
-                                input_failure = true;
-                                break;
-                            }
-                            let start = pos;
-                            pos += take;
-                            if !suppress {
-                                let target = va.read_pointer(memory)?;
-                                if target != 0 {
-                                    memory.map_bytes(target, &input[start..pos]);
-                                }
-                                assigned += 1;
-                            }
-                        }
-                        b's' => {
-                            // %s skips whitespace, matches non-whitespace up
-                            // to `width`, and appends a NUL.
-                            pos = skip_ws(&input, pos);
-                            if pos >= input.len() {
-                                input_failure = true;
-                                break;
-                            }
-                            let start = pos;
-                            let mut end = pos;
-                            while end < input.len()
-                                && end - start < max
-                                && !input[end].is_ascii_whitespace()
-                            {
-                                end += 1;
-                            }
-                            if end == start {
-                                input_failure = true;
-                                break;
-                            }
-                            pos = end;
-                            if !suppress {
-                                let target = va.read_pointer(memory)?;
-                                if target != 0 {
-                                    memory.map_bytes(target, &input[start..end]);
-                                    memory.write_u8(target + (end - start) as u64, 0);
-                                }
-                                assigned += 1;
-                            }
-                        }
-                        b'[' => {
-                            // Scanset: %[...] (or %[^...]).  A leading ']' is
-                            // part of the set; '-' between two chars is a
-                            // range ("a-z"); a leading or trailing '-' is
-                            // literal; unterminated sets stop the scan.
-                            let negated = f2 < format.len() && format[f2] == b'^';
-                            if negated {
-                                f2 += 1;
-                            }
-                            let set_start = f2;
-                            let mut set_end = f2;
-                            if set_end < format.len() && format[set_end] == b']' {
-                                set_end += 1;
-                            }
-                            while set_end < format.len() && format[set_end] != b']' {
-                                set_end += 1;
-                            }
-                            if set_end >= format.len() {
-                                break;
-                            }
-                            let set = &format[set_start..set_end];
-                            let mut member = [false; 256];
-                            let mut set_i = 0_usize;
-                            while set_i < set.len() {
-                                if set[set_i] == b'-' && set_i > 0 && set_i + 1 < set.len() {
-                                    let lo = set[set_i - 1];
-                                    let hi = set[set_i + 1];
-                                    for byte in lo..=hi {
-                                        member[byte as usize] = true;
-                                    }
-                                    set_i += 2;
-                                } else {
-                                    member[set[set_i] as usize] = true;
-                                    set_i += 1;
-                                }
-                            }
-                            pos = skip_ws(&input, pos);
-                            if pos >= input.len() {
-                                input_failure = true;
-                                break;
-                            }
-                            let start = pos;
-                            let mut end = pos;
-                            while end < input.len()
-                                && end - start < max
-                                && member[input[end] as usize] != negated
-                            {
-                                end += 1;
-                            }
-                            if end == start {
-                                input_failure = true;
-                                break;
-                            }
-                            pos = end;
-                            if !suppress {
-                                let target = va.read_pointer(memory)?;
-                                if target != 0 {
-                                    memory.map_bytes(target, &input[start..end]);
-                                    memory.write_u8(target + (end - start) as u64, 0);
-                                }
-                                assigned += 1;
-                            }
-                            f2 = set_end + 1;
-                        }
-                        b'd' | b'i' | b'u' | b'x' | b'X' | b'o' => {
-                            pos = skip_ws(&input, pos);
-                            if pos >= input.len() {
-                                input_failure = true;
-                                break;
-                            }
-                            let end = pos.saturating_add(max).min(input.len());
-                            let base = match conv {
-                                b'x' | b'X' => 16,
-                                b'o' => 8,
-                                b'i' => 0,
-                                _ => 10,
-                            };
-                            let text = String::from_utf8_lossy(&input[pos..end]);
-                            let (value, consumed, _overflow) = crt_parse_strtol_full(&text, base);
-                            if consumed == 0 {
-                                // Matching failure (chars remain but none
-                                // convert) vs input failure (input ended).
-                                if pos >= input.len() {
-                                    input_failure = true;
-                                }
-                                break;
-                            }
-                            pos += consumed;
-                            if !suppress {
-                                let target = va.read_pointer(memory)?;
-                                if target != 0 {
-                                    match conv {
-                                        b'u' | b'x' | b'X' | b'o' => {
-                                            let bits = value as u32;
-                                            match length {
-                                                CrtLengthModifier::Hh => {
-                                                    memory.write_u8(target, bits as u8)
-                                                }
-                                                CrtLengthModifier::H => {
-                                                    memory.write_u16(target, bits as u16)
-                                                }
-                                                CrtLengthModifier::L | CrtLengthModifier::Ll => {
-                                                    memory.write_u64(target, value as u64)
-                                                }
-                                                CrtLengthModifier::None => {
-                                                    write_u32(memory, target, bits)
-                                                }
-                                            }
-                                        }
-                                        _ => match length {
-                                            CrtLengthModifier::Hh => {
-                                                memory.write_u8(target, value as u8)
-                                            }
-                                            CrtLengthModifier::H => {
-                                                memory.write_u16(target, value as u16)
-                                            }
-                                            CrtLengthModifier::L | CrtLengthModifier::Ll => {
-                                                memory.write_u64(target, value as u64)
-                                            }
-                                            CrtLengthModifier::None => {
-                                                write_u32(memory, target, value as u32)
-                                            }
-                                        },
-                                    }
-                                }
-                                assigned += 1;
-                            }
-                        }
-                        b'f' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
-                            pos = skip_ws(&input, pos);
-                            if pos >= input.len() {
-                                input_failure = true;
-                                break;
-                            }
-                            let end = pos.saturating_add(max).min(input.len());
-                            let consumed = crt_scan_float_consumed(&input[pos..end]);
-                            if consumed == 0 {
-                                if pos >= input.len() {
-                                    input_failure = true;
-                                }
-                                break;
-                            }
-                            let text = String::from_utf8_lossy(&input[pos..pos + consumed]);
-                            let value = crt_parse_strtod(&text);
-                            pos += consumed;
-                            if !suppress {
-                                let target = va.read_pointer(memory)?;
-                                if target != 0 {
-                                    match length {
-                                        // %lf / %Lf write a double (8 bytes).
-                                        CrtLengthModifier::L => {
-                                            memory.write_u64(target, value.to_bits())
-                                        }
-                                        // %f / %e / %g write a float (4 bytes).
-                                        _ => write_u32(memory, target, (value as f32).to_bits()),
-                                    }
-                                }
-                                assigned += 1;
-                            }
-                        }
-                        _ => break,
-                    }
-                    f = f2;
-                }
-                _ => {
-                    // Literal directive: must match exactly one input char.
-                    if pos < input.len() && input[pos] == directive {
-                        pos += 1;
-                    } else {
-                        input_failure = true;
-                        break;
-                    }
-                    f += 1;
-                }
-            }
-        }
-        if input_failure && assigned == 0 {
-            Ok(-1)
-        } else {
-            Ok(assigned)
-        }
-    }
-
-    // ── Patch 6b: fopen-family implementation ─────────────────────────────────
-    /// Parse a CRT fopen mode string: base r/w/a, optional '+', optional
-    /// b/t (ignored), and the S/D/N/c flags (ignored).  Returns
-    /// (readable, writable, append, update, base) where `base` is the mode
-    /// character that drives the creation disposition.
-    fn crt_parse_fopen_mode(mode: &str) -> Option<(bool, bool, bool, bool, char)> {
-        let mode = mode.trim();
-        let mut chars = mode.chars();
-        let base = chars.next()?;
-        let (readable, writable) = match base {
-            'r' => (true, false),
-            'w' => (false, true),
-            'a' => (false, true),
-            _ => return None,
-        };
-        let append = base == 'a';
-        let mut update = false;
-        for ch in chars {
-            match ch {
-                '+' => update = true,
-                'b' | 't' | 'S' | 'D' | 'N' | 'c' | 'R' | 'T' => {}
-                _ => return None,
-            }
-        }
-        let (readable, writable) = if update {
-            (true, true)
-        } else {
-            (readable, writable)
-        };
-        Some((readable, writable, append, update, base))
-    }
-
-    /// Open a CRT stream: parse the mode, open the file via the win32
-    /// create-file path, allocate a guest FILE block, and register it.  On
-    /// failure returns Ok(None) with errno set.
-    fn crt_fopen_impl(
-        &mut self,
-        memory: &mut MemoryImage,
-        path: &str,
-        mode: &str,
-    ) -> AppResult<Option<u64>> {
-        self.crt_fopen_impl_at(memory, path, mode, None)
-    }
-
-    /// Like `crt_fopen_impl`, but when `existing_ptr` is Some the FILE block at
-    /// that address is reused (freopen semantics: the same FILE* is returned).
-    fn crt_fopen_impl_at(
-        &mut self,
-        memory: &mut MemoryImage,
-        path: &str,
-        mode: &str,
-        existing_ptr: Option<u64>,
-    ) -> AppResult<Option<u64>> {
-        let resolved = resolve_guest_path(&self.current_directory, path);
-        let Some((readable, writable, append, update, base)) = Self::crt_parse_fopen_mode(mode)
-        else {
-            self.set_crt_errno(memory, EINVAL);
-            return Ok(None);
-        };
-        // Append streams additionally grant read access so the model's
-        // seek-to-EOF (which needs FILE_READ_ATTRIBUTES for the size query)
-        // works with write-only "a" modes.
-        let access = crate::ge::FileAccess {
-            read: readable || append,
-            write: writable,
-            delete: false,
-        };
-        let share = crate::ge::ShareMode {
-            read: true,
-            write: true,
-            delete: false,
-        };
-        // The BASE mode character drives the disposition: r → open existing,
-        // w → create always (truncate), a → open always (append).
-        let creation = match base {
-            'w' => crate::win32::CreationDisposition::CreateAlways,
-            'a' => crate::win32::CreationDisposition::OpenAlways,
-            _ => crate::win32::CreationDisposition::OpenExisting,
-        };
-        let handle = match self
-            .win32
-            .create_file_w(&resolved, access, share, creation, false, false, false)
-        {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.set_crt_doserrno(memory, last_error_from_app_error(&error) as i32);
-                self.set_crt_errno(
-                    memory,
-                    match error.code {
-                        ReasonCode::RcFsNotFound => ENOENT,
-                        ReasonCode::RcFsAlreadyExists => EEXIST,
-                        ReasonCode::RcFsPathInvalid => ENOENT,
-                        ReasonCode::RcIo => EACCES,
-                        _ => EACCES,
-                    },
-                );
-                return Ok(None);
-            }
-        };
-        if append {
-            let _ = self
-                .win32
-                .set_file_pointer_ex(handle, 0, crate::win32::SeekOrigin::End);
-        }
-        let file_state = CrtFileState {
-            handle,
-            path: resolved,
-            readable,
-            writable,
-            append,
-            update,
-        };
-        let file_ptr = match existing_ptr {
-            Some(ptr) => {
-                memory.map_bytes(ptr + 0x10, &handle.to_le_bytes());
-                ptr
-            }
-            None => self.crt_alloc_file(memory, &file_state)?,
-        };
-        self.crt_files.insert(file_ptr, file_state);
-        Ok(Some(file_ptr))
-    }
-
-    /// fread core: read up to `size*count` bytes at the stream position.
-    /// Returns the number of complete items read.
-    fn crt_fread_impl(
-        &mut self,
-        memory: &mut MemoryImage,
-        buffer: u64,
-        size: u64,
-        count: u64,
-        stream: u64,
-    ) -> AppResult<u64> {
-        let total = match size.checked_mul(count) {
-            Some(total) if total <= 0x7FFF_FFFF => total as usize,
-            _ => {
-                self.set_crt_errno(memory, EINVAL);
-                return Ok(0);
-            }
-        };
-        if buffer == 0 || total == 0 {
-            return Ok(0);
-        }
-        if let Some(index) = self.crt_iob_index(stream) {
-            // stdin has no backing data in this model.
-            let _ = index;
-            return Ok(0);
-        }
-        let Some(state) = self.crt_stream_state(stream) else {
-            self.set_crt_errno(memory, EBADF);
-            return Ok(0);
-        };
-        if !state.readable {
-            self.set_crt_errno(memory, EBADF);
-            return Ok(0);
-        }
-        match self.win32.read_file(state.handle, total) {
-            Ok(bytes) => {
-                if !bytes.is_empty() {
-                    memory.map_bytes(buffer, &bytes);
-                }
-                let items = (bytes.len() as u64).checked_div(size).unwrap_or(0);
-                Ok(items)
-            }
-            Err(_) => {
-                self.set_crt_errno(memory, EIO);
-                Ok(0)
-            }
-        }
-    }
-
-    /// fwrite core: write `size*count` bytes at the stream position (append
-    /// streams seek to EOF first).  Returns the number of complete items.
-    fn crt_fwrite_impl(
-        &mut self,
-        memory: &mut MemoryImage,
-        buffer: u64,
-        size: u64,
-        count: u64,
-        stream: u64,
-    ) -> AppResult<u64> {
-        let total = match size.checked_mul(count) {
-            Some(total) if total <= 0x7FFF_FFFF => total as usize,
-            _ => {
-                self.set_crt_errno(memory, EINVAL);
-                return Ok(0);
-            }
-        };
-        if buffer == 0 || total == 0 {
-            return Ok(0);
-        }
-        let bytes = memory.read_bytes(buffer, total)?;
-        if let Some(index) = self.crt_iob_index(stream) {
-            let text = String::from_utf8_lossy(&bytes);
-            if index == 2 {
-                self.stderr.push_str(&text);
-            } else {
-                self.stdout.push_str(&text);
-            }
-            return Ok(count);
-        }
-        let Some(state) = self.crt_stream_state(stream) else {
-            self.set_crt_errno(memory, EBADF);
-            return Ok(0);
-        };
-        if !state.writable {
-            self.set_crt_errno(memory, EBADF);
-            return Ok(0);
-        }
-        if state.append {
-            let _ = self
-                .win32
-                .set_file_pointer_ex(state.handle, 0, crate::win32::SeekOrigin::End);
-        }
-        match self.win32.write_file(state.handle, &bytes) {
-            Ok(written) => {
-                let items = u64::from(written).checked_div(size).unwrap_or(0);
-                Ok(items)
-            }
-            Err(_) => {
-                self.set_crt_errno(memory, EIO);
-                Ok(0)
-            }
-        }
-    }
-
-    /// qsort core: heap sort of `num` elements of `size` bytes at `base`,
-    /// comparing via the guest comparator (x86 cdecl, two pointer args).
-    fn crt_qsort_impl(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-        base: u64,
-        num: usize,
-        size: usize,
-        compare: u64,
-    ) -> AppResult<()> {
-        if num < 2 || size == 0 {
-            return Ok(());
-        }
-        let compare_at = |runtime: &mut Self,
-                          memory: &mut MemoryImage,
-                          state: &mut CpuState,
-                          a: usize,
-                          b: usize|
-         -> AppResult<i32> {
-            let pa = base.wrapping_add((a as u64).wrapping_mul(size as u64));
-            let pb = base.wrapping_add((b as u64).wrapping_mul(size as u64));
-            let result = runtime.execute_guest_callback(
-                state,
-                memory,
-                compare,
-                &[pa, pb],
-                "qsort_compare",
-            )?;
-            Ok(result as i32)
-        };
-        let swap = |memory: &mut MemoryImage, a: usize, b: usize| -> AppResult<()> {
-            let pa = base.wrapping_add((a as u64).wrapping_mul(size as u64));
-            let pb = base.wrapping_add((b as u64).wrapping_mul(size as u64));
-            let bytes_a = memory.read_bytes(pa, size)?;
-            let bytes_b = memory.read_bytes(pb, size)?;
-            memory.map_bytes(pa, &bytes_b);
-            memory.map_bytes(pb, &bytes_a);
-            Ok(())
-        };
-        // Heap sort (in-place, O(n log n) comparisons).
-        let sift_down = |runtime: &mut Self,
-                         memory: &mut MemoryImage,
-                         state: &mut CpuState,
-                         root: usize,
-                         bottom: usize|
-         -> AppResult<()> {
-            let mut root = root;
-            loop {
-                let mut child = root * 2 + 1;
-                if child >= bottom {
-                    return Ok(());
-                }
-                if child + 1 < bottom && compare_at(runtime, memory, state, child, child + 1)? < 0 {
-                    child += 1;
-                }
-                if compare_at(runtime, memory, state, root, child)? < 0 {
-                    swap(memory, root, child)?;
-                    root = child;
-                } else {
-                    return Ok(());
-                }
-            }
-        };
-        for start in (0..num / 2).rev() {
-            sift_down(self, memory, state, start, num)?;
-        }
-        for end in (1..num).rev() {
-            swap(memory, 0, end)?;
-            sift_down(self, memory, state, 0, end)?;
-        }
-        Ok(())
-    }
-
-    fn lcmap_string(
-        &mut self,
-        memory: &mut MemoryImage,
-        flags: u32,
-        source_ptr: u64,
-        source_len: i32,
-        destination_ptr: u64,
-        destination_len: i32,
-    ) -> AppResult<u64> {
-        if source_ptr == 0
-            || source_len == 0
-            || (flags & (LCMAP_LOWERCASE | LCMAP_UPPERCASE)) == (LCMAP_LOWERCASE | LCMAP_UPPERCASE)
-        {
-            self.last_error = ERROR_INVALID_PARAMETER;
-            return Ok(0);
-        }
-
-        let source_units = if source_len < 0 {
-            read_utf16_string(memory, source_ptr)?
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect::<Vec<_>>()
-        } else {
-            (0..source_len as usize)
-                .map(|index| read_guest_u16(memory, source_ptr + (index as u64 * 2)))
-                .collect::<AppResult<Vec<_>>>()?
-        };
-        let mapped_units = if flags & (LCMAP_LOWERCASE | LCMAP_UPPERCASE) != 0 {
-            source_units
-                .iter()
-                .copied()
-                .map(|unit| {
-                    let Some(original) = char::from_u32(unit as u32) else {
-                        return unit;
-                    };
-                    let mapped = if flags & LCMAP_UPPERCASE != 0 {
-                        original.to_uppercase().collect::<Vec<_>>()
-                    } else {
-                        original.to_lowercase().collect::<Vec<_>>()
-                    };
-                    let Some(&candidate) = mapped.first() else {
-                        return unit;
-                    };
-                    if mapped.len() != 1 {
-                        return unit;
-                    }
-                    let mut encoded = [0_u16; 2];
-                    if candidate.encode_utf16(&mut encoded).len() != 1 {
-                        return unit;
-                    }
-                    if self
-                        .win32
-                        .wide_char_to_multi_byte(DEFAULT_ANSI_CODE_PAGE, &encoded[..1])
-                        .is_err()
-                    {
-                        return unit;
-                    }
-                    encoded[0]
-                })
-                .collect::<Vec<_>>()
-        } else {
-            source_units.clone()
-        };
-        let required = mapped_units.len() as u32;
-        if destination_ptr == 0 || destination_len == 0 {
-            self.last_error = 0;
-            return Ok(required as u64);
-        }
-        if destination_len < required as i32 {
-            self.last_error = ERROR_INSUFFICIENT_BUFFER;
-            return Ok(0);
-        }
-
-        let encoded = mapped_units
-            .iter()
-            .flat_map(|unit| unit.to_le_bytes())
-            .collect::<Vec<_>>();
-        if !encoded.is_empty() {
-            memory.map_bytes(destination_ptr, &encoded);
-        }
-        self.last_error = 0;
-        Ok(required as u64)
     }
 
     fn sync_guest_critical_section(
@@ -68652,497 +67665,6 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    fn alloc_d3d11_device_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device: D3d11Device,
-    ) -> AppResult<u64> {
-        let mut device_methods =
-            vec![unsupported_method(&self.telemetry, "ID3D11Device::unsupported"); 43];
-        device_methods[0] = HostThunk::GraphicsObjectQueryInterface;
-        device_methods[1] = HostThunk::GuestObjectAddRef;
-        device_methods[2] = HostThunk::GuestObjectRelease;
-        device_methods[3] = HostThunk::D3D11DeviceCreateBuffer;
-        device_methods[4] = HostThunk::D3D11DeviceCreateTexture1D;
-        device_methods[5] = HostThunk::D3D11DeviceCreateTexture2D;
-        device_methods[6] = HostThunk::D3D11DeviceCreateTexture3D;
-        device_methods[7] = HostThunk::D3D11DeviceCreateShaderResourceView;
-        device_methods[8] = HostThunk::D3D11DeviceCreateUnorderedAccessView;
-        device_methods[9] = HostThunk::D3D11DeviceCreateRenderTargetView;
-        device_methods[10] = HostThunk::D3D11DeviceCreateDepthStencilView;
-        device_methods[11] = HostThunk::D3D11DeviceCreateInputLayout;
-        device_methods[12] = HostThunk::D3D11DeviceCreateVertexShader;
-        device_methods[13] = HostThunk::D3D11DeviceCreateGeometryShader;
-        device_methods[14] = HostThunk::D3D11DeviceCreateGeometryShaderWithStreamOutput;
-        device_methods[15] = HostThunk::D3D11DeviceCreatePixelShader;
-        device_methods[16] = HostThunk::D3D11DeviceCreateHullShader;
-        device_methods[17] = HostThunk::D3D11DeviceCreateDomainShader;
-        device_methods[18] = HostThunk::D3D11DeviceCreateComputeShader;
-        device_methods[19] = HostThunk::D3D11DeviceCreateClassLinkage;
-        device_methods[20] = HostThunk::D3D11DeviceCreateBlendState;
-        device_methods[21] = HostThunk::D3D11DeviceCreateDepthStencilState;
-        device_methods[22] = HostThunk::D3D11DeviceCreateRasterizerState;
-        device_methods[23] = HostThunk::D3D11DeviceCreateSamplerState;
-        device_methods[24] = HostThunk::D3D11DeviceCreateQuery;
-        device_methods[25] = HostThunk::D3D11DeviceCreatePredicate;
-        device_methods[26] = HostThunk::D3D11DeviceCreateCounter;
-        device_methods[27] = HostThunk::D3D11DeviceCreateDeferredContext;
-        device_methods[28] = HostThunk::D3D11DeviceOpenSharedResource;
-        device_methods[29] = HostThunk::D3D11DeviceCheckFormatSupport;
-        device_methods[30] = HostThunk::D3D11DeviceCheckMultisampleQualityLevels;
-        device_methods[31] = HostThunk::D3D11DeviceCheckCounterInfo;
-        device_methods[32] = HostThunk::D3D11DeviceCheckCounter;
-        device_methods[33] = HostThunk::D3D11DeviceCheckFeatureSupport;
-        device_methods[34] = HostThunk::DXGIFactoryGetPrivateData; // GetPrivateData
-        device_methods[35] = HostThunk::DXGIFactorySetPrivateData; // SetPrivateData
-        device_methods[36] = HostThunk::D3D11DeviceGetDeviceRemovedReason;
-        device_methods[37] = HostThunk::DXGIFactorySetPrivateDataInterface;
-        device_methods[38] = HostThunk::D3D11DeviceGetFeatureLevel;
-        device_methods[39] = HostThunk::D3D11DeviceGetImmediateContext_Base; // ID3D11Device::GetImmediateContext (base)
-        device_methods[40] = HostThunk::D3D11DeviceGetImmediateContext; // ID3D11Device1::GetImmediateContext1
-        device_methods[41] = HostThunk::D3D11DeviceCreateDeferredContext1;
-        device_methods[42] = HostThunk::D3D11DeviceGetImmediateContext2;
-
-        let mut context_methods =
-            vec![unsupported_method(&self.telemetry, "ID3D11DeviceContext::unsupported"); 70];
-        context_methods[0] = HostThunk::GraphicsObjectQueryInterface;
-        context_methods[1] = HostThunk::GuestObjectAddRef;
-        context_methods[2] = HostThunk::GuestObjectRelease;
-        // ID3D11DeviceChild methods (slots 3-6)
-        context_methods[3] = HostThunk::D3D11DeviceContextGetDevice;
-        context_methods[4] = HostThunk::DXGIFactoryGetPrivateData; // GetPrivateData
-        context_methods[5] = HostThunk::DXGIFactorySetPrivateData; // SetPrivateData
-        context_methods[6] = HostThunk::DXGIFactorySetPrivateDataInterface; // SetPrivateDataInterface
-        context_methods[7] = HostThunk::D3D11DeviceContextVSSetConstantBuffers;
-        context_methods[8] = HostThunk::D3D11DeviceContextPSSetShaderResources;
-        context_methods[9] = HostThunk::D3D11DeviceContextPSSetShader;
-        context_methods[10] = HostThunk::D3D11DeviceContextPSSetSamplers;
-        context_methods[11] = HostThunk::D3D11DeviceContextVSSetShader;
-        context_methods[12] = HostThunk::D3D11DeviceContextDrawIndexed;
-        context_methods[13] = HostThunk::D3D11DeviceContextDraw;
-        context_methods[14] = HostThunk::D3D11DeviceContextDrawAuto;
-        context_methods[15] = HostThunk::D3D11DeviceContextClearRenderTargetView;
-        context_methods[16] = HostThunk::D3D11DeviceContextClearDepthStencilView;
-        context_methods[17] = HostThunk::D3D11DeviceContextIASetInputLayout;
-        context_methods[18] = HostThunk::D3D11DeviceContextIASetVertexBuffers;
-        context_methods[19] = HostThunk::D3D11DeviceContextIASetIndexBuffer;
-        context_methods[20] = HostThunk::D3D11DeviceContextDrawIndexedInstanced;
-        context_methods[21] = HostThunk::D3D11DeviceContextDrawInstanced;
-        context_methods[22] = HostThunk::D3D11DeviceContextGSSetShader;
-        context_methods[23] = HostThunk::D3D11DeviceContextGSSetConstantBuffers;
-        context_methods[24] = HostThunk::D3D11DeviceContextIASetPrimitiveTopology;
-        context_methods[25] = HostThunk::D3D11DeviceContextGSSetShaderResources;
-        context_methods[26] = HostThunk::D3D11DeviceContextGSSetSamplers;
-        context_methods[27] = HostThunk::D3D11DeviceContextHSSetShader;
-        context_methods[28] = HostThunk::D3D11DeviceContextHSSetConstantBuffers;
-        context_methods[29] = HostThunk::D3D11DeviceContextHSSetShaderResources;
-        context_methods[30] = HostThunk::D3D11DeviceContextHSSetSamplers;
-        context_methods[31] = HostThunk::D3D11DeviceContextDSSetShader;
-        context_methods[32] = HostThunk::D3D11DeviceContextDSSetConstantBuffers;
-        context_methods[33] = HostThunk::D3D11DeviceContextOMSetRenderTargets;
-        context_methods[34] = HostThunk::D3D11DeviceContextDSSetShaderResources;
-        context_methods[35] = HostThunk::D3D11DeviceContextOMSetBlendState;
-        context_methods[36] = HostThunk::D3D11DeviceContextOMSetDepthStencilState;
-        context_methods[37] = HostThunk::D3D11DeviceContextDSSetSamplers;
-        context_methods[38] = HostThunk::D3D11DeviceContextVSSetShaderResources;
-        context_methods[39] = HostThunk::D3D11DeviceContextVSSetSamplers;
-        context_methods[40] = HostThunk::D3D11DeviceContextCSSetShaderResources;
-        context_methods[41] = HostThunk::D3D11DeviceContextCSSetUnorderedAccessViews;
-        context_methods[42] = HostThunk::D3D11DeviceContextCSSetSamplers;
-        context_methods[43] = HostThunk::D3D11DeviceContextRSSetState;
-        context_methods[44] = HostThunk::D3D11DeviceContextRSSetViewports;
-        context_methods[45] = HostThunk::D3D11DeviceContextRSSetScissorRects;
-        context_methods[46] = HostThunk::D3D11DeviceContextCSSetConstantBuffers;
-        context_methods[47] = HostThunk::D3D11DeviceContextCopySubresourceRegion;
-        context_methods[48] = HostThunk::D3D11DeviceContextUpdateSubresource;
-        context_methods[49] = HostThunk::D3D11DeviceContextCopyResource;
-        context_methods[50] = HostThunk::D3D11DeviceContextCopyStructureCount;
-        context_methods[51] = HostThunk::D3D11DeviceContextBegin;
-        context_methods[52] = HostThunk::D3D11DeviceContextEnd;
-        context_methods[53] = HostThunk::D3D11DeviceContextGetData;
-        context_methods[54] = HostThunk::D3D11DeviceContextResolveSubresource;
-        context_methods[55] = HostThunk::D3D11DeviceContextSetPredication;
-        context_methods[56] = HostThunk::D3D11DeviceContextGetPredication;
-        context_methods[57] = HostThunk::D3D11DeviceContextMap;
-        context_methods[58] = HostThunk::D3D11DeviceContextUnmap;
-        context_methods[59] = HostThunk::D3D11DeviceContextGenerateMips;
-        context_methods[60] = HostThunk::D3D11DeviceContextSetResourceMinLOD;
-        context_methods[61] = HostThunk::D3D11DeviceContextGetResourceMinLOD;
-        context_methods[62] = HostThunk::D3D11DeviceContextResolveSubresourceFlag;
-        context_methods[63] = HostThunk::D3D11DeviceContextFinishCommandList;
-        context_methods[64] = HostThunk::D3D11DeviceContextFlush;
-        context_methods[65] = HostThunk::D3D11DeviceContextExecuteCommandList;
-        context_methods[66] = HostThunk::D3D11DeviceContextClearState;
-        context_methods[67] = HostThunk::D3D11DeviceContextClearUnorderedAccessViewUint;
-        context_methods[68] = HostThunk::D3D11DeviceContextClearUnorderedAccessViewFloat;
-        context_methods[69] = HostThunk::D3D11DeviceContextCSSetShader;
-
-        let mut swapchain_methods =
-            vec![unsupported_method(&self.telemetry, "IDXGISwapChain::unsupported"); 14];
-        swapchain_methods[0] = HostThunk::GraphicsObjectQueryInterface;
-        swapchain_methods[1] = HostThunk::GuestObjectAddRef;
-        swapchain_methods[2] = HostThunk::GuestObjectRelease;
-        swapchain_methods[8] = HostThunk::DXGISwapChainPresent;
-        swapchain_methods[9] = HostThunk::DXGISwapChainGetBuffer;
-
-        let device_vtable = self.alloc_guest_vtable(memory, device_methods)?;
-        let context_vtable = self.alloc_guest_vtable(memory, context_methods)?;
-        let swapchain_vtable = if device.swapchain_state().is_some() {
-            Some(self.alloc_guest_vtable(memory, swapchain_methods)?)
-        } else {
-            None
-        };
-
-        let device_object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d11Device, device_vtable)?;
-        let context_object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d11DeviceContext, context_vtable)?;
-        let swapchain_object = if let Some(vtable) = swapchain_vtable {
-            Some(self.alloc_guest_object(memory, GuestObjectKind::DxgiSwapChain, vtable)?)
-        } else {
-            None
-        };
-        if let Some(context_meta) = self.guest_objects.get_mut(&context_object) {
-            context_meta.refcount = 0;
-        }
-        if let Some(swapchain_object) = swapchain_object
-            && let Some(swapchain_meta) = self.guest_objects.get_mut(&swapchain_object)
-        {
-            swapchain_meta.refcount = 0;
-        }
-
-        self.add_ref_guest_object(device_object)?;
-        if swapchain_object.is_some() {
-            self.add_ref_guest_object(device_object)?;
-        }
-
-        self.d3d11_contexts
-            .insert(context_object, GuestD3d11Context { device_object });
-        if let Some(swapchain_object) = swapchain_object {
-            self.d3d11_swapchains
-                .insert(swapchain_object, GuestDxgiSwapChain { device_object });
-        }
-        self.d3d11_devices.insert(
-            device_object,
-            GuestD3d11Device {
-                device,
-                context_object,
-                swapchain_object,
-                backbuffer_objects: BTreeMap::new(),
-            },
-        );
-        Ok(device_object)
-    }
-
-    fn alloc_d3d11_texture_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        resource_id: D3d11ResourceId,
-    ) -> AppResult<u64> {
-        let texture_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11Texture2D::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-            ],
-        )?;
-        let texture_object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d11Texture2D, texture_vtable)?;
-        if let Some(texture_meta) = self.guest_objects.get_mut(&texture_object) {
-            texture_meta.refcount = 0;
-        }
-        self.add_ref_guest_object(device_object)?;
-        self.d3d11_textures.insert(
-            texture_object,
-            GuestD3d11Texture2D {
-                device_object,
-                resource_id,
-            },
-        );
-        Ok(texture_object)
-    }
-
-    fn alloc_d3d11_buffer_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        resource_id: D3d11ResourceId,
-    ) -> AppResult<u64> {
-        let buffer_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11Buffer::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
-        let buffer_object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d11Buffer, buffer_vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d11_buffers.insert(
-            buffer_object,
-            GuestD3d11Buffer {
-                device_object,
-                resource_id,
-            },
-        );
-        Ok(buffer_object)
-    }
-
-    fn alloc_d3d11_view_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        view_id: D3d11ViewId,
-        kind: ViewKind,
-    ) -> AppResult<u64> {
-        let view_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11View::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
-        let view_object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d11View, view_vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d11_views.insert(
-            view_object,
-            GuestD3d11View {
-                device_object,
-                view_id,
-                kind,
-            },
-        );
-        Ok(view_object)
-    }
-
-    fn alloc_d3d11_input_layout_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        layout_id: InputLayoutId,
-    ) -> AppResult<u64> {
-        let layout_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11InputLayout::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
-        let layout_object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d11InputLayout, layout_vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d11_input_layouts.insert(
-            layout_object,
-            GuestD3d11InputLayout {
-                device_object,
-                layout_id,
-            },
-        );
-        Ok(layout_object)
-    }
-
-    fn alloc_d3d11_shader_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        shader_id: u64,
-        stage: D3d11ShaderStage,
-    ) -> AppResult<u64> {
-        let shader_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
-        let shader_object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d11Shader, shader_vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d11_shaders.insert(
-            shader_object,
-            GuestD3d11Shader {
-                device_object,
-                shader_id,
-                stage,
-            },
-        );
-        Ok(shader_object)
-    }
-
-    fn alloc_d3d11_blend_state_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        state_id: u64,
-    ) -> AppResult<u64> {
-        let state_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11BlendState::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
-        let state_object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d11BlendState, state_vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d11_blend_states.insert(
-            state_object,
-            GuestD3d11BlendState {
-                device_object,
-                state_id,
-            },
-        );
-        Ok(state_object)
-    }
-
-    fn alloc_d3d11_rasterizer_state_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        state_id: u64,
-    ) -> AppResult<u64> {
-        let state_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11RasterizerState::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
-        let state_object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d11RasterizerState, state_vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d11_rasterizer_states.insert(
-            state_object,
-            GuestD3d11RasterizerState {
-                device_object,
-                state_id,
-            },
-        );
-        Ok(state_object)
-    }
-
-    fn alloc_d3d11_depth_stencil_state_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        state_id: u64,
-    ) -> AppResult<u64> {
-        let state_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11DepthStencilState::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
-        let state_object = self.alloc_guest_object(
-            memory,
-            GuestObjectKind::D3d11DepthStencilState,
-            state_vtable,
-        )?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d11_depth_stencil_states.insert(
-            state_object,
-            GuestD3d11DepthStencilState {
-                device_object,
-                state_id,
-            },
-        );
-        Ok(state_object)
-    }
-
-    fn alloc_d3d11_sampler_state_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        state_id: u64,
-    ) -> AppResult<u64> {
-        let state_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11SamplerState::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
-        let state_object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d11SamplerState, state_vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d11_sampler_states.insert(
-            state_object,
-            GuestD3d11SamplerState {
-                device_object,
-                state_id,
-            },
-        );
-        Ok(state_object)
-    }
-
     // ── SteamVR vtable allocators (Phase 5.3.1) ──────────────────────────
 
     /// Allocates an IVRSystem vtable (80 slots) and returns the guest object address.
@@ -69248,2417 +67770,6 @@ impl PeHostRuntime {
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object =
             self.alloc_guest_object(memory, GuestObjectKind::SteamVRRenderModels, vtable)?;
-        Ok(object)
-    }
-
-    fn destroy_d3d11_device_object(&mut self, address: u64) -> AppResult<()> {
-        let device = self.d3d11_devices.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 device {address:#x}"),
-            )
-        })?;
-        for texture_object in device.backbuffer_objects.into_values() {
-            let _ = self.destroy_d3d11_texture_object(texture_object);
-        }
-        self.d3d11_contexts.remove(&device.context_object);
-        self.guest_objects.remove(&device.context_object);
-        if let Some(swapchain_object) = device.swapchain_object {
-            self.d3d11_swapchains.remove(&swapchain_object);
-            self.guest_objects.remove(&swapchain_object);
-        }
-        self.guest_objects.remove(&address);
-        Ok(())
-    }
-
-    fn destroy_d3d11_texture_object(&mut self, address: u64) -> AppResult<()> {
-        let texture = self.d3d11_textures.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 texture {address:#x}"),
-            )
-        })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(texture.device_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d11_buffer_object(&mut self, address: u64) -> AppResult<()> {
-        let buffer = self.d3d11_buffers.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 buffer {address:#x}"),
-            )
-        })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(buffer.device_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d11_view_object(&mut self, address: u64) -> AppResult<()> {
-        let view = self.d3d11_views.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 view {address:#x}"),
-            )
-        })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(view.device_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d11_input_layout_object(&mut self, address: u64) -> AppResult<()> {
-        let input_layout = self.d3d11_input_layouts.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 input layout {address:#x}"),
-            )
-        })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(input_layout.device_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d11_shader_object(&mut self, address: u64) -> AppResult<()> {
-        let shader = self.d3d11_shaders.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 shader {address:#x}"),
-            )
-        })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(shader.device_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d11_blend_state_object(&mut self, address: u64) -> AppResult<()> {
-        let state = self.d3d11_blend_states.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 blend state {address:#x}"),
-            )
-        })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(state.device_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d11_rasterizer_state_object(&mut self, address: u64) -> AppResult<()> {
-        let state = self
-            .d3d11_rasterizer_states
-            .remove(&address)
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D11 rasterizer state {address:#x}"),
-                )
-            })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(state.device_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d11_depth_stencil_state_object(&mut self, address: u64) -> AppResult<()> {
-        let state = self
-            .d3d11_depth_stencil_states
-            .remove(&address)
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D11 depth stencil state {address:#x}"),
-                )
-            })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(state.device_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d11_sampler_state_object(&mut self, address: u64) -> AppResult<()> {
-        let state = self.d3d11_sampler_states.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 sampler state {address:#x}"),
-            )
-        })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(state.device_object)?;
-        Ok(())
-    }
-
-    fn d3d11_device(&self, address: u64) -> AppResult<&GuestD3d11Device> {
-        self.d3d11_devices.get(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 device {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d11_device_mut(&mut self, address: u64) -> AppResult<&mut GuestD3d11Device> {
-        self.d3d11_devices.get_mut(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 device {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d11_context(&self, address: u64) -> AppResult<GuestD3d11Context> {
-        self.d3d11_contexts.get(&address).copied().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 context {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d11_deferred_context(&self, address: u64) -> AppResult<&GuestD3d11DeferredContext> {
-        self.d3d11_deferred_contexts.get(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 deferred context {address:#x}"),
-            )
-        })
-    }
-
-    #[allow(dead_code)] // D3D11 deferred-context accessor; used by tests
-    fn d3d11_deferred_context_mut(
-        &mut self,
-        address: u64,
-    ) -> AppResult<&mut GuestD3d11DeferredContext> {
-        self.d3d11_deferred_contexts
-            .get_mut(&address)
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D11 deferred context {address:#x}"),
-                )
-            })
-    }
-
-    /// Resolves a D3D11 context object (immediate or deferred) to its
-    /// underlying device. Returns `None` if the context is invalid.
-    fn d3d11_device_for_context(&self, context_object: u64) -> Option<&GuestD3d11Device> {
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            self.d3d11_device(deferred.device_object).ok()
-        } else if let Ok(context) = self.d3d11_context(context_object) {
-            self.d3d11_device(context.device_object).ok()
-        } else {
-            None
-        }
-    }
-
-    fn d3d11_swapchain(&self, address: u64) -> AppResult<GuestDxgiSwapChain> {
-        self.d3d11_swapchains.get(&address).copied().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown DXGI swapchain {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d11_texture(&self, address: u64) -> AppResult<GuestD3d11Texture2D> {
-        self.d3d11_textures.get(&address).copied().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 texture {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d11_buffer(&self, address: u64) -> AppResult<GuestD3d11Buffer> {
-        self.d3d11_buffers.get(&address).copied().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 buffer {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d11_view(&self, address: u64) -> AppResult<GuestD3d11View> {
-        self.d3d11_views.get(&address).copied().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 view {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d11_input_layout(&self, address: u64) -> AppResult<GuestD3d11InputLayout> {
-        self.d3d11_input_layouts
-            .get(&address)
-            .copied()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D11 input layout {address:#x}"),
-                )
-            })
-    }
-
-    fn d3d11_shader(&self, address: u64) -> AppResult<GuestD3d11Shader> {
-        self.d3d11_shaders.get(&address).copied().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D11 shader {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d11_blend_state(&self, address: u64) -> AppResult<GuestD3d11BlendState> {
-        self.d3d11_blend_states
-            .get(&address)
-            .copied()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D11 blend state {address:#x}"),
-                )
-            })
-    }
-
-    fn d3d11_rasterizer_state(&self, address: u64) -> AppResult<GuestD3d11RasterizerState> {
-        self.d3d11_rasterizer_states
-            .get(&address)
-            .copied()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D11 rasterizer state {address:#x}"),
-                )
-            })
-    }
-
-    fn d3d11_depth_stencil_state(&self, address: u64) -> AppResult<GuestD3d11DepthStencilState> {
-        self.d3d11_depth_stencil_states
-            .get(&address)
-            .copied()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D11 depth stencil state {address:#x}"),
-                )
-            })
-    }
-
-    fn d3d11_sampler_state(&self, address: u64) -> AppResult<GuestD3d11SamplerState> {
-        self.d3d11_sampler_states
-            .get(&address)
-            .copied()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D11 sampler state {address:#x}"),
-                )
-            })
-    }
-
-    fn d3d11_resource_owner_and_id(&self, address: u64) -> AppResult<(u64, D3d11ResourceId)> {
-        match self.guest_object_kind(address)? {
-            GuestObjectKind::D3d11Buffer => {
-                let buffer = self.d3d11_buffer(address)?;
-                Ok((buffer.device_object, buffer.resource_id))
-            }
-            GuestObjectKind::D3d11Texture2D => {
-                let texture = self.d3d11_texture(address)?;
-                Ok((texture.device_object, texture.resource_id))
-            }
-            kind => Err(AppError::new(
-                ReasonCode::RcD3dInvalidState,
-                format!(
-                    "unsupported D3D11 resource object kind {:?} for object {address:#x}",
-                    kind
-                ),
-            )),
-        }
-    }
-
-    fn dispatch_d3d11_create_buffer(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D11Device::CreateBuffer on non-device object {device_object:#x}"),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let initial_data_ptr = state.get(Register::R8);
-        let out_ptr = state.get(Register::R9);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let byte_width = read_d3d11_buffer_byte_width(memory, desc_ptr)?;
-        let (label, usage_hint) = read_d3d11_buffer_usage(memory, desc_ptr)?;
-        let resource_id = match self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_buffer(&label, byte_width, usage_hint)
-        {
-            Ok(resource_id) => resource_id,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        if initial_data_ptr != 0 {
-            let src_ptr = read_guest_u64(memory, initial_data_ptr)?;
-            if src_ptr != 0 {
-                let bytes = read_guest_bytes(memory, src_ptr, byte_width)?;
-                self.d3d11_device_mut(device_object)?
-                    .device
-                    .update_subresource(resource_id, &bytes)?;
-            }
-        }
-        let buffer_object = self.alloc_d3d11_buffer_object(memory, device_object, resource_id)?;
-        write_u64(memory, out_ptr, buffer_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11Device::CreateBuffer",
-            BTreeMap::from([
-                ("byte_width".to_string(), json!(byte_width)),
-                ("initialized".to_string(), json!(initial_data_ptr != 0)),
-                ("label".to_string(), json!(label)),
-                (
-                    "usage_hint".to_string(),
-                    json!(match usage_hint {
-                        ResourceUsageHint::Buffer {
-                            role,
-                            cpu_write_frequent,
-                        } => format!("{:?}:{}", role, cpu_write_frequent),
-                        other => format!("{:?}", other),
-                    }),
-                ),
-            ]),
-            json!(buffer_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_create_texture2d(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D11Device::CreateTexture2D on non-device object {device_object:#x}"),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let initial_data_ptr = state.get(Register::R8);
-        let out_ptr = state.get(Register::R9);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let desc = match read_d3d11_texture2d_desc(memory, desc_ptr) {
-            Ok(desc) => desc,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let resource_id = match self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_texture_2d_with_usage(
-                &desc.label,
-                desc.width,
-                desc.height,
-                desc.format,
-                desc.usage_hint,
-            ) {
-            Ok(resource_id) => resource_id,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        if initial_data_ptr != 0 {
-            let src_ptr = read_guest_u64(memory, initial_data_ptr)?;
-            if src_ptr != 0 {
-                let bytes = read_guest_bytes(memory, src_ptr, desc.byte_width)?;
-                self.d3d11_device_mut(device_object)?
-                    .device
-                    .update_subresource(resource_id, &bytes)?;
-            }
-        }
-        let texture_object = self.alloc_d3d11_texture_object(memory, device_object, resource_id)?;
-        write_u64(memory, out_ptr, texture_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11Device::CreateTexture2D",
-            BTreeMap::from([
-                ("width".to_string(), json!(desc.width)),
-                ("height".to_string(), json!(desc.height)),
-                ("format".to_string(), json!(format!("{:?}", desc.format))),
-                ("label".to_string(), json!(desc.label)),
-            ]),
-            json!(texture_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_create_shader_resource_view(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D11Device::CreateShaderResourceView on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let resource_object = state.get(Register::Rdx);
-        let desc_ptr = state.get(Register::R8);
-        let out_ptr = state.get(Register::R9);
-        if resource_object == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let (resource_device_object, resource_id) =
-            self.d3d11_resource_owner_and_id(resource_object)?;
-        if resource_device_object != device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let default_format = self
-            .d3d11_device(device_object)?
-            .device
-            .resource_desc(resource_id)?
-            .format;
-        let format = if desc_ptr == 0 {
-            default_format
-        } else {
-            read_d3d11_view_format(memory, desc_ptr, default_format)?
-        };
-        let view_id = match self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_shader_resource_view(resource_id, format)
-        {
-            Ok(view_id) => view_id,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let view_object =
-            self.alloc_d3d11_view_object(memory, device_object, view_id, ViewKind::Srv)?;
-        write_u64(memory, out_ptr, view_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11Device::CreateShaderResourceView",
-            BTreeMap::from([("format".to_string(), json!(format!("{:?}", format)))]),
-            json!(view_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_create_depth_stencil_view(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D11Device::CreateDepthStencilView on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let resource_object = state.get(Register::Rdx);
-        let desc_ptr = state.get(Register::R8);
-        let out_ptr = state.get(Register::R9);
-        if resource_object == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let (resource_device_object, resource_id) =
-            self.d3d11_resource_owner_and_id(resource_object)?;
-        if resource_device_object != device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let default_format = self
-            .d3d11_device(device_object)?
-            .device
-            .resource_desc(resource_id)?
-            .format;
-        let format = if desc_ptr == 0 {
-            default_format
-        } else {
-            read_d3d11_view_format(memory, desc_ptr, default_format)?
-        };
-        let view_id = match self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_depth_stencil_view(resource_id, format)
-        {
-            Ok(view_id) => view_id,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let view_object =
-            self.alloc_d3d11_view_object(memory, device_object, view_id, ViewKind::Dsv)?;
-        write_u64(memory, out_ptr, view_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11Device::CreateDepthStencilView",
-            BTreeMap::from([("format".to_string(), json!(format!("{:?}", format)))]),
-            json!(view_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_create_render_target_view(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D11Device::CreateRenderTargetView on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let resource_object = state.get(Register::Rdx);
-        let desc_ptr = state.get(Register::R8);
-        let out_ptr = state.get(Register::R9);
-        if resource_object == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let (resource_device_object, resource_id) =
-            self.d3d11_resource_owner_and_id(resource_object)?;
-        if resource_device_object != device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let default_format = self
-            .d3d11_device(device_object)?
-            .device
-            .resource_desc(resource_id)?
-            .format;
-        let format = if desc_ptr == 0 {
-            default_format
-        } else {
-            read_d3d11_view_format(memory, desc_ptr, default_format)?
-        };
-        let view_id = match self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_render_target_view(resource_id, format)
-        {
-            Ok(view_id) => view_id,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let view_object =
-            self.alloc_d3d11_view_object(memory, device_object, view_id, ViewKind::Rtv)?;
-        write_u64(memory, out_ptr, view_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11Device::CreateRenderTargetView",
-            BTreeMap::from([("format".to_string(), json!(format!("{:?}", format)))]),
-            json!(view_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_create_blend_state(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D11Device::CreateBlendState on non-device object {device_object:#x}"),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R8);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let desc = match read_d3d11_blend_desc(memory, desc_ptr) {
-            Ok(desc) => desc,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let state_id = self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_blend_state(desc.clone());
-        let state_object = self.alloc_d3d11_blend_state_object(memory, device_object, state_id)?;
-        write_u64(memory, out_ptr, state_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11Device::CreateBlendState",
-            BTreeMap::from([
-                (
-                    "alpha_to_coverage_enable".to_string(),
-                    json!(desc.alpha_to_coverage_enable),
-                ),
-                (
-                    "independent_blend_enable".to_string(),
-                    json!(desc.independent_blend_enable),
-                ),
-                (
-                    "rt0_blend_enable".to_string(),
-                    json!(desc.render_target[0].blend_enable),
-                ),
-            ]),
-            json!(state_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_create_depth_stencil_state(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D11Device::CreateDepthStencilState on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R8);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let desc = match read_d3d11_depth_stencil_desc(memory, desc_ptr) {
-            Ok(desc) => desc,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let state_id = self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_depth_stencil_state(desc.clone());
-        let state_object =
-            self.alloc_d3d11_depth_stencil_state_object(memory, device_object, state_id)?;
-        write_u64(memory, out_ptr, state_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11Device::CreateDepthStencilState",
-            BTreeMap::from([
-                ("depth_enable".to_string(), json!(desc.depth_enable)),
-                ("depth_write_mask".to_string(), json!(desc.depth_write_mask)),
-                ("depth_func".to_string(), json!(desc.depth_func)),
-                ("stencil_enable".to_string(), json!(desc.stencil_enable)),
-            ]),
-            json!(state_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_create_rasterizer_state(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D11Device::CreateRasterizerState on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R8);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let desc = match read_d3d11_rasterizer_desc(memory, desc_ptr) {
-            Ok(desc) => desc,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let state_id = self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_rasterizer_state(desc.clone());
-        let state_object =
-            self.alloc_d3d11_rasterizer_state_object(memory, device_object, state_id)?;
-        write_u64(memory, out_ptr, state_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11Device::CreateRasterizerState",
-            BTreeMap::from([
-                ("fill_mode".to_string(), json!(desc.fill_mode)),
-                ("cull_mode".to_string(), json!(desc.cull_mode)),
-            ]),
-            json!(state_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_create_sampler_state(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D11Device::CreateSamplerState on non-device object {device_object:#x}"),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R8);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let desc = match read_d3d11_sampler_desc(memory, desc_ptr) {
-            Ok(desc) => desc,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let state_id = self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_sampler_state(desc.clone());
-        let state_object =
-            self.alloc_d3d11_sampler_state_object(memory, device_object, state_id)?;
-        write_u64(memory, out_ptr, state_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11Device::CreateSamplerState",
-            BTreeMap::from([
-                ("filter".to_string(), json!(format!("{:?}", desc.filter))),
-                ("address_u".to_string(), json!(desc.address_u)),
-                ("address_v".to_string(), json!(desc.address_v)),
-            ]),
-            json!(state_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_create_input_layout(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D11Device::CreateInputLayout on non-device object {device_object:#x}"),
-            ));
-        }
-        let stack = state.get(Register::Rsp);
-        let desc_ptr = state.get(Register::Rdx);
-        let num_elements = state.get(Register::R8) as u32;
-        let bytecode_ptr = state.get(Register::R9);
-        let bytecode_len = memory.read_u64(stack + 0x20)? as usize;
-        let out_ptr = memory.read_u64(stack + 0x28)?;
-        if desc_ptr == 0
-            || num_elements == 0
-            || bytecode_ptr == 0
-            || bytecode_len == 0
-            || out_ptr == 0
-        {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let desc = read_d3d11_input_layout_desc(memory, desc_ptr, num_elements)?;
-        let layout_id = self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_input_layout(desc);
-        let layout_object =
-            self.alloc_d3d11_input_layout_object(memory, device_object, layout_id)?;
-        write_u64(memory, out_ptr, layout_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11Device::CreateInputLayout",
-            BTreeMap::from([
-                ("elements".to_string(), json!(num_elements)),
-                ("bytecode_len".to_string(), json!(bytecode_len)),
-            ]),
-            json!(layout_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_vs_set_constant_buffers(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let start_slot = state.get(Register::Rdx) as u32;
-        let num_buffers = state.get(Register::R8) as usize;
-        let buffers_ptr = state.get(Register::R9);
-        if start_slot != 0 || (num_buffers != 0 && buffers_ptr == 0) {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let mut buffers = Vec::new();
-        if num_buffers != 0 {
-            let objects = read_guest_pointer_array(memory, buffers_ptr, num_buffers)?;
-            if !objects.iter().all(|object| *object == 0) {
-                buffers.reserve(objects.len());
-                // Resolve device object for validation
-                let device_object =
-                    if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                        deferred.device_object
-                    } else {
-                        let context = self.d3d11_context(context_object)?;
-                        context.device_object
-                    };
-                for object in objects {
-                    if object == 0 {
-                        state.set(Register::Rax, E_INVALIDARG);
-                        self.last_error = 0;
-                        return Ok(());
-                    }
-                    let buffer = self.d3d11_buffer(object)?;
-                    if buffer.device_object != device_object {
-                        state.set(Register::Rax, E_INVALIDARG);
-                        self.last_error = 0;
-                        return Ok(());
-                    }
-                    buffers.push(buffer.resource_id);
-                }
-            }
-        }
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred
-                .deferred_context
-                .vs_set_constant_buffers(buffers.clone())?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .vs_set_constant_buffers(buffers.clone());
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::VSSetConstantBuffers",
-            BTreeMap::from([("count".to_string(), json!(buffers.len()))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_ps_set_shader_resources(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let start_slot = state.get(Register::Rdx) as u32;
-        let num_views = state.get(Register::R8) as usize;
-        let views_ptr = state.get(Register::R9);
-        if start_slot != 0 || (num_views != 0 && views_ptr == 0) {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let mut views = Vec::new();
-        if num_views != 0 {
-            let objects = read_guest_pointer_array(memory, views_ptr, num_views)?;
-            if !objects.iter().all(|object| *object == 0) {
-                views.reserve(objects.len());
-                // Resolve device object for validation
-                let device_object =
-                    if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                        deferred.device_object
-                    } else {
-                        let context = self.d3d11_context(context_object)?;
-                        context.device_object
-                    };
-                for object in objects {
-                    if object == 0 {
-                        state.set(Register::Rax, E_INVALIDARG);
-                        self.last_error = 0;
-                        return Ok(());
-                    }
-                    let view = self.d3d11_view(object)?;
-                    if view.device_object != device_object || view.kind != ViewKind::Srv {
-                        state.set(Register::Rax, E_INVALIDARG);
-                        self.last_error = 0;
-                        return Ok(());
-                    }
-                    views.push(view.view_id);
-                }
-            }
-        }
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred
-                .deferred_context
-                .ps_set_shader_resources(views.clone())?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .ps_set_shader_resources(views.clone());
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::PSSetShaderResources",
-            BTreeMap::from([("count".to_string(), json!(views.len()))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_ps_set_samplers(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let start_slot = state.get(Register::Rdx) as u32;
-        let num_samplers = state.get(Register::R8) as usize;
-        let samplers_ptr = state.get(Register::R9);
-        if start_slot != 0 || (num_samplers != 0 && samplers_ptr == 0) {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let mut samplers = Vec::new();
-        if num_samplers != 0 {
-            let objects = read_guest_pointer_array(memory, samplers_ptr, num_samplers)?;
-            if !objects.iter().all(|object| *object == 0) {
-                samplers.reserve(objects.len());
-                // Resolve device object for validation
-                let device_object =
-                    if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                        deferred.device_object
-                    } else {
-                        let context = self.d3d11_context(context_object)?;
-                        context.device_object
-                    };
-                for object in objects {
-                    if object == 0 {
-                        state.set(Register::Rax, E_INVALIDARG);
-                        self.last_error = 0;
-                        return Ok(());
-                    }
-                    let sampler = self.d3d11_sampler_state(object)?;
-                    if sampler.device_object != device_object {
-                        state.set(Register::Rax, E_INVALIDARG);
-                        self.last_error = 0;
-                        return Ok(());
-                    }
-                    samplers.push(sampler.state_id);
-                }
-            }
-        }
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred
-                .deferred_context
-                .ps_set_samplers(samplers.clone())?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .ps_set_samplers(samplers.clone());
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::PSSetSamplers",
-            BTreeMap::from([("count".to_string(), json!(samplers.len()))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_ia_set_input_layout(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let layout_object = state.get(Register::Rdx);
-        if layout_object == 0 {
-            if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                deferred.deferred_context.ia_clear_input_layout()?;
-            } else {
-                let context = self.d3d11_context(context_object)?;
-                self.d3d11_device_mut(context.device_object)?
-                    .device
-                    .ia_clear_input_layout();
-            }
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            self.push_trace(
-                "d3d12",
-                "ID3D11DeviceContext::IASetInputLayout",
-                BTreeMap::new(),
-                json!(0),
-            );
-            return Ok(());
-        }
-        let input_layout = self.d3d11_input_layout(layout_object)?;
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            if input_layout.device_object != deferred.device_object {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            deferred
-                .deferred_context
-                .ia_set_input_layout(input_layout.layout_id)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            if input_layout.device_object != context.device_object {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .ia_set_input_layout(input_layout.layout_id);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::IASetInputLayout",
-            BTreeMap::new(),
-            json!(layout_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_ia_set_vertex_buffers(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let start_slot = state.get(Register::Rdx) as u32;
-        let num_buffers = state.get(Register::R8) as usize;
-        let buffers_ptr = state.get(Register::R9);
-        let stack = state.get(Register::Rsp);
-        let strides_ptr = memory.read_u64(stack + 0x20)?;
-        let offsets_ptr = memory.read_u64(stack + 0x28)?;
-        if start_slot != 0
-            || (num_buffers != 0 && (buffers_ptr == 0 || strides_ptr == 0 || offsets_ptr == 0))
-        {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let mut buffers = Vec::new();
-        if num_buffers != 0 {
-            let objects = read_guest_pointer_array(memory, buffers_ptr, num_buffers)?;
-            for index in 0..num_buffers as u64 {
-                read_guest_u32(memory, strides_ptr + index * 4)?;
-                read_guest_u32(memory, offsets_ptr + index * 4)?;
-            }
-            if !objects.iter().all(|object| *object == 0) {
-                buffers.reserve(objects.len());
-                // Resolve device object for validation
-                let device_object =
-                    if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                        deferred.device_object
-                    } else {
-                        let context = self.d3d11_context(context_object)?;
-                        context.device_object
-                    };
-                for object in objects {
-                    if object == 0 {
-                        state.set(Register::Rax, E_INVALIDARG);
-                        self.last_error = 0;
-                        return Ok(());
-                    }
-                    let buffer = self.d3d11_buffer(object)?;
-                    if buffer.device_object != device_object {
-                        state.set(Register::Rax, E_INVALIDARG);
-                        self.last_error = 0;
-                        return Ok(());
-                    }
-                    buffers.push(buffer.resource_id);
-                }
-            }
-        }
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred
-                .deferred_context
-                .ia_set_vertex_buffers(buffers.clone())?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .ia_set_vertex_buffers(buffers.clone());
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::IASetVertexBuffers",
-            BTreeMap::from([("count".to_string(), json!(buffers.len()))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_ia_set_index_buffer(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let buffer_object = state.get(Register::Rdx);
-        let format = state.get(Register::R8) as u32;
-        let offset = state.get(Register::R9) as u32;
-        if buffer_object == 0 {
-            if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                deferred.deferred_context.ia_clear_index_buffer()?;
-            } else {
-                let context = self.d3d11_context(context_object)?;
-                self.d3d11_device_mut(context.device_object)?
-                    .device
-                    .ia_clear_index_buffer();
-            }
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            self.push_trace(
-                "d3d12",
-                "ID3D11DeviceContext::IASetIndexBuffer",
-                BTreeMap::new(),
-                json!(0),
-            );
-            return Ok(());
-        }
-        if format != 42 && format != 57 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let buffer = self.d3d11_buffer(buffer_object)?;
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            if buffer.device_object != deferred.device_object {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            deferred
-                .deferred_context
-                .ia_set_index_buffer(buffer.resource_id)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            if buffer.device_object != context.device_object {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .ia_set_index_buffer(buffer.resource_id);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::IASetIndexBuffer",
-            BTreeMap::from([
-                ("format".to_string(), json!(format)),
-                ("offset".to_string(), json!(offset)),
-            ]),
-            json!(buffer_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_ia_set_primitive_topology(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let topology = state.get(Register::Rdx) as u32;
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred
-                .deferred_context
-                .ia_set_primitive_topology(topology)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .ia_set_primitive_topology(topology);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::IASetPrimitiveTopology",
-            BTreeMap::from([("topology".to_string(), json!(topology))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_om_set_render_targets(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let count = state.get(Register::Rdx) as usize;
-        let render_targets_ptr = state.get(Register::R8);
-        let depth_view_object = state.get(Register::R9);
-        if count != 0 && render_targets_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Resolve device object for validation
-        let device_object = if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred.device_object
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            context.device_object
-        };
-        let mut render_targets = Vec::new();
-        if count != 0 {
-            let objects = read_guest_pointer_array(memory, render_targets_ptr, count)?;
-            if !objects.iter().all(|object| *object == 0) {
-                render_targets.reserve(objects.len());
-                for object in objects {
-                    if object == 0 {
-                        state.set(Register::Rax, E_INVALIDARG);
-                        self.last_error = 0;
-                        return Ok(());
-                    }
-                    let view = self.d3d11_view(object)?;
-                    if view.device_object != device_object || view.kind != ViewKind::Rtv {
-                        state.set(Register::Rax, E_INVALIDARG);
-                        self.last_error = 0;
-                        return Ok(());
-                    }
-                    render_targets.push(view.view_id);
-                }
-            }
-        }
-        let depth_target = if depth_view_object == 0 {
-            None
-        } else {
-            let view = self.d3d11_view(depth_view_object)?;
-            if view.device_object != device_object || view.kind != ViewKind::Dsv {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            Some(view.view_id)
-        };
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred
-                .deferred_context
-                .om_set_render_targets(render_targets.clone(), depth_target)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .om_set_render_targets(render_targets.clone(), depth_target);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::OMSetRenderTargets",
-            BTreeMap::from([
-                ("count".to_string(), json!(render_targets.len())),
-                ("depth_bound".to_string(), json!(depth_target.is_some())),
-            ]),
-            json!(depth_view_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_om_set_blend_state(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let blend_state_object = state.get(Register::Rdx);
-        if blend_state_object == 0 {
-            if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                deferred.deferred_context.om_clear_blend_state()?;
-            } else {
-                let context = self.d3d11_context(context_object)?;
-                self.d3d11_device_mut(context.device_object)?
-                    .device
-                    .om_clear_blend_state();
-            }
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            self.push_trace(
-                "d3d12",
-                "ID3D11DeviceContext::OMSetBlendState",
-                BTreeMap::new(),
-                json!(0),
-            );
-            return Ok(());
-        }
-        let blend_state = self.d3d11_blend_state(blend_state_object)?;
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            if blend_state.device_object != deferred.device_object {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            deferred
-                .deferred_context
-                .om_set_blend_state(blend_state.state_id)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            if blend_state.device_object != context.device_object {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .om_set_blend_state(blend_state.state_id);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::OMSetBlendState",
-            BTreeMap::new(),
-            json!(blend_state_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_om_set_depth_stencil_state(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let depth_stencil_state_object = state.get(Register::Rdx);
-        let stencil_ref = state.get(Register::R8) as u32;
-        if depth_stencil_state_object == 0 {
-            if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                deferred.deferred_context.om_clear_depth_stencil_state()?;
-            } else {
-                let context = self.d3d11_context(context_object)?;
-                self.d3d11_device_mut(context.device_object)?
-                    .device
-                    .om_clear_depth_stencil_state();
-            }
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            self.push_trace(
-                "d3d12",
-                "ID3D11DeviceContext::OMSetDepthStencilState",
-                BTreeMap::from([("stencil_ref".to_string(), json!(stencil_ref))]),
-                json!(0),
-            );
-            return Ok(());
-        }
-        let depth_stencil_state = self.d3d11_depth_stencil_state(depth_stencil_state_object)?;
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            if depth_stencil_state.device_object != deferred.device_object {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            deferred
-                .deferred_context
-                .om_set_depth_stencil_state(depth_stencil_state.state_id)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            if depth_stencil_state.device_object != context.device_object {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .om_set_depth_stencil_state(depth_stencil_state.state_id);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::OMSetDepthStencilState",
-            BTreeMap::from([("stencil_ref".to_string(), json!(stencil_ref))]),
-            json!(depth_stencil_state_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_rs_set_state(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let rasterizer_state_object = state.get(Register::Rdx);
-        if rasterizer_state_object == 0 {
-            if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                deferred.deferred_context.rs_clear_state()?;
-            } else {
-                let context = self.d3d11_context(context_object)?;
-                self.d3d11_device_mut(context.device_object)?
-                    .device
-                    .rs_clear_state();
-            }
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            self.push_trace(
-                "d3d12",
-                "ID3D11DeviceContext::RSSetState",
-                BTreeMap::new(),
-                json!(0),
-            );
-            return Ok(());
-        }
-        let rasterizer_state = self.d3d11_rasterizer_state(rasterizer_state_object)?;
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            if rasterizer_state.device_object != deferred.device_object {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            deferred
-                .deferred_context
-                .rs_set_state(rasterizer_state.state_id)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            if rasterizer_state.device_object != context.device_object {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .rs_set_state(rasterizer_state.state_id);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::RSSetState",
-            BTreeMap::new(),
-            json!(rasterizer_state_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_rs_set_viewports(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let count = state.get(Register::Rdx) as usize;
-        let viewports_ptr = state.get(Register::R8);
-        if count == 0 {
-            if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                deferred.deferred_context.rs_clear_viewports()?;
-            } else {
-                let context = self.d3d11_context(context_object)?;
-                self.d3d11_device_mut(context.device_object)?
-                    .device
-                    .rs_clear_viewports();
-            }
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            self.push_trace(
-                "d3d12",
-                "ID3D11DeviceContext::RSSetViewports",
-                BTreeMap::new(),
-                json!(0),
-            );
-            return Ok(());
-        }
-        if count != 1 || viewports_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let viewport = match read_d3d11_viewport(memory, viewports_ptr) {
-            Ok(viewport) => viewport,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred
-                .deferred_context
-                .rs_set_viewports(viewport.clone())?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .rs_set_viewports(viewport.clone());
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::RSSetViewports",
-            BTreeMap::from([
-                ("width".to_string(), json!(viewport.width)),
-                ("height".to_string(), json!(viewport.height)),
-            ]),
-            json!(count),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_rs_set_scissor_rects(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let count = state.get(Register::Rdx) as usize;
-        let rects_ptr = state.get(Register::R8);
-        if count == 0 {
-            if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                deferred.deferred_context.rs_clear_scissor_rects()?;
-            } else {
-                let context = self.d3d11_context(context_object)?;
-                self.d3d11_device_mut(context.device_object)?
-                    .device
-                    .rs_clear_scissor_rects();
-            }
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            self.push_trace(
-                "d3d12",
-                "ID3D11DeviceContext::RSSetScissorRects",
-                BTreeMap::new(),
-                json!(0),
-            );
-            return Ok(());
-        }
-        if count != 1 || rects_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let rect = match read_d3d11_scissor_rect(memory, rects_ptr) {
-            Ok(rect) => rect,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred
-                .deferred_context
-                .rs_set_scissor_rects(rect.clone())?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .rs_set_scissor_rects(rect.clone());
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::RSSetScissorRects",
-            BTreeMap::from([
-                ("left".to_string(), json!(rect.left)),
-                ("top".to_string(), json!(rect.top)),
-                ("right".to_string(), json!(rect.right)),
-                ("bottom".to_string(), json!(rect.bottom)),
-            ]),
-            json!(count),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_draw(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let vertex_count = state.get(Register::Rdx) as u32;
-        let start_vertex_location = state.get(Register::R8) as u32;
-        if start_vertex_location != 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred.deferred_context.draw(vertex_count)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .draw(vertex_count);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::Draw",
-            BTreeMap::from([("vertices".to_string(), json!(vertex_count))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_draw_instanced(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let vertex_count_per_instance = state.get(Register::Rdx) as u32;
-        let instance_count = state.get(Register::R8) as u32;
-        let start_vertex_location = state.get(Register::R9) as u32;
-        let start_instance_location = read_guest_u32(memory, state.get(Register::Rsp) + 0x20)?;
-        if start_vertex_location != 0 || start_instance_location != 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred
-                .deferred_context
-                .draw_instanced(vertex_count_per_instance, instance_count)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .draw_instanced(vertex_count_per_instance, instance_count);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::DrawInstanced",
-            BTreeMap::from([
-                (
-                    "vertices_per_instance".to_string(),
-                    json!(vertex_count_per_instance),
-                ),
-                ("instances".to_string(), json!(instance_count)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_draw_indexed(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let index_count = state.get(Register::Rdx) as u32;
-        let start_index_location = state.get(Register::R8) as u32;
-        let base_vertex_location = state.get(Register::R9) as i32;
-        if start_index_location != 0 || base_vertex_location != 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred.deferred_context.draw_indexed(index_count)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .draw_indexed(index_count);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::DrawIndexed",
-            BTreeMap::from([("indices".to_string(), json!(index_count))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_draw_indexed_instanced(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let index_count_per_instance = state.get(Register::Rdx) as u32;
-        let instance_count = state.get(Register::R8) as u32;
-        let start_index_location = state.get(Register::R9) as u32;
-        let stack = state.get(Register::Rsp);
-        let base_vertex_location = read_guest_u32(memory, stack + 0x20)? as i32;
-        let start_instance_location = read_guest_u32(memory, stack + 0x28)?;
-        if start_index_location != 0 || base_vertex_location != 0 || start_instance_location != 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            deferred
-                .deferred_context
-                .draw_indexed_instanced(index_count_per_instance, instance_count)?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .draw_indexed_instanced(index_count_per_instance, instance_count);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::DrawIndexedInstanced",
-            BTreeMap::from([
-                (
-                    "indices_per_instance".to_string(),
-                    json!(index_count_per_instance),
-                ),
-                ("instances".to_string(), json!(instance_count)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_resolve_subresource(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        // ID3D11DeviceContext::ResolveSubresource calling convention (x64):
-        //   RCX = this (context object)
-        //   RDX = pDstResource
-        //   R8  = DstSubresource
-        //   R9  = pSrcResource
-        //   [RSP+0x20] = SrcSubresource
-        //   [RSP+0x28] = Format (DXGI_FORMAT)
-        let context_object = state.get(Register::Rcx);
-        let dst_texture = self.d3d11_texture(state.get(Register::Rdx))?;
-        let dst_subresource = state.get(Register::R8) as u32;
-        let src_texture = self.d3d11_texture(state.get(Register::R9))?;
-        let stack = state.get(Register::Rsp);
-        let src_subresource = memory.read_u64(stack + 0x20)? as u32;
-        let format = memory.read_u64(stack + 0x28)? as u32;
-
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            if dst_texture.device_object != deferred.device_object
-                || src_texture.device_object != deferred.device_object
-            {
-                return Err(AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    "ResolveSubresource requires resources owned by the same device",
-                ));
-            }
-            deferred.deferred_context.resolve_subresource(
-                dst_texture.resource_id,
-                dst_subresource,
-                src_texture.resource_id,
-                src_subresource,
-                format,
-            )?;
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            if dst_texture.device_object != context.device_object
-                || src_texture.device_object != context.device_object
-            {
-                return Err(AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    "ResolveSubresource requires resources owned by the same device",
-                ));
-            }
-            self.d3d11_device_mut(context.device_object)?
-                .device
-                .resolve_subresource(
-                    dst_texture.resource_id,
-                    dst_subresource,
-                    src_texture.resource_id,
-                    src_subresource,
-                    format,
-                )?;
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D11DeviceContext::ResolveSubresource",
-            BTreeMap::from([
-                ("dst_subresource".to_string(), json!(dst_subresource)),
-                ("src_subresource".to_string(), json!(src_subresource)),
-                ("format".to_string(), json!(format)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_create_shader(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-        stage: D3d11ShaderStage,
-        trace_name: &str,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d11Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("{trace_name} on non-device object {device_object:#x}"),
-            ));
-        }
-        let stack = state.get(Register::Rsp);
-        let bytecode_ptr = state.get(Register::Rdx);
-        let bytecode_len = state.get(Register::R8) as usize;
-        let class_linkage = state.get(Register::R9);
-        let out_ptr = memory.read_u64(stack + 0x20)?;
-        if bytecode_ptr == 0 || bytecode_len == 0 || out_ptr == 0 || class_linkage != 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let bytecode = read_guest_bytes(memory, bytecode_ptr, bytecode_len)?;
-        let parsed = match parse_dxil_container(&bytecode) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let Some(root_signature) = parsed.root_signature_part.clone() else {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        };
-        let entry_name = parsed.entry_name.clone();
-        let shader_id = match self
-            .d3d11_device_mut(device_object)?
-            .device
-            .create_shader_from_dxil(
-                crate::d3d11::ShaderModuleDesc {
-                    stage,
-                    entry: entry_name.clone(),
-                },
-                bytecode,
-                root_signature,
-            ) {
-            Ok(shader_id) => shader_id,
-            Err(_) => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let shader_object =
-            self.alloc_d3d11_shader_object(memory, device_object, shader_id, stage)?;
-        write_u64(memory, out_ptr, shader_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        let cache_key = self
-            .d3d11_device(device_object)?
-            .device
-            .shader_translation_cache_key(shader_id)?
-            .unwrap_or_default();
-        self.push_trace(
-            "d3d12",
-            trace_name,
-            BTreeMap::from([
-                ("bytes".to_string(), json!(bytecode_len)),
-                ("entry".to_string(), json!(entry_name)),
-                ("cache_key".to_string(), json!(cache_key)),
-            ]),
-            json!(shader_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_set_shader(
-        &mut self,
-        state: &mut CpuState,
-        stage: D3d11ShaderStage,
-        trace_name: &str,
-    ) -> AppResult<()> {
-        let context_object = state.get(Register::Rcx);
-        let shader_object = state.get(Register::Rdx);
-        let class_instances = state.get(Register::R8);
-        let class_instance_count = state.get(Register::R9);
-        if class_instances != 0 || class_instance_count != 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        if shader_object == 0 {
-            if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                match stage {
-                    D3d11ShaderStage::Vs => deferred.deferred_context.vs_clear_shader()?,
-                    D3d11ShaderStage::Ps => deferred.deferred_context.ps_clear_shader()?,
-                    D3d11ShaderStage::Cs => deferred.deferred_context.cs_clear_shader()?,
-                    D3d11ShaderStage::Gs => deferred.deferred_context.gs_clear_shader()?,
-                    D3d11ShaderStage::Hs => deferred.deferred_context.hs_clear_shader()?,
-                    D3d11ShaderStage::Ds => deferred.deferred_context.ds_clear_shader()?,
-                }
-            } else {
-                let context = self.d3d11_context(context_object)?;
-                let device = &mut self.d3d11_device_mut(context.device_object)?.device;
-                match stage {
-                    D3d11ShaderStage::Vs => device.vs_clear_shader(),
-                    D3d11ShaderStage::Ps => device.ps_clear_shader(),
-                    D3d11ShaderStage::Cs => device.cs_clear_shader(),
-                    D3d11ShaderStage::Gs => device.gs_clear_shader(),
-                    D3d11ShaderStage::Hs => device.hs_clear_shader(),
-                    D3d11ShaderStage::Ds => device.ds_clear_shader(),
-                }
-            }
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            self.push_trace("d3d12", trace_name, BTreeMap::new(), json!(0));
-            return Ok(());
-        }
-        let shader = self.d3d11_shader(shader_object)?;
-        if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-            if shader.device_object != deferred.device_object || shader.stage != stage {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            match stage {
-                D3d11ShaderStage::Vs => {
-                    deferred.deferred_context.vs_set_shader(shader.shader_id)?
-                }
-                D3d11ShaderStage::Ps => {
-                    deferred.deferred_context.ps_set_shader(shader.shader_id)?
-                }
-                D3d11ShaderStage::Cs => {
-                    deferred.deferred_context.cs_set_shader(shader.shader_id)?
-                }
-                D3d11ShaderStage::Gs => {
-                    deferred.deferred_context.gs_set_shader(shader.shader_id)?
-                }
-                D3d11ShaderStage::Hs => {
-                    deferred.deferred_context.hs_set_shader(shader.shader_id)?
-                }
-                D3d11ShaderStage::Ds => {
-                    deferred.deferred_context.ds_set_shader(shader.shader_id)?
-                }
-            }
-            let cache_key = String::new();
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            self.push_trace(
-                "d3d12",
-                trace_name,
-                BTreeMap::from([("cache_key".to_string(), json!(cache_key))]),
-                json!(shader_object),
-            );
-            Ok(())
-        } else {
-            let context = self.d3d11_context(context_object)?;
-            if shader.device_object != context.device_object || shader.stage != stage {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-            let cache_key = {
-                let device = &mut self.d3d11_device_mut(context.device_object)?.device;
-                match stage {
-                    D3d11ShaderStage::Vs => device.vs_set_shader(shader.shader_id),
-                    D3d11ShaderStage::Ps => device.ps_set_shader(shader.shader_id),
-                    D3d11ShaderStage::Cs => device.cs_set_shader(shader.shader_id),
-                    D3d11ShaderStage::Gs => device.gs_set_shader(shader.shader_id),
-                    D3d11ShaderStage::Hs => device.hs_set_shader(shader.shader_id),
-                    D3d11ShaderStage::Ds => device.ds_set_shader(shader.shader_id),
-                }
-                device
-                    .shader_translation_cache_key(shader.shader_id)?
-                    .unwrap_or_default()
-            };
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            self.push_trace(
-                "d3d12",
-                trace_name,
-                BTreeMap::from([("cache_key".to_string(), json!(cache_key))]),
-                json!(shader_object),
-            );
-            Ok(())
-        }
-    }
-
-    fn ensure_d3d11_backbuffer_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        swapchain_object: u64,
-        index: u32,
-    ) -> AppResult<u64> {
-        let device_object = self.d3d11_swapchain(swapchain_object)?.device_object;
-        if let Some(existing) = self
-            .d3d11_device(device_object)?
-            .backbuffer_objects
-            .get(&index)
-            .copied()
-        {
-            return Ok(existing);
-        }
-        let resource_id = self
-            .d3d11_device(device_object)?
-            .device
-            .swapchain_backbuffer(index)?;
-        let texture_object = self.alloc_d3d11_texture_object(memory, device_object, resource_id)?;
-        self.d3d11_device_mut(device_object)?
-            .backbuffer_objects
-            .insert(index, texture_object);
-        Ok(texture_object)
-    }
-
-    fn alloc_dxgi_factory_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        let mut methods =
-            vec![unsupported_method(&self.telemetry, "IDXGIFactory::unsupported"); 26];
-        methods[0] = HostThunk::GraphicsObjectQueryInterface;
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-        // IDXGIObject methods (slots 3-6)
-        methods[3] = HostThunk::DXGIFactorySetPrivateData;
-        methods[4] = HostThunk::DXGIFactorySetPrivateDataInterface;
-        methods[5] = HostThunk::DXGIFactoryGetPrivateData;
-        methods[6] = HostThunk::DXGIFactoryGetParent;
-        // IDXGIFactory methods (slots 7-13)
-        methods[7] = HostThunk::DXGIFactoryEnumAdapters;
-        methods[8] = HostThunk::DXGIFactoryMakeWindowAssociation;
-        methods[9] = HostThunk::DXGIFactoryGetWindowAssociation;
-        methods[10] = HostThunk::DXGIFactoryCreateSwapChain;
-        methods[11] = HostThunk::DXGIFactoryCreateSoftwareAdapter;
-        methods[12] = HostThunk::DXGIFactoryEnumAdapters1;
-        // IDXGIFactory1 methods (slot 13)
-        methods[13] = HostThunk::DXGIFactoryIsCurrent;
-        // IDXGIFactory2 methods (slots 14-22)
-        methods[14] = HostThunk::DXGIFactoryRegisterStereoStatus;
-        methods[15] = HostThunk::DXGIFactoryCreateSwapChainForHwnd;
-        methods[16] = HostThunk::DXGIFactoryCreateSwapChainForCoreWindow;
-        methods[17] = HostThunk::DXGIFactoryCreateSwapChainForComposition;
-        methods[18] = HostThunk::DXGIFactoryRegisterStereoStatusEvent;
-        methods[19] = HostThunk::DXGIFactoryUnregisterStereoStatus;
-        methods[20] = HostThunk::DXGIFactoryRegisterOcclusionStatus;
-        methods[21] = HostThunk::DXGIFactoryRegisterOcclusionStatusEvent;
-        methods[22] = HostThunk::DXGIFactoryUnregisterOcclusionStatus;
-        // IDXGIFactory3+ methods (slots 23-25)
-        methods[23] = HostThunk::DXGIFactoryGetCreationFlags;
-        methods[24] = HostThunk::DXGIFactoryEnumAdapterByLuid;
-        methods[25] = HostThunk::DXGIFactoryEnumWarpAdapter;
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::DxgiFactory, vtable)?;
-        self.dxgi_factories.insert(object, GuestDxgiFactory);
-        Ok(object)
-    }
-
-    // ── D3D9 COM object allocators (Phase 1.5) ──────────────────────────────
-
-    fn alloc_d3d9_factory_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        // IDirect3D9 has ~20 methods. Fill with unsupported defaults, then
-        // wire up the ones we implement.
-        let mut methods =
-            vec![unsupported_method(&self.telemetry, "IDirect3D9::QueryInterface"); 20];
-        methods[0] = unsupported_method(&self.telemetry, "IDirect3D9::QueryInterface");
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-        methods[3] = HostThunk::D3d9FactoryCreateDevice;
-        methods[4] = HostThunk::D3d9FactoryGetAdapterCount;
-        methods[5] = HostThunk::D3d9FactoryGetAdapterIdentifier;
-        methods[6] = HostThunk::D3d9FactoryGetAdapterModeCount;
-        methods[7] = HostThunk::D3d9FactoryGetAdapterDisplayMode;
-        methods[8] = HostThunk::D3d9FactoryGetDeviceCaps;
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d9Factory, vtable)?;
-        self.d3d9_factories.insert(object);
-        Ok(object)
-    }
-
-    fn alloc_d3d9_device_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_id: D3d9DeviceId,
-        present_params: D3dPresentParameters,
-    ) -> AppResult<u64> {
-        // IDirect3DDevice9 has 105 vtable slots. Fill with unsupported, wire up
-        // the methods we handle for basic fixed-function rendering.
-        let mut methods = vec![unsupported_method(&self.telemetry, "IDirect3DDevice9::?"); 105];
-
-        // Standard COM (slots 0-2)
-        methods[0] = unsupported_method(&self.telemetry, "IDirect3DDevice9::QueryInterface");
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-
-        // State queries (slot 3)
-        methods[3] = HostThunk::D3d9DeviceTestCooperativeLevel;
-
-        // Capabilities (slot 7)
-        methods[7] = HostThunk::D3d9DeviceGetDeviceCaps;
-
-        // Reset / Present (slots 16-17)
-        methods[16] = HostThunk::D3d9DeviceReset;
-        methods[17] = HostThunk::D3d9DevicePresent;
-
-        // Back buffer / render target (slots 18-22)
-        methods[18] = HostThunk::D3d9DeviceGetBackBuffer;
-        methods[19] = HostThunk::D3d9DeviceGetRenderTarget;
-        methods[20] = HostThunk::D3d9DeviceSetRenderTarget;
-        methods[21] = HostThunk::D3d9DeviceGetDepthStencilSurface;
-        methods[22] = HostThunk::D3d9DeviceSetDepthStencilSurface;
-
-        // Scene management (slots 23-24)
-        methods[23] = HostThunk::D3d9DeviceBeginScene;
-        methods[24] = HostThunk::D3d9DeviceEndScene;
-
-        // Clear (slot 25)
-        methods[25] = HostThunk::D3d9DeviceClear;
-
-        // Transform (slots 26-28)
-        methods[26] = HostThunk::D3d9DeviceSetTransform;
-        methods[27] = HostThunk::D3d9DeviceGetTransform;
-
-        // Viewport (slots 29-30)
-        methods[29] = HostThunk::D3d9DeviceSetViewport;
-        methods[30] = HostThunk::D3d9DeviceGetViewport;
-
-        // Material (slots 31-32)
-        methods[31] = HostThunk::D3d9DeviceSetMaterial;
-
-        // Light (slots 33-36)
-        methods[33] = HostThunk::D3d9DeviceSetLight;
-        methods[35] = HostThunk::D3d9DeviceLightEnable;
-
-        // Clip plane (slots 37-38)
-        methods[37] = HostThunk::D3d9DeviceSetClipPlane;
-
-        // Render states (slots 39-40)
-        methods[39] = HostThunk::D3d9DeviceSetRenderState;
-        methods[40] = HostThunk::D3d9DeviceGetRenderState;
-
-        // Texture (slots 46-49)
-        methods[46] = HostThunk::D3d9DeviceGetTexture;
-        methods[47] = HostThunk::D3d9DeviceSetTexture;
-        methods[49] = HostThunk::D3d9DeviceSetTextureStageState;
-
-        // Sampler state (slots 50-51)
-        methods[51] = HostThunk::D3d9DeviceSetSamplerState;
-
-        // Scissor rect (slots 57-58)
-        methods[57] = HostThunk::D3d9DeviceSetScissorRect;
-
-        // Draw (slots 63-66)
-        methods[63] = HostThunk::D3d9DeviceDrawPrimitive;
-        methods[64] = HostThunk::D3d9DeviceDrawIndexedPrimitive;
-        methods[65] = HostThunk::D3d9DeviceDrawPrimitiveUP;
-        methods[66] = HostThunk::D3d9DeviceDrawIndexedPrimitiveUP;
-
-        // Vertex/pixel shader (slots 71-76)
-        methods[72] = HostThunk::D3d9DeviceSetVertexShader;
-        methods[75] = HostThunk::D3d9DeviceSetPixelShader;
-
-        // Resource creation (slots 77-82)
-        methods[77] = HostThunk::D3d9DeviceCreateVertexBuffer;
-        methods[78] = HostThunk::D3d9DeviceCreateIndexBuffer;
-        methods[79] = HostThunk::D3d9DeviceCreateTexture;
-
-        // Shader constants (slots 84-87)
-        methods[84] = HostThunk::D3d9DeviceSetVertexShaderConstantF;
-        methods[86] = HostThunk::D3d9DeviceSetPixelShaderConstantF;
-
-        // Stream source / indices (slots 88-93)
-        methods[88] = HostThunk::D3d9DeviceSetStreamSource;
-        methods[89] = HostThunk::D3d9DeviceGetStreamSource;
-        methods[90] = unsupported_method(&self.telemetry, "IDirect3DDevice9::SetStreamSourceFreq");
-        methods[92] = HostThunk::D3d9DeviceSetIndices;
-        methods[93] = HostThunk::D3d9DeviceGetIndices;
-
-        // Render target / depth-stencil creation (slots 94-95)
-        methods[94] = HostThunk::D3d9DeviceCreateRenderTarget;
-        methods[95] = HostThunk::D3d9DeviceCreateDepthStencilSurface;
-
-        // Query creation (slot 82)
-        methods[82] = HostThunk::D3d9DeviceCreateQuery;
-
-        // Swap chain (slots 13-15)
-        methods[13] = HostThunk::D3d9DeviceGetSwapChain;
-        methods[14] =
-            unsupported_method(&self.telemetry, "IDirect3DDevice9::GetNumberOfSwapChains");
-
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d9Device, vtable)?;
-
-        // Create a Direct3D9Device for state tracking, indexed by device_id
-        // (device_id comes from the shim's create_device call)
-        let swapchain_width = present_params.back_buffer_width.max(1);
-        let swapchain_height = present_params.back_buffer_height.max(1);
-        let shim_device = crate::d3d11::Direct3D9Device {
-            id: device_id,
-            state: D3d9StateBlock::new(),
-            present_params,
-            swapchain_width,
-            swapchain_height,
-        };
-        self.d3d9_devices.insert(object, shim_device);
-
-        Ok(object)
-    }
-
-    fn alloc_d3d9_vertex_buffer_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        size: usize,
-        fvf: u32,
-        stride: u32,
-    ) -> AppResult<u64> {
-        let methods = vec![
-            unsupported_method(&self.telemetry, "IDirect3DVertexBuffer9::QueryInterface"),
-            HostThunk::GuestObjectAddRef,
-            HostThunk::GuestObjectRelease,
-            HostThunk::D3d9VertexBufferLock,
-            HostThunk::D3d9VertexBufferUnlock,
-            unsupported_method(&self.telemetry, "IDirect3DVertexBuffer9::GetDesc"),
-        ];
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d9VertexBuffer, vtable)?;
-        let vb = crate::d3d11::VertexBuffer9 {
-            id: 0, // unused for guest-managed
-            size,
-            data: vec![0u8; size],
-            fvf,
-            stride,
-        };
-        self.d3d9_vertex_buffers.insert(object, vb);
-        Ok(object)
-    }
-
-    fn alloc_d3d9_index_buffer_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        size: usize,
-        format: bool,
-    ) -> AppResult<u64> {
-        let methods = vec![
-            unsupported_method(&self.telemetry, "IDirect3DIndexBuffer9::QueryInterface"),
-            HostThunk::GuestObjectAddRef,
-            HostThunk::GuestObjectRelease,
-            HostThunk::D3d9IndexBufferLock,
-            HostThunk::D3d9IndexBufferUnlock,
-            unsupported_method(&self.telemetry, "IDirect3DIndexBuffer9::GetDesc"),
-        ];
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d9IndexBuffer, vtable)?;
-        let ib = crate::d3d11::IndexBuffer9 {
-            id: 0,
-            size,
-            format,
-            data: vec![0u8; size],
-        };
-        self.d3d9_index_buffers.insert(object, ib);
-        Ok(object)
-    }
-
-    fn alloc_d3d9_texture_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        width: u32,
-        height: u32,
-        levels: u32,
-        format: u32,
-    ) -> AppResult<u64> {
-        let methods = vec![
-            unsupported_method(&self.telemetry, "IDirect3DTexture9::QueryInterface"),
-            HostThunk::GuestObjectAddRef,
-            HostThunk::GuestObjectRelease,
-            unsupported_method(&self.telemetry, "IDirect3DTexture9::GetLevelDesc"),
-            unsupported_method(&self.telemetry, "IDirect3DTexture9::GetSurfaceLevel"),
-            HostThunk::D3d9TextureLockRect,
-            HostThunk::D3d9TextureUnlockRect,
-            unsupported_method(&self.telemetry, "IDirect3DTexture9::AddDirtyRect"),
-        ];
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d9Texture, vtable)?;
-        let mut mip_levels = Vec::new();
-        let mut mw = width;
-        let mut mh = height;
-        for _ in 0..levels {
-            let pixel_count = (mw * mh * 4) as usize;
-            mip_levels.push(vec![0u8; pixel_count]);
-            mw = (mw / 2).max(1);
-            mh = (mh / 2).max(1);
-        }
-        let tex = crate::d3d11::D3d9Texture {
-            id: 0,
-            width,
-            height,
-            levels: mip_levels,
-            format,
-        };
-        self.d3d9_textures.insert(object, tex);
         Ok(object)
     }
 
@@ -71813,6391 +67924,6 @@ impl PeHostRuntime {
             .unwrap_or(0)
     }
 
-    fn alloc_dxgi_adapter_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        factory_object: u64,
-    ) -> AppResult<u64> {
-        let mut methods =
-            vec![unsupported_method(&self.telemetry, "IDXGIAdapter::unsupported"); 11];
-        methods[0] = unsupported_method(&self.telemetry, "IDXGIAdapter::QueryInterface");
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-        // IDXGIObject methods (slots 3-6)
-        methods[3] = HostThunk::DXGIAdapterSetPrivateData;
-        methods[4] = HostThunk::DXGIFactorySetPrivateDataInterface;
-        methods[5] = HostThunk::DXGIAdapterGetPrivateData;
-        methods[6] = HostThunk::DXGIAdapterGetParent;
-        // IDXGIAdapter methods (slots 7-9)
-        methods[7] = HostThunk::DXGIAdapterEnumOutputs;
-        methods[8] = HostThunk::DXGIAdapterGetDesc;
-        methods[9] = HostThunk::DXGIAdapterCheckInterfaceSupport;
-        // IDXGIAdapter1 methods (slot 10+)
-        methods[10] = HostThunk::DXGIAdapterGetDesc1;
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::DxgiAdapter, vtable)?;
-        self.add_ref_guest_object(factory_object)?;
-        self.dxgi_adapters
-            .insert(object, GuestDxgiAdapter { factory_object });
-        Ok(object)
-    }
-
-    fn alloc_d3d12_device_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        // ID3D12Device vtable has 44 slots (0-43).
-        let mut methods =
-            vec![unsupported_method(&self.telemetry, "ID3D12Device::unsupported"); 44];
-        methods[0] = HostThunk::GraphicsObjectQueryInterface;
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-        // Slot 3: SetStablePowerState — power optimization hint, just return S_OK
-        methods[3] = HostThunk::D3D12DeviceSetStablePowerState;
-        methods[4] = HostThunk::D3D12DeviceCreateGraphicsPipelineState;
-        methods[5] = HostThunk::D3D12DeviceCreateComputePipelineState;
-        methods[6] = HostThunk::D3D12DeviceCreateRootSignature;
-        // Slot 7: CreateRootSignature (12 versioned) — delegate to existing version
-        methods[7] = HostThunk::D3D12DeviceCreateRootSignature;
-        methods[8] = HostThunk::D3D12DeviceCreateCommandQueue;
-        methods[9] = HostThunk::D3D12DeviceCreateCommandAllocator;
-        methods[10] = HostThunk::D3D12DeviceCreateCommandSignature;
-        methods[11] = HostThunk::D3D12DeviceCreatePipelineLibrary;
-        methods[12] = HostThunk::D3D12DeviceCreateCommandList;
-        methods[13] = HostThunk::D3D12DeviceCheckFeatureSupport;
-        methods[14] = HostThunk::D3D12DeviceCreateDescriptorHeap;
-        methods[15] = HostThunk::D3D12DeviceCreateSampler;
-        methods[16] = HostThunk::D3D12DeviceCopyDescriptors;
-        methods[17] = HostThunk::D3D12DeviceCopyDescriptorsSimple;
-        methods[18] = HostThunk::D3D12DeviceGetDescriptorHandleIncrementSize;
-        methods[19] = HostThunk::D3D12DeviceCreateConstantBufferView;
-        methods[20] = HostThunk::D3D12DeviceCreateRenderTargetView;
-        methods[21] = HostThunk::D3D12DeviceCreateShaderResourceView;
-        methods[22] = HostThunk::D3D12DeviceCreateUnorderedAccessView;
-        methods[23] = HostThunk::D3D12DeviceCreateDepthStencilView;
-        methods[24] = HostThunk::D3D12DeviceCreateCommittedResource;
-        methods[25] = HostThunk::D3D12DeviceCreateHeap;
-        methods[26] = HostThunk::D3D12DeviceCreatePlacedResource;
-        methods[27] = HostThunk::D3D12DeviceCreateReservedResource;
-        methods[28] = HostThunk::D3D12DeviceCreateSharedHandle;
-        methods[29] = HostThunk::D3D12DeviceOpenSharedHandle;
-        methods[30] = HostThunk::D3D12DeviceOpenSharedHandleByName;
-        methods[31] = HostThunk::D3D12DeviceMakeResident;
-        methods[32] = HostThunk::D3D12DeviceEvict;
-        methods[33] = HostThunk::D3D12DeviceCreateQueryHeap;
-        // Slot 34: CreatePipelineLibrary (versioned) — delegate to existing variant
-        methods[34] = HostThunk::D3D12DeviceCreatePipelineLibrary1;
-        methods[35] = HostThunk::D3D12DeviceCreateCachedPipelineState;
-        methods[36] = HostThunk::D3D12DeviceCreateFence;
-        methods[37] = HostThunk::D3D12DeviceGetNodeCount;
-        // Slots 38-43: ID3D12Device1-6 extension methods
-        methods[38] = HostThunk::D3D12Device1CreateShaderResourceView;
-        methods[39] = HostThunk::D3D12Device1GetShaderResourceView;
-        methods[40] = HostThunk::D3D12Device2CreateShaderResourceView;
-        methods[41] = HostThunk::D3D12Device2GetShaderResourceView;
-        methods[42] = HostThunk::D3D12Device3CreateShaderResourceView;
-        methods[43] = HostThunk::D3D12Device3GetShaderResourceView;
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d12Device, vtable)?;
-        self.d3d12_devices.insert(object, GuestD3d12Device);
-        Ok(object)
-    }
-
-    fn alloc_d3d12_command_queue_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        queue_id: D3d12CommandQueueId,
-    ) -> AppResult<u64> {
-        let mut methods =
-            vec![unsupported_method(&self.telemetry, "ID3D12CommandQueue::unsupported"); 19];
-        methods[0] = HostThunk::GraphicsObjectQueryInterface;
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-        methods[3] = HostThunk::D3D12ObjectGetPrivateData;
-        methods[4] = HostThunk::D3D12ObjectSetPrivateData;
-        methods[5] = HostThunk::D3D12ObjectSetPrivateData;
-        methods[6] = HostThunk::D3D12ObjectSetName;
-        methods[7] = HostThunk::D3D12CommandQueueGetDevice;
-        methods[8] = HostThunk::D3D12CommandQueueGetDesc;
-        methods[9] = HostThunk::D3D12CommandQueueGetTimestampFrequency;
-        methods[10] = HostThunk::D3D12CommandQueueGetClockCalibration;
-        methods[11] = HostThunk::D3D12CommandQueueExecuteCommandLists;
-        methods[12] = HostThunk::D3D12CommandQueueSignal;
-        methods[13] = HostThunk::D3D12CommandQueueWait;
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d12CommandQueue, vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d12_command_queues.insert(
-            object,
-            GuestD3d12CommandQueue {
-                device_object,
-                queue_id,
-            },
-        );
-        Ok(object)
-    }
-
-    fn alloc_d3d12_command_allocator_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        allocator_id: D3d12CommandAllocatorId,
-    ) -> AppResult<u64> {
-        let mut methods =
-            vec![unsupported_method(&self.telemetry, "ID3D12CommandAllocator::unsupported"); 9];
-        methods[0] = HostThunk::GraphicsObjectQueryInterface;
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d12CommandAllocator, vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d12_command_allocators.insert(
-            object,
-            GuestD3d12CommandAllocator {
-                device_object,
-                allocator_id,
-            },
-        );
-        Ok(object)
-    }
-
-    fn alloc_d3d12_descriptor_heap_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        heap_id: D3d12DescriptorHeapId,
-        ty: DescriptorHeapType,
-        descriptor_count: usize,
-    ) -> AppResult<u64> {
-        let mut methods =
-            vec![unsupported_method(&self.telemetry, "ID3D12DescriptorHeap::unsupported"); 11];
-        methods[0] = HostThunk::GraphicsObjectQueryInterface;
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-        // The true ID3D12DescriptorHeap order: the ID3D12Object methods +
-        // GetDesc, GetCPUDescriptorHandleForHeapStart,
-        // GetGPUDescriptorHandleForHeapStart.
-        methods[3] = HostThunk::D3D12ObjectGetPrivateData;
-        methods[4] = HostThunk::D3D12ObjectSetPrivateData;
-        methods[5] = HostThunk::D3D12ObjectSetPrivateData;
-        methods[6] = HostThunk::D3D12ObjectSetName;
-        methods[7] = HostThunk::D3D12DescriptorHeapGetDevice;
-        methods[8] = HostThunk::D3D12DescriptorHeapGetDesc;
-        methods[9] = HostThunk::D3D12DescriptorHeapGetCpuHandleForHeapStart;
-        methods[10] = HostThunk::D3D12DescriptorHeapGetGpuHandleForHeapStart;
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d12DescriptorHeap, vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        let cpu_handle_start = self.next_descriptor_handle;
-        self.next_descriptor_handle = self
-            .next_descriptor_handle
-            .saturating_add(descriptor_count as u64 * DESCRIPTOR_HANDLE_STRIDE);
-        self.d3d12_descriptor_heaps.insert(
-            object,
-            GuestD3d12DescriptorHeap {
-                device_object,
-                heap_id,
-                ty,
-                cpu_handle_start,
-                descriptor_count,
-            },
-        );
-        Ok(object)
-    }
-
-    fn alloc_d3d12_command_list_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        allocator_object: u64,
-        command_list_id: D3d12CommandListId,
-        is_bundle: bool,
-    ) -> AppResult<u64> {
-        // ID3D12GraphicsCommandList vtable has 49 methods (0-48).
-        // ID3D12GraphicsCommandList1-9 add methods at slots 49-72.
-        // Vtable layout (from Windows SDK d3d12.h):
-        //   0-2: IUnknown, 3-5: ID3D12Object, 6-8: ID3D12DeviceChild
-        //   9: Close, 10: Reset, 11: ClearState, 12: DrawInstanced
-        //   13: DrawIndexedInstanced, 14: Dispatch
-        //   15: CopyBufferRegion, 16: CopyTextureRegion, 17: CopyResource
-        //   18: CopyTiles, 19: ResolveSubresource
-        //   20: IASetPrimitiveTopology, 21: RSSetViewports, 22: RSSetScissorRects
-        //   23: SetPipelineState, 24: SetGraphicsRootSignature, 25: SetDescriptorHeaps
-        //   26: ResourceBarrier, 27: ExecuteBundle
-        //   28: SetPredication, 29: SetMarker, 30: BeginQuery, 31: EndQuery, 32: ResolveQueryData
-        //   33-40: SetGraphicsRootDescriptorTable, SetGraphicsRootConstantBufferView,
-        //           SetGraphicsRoot32BitConstants, IASetVertexBuffers, IASetIndexBuffer,
-        //           OMSetRenderTargets, OMSetBlendFactor, OMSetStencilRef
-        //   41-46: ClearUnorderedAccessView*, 47: ExecuteIndirect
-        //   48: ClearRenderTargetView
-        //   49-72: ID3D12GraphicsCommandList1-9 extensions
-        let mut methods =
-            vec![unsupported_method(&self.telemetry, "ID3D12GraphicsCommandList::unsupported"); 73];
-        methods[0] =
-            unsupported_method(&self.telemetry, "ID3D12GraphicsCommandList::QueryInterface");
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-        // Slots 3-8: ID3D12Object / ID3D12DeviceChild — leave as unsupported
-        methods[3] = HostThunk::D3D12ObjectGetPrivateData;
-        methods[4] = HostThunk::D3D12ObjectSetPrivateData;
-        methods[5] = HostThunk::D3D12ObjectSetPrivateData;
-        methods[6] = HostThunk::D3D12ObjectSetName;
-        methods[7] = HostThunk::D3D12CommandListGetDevice;
-        methods[11] = HostThunk::D3D12GraphicsCommandListClearState;
-        methods[13] = HostThunk::D3D12GraphicsCommandListDrawIndexedInstanced;
-        methods[15] = HostThunk::D3D12GraphicsCommandListCopyBufferRegion;
-        methods[18] = HostThunk::D3D12GraphicsCommandListCopyTiles;
-        methods[19] = HostThunk::D3D12GraphicsCommandListResolveSubresource;
-        methods[9] = HostThunk::D3D12GraphicsCommandListClose;
-        methods[10] = HostThunk::D3D12GraphicsCommandListReset;
-        // Slot 11: ClearState — leave as unsupported
-        methods[12] = HostThunk::D3D12GraphicsCommandListDrawInstanced;
-        // Slot 13: DrawIndexedInstanced — leave as unsupported
-        methods[14] = HostThunk::D3D12GraphicsCommandListDispatch;
-        // Slot 15: CopyBufferRegion — leave as unsupported
-        methods[16] = HostThunk::D3D12GraphicsCommandListCopyTextureRegion;
-        methods[17] = HostThunk::D3D12GraphicsCommandListCopyResource;
-        // Slots 18-19: CopyTiles, ResolveSubresource — leave as unsupported
-        methods[20] = HostThunk::D3D12GraphicsCommandListIASetPrimitiveTopology;
-        methods[21] = HostThunk::D3D12GraphicsCommandListRSSetViewports;
-        methods[22] = HostThunk::D3D12GraphicsCommandListRSSetScissorRects;
-        methods[23] = HostThunk::D3D12GraphicsCommandListSetPipelineState;
-        methods[24] = HostThunk::D3D12GraphicsCommandListSetGraphicsRootSignature;
-        methods[25] = HostThunk::D3D12GraphicsCommandListSetDescriptorHeaps;
-        methods[26] = HostThunk::D3D12GraphicsCommandListResourceBarrier;
-        methods[27] = HostThunk::D3D12GraphicsCommandListExecuteBundle;
-        methods[28] = HostThunk::D3D12GraphicsCommandListSetPredication;
-        methods[29] = HostThunk::D3D12GraphicsCommandListSetMarker;
-        methods[30] = HostThunk::D3D12GraphicsCommandListBeginQuery;
-        methods[31] = HostThunk::D3D12GraphicsCommandListEndQuery;
-        methods[32] = HostThunk::D3D12GraphicsCommandListResolveQueryData;
-        methods[33] = HostThunk::D3D12GraphicsCommandListSetGraphicsRootDescriptorTable;
-        methods[34] = HostThunk::D3D12GraphicsCommandListSetGraphicsRootConstantBufferView;
-        methods[35] = HostThunk::D3D12GraphicsCommandListSetGraphicsRoot32BitConstants;
-        methods[36] = HostThunk::D3D12GraphicsCommandListIASetVertexBuffers;
-        methods[37] = HostThunk::D3D12GraphicsCommandListIASetIndexBuffer;
-        methods[38] = HostThunk::D3D12GraphicsCommandListOMSetRenderTargets;
-        methods[39] = HostThunk::D3D12GraphicsCommandListOMSetBlendFactor;
-        methods[40] = HostThunk::D3D12GraphicsCommandListOMSetStencilRef;
-        // Slots 41-46: ClearUnorderedAccessView*, etc. — leave as unsupported
-        methods[47] = HostThunk::D3D12GraphicsCommandListExecuteIndirect;
-        methods[48] = HostThunk::D3D12GraphicsCommandListClearRenderTargetView;
-        // ID3D12GraphicsCommandList1 (49-54)
-        methods[49] = HostThunk::D3D12GraphicsCommandList1AtomicCopyBufferUINT;
-        methods[50] = HostThunk::D3D12GraphicsCommandList1AtomicCopyBufferUINT64;
-        methods[51] = HostThunk::D3D12GraphicsCommandList1OMSetDepthBounds;
-        methods[52] = HostThunk::D3D12GraphicsCommandList1SetSamplePositions;
-        methods[53] = HostThunk::D3D12GraphicsCommandList1ResolveSubresourceRegion;
-        methods[54] = HostThunk::D3D12GraphicsCommandList1SetViewInstanceMask;
-        // ID3D12GraphicsCommandList2 (55)
-        methods[55] = HostThunk::D3D12GraphicsCommandList2WriteBufferImmediate;
-        // ID3D12GraphicsCommandList3 (56)
-        methods[56] = HostThunk::D3D12GraphicsCommandList3SetProtectedResourceSession;
-        // ID3D12GraphicsCommandList4 (57-65)
-        methods[57] = HostThunk::D3D12GraphicsCommandList4BeginRenderPass;
-        methods[58] = HostThunk::D3D12GraphicsCommandList4EndRenderPass;
-        methods[59] = HostThunk::D3D12GraphicsCommandList4InitializeMetaCommand;
-        methods[60] = HostThunk::D3D12GraphicsCommandList4ExecuteMetaCommand;
-        methods[61] = HostThunk::D3D12GraphicsCommandList4BuildRaytracingAccelerationStructure;
-        methods[62] =
-            HostThunk::D3D12GraphicsCommandList4EmitRaytracingAccelerationStructurePostbuildInfo;
-        methods[63] = HostThunk::D3D12GraphicsCommandList4CopyRaytracingAccelerationStructure;
-        methods[64] = HostThunk::D3D12GraphicsCommandList4SetPipelineState1;
-        methods[65] = HostThunk::D3D12GraphicsCommandList4DispatchRays;
-        // ID3D12GraphicsCommandList5 (66-67)
-        methods[66] = HostThunk::D3D12GraphicsCommandList5RSSetShadingRate;
-        methods[67] = HostThunk::D3D12GraphicsCommandList5RSSetShadingRateImage;
-        // ID3D12GraphicsCommandList6 (68)
-        methods[68] = HostThunk::D3D12GraphicsCommandList6DispatchMesh;
-        // ID3D12GraphicsCommandList7 (69)
-        methods[69] = HostThunk::D3D12GraphicsCommandList7Barrier;
-        // ID3D12GraphicsCommandList8 (70)
-        methods[70] = HostThunk::D3D12GraphicsCommandList8OMSetFrontAndBackStencilRef;
-        // ID3D12GraphicsCommandList9 (71-72)
-        methods[71] = HostThunk::D3D12GraphicsCommandList9RSSetDepthBias;
-        methods[72] = HostThunk::D3D12GraphicsCommandList9IASetIndexBufferStripCutValue;
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d12GraphicsCommandList, vtable)?;
-        self.add_ref_guest_object(allocator_object)?;
-        self.d3d12_command_lists.insert(
-            object,
-            GuestD3d12CommandList {
-                device_object,
-                allocator_object,
-                command_list_id: Some(command_list_id),
-                closed_stream: None,
-                render_pass_active: false,
-                is_bundle,
-            },
-        );
-        Ok(object)
-    }
-
-    fn alloc_d3d12_fence_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        fence_id: D3d12FenceId,
-    ) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method(&self.telemetry, "ID3D12Fence::unsupported"); 11];
-        methods[0] = HostThunk::GraphicsObjectQueryInterface;
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-        // The true ID3D12Fence order: the ID3D12Object methods + the
-        // fence value methods (GetDevice is at slot 7 via the object
-        // registry on the shared vtable helper).
-        methods[3] = HostThunk::D3D12ObjectGetPrivateData;
-        methods[4] = HostThunk::D3D12ObjectSetPrivateData;
-        methods[5] = HostThunk::D3D12ObjectSetPrivateData;
-        methods[6] = HostThunk::D3D12ObjectSetName;
-        methods[7] = HostThunk::D3D12FenceGetDevice;
-        methods[8] = HostThunk::D3D12FenceGetCompletedValue;
-        methods[9] = HostThunk::D3D12FenceSetEventOnCompletion;
-        methods[10] = HostThunk::D3D12FenceSignal;
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d12Fence, vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d12_fences.insert(
-            object,
-            GuestD3d12Fence {
-                device_object,
-                fence_id,
-            },
-        );
-        Ok(object)
-    }
-
-    fn alloc_d3d12_swapchain_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        swapchain_id: D3d12SwapchainId,
-    ) -> AppResult<u64> {
-        let mut methods =
-            vec![unsupported_method(&self.telemetry, "IDXGISwapChain::unsupported"); 18];
-        methods[0] = unsupported_method(&self.telemetry, "IDXGISwapChain::QueryInterface");
-        methods[1] = HostThunk::GuestObjectAddRef;
-        methods[2] = HostThunk::GuestObjectRelease;
-        methods[8] = HostThunk::DXGISwapChainPresent;
-        methods[9] = HostThunk::DXGISwapChainGetBuffer;
-        methods[13] = HostThunk::DXGISwapChainResizeBuffers;
-        methods[3] = HostThunk::D3D12ObjectGetPrivateData;
-        methods[4] = HostThunk::D3D12ObjectSetPrivateData;
-        methods[5] = HostThunk::D3D12ObjectSetPrivateData;
-        methods[6] = HostThunk::D3D12ObjectSetName;
-        methods[10] = HostThunk::DXGISwapChainSetFullscreenState;
-        methods[11] = HostThunk::DXGISwapChainGetFullscreenState;
-        methods[12] = HostThunk::DXGISwapChainGetDesc;
-        methods[14] = HostThunk::DXGISwapChainResizeTarget;
-        methods[15] = HostThunk::DXGISwapChainGetContainingOutput;
-        methods[16] = HostThunk::DXGISwapChainGetFrameStatistics;
-        methods[17] = HostThunk::DXGISwapChainGetLastPresentCount;
-        let vtable = self.alloc_guest_vtable(memory, methods)?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::DxgiSwapChain, vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d12_swapchains.insert(
-            object,
-            GuestD3d12SwapChain {
-                device_object,
-                swapchain_id,
-                backbuffer_objects: BTreeMap::new(),
-            },
-        );
-        Ok(object)
-    }
-
-    fn alloc_d3d12_resource_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        device_object: u64,
-        resource_id: D3d12ResourceId,
-        format: DxgiFormat,
-        swapchain_backbuffer: bool,
-    ) -> AppResult<u64> {
-        let resource_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D12Resource::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-            ],
-        )?;
-        let object =
-            self.alloc_guest_object(memory, GuestObjectKind::D3d12Resource, resource_vtable)?;
-        self.add_ref_guest_object(device_object)?;
-        self.d3d12_resources.insert(
-            object,
-            GuestD3d12Resource {
-                device_object,
-                resource_id,
-                format,
-                swapchain_backbuffer,
-            },
-        );
-        Ok(object)
-    }
-
-    fn ensure_d3d12_guest_pipeline_state(&mut self) -> D3d12PipelineStateId {
-        if let Some(pipeline_state) = self.d3d12_guest_pipeline_state {
-            return pipeline_state;
-        }
-        let root_signature = self.d3d12_runtime.create_root_signature(RootSignatureDesc {
-            descriptor_tables: Vec::new(),
-            root_constants: 0,
-            parameters: Vec::new(),
-            static_samplers: Vec::new(),
-            visibility_offsets: BTreeMap::new(),
-        });
-        let pipeline_state = self.d3d12_runtime.create_pipeline_state(
-            root_signature,
-            PipelineStateDesc {
-                label: "guest-default".to_string(),
-                compute: false,
-                render_target_formats: Vec::new(),
-                depth_format: None,
-            },
-        );
-        self.d3d12_guest_root_signature = Some(root_signature);
-        self.d3d12_guest_pipeline_state = Some(pipeline_state);
-        pipeline_state
-    }
-
-    fn destroy_dxgi_factory_object(&mut self, address: u64) -> AppResult<()> {
-        self.dxgi_factories.remove(&address);
-        self.guest_objects.remove(&address);
-        Ok(())
-    }
-
-    fn destroy_dxgi_adapter_object(&mut self, address: u64) -> AppResult<()> {
-        let adapter = self.dxgi_adapters.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown DXGI adapter {address:#x}"),
-            )
-        })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(adapter.factory_object)?;
-        Ok(())
-    }
-
-    fn destroy_dxgi_swapchain_object(&mut self, address: u64) -> AppResult<()> {
-        if let Some(swapchain) = self.d3d11_swapchains.remove(&address) {
-            self.release_guest_object(swapchain.device_object)?;
-            self.guest_objects.remove(&address);
-            return Ok(());
-        }
-        if let Some(swapchain) = self.d3d12_swapchains.remove(&address) {
-            for resource_object in swapchain.backbuffer_objects.into_values() {
-                self.release_guest_object(resource_object)?;
-            }
-            self.release_guest_object(swapchain.device_object)?;
-            self.guest_objects.remove(&address);
-            return Ok(());
-        }
-        Err(AppError::new(
-            ReasonCode::RcUnimplInsn,
-            format!("unknown DXGI swapchain {address:#x}"),
-        ))
-    }
-
-    fn destroy_d3d12_device_object(&mut self, address: u64) -> AppResult<()> {
-        self.d3d12_devices.remove(&address);
-        self.guest_objects.remove(&address);
-        Ok(())
-    }
-
-    fn destroy_d3d12_command_queue_object(&mut self, address: u64) -> AppResult<()> {
-        if let Some(queue) = self.d3d12_command_queues.remove(&address) {
-            self.release_guest_object(queue.device_object)?;
-        }
-        self.guest_objects.remove(&address);
-        Ok(())
-    }
-
-    fn destroy_d3d12_command_allocator_object(&mut self, address: u64) -> AppResult<()> {
-        let allocator = self
-            .d3d12_command_allocators
-            .remove(&address)
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D12 command allocator {address:#x}"),
-                )
-            })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(allocator.device_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d12_descriptor_heap_object(&mut self, address: u64) -> AppResult<()> {
-        let heap = self
-            .d3d12_descriptor_heaps
-            .remove(&address)
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D12 descriptor heap {address:#x}"),
-                )
-            })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(heap.device_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d12_command_list_object(&mut self, address: u64) -> AppResult<()> {
-        let command_list = self.d3d12_command_lists.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D12 command list {address:#x}"),
-            )
-        })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(command_list.allocator_object)?;
-        Ok(())
-    }
-
-    fn destroy_d3d12_fence_object(&mut self, address: u64) -> AppResult<()> {
-        if let Some(fence) = self.d3d12_fences.remove(&address) {
-            self.release_guest_object(fence.device_object)?;
-        }
-        self.guest_objects.remove(&address);
-        Ok(())
-    }
-
-    fn destroy_d3d12_resource_object(&mut self, address: u64) -> AppResult<()> {
-        let resource = self.d3d12_resources.remove(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D12 resource {address:#x}"),
-            )
-        })?;
-        self.guest_objects.remove(&address);
-        self.release_guest_object(resource.device_object)?;
-        Ok(())
-    }
-
-    fn d3d12_command_queue(&self, address: u64) -> AppResult<GuestD3d12CommandQueue> {
-        self.d3d12_command_queues
-            .get(&address)
-            .copied()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D12 command queue {address:#x}"),
-                )
-            })
-    }
-
-    fn d3d12_fence(&self, address: u64) -> AppResult<GuestD3d12Fence> {
-        self.d3d12_fences.get(&address).copied().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D12 fence {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d12_command_allocator(&self, address: u64) -> AppResult<GuestD3d12CommandAllocator> {
-        self.d3d12_command_allocators
-            .get(&address)
-            .copied()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D12 command allocator {address:#x}"),
-                )
-            })
-    }
-
-    fn d3d12_descriptor_heap(&self, address: u64) -> AppResult<GuestD3d12DescriptorHeap> {
-        self.d3d12_descriptor_heaps
-            .get(&address)
-            .copied()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown D3D12 descriptor heap {address:#x}"),
-                )
-            })
-    }
-
-    fn d3d12_command_list(&self, address: u64) -> AppResult<&GuestD3d12CommandList> {
-        self.d3d12_command_lists.get(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D12 command list {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d12_command_list_mut(&mut self, address: u64) -> AppResult<&mut GuestD3d12CommandList> {
-        self.d3d12_command_lists.get_mut(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D12 command list {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d12_swapchain(&self, address: u64) -> AppResult<&GuestD3d12SwapChain> {
-        self.d3d12_swapchains.get(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D12 swapchain {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d12_swapchain_mut(&mut self, address: u64) -> AppResult<&mut GuestD3d12SwapChain> {
-        self.d3d12_swapchains.get_mut(&address).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D12 swapchain {address:#x}"),
-            )
-        })
-    }
-
-    fn d3d12_resource(&self, address: u64) -> AppResult<GuestD3d12Resource> {
-        self.d3d12_resources.get(&address).copied().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown D3D12 resource {address:#x}"),
-            )
-        })
-    }
-
-    fn dxgi_adapter(&self, address: u64) -> AppResult<GuestDxgiAdapter> {
-        self.dxgi_adapters.get(&address).copied().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unknown DXGI adapter {address:#x}"),
-            )
-        })
-    }
-
-    fn open_d3d12_command_list_id(&self, address: u64) -> AppResult<D3d12CommandListId> {
-        self.d3d12_command_list(address)?
-            .command_list_id
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    format!("D3D12 command list {address:#x} is already closed"),
-                )
-            })
-    }
-
-    fn decode_d3d12_cpu_descriptor_handle(
-        &self,
-        handle: u64,
-        expected_type: DescriptorHeapType,
-    ) -> AppResult<(GuestD3d12DescriptorHeap, usize)> {
-        self.d3d12_descriptor_heaps
-            .values()
-            .find_map(|heap| {
-                let byte_len = heap.descriptor_count as u64 * DESCRIPTOR_HANDLE_STRIDE;
-                if handle < heap.cpu_handle_start || handle >= heap.cpu_handle_start + byte_len {
-                    return None;
-                }
-                let offset = handle - heap.cpu_handle_start;
-                if !offset.is_multiple_of(DESCRIPTOR_HANDLE_STRIDE) {
-                    return None;
-                }
-                Some((*heap, (offset / DESCRIPTOR_HANDLE_STRIDE) as usize))
-            })
-            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown CPU descriptor handle {handle:#x}")))
-            .and_then(|(heap, index)| {
-                if heap.ty != expected_type {
-                    return Err(AppError::new(
-                        ReasonCode::RcD3dInvalidState,
-                        format!("descriptor heap type mismatch for handle {handle:#x}: expected {:?}, found {:?}", expected_type, heap.ty),
-                    ));
-                }
-                Ok((heap, index))
-            })
-    }
-
-    fn ensure_d3d12_backbuffer_object(
-        &mut self,
-        memory: &mut MemoryImage,
-        swapchain_object: u64,
-        index: u32,
-    ) -> AppResult<u64> {
-        let (device_object, swapchain_id, existing) = {
-            let swapchain = self.d3d12_swapchain(swapchain_object)?;
-            (
-                swapchain.device_object,
-                swapchain.swapchain_id,
-                swapchain.backbuffer_objects.get(&index).copied(),
-            )
-        };
-        if let Some(existing) = existing {
-            return Ok(existing);
-        }
-        let resource_id = self
-            .d3d12_runtime
-            .swapchain_state(swapchain_id)?
-            .backbuffers
-            .get(index as usize)
-            .copied()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    format!("swapchain backbuffer index {index} is out of bounds"),
-                )
-            })?;
-        let format = self
-            .d3d12_runtime
-            .swapchain_state(swapchain_id)?
-            .desc
-            .format;
-        let resource_object =
-            self.alloc_d3d12_resource_object(memory, device_object, resource_id, format, true)?;
-        self.d3d12_swapchain_mut(swapchain_object)?
-            .backbuffer_objects
-            .insert(index, resource_object);
-        Ok(resource_object)
-    }
-
-    fn create_d3d12_swapchain_from_desc(
-        &mut self,
-        memory: &mut MemoryImage,
-        queue_object: u64,
-        desc: SwapchainDesc,
-    ) -> AppResult<u64> {
-        let queue = self.d3d12_command_queue(queue_object)?;
-        let swapchain_id = self.d3d12_runtime.create_swapchain(desc)?;
-        self.alloc_d3d12_swapchain_object(memory, queue.device_object, swapchain_id)
-    }
-
-    fn dispatch_dxgi_factory_enum_adapters(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-        extended: bool,
-    ) -> AppResult<()> {
-        let factory_object = state.get(Register::Rcx);
-        if self.guest_object_kind(factory_object)? != GuestObjectKind::DxgiFactory {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("IDXGIFactory::EnumAdapters on non-factory object {factory_object:#x}"),
-            ));
-        }
-        let adapter_index = state.get(Register::Rdx) as u32;
-        let out_ptr = state.get(Register::R8);
-        if out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        if adapter_index != 0 {
-            write_u64(memory, out_ptr, 0);
-            state.set(Register::Rax, DXGI_ERROR_NOT_FOUND);
-            self.last_error = 0;
-            return Ok(());
-        }
-
-        let device_info = self.d3d12_runtime.device_info();
-        let adapter_object = self.alloc_dxgi_adapter_object(memory, factory_object)?;
-        write_u64(memory, out_ptr, adapter_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "dxgi",
-            if extended {
-                "IDXGIFactory1::EnumAdapters1"
-            } else {
-                "IDXGIFactory::EnumAdapters"
-            },
-            BTreeMap::from([
-                ("index".to_string(), json!(adapter_index)),
-                ("adapter".to_string(), json!(device_info.adapter.name)),
-                (
-                    "vendor_id".to_string(),
-                    json!(format!("0x{:04x}", device_info.adapter.vendor_id)),
-                ),
-                (
-                    "device_id".to_string(),
-                    json!(format!("0x{:04x}", device_info.adapter.device_id)),
-                ),
-            ]),
-            json!(adapter_object),
-        );
-        Ok(())
-    }
-
-    fn dispatch_dxgi_adapter_get_desc(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-        extended: bool,
-    ) -> AppResult<()> {
-        let adapter_object = state.get(Register::Rcx);
-        let desc_ptr = state.get(Register::Rdx);
-        if self.guest_object_kind(adapter_object)? != GuestObjectKind::DxgiAdapter {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("IDXGIAdapter::GetDesc on non-adapter object {adapter_object:#x}"),
-            ));
-        }
-        if desc_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-
-        self.dxgi_adapter(adapter_object)?;
-        let device_info = self.d3d12_runtime.device_info();
-        let bytes = build_dxgi_adapter_desc_bytes(
-            &device_info.adapter,
-            device_info.features.unified_memory,
-            extended,
-        );
-        memory.map_bytes(desc_ptr, &bytes);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "dxgi",
-            if extended {
-                "IDXGIAdapter1::GetDesc1"
-            } else {
-                "IDXGIAdapter::GetDesc"
-            },
-            BTreeMap::from([
-                ("adapter".to_string(), json!(device_info.adapter.name)),
-                (
-                    "vendor_id".to_string(),
-                    json!(format!("0x{:04x}", device_info.adapter.vendor_id)),
-                ),
-                (
-                    "device_id".to_string(),
-                    json!(format!("0x{:04x}", device_info.adapter.device_id)),
-                ),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_dxgi_create_swapchain(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let factory_object = state.get(Register::Rcx);
-        if self.guest_object_kind(factory_object)? != GuestObjectKind::DxgiFactory {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("IDXGIFactory::CreateSwapChain on non-factory object {factory_object:#x}"),
-            ));
-        }
-        let queue_object = state.get(Register::Rdx);
-        let desc_ptr = state.get(Register::R8);
-        let out_ptr = state.get(Register::R9);
-        if out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let desc = read_swapchain_desc(memory, desc_ptr)?;
-        let swapchain_object =
-            self.create_d3d12_swapchain_from_desc(memory, queue_object, desc.clone())?;
-        if self.live_session.is_some() {
-            eprintln!(
-                "casa1-live-dxgi create-swapchain kind=CreateSwapChain width={} height={} buffers={} format={:?}",
-                desc.width, desc.height, desc.buffer_count, desc.format
-            );
-        }
-        write_u64(memory, out_ptr, swapchain_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "dxgi",
-            "IDXGIFactory::CreateSwapChain",
-            BTreeMap::from([
-                ("width".to_string(), json!(desc.width)),
-                ("height".to_string(), json!(desc.height)),
-                ("buffer_count".to_string(), json!(desc.buffer_count)),
-                ("format".to_string(), json!(format!("{:?}", desc.format))),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_dxgi_create_swapchain_for_hwnd(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let factory_object = state.get(Register::Rcx);
-        if self.guest_object_kind(factory_object)? != GuestObjectKind::DxgiFactory {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "IDXGIFactory2::CreateSwapChainForHwnd on non-factory object {factory_object:#x}"
-                ),
-            ));
-        }
-        let queue_object = state.get(Register::Rdx);
-        let hwnd = state.get(Register::R8);
-        let desc_ptr = state.get(Register::R9);
-        let stack = state.get(Register::Rsp);
-        let out_ptr = memory.read_u64(stack + 0x30)?;
-        if hwnd == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let desc = read_swapchain_desc1(memory, desc_ptr)?;
-        let swapchain_object =
-            self.create_d3d12_swapchain_from_desc(memory, queue_object, desc.clone())?;
-        if self.live_session.is_some() {
-            eprintln!(
-                "casa1-live-dxgi create-swapchain kind=CreateSwapChainForHwnd width={} height={} buffers={} format={:?} hwnd={:#x}",
-                desc.width, desc.height, desc.buffer_count, desc.format, hwnd
-            );
-        }
-        write_u64(memory, out_ptr, swapchain_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "dxgi",
-            "IDXGIFactory2::CreateSwapChainForHwnd",
-            BTreeMap::from([
-                ("width".to_string(), json!(desc.width)),
-                ("height".to_string(), json!(desc.height)),
-                ("buffer_count".to_string(), json!(desc.buffer_count)),
-                ("format".to_string(), json!(format!("{:?}", desc.format))),
-                ("hwnd".to_string(), json!(hwnd)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_dxgi_swapchain_get_buffer(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let swapchain_object = state.get(Register::Rcx);
-        let index = state.get(Register::Rdx) as u32;
-        let out_ptr = state.get(Register::R9);
-        if out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let resource_object = if self.d3d11_swapchains.contains_key(&swapchain_object) {
-            self.ensure_d3d11_backbuffer_object(memory, swapchain_object, index)?
-        } else if self.d3d12_swapchains.contains_key(&swapchain_object) {
-            self.ensure_d3d12_backbuffer_object(memory, swapchain_object, index)?
-        } else {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("GetBuffer on unknown DXGI swapchain {swapchain_object:#x}"),
-            ));
-        };
-        self.add_ref_guest_object(resource_object)?;
-        write_u64(memory, out_ptr, resource_object);
-        let mut trace_params = BTreeMap::from([("index".to_string(), json!(index))]);
-        if let Some(resource) = self.d3d12_resources.get(&resource_object) {
-            trace_params.insert("resource_id".to_string(), json!(resource.resource_id));
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace("dxgi", "IDXGISwapChain::GetBuffer", trace_params, json!(0));
-        Ok(())
-    }
-
-    fn dispatch_dxgi_swapchain_present(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let swapchain_object = state.get(Register::Rcx);
-        let sync_interval = state.get(Register::Rdx) as u32;
-        let flags = state.get(Register::R8) as u32;
-        let allow_tearing = flags & 0x0200 != 0;
-        if self.d3d11_swapchains.contains_key(&swapchain_object) {
-            self.dispatch_d3d11_swapchain_present(
-                sync_interval,
-                allow_tearing,
-                swapchain_object,
-                state,
-            )
-        } else if self.d3d12_swapchains.contains_key(&swapchain_object) {
-            self.dispatch_d3d12_swapchain_present(
-                sync_interval,
-                allow_tearing,
-                swapchain_object,
-                state,
-            )
-        } else {
-            Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("Present on unknown DXGI swapchain {swapchain_object:#x}"),
-            ))
-        }
-    }
-
-    fn dispatch_dxgi_swapchain_set_fullscreen_state(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let this = state.get(Register::Rcx);
-        let fullscreen = state.get(Register::Rdx) != 0;
-        self.d3d12_fullscreen.insert(this, fullscreen);
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_dxgi_swapchain_get_fullscreen_state(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let this = state.get(Register::Rcx);
-        let out = state.get(Register::Rdx);
-        let fullscreen = self.d3d12_fullscreen.get(&this).copied().unwrap_or(false);
-        if out != 0 {
-            write_u32(memory, out, u32::from(fullscreen));
-        }
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_dxgi_swapchain_get_desc(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _this = state.get(Register::Rcx);
-        let desc = state.get(Register::Rdx);
-        if desc != 0 {
-            // DXGI_SWAP_CHAIN_DESC: BufferDesc(0..40: width 0, height 4,
-            // format 8, refresh 12..19, scanline 20, scaling 21, flags 24),
-            // SampleDesc(40), BufferUsage(48), BufferCount(52),
-            // OutputWindow(56), Windowed(64), SwapEffect(68), Flags(72).
-            write_u32(memory, desc, 640);
-            write_u32(memory, desc + 4, 480);
-            write_u32(memory, desc + 8, 28); // R8G8B8A8_UNORM
-            write_u32(memory, desc + 40, 1); // 1 sample
-            write_u32(memory, desc + 44, 0);
-            write_u32(memory, desc + 48, 8); // RENDER_TARGET_OUTPUT
-            write_u32(memory, desc + 52, 2); // double buffered
-            write_u32(memory, desc + 64, 1); // windowed
-            write_u32(memory, desc + 68, 2); // FLIP_DISCARD
-        }
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_dxgi_swapchain_resize_target(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _this = state.get(Register::Rcx);
-        let desc = state.get(Register::Rdx);
-        if desc != 0 {
-            let width = read_u32(memory, desc).unwrap_or(640).max(1);
-            let height = read_u32(memory, desc + 4).unwrap_or(480).max(1);
-            let _ = (width, height);
-        }
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_dxgi_swapchain_get_containing_output(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let out = state.get(Register::Rdx);
-        // The runtime's single adapter output.
-        if out != 0 {
-            write_guest_pointer(memory, out, 1, self.guest_arch).ok();
-        }
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_dxgi_swapchain_get_frame_statistics(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let stats = state.get(Register::Rdx);
-        if stats != 0 {
-            // DXGI_FRAME_STATISTICS: PresentCount(0), PresentRefreshCount(4),
-            // SyncRefreshCount(8), SyncQPCTime(16), SyncGPUTime(24).
-            write_u32(memory, stats, 1);
-            write_u32(memory, stats + 4, 0);
-            write_u32(memory, stats + 8, 0);
-            write_u64(memory, stats + 16, 0);
-            write_u64(memory, stats + 24, 0);
-        }
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_dxgi_swapchain_get_last_present_count(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let out = state.get(Register::Rdx);
-        if out != 0 {
-            write_u32(memory, out, 1);
-        }
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_dxgi_swapchain_resize_buffers(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let swapchain_object = state.get(Register::Rcx);
-        let buffer_count = state.get(Register::Rdx) as u32;
-        let width = state.get(Register::R8) as u32;
-        let height = state.get(Register::R9) as u32;
-        if !self.d3d12_swapchains.contains_key(&swapchain_object) {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ResizeBuffers on non-D3D12 swapchain {swapchain_object:#x}"),
-            ));
-        }
-        let stack = state.get(Register::Rsp);
-        let format_raw = read_guest_u32(memory, stack + 0x20)?;
-        let flags = read_guest_u32(memory, stack + 0x28)?;
-        let swapchain = self.d3d12_swapchain(swapchain_object)?.clone();
-        let current_desc = self
-            .d3d12_runtime
-            .swapchain_state(swapchain.swapchain_id)?
-            .desc;
-        let resolved_buffer_count = if buffer_count == 0 {
-            current_desc.buffer_count
-        } else {
-            buffer_count
-        };
-        let resolved_width = if width == 0 {
-            current_desc.width
-        } else {
-            width
-        };
-        let resolved_height = if height == 0 {
-            current_desc.height
-        } else {
-            height
-        };
-        let resolved_format = if format_raw == 0 {
-            current_desc.format
-        } else {
-            map_dxgi_format(format_raw)?
-        };
-        for resource_object in swapchain
-            .backbuffer_objects
-            .values()
-            .copied()
-            .collect::<Vec<_>>()
-        {
-            self.release_guest_object(resource_object)?;
-        }
-        self.d3d12_swapchain_mut(swapchain_object)?
-            .backbuffer_objects
-            .clear();
-        self.d3d12_runtime.resize_buffers(
-            swapchain.swapchain_id,
-            resolved_buffer_count,
-            resolved_width,
-            resolved_height,
-            resolved_format,
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "dxgi",
-            "IDXGISwapChain::ResizeBuffers",
-            BTreeMap::from([
-                ("buffer_count".to_string(), json!(resolved_buffer_count)),
-                ("width".to_string(), json!(resolved_width)),
-                ("height".to_string(), json!(resolved_height)),
-                (
-                    "format".to_string(),
-                    json!(format!("{:?}", resolved_format)),
-                ),
-                ("flags".to_string(), json!(flags)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_swapchain_present(
-        &mut self,
-        sync_interval: u32,
-        allow_tearing: bool,
-        swapchain_object: u64,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        if self.live_session.is_some() {
-            if !self.first_real_guest_frame_seen {
-                crate::live::live_trace(&format!(
-                    "casa1-live-dxgi first-present api=d3d11 sync_interval={} allow_tearing={} swapchain={:#x}",
-                    sync_interval, allow_tearing, swapchain_object
-                ));
-            }
-            crate::live::live_trace(&format!(
-                "casa1-live-dxgi present api=d3d11 sync_interval={} swapchain={:#x} first_real_guest_frame_seen={}",
-                sync_interval, swapchain_object, self.first_real_guest_frame_seen
-            ));
-        }
-        let device_object = self.d3d11_swapchain(swapchain_object)?.device_object;
-        let live_mode = self.live_session.is_some();
-        let (frame_record, displayed_frame_index, queued_frames, live_frame) = {
-            let device_host = self.d3d11_device_mut(device_object)?;
-            let (submission, present) =
-                device_host
-                    .device
-                    .present_swapchain(sync_interval, allow_tearing, !live_mode)?;
-            let presented_frame = if live_mode {
-                Some(device_host.device.presented_frame()?)
-            } else {
-                None
-            };
-            let frame_record = if live_mode {
-                None
-            } else {
-                let backbuffer = device_host.device.swapchain_backbuffer(0)?;
-                let hash = device_host.device.resource_digest(backbuffer)?;
-                let state = device_host.device.swapchain_state().ok_or_else(|| {
-                    AppError::new(
-                        ReasonCode::RcD3dInvalidState,
-                        "swapchain state disappeared before present completed",
-                    )
-                })?;
-                let submission = submission.ok_or_else(|| {
-                    AppError::new(
-                        ReasonCode::RcD3dInvalidState,
-                        "non-live present is missing submission metadata",
-                    )
-                })?;
-                Some((
-                    hash,
-                    BTreeMap::from([
-                        ("source".to_string(), "dxgi_d3d11".to_string()),
-                        ("submission_hash".to_string(), submission.hash),
-                        ("width".to_string(), state.desc.width.to_string()),
-                        ("height".to_string(), state.desc.height.to_string()),
-                        ("format".to_string(), format!("{:?}", state.desc.format)),
-                        (
-                            "displayed_frame_index".to_string(),
-                            present.displayed_frame_index.to_string(),
-                        ),
-                    ]),
-                ))
-            };
-            let live_frame = presented_frame.map(|frame| LiveFrame {
-                width: frame.width,
-                height: frame.height,
-                format: frame.format,
-                bytes: frame.bytes,
-                displayed_frame_index: present.displayed_frame_index,
-            });
-            (
-                frame_record,
-                present.displayed_frame_index,
-                present.queued_frames,
-                live_frame,
-            )
-        };
-        if let Some(frame) = live_frame {
-            self.publish_live_frame(frame);
-            self.first_real_guest_frame_seen = true;
-        }
-        // Real D3D11 guest present — count it regardless of live mode.
-        self.real_guest_frames += 1;
-        if let Some((frame_hash, metadata)) = frame_record {
-            // Generic runtime event (no behavior change): a frame was
-            // presented; the Steam workload observer counts it by its
-            // metadata source.
-            let source = metadata.get("source").cloned().unwrap_or_default();
-            let width = metadata
-                .get("width")
-                .and_then(|raw| raw.parse().ok())
-                .unwrap_or(0);
-            let height = metadata
-                .get("height")
-                .and_then(|raw| raw.parse().ok())
-                .unwrap_or(0);
-            self.emit_event(crate::runtime_events::RuntimeEvent::FramePresented {
-                producer: source,
-                width,
-                height,
-                sequence: self.next_frame_index as u64,
-            });
-            self.gfx_frames.push(GfxFrame {
-                scene_id: "pe-runtime-d3d11".to_string(),
-                frame_index: self.next_frame_index,
-                hash: frame_hash,
-                ssim: None,
-                metadata,
-            });
-            self.next_frame_index = self.next_frame_index.saturating_add(1);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "dxgi",
-            "IDXGISwapChain::Present",
-            BTreeMap::from([
-                ("sync_interval".to_string(), json!(sync_interval)),
-                ("allow_tearing".to_string(), json!(allow_tearing)),
-                ("queued_frames".to_string(), json!(queued_frames)),
-            ]),
-            json!(displayed_frame_index),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_swapchain_present(
-        &mut self,
-        sync_interval: u32,
-        allow_tearing: bool,
-        swapchain_object: u64,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        if self.live_session.is_some() {
-            if !self.first_real_guest_frame_seen {
-                crate::live::live_trace(&format!(
-                    "casa1-live-dxgi first-present api=d3d12 sync_interval={} allow_tearing={} swapchain={:#x}",
-                    sync_interval, allow_tearing, swapchain_object
-                ));
-            }
-            crate::live::live_trace(&format!(
-                "casa1-live-dxgi present api=d3d12 sync_interval={} swapchain={:#x} first_real_guest_frame_seen={}",
-                sync_interval, swapchain_object, self.first_real_guest_frame_seen
-            ));
-        }
-        let swapchain_id = self.d3d12_swapchain(swapchain_object)?.swapchain_id;
-        let present = self
-            .d3d12_runtime
-            .present(swapchain_id, sync_interval, allow_tearing)?;
-        let mut frame = self.d3d12_runtime.presented_frame(swapchain_id)?;
-        // The d3d12 runtime's backend defaults to a D3D11 source label;
-        // correct it here so the frame is marked with its real origin.
-        frame.source = crate::gfx::FrameSource::DxgiD3D12;
-        let displayed_frame_index = present.displayed_frame_index;
-        let queued_frames = present.queued_frames;
-        let live_frame = LiveFrame {
-            width: frame.width,
-            height: frame.height,
-            format: frame.format,
-            bytes: frame.bytes.clone(),
-            displayed_frame_index,
-        };
-        // Real D3D12 guest present — count it regardless of live mode.
-        self.real_guest_frames += 1;
-        if self.live_session.is_some() {
-            self.publish_live_frame(live_frame);
-            self.first_real_guest_frame_seen = true;
-        } else {
-            let metadata = BTreeMap::from([
-                ("source".to_string(), "dxgi_d3d12".to_string()),
-                ("width".to_string(), frame.width.to_string()),
-                ("height".to_string(), frame.height.to_string()),
-                ("format".to_string(), format!("{:?}", frame.format)),
-                (
-                    "displayed_frame_index".to_string(),
-                    displayed_frame_index.to_string(),
-                ),
-            ]);
-            // Generic runtime event (no behavior change): a frame was
-            // presented; the Steam workload observer counts it by its
-            // metadata source.
-            let source = metadata.get("source").cloned().unwrap_or_default();
-            let width = metadata
-                .get("width")
-                .and_then(|raw| raw.parse().ok())
-                .unwrap_or(0);
-            let height = metadata
-                .get("height")
-                .and_then(|raw| raw.parse().ok())
-                .unwrap_or(0);
-            self.emit_event(crate::runtime_events::RuntimeEvent::FramePresented {
-                producer: source,
-                width,
-                height,
-                sequence: self.next_frame_index as u64,
-            });
-            self.gfx_frames.push(GfxFrame {
-                scene_id: "pe-runtime-d3d12".to_string(),
-                frame_index: self.next_frame_index,
-                hash: util::sha256_bytes(&frame.bytes),
-                ssim: None,
-                metadata,
-            });
-            self.next_frame_index = self.next_frame_index.saturating_add(1);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "dxgi",
-            "IDXGISwapChain::Present",
-            BTreeMap::from([
-                ("sync_interval".to_string(), json!(sync_interval)),
-                ("allow_tearing".to_string(), json!(allow_tearing)),
-                ("queued_frames".to_string(), json!(queued_frames)),
-            ]),
-            json!(displayed_frame_index),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_command_queue(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D12Device::CreateCommandQueue on non-device object {device_object:#x}"),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R9);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let (queue_type, priority, flags, node_mask) =
-            read_d3d12_command_queue_desc(memory, desc_ptr)?;
-        let queue_id = self.d3d12_runtime.create_command_queue();
-        let queue_object =
-            self.alloc_d3d12_command_queue_object(memory, device_object, queue_id)?;
-        write_u64(memory, out_ptr, queue_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateCommandQueue",
-            BTreeMap::from([
-                ("flags".to_string(), json!(flags)),
-                ("node_mask".to_string(), json!(node_mask)),
-                ("priority".to_string(), json!(priority)),
-                ("type".to_string(), json!(queue_type)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_command_allocator(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateCommandAllocator on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let command_list_type = state.get(Register::Rdx) as u32;
-        let out_ptr = state.get(Register::R9);
-        if out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let allocator_id = self.d3d12_runtime.create_command_allocator();
-        let allocator_object =
-            self.alloc_d3d12_command_allocator_object(memory, device_object, allocator_id)?;
-        write_u64(memory, out_ptr, allocator_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateCommandAllocator",
-            BTreeMap::from([("type".to_string(), json!(command_list_type))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_command_list(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D12Device::CreateCommandList on non-device object {device_object:#x}"),
-            ));
-        }
-        let node_mask = state.get(Register::Rdx) as u32;
-        let command_list_type = state.get(Register::R8) as u32;
-        let allocator_object = state.get(Register::R9);
-        let stack = state.get(Register::Rsp);
-        let initial_state = memory.read_u64(stack + 0x20)?;
-        let out_ptr = memory.read_u64(stack + 0x30)?;
-        if allocator_object == 0 || out_ptr == 0 || initial_state != 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let allocator = self.d3d12_command_allocator(allocator_object)?;
-        if allocator.device_object != device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // D3D12_COMMAND_LIST_TYPE_DIRECT = 0, D3D12_COMMAND_LIST_TYPE_BUNDLE = 1
-        let is_bundle = command_list_type == 1;
-        let pipeline_state = self.ensure_d3d12_guest_pipeline_state();
-        let command_list_id = self.d3d12_runtime.create_graphics_command_list(
-            allocator.allocator_id,
-            pipeline_state,
-            is_bundle,
-        );
-        let command_list_object = self.alloc_d3d12_command_list_object(
-            memory,
-            device_object,
-            allocator_object,
-            command_list_id,
-            is_bundle,
-        )?;
-        write_u64(memory, out_ptr, command_list_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateCommandList",
-            BTreeMap::from([
-                ("node_mask".to_string(), json!(node_mask)),
-                ("type".to_string(), json!(command_list_type)),
-                ("is_bundle".to_string(), json!(is_bundle)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_check_feature_support(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CheckFeatureSupport on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let feature = state.get(Register::Rdx) as u32;
-        let data_ptr = state.get(Register::R8);
-        let data_size = state.get(Register::R9) as usize;
-        if data_ptr == 0 || data_size == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-
-        let device_info = self.d3d12_runtime.device_info();
-        let Some(trace_params) = write_d3d12_feature_support(
-            memory,
-            feature,
-            data_ptr,
-            data_size,
-            &device_info,
-            Some(&self.telemetry),
-        )?
-        else {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        };
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CheckFeatureSupport",
-            trace_params,
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_descriptor_heap(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateDescriptorHeap on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R9);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let (heap_type, descriptor_count, flags, node_mask) =
-            read_d3d12_descriptor_heap_desc(memory, desc_ptr)?;
-        let heap_id = self
-            .d3d12_runtime
-            .create_descriptor_heap(heap_type, descriptor_count);
-        let heap_object = self.alloc_d3d12_descriptor_heap_object(
-            memory,
-            device_object,
-            heap_id,
-            heap_type,
-            descriptor_count,
-        )?;
-        write_u64(memory, out_ptr, heap_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateDescriptorHeap",
-            BTreeMap::from([
-                ("type".to_string(), json!(format!("{:?}", heap_type))),
-                ("descriptor_count".to_string(), json!(descriptor_count)),
-                ("flags".to_string(), json!(flags)),
-                ("node_mask".to_string(), json!(node_mask)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_render_target_view(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateRenderTargetView on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let resource = self.d3d12_resource(state.get(Register::Rdx))?;
-        let descriptor_handle = state.get(Register::R9);
-        let (heap, index) =
-            self.decode_d3d12_cpu_descriptor_handle(descriptor_handle, DescriptorHeapType::Rtv)?;
-        if resource.device_object != device_object || heap.device_object != device_object {
-            return Err(AppError::new(
-                ReasonCode::RcD3dInvalidState,
-                "RTV resource and descriptor heap must belong to the same D3D12 device",
-            ));
-        }
-        self.d3d12_runtime.write_descriptor(
-            heap.heap_id,
-            index,
-            ViewDescriptor::Rtv {
-                resource: resource.resource_id,
-                format: resource.format,
-            },
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateRenderTargetView",
-            BTreeMap::from([
-                ("descriptor_index".to_string(), json!(index)),
-                (
-                    "format".to_string(),
-                    json!(format!("{:?}", resource.format)),
-                ),
-                ("resource_id".to_string(), json!(resource.resource_id)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_fence(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D12Device::CreateFence on non-device object {device_object:#x}"),
-            ));
-        }
-        let initial_value = state.get(Register::Rdx);
-        let flags = state.get(Register::R8) as u32;
-        let stack = state.get(Register::Rsp);
-        let out_ptr = memory.read_u64(stack + 0x20)?;
-        if out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let fence_id = self.d3d12_runtime.create_fence(initial_value);
-        let fence_object = self.alloc_d3d12_fence_object(memory, device_object, fence_id)?;
-        write_u64(memory, out_ptr, fence_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateFence",
-            BTreeMap::from([
-                ("flags".to_string(), json!(flags)),
-                ("initial_value".to_string(), json!(initial_value)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── DXGI Factory gap-fill dispatch handlers (Phase 3.4) ──────────
-
-    fn dispatch_dxgi_factory_is_current(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        // DXGI spec: returns TRUE if the factory object is current.
-        state.set(Register::Rax, 1); // TRUE
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_register_stereo_status(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        let event_handle = state.get(Register::Rdx);
-        let cookie_out = state.get(Register::R8);
-        // Allocate a unique cookie and track the event handle.
-        let cookie = self.next_dxgi_cookie;
-        self.next_dxgi_cookie += 1;
-        self.dxgi_stereo_events.insert(cookie, event_handle);
-        if cookie_out != 0 {
-            write_u64(memory, cookie_out, cookie);
-        }
-        state.set(Register::Rax, 0); // S_OK
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_create_swapchain_for_corewindow(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        let _queue_object = state.get(Register::Rdx);
-        let _core_window = state.get(Register::R8);
-        let desc_ptr = state.get(Register::R9);
-        let stack = state.get(Register::Rsp);
-        let out_ptr = memory.read_u64(stack + 0x30)?;
-        // Reuse the CreateSwapChainForHwnd path with a dummy HWND
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let desc = read_swapchain_desc1(memory, desc_ptr)?;
-        let swapchain_object =
-            self.create_d3d12_swapchain_from_desc(memory, state.get(Register::Rdx), desc.clone())?;
-        write_u64(memory, out_ptr, swapchain_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "dxgi",
-            "IDXGIFactory2::CreateSwapChainForCoreWindow",
-            BTreeMap::from([
-                ("width".to_string(), json!(desc.width)),
-                ("height".to_string(), json!(desc.height)),
-                ("buffer_count".to_string(), json!(desc.buffer_count)),
-                ("format".to_string(), json!(format!("{:?}", desc.format))),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_create_swapchain_for_composition(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        let _queue_object = state.get(Register::Rdx);
-        let _desc_ptr = state.get(Register::R8);
-        let _out_ptr = state.get(Register::R9);
-        // Composition swapchain not supported — return DXGI_ERROR_UNSUPPORTED.
-        state.set(Register::Rax, 0x887A0002_u64); // DXGI_ERROR_UNSUPPORTED
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_register_stereo_status_event(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        let event_handle = state.get(Register::Rdx);
-        let cookie_out = state.get(Register::R8);
-        // Allocate a unique cookie and track the event handle.
-        let cookie = self.next_dxgi_cookie;
-        self.next_dxgi_cookie += 1;
-        self.dxgi_stereo_events.insert(cookie, event_handle);
-        if cookie_out != 0 {
-            write_u64(memory, cookie_out, cookie);
-        }
-        state.set(Register::Rax, 0); // S_OK
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_unregister_stereo_status(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        let cookie = state.get(Register::Rdx);
-        // Remove the cookie from tracked stereo events.
-        self.dxgi_stereo_events.remove(&cookie);
-        state.set(Register::Rax, 0); // S_OK
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_register_occlusion_status(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        let event_handle = state.get(Register::Rdx);
-        let cookie_out = state.get(Register::R8);
-        // Allocate a unique cookie and track the event handle.
-        let cookie = self.next_dxgi_cookie;
-        self.next_dxgi_cookie += 1;
-        self.dxgi_occlusion_events.insert(cookie, event_handle);
-        if cookie_out != 0 {
-            write_u64(memory, cookie_out, cookie);
-        }
-        state.set(Register::Rax, 0); // S_OK
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_register_occlusion_status_event(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        let event_handle = state.get(Register::Rdx);
-        let cookie_out = state.get(Register::R8);
-        // Allocate a unique cookie and track the event handle.
-        let cookie = self.next_dxgi_cookie;
-        self.next_dxgi_cookie += 1;
-        self.dxgi_occlusion_events.insert(cookie, event_handle);
-        if cookie_out != 0 {
-            write_u64(memory, cookie_out, cookie);
-        }
-        state.set(Register::Rax, 0); // S_OK
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_unregister_occlusion_status(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        let cookie = state.get(Register::Rdx);
-        // Remove the cookie from tracked occlusion events.
-        self.dxgi_occlusion_events.remove(&cookie);
-        state.set(Register::Rax, 0); // S_OK
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_get_creation_flags(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        // IDXGIFactory3::GetCreationFlags — return 0 (no special flags).
-        state.set(Register::Rax, 0); // 0 flags, S_OK
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_enum_adapter_by_luid(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let factory_object = state.get(Register::Rcx);
-        let _luid = state.get(Register::Rdx); // LUID in Rdx (low part) and R8 (high part)
-        let _riid_ptr = state.get(Register::R8);
-        let out_ptr = state.get(Register::R9);
-        if out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Return the single adapter we support.
-        let adapter_object = self.alloc_dxgi_adapter_object(memory, factory_object)?;
-        write_u64(memory, out_ptr, adapter_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_dxgi_factory_enum_warp_adapter(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _factory_object = state.get(Register::Rcx);
-        let _riid_ptr = state.get(Register::Rdx);
-        let _out_ptr = state.get(Register::R8);
-        // WARP adapter not supported.
-        state.set(Register::Rax, 0x887A0002_u64); // DXGI_ERROR_UNSUPPORTED
-        self.last_error = 0;
-        Ok(())
-    }
-
-    fn dispatch_d3d12_command_queue_execute_command_lists(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let queue = self.d3d12_command_queue(state.get(Register::Rcx))?;
-        let count = state.get(Register::Rdx) as usize;
-        let lists_ptr = state.get(Register::R8);
-        if count != 0 && lists_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let mut streams = Vec::with_capacity(count);
-        if count != 0 {
-            let command_list_objects = read_guest_pointer_array(memory, lists_ptr, count)?;
-            for command_list_object in command_list_objects {
-                let command_list = self.d3d12_command_list(command_list_object)?;
-                if command_list.device_object != queue.device_object {
-                    state.set(Register::Rax, E_INVALIDARG);
-                    self.last_error = 0;
-                    return Ok(());
-                }
-                let stream = command_list.closed_stream.clone().ok_or_else(|| {
-                    AppError::new(
-                        ReasonCode::RcD3dInvalidState,
-                        format!("D3D12 command list {command_list_object:#x} must be closed before execute"),
-                    )
-                })?;
-                streams.push(stream);
-            }
-        }
-        let (render_passes, compute_passes, blit_passes) = if streams.is_empty() {
-            (0, 0, 0)
-        } else {
-            let plan = self
-                .d3d12_runtime
-                .execute_command_lists(queue.queue_id, &streams, None)?;
-            (
-                plan.render_passes.len(),
-                plan.compute_passes,
-                plan.blit_passes,
-            )
-        };
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12CommandQueue::ExecuteCommandLists",
-            BTreeMap::from([
-                ("command_lists".to_string(), json!(count)),
-                ("render_passes".to_string(), json!(render_passes)),
-                ("compute_passes".to_string(), json!(compute_passes)),
-                ("blit_passes".to_string(), json!(blit_passes)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_command_queue_signal(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let queue = self.d3d12_command_queue(state.get(Register::Rcx))?;
-        let fence = self.d3d12_fence(state.get(Register::Rdx))?;
-        let value = state.get(Register::R8);
-        if fence.device_object != queue.device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        self.d3d12_runtime.signal_fence(fence.fence_id, value)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12CommandQueue::Signal",
-            BTreeMap::from([
-                ("queue_id".to_string(), json!(queue.queue_id)),
-                ("value".to_string(), json!(value)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_descriptor_heap_get_cpu_handle_for_heap_start(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let heap = self.d3d12_descriptor_heap(state.get(Register::Rcx))?;
-        state.set(Register::Rax, heap.cpu_handle_start);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12DescriptorHeap::GetCPUDescriptorHandleForHeapStart",
-            BTreeMap::from([
-                ("descriptor_count".to_string(), json!(heap.descriptor_count)),
-                ("type".to_string(), json!(format!("{:?}", heap.ty))),
-            ]),
-            json!(heap.cpu_handle_start),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_resource_barrier(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_object = state.get(Register::Rcx);
-        let barrier_count = state.get(Register::Rdx) as usize;
-        let barriers_ptr = state.get(Register::R8);
-        if barrier_count != 0 && barriers_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let command_list_id = self.open_d3d12_command_list_id(command_list_object)?;
-        for index in 0..barrier_count {
-            let barrier_address = barriers_ptr + index as u64 * 32;
-            let barrier = read_d3d12_resource_barrier(memory, barrier_address)?;
-            let resource = self.d3d12_resource(barrier.resource_object)?;
-            let subresource = if barrier.subresource == u32::MAX {
-                0
-            } else {
-                barrier.subresource
-            };
-            let current_state = self
-                .d3d12_runtime
-                .resource_state(resource.resource_id, subresource)?;
-            let from = map_d3d12_resource_state(
-                barrier.state_before,
-                resource,
-                Some(current_state),
-                true,
-            )?;
-            let to = map_d3d12_resource_state(
-                barrier.state_after,
-                resource,
-                Some(current_state),
-                false,
-            )?;
-            self.d3d12_runtime.record_transition(
-                command_list_id,
-                resource.resource_id,
-                subresource,
-                from,
-                to,
-            )?;
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::ResourceBarrier",
-            BTreeMap::from([("barriers".to_string(), json!(barrier_count))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_clear_render_target_view(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let descriptor_handle = state.get(Register::Rdx);
-        let num_rects = state.get(Register::R9) as u32;
-        if num_rects != 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let (heap, index) =
-            self.decode_d3d12_cpu_descriptor_handle(descriptor_handle, DescriptorHeapType::Rtv)?;
-        self.d3d12_runtime
-            .record_clear_rtv(command_list_id, heap.heap_id, index)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::ClearRenderTargetView",
-            BTreeMap::from([("descriptor_index".to_string(), json!(index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_draw_instanced(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let vertex_count = state.get(Register::Rdx) as u32;
-        let instance_count = state.get(Register::R8) as u32;
-        let start_vertex = state.get(Register::R9) as u32;
-        let start_instance = read_guest_u32(memory, state.get(Register::Rsp) + 0x20)?;
-        if start_vertex != 0 || start_instance != 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        self.d3d12_runtime
-            .record_draw_instanced(command_list_id, vertex_count, instance_count)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::DrawInstanced",
-            BTreeMap::from([
-                ("instances".to_string(), json!(instance_count)),
-                ("vertices".to_string(), json!(vertex_count)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_close(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_object = state.get(Register::Rcx);
-        let command_list_id = {
-            let command_list = self.d3d12_command_list_mut(command_list_object)?;
-            match command_list.command_list_id.take() {
-                Some(command_list_id) => command_list_id,
-                None => {
-                    state.set(Register::Rax, E_INVALIDARG);
-                    self.last_error = 0;
-                    return Ok(());
-                }
-            }
-        };
-        let stream = self.d3d12_runtime.close_command_list(command_list_id)?;
-        let stream_id = stream.id;
-        let command_count = stream.commands.len();
-        let command_list = self.d3d12_command_list_mut(command_list_object)?;
-        command_list.closed_stream = Some(stream);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::Close",
-            BTreeMap::from([
-                ("command_list_id".to_string(), json!(stream_id)),
-                ("commands".to_string(), json!(command_count)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── ID3D12GraphicsCommandList bundle and reset methods ─────────────
-
-    /// Handle ID3D12GraphicsCommandList::Reset (vtable slot 10).
-    ///
-    /// For direct command lists, resets with the given allocator. For bundle
-    /// command lists, resets with a bundle allocator. In both cases the
-    /// optional initial pipeline state (`initial_state`) is currently ignored
-    /// (a default PSO is used), which is valid per D3D12 spec — passing null
-    /// for `initial_state` leaves the command list in a known default state.
-    ///
-    /// x64 calling convention:
-    ///   RCX = this (command list guest object)
-    ///   RDX = allocator (command allocator guest object)
-    ///   R8  = initial_state (pipeline state, can be 0/null)
-    fn dispatch_d3d12_graphics_command_list_reset(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_object = state.get(Register::Rcx);
-        let allocator_object = state.get(Register::Rdx);
-        let _initial_state = state.get(Register::R8);
-
-        // Validate the command list object
-        let command_list = self.d3d12_command_list(command_list_object)?;
-        let is_bundle = command_list.is_bundle;
-
-        // Validate the allocator object
-        let allocator = self.d3d12_command_allocator(allocator_object)?;
-        if allocator.device_object != command_list.device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-
-        // Create a fresh command list ID from the runtime
-        let pipeline_state = self.ensure_d3d12_guest_pipeline_state();
-        let command_list_id = self.d3d12_runtime.create_graphics_command_list(
-            allocator.allocator_id,
-            pipeline_state,
-            is_bundle,
-        );
-
-        // Update the guest-side command list state
-        let command_list = self.d3d12_command_list_mut(command_list_object)?;
-        command_list.command_list_id = Some(command_list_id);
-        command_list.closed_stream = None;
-        command_list.render_pass_active = false;
-
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::Reset",
-            BTreeMap::from([
-                ("is_bundle".to_string(), json!(is_bundle)),
-                ("allocator".to_string(), json!(allocator_object)),
-                ("command_list_id".to_string(), json!(command_list_id)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    /// Handle ID3D12GraphicsCommandList::ExecuteBundle (vtable slot 27).
-    ///
-    /// Replays a pre-recorded bundle command list on a parent direct command
-    /// list. The bundle's commands are deep-cloned at record time so the
-    /// bundle can be Reset and re-recorded independently.
-    ///
-    /// x64 calling convention:
-    ///   RCX = this (parent command list, must be DIRECT type)
-    ///   RDX = bundle (bundle command list guest object)
-    fn dispatch_d3d12_graphics_command_list_execute_bundle(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let parent_object = state.get(Register::Rcx);
-        let bundle_object = state.get(Register::Rdx);
-
-        // The parent must be a direct command list (not a bundle)
-        let parent = self.d3d12_command_list(parent_object)?;
-        if parent.is_bundle {
-            // Cannot ExecuteBundle on a bundle — only direct lists can replay bundles
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let parent_id = match parent.command_list_id {
-            Some(id) => id,
-            None => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-
-        // The bundle must actually be a bundle and have a valid ID
-        let bundle = self.d3d12_command_list(bundle_object)?;
-        if !bundle.is_bundle {
-            // Cannot ExecuteBundle with a non-bundle command list
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let bundle_id = match bundle.command_list_id {
-            Some(id) => id,
-            None => {
-                // Bundle hasn't been closed yet — need to close first
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-
-        // Both must belong to the same device
-        if bundle.device_object != parent.device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-
-        // Record the bundle execution on the parent command list
-        self.d3d12_runtime
-            .record_execute_bundle(parent_id, bundle_id)?;
-
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::ExecuteBundle",
-            BTreeMap::from([
-                ("parent".to_string(), json!(parent_object)),
-                ("bundle".to_string(), json!(bundle_object)),
-                ("bundle_id".to_string(), json!(bundle_id)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_fence_get_completed_value(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let fence = self.d3d12_fence(state.get(Register::Rcx))?;
-        let value = self.d3d12_runtime.fence_value(fence.fence_id)?;
-        state.set(Register::Rax, value);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Fence::GetCompletedValue",
-            BTreeMap::new(),
-            json!(value),
-        );
-        Ok(())
-    }
-
-    // ── D3D12 fence gap-fill dispatch handlers (Phase 3.2) ──────────
-
-    fn dispatch_d3d12_fence_set_event_on_completion(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _fence_object = state.get(Register::Rcx);
-        let _event_handle = state.get(Register::Rdx);
-        let _value = state.get(Register::R8);
-        // Event-based fence notification is not supported on Metal.
-        // The application should poll GetCompletedValue instead.
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Fence::SetEventOnCompletion",
-            BTreeMap::from([("value".to_string(), json!(_value))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_fence_signal(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let fence_object = state.get(Register::Rcx);
-        let value = state.get(Register::Rdx);
-        let fence = self.d3d12_fence(fence_object)?;
-        self.d3d12_runtime.signal_fence(fence.fence_id, value)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Fence::Signal",
-            BTreeMap::from([("value".to_string(), json!(value))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── D3D12 command queue gap-fill dispatch handlers (Phase 3.2) ──
-
-    fn dispatch_d3d12_command_queue_get_desc(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let queue = state.get(Register::Rcx);
-        let desc_out = state.get(Register::Rdx);
-        let Some(state_obj) = self.d3d12_command_queues.get(&queue) else {
-            return Ok(());
-        };
-        if desc_out != 0 {
-            write_u32(memory, desc_out, 3); // DIRECT
-            write_u32(memory, desc_out + 4, 0);
-            write_u32(memory, desc_out + 8, 0);
-            write_u32(memory, desc_out + 12, 0);
-        }
-        let _ = state_obj;
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_d3d12_object_set_name(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let this = state.get(Register::Rcx);
-        let name = state.get(Register::Rdx);
-        let text = read_utf16_string(memory, name).unwrap_or_default();
-        self.d3d12_object_names.insert(this, text);
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_d3d12_object_get_private_data(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let this = state.get(Register::Rcx);
-        let _guid = state.get(Register::Rdx);
-        let data = state.get(Register::R8);
-        let size = state.get(Register::R9);
-        let actual = state.get(Register::Rsp) + 0x28;
-        let Some(bytes) = self.d3d12_private_data.get(&this).cloned() else {
-            if data != 0 && size != 0 {
-                write_u32(memory, actual, 0);
-            }
-            state.set(Register::Rax, 0x8007_004e); // DXGI_ERROR_NOT_FOUND
-            return Ok(());
-        };
-        if data != 0 {
-            let copy = (size as usize).min(bytes.len());
-            for (i, byte) in bytes[..copy].iter().enumerate() {
-                memory.write_u8(data + i as u64, *byte);
-            }
-        }
-        if size != 0 {
-            write_u32(memory, actual, bytes.len() as u32);
-        }
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_d3d12_object_set_private_data(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let this = state.get(Register::Rcx);
-        let _guid = state.get(Register::Rdx);
-        let size = state.get(Register::R8);
-        let data = state.get(Register::R9);
-        let bytes = memory.read_bytes(data, size as usize).unwrap_or_default();
-        self.d3d12_private_data.insert(this, bytes);
-        state.set(Register::Rax, 0);
-        Ok(())
-    }
-
-    fn dispatch_d3d12_command_queue_wait(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let queue_object = state.get(Register::Rcx);
-        let fence_object = state.get(Register::Rdx);
-        let value = state.get(Register::R8);
-        let queue = self.d3d12_command_queue(queue_object)?;
-        let fence = self.d3d12_fence(fence_object)?;
-        if fence.device_object != queue.device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // On Metal, fence waits are tracked via fence_values map
-        self.d3d12_runtime
-            .wait_for_fence(fence.fence_id, value, u64::MAX)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12CommandQueue::Wait",
-            BTreeMap::from([("value".to_string(), json!(value))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_command_queue_get_timestamp_frequency(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _queue_object = state.get(Register::Rcx);
-        let out_ptr = state.get(Register::Rdx);
-        if out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Metal GPU timestamp frequency is typically 1 GHz (nanoseconds)
-        let frequency: u64 = 1_000_000_000;
-        write_u64(memory, out_ptr, frequency);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12CommandQueue::GetTimestampFrequency",
-            BTreeMap::from([("frequency".to_string(), json!(frequency))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_command_queue_get_clock_calibration(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _queue_object = state.get(Register::Rcx);
-        let gpu_timestamp_ptr = state.get(Register::Rdx);
-        let cpu_timestamp_ptr = state.get(Register::R8);
-        if gpu_timestamp_ptr == 0 || cpu_timestamp_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Return current timestamp values for calibration
-        let cpu_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let gpu_timestamp = cpu_timestamp; // Assume GPU and CPU clocks are in sync
-        write_u64(memory, gpu_timestamp_ptr, gpu_timestamp);
-        write_u64(memory, cpu_timestamp_ptr, cpu_timestamp);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12CommandQueue::GetClockCalibration",
-            BTreeMap::from([
-                ("gpu".to_string(), json!(gpu_timestamp)),
-                ("cpu".to_string(), json!(cpu_timestamp)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── ID3D12GraphicsCommandList1 dispatch methods ─────────────────
-
-    fn dispatch_d3d12_graphics_command_list1_atomic_copy_buffer_uint(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        self.d3d12_runtime
-            .atomic_copy_buffer_uint(command_list_id)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList1::AtomicCopyBufferUINT",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list1_atomic_copy_buffer_uint64(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        self.d3d12_runtime
-            .atomic_copy_buffer_uint64(command_list_id)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList1::AtomicCopyBufferUINT64",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list1_om_set_depth_bounds(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let min = f32::from_bits(state.get(Register::Rdx) as u32);
-        let max = f32::from_bits(state.get(Register::R8) as u32);
-        self.d3d12_runtime
-            .omset_depth_bounds(command_list_id, min, max)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList1::OMSetDepthBounds",
-            BTreeMap::from([
-                ("min".to_string(), json!(min)),
-                ("max".to_string(), json!(max)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list1_set_sample_positions(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let pixel_samples = state.get(Register::Rdx) as u32;
-        let num_pixels = state.get(Register::R8) as u32;
-        self.d3d12_runtime
-            .set_sample_positions(command_list_id, pixel_samples, num_pixels)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList1::SetSamplePositions",
-            BTreeMap::from([
-                ("pixel_samples".to_string(), json!(pixel_samples)),
-                ("num_pixels".to_string(), json!(num_pixels)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list1_resolve_subresource_region(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        // ID3D12GraphicsCommandList1::ResolveSubresourceRegion calling convention (x64):
-        //   RCX = this (command list object)
-        //   RDX = pDstResource
-        //   R8  = DstSubresource
-        //   R9  = DstX
-        //   [RSP+0x20] = DstY
-        //   [RSP+0x28] = DstZ
-        //   [RSP+0x30] = pSrcResource
-        //   [RSP+0x38] = SrcSubresource
-        //   [RSP+0x40] = SrcX
-        //   [RSP+0x48] = SrcY
-        //   [RSP+0x50] = SrcZ
-        //   [RSP+0x58] = pRect (D3D12_RESOLVE_SUBRESOURCE_REGION_DESC*)
-        //   [RSP+0x60] = Format (DXGI_FORMAT)
-        let command_list_object = state.get(Register::Rcx);
-        let dst_resource_object = state.get(Register::Rdx);
-        let _dst_subresource = state.get(Register::R8) as u32;
-        let _dst_x = state.get(Register::R9) as u32;
-        let sp = state.get(Register::Rsp);
-        let _dst_y = memory.read_u32(sp + 0x20)?;
-        let _dst_z = memory.read_u32(sp + 0x28)?;
-        let src_resource_object = memory.read_u64(sp + 0x30)?;
-        let _src_subresource = memory.read_u32(sp + 0x38)?;
-        let _src_x = memory.read_u32(sp + 0x40)?;
-        let _src_y = memory.read_u32(sp + 0x48)?;
-        let _src_z = memory.read_u32(sp + 0x50)?;
-        let p_rect = memory.read_u64(sp + 0x58)?;
-        let format_raw = memory.read_u32(sp + 0x60)?;
-
-        let command_list_id = self.open_d3d12_command_list_id(command_list_object)?;
-
-        // Look up source and destination resources by guest object address
-        let dst_resource = self.d3d12_resource(dst_resource_object)?;
-        let src_resource = self.d3d12_resource(src_resource_object)?;
-
-        // Parse D3D12_RESOLVE_SUBRESOURCE_REGION_DESC from guest memory (if non-null).
-        // struct { UINT NumRects; const D3D12_RECT* pRects; }
-        // D3D12_RECT = { LONG left, top, right, bottom }
-        let _num_rects = if p_rect != 0 {
-            memory.read_u32(p_rect)?
-        } else {
-            0
-        };
-
-        self.d3d12_runtime.resolve_subresource_region(
-            command_list_id,
-            dst_resource.resource_id,
-            src_resource.resource_id,
-            format_raw,
-        )?;
-
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList1::ResolveSubresourceRegion",
-            BTreeMap::from([
-                ("dst_format".to_string(), json!(format_raw)),
-                ("dst_subresource".to_string(), json!(_dst_subresource)),
-                ("src_subresource".to_string(), json!(_src_subresource)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list1_set_view_instance_mask(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let mask = state.get(Register::Rdx) as u32;
-        self.d3d12_runtime
-            .set_view_instance_mask(command_list_id, mask)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList1::SetViewInstanceMask",
-            BTreeMap::from([("mask".to_string(), json!(mask))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── ID3D12GraphicsCommandList2 dispatch methods ─────────────────
-
-    fn dispatch_d3d12_graphics_command_list2_write_buffer_immediate(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let count = state.get(Register::Rdx) as u32;
-        let values_ptr = state.get(Register::R8);
-        let destinations_ptr = state.get(Register::R9);
-        if count != 0 && (values_ptr == 0 || destinations_ptr == 0) {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let mut values = Vec::with_capacity(count as usize);
-        let mut destinations = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            let offset = i as u64 * 8;
-            values.push(read_guest_u64(memory, values_ptr + offset)?);
-            destinations.push(read_guest_u64(memory, destinations_ptr + offset)?);
-        }
-        self.d3d12_runtime.write_buffer_immediate(
-            command_list_id,
-            count,
-            &values,
-            &destinations,
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList2::WriteBufferImmediate",
-            BTreeMap::from([("count".to_string(), json!(count))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── ID3D12GraphicsCommandList3 dispatch methods ─────────────────
-
-    fn dispatch_d3d12_graphics_command_list3_set_protected_resource_session(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let session = state.get(Register::Rdx);
-        self.d3d12_runtime
-            .set_protected_resource_session(command_list_id, session)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList3::SetProtectedResourceSession",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── ID3D12GraphicsCommandList4 dispatch methods ─────────────────
-
-    fn dispatch_d3d12_graphics_command_list4_begin_render_pass(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let num_render_targets = state.get(Register::Rdx) as u32;
-        let rts_ptr = state.get(Register::R8);
-        let depth_ptr = state.get(Register::R9);
-        let _desc_ptr = read_guest_u64(memory, state.get(Register::Rsp) + 0x20)?;
-        let mut color_formats = Vec::new();
-        for i in 0..num_render_targets as usize {
-            let _rt_addr = read_guest_u64(memory, rts_ptr + i as u64 * 8)?;
-            // Read CPU descriptor handle for the render target
-            let _cpu_handle = read_guest_u64(memory, _rt_addr)?;
-            // Default format for now
-            color_formats.push(DxgiFormat::R8G8B8A8Unorm);
-        }
-        let depth_format = if depth_ptr != 0 {
-            Some(DxgiFormat::D24UnormS8Uint)
-        } else {
-            None
-        };
-        // Track render pass active on the guest struct too
-        if let Ok(cmd_list) = self.d3d12_command_list_mut(state.get(Register::Rcx)) {
-            cmd_list.render_pass_active = true;
-        }
-        self.d3d12_runtime.begin_render_pass(
-            command_list_id,
-            color_formats,
-            depth_format,
-            "clear",
-            "store",
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList4::BeginRenderPass",
-            BTreeMap::from([("num_render_targets".to_string(), json!(num_render_targets))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list4_end_render_pass(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        if let Ok(cmd_list) = self.d3d12_command_list_mut(state.get(Register::Rcx)) {
-            cmd_list.render_pass_active = false;
-        }
-        self.d3d12_runtime.end_render_pass(command_list_id)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList4::EndRenderPass",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list4_initialize_meta_command(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        self.d3d12_runtime
-            .initialize_meta_command(command_list_id)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList4::InitializeMetaCommand",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list4_execute_meta_command(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        self.d3d12_runtime.execute_meta_command(command_list_id)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList4::ExecuteMetaCommand",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list4_build_raytracing_acceleration_structure(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let desc_ptr = state.get(Register::Rdx);
-        // R8 = NumPostbuildInfoDescs (unused in this bridge iteration)
-        // R9 = pPostbuildInfoDescs (unused in this bridge iteration)
-
-        if desc_ptr == 0 {
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            return Ok(());
-        }
-
-        // Parse D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC from guest memory
-        // x64 layout (all offsets in bytes):
-        // +0:  DestAccelerationStructureData (u64)
-        // +8:  Inputs.Type (u32)
-        // +12: Inputs.Flags (u32)
-        // +16: Inputs.NumDescs (u32)
-        // +20: Inputs.DescriptorsLayout (u32)
-        // +24: Inputs.pGeometryDescs/ppInstances (u64)
-        // +32: SourceAccelerationStructureData (u64)
-        // +40: ScratchAccelerationStructureData (u64)
-        // +48: NumPostbuildInfoDescs (u32)
-        // +52: padding (4 bytes)
-        // +56: pPostbuildInfoDescs (u64)
-
-        let dest_address = read_guest_u64(memory, desc_ptr)?;
-        let as_type = read_guest_u32(memory, desc_ptr + 8)?; // 0=BLAS, 1=TLAS
-        let _flags = read_guest_u32(memory, desc_ptr + 12)?;
-        let num_descs = read_guest_u32(memory, desc_ptr + 16)?;
-        let _descriptors_layout = read_guest_u32(memory, desc_ptr + 20)?;
-        let geometry_descs_ptr = read_guest_u64(memory, desc_ptr + 24)?;
-
-        let mut geometries = Vec::new();
-        if as_type == 0 && geometry_descs_ptr != 0 {
-            // Bottom-level AS: parse D3D12_RAYTRACING_GEOMETRY_DESC array
-            for i in 0..num_descs as u64 {
-                let geom_addr = geometry_descs_ptr + i * 48; // 48 bytes per geometry desc
-                // D3D12_RAYTRACING_GEOMETRY_DESC layout:
-                // +0:  Type (u32)
-                // +4:  Flags (u32)
-                // +8:  Triangles.VertexBuffer (u64)
-                // +16: Triangles.IndexBuffer (u64)
-                // +24: Triangles.IndexBufferOffsetInBytes (u32)
-                // +28: Triangles.VertexCount (u32)
-                // +32: Triangles.IndexFormat (u32)
-                // +36: Triangles.VertexFormat (u32)
-                // +40: Triangles.VertexBufferStrideInBytes (u32)
-                // +44: Triangles.PrimitiveCount (u32)
-                let geom_type = read_guest_u32(memory, geom_addr)?;
-                let geom_flags = read_guest_u32(memory, geom_addr + 4)?;
-                let vb = read_guest_u64(memory, geom_addr + 8)?;
-                let ib = read_guest_u64(memory, geom_addr + 16)?;
-                let _ib_offset = read_guest_u32(memory, geom_addr + 24)?;
-                let vertex_count = read_guest_u32(memory, geom_addr + 28)?;
-                let index_format = read_guest_u32(memory, geom_addr + 32)?;
-                let vertex_format = read_guest_u32(memory, geom_addr + 36)?;
-                let vertex_stride = read_guest_u32(memory, geom_addr + 40)?;
-                let primitive_count = read_guest_u32(memory, geom_addr + 44)?;
-
-                geometries.push(crate::d3d12::D3D12RaytracingGeometryDesc {
-                    ty: geom_type,
-                    flags: geom_flags,
-                    vertex_buffer: vb,
-                    vertex_format,
-                    vertex_stride,
-                    vertex_count,
-                    index_buffer: ib,
-                    index_format,
-                    index_count: if ib != 0 {
-                        primitive_count * 3
-                    } else {
-                        primitive_count
-                    },
-                });
-            }
-        }
-
-        let source_address = read_guest_u64(memory, desc_ptr + 32)?;
-        let scratch_address = read_guest_u64(memory, desc_ptr + 40)?;
-
-        let build_desc = crate::d3d12::D3D12BuildAccelerationStructureDesc {
-            dest_address,
-            inputs: crate::d3d12::D3D12BuildRaytracingInputs {
-                ty: as_type,
-                flags: 0,
-                num_descs,
-                geometries,
-            },
-            source_address,
-            scratch_address,
-        };
-
-        let result = self
-            .d3d12_runtime
-            .build_raytracing_acceleration_structure(command_list_id, &build_desc)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure",
-            BTreeMap::from([
-                (
-                    "dest_address".to_string(),
-                    json!(format!("{dest_address:#x}")),
-                ),
-                ("type".to_string(), json!(as_type)),
-                ("num_geometries".to_string(), json!(num_descs)),
-                (
-                    "scratch_address".to_string(),
-                    json!(format!("{scratch_address:#x}")),
-                ),
-            ]),
-            json!(result),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list4_emit_raytracing_acceleration_structure_postbuild_info(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let postbuild_info_desc_ptr = state.get(Register::Rdx);
-        let num_source_as = state.get(Register::R8) as usize;
-        let source_as_data_ptr = state.get(Register::R9);
-
-        if postbuild_info_desc_ptr == 0 || num_source_as == 0 || source_as_data_ptr == 0 {
-            state.set(Register::Rax, 0);
-            self.last_error = 0;
-            return Ok(());
-        }
-
-        // Parse D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC
-        // x64 layout:
-        // +0: DestBuffer (u64)
-        // +8: InfoType (u32)
-        // +12: padding (4 bytes)
-        let dest_buffer = read_guest_u64(memory, postbuild_info_desc_ptr)?;
-        let info_type = read_guest_u32(memory, postbuild_info_desc_ptr + 8)?;
-
-        // Read source acceleration structure GPU addresses
-        let mut source_addresses = Vec::with_capacity(num_source_as);
-        for i in 0..num_source_as {
-            let addr = read_guest_u64(memory, source_as_data_ptr + i as u64 * 8)?;
-            source_addresses.push(addr);
-        }
-
-        // Determine output size based on info type
-        let output_size = match info_type {
-            1 | 2 => num_source_as * 8, // COMPACTED_SIZE or TOOLS_VISUALIZATION
-            3 => num_source_as * 16,    // SERIALIZATION
-            _ => 0,
-        };
-
-        if output_size > 0 && dest_buffer != 0 {
-            let mut output_buf = vec![0u8; output_size];
-            if memory.is_range_mapped(dest_buffer, output_size)
-                && let Ok(bytes) = memory.read_bytes(dest_buffer, output_size)
-            {
-                output_buf.copy_from_slice(&bytes);
-            }
-
-            self.d3d12_runtime
-                .emit_raytracing_acceleration_structure_postbuild_info(
-                    command_list_id,
-                    info_type,
-                    &source_addresses,
-                    &mut output_buf,
-                )?;
-
-            memory.map_bytes(dest_buffer, &output_buf);
-        }
-
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList4::EmitRaytracingAccelerationStructurePostbuildInfo",
-            BTreeMap::from([
-                ("info_type".to_string(), json!(info_type)),
-                ("num_sources".to_string(), json!(num_source_as)),
-                (
-                    "dest_buffer".to_string(),
-                    json!(format!("{dest_buffer:#x}")),
-                ),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list4_copy_raytracing_acceleration_structure(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        // D3D12 API: CopyRaytracingAccelerationStructure(Dest, Source, Mode)
-        // RCX = this, RDX = DestAddress, R8 = SourceAddress, R9 = Mode
-        let dest_address = state.get(Register::Rdx);
-        let source_address = state.get(Register::R8);
-        let mode = state.get(Register::R9) as u32;
-
-        self.d3d12_runtime.copy_raytracing_acceleration_structure(
-            command_list_id,
-            dest_address,
-            source_address,
-            mode,
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList4::CopyRaytracingAccelerationStructure",
-            BTreeMap::from([
-                ("dest".to_string(), json!(format!("{dest_address:#x}"))),
-                ("source".to_string(), json!(format!("{source_address:#x}"))),
-                ("mode".to_string(), json!(mode)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list4_set_pipeline_state1(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let state_object_ptr = state.get(Register::Rdx);
-
-        // Parse D3D12_STATE_OBJECT_DESC from guest memory to extract DXIL shader bytecode.
-        // The state object is a container with subobjects (shaders, hit groups, configs).
-        //
-        // D3D12_STATE_OBJECT_DESC layout (x64):
-        // +0:  Type (u32) — D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE = 4
-        // +4:  NumSubobjects (u32)
-        // +8:  pSubobjects (u64) — pointer to array of D3D12_STATE_SUBOBJECT
-        //
-        // D3D12_STATE_SUBOBJECT layout (x64):
-        // +0:  Type (u32)
-        // +4:  padding (4 bytes)
-        // +8:  pDesc (u64) — pointer to subobject-specific data
-
-        let dxil_bytecode = if state_object_ptr != 0 {
-            self.read_dxil_from_state_object(memory, state_object_ptr)
-        } else {
-            Vec::new()
-        };
-
-        self.d3d12_runtime
-            .set_pipeline_state1(command_list_id, state_object_ptr, dxil_bytecode)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList4::SetPipelineState1",
-            BTreeMap::from([(
-                "state_object".to_string(),
-                json!(format!("{state_object_ptr:#x}")),
-            )]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    /// Helper: read DXIL bytecode from a D3D12_STATE_OBJECT_DESC.
-    fn read_dxil_from_state_object(&self, memory: &MemoryImage, state_object_ptr: u64) -> Vec<u8> {
-        // D3D12_STATE_OBJECT_DESC
-        // +0: Type (u32)
-        // +4: NumSubobjects (u32)
-        // +8: pSubobjects (u64)
-        let _ty = match memory.read_u32(state_object_ptr) {
-            Ok(v) => v,
-            _ => return Vec::new(),
-        };
-        let num_subobjects = match memory.read_u32(state_object_ptr + 4) {
-            Ok(v) => v as u64,
-            _ => return Vec::new(),
-        };
-        let subobjects_ptr = match memory.read_u64(state_object_ptr + 8) {
-            Ok(v) => v,
-            _ => return Vec::new(),
-        };
-        if num_subobjects == 0 || subobjects_ptr == 0 {
-            return Vec::new();
-        }
-
-        // D3D12_STATE_SUBOBJECT is 16 bytes each on x64:
-        // +0: Type (u32)
-        // +4: padding (4 bytes)
-        // +8: pDesc (u64)
-        //
-        // We look for:
-        //  - D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY = 5
-        //  - D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP = 4
-        //  - D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG = 6
-        //  - D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG = 7
-
-        const SUBOBJECT_DXIL_LIBRARY: u32 = 5;
-        const SUBOBJECT_HIT_GROUP: u32 = 4;
-        const SUBOBJECT_SHADER_CONFIG: u32 = 6;
-        const SUBOBJECT_PIPELINE_CONFIG: u32 = 7;
-
-        for i in 0..num_subobjects {
-            let sub_obj_addr = subobjects_ptr + i * 16;
-            let sub_type = match memory.read_u32(sub_obj_addr) {
-                Ok(t) => t,
-                _ => continue,
-            };
-            let sub_desc_ptr = match memory.read_u64(sub_obj_addr + 8) {
-                Ok(p) => p,
-                _ => continue,
-            };
-            if sub_desc_ptr == 0 {
-                continue;
-            }
-
-            match sub_type {
-                SUBOBJECT_DXIL_LIBRARY => {
-                    // D3D12_DXIL_LIBRARY_DESC:
-                    // +0:  CreatorExport (D3D12_EXPORT_DESC) — we skip for now
-                    // +24: Bytecode (D3D12_SHADER_BYTECODE)
-                    //   D3D12_SHADER_BYTECODE:
-                    //   +0: pShaderBytecode (u64 pointer)
-                    //   +8: BytecodeLength (u64)
-                    let p_bytecode = match memory.read_u64(sub_desc_ptr + 24) {
-                        Ok(p) => p,
-                        _ => continue,
-                    };
-                    let bytecode_len = match memory.read_u64(sub_desc_ptr + 32) {
-                        Ok(len) => len as usize,
-                        _ => continue,
-                    };
-                    if p_bytecode != 0
-                        && bytecode_len > 0
-                        && bytecode_len <= 1024 * 1024
-                        && let Ok(bytes) = memory.read_bytes(p_bytecode, bytecode_len)
-                    {
-                        return bytes;
-                    }
-                }
-                SUBOBJECT_SHADER_CONFIG => {
-                    // D3D12_RAYTRACING_SHADER_CONFIG:
-                    // +0: MaxPayloadSizeInBytes (u32)
-                    // +4: MaxAttributeSizeInBytes (u32)
-                    // We don't store these separately yet
-                }
-                SUBOBJECT_PIPELINE_CONFIG => {
-                    // D3D12_RAYTRACING_PIPELINE_CONFIG:
-                    // +0: MaxTraceRecursionDepth (u32)
-                    // We don't store this separately yet
-                }
-                SUBOBJECT_HIT_GROUP => {
-                    // D3D12_HIT_GROUP_DESC:
-                    // +0: HitGroupExport (wchar_t*)
-                    // +8: AnyHitShaderImport (wchar_t*)
-                    // +16: ClosestHitShaderImport (wchar_t*)
-                    // +24: IntersectionShaderImport (wchar_t*)
-                    // +32: Type (u32)
-                    // We skip for now
-                }
-                _ => {}
-            }
-        }
-
-        Vec::new()
-    }
-
-    fn dispatch_d3d12_graphics_command_list4_dispatch_rays(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let desc_ptr = state.get(Register::Rdx);
-
-        let desc = if desc_ptr != 0 {
-            // D3D12_DISPATCH_RAYS_DESC layout (x64):
-            // +0:  RaygenShaderRecord.StartAddress (u64)
-            // +8:  RaygenShaderRecord.SizeInBytes (u64)
-            // +16: MissShaderTable.StartAddress (u64)
-            // +24: MissShaderTable.SizeInBytes (u64)
-            // +32: MissShaderTable.StrideInBytes (u64)
-            // +40: HitGroupTable.StartAddress (u64)
-            // +48: HitGroupTable.SizeInBytes (u64)
-            // +56: HitGroupTable.StrideInBytes (u64)
-            // +64: CallableShaderTable.StartAddress (u64)
-            // +72: CallableShaderTable.SizeInBytes (u64)
-            // +80: CallableShaderTable.StrideInBytes (u64)
-            // +88: Width (u32)
-            // +92: Height (u32)
-            // +96: Depth (u32)
-            // Total: 100 bytes
-            let raygen_start = read_guest_u64(memory, desc_ptr)?;
-            let raygen_size = read_guest_u64(memory, desc_ptr + 8)?;
-            let miss_start = read_guest_u64(memory, desc_ptr + 16)?;
-            let miss_size = read_guest_u64(memory, desc_ptr + 24)?;
-            let miss_stride = read_guest_u64(memory, desc_ptr + 32)?;
-            let hit_start = read_guest_u64(memory, desc_ptr + 40)?;
-            let hit_size = read_guest_u64(memory, desc_ptr + 48)?;
-            let hit_stride = read_guest_u64(memory, desc_ptr + 56)?;
-            let callable_start = read_guest_u64(memory, desc_ptr + 64)?;
-            let callable_size = read_guest_u64(memory, desc_ptr + 72)?;
-            let callable_stride = read_guest_u64(memory, desc_ptr + 80)?;
-            let width = read_guest_u32(memory, desc_ptr + 88)?;
-            let height = read_guest_u32(memory, desc_ptr + 92)?;
-            let depth = read_guest_u32(memory, desc_ptr + 96)?;
-
-            crate::d3d12::D3D12DispatchRaysDesc {
-                raygen_shader_start_address: raygen_start,
-                raygen_shader_size: raygen_size,
-                miss_shader_start_address: miss_start,
-                miss_shader_size: miss_size,
-                miss_shader_stride: miss_stride,
-                hit_group_start_address: hit_start,
-                hit_group_size: hit_size,
-                hit_group_stride: hit_stride,
-                callable_shader_start_address: callable_start,
-                callable_shader_size: callable_size,
-                callable_shader_stride: callable_stride,
-                width,
-                height,
-                depth,
-            }
-        } else {
-            crate::d3d12::D3D12DispatchRaysDesc {
-                raygen_shader_start_address: 0,
-                raygen_shader_size: 0,
-                miss_shader_start_address: 0,
-                miss_shader_size: 0,
-                miss_shader_stride: 0,
-                hit_group_start_address: 0,
-                hit_group_size: 0,
-                hit_group_stride: 0,
-                callable_shader_start_address: 0,
-                callable_shader_size: 0,
-                callable_shader_stride: 0,
-                width: 0,
-                height: 0,
-                depth: 0,
-            }
-        };
-
-        self.d3d12_runtime.dispatch_rays(command_list_id, &desc)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList4::DispatchRays",
-            BTreeMap::from([
-                (
-                    "raygen".to_string(),
-                    json!(format!("{:#x}", desc.raygen_shader_start_address)),
-                ),
-                (
-                    "miss".to_string(),
-                    json!(format!("{:#x}", desc.miss_shader_start_address)),
-                ),
-                (
-                    "hit".to_string(),
-                    json!(format!("{:#x}", desc.hit_group_start_address)),
-                ),
-                ("width".to_string(), json!(desc.width)),
-                ("height".to_string(), json!(desc.height)),
-                ("depth".to_string(), json!(desc.depth)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── ID3D12GraphicsCommandList5 dispatch methods ─────────────────
-
-    fn dispatch_d3d12_graphics_command_list5_rs_set_shading_rate(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let shading_rate = state.get(Register::Rdx) as u32;
-        self.d3d12_runtime
-            .rsset_shading_rate(command_list_id, shading_rate)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList5::RSSetShadingRate",
-            BTreeMap::from([("shading_rate".to_string(), json!(shading_rate))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list5_rs_set_shading_rate_image(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        self.d3d12_runtime
-            .rsset_shading_rate_image(command_list_id)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList5::RSSetShadingRateImage",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── ID3D12GraphicsCommandList6 dispatch methods ─────────────────
-
-    fn dispatch_d3d12_graphics_command_list6_dispatch_mesh(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let x = state.get(Register::Rdx) as u32;
-        let y = state.get(Register::R8) as u32;
-        let z = state.get(Register::R9) as u32;
-        self.d3d12_runtime.dispatch_mesh(command_list_id, x, y, z)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList6::DispatchMesh",
-            BTreeMap::from([
-                ("x".to_string(), json!(x)),
-                ("y".to_string(), json!(y)),
-                ("z".to_string(), json!(z)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── ID3D12GraphicsCommandList7 dispatch methods ─────────────────
-
-    fn dispatch_d3d12_graphics_command_list7_barrier(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let barrier_count = state.get(Register::Rdx) as u32;
-        let barrier_group_ptr = state.get(Register::R8);
-        if barrier_count != 0 && barrier_group_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Process enhanced barriers: for now, read first barrier and translate to transition
-        for i in 0..barrier_count as usize {
-            let group_addr = barrier_group_ptr + i as u64 * 32; // D3D12_BARRIER_GROUP size estimate
-            let _type_flags = read_guest_u32(memory, group_addr)?;
-            let resource_ptr = read_guest_u64(memory, group_addr + 8)?;
-            let resource = self.d3d12_resource(resource_ptr)?;
-            let _subresource = read_guest_u32(memory, group_addr + 16)?;
-            let _state_before = read_guest_u32(memory, group_addr + 20)?;
-            let _state_after = read_guest_u32(memory, group_addr + 24)?;
-            self.d3d12_runtime.barrier(
-                command_list_id,
-                resource.resource_id,
-                0, // subresource
-                ResourceState::Common,
-                ResourceState::Common,
-            )?;
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList7::Barrier",
-            BTreeMap::from([("barrier_count".to_string(), json!(barrier_count))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── ID3D12GraphicsCommandList8 dispatch methods ─────────────────
-
-    fn dispatch_d3d12_graphics_command_list8_om_set_front_and_back_stencil_ref(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let front_ref = state.get(Register::Rdx) as u32;
-        let back_ref = state.get(Register::R8) as u32;
-        self.d3d12_runtime.omset_front_and_back_stencil_ref(
-            command_list_id,
-            front_ref,
-            back_ref,
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef",
-            BTreeMap::from([
-                ("front_ref".to_string(), json!(front_ref)),
-                ("back_ref".to_string(), json!(back_ref)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── ID3D12GraphicsCommandList9 dispatch methods ─────────────────
-
-    fn dispatch_d3d12_graphics_command_list9_rs_set_depth_bias(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let depth_bias = state.get(Register::Rdx) as i32;
-        let depth_bias_clamp = f32::from_bits(state.get(Register::R8) as u32);
-        let slope_scaled_depth_bias = f32::from_bits(state.get(Register::R9) as u32);
-        self.d3d12_runtime.rsset_depth_bias(
-            command_list_id,
-            depth_bias,
-            depth_bias_clamp,
-            slope_scaled_depth_bias,
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList9::RSSetDepthBias",
-            BTreeMap::from([
-                ("depth_bias".to_string(), json!(depth_bias)),
-                ("depth_bias_clamp".to_string(), json!(depth_bias_clamp)),
-                (
-                    "slope_scaled_depth_bias".to_string(),
-                    json!(slope_scaled_depth_bias),
-                ),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list9_ia_set_index_buffer_strip_cut_value(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let cut_value = state.get(Register::Rdx) as u32;
-        self.d3d12_runtime
-            .iaset_index_buffer_strip_cut_value(command_list_id, cut_value)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList9::IASetIndexBufferStripCutValue",
-            BTreeMap::from([("cut_value".to_string(), json!(cut_value))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── D3D12 Device gap-fill dispatch handlers (Phase 3.2) ──────────
-
-    fn dispatch_d3d12_create_graphics_pipeline_state(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateGraphicsPipelineState on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R9);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Use a default root signature — fallback PSO for simple rendering
-        let root_sig = self
-            .d3d12_runtime
-            .create_root_signature(crate::gfx::RootSignatureDesc::default());
-        let pso_desc = crate::gfx::PipelineStateDesc {
-            label: "guest-GraphicsPipelineState".to_string(),
-            compute: false,
-            render_target_formats: vec![],
-            depth_format: None,
-        };
-        let pso_id = self.d3d12_runtime.create_pipeline_state(root_sig, pso_desc);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateGraphicsPipelineState",
-            BTreeMap::from([("pso_id".to_string(), json!(pso_id))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_root_signature(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateRootSignature on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R9);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let root_sig = self
-            .d3d12_runtime
-            .create_root_signature(crate::gfx::RootSignatureDesc::default());
-        write_u64(memory, out_ptr, root_sig);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateRootSignature",
-            BTreeMap::from([("root_sig".to_string(), json!(root_sig))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_get_node_count(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        // D3D12 spec: for single-adapter systems, node count is 1
-        state.set(Register::Rax, 1);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::GetNodeCount",
-            BTreeMap::new(),
-            json!(1),
-        );
-        Ok(())
-    }
-
-    // ── D3D12 additional device slot handlers (Phase 3.2) ────────────
-
-    fn dispatch_d3d12_create_compute_pipeline_state(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateComputePipelineState on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R9);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Use a default root signature and PSO desc for compute
-        let root_sig = self
-            .d3d12_runtime
-            .create_root_signature(crate::gfx::RootSignatureDesc::default());
-        let pso_desc = crate::gfx::PipelineStateDesc {
-            label: "guest-ComputePipelineState".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        };
-        let pso_id = self.d3d12_runtime.create_pipeline_state(root_sig, pso_desc);
-        write_u64(memory, out_ptr, pso_id);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateComputePipelineState",
-            BTreeMap::from([("pso_id".to_string(), json!(pso_id))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_command_signature(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateCommandSignature on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R9);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Write a null pointer — command signature not used in Metal
-        write_u64(memory, out_ptr, 0);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateCommandSignature",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_pipeline_library(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        // Pipeline library is deprecated in modern D3D12 — just return S_OK
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreatePipelineLibrary",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_heap(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R9);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Heaps are virtualized in our Metal backend — return a sentinel
-        write_u64(memory, out_ptr, 1);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateHeap",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_placed_resource(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreatePlacedResource on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let desc_ptr = state.get(Register::R9);
-        let sp = state.get(Register::Rsp);
-        let out_ptr = memory.read_u64(sp + 0x20)?;
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Create a committed resource as a substitute for placed resource
-        let format_raw = memory.read_u32(desc_ptr)?;
-        let dimension = memory.read_u32(desc_ptr + 4)?;
-        let width = memory.read_u64(desc_ptr + 8)?;
-        let height = memory.read_u32(desc_ptr + 16)?;
-        // Guest-facing production path: never substitute an unsupported
-        // format — reject with an explicit error.
-        let format = crate::gfx::DxgiFormat::from_u32_checked(format_raw)?;
-        let resource_desc = crate::gfx::ResourceDesc {
-            name: format!("D3D12PlacedResource({dimension})"),
-            format,
-            heap: crate::gfx::HeapType::Default,
-            size: width as usize * height.max(1) as usize * 4,
-            subresources: 1,
-            initial_state: crate::gfx::ResourceState::Common,
-            usage_hint: crate::gfx::ResourceUsageHint::Texture {
-                sampled: false,
-                render_target: true,
-                depth_stencil: false,
-                cpu_write_frequent: false,
-            },
-        };
-        let resource_id = self
-            .d3d12_runtime
-            .create_committed_resource(resource_desc)?;
-        let resource_object =
-            self.alloc_d3d12_resource_object(memory, device_object, resource_id, format, false)?;
-        write_u64(memory, out_ptr, resource_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreatePlacedResource",
-            BTreeMap::from([("dimension".to_string(), json!(dimension))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_reserved_resource(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateReservedResource on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let desc_ptr = state.get(Register::R9);
-        let sp = state.get(Register::Rsp);
-        let out_ptr = memory.read_u64(sp + 0x20)?;
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let format_raw = memory.read_u32(desc_ptr)?;
-        let dimension = memory.read_u32(desc_ptr + 4)?;
-        let width = memory.read_u64(desc_ptr + 8)?;
-        let height = memory.read_u32(desc_ptr + 16)?;
-        // Guest-facing production path: never substitute an unsupported
-        // format — reject with an explicit error.
-        let format = crate::gfx::DxgiFormat::from_u32_checked(format_raw)?;
-        let resource_desc = crate::gfx::ResourceDesc {
-            name: format!("D3D12ReservedResource({dimension})"),
-            format,
-            heap: crate::gfx::HeapType::Default,
-            size: width as usize * height.max(1) as usize * 4,
-            subresources: 1,
-            initial_state: crate::gfx::ResourceState::Common,
-            usage_hint: crate::gfx::ResourceUsageHint::Texture {
-                sampled: false,
-                render_target: true,
-                depth_stencil: false,
-                cpu_write_frequent: false,
-            },
-        };
-        let resource_id = self
-            .d3d12_runtime
-            .create_committed_resource(resource_desc)?;
-        let resource_object =
-            self.alloc_d3d12_resource_object(memory, device_object, resource_id, format, false)?;
-        write_u64(memory, out_ptr, resource_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateReservedResource",
-            BTreeMap::from([("dimension".to_string(), json!(dimension))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_shared_handle(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        // Shared handles not supported on Metal — return S_OK with null handle
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateSharedHandle",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_open_shared_handle(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let out_ptr = state.get(Register::R8);
-        if out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        write_u64(memory, out_ptr, 0);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::OpenSharedHandle",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_open_shared_handle_by_name(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::OpenSharedHandleByName",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_make_resident(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        // No-op on Metal — resources are always resident
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::MakeResident",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_evict(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        // No-op on Metal — resources are always resident
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace("d3d12", "ID3D12Device::Evict", BTreeMap::new(), json!(0));
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_query_heap(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D12Device::CreateQueryHeap on non-device object {device_object:#x}"),
-            ));
-        }
-        let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R9);
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // D3D12_QUERY_HEAP_DESC: +0 Type (D3D12_QUERY_HEAP_TYPE, u32), +8 Count (u32)
-        let query_type_raw = memory.read_u32(desc_ptr)?;
-        let count = memory.read_u32(desc_ptr + 8)? as usize;
-        let ty = match query_type_raw {
-            0 => crate::gfx::QueryType::Occlusion,
-            1 => crate::gfx::QueryType::Timestamp,
-            2 => crate::gfx::QueryType::PipelineStatistics,
-            3 => crate::gfx::QueryType::SoStatistics,
-            4 => crate::gfx::QueryType::VideoDecodeStat,
-            5 => crate::gfx::QueryType::VideoProcessStat,
-            _ => crate::gfx::QueryType::Occlusion,
-        };
-        let heap_id = self.d3d12_runtime.create_query_heap(ty, count);
-        write_u64(memory, out_ptr, heap_id);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateQueryHeap",
-            BTreeMap::from([
-                ("type".to_string(), json!(query_type_raw)),
-                ("count".to_string(), json!(count)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_cached_pipeline_state(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        // Cached PSO not supported — just return S_OK
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateCachedPipelineState",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_committed_resource(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateCommittedResource on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let _heap_props_ptr = state.get(Register::Rdx);
-        let _heap_flags = state.get(Register::R8) as u32;
-        let desc_ptr = state.get(Register::R9);
-        let sp = state.get(Register::Rsp);
-        let _initial_state = memory.read_u32(sp + 0x20)?;
-        let _optimized_clear = memory.read_u64(sp + 0x28)?;
-        let out_ptr = memory.read_u64(sp + 0x30)?;
-        if desc_ptr == 0 || out_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Read D3D12_RESOURCE_DESC from guest memory
-        // D3D12_RESOURCE_DESC layout (48 bytes):
-        //   +0: DXGI_FORMAT (u32), +4: UINT Dimension (u32)
-        //   +8: UINT64 Width, +16: UINT Height (u32), +20: UINT16 DepthOrArraySize (u16)
-        //   +24: UINT16 MipLevels (u16), +28: DXGI_SAMPLE_DESC { UINT Count, UINT Quality } (8 bytes)
-        //   +36: D3D12_TEXTURE_LAYOUT (u32), +40: UINT Flags (u32)
-        let format_raw = memory.read_u32(desc_ptr)?;
-        let dimension = memory.read_u32(desc_ptr + 4)?;
-        let width = memory.read_u64(desc_ptr + 8)?;
-        let height = memory.read_u32(desc_ptr + 16)?;
-        let _depth_or_array = memory.read_u16(desc_ptr + 20)?;
-        let _mip_levels = memory.read_u16(desc_ptr + 24)?;
-        let _sample_count = memory.read_u32(desc_ptr + 28)?;
-        let _sample_quality = memory.read_u32(desc_ptr + 32)?;
-        let layout = memory.read_u32(desc_ptr + 36)?;
-        let flags = memory.read_u32(desc_ptr + 40)?;
-
-        // Guest-facing production path: never substitute an unsupported
-        // format — reject with an explicit error.
-        let format = crate::gfx::DxgiFormat::from_u32_checked(format_raw)?;
-        let resource_desc = crate::gfx::ResourceDesc {
-            name: format!("D3D12CommittedResource({dimension})"),
-            format,
-            heap: crate::gfx::HeapType::Default,
-            size: width as usize * height.max(1) as usize * 4,
-            subresources: 1,
-            initial_state: crate::gfx::ResourceState::Common,
-            usage_hint: crate::gfx::ResourceUsageHint::Texture {
-                sampled: false,
-                render_target: true,
-                depth_stencil: false,
-                cpu_write_frequent: false,
-            },
-        };
-        let resource_id = self
-            .d3d12_runtime
-            .create_committed_resource(resource_desc)?;
-        let resource_object =
-            self.alloc_d3d12_resource_object(memory, device_object, resource_id, format, false)?;
-        write_u64(memory, out_ptr, resource_object);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateCommittedResource",
-            BTreeMap::from([
-                ("dimension".to_string(), json!(dimension)),
-                ("width".to_string(), json!(width)),
-                ("height".to_string(), json!(height)),
-                ("format".to_string(), json!(format_raw)),
-                ("layout".to_string(), json!(layout)),
-                ("flags".to_string(), json!(flags)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_sampler(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D12Device::CreateSampler on non-device object {device_object:#x}"),
-            ));
-        }
-        let _sampler_desc_ptr = state.get(Register::Rdx);
-        let descriptor_handle = state.get(Register::R8);
-        let (heap, index) = self
-            .decode_d3d12_cpu_descriptor_handle(descriptor_handle, DescriptorHeapType::Sampler)?;
-        if heap.device_object != device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        self.d3d12_runtime.write_descriptor(
-            heap.heap_id,
-            index,
-            crate::gfx::ViewDescriptor::Sampler {
-                filter: crate::gfx::FilterMode::Linear,
-            },
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateSampler",
-            BTreeMap::from([("descriptor_index".to_string(), json!(index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_copy_descriptors(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("ID3D12Device::CopyDescriptors on non-device object {device_object:#x}"),
-            ));
-        }
-        // ID3D12Device::CopyDescriptors parameters (x64 calling convention):
-        // RCX=this, RDX=NumDestRanges, R8=pDestRangeStarts, R9=NumSrcRanges
-        // [sp+0x20]=pDestRangeSizes, [sp+0x28]=pSrcRangeStarts,
-        // [sp+0x30]=pSrcRangeSizes, [sp+0x38]=DescriptorHeapsType
-        let num_dst = state.get(Register::Rdx) as usize;
-        let dst_ptrs = state.get(Register::R8);
-        let num_src = state.get(Register::R9) as usize;
-        let sp = state.get(Register::Rsp);
-        let _dst_range_sizes_ptr = memory.read_u64(sp + 0x20)?;
-        let src_ptrs = memory.read_u64(sp + 0x28)?;
-        let _src_range_sizes_ptr = memory.read_u64(sp + 0x30)?;
-        let heap_type_raw = memory.read_u32(sp + 0x38)?;
-        let heap_type = match heap_type_raw {
-            0 => DescriptorHeapType::CbvSrvUav,
-            1 => DescriptorHeapType::Sampler,
-            2 => DescriptorHeapType::Rtv,
-            3 => DescriptorHeapType::Dsv,
-            _ => DescriptorHeapType::CbvSrvUav,
-        };
-        if num_dst == 0 || num_src == 0 || dst_ptrs == 0 || src_ptrs == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        // Decode first destination descriptor handle
-        let dst_handle = memory.read_u64(dst_ptrs)?;
-        let (dst_heap, dst_index) =
-            self.decode_d3d12_cpu_descriptor_handle(dst_handle, heap_type)?;
-        // Decode first source descriptor handle
-        let src_handle = memory.read_u64(src_ptrs)?;
-        let (src_heap, src_index) =
-            self.decode_d3d12_cpu_descriptor_handle(src_handle, heap_type)?;
-        // Determine count from the first range's size, defaulting to 1 per range
-        let count = if _dst_range_sizes_ptr != 0 && num_dst > 0 {
-            memory.read_u32(_dst_range_sizes_ptr)? as usize
-        } else {
-            num_dst
-        };
-        self.d3d12_runtime.copy_descriptors(
-            src_heap.heap_id,
-            src_index,
-            dst_heap.heap_id,
-            dst_index,
-            count,
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CopyDescriptors",
-            BTreeMap::from([
-                ("num_dst".to_string(), json!(num_dst)),
-                ("num_src".to_string(), json!(num_src)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_copy_descriptors_simple(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CopyDescriptorsSimple on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        // ID3D12Device::CopyDescriptorsSimple parameters (x64 calling convention):
-        // RCX=this, RDX=NumDescriptors, R8=DestHandle, R9=SrcHandle
-        // [sp+0x20]=DescriptorHeapsType
-        let num = state.get(Register::Rdx) as usize;
-        let dst_ptr = state.get(Register::R8);
-        let src_ptr = state.get(Register::R9);
-        let sp = state.get(Register::Rsp);
-        let heap_type_raw = memory.read_u32(sp + 0x20)?;
-        let heap_type = match heap_type_raw {
-            0 => DescriptorHeapType::CbvSrvUav,
-            1 => DescriptorHeapType::Sampler,
-            2 => DescriptorHeapType::Rtv,
-            3 => DescriptorHeapType::Dsv,
-            _ => DescriptorHeapType::CbvSrvUav,
-        };
-        if num == 0 || dst_ptr == 0 || src_ptr == 0 {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let (dst_heap, dst_index) = self.decode_d3d12_cpu_descriptor_handle(dst_ptr, heap_type)?;
-        let (src_heap, src_index) = self.decode_d3d12_cpu_descriptor_handle(src_ptr, heap_type)?;
-        self.d3d12_runtime.copy_descriptors_simple(
-            src_heap.heap_id,
-            src_index,
-            dst_heap.heap_id,
-            dst_index,
-            num,
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CopyDescriptorsSimple",
-            BTreeMap::from([("num".to_string(), json!(num))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_get_descriptor_handle_increment_size(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let heap_type_raw = state.get(Register::Rdx) as u32;
-        let heap_type = match heap_type_raw {
-            0 => DescriptorHeapType::CbvSrvUav,
-            1 => DescriptorHeapType::Sampler,
-            2 => DescriptorHeapType::Rtv,
-            3 => DescriptorHeapType::Dsv,
-            _ => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let increment = self
-            .d3d12_runtime
-            .get_descriptor_handle_increment_size(heap_type);
-        state.set(Register::Rax, increment as u64);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::GetDescriptorHandleIncrementSize",
-            BTreeMap::from([("type".to_string(), json!(heap_type_raw))]),
-            json!(increment),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_constant_buffer_view(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateConstantBufferView on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let _cbv_desc_ptr = state.get(Register::Rdx);
-        let descriptor_handle = state.get(Register::R8);
-        let (heap, index) = self
-            .decode_d3d12_cpu_descriptor_handle(descriptor_handle, DescriptorHeapType::CbvSrvUav)?;
-        if heap.device_object != device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        self.d3d12_runtime.write_descriptor(
-            heap.heap_id,
-            index,
-            crate::gfx::ViewDescriptor::Cbv {
-                resource: 0u64,
-                size: 0,
-            },
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateConstantBufferView",
-            BTreeMap::from([("descriptor_index".to_string(), json!(index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_shader_resource_view(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateShaderResourceView on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let resource_object = state.get(Register::Rdx);
-        let descriptor_handle = state.get(Register::R9);
-        let resource = self.d3d12_resource(resource_object)?;
-        let (heap, index) = self
-            .decode_d3d12_cpu_descriptor_handle(descriptor_handle, DescriptorHeapType::CbvSrvUav)?;
-        if resource.device_object != device_object || heap.device_object != device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        self.d3d12_runtime.write_descriptor(
-            heap.heap_id,
-            index,
-            crate::gfx::ViewDescriptor::Srv {
-                resource: resource.resource_id,
-                format: resource.format,
-            },
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateShaderResourceView",
-            BTreeMap::from([("descriptor_index".to_string(), json!(index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_unordered_access_view(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateUnorderedAccessView on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let resource_object = state.get(Register::Rdx);
-        let descriptor_handle = state.get(Register::R9);
-        let sp = state.get(Register::Rsp);
-        let _counter_resource = memory.read_u64(sp + 0x20)?;
-        let resource = self.d3d12_resource(resource_object)?;
-        let (heap, index) = self
-            .decode_d3d12_cpu_descriptor_handle(descriptor_handle, DescriptorHeapType::CbvSrvUav)?;
-        if resource.device_object != device_object || heap.device_object != device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        self.d3d12_runtime.write_descriptor(
-            heap.heap_id,
-            index,
-            crate::gfx::ViewDescriptor::Uav {
-                resource: resource.resource_id,
-                format: resource.format,
-            },
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateUnorderedAccessView",
-            BTreeMap::from([("descriptor_index".to_string(), json!(index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_create_depth_stencil_view(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let device_object = state.get(Register::Rcx);
-        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!(
-                    "ID3D12Device::CreateDepthStencilView on non-device object {device_object:#x}"
-                ),
-            ));
-        }
-        let resource_object = state.get(Register::Rdx);
-        let descriptor_handle = state.get(Register::R9);
-        let resource = self.d3d12_resource(resource_object)?;
-        let (heap, index) =
-            self.decode_d3d12_cpu_descriptor_handle(descriptor_handle, DescriptorHeapType::Dsv)?;
-        if resource.device_object != device_object || heap.device_object != device_object {
-            state.set(Register::Rax, E_INVALIDARG);
-            self.last_error = 0;
-            return Ok(());
-        }
-        self.d3d12_runtime.write_descriptor(
-            heap.heap_id,
-            index,
-            crate::gfx::ViewDescriptor::Dsv {
-                resource: resource.resource_id,
-                format: resource.format,
-            },
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::CreateDepthStencilView",
-            BTreeMap::from([("descriptor_index".to_string(), json!(index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── D3D12 Command List gap-fill dispatch handlers (Phase 3.2) ────
-
-    fn dispatch_d3d12_graphics_command_list_clear_depth_stencil_view(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let descriptor_handle = state.get(Register::Rdx);
-        let _clear_flags = state.get(Register::R8) as u32;
-        let (heap, index) =
-            self.decode_d3d12_cpu_descriptor_handle(descriptor_handle, DescriptorHeapType::Dsv)?;
-        self.d3d12_runtime
-            .record_clear_dsv(command_list_id, heap.heap_id, index)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::ClearDepthStencilView",
-            BTreeMap::from([("descriptor_index".to_string(), json!(index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_dispatch(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let x = state.get(Register::Rdx) as u32;
-        let y = state.get(Register::R8) as u32;
-        let z = state.get(Register::R9) as u32;
-        self.d3d12_runtime
-            .record_dispatch(command_list_id, x, y, z)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::Dispatch",
-            BTreeMap::from([
-                ("x".to_string(), json!(x)),
-                ("y".to_string(), json!(y)),
-                ("z".to_string(), json!(z)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_ia_set_primitive_topology(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _topology = state.get(Register::Rdx) as u32;
-        // Topology is tracked by the Metal backend via draw calls
-        self.d3d12_runtime
-            .record_set_root_constants(command_list_id, vec![])?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::IASetPrimitiveTopology",
-            BTreeMap::from([("topology".to_string(), json!(_topology))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_rs_set_viewports(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _num_viewports = state.get(Register::Rdx) as u32;
-        let _viewports_ptr = state.get(Register::R8);
-        // Viewport state is read from the viewport array at draw time by the Metal backend
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::RSSetViewports",
-            BTreeMap::from([("count".to_string(), json!(_num_viewports))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_rs_set_scissor_rects(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _num_rects = state.get(Register::Rdx) as u32;
-        let _rects_ptr = state.get(Register::R8);
-        // Scissor rect state is tracked by the Metal backend
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::RSSetScissorRects",
-            BTreeMap::from([("count".to_string(), json!(_num_rects))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_set_pipeline_state(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_object = state.get(Register::Rcx);
-        let command_list = self.d3d12_command_list(command_list_object)?;
-        let _command_list_id = command_list.command_list_id.ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcD3dInvalidState,
-                format!("command list {command_list_object:#x} is closed"),
-            )
-        })?;
-        let _pso_object = state.get(Register::Rdx);
-        // PSO state is applied by the Metal backend at draw time from the guest pipeline state
-        // The current implementation uses a default/fallback PSO
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::SetPipelineState",
-            BTreeMap::from([("pso_object".to_string(), json!(_pso_object))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_set_graphics_root_signature(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _root_sig = state.get(Register::Rdx);
-        // Root signature applied at draw time by the Metal backend
-        self.d3d12_runtime
-            .record_set_root_constants(command_list_id, vec![])?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::SetGraphicsRootSignature",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_set_descriptor_heaps(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _num_heaps = state.get(Register::Rdx) as u32;
-        let _heaps_ptr = state.get(Register::R8);
-        // Descriptor heap tracking is handled by the Metal backend at draw time
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::SetDescriptorHeaps",
-            BTreeMap::from([("num_heaps".to_string(), json!(_num_heaps))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_set_graphics_root_descriptor_table(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _root_param_index = state.get(Register::Rdx) as u32;
-        let _base_descriptor = state.get(Register::R8);
-        self.d3d12_runtime
-            .record_set_root_constants(command_list_id, vec![])?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable",
-            BTreeMap::from([("root_param_index".to_string(), json!(_root_param_index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_set_graphics_root_constant_buffer_view(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _root_param_index = state.get(Register::Rdx) as u32;
-        let _buffer_location = state.get(Register::R8);
-        self.d3d12_runtime
-            .record_set_root_constants(command_list_id, vec![])?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView",
-            BTreeMap::from([("root_param_index".to_string(), json!(_root_param_index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_set_graphics_root_32_bit_constants(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let root_param_index = state.get(Register::Rdx) as u32;
-        let num_constants = state.get(Register::R8) as u32;
-        let constants_ptr = state.get(Register::R9);
-        if num_constants != 0 && constants_ptr != 0 {
-            let mut values = Vec::with_capacity(num_constants as usize);
-            for i in 0..num_constants as u64 {
-                values.push(memory.read_u32(constants_ptr + i * 4)?);
-            }
-            self.d3d12_runtime
-                .record_set_root_constants(command_list_id, values)?;
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstants",
-            BTreeMap::from([
-                ("root_param_index".to_string(), json!(root_param_index)),
-                ("num_constants".to_string(), json!(num_constants)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_ia_set_vertex_buffers(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _start_slot = state.get(Register::Rdx) as u32;
-        let num_views = state.get(Register::R8) as u32;
-        let views_ptr = state.get(Register::R9);
-        if num_views != 0 && views_ptr != 0 {
-            for i in 0..num_views as u64 {
-                let view_addr = views_ptr + i * 24;
-                let _buffer_object = memory.read_u64(view_addr)?;
-                let _byte_offset = memory.read_u64(view_addr + 8)?;
-                let _byte_stride = memory.read_u32(view_addr + 16)?;
-                let _size = memory.read_u32(view_addr + 20)?;
-            }
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::IASetVertexBuffers",
-            BTreeMap::from([
-                ("start_slot".to_string(), json!(_start_slot)),
-                ("num_views".to_string(), json!(num_views)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_ia_set_index_buffer(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let view_ptr = state.get(Register::Rdx);
-        if view_ptr != 0 {
-            let _buffer_object = memory.read_u64(view_ptr)?;
-            let _byte_offset = memory.read_u64(view_ptr + 8)?;
-            let _size = memory.read_u32(view_ptr + 16)?;
-            let _format = memory.read_u32(view_ptr + 20)?;
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::IASetIndexBuffer",
-            BTreeMap::from([("view_ptr".to_string(), json!(view_ptr))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_om_set_render_targets(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let num_rts = state.get(Register::Rdx) as u32;
-        let rts_ptr = state.get(Register::R8);
-        let _single_handle = state.get(Register::R9) as u32;
-        let sp = state.get(Register::Rsp);
-        let _ds_ptr = memory.read_u64(sp + 0x20)?;
-        if num_rts != 0 && rts_ptr != 0 {
-            // Read CPU descriptor handles for each render target
-            for i in 0..num_rts as u64 {
-                let _handle = memory.read_u64(rts_ptr + i * 8)?;
-            }
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::OMSetRenderTargets",
-            BTreeMap::from([("num_rts".to_string(), json!(num_rts))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_om_set_blend_factor(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _blend_factor_ptr = state.get(Register::Rdx);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::OMSetBlendFactor",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_om_set_stencil_ref(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _stencil_ref = state.get(Register::Rdx) as u32;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::OMSetStencilRef",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_set_predication(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _buffer_object = state.get(Register::Rdx);
-        let _buffer_offset = state.get(Register::R8);
-        let _predicate_value = state.get(Register::R9) as u32;
-        self.d3d12_runtime
-            .record_set_root_constants(command_list_id, vec![])?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::SetPredication",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_set_marker(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _metadata = state.get(Register::Rdx) as u32;
-        let _data_ptr = state.get(Register::R8);
-        let _data_size = state.get(Register::R9) as u32;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::SetMarker",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_begin_query(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _heap_object = state.get(Register::Rdx);
-        let _query_type = state.get(Register::R8) as u32;
-        let index = state.get(Register::R9) as u32;
-        // Use a temporary query heap from the runtime
-        let query_heap = self
-            .d3d12_runtime
-            .create_query_heap(crate::gfx::QueryType::Occlusion, 64);
-        self.d3d12_runtime
-            .record_begin_query(command_list_id, query_heap, index)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::BeginQuery",
-            BTreeMap::from([("index".to_string(), json!(index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_end_query(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _heap_object = state.get(Register::Rdx);
-        let _query_type = state.get(Register::R8) as u32;
-        let index = state.get(Register::R9) as u32;
-        let query_heap = self
-            .d3d12_runtime
-            .create_query_heap(crate::gfx::QueryType::Occlusion, 64);
-        self.d3d12_runtime
-            .record_end_query(command_list_id, query_heap, index)?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::EndQuery",
-            BTreeMap::from([("index".to_string(), json!(index))]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_resolve_query_data(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _heap_object = state.get(Register::Rdx);
-        let _start = state.get(Register::R8) as u32;
-        let _count = state.get(Register::R9) as u32;
-        let sp = state.get(Register::Rsp);
-        let _dst_resource = memory.read_u64(sp + 0x20)?;
-        let query_heap = self
-            .d3d12_runtime
-            .create_query_heap(crate::gfx::QueryType::Occlusion, 64);
-        self.d3d12_runtime.record_resolve_query_data(
-            command_list_id,
-            query_heap,
-            _start,
-            _count,
-            0u64,
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::ResolveQueryData",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_execute_indirect(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _sig_object = state.get(Register::Rdx);
-        let _max_count = state.get(Register::R8) as u32;
-        let _args_object = state.get(Register::R9);
-        let sp = state.get(Register::Rsp);
-        let _args_offset = memory.read_u64(sp + 0x20)?;
-        // ExecuteIndirect currently unsupported — stub
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::ExecuteIndirect",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_copy_resource(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let dst_object = state.get(Register::Rdx);
-        let src_object = state.get(Register::R8);
-        let dst = self.d3d12_resource(dst_object)?;
-        let src = self.d3d12_resource(src_object)?;
-        self.d3d12_runtime.record_copy_resource(
-            command_list_id,
-            src.resource_id,
-            dst.resource_id,
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::CopyResource",
-            BTreeMap::from([
-                ("dst".to_string(), json!(dst.resource_id)),
-                ("src".to_string(), json!(src.resource_id)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d12_graphics_command_list_copy_texture_region(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let dst_object = state.get(Register::Rdx);
-        let _dst_subresource = state.get(Register::R8) as u32;
-        let sp = state.get(Register::Rsp);
-        let dst_x = memory.read_u32(sp + 0x20)?;
-        let dst_y = memory.read_u32(sp + 0x24)?;
-        let dst_z = memory.read_u32(sp + 0x28)?;
-        let src_object = memory.read_u64(sp + 0x30)?;
-        let _src_subresource = memory.read_u32(sp + 0x38)?;
-        let src_box_ptr = memory.read_u64(sp + 0x40)?;
-        let dst = self.d3d12_resource(dst_object)?;
-        let src = self.d3d12_resource(src_object)?;
-        let (src_x, src_y, src_z, width, height, depth) = if src_box_ptr != 0 {
-            let sx = memory.read_u32(src_box_ptr)?;
-            let sy = memory.read_u32(src_box_ptr + 4)?;
-            let sz = memory.read_u32(src_box_ptr + 8)?;
-            let w = memory.read_u32(src_box_ptr + 12)?;
-            let h = memory.read_u32(src_box_ptr + 16)?;
-            let d = memory.read_u32(src_box_ptr + 20)?;
-            (sx, sy, sz, w, h, d)
-        } else {
-            (0, 0, 0, 0, 0, 1)
-        };
-        self.d3d12_runtime.record_copy_resource_region(
-            command_list_id,
-            dst.resource_id,
-            dst_x,
-            dst_y,
-            dst_z,
-            src.resource_id,
-            src_x,
-            src_y,
-            src_z,
-            width,
-            height,
-            depth,
-        )?;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12GraphicsCommandList::CopyTextureRegion",
-            BTreeMap::from([
-                ("dst".to_string(), json!(dst.resource_id)),
-                ("src".to_string(), json!(src.resource_id)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── D3D9 Device gap-fill dispatch handlers (Phase 3.3) ─────────────
-
-    fn dispatch_d3d9_device_create_render_target(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _width = state.get(Register::Rdx) as u32;
-        let _height = state.get(Register::R8) as u32;
-        let _format = state.get(Register::R9) as u32;
-        let sp = state.get(Register::Rsp);
-        let _multi_sample = memory.read_u32(sp + 0x20)?;
-        let _multi_quality = memory.read_u32(sp + 0x24)?;
-        let _lockable = memory.read_u32(sp + 0x28)?;
-        let surface_ptr = memory.read_u64(sp + 0x30)?;
-        let _shared_handle = memory.read_u64(sp + 0x38)?;
-        if surface_ptr != 0 {
-            // IDirect3DSurface9 vtable: 13 methods (IUnknown[3] + IDirect3DResource9[5] + IDirect3DSurface9[5])
-            let methods = vec![
-                HostThunk::D3d9StubReturnOk,      // 0: QueryInterface
-                HostThunk::GuestObjectAddRef,     // 1: AddRef
-                HostThunk::GuestObjectRelease,    // 2: Release
-                HostThunk::D3d9StubReturnOk,      // 3: GetDevice
-                HostThunk::D3d9SetPrivateData,    // 4: SetPrivateData
-                HostThunk::D3d9GetPrivateData,    // 5: GetPrivateData
-                HostThunk::D3d9FreePrivateData,   // 6: FreePrivateData
-                HostThunk::D3d9StubReturnOk,      // 7: GetContainer
-                HostThunk::D3d9SurfaceGetDesc,    // 8: GetDesc
-                HostThunk::D3d9SurfaceLockRect,   // 9: LockRect
-                HostThunk::D3d9SurfaceUnlockRect, // 10: UnlockRect
-                HostThunk::D3d9SurfaceGetDC,      // 11: GetDC
-                HostThunk::D3d9SurfaceReleaseDC,  // 12: ReleaseDC
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let surface_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D3d9Surface, vtable)?;
-            write_u64(memory, surface_ptr, surface_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::CreateRenderTarget",
-            BTreeMap::from([
-                ("width".to_string(), json!(_width)),
-                ("height".to_string(), json!(_height)),
-                ("format".to_string(), json!(_format)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_create_depth_stencil_surface(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _width = state.get(Register::Rdx) as u32;
-        let _height = state.get(Register::R8) as u32;
-        let _format = state.get(Register::R9) as u32;
-        let sp = state.get(Register::Rsp);
-        let _multi_sample = memory.read_u32(sp + 0x20)?;
-        let _multi_quality = memory.read_u32(sp + 0x24)?;
-        let _discard = memory.read_u32(sp + 0x28)?;
-        let surface_ptr = memory.read_u64(sp + 0x30)?;
-        let _shared_handle = memory.read_u64(sp + 0x38)?;
-        if surface_ptr != 0 {
-            // IDirect3DSurface9 vtable: 13 methods (IUnknown[3] + IDirect3DResource9[5] + IDirect3DSurface9[5])
-            let methods = vec![
-                HostThunk::D3d9StubReturnOk,      // 0: QueryInterface
-                HostThunk::GuestObjectAddRef,     // 1: AddRef
-                HostThunk::GuestObjectRelease,    // 2: Release
-                HostThunk::D3d9StubReturnOk,      // 3: GetDevice
-                HostThunk::D3d9SetPrivateData,    // 4: SetPrivateData
-                HostThunk::D3d9GetPrivateData,    // 5: GetPrivateData
-                HostThunk::D3d9FreePrivateData,   // 6: FreePrivateData
-                HostThunk::D3d9StubReturnOk,      // 7: GetContainer
-                HostThunk::D3d9SurfaceGetDesc,    // 8: GetDesc
-                HostThunk::D3d9SurfaceLockRect,   // 9: LockRect
-                HostThunk::D3d9SurfaceUnlockRect, // 10: UnlockRect
-                HostThunk::D3d9SurfaceGetDC,      // 11: GetDC
-                HostThunk::D3d9SurfaceReleaseDC,  // 12: ReleaseDC
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let surface_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D3d9Surface, vtable)?;
-            write_u64(memory, surface_ptr, surface_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::CreateDepthStencilSurface",
-            BTreeMap::from([
-                ("width".to_string(), json!(_width)),
-                ("height".to_string(), json!(_height)),
-                ("format".to_string(), json!(_format)),
-            ]),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_create_offscreen_plain_surface(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _width = state.get(Register::Rdx) as u32;
-        let _height = state.get(Register::R8) as u32;
-        let _format = state.get(Register::R9) as u32;
-        let sp = state.get(Register::Rsp);
-        let _pool = memory.read_u32(sp + 0x20)?;
-        let surface_ptr = memory.read_u64(sp + 0x28)?;
-        let _shared_handle = memory.read_u64(sp + 0x30)?;
-        if surface_ptr != 0 {
-            // IDirect3DSurface9 vtable: 13 methods (IUnknown[3] + IDirect3DResource9[5] + IDirect3DSurface9[5])
-            let methods = vec![
-                HostThunk::D3d9StubReturnOk,      // 0: QueryInterface
-                HostThunk::GuestObjectAddRef,     // 1: AddRef
-                HostThunk::GuestObjectRelease,    // 2: Release
-                HostThunk::D3d9StubReturnOk,      // 3: GetDevice
-                HostThunk::D3d9SetPrivateData,    // 4: SetPrivateData
-                HostThunk::D3d9GetPrivateData,    // 5: GetPrivateData
-                HostThunk::D3d9FreePrivateData,   // 6: FreePrivateData
-                HostThunk::D3d9StubReturnOk,      // 7: GetContainer
-                HostThunk::D3d9SurfaceGetDesc,    // 8: GetDesc
-                HostThunk::D3d9SurfaceLockRect,   // 9: LockRect
-                HostThunk::D3d9SurfaceUnlockRect, // 10: UnlockRect
-                HostThunk::D3d9SurfaceGetDC,      // 11: GetDC
-                HostThunk::D3d9SurfaceReleaseDC,  // 12: ReleaseDC
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let surface_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D3d9Surface, vtable)?;
-            write_u64(memory, surface_ptr, surface_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::CreateOffscreenPlainSurface",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_get_render_target_data(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _src = state.get(Register::Rdx);
-        let _dst = state.get(Register::R8);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::GetRenderTargetData",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_stretch_rect(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _src = state.get(Register::Rdx);
-        let _dst = state.get(Register::R8);
-        let _filter = state.get(Register::R9) as u32;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::StretchRect",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_get_front_buffer_data(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _index = state.get(Register::Rdx) as u32;
-        let _buffer = state.get(Register::R8);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::GetFrontBufferData",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_update_surface(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _src = state.get(Register::Rdx);
-        let _src_rect = state.get(Register::R8);
-        let _dst = state.get(Register::R9);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::UpdateSurface",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_color_fill(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _surface = state.get(Register::Rdx);
-        let _rect = state.get(Register::R8);
-        let _color = state.get(Register::R9) as u32;
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::ColorFill",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_create_vertex_declaration(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _decl_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R8);
-        if out_ptr != 0 {
-            // IDirect3DVertexDeclaration9 vtable (IUnknown[3] + IDirect3DResource9[5] + GetDeclaration)
-            let methods = vec![
-                HostThunk::D3d9StubReturnOk,    // 0: QueryInterface
-                HostThunk::GuestObjectAddRef,   // 1: AddRef
-                HostThunk::GuestObjectRelease,  // 2: Release
-                HostThunk::D3d9StubReturnOk,    // 3: GetDevice
-                HostThunk::D3d9SetPrivateData,  // 4: SetPrivateData
-                HostThunk::D3d9GetPrivateData,  // 5: GetPrivateData
-                HostThunk::D3d9FreePrivateData, // 6: FreePrivateData
-                HostThunk::D3d9StubReturnOk,    // 7: GetContainer
-                HostThunk::D3d9StubReturnOk,    // 8: GetDeclaration
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let decl_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D3d9VertexDeclaration, vtable)?;
-            write_u64(memory, out_ptr, decl_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::CreateVertexDeclaration",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_create_vertex_shader(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _func_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R8);
-        if out_ptr != 0 {
-            // IDirect3DVertexShader9 vtable (IUnknown[3] + IDirect3DResource9[5] + GetFunction)
-            let methods = vec![
-                HostThunk::D3d9StubReturnOk,    // 0: QueryInterface
-                HostThunk::GuestObjectAddRef,   // 1: AddRef
-                HostThunk::GuestObjectRelease,  // 2: Release
-                HostThunk::D3d9StubReturnOk,    // 3: GetDevice
-                HostThunk::D3d9SetPrivateData,  // 4: SetPrivateData
-                HostThunk::D3d9GetPrivateData,  // 5: GetPrivateData
-                HostThunk::D3d9FreePrivateData, // 6: FreePrivateData
-                HostThunk::D3d9StubReturnOk,    // 7: GetContainer
-                HostThunk::D3d9StubReturnOk,    // 8: GetFunction
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let shader_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D3d9VertexShader, vtable)?;
-            write_u64(memory, out_ptr, shader_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::CreateVertexShader",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_create_pixel_shader(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _func_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R8);
-        if out_ptr != 0 {
-            // IDirect3DPixelShader9 vtable (IUnknown[3] + IDirect3DResource9[5] + GetFunction)
-            let methods = vec![
-                HostThunk::D3d9StubReturnOk,    // 0: QueryInterface
-                HostThunk::GuestObjectAddRef,   // 1: AddRef
-                HostThunk::GuestObjectRelease,  // 2: Release
-                HostThunk::D3d9StubReturnOk,    // 3: GetDevice
-                HostThunk::D3d9SetPrivateData,  // 4: SetPrivateData
-                HostThunk::D3d9GetPrivateData,  // 5: GetPrivateData
-                HostThunk::D3d9FreePrivateData, // 6: FreePrivateData
-                HostThunk::D3d9StubReturnOk,    // 7: GetContainer
-                HostThunk::D3d9StubReturnOk,    // 8: GetFunction
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let shader_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D3d9PixelShader, vtable)?;
-            write_u64(memory, out_ptr, shader_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::CreatePixelShader",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_set_vertex_declaration(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _decl = state.get(Register::Rdx);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::SetVertexDeclaration",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d9_device_get_vertex_declaration(
-        &mut self,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        let _decl_out = state.get(Register::Rdx);
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d9",
-            "IDirect3DDevice9::GetVertexDeclaration",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── D3D11 Query dispatch handlers (Phase 3.5) ─────────────────────
-
-    fn dispatch_d3d11_asynchronous_get_data(
-        &mut self,
-        _memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _query_object = state.get(Register::Rcx);
-        let _data_ptr = state.get(Register::Rdx);
-        let _data_size = state.get(Register::R8) as u32;
-        let _flags = state.get(Register::R9) as u32;
-        // Return S_OK with no data — signals that the query data is not available yet
-        state.set(Register::Rax, 1); // S_FALSE = data not ready
-        self.last_error = 0;
-        self.push_trace(
-            "d3d11",
-            "ID3D11Asynchronous::GetData",
-            BTreeMap::new(),
-            json!(1),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_asynchronous_get_data_size(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _query_object = state.get(Register::Rcx);
-        // Return 0 as the data size (no data available)
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d11",
-            "ID3D11Asynchronous::GetDataSize",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d3d11_query_get_desc(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _query_object = state.get(Register::Rcx);
-        let desc_ptr = state.get(Register::Rdx);
-        if desc_ptr != 0 {
-            // Write a default D3D11_QUERY_DESC { Query = 0 (D3D11_QUERY_EVENT), MiscFlags = 0 }
-            memory.write_u32(desc_ptr, 0);
-            memory.write_u32(desc_ptr + 4, 0);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace("d3d11", "ID3D11Query::GetDesc", BTreeMap::new(), json!(0));
-        Ok(())
-    }
-
-    fn dispatch_d3d11_predicate_get_desc(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _predicate_object = state.get(Register::Rcx);
-        let desc_ptr = state.get(Register::Rdx);
-        if desc_ptr != 0 {
-            // Write a default D3D11_QUERY_DESC { Query = 0 (D3D11_QUERY_EVENT), MiscFlags = 0 }
-            memory.write_u32(desc_ptr, 0);
-            memory.write_u32(desc_ptr + 4, 0);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d11",
-            "ID3D11Predicate::GetDesc",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── D2D/DWrite dispatch handlers (Phase 3.6) ──────────────────────
-
-    fn dispatch_d2d1_factory_create_stroke_style(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _factory = state.get(Register::Rcx);
-        let _props_ptr = state.get(Register::Rdx);
-        let _dashes_ptr = state.get(Register::R8);
-        let _dashes_count = state.get(Register::R9) as u32;
-        let sp = state.get(Register::Rsp);
-        let style_ptr = memory.read_u64(sp + 0x20)?;
-        if style_ptr != 0 {
-            let methods = vec![
-                unsupported_method(&self.telemetry, "ID2D1StrokeStyle::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let style_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D2d1StrokeStyle, vtable)?;
-            write_u64(memory, style_ptr, style_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d2d1",
-            "ID2D1Factory::CreateStrokeStyle",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d2d1_factory_create_drawing_state_block(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _factory = state.get(Register::Rcx);
-        let _desc_ptr = state.get(Register::Rdx);
-        let _text_ptr = state.get(Register::R8);
-        let _state_block_ptr = state.get(Register::R9);
-        let block_ptr = state.get(Register::R9);
-        if block_ptr != 0 {
-            let methods = vec![
-                unsupported_method(&self.telemetry, "ID2D1DrawingStateBlock::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let block_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D2d1DrawingStateBlock, vtable)?;
-            write_u64(memory, block_ptr, block_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d2d1",
-            "ID2D1Factory::CreateDrawingStateBlock",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d2d1_hwnd_render_target_create_solid_color_brush(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _target = state.get(Register::Rcx);
-        let _color_ptr = state.get(Register::Rdx);
-        let _alpha = state.get(Register::R8) as u32;
-        let sp = state.get(Register::Rsp);
-        let brush_ptr = memory.read_u64(sp + 0x20)?;
-        if brush_ptr != 0 {
-            let methods = vec![
-                unsupported_method(&self.telemetry, "ID2D1SolidColorBrush::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                HostThunk::ID2D1SolidColorBrush_SetColor,
-                HostThunk::ID2D1SolidColorBrush_SetOpacity,
-                HostThunk::ID2D1SolidColorBrush_Release,
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let brush_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D2d1Brush, vtable)?;
-            write_u64(memory, brush_ptr, brush_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d2d1",
-            "ID2D1HwndRenderTarget::CreateSolidColorBrush",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d2d1_hwnd_render_target_create_linear_gradient_brush(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _target = state.get(Register::Rcx);
-        let _props_ptr = state.get(Register::Rdx);
-        let _colors_ptr = state.get(Register::R8);
-        let sp = state.get(Register::Rsp);
-        let brush_ptr = memory.read_u64(sp + 0x20)?;
-        if brush_ptr != 0 {
-            let methods = vec![
-                unsupported_method(&self.telemetry, "ID2D1LinearGradientBrush::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let brush_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D2d1Brush, vtable)?;
-            write_u64(memory, brush_ptr, brush_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d2d1",
-            "ID2D1HwndRenderTarget::CreateLinearGradientBrush",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d2d1_hwnd_render_target_create_radial_gradient_brush(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _target = state.get(Register::Rcx);
-        let _props_ptr = state.get(Register::Rdx);
-        let _colors_ptr = state.get(Register::R8);
-        let sp = state.get(Register::Rsp);
-        let brush_ptr = memory.read_u64(sp + 0x20)?;
-        if brush_ptr != 0 {
-            let methods = vec![
-                unsupported_method(&self.telemetry, "ID2D1RadialGradientBrush::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let brush_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D2d1Brush, vtable)?;
-            write_u64(memory, brush_ptr, brush_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d2d1",
-            "ID2D1HwndRenderTarget::CreateRadialGradientBrush",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d2d1_hwnd_render_target_create_bitmap(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _target = state.get(Register::Rcx);
-        let _size_ptr = state.get(Register::Rdx);
-        let _data_ptr = state.get(Register::R8);
-        let _pitch = state.get(Register::R9) as u32;
-        let sp = state.get(Register::Rsp);
-        let _props_ptr = memory.read_u64(sp + 0x20)?;
-        let bitmap_ptr = memory.read_u64(sp + 0x28)?;
-        if bitmap_ptr != 0 {
-            let methods = vec![
-                unsupported_method(&self.telemetry, "ID2D1Bitmap::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                HostThunk::ID2D1Bitmap_Release,
-                HostThunk::ID2D1Bitmap_GetSize,
-                HostThunk::ID2D1Bitmap_GetDpi,
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let bitmap_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D2d1Bitmap, vtable)?;
-            write_u64(memory, bitmap_ptr, bitmap_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d2d1",
-            "ID2D1HwndRenderTarget::CreateBitmap",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    fn dispatch_d2d1_hwnd_render_target_create_compatible_render_target(
-        &mut self,
-        memory: &mut MemoryImage,
-        state: &mut CpuState,
-    ) -> AppResult<()> {
-        let _target = state.get(Register::Rcx);
-        let _desired_size = state.get(Register::Rdx);
-        let _desired_pixel_size = state.get(Register::R8);
-        let _desired_format = state.get(Register::R9) as u32;
-        let sp = state.get(Register::Rsp);
-        let _compat_options = memory.read_u32(sp + 0x20)?;
-        let target_ptr = memory.read_u64(sp + 0x28)?;
-        if target_ptr != 0 {
-            let methods = vec![
-                unsupported_method(&self.telemetry, "ID2D1BitmapRenderTarget::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-            ];
-            let vtable = self.alloc_guest_vtable(memory, methods)?;
-            let target_object =
-                self.alloc_guest_object(memory, GuestObjectKind::D2d1RenderTarget, vtable)?;
-            write_u64(memory, target_ptr, target_object);
-        }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d2d1",
-            "ID2D1HwndRenderTarget::CreateCompatibleRenderTarget",
-            BTreeMap::new(),
-            json!(0),
-        );
-        Ok(())
-    }
-
-    // ── GDI+ drawing helpers ──────────────────────────────────────────
-
-    /// Resolve a graphics object's drawing environment: the raster target
-    /// (GDI+ bitmap, window surface, or memory-DC bitmap), the compositing /
-    /// smoothing modes, the world transform and the world-space clip rect.
-    fn gdiplus_graphics_info(&self, graphics: u64) -> Option<GdiplusGraphicsInfo> {
-        let gfx = match self.user32.gdiplus_state.get(graphics) {
-            Some(GdiplusObject::Graphics(g)) => g,
-            _ => return None,
-        };
-        let world = match gfx.world_transform {
-            Some(handle) => match self.user32.gdiplus_state.get(handle) {
-                Some(GdiplusObject::Matrix(m)) => m.elements,
-                _ => gdiplus_matrix_identity(),
-            },
-            None => gdiplus_matrix_identity(),
-        };
-        let target = if let Some(tb) = gfx.target_bitmap {
-            Some(GdiplusTargetKind::Bitmap(tb))
-        } else if gfx.hdc != 0 {
-            if let Some(hwnd) = self.device_contexts.get(&gfx.hdc).copied().flatten() {
-                Some(GdiplusTargetKind::Window(hwnd))
-            } else if self.dc_selected_objects.contains_key(&gfx.hdc) {
-                Some(GdiplusTargetKind::MemoryDc(gfx.hdc))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        Some(GdiplusGraphicsInfo {
-            target,
-            state: GdiplusRenderState {
-                cm: gfx.compositing_mode,
-                sm: gfx.smoothing_mode,
-                interp: gfx.interpolation_mode,
-                clip: gfx.clip_rect,
-                clip_region: gfx.clip_region.clone(),
-                world,
-            },
-        })
-    }
-
-    /// The world transform of a graphics object (identity when unset).
-    fn gdiplus_world_matrix(&self, graphics: u64) -> [f32; 6] {
-        match self.user32.gdiplus_state.get(graphics) {
-            Some(GdiplusObject::Graphics(gfx)) => match gfx.world_transform {
-                Some(handle) => match self.user32.gdiplus_state.get(handle) {
-                    Some(GdiplusObject::Matrix(m)) => m.elements,
-                    _ => gdiplus_matrix_identity(),
-                },
-                None => gdiplus_matrix_identity(),
-            },
-            _ => gdiplus_matrix_identity(),
-        }
-    }
-
-    /// The graphics object's current clip as a device-space scanned region:
-    /// the rect clip (mapped through the world transform) intersected with any
-    /// scanned region.  `None` when the graphics handle is invalid.
-    fn gdiplus_effective_clip_region(&self, graphics: u64) -> Option<crate::user32::GdiplusRegion> {
-        let gfx = match self.user32.gdiplus_state.get(graphics) {
-            Some(GdiplusObject::Graphics(g)) => g,
-            _ => return None,
-        };
-        let world = self.gdiplus_world_matrix(graphics);
-        let rect_region = gfx.clip_rect.map(|(x, y, w, h)| {
-            if gdiplus_matrix_axis_aligned(&world) {
-                // An axis-aligned rect clip maps to an exact half-open rect.
-                let (bx, by, bw, bh) = gdiplus_matrix_rect_bounds(&world, x, y, w, h);
-                crate::user32::GdiplusRegion::from_rect(bx, by, bw, bh)
-            } else {
-                let corners = [
-                    gdiplus_matrix_apply(&world, x, y),
-                    gdiplus_matrix_apply(&world, x + w, y),
-                    gdiplus_matrix_apply(&world, x + w, y + h),
-                    gdiplus_matrix_apply(&world, x, y + h),
-                ];
-                let points: Vec<GdiplusPointF> = corners
-                    .iter()
-                    .map(|&(cx, cy)| GdiplusPointF { x: cx, y: cy })
-                    .collect();
-                crate::user32::GdiplusRegion::from_spans(
-                    crate::gdiplus_render::polygon_scanlines(&points),
-                    false,
-                )
-            }
-        });
-        let region = match (&gfx.clip_region, rect_region) {
-            (Some(region), Some(rect)) => region.intersect(&rect),
-            (Some(region), None) => (**region).clone(),
-            (None, Some(rect)) => rect,
-            (None, None) => crate::user32::GdiplusRegion::infinite(),
-        };
-        Some(region)
-    }
-
-    /// Resolve a pen into concrete drawing style, sampling brush-backed pens
-    /// at `(sample_x, sample_y)` (world coordinates).
-    fn gdiplus_pen_style(
-        &self,
-        pen_handle: u64,
-        sample_x: f32,
-        sample_y: f32,
-    ) -> Option<GdiplusStrokeStyle> {
-        let pen = match self.user32.gdiplus_state.get(pen_handle) {
-            Some(GdiplusObject::Pen(p)) => p,
-            _ => return None,
-        };
-        let color = match pen.brush_handle {
-            Some(brush_handle) => self.gdiplus_brush_color(brush_handle, sample_x, sample_y),
-            None => None,
-        }
-        .unwrap_or(pen.color);
-        Some(GdiplusStrokeStyle {
-            color,
-            width_px: gdiplus_unit_to_pixels(pen.width, pen.unit).max(0.0),
-            dash: pen.dash_style,
-            join: pen.line_join,
-            start_cap: pen.start_cap,
-            end_cap: pen.end_cap,
-            cm: 0,
-            sm: 0,
-        })
-    }
-
-    /// Resolve a brush's colour at a world-space point (solid brushes are
-    /// exact; linear-gradient and texture brushes are sampled at the point,
-    /// with texture data read from the brush's image).
-    fn gdiplus_brush_color(&self, brush_handle: u64, px: f32, py: f32) -> Option<u32> {
-        let tex_image_handle = match self.user32.gdiplus_state.get(brush_handle) {
-            Some(GdiplusObject::Brush(brush)) => match brush.as_ref() {
-                GdiplusBrush::Texture(tb) => Some(tb.image_handle),
-                _ => None,
-            },
-            _ => return None,
-        };
-        let tex_data: Option<(&[u8], u32, u32, i32)> = tex_image_handle.and_then(|image_handle| {
-            self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
-                if let GdiplusObject::Image(img) = obj {
-                    match img.as_ref() {
-                        GdiplusImage::Bitmap(bmp) => {
-                            Some((bmp.pixels.as_slice(), bmp.width, bmp.height, bmp.stride))
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-        });
-        self.user32.gdiplus_state.get(brush_handle).and_then(|obj| {
-            if let GdiplusObject::Brush(brush) = obj {
-                Some(crate::gdiplus_render::brush_color_at(
-                    brush, px, py, tex_data,
-                ))
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Run a raster operation against the pixels of a graphics object's
-    /// surface.  The closure receives the raw top-down ARGB pixel buffer and
-    /// its geometry; memory-DC targets are refreshed from guest memory before
-    /// the draw and mirrored back afterwards, and window surfaces are marked
-    /// as carrying real guest pixels and published to the live channel.
-    fn gdiplus_paint(
-        &mut self,
-        memory: &mut MemoryImage,
-        graphics: u64,
-        op: impl FnOnce(&mut [u8], u32, u32, i32),
-    ) -> GdiplusStatus {
-        let Some(info) = self.gdiplus_graphics_info(graphics) else {
-            return GdiplusStatus::InvalidParameter;
-        };
-        let Some(target) = info.target else {
-            return GdiplusStatus::InvalidParameter;
-        };
-        let clip_region = info.state.clip_region.clone();
-        match target {
-            GdiplusTargetKind::Bitmap(handle) => {
-                let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(handle)
-                else {
-                    return GdiplusStatus::InvalidParameter;
-                };
-                let GdiplusImage::Bitmap(bmp) = &mut **img else {
-                    return GdiplusStatus::InvalidParameter;
-                };
-                gdiplus_paint_with_region_clip(
-                    &mut bmp.pixels,
-                    bmp.width,
-                    bmp.height,
-                    bmp.stride,
-                    clip_region.as_deref(),
-                    op,
-                );
-            }
-            GdiplusTargetKind::Window(hwnd) => {
-                let preview = match self
-                    .user32
-                    .window_previews()
-                    .into_iter()
-                    .find(|window| window.hwnd == hwnd)
-                {
-                    Some(p) => p,
-                    None => return GdiplusStatus::InvalidParameter,
-                };
-                let w = (preview.width as usize).max(1);
-                let h = (preview.height as usize).max(1);
-                let surface = self
-                    .window_surfaces
-                    .entry(hwnd)
-                    .or_insert_with(|| WindowSurface {
-                        width: w,
-                        height: h,
-                        bytes: vec![0; w.saturating_mul(h).saturating_mul(4)],
-                        real_pixels: false,
-                    });
-                if surface.width != w || surface.height != h {
-                    surface.width = w;
-                    surface.height = h;
-                    surface.bytes = vec![0; w.saturating_mul(h).saturating_mul(4)];
-                    surface.real_pixels = false;
-                }
-                let stride = (surface.width * 4) as i32;
-                let width = surface.width as u32;
-                let height = surface.height as u32;
-                gdiplus_paint_with_region_clip(
-                    &mut surface.bytes,
-                    width,
-                    height,
-                    stride,
-                    clip_region.as_deref(),
-                    op,
-                );
-                surface.real_pixels = true;
-                self.publish_live_window_preview_if_needed();
-            }
-            GdiplusTargetKind::MemoryDc(hdc) => {
-                let object = match self.dc_selected_objects.get(&hdc).copied() {
-                    Some(o) => o,
-                    None => return GdiplusStatus::InvalidParameter,
-                };
-                let Some(bitmap) = self.gdi_bitmaps.get_mut(&object) else {
-                    return GdiplusStatus::InvalidParameter;
-                };
-                // Refresh the host mirror: the guest may have written the DIB
-                // pixels directly through the DIB section pointer.
-                if bitmap.guest_pixel_ptr != 0
-                    && !bitmap.bytes.is_empty()
-                    && let Ok(slice) = memory.read_bytes(bitmap.guest_pixel_ptr, bitmap.bytes.len())
-                    && slice.len() == bitmap.bytes.len()
-                {
-                    bitmap.bytes.copy_from_slice(&slice);
-                }
-                let w = bitmap.width as u32;
-                let h = bitmap.height as u32;
-                let mut scratch = gdiplus_bitmap_to_argb(bitmap).unwrap_or_default();
-                if scratch.len() >= w as usize * h as usize * 4 {
-                    gdiplus_paint_with_region_clip(
-                        &mut scratch,
-                        w,
-                        h,
-                        w as i32 * 4,
-                        clip_region.as_deref(),
-                        op,
-                    );
-                }
-                if let Some(native) = gdiplus_argb_to_bitmap(bitmap, &scratch) {
-                    bitmap.bytes = native;
-                }
-                // Mirror the result back into guest memory.
-                if bitmap.guest_pixel_ptr != 0 && !bitmap.bytes.is_empty() {
-                    for (i, &byte) in bitmap.bytes.iter().enumerate() {
-                        memory.write_u8(bitmap.guest_pixel_ptr + i as u64, byte);
-                    }
-                }
-            }
-        }
-        GdiplusStatus::Ok
-    }
-
-    /// Stroke a world-space polyline through the full pipeline: world
-    /// transform, dash pattern, device-space clipping and pen caps/joins.
-    /// Closed polylines join their last point back to the first.
-    fn gdiplus_paint_stroke(
-        &mut self,
-        memory: &mut MemoryImage,
-        graphics: u64,
-        style: &GdiplusStrokeStyle,
-        world_points: &[GdiplusPointF],
-        closed: bool,
-    ) -> GdiplusStatus {
-        if world_points.len() < 2 {
-            return GdiplusStatus::Ok;
-        }
-        let Some(info) = self.gdiplus_graphics_info(graphics) else {
-            return GdiplusStatus::InvalidParameter;
-        };
-        let scale = gdiplus_matrix_scale(&info.state.world);
-        let width_px = if scale > 0.0 && (scale - 1.0).abs() > 1e-4 {
-            style.width_px * scale
-        } else {
-            style.width_px
-        };
-        let mut style = *style;
-        style.width_px = width_px.max(0.01);
-        style.cm = info.state.cm;
-        style.sm = info.state.sm;
-        let world = &info.state.world;
-        let dev: Vec<GdiplusPointF> = world_points
-            .iter()
-            .map(|p| {
-                let (x, y) = gdiplus_matrix_apply(world, p.x, p.y);
-                GdiplusPointF { x, y }
-            })
-            .collect();
-        let clip_quad = gdiplus_device_clip_quad(world, info.state.clip);
-        if clip_quad.is_none() && style.dash == crate::user32::GDIPLUS_DASH_STYLE_SOLID {
-            // Draw the (possibly closed) polyline directly.
-            let mut chain = dev.clone();
-            if closed && chain.len() >= 2 {
-                let first = chain[0];
-                chain.push(first);
-            }
-            return self.gdiplus_paint(memory, graphics, |px, w, h, s| {
-                gdiplus_render_stroke_chain(px, w, h, s, &chain, &style, false, false);
-            });
-        }
-        // Dash first (device space), then clip each span.
-        let mut chains: Vec<Vec<GdiplusPointF>> =
-            if style.dash == crate::user32::GDIPLUS_DASH_STYLE_SOLID {
-                vec![dev.clone()]
-            } else {
-                gdiplus_dash_spans(&dev, closed, style.dash, style.width_px)
-            };
-        if chains.is_empty() {
-            return GdiplusStatus::Ok;
-        }
-        if let Some(clip) = &clip_quad {
-            chains = chains
-                .into_iter()
-                .flat_map(|span| {
-                    let mut clipped: Vec<Vec<GdiplusPointF>> = Vec::new();
-                    let mut run: Vec<GdiplusPointF> = Vec::new();
-                    for pair in span.windows(2) {
-                        if let Some(((ax, ay), (bx, by))) =
-                            gdiplus_clip_segment(pair[0].x, pair[0].y, pair[1].x, pair[1].y, clip)
-                        {
-                            if run.is_empty() {
-                                run.push(GdiplusPointF { x: ax, y: ay });
-                            }
-                            run.push(GdiplusPointF { x: bx, y: by });
-                        } else if !run.is_empty() {
-                            clipped.push(std::mem::take(&mut run));
-                        }
-                    }
-                    if !run.is_empty() {
-                        clipped.push(run);
-                    }
-                    clipped
-                })
-                .collect();
-        }
-        if chains.is_empty() {
-            return GdiplusStatus::Ok;
-        }
-        self.gdiplus_paint(memory, graphics, |px, w, h, s| {
-            for chain in &chains {
-                gdiplus_render_stroke_chain(
-                    px,
-                    w,
-                    h,
-                    s,
-                    chain,
-                    &style,
-                    true,
-                    style.dash != crate::user32::GDIPLUS_DASH_STYLE_SOLID,
-                );
-            }
-        })
-    }
-
-    /// Fill world-space polygons through the transform + clip pipeline.
-    /// Each polygon is treated as a closed figure.
-    fn gdiplus_paint_fill(
-        &mut self,
-        memory: &mut MemoryImage,
-        graphics: u64,
-        color: u32,
-        world_figures: &[Vec<GdiplusPointF>],
-    ) -> GdiplusStatus {
-        let Some(info) = self.gdiplus_graphics_info(graphics) else {
-            return GdiplusStatus::InvalidParameter;
-        };
-        let world = &info.state.world;
-        let clip_quad = gdiplus_device_clip_quad(world, info.state.clip);
-        let mut dev_figures: Vec<Vec<GdiplusPointF>> = Vec::new();
-        for figure in world_figures {
-            if figure.len() < 3 {
-                continue;
-            }
-            let mapped: Vec<GdiplusPointF> = figure
-                .iter()
-                .map(|p| {
-                    let (x, y) = gdiplus_matrix_apply(world, p.x, p.y);
-                    GdiplusPointF { x, y }
-                })
-                .collect();
-            if let Some(clip) = &clip_quad {
-                let clipped = gdiplus_clip_polygon(&mapped, clip);
-                if clipped.len() >= 3 {
-                    dev_figures.push(clipped);
-                }
-            } else {
-                dev_figures.push(mapped);
-            }
-        }
-        if dev_figures.is_empty() {
-            return GdiplusStatus::Ok;
-        }
-        self.gdiplus_paint(memory, graphics, |px, w, h, s| {
-            for figure in &dev_figures {
-                crate::gdiplus_render::fill_polygon(px, w, h, s, figure, color, info.state.cm);
-            }
-        })
-    }
-
-    /// Blit a source bitmap through the world transform with optional clip,
-    /// colour key and colour matrix.  Axis-aligned destinations are exact
-    /// (destination rect ∩ clip rect with a proportional source crop);
-    /// rotated destinations are genuinely unsupported by the software
-    /// rasterizer and report NotImplemented.
-    #[allow(clippy::too_many_arguments)]
-    fn gdiplus_blit_image(
-        &mut self,
-        memory: &mut MemoryImage,
-        graphics: u64,
-        info: &GdiplusGraphicsInfo,
-        src_pixels: Vec<u8>,
-        src_width: u32,
-        src_height: u32,
-        src_stride: i32,
-        src_x: f32,
-        src_y: f32,
-        src_w: f32,
-        src_h: f32,
-        dst_x: f32,
-        dst_y: f32,
-        dst_w: f32,
-        dst_h: f32,
-        color_key: Option<(u32, u32)>,
-        color_matrix: Option<[[f32; 5]; 5]>,
-    ) -> GdiplusStatus {
-        if dst_w <= 0.0 || dst_h <= 0.0 || src_w <= 0.0 || src_h <= 0.0 {
-            return GdiplusStatus::Ok;
-        }
-        let world = &info.state.world;
-        if !gdiplus_matrix_axis_aligned(world) {
-            return GdiplusStatus::NotImplemented;
-        }
-        let (ddx, ddy, ddw, ddh) = gdiplus_matrix_rect_bounds(world, dst_x, dst_y, dst_w, dst_h);
-        let mut vis = (ddx, ddy, ddw, ddh);
-        if let Some(clip) = info.state.clip {
-            let (cx, cy, cw, ch) =
-                gdiplus_matrix_rect_bounds(world, clip.0, clip.1, clip.2, clip.3);
-            let nx0 = vis.0.max(cx);
-            let ny0 = vis.1.max(cy);
-            let nx1 = (vis.0 + vis.2).min(cx + cw);
-            let ny1 = (vis.1 + vis.3).min(cy + ch);
-            vis = (nx0, ny0, (nx1 - nx0).max(0.0), (ny1 - ny0).max(0.0));
-        }
-        if vis.2 <= 0.0 || vis.3 <= 0.0 {
-            return GdiplusStatus::Ok;
-        }
-        // Crop the source to the visible destination region.
-        let crop_sx = src_x + (vis.0 - ddx) / ddw * src_w;
-        let crop_sy = src_y + (vis.1 - ddy) / ddh * src_h;
-        let crop_sw = src_w * vis.2 / ddw;
-        let crop_sh = src_h * vis.3 / ddh;
-        let bilinear = matches!(
-            info.state.interp,
-            2 | 3 | 4 | 6 | 7 // HighQuality/Bilinear/Bicubic/HighQualityBilinear/HighQualityBicubic
-        );
-        let cm = info.state.cm;
-        self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
-            crate::gdiplus_render::draw_image_ex(
-                px,
-                pw,
-                ph,
-                ps,
-                &src_pixels,
-                src_width,
-                src_height,
-                src_stride,
-                crop_sx,
-                crop_sy,
-                crop_sw,
-                crop_sh,
-                vis.0,
-                vis.1,
-                vis.2,
-                vis.3,
-                color_key,
-                color_matrix,
-                bilinear,
-                cm,
-            );
-        })
-    }
-
-    /// Decode a GpRegion reference.  Two representations exist:
-    ///
-    /// * a live region handle from the GDI+ object table (created by
-    ///   `GdipMeasureCharacterRanges` and the path-clip machinery), or
-    /// * the byte encoding `GdipGetClip` writes (u32 type: 0 = infinite,
-    ///   1 = rect followed by four i32 bounds).
-    ///
-    /// `Err` is an undecodable pointer/handle.
-    fn gdiplus_decode_region(
-        &self,
-        memory: &MemoryImage,
-        region: u64,
-    ) -> Result<GdiplusDecodedRegion, ()> {
-        if region == 0 {
-            return Err(());
-        }
-        // A live region handle resolves through the object table first; its
-        // exact rectangle is exposed when the spans form one, otherwise the
-        // scanned region is returned as-is.
-        if let Some(GdiplusObject::Region(scanned)) = self.user32.gdiplus_state.get(region) {
-            return Ok(match scanned.as_rect() {
-                Some(rect) => GdiplusDecodedRegion::Rect(rect),
-                None => GdiplusDecodedRegion::Scanned(Box::new((**scanned).clone())),
-            });
-        }
-        let Ok(region_type) = read_u32(memory, region) else {
-            return Err(());
-        };
-        match region_type {
-            0 => Ok(GdiplusDecodedRegion::Infinite), // RegionDataTypeInfinite
-            1 => {
-                let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
-                    read_u32(memory, region + 4),
-                    read_u32(memory, region + 8),
-                    read_u32(memory, region + 12),
-                    read_u32(memory, region + 16),
-                ) else {
-                    return Err(());
-                };
-                Ok(GdiplusDecodedRegion::Rect((
-                    x as i32 as f32,
-                    y as i32 as f32,
-                    w as i32 as f32,
-                    h as i32 as f32,
-                )))
-            }
-            _ => Err(()),
-        }
-    }
-
-    fn gdiplus_pixel_count(format: u32) -> Option<u32> {
-        match format {
-            crate::user32::GDIPLUS_PIXEL_FORMAT_24BPP_RGB => Some(24),
-            crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB
-            | crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_PARGB => Some(32),
-            _ => None,
-        }
-    }
-
     fn overlapped_event_handle(&self, memory: &MemoryImage, overlapped: u64) -> Option<u32> {
         if overlapped == 0 {
             return None;
@@ -78285,1588 +68011,6 @@ impl PeHostRuntime {
             format!("unknown module handle {module_handle:#x}"),
         ))
     }
-
-    // ── IAudioClient / IAudioRenderClient dispatch ──────────────────────────
-    //
-    // The methods below implement the real WASAPI method surface of an audio
-    // endpoint activated by `ActivateAudioInterfaceAsync`.  The per-endpoint
-    // state (parsed format, real buffer geometry, playback clock, service
-    // objects) lives in `crate::audio_activation`; these handlers marshal the
-    // guest arguments, touch guest memory, and route the ready-event signal
-    // through the runtime's real guest event machinery.
-
-    /// `IActivateAudioInterfaceAsyncOperation::QueryInterface(riid, ppv)`.
-    fn dispatch_audio_activation_operation_query_interface(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_POINTER,
-            activation_operation_supports_riid,
-        };
-        let object = guest_call_arg(state, memory, 0)?;
-        let riid_ptr = guest_call_arg(state, memory, 1)?;
-        let out = guest_call_arg(state, memory, 2)?;
-        if riid_ptr == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let riid = match memory.read_bytes(riid_ptr, 16) {
-            Ok(bytes) => <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0_u8; 16]),
-            Err(_) => {
-                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        if activation_operation_supports_riid(&riid) {
-            self.add_ref_guest_object(object)?;
-            if out != 0 {
-                write_guest_pointer(memory, out, object, self.guest_arch)?;
-            }
-            state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-        } else {
-            if out != 0 {
-                write_guest_pointer(memory, out, 0, self.guest_arch)?;
-            }
-            state.set(Register::Rax, u64::from(ACTIVATION_E_NOINTERFACE));
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IActivateAudioInterfaceAsyncOperation::GetActivateResult(activateResult,
-    /// activatedInterface)`.
-    fn dispatch_audio_activation_operation_get_activate_result(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_S_OK, AUDCLNT_E_POINTER, operation_get_activate_result,
-        };
-        let operation = guest_call_arg(state, memory, 0)?;
-        let result_out = guest_call_arg(state, memory, 1)?;
-        let interface_out = guest_call_arg(state, memory, 2)?;
-        if result_out == 0 || interface_out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        match operation_get_activate_result(self.guest_pid, operation) {
-            Ok((result_hr, interface_object)) => {
-                if interface_object != 0 {
-                    self.add_ref_guest_object(interface_object)?;
-                }
-                write_u32(memory, result_out, result_hr);
-                write_guest_pointer(memory, interface_out, interface_object, self.guest_arch)?;
-                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-            }
-            Err(hr) => state.set(Register::Rax, u64::from(hr)),
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient::QueryInterface(riid, ppv)`.
-    fn dispatch_audio_client_query_interface(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_POINTER, IID_IAUDIO_CLIENT,
-            IID_IAUDIO_CLIENT_2, IID_IAUDIO_CLIENT_3, IID_IUNKNOWN,
-        };
-        let object = guest_call_arg(state, memory, 0)?;
-        let riid_ptr = guest_call_arg(state, memory, 1)?;
-        let out = guest_call_arg(state, memory, 2)?;
-        if riid_ptr == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let riid = match memory.read_bytes(riid_ptr, 16) {
-            Ok(bytes) => <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0_u8; 16]),
-            Err(_) => {
-                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let supported = riid == IID_IUNKNOWN
-            || riid == IID_IAUDIO_CLIENT
-            || riid == IID_IAUDIO_CLIENT_2
-            || riid == IID_IAUDIO_CLIENT_3;
-        if supported {
-            self.add_ref_guest_object(object)?;
-            if out != 0 {
-                write_guest_pointer(memory, out, object, self.guest_arch)?;
-            }
-            state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-        } else {
-            if out != 0 {
-                write_guest_pointer(memory, out, 0, self.guest_arch)?;
-            }
-            state.set(Register::Rax, u64::from(ACTIVATION_E_NOINTERFACE));
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// Read a guest `WAVEFORMATEX`/`WAVEFORMATEXTENSIBLE` pointer and parse
-    /// it for real (extending to the 40-byte form when the tag says so).
-    fn read_guest_wave_format(
-        &self,
-        memory: &MemoryImage,
-        format_ptr: u64,
-    ) -> Result<crate::audio_activation::AudioClientFormat, u32> {
-        use crate::audio_activation::{
-            AUDCLNT_E_POINTER, WAVE_FORMAT_EXTENSIBLE, parse_wave_format,
-        };
-        if format_ptr == 0 {
-            return Err(AUDCLNT_E_POINTER);
-        }
-        let mut bytes = memory
-            .read_bytes(format_ptr, 18)
-            .map_err(|_| AUDCLNT_E_POINTER)?;
-        if bytes.len() >= 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == WAVE_FORMAT_EXTENSIBLE {
-            // Fall back to the short read when the guest only mapped the
-            // base structure; the parser then rejects it for real.
-            if let Ok(extended) = memory.read_bytes(format_ptr, 40) {
-                bytes = extended;
-            }
-        }
-        parse_wave_format(&bytes)
-    }
-
-    /// Allocate the real guest render buffer for an initialization plan and
-    /// commit the successful `Initialize`.
-    fn commit_audio_client_initialize(
-        &mut self,
-        memory: &mut MemoryImage,
-        object: u64,
-        plan: &crate::audio_activation::AudioInitializePlan,
-        format: &crate::audio_activation::AudioClientFormat,
-    ) -> AppResult<u32> {
-        let buffer_bytes = (plan.buffer_frames as u64)
-            .saturating_mul(plan.block_align as u64)
-            .max(1);
-        let buffer_address = self.alloc_zeroed(memory, buffer_bytes as usize, 16)?;
-        Ok(crate::audio_activation::commit_initialize(
-            self.guest_pid,
-            object,
-            plan,
-            format,
-            buffer_address,
-            buffer_bytes,
-        ))
-    }
-
-    /// `IAudioClient::Initialize(share_mode, stream_flags, buffer_duration,
-    /// periodicity, format, session_guid)`.
-    fn dispatch_audio_client_initialize(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{AUDCLNT_E_POINTER, plan_initialize};
-        let object = guest_call_arg(state, memory, 0)?;
-        let share_mode = guest_call_arg_u32(state, memory, 1)?;
-        let stream_flags = guest_call_arg_u32(state, memory, 2)?;
-        let duration_hns = guest_call_arg(state, memory, 3)? as i64;
-        let periodicity_hns = guest_call_arg(state, memory, 4)? as i64;
-        let format_ptr = guest_call_arg(state, memory, 5)?;
-        let _session_guid = guest_call_arg(state, memory, 6)?;
-        let fail = |state: &mut CpuState, hr: u32| {
-            state.set(Register::Rax, u64::from(hr));
-        };
-        if format_ptr == 0 {
-            fail(state, AUDCLNT_E_POINTER);
-            self.last_error = 0;
-            return Ok(());
-        }
-        let format = match self.read_guest_wave_format(memory, format_ptr) {
-            Ok(format) => format,
-            Err(hr) => {
-                fail(state, hr);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let plan = match plan_initialize(
-            self.guest_pid,
-            object,
-            share_mode,
-            stream_flags,
-            duration_hns,
-            periodicity_hns,
-            &format,
-        ) {
-            Ok(plan) => plan,
-            Err(hr) => {
-                fail(state, hr);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let hr = self.commit_audio_client_initialize(memory, object, &plan, &format)?;
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        self.push_trace(
-            "audio",
-            "IAudioClient::Initialize",
-            BTreeMap::from([
-                ("share_mode".to_string(), json!(share_mode)),
-                ("stream_flags".to_string(), json!(stream_flags)),
-                ("buffer_frames".to_string(), json!(plan.buffer_frames)),
-                ("channels".to_string(), json!(format.channels)),
-                ("sample_rate".to_string(), json!(format.sample_rate)),
-                ("bits_per_sample".to_string(), json!(format.bits_per_sample)),
-            ]),
-            json!(hr),
-        );
-        Ok(())
-    }
-
-    /// `IAudioClient::GetBufferSize(pNumBufferFrames)`.
-    fn dispatch_audio_client_get_buffer_size(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_buffer_size};
-        let object = guest_call_arg(state, memory, 0)?;
-        let out = guest_call_arg(state, memory, 1)?;
-        if out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-        } else {
-            match get_buffer_size(self.guest_pid, object) {
-                Ok(frames) => {
-                    write_u32(memory, out, frames);
-                    state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-                }
-                Err(hr) => state.set(Register::Rax, u64::from(hr)),
-            }
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient::GetStreamLatency(phnsLatency)`.
-    fn dispatch_audio_client_get_stream_latency(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_stream_latency};
-        let object = guest_call_arg(state, memory, 0)?;
-        let out = guest_call_arg(state, memory, 1)?;
-        if out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-        } else {
-            match get_stream_latency(self.guest_pid, object) {
-                Ok(latency_hns) => {
-                    write_u64(memory, out, latency_hns);
-                    state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-                }
-                Err(hr) => state.set(Register::Rax, u64::from(hr)),
-            }
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient::GetCurrentPadding(pNumPaddingFrames)`.
-    fn dispatch_audio_client_get_current_padding(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_current_padding};
-        let object = guest_call_arg(state, memory, 0)?;
-        let out = guest_call_arg(state, memory, 1)?;
-        if out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-        } else {
-            match get_current_padding(self.guest_pid, object) {
-                Ok(padding) => {
-                    write_u32(memory, out, padding);
-                    state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-                }
-                Err(hr) => state.set(Register::Rax, u64::from(hr)),
-            }
-        }
-        // The guest observed the buffer state; if the drain freed space the
-        // ready event is raised through the real event machinery.
-        self.signal_audio_ready_event(object);
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient::IsFormatSupported(share_mode, format, ppClosestMatch)`.
-    fn dispatch_audio_client_is_format_supported(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_POINTER, AUDCLNT_S_FALSE,
-            WAVE_FORMAT_EXTENSIBLE, audio_format_support, device_of, mix_format_for_device,
-            parse_wave_format, wave_format_bytes,
-        };
-        let object = guest_call_arg(state, memory, 0)?;
-        let share_mode = guest_call_arg_u32(state, memory, 1)?;
-        let format_ptr = guest_call_arg(state, memory, 2)?;
-        let closest_out = guest_call_arg(state, memory, 3)?;
-        if share_mode > crate::audio_activation::AUDCLNT_SHAREMODE_EXCLUSIVE {
-            state.set(
-                Register::Rax,
-                u64::from(crate::audio_activation::AUDCLNT_E_INVALIDARG),
-            );
-            self.last_error = 0;
-            return Ok(());
-        }
-        if format_ptr == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let mut bytes = match memory.read_bytes(format_ptr, 18) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        if bytes.len() >= 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == WAVE_FORMAT_EXTENSIBLE {
-            if let Ok(extended) = memory.read_bytes(format_ptr, 40) {
-                bytes = extended;
-            }
-        }
-        let format = match parse_wave_format(&bytes) {
-            Ok(format) => format,
-            Err(hr) => {
-                state.set(Register::Rax, u64::from(hr));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let Some(device) = device_of(self.guest_pid, object) else {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_DEVICE_INVALIDATED));
-            self.last_error = 0;
-            return Ok(());
-        };
-        let hr = audio_format_support(&device, &format, share_mode);
-        if closest_out != 0 {
-            if hr == AUDCLNT_S_FALSE {
-                // The engine would convert; the real closest match is the
-                // device's own mix format.
-                let mix = mix_format_for_device(&device);
-                let mix_bytes = wave_format_bytes(&mix);
-                let address = self.alloc_zeroed(memory, mix_bytes.len(), 16)?;
-                memory.map_bytes(address, &mix_bytes);
-                write_guest_pointer(memory, closest_out, address, self.guest_arch)?;
-            } else {
-                write_guest_pointer(memory, closest_out, 0, self.guest_arch)?;
-            }
-        }
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient::GetMixFormat(ppDeviceFormat)`.
-    fn dispatch_audio_client_get_mix_format(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_S_OK, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_POINTER, device_of,
-            mix_format_for_device, wave_format_bytes,
-        };
-        let object = guest_call_arg(state, memory, 0)?;
-        let out = guest_call_arg(state, memory, 1)?;
-        if out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let Some(device) = device_of(self.guest_pid, object) else {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_DEVICE_INVALIDATED));
-            self.last_error = 0;
-            return Ok(());
-        };
-        let format = mix_format_for_device(&device);
-        let bytes = wave_format_bytes(&format);
-        let address = self.alloc_zeroed(memory, bytes.len(), 16)?;
-        memory.map_bytes(address, &bytes);
-        write_guest_pointer(memory, out, address, self.guest_arch)?;
-        state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-        self.last_error = 0;
-        self.push_trace(
-            "audio",
-            "IAudioClient::GetMixFormat",
-            BTreeMap::from([
-                ("channels".to_string(), json!(format.channels)),
-                ("sample_rate".to_string(), json!(format.sample_rate)),
-            ]),
-            json!(ACTIVATION_S_OK),
-        );
-        Ok(())
-    }
-
-    /// `IAudioClient::GetDevicePeriod(phnsDefault, phnsMinimum)`.
-    fn dispatch_audio_client_get_device_period(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_device_period};
-        let object = guest_call_arg(state, memory, 0)?;
-        let default_out = guest_call_arg(state, memory, 1)?;
-        let minimum_out = guest_call_arg(state, memory, 2)?;
-        if default_out == 0 && minimum_out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-        } else {
-            match get_device_period(self.guest_pid, object) {
-                Ok((default_hns, minimum_hns)) => {
-                    if default_out != 0 {
-                        write_u64(memory, default_out, default_hns);
-                    }
-                    if minimum_out != 0 {
-                        write_u64(memory, minimum_out, minimum_hns);
-                    }
-                    state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-                }
-                Err(hr) => state.set(Register::Rax, u64::from(hr)),
-            }
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient::Start()`.
-    fn dispatch_audio_client_start(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let object = guest_call_arg(state, memory, 0)?;
-        let hr = crate::audio_activation::start(self.guest_pid, object);
-        self.signal_audio_ready_event(object);
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        self.push_trace("audio", "IAudioClient::Start", BTreeMap::new(), json!(hr));
-        Ok(())
-    }
-
-    /// `IAudioClient::Stop()`.
-    fn dispatch_audio_client_stop(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let object = guest_call_arg(state, memory, 0)?;
-        let hr = crate::audio_activation::stop(self.guest_pid, object);
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        self.push_trace("audio", "IAudioClient::Stop", BTreeMap::new(), json!(hr));
-        Ok(())
-    }
-
-    /// `IAudioClient::Reset()`.
-    fn dispatch_audio_client_reset(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let object = guest_call_arg(state, memory, 0)?;
-        let hr = crate::audio_activation::reset(self.guest_pid, object);
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        self.push_trace("audio", "IAudioClient::Reset", BTreeMap::new(), json!(hr));
-        Ok(())
-    }
-
-    /// `IAudioClient::SetEventHandle(eventHandle)`.
-    fn dispatch_audio_client_set_event_handle(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        let object = guest_call_arg(state, memory, 0)?;
-        let handle = guest_call_arg(state, memory, 1)?;
-        let hr = crate::audio_activation::set_event_handle(self.guest_pid, object, handle);
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        self.push_trace(
-            "audio",
-            "IAudioClient::SetEventHandle",
-            BTreeMap::from([("handle".to_string(), json!(format!("{handle:#x}")))]),
-            json!(hr),
-        );
-        Ok(())
-    }
-
-    /// `IAudioClient::GetService(riid, ppv)` — real service objects.
-    fn dispatch_audio_client_get_service(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_POINTER, IID_IUNKNOWN,
-        };
-        let object = guest_call_arg(state, memory, 0)?;
-        let riid_ptr = guest_call_arg(state, memory, 1)?;
-        let out = guest_call_arg(state, memory, 2)?;
-        if out == 0 || riid_ptr == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let riid = match memory.read_bytes(riid_ptr, 16) {
-            Ok(bytes) => <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0_u8; 16]),
-            Err(_) => {
-                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let hr = if riid == IID_IUNKNOWN {
-            self.add_ref_guest_object(object)?;
-            write_guest_pointer(memory, out, object, self.guest_arch)?;
-            ACTIVATION_S_OK
-        } else if let Some(kind) = crate::audio_activation::audio_service_kind_for_riid(&riid) {
-            let direction = crate::audio_activation::client_direction(self.guest_pid, object);
-            let Some(direction) = direction else {
-                write_guest_pointer(memory, out, 0, self.guest_arch)?;
-                state.set(
-                    Register::Rax,
-                    u64::from(crate::audio_activation::AUDCLNT_E_DEVICE_INVALIDATED),
-                );
-                self.last_error = 0;
-                return Ok(());
-            };
-            if !crate::audio_activation::service_supported_for_direction(direction, kind) {
-                write_guest_pointer(memory, out, 0, self.guest_arch)?;
-                state.set(
-                    Register::Rax,
-                    u64::from(crate::audio_activation::AUDCLNT_E_WRONG_ENDPOINT_TYPE),
-                );
-                self.last_error = 0;
-                return Ok(());
-            }
-            let cached = crate::audio_activation::service_for(self.guest_pid, object, kind)
-                .filter(|service| self.guest_objects.contains_key(service));
-            let service = match cached {
-                Some(service) => {
-                    self.add_ref_guest_object(service)?;
-                    service
-                }
-                None => {
-                    let vtable = self.alloc_guest_vtable(
-                        memory,
-                        crate::audio_activation::audio_service_methods(kind),
-                    )?;
-                    let service =
-                        self.alloc_guest_object(memory, GuestObjectKind::DirectSound8, vtable)?;
-                    crate::audio_activation::bind_service(self.guest_pid, object, service, kind);
-                    service
-                }
-            };
-            write_guest_pointer(memory, out, service, self.guest_arch)?;
-            ACTIVATION_S_OK
-        } else {
-            write_guest_pointer(memory, out, 0, self.guest_arch)?;
-            ACTIVATION_E_NOINTERFACE
-        };
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        let service_name = crate::audio_activation::audio_service_kind_for_riid(&riid)
-            .map(crate::audio_activation::audio_service_name);
-        self.push_trace(
-            "audio",
-            "IAudioClient::GetService",
-            BTreeMap::from([
-                (
-                    "riid".to_string(),
-                    json!(crate::audio_activation::activation_riid_name(&riid)),
-                ),
-                ("service".to_string(), json!(service_name)),
-            ]),
-            json!(hr),
-        );
-        Ok(())
-    }
-
-    /// `IAudioRenderClient::QueryInterface(riid, ppv)`.
-    fn dispatch_audio_render_client_query_interface(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_POINTER, IID_IAUDIO_RENDER_CLIENT,
-            IID_IUNKNOWN,
-        };
-        let object = guest_call_arg(state, memory, 0)?;
-        let riid_ptr = guest_call_arg(state, memory, 1)?;
-        let out = guest_call_arg(state, memory, 2)?;
-        if riid_ptr == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let riid = match memory.read_bytes(riid_ptr, 16) {
-            Ok(bytes) => <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0_u8; 16]),
-            Err(_) => {
-                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let hr = if riid == IID_IUNKNOWN || riid == IID_IAUDIO_RENDER_CLIENT {
-            self.add_ref_guest_object(object)?;
-            if out != 0 {
-                write_guest_pointer(memory, out, object, self.guest_arch)?;
-            }
-            ACTIVATION_S_OK
-        } else {
-            if out != 0 {
-                write_guest_pointer(memory, out, 0, self.guest_arch)?;
-            }
-            ACTIVATION_E_NOINTERFACE
-        };
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioRenderClient::GetBuffer(NumFramesRequested, ppData)`.
-    fn dispatch_audio_render_client_get_buffer(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, render_get_buffer};
-        let service = guest_call_arg(state, memory, 0)?;
-        let frames_requested = guest_call_arg_u32(state, memory, 1)?;
-        let out = guest_call_arg(state, memory, 2)?;
-        if out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        match render_get_buffer(self.guest_pid, service, frames_requested) {
-            Ok((address, _frames)) => {
-                write_guest_pointer(memory, out, address, self.guest_arch)?;
-                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-            }
-            Err(hr) => {
-                write_guest_pointer(memory, out, 0, self.guest_arch)?;
-                state.set(Register::Rax, u64::from(hr));
-            }
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioRenderClient::ReleaseBuffer(NumFramesWritten, dwFlags)`.
-    fn dispatch_audio_render_client_release_buffer(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_S_OK, push_real_render_samples, render_release_buffer,
-        };
-        let service = guest_call_arg(state, memory, 0)?;
-        let frames_written = guest_call_arg_u32(state, memory, 1)?;
-        let flags = guest_call_arg_u32(state, memory, 2)?;
-        match render_release_buffer(self.guest_pid, service, frames_written, flags) {
-            Ok(release) => {
-                let channels = release.channels.max(1) as usize;
-                let sample_count = release.frames as usize * channels;
-                let samples = if release.silent {
-                    vec![0.0f32; sample_count]
-                } else {
-                    let byte_len = release.frames as usize * release.block_align.max(1) as usize;
-                    match memory.read_bytes(release.buffer_address, byte_len) {
-                        Ok(bytes) => crate::real_audio::pcm_bytes_to_float(
-                            &bytes,
-                            release.wave_format_tag,
-                            release.bits_per_sample,
-                            release.channels,
-                        ),
-                        Err(_) => Vec::new(),
-                    }
-                };
-                if !samples.is_empty() {
-                    if let Some(device_id) = release.real_device_id {
-                        push_real_render_samples(
-                            device_id,
-                            &samples,
-                            release.channels,
-                            release.sample_rate,
-                        );
-                    }
-                    // The client-side render queue feeds loopback capture even
-                    // when the host output stream could not be opened.
-                    if let Some(device) =
-                        crate::audio_activation::device_of(self.guest_pid, release.endpoint)
-                    {
-                        crate::audio_activation::push_loopback_render_samples(
-                            self.guest_pid,
-                            &device.key,
-                            &samples,
-                            release.channels,
-                            release.sample_rate,
-                        );
-                    }
-                }
-                self.signal_audio_ready_event(release.endpoint);
-                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-            }
-            Err(hr) => state.set(Register::Rax, u64::from(hr)),
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// Dispatch the service interfaces returned by
-    /// `IAudioClient::GetService` / activation — IAudioClock,
-    /// ISimpleAudioVolume, IAudioStreamVolume, IAudioSessionControl(2) and
-    /// IAudioCaptureClient.  All state is real and lives in
-    /// `crate::audio_activation`; this layer only reads guest arguments,
-    /// calls the state operation and writes real results back.
-    fn dispatch_audio_service_method(
-        &mut self,
-        thunk: &HostThunk,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_INVALIDARG, AUDCLNT_E_POINTER,
-            AUDCLNT_S_FALSE, AUDCLNT_S_OK, audio_service_supports_riid, capture_get_buffer,
-            capture_next_packet_size, capture_release_buffer, clock_frequency, clock_position,
-            clock_state, get_all_volumes, get_channel_volume, get_display_name, get_grouping_param,
-            get_icon_path, get_master_volume, get_mute, is_system_sounds_session,
-            register_session_notification, service_kind, session_identifier,
-            session_instance_identifier, session_process_id, session_state, set_all_volumes,
-            set_channel_volume, set_display_name, set_ducking_preference, set_grouping_param,
-            set_icon_path, set_master_volume, set_mute, stream_volume_channel_count,
-            unregister_session_notification,
-        };
-        let pid = self.guest_pid;
-        let this = guest_call_arg(state, memory, 0)?;
-        let hr: u32 = match thunk {
-            HostThunk::AudioServiceQueryInterface => {
-                let riid_ptr = guest_call_arg(state, memory, 1)?;
-                let out = guest_call_arg(state, memory, 2)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    let riid: Option<[u8; 16]> = memory
-                        .read_bytes(riid_ptr, 16)
-                        .ok()
-                        .and_then(|bytes| bytes.try_into().ok());
-                    match (riid, service_kind(pid, this)) {
-                        (Some(riid), Some(kind)) if audio_service_supports_riid(kind, &riid) => {
-                            let _ = write_guest_pointer(memory, out, this, self.guest_arch);
-                            AUDCLNT_S_OK
-                        }
-                        _ => {
-                            let _ = write_guest_pointer(memory, out, 0, self.guest_arch);
-                            ACTIVATION_E_NOINTERFACE
-                        }
-                    }
-                }
-            }
-            HostThunk::AudioClockGetFrequency => {
-                let out = guest_call_arg(state, memory, 1)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match clock_frequency(pid, this) {
-                        Ok(frequency) => {
-                            write_u64(memory, out, frequency as u64);
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioClockGetPosition => {
-                let position_out = guest_call_arg(state, memory, 1)?;
-                let qpc_out = guest_call_arg(state, memory, 2)?;
-                if position_out == 0 || qpc_out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match clock_position(pid, this) {
-                        Ok((position, qpc)) => {
-                            write_u64(memory, position_out, position);
-                            write_u64(memory, qpc_out, qpc);
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioClockGetState => {
-                let out = guest_call_arg(state, memory, 1)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match clock_state(pid, this) {
-                        Ok(value) => {
-                            write_u32(memory, out, value);
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioSimpleVolumeSetMasterVolume => {
-                let level = f32::from_bits(guest_call_arg_u32(state, memory, 1)?);
-                let event_context = guest_call_arg(state, memory, 2)?;
-                set_master_volume(pid, this, level, event_context)
-            }
-            HostThunk::AudioSimpleVolumeGetMasterVolume => {
-                let out = guest_call_arg(state, memory, 1)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match get_master_volume(pid, this) {
-                        Ok(level) => {
-                            write_u32(memory, out, level.to_bits());
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioSimpleVolumeSetMute => {
-                let muted = guest_call_arg_u32(state, memory, 1)? != 0;
-                let event_context = guest_call_arg(state, memory, 2)?;
-                set_mute(pid, this, muted, event_context)
-            }
-            HostThunk::AudioSimpleVolumeGetMute => {
-                let out = guest_call_arg(state, memory, 1)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match get_mute(pid, this) {
-                        Ok(muted) => {
-                            write_u32(memory, out, u32::from(muted));
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioStreamVolumeGetChannelCount => {
-                let out = guest_call_arg(state, memory, 1)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match stream_volume_channel_count(pid, this) {
-                        Ok(count) => {
-                            write_u32(memory, out, count);
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioStreamVolumeSetChannelVolume => {
-                let index = guest_call_arg_u32(state, memory, 1)?;
-                let level = f32::from_bits(guest_call_arg_u32(state, memory, 2)?);
-                let event_context = guest_call_arg(state, memory, 3)?;
-                set_channel_volume(pid, this, index, level, event_context)
-            }
-            HostThunk::AudioStreamVolumeGetChannelVolume => {
-                let index = guest_call_arg_u32(state, memory, 1)?;
-                let out = guest_call_arg(state, memory, 2)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match get_channel_volume(pid, this, index) {
-                        Ok(level) => {
-                            write_u32(memory, out, level.to_bits());
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioStreamVolumeSetAllVolumes => {
-                let count = guest_call_arg_u32(state, memory, 1)?;
-                let volumes_ptr = guest_call_arg(state, memory, 2)?;
-                let event_context = guest_call_arg(state, memory, 3)?;
-                if volumes_ptr == 0 || count == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    let mut volumes = Vec::with_capacity(count as usize);
-                    let mut ok = true;
-                    for index in 0..count as u64 {
-                        match read_u32(memory, volumes_ptr + index * 4) {
-                            Ok(bits) => volumes.push(f32::from_bits(bits)),
-                            Err(_) => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    if ok {
-                        set_all_volumes(pid, this, volumes, event_context)
-                    } else {
-                        AUDCLNT_E_POINTER
-                    }
-                }
-            }
-            HostThunk::AudioStreamVolumeGetAllVolumes => {
-                let count = guest_call_arg_u32(state, memory, 1)?;
-                let out = guest_call_arg(state, memory, 2)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match get_all_volumes(pid, this) {
-                        Ok(volumes) => {
-                            if count < volumes.len() as u32 {
-                                AUDCLNT_E_INVALIDARG
-                            } else {
-                                for (index, level) in volumes.iter().enumerate() {
-                                    write_u32(memory, out + index as u64 * 4, level.to_bits());
-                                }
-                                ACTIVATION_S_OK
-                            }
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioSessionControlGetState => {
-                let out = guest_call_arg(state, memory, 1)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match session_state(pid, this) {
-                        Ok(value) => {
-                            write_u32(memory, out, value);
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioSessionControlSetDisplayName => {
-                let name_ptr = guest_call_arg(state, memory, 1)?;
-                let event_context = guest_call_arg(state, memory, 2)?;
-                let name = if name_ptr == 0 {
-                    None
-                } else {
-                    Some(read_utf16z(memory, name_ptr, 1024)?)
-                };
-                set_display_name(pid, this, name, event_context)
-            }
-            HostThunk::AudioSessionControlGetDisplayName => {
-                let out = guest_call_arg(state, memory, 1)?;
-                let capacity = guest_call_arg_u32(state, memory, 2)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match get_display_name(pid, this) {
-                        Ok(name) => {
-                            if write_utf16_buffer(memory, out, capacity as usize, &name) {
-                                ACTIVATION_S_OK
-                            } else {
-                                AUDCLNT_E_INVALIDARG
-                            }
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioSessionControlSetIconPath => {
-                let path_ptr = guest_call_arg(state, memory, 1)?;
-                let event_context = guest_call_arg(state, memory, 2)?;
-                let path = if path_ptr == 0 {
-                    None
-                } else {
-                    Some(read_utf16z(memory, path_ptr, 1024)?)
-                };
-                set_icon_path(pid, this, path, event_context)
-            }
-            HostThunk::AudioSessionControlGetIconPath => {
-                let out = guest_call_arg(state, memory, 1)?;
-                let capacity = guest_call_arg_u32(state, memory, 2)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match get_icon_path(pid, this) {
-                        Ok(path) => {
-                            let path = path.unwrap_or_default();
-                            if write_utf16_buffer(memory, out, capacity as usize, &path) {
-                                ACTIVATION_S_OK
-                            } else {
-                                AUDCLNT_E_INVALIDARG
-                            }
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioSessionControlSetGroupingParam => {
-                let override_ptr = guest_call_arg(state, memory, 1)?;
-                let event_context = guest_call_arg(state, memory, 2)?;
-                let param = if override_ptr == 0 {
-                    None
-                } else {
-                    memory
-                        .read_bytes(override_ptr, 16)
-                        .ok()
-                        .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
-                };
-                set_grouping_param(pid, this, param, event_context)
-            }
-            HostThunk::AudioSessionControlGetGroupingParam => {
-                let out = guest_call_arg(state, memory, 1)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match get_grouping_param(pid, this) {
-                        Ok(param) => {
-                            for (index, byte) in param.iter().enumerate() {
-                                write_u8(memory, out + index as u64, *byte);
-                            }
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioSessionControlRegisterNotification => {
-                let object = guest_call_arg(state, memory, 1)?;
-                register_session_notification(pid, this, object)
-            }
-            HostThunk::AudioSessionControlUnregisterNotification => {
-                let object = guest_call_arg(state, memory, 1)?;
-                unregister_session_notification(pid, this, object)
-            }
-            HostThunk::AudioSessionControl2GetProcessId => {
-                let out = guest_call_arg(state, memory, 1)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match session_process_id(pid, this) {
-                        Ok(process_id) => {
-                            write_u32(memory, out, process_id);
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioSessionControl2GetSessionIdentifier => {
-                let out = guest_call_arg(state, memory, 1)?;
-                let capacity = guest_call_arg_u32(state, memory, 2)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match session_identifier(pid, this) {
-                        Ok(identifier) => {
-                            if write_utf16_buffer(memory, out, capacity as usize, &identifier) {
-                                ACTIVATION_S_OK
-                            } else {
-                                AUDCLNT_E_INVALIDARG
-                            }
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioSessionControl2GetSessionInstanceIdentifier => {
-                let out = guest_call_arg(state, memory, 1)?;
-                let capacity = guest_call_arg_u32(state, memory, 2)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match session_instance_identifier(pid, this) {
-                        Ok(identifier) => {
-                            if write_utf16_buffer(memory, out, capacity as usize, &identifier) {
-                                ACTIVATION_S_OK
-                            } else {
-                                AUDCLNT_E_INVALIDARG
-                            }
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioSessionControl2IsSystemSoundsSession => {
-                match is_system_sounds_session(pid, this) {
-                    Ok(true) => AUDCLNT_S_OK,
-                    Ok(false) => AUDCLNT_S_FALSE,
-                    Err(hr) => hr,
-                }
-            }
-            HostThunk::AudioSessionControl2SetDuckingPreference => {
-                let opt_out = guest_call_arg_u32(state, memory, 1)? != 0;
-                set_ducking_preference(pid, this, opt_out)
-            }
-            HostThunk::AudioCaptureClientGetBuffer => {
-                let data_out = guest_call_arg(state, memory, 1)?;
-                let frames_out = guest_call_arg(state, memory, 2)?;
-                let flags_out = guest_call_arg(state, memory, 3)?;
-                let device_position_out = guest_call_arg(state, memory, 4)?;
-                let qpc_out = guest_call_arg(state, memory, 5)?;
-                if data_out == 0 || frames_out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match capture_get_buffer(pid, this) {
-                        Ok(packet) => {
-                            let buffer = packet.buffer_address;
-                            memory.map_bytes(buffer, &packet.sample_bytes());
-                            let _ = write_guest_pointer(memory, data_out, buffer, self.guest_arch);
-                            write_u32(memory, frames_out, packet.frames);
-                            if flags_out != 0 {
-                                write_u32(memory, flags_out, packet.flags);
-                            }
-                            if device_position_out != 0 {
-                                write_u64(memory, device_position_out, packet.device_position);
-                            }
-                            if qpc_out != 0 {
-                                write_u64(memory, qpc_out, packet.qpc_position);
-                            }
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            HostThunk::AudioCaptureClientReleaseBuffer => {
-                let frames = guest_call_arg_u32(state, memory, 1)?;
-                let flags = guest_call_arg_u32(state, memory, 2).unwrap_or(0);
-                match capture_release_buffer(pid, this, frames, flags) {
-                    Ok(_) => ACTIVATION_S_OK,
-                    Err(hr) => hr,
-                }
-            }
-            HostThunk::AudioCaptureClientGetNextPacketSize => {
-                let out = guest_call_arg(state, memory, 1)?;
-                if out == 0 {
-                    AUDCLNT_E_POINTER
-                } else {
-                    match capture_next_packet_size(pid, this) {
-                        Ok(frames) => {
-                            write_u32(memory, out, frames);
-                            ACTIVATION_S_OK
-                        }
-                        Err(hr) => hr,
-                    }
-                }
-            }
-            _ => AUDCLNT_E_INVALIDARG,
-        };
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient2::IsOffloadCapable(category, pbOffloadCapable)`.
-    fn dispatch_audio_client_is_offload_capable(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_S_OK, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_POINTER,
-        };
-        let object = guest_call_arg(state, memory, 0)?;
-        let _category = guest_call_arg_u32(state, memory, 1)?;
-        let out = guest_call_arg(state, memory, 2)?;
-        if out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-        } else if !crate::audio_activation::has_audio_client(self.guest_pid, object) {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_DEVICE_INVALIDATED));
-        } else {
-            // Honest host answer: TRUE only when a real offload engine is
-            // exposed by the backed host (never on the current hosts).
-            write_u32(
-                memory,
-                out,
-                u32::from(crate::audio_activation::host_offload_capability()),
-            );
-            state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient2::SetClientProperties(pProperties)`.
-    fn dispatch_audio_client_set_client_properties(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            AUDCLNT_E_INVALIDARG, AUDCLNT_E_POINTER, set_client_properties,
-        };
-        let object = guest_call_arg(state, memory, 0)?;
-        let properties = guest_call_arg(state, memory, 1)?;
-        if properties == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let bytes = match memory.read_bytes(properties, 12) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let cb_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if cb_size < 12 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_INVALIDARG));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let offload_requested = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) != 0;
-        let category = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        // `AUDCLNT_STREAMOPTIONS Options` follows the 12-byte prefix when the
-        // guest supplies the Windows 8.1+ `AudioClientProperties` size
-        // (16 bytes: cbSize, bIsOffload, eCategory, Options).
-        let options = if cb_size >= 16 {
-            match memory.read_bytes(properties + 12, 4) {
-                Ok(options) => u32::from_le_bytes([options[0], options[1], options[2], options[3]]),
-                Err(_) => {
-                    state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-                    self.last_error = 0;
-                    return Ok(());
-                }
-            }
-        } else {
-            0
-        };
-        let raw_requested = options & crate::audio_activation::AUDCLNT_STREAMOPTIONS_RAW != 0;
-        let hr = set_client_properties(
-            self.guest_pid,
-            object,
-            category,
-            offload_requested,
-            raw_requested,
-        );
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient2::GetBufferSizeLimits(pFormat, bEventDriven, pMin, pMax)`.
-    fn dispatch_audio_client_get_buffer_size_limits(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_buffer_size_limits};
-        let object = guest_call_arg(state, memory, 0)?;
-        let format_ptr = guest_call_arg(state, memory, 1)?;
-        let _event_driven = guest_call_arg_u32(state, memory, 2)?;
-        let minimum_out = guest_call_arg(state, memory, 3)?;
-        let maximum_out = guest_call_arg(state, memory, 4)?;
-        if minimum_out == 0 && maximum_out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let format = match self.read_guest_wave_format(memory, format_ptr) {
-            Ok(format) => format,
-            Err(hr) => {
-                state.set(Register::Rax, u64::from(hr));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        match get_buffer_size_limits(self.guest_pid, object, &format) {
-            Ok((minimum_hns, maximum_hns)) => {
-                if minimum_out != 0 {
-                    write_u64(memory, minimum_out, minimum_hns);
-                }
-                if maximum_out != 0 {
-                    write_u64(memory, maximum_out, maximum_hns);
-                }
-                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-            }
-            Err(hr) => state.set(Register::Rax, u64::from(hr)),
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient3::GetSharedModeEnginePeriod(pFormat, pDefault,
-    /// pFundamental, pMin, pMax)`.
-    fn dispatch_audio_client_get_shared_mode_engine_period(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_shared_mode_engine_period,
-        };
-        let object = guest_call_arg(state, memory, 0)?;
-        let format_ptr = guest_call_arg(state, memory, 1)?;
-        let default_out = guest_call_arg(state, memory, 2)?;
-        let fundamental_out = guest_call_arg(state, memory, 3)?;
-        let minimum_out = guest_call_arg(state, memory, 4)?;
-        let maximum_out = guest_call_arg(state, memory, 5)?;
-        if default_out == 0 && fundamental_out == 0 && minimum_out == 0 && maximum_out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let format = match self.read_guest_wave_format(memory, format_ptr) {
-            Ok(format) => format,
-            Err(hr) => {
-                state.set(Register::Rax, u64::from(hr));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        match get_shared_mode_engine_period(self.guest_pid, object, &format) {
-            Ok((default_frames, fundamental_frames, minimum_frames, maximum_frames)) => {
-                if default_out != 0 {
-                    write_u32(memory, default_out, default_frames);
-                }
-                if fundamental_out != 0 {
-                    write_u32(memory, fundamental_out, fundamental_frames);
-                }
-                if minimum_out != 0 {
-                    write_u32(memory, minimum_out, minimum_frames);
-                }
-                if maximum_out != 0 {
-                    write_u32(memory, maximum_out, maximum_frames);
-                }
-                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-            }
-            Err(hr) => state.set(Register::Rax, u64::from(hr)),
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient3::GetCurrentSharedModeEnginePeriod(ppFormat,
-    /// pCurrentPeriod)`.
-    fn dispatch_audio_client_get_current_shared_mode_engine_period(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_S_OK, AUDCLNT_E_POINTER, current_shared_mode_engine_period,
-            wave_format_bytes,
-        };
-        let object = guest_call_arg(state, memory, 0)?;
-        let format_out = guest_call_arg(state, memory, 1)?;
-        let period_out = guest_call_arg(state, memory, 2)?;
-        if format_out == 0 || period_out == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        match current_shared_mode_engine_period(self.guest_pid, object) {
-            Ok((mix, current_frames)) => {
-                let bytes = wave_format_bytes(&mix);
-                let address = self.alloc_zeroed(memory, bytes.len(), 16)?;
-                memory.map_bytes(address, &bytes);
-                write_guest_pointer(memory, format_out, address, self.guest_arch)?;
-                write_u32(memory, period_out, current_frames);
-                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
-            }
-            Err(hr) => state.set(Register::Rax, u64::from(hr)),
-        }
-        self.last_error = 0;
-        Ok(())
-    }
-
-    /// `IAudioClient3::InitializeSharedAudioStream(flags, period_frames,
-    /// format, session_guid)`.
-    fn dispatch_audio_client_initialize_shared_audio_stream(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{AUDCLNT_E_POINTER, plan_initialize_shared_audio_stream};
-        let object = guest_call_arg(state, memory, 0)?;
-        let stream_flags = guest_call_arg_u32(state, memory, 1)?;
-        let period_frames = guest_call_arg_u32(state, memory, 2)?;
-        let format_ptr = guest_call_arg(state, memory, 3)?;
-        let _session_guid = guest_call_arg(state, memory, 4)?;
-        if format_ptr == 0 {
-            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
-            self.last_error = 0;
-            return Ok(());
-        }
-        let format = match self.read_guest_wave_format(memory, format_ptr) {
-            Ok(format) => format,
-            Err(hr) => {
-                state.set(Register::Rax, u64::from(hr));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let plan = match plan_initialize_shared_audio_stream(
-            self.guest_pid,
-            object,
-            stream_flags,
-            period_frames,
-            &format,
-        ) {
-            Ok(plan) => plan,
-            Err(hr) => {
-                state.set(Register::Rax, u64::from(hr));
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
-        let hr = self.commit_audio_client_initialize(memory, object, &plan, &format)?;
-        state.set(Register::Rax, u64::from(hr));
-        self.last_error = 0;
-        self.push_trace(
-            "audio",
-            "IAudioClient3::InitializeSharedAudioStream",
-            BTreeMap::from([
-                ("stream_flags".to_string(), json!(stream_flags)),
-                ("period_frames".to_string(), json!(period_frames)),
-                ("buffer_frames".to_string(), json!(plan.buffer_frames)),
-            ]),
-            json!(hr),
-        );
-        Ok(())
-    }
-
-    /// Raise the endpoint's ready event through the runtime's real guest
-    /// event machinery (a no-op when the buffer is full or no event handle is
-    /// bound; invalid handles are reported, never silently treated as
-    /// success).
-    fn signal_audio_ready_event(&mut self, endpoint: u64) {
-        let Some(handle) = crate::audio_activation::take_ready_event(self.guest_pid, endpoint)
-        else {
-            return;
-        };
-        let handle = handle as u32;
-        if let Err(error) = self.win32.set_event(handle) {
-            eprintln!(
-                "[RealAudio] audio-client ready event {handle:#x} cannot be signaled: {error}"
-            );
-        }
-    }
-
-    /// Servicing-point tick: every running event-driven audio client whose
-    /// buffer has free space raises its ready event through the real guest
-    /// event machinery, so a guest blocked in a wait wakes when the real
-    /// playback clock frees a buffer.
-    fn tick_audio_client_events(&mut self) {
-        for handle in crate::audio_activation::take_ready_events(self.guest_pid) {
-            if let Err(error) = self.win32.set_event(handle as u32) {
-                eprintln!(
-                    "[RealAudio] audio-client ready event {handle:#x} cannot be signaled: {error}"
-                );
-            }
-        }
-    }
-
-    /// Attach the real IAudioClient method surface to the endpoint object an
-    /// `ActivateAudioInterfaceAsync` dispatch produced: replace the activation
-    /// wrapper vtable with the full method vtable and bind the per-endpoint
-    /// real client state (bound device, riid, real period/latency values).
-    fn attach_activated_audio_client_surface(
-        &mut self,
-        state: &CpuState,
-        memory: &mut MemoryImage,
-    ) -> AppResult<()> {
-        use crate::audio_activation::{
-            ACTIVATION_S_OK, AudioDirection, audio_activation_operation_methods,
-            audio_client_methods, device_is_capture, endpoint_record, has_audio_client,
-            register_activation_operation, register_audio_client_direction,
-        };
-        if state.get(Register::Rax) != u64::from(ACTIVATION_S_OK) {
-            return Ok(());
-        }
-        let operation_out = guest_call_arg(state, memory, 4)?;
-        if operation_out == 0 {
-            return Ok(());
-        }
-        // The activation dispatch wrote the activated endpoint (0 on a failed
-        // activation) here.  Turn the out-parameter into the real Windows
-        // operation object; failed activations still get an operation whose
-        // GetActivateResult reports the failure HRESULT.
-        let interface_object = read_guest_pointer(memory, operation_out, self.guest_arch)?;
-        let operation_vtable =
-            self.alloc_guest_vtable(memory, audio_activation_operation_methods())?;
-        let operation =
-            self.alloc_guest_object(memory, GuestObjectKind::DirectSound8, operation_vtable)?;
-        register_activation_operation(self.guest_pid, operation, interface_object);
-        // One reference for the guest (the out-parameter) and one held by the
-        // pending completion, so a guest that releases the operation before
-        // the asynchronous completion still receives a valid operation.
-        self.add_ref_guest_object(operation)?;
-        write_guest_pointer(memory, operation_out, operation, self.guest_arch)?;
-        if interface_object == 0 {
-            return Ok(());
-        }
-        if has_audio_client(self.guest_pid, interface_object) {
-            return Ok(());
-        }
-        let Some(record) = endpoint_record(self.guest_pid, interface_object) else {
-            return Ok(());
-        };
-        let vtable = self.alloc_guest_vtable(memory, audio_client_methods())?;
-        write_guest_pointer(memory, interface_object, vtable, self.guest_arch)?;
-        let direction = if device_is_capture(&record.device) {
-            AudioDirection::Capture
-        } else {
-            AudioDirection::Render
-        };
-        register_audio_client_direction(
-            self.guest_pid,
-            interface_object,
-            record.device,
-            record.requested_riid,
-            direction,
-        );
-        Ok(())
-    }
-
-    /// Allocate a guest audio endpoint object carrying the full real
-    /// IAudioClient method vtable and bind its real client state.  Used by the
-    /// audio-client tests to build endpoints deterministically (the
-    /// activation path attaches the same surface to the object the
-    /// final-scraps activation produced).
-    #[cfg(test)]
-    fn alloc_audio_client_endpoint(
-        &mut self,
-        memory: &mut MemoryImage,
-        device: &crate::real_audio::RealAudioDevice,
-        requested_riid: [u8; 16],
-    ) -> AppResult<u64> {
-        let vtable =
-            self.alloc_guest_vtable(memory, crate::audio_activation::audio_client_methods())?;
-        let object = self.alloc_guest_object(memory, GuestObjectKind::DirectSound8, vtable)?;
-        crate::audio_activation::register_audio_client(
-            self.guest_pid,
-            object,
-            device.clone(),
-            requested_riid,
-        );
-        Ok(object)
-    }
 }
 
 impl Drop for PeHostRuntime {
@@ -79878,6 +68022,13 @@ impl Drop for PeHostRuntime {
         crate::cef_bridge::set_event_observers(None);
         crate::media::clear_mf_async_state(self.guest_pid);
         crate::driver_island::forget_runtime(self);
+        // Drop inline-API target registrations that pointed at this runtime's
+        // thunk range.  A concurrently live runtime with the same synthetic
+        // address range would re-register on its own binding path.
+        let owner = self as *const PeHostRuntime as u64;
+        for address in self.host_thunks.keys().copied().collect::<Vec<_>>() {
+            crate::jit::unregister_inline_api_target(address, owner);
+        }
     }
 }
 
@@ -80740,6 +68891,21 @@ impl HostThunk {
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "IsDebuggerPresent" => {
                 Self::IsDebuggerPresent
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CheckRemoteDebuggerPresent" =>
+            {
+                Self::CheckRemoteDebuggerPresent
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetSystemFirmwareTable" =>
+            {
+                Self::GetSystemFirmwareTable
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetVolumeInformationW" =>
+            {
+                Self::GetVolumeInformationW
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. })
                 if name == "InitOnceBeginInitialize" =>
@@ -85643,6 +73809,40 @@ impl HostThunk {
             }
             ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtQueryObject" => {
                 Self::NtQueryObject
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtOpenDirectoryObject" => {
+                Self::NtOpenDirectoryObject
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtQueryDirectoryObject" =>
+            {
+                Self::NtQueryDirectoryObject
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtQueryVolumeInformationFile" =>
+            {
+                Self::NtQueryVolumeInformationFile
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtAttestationChallenge" =>
+            {
+                Self::NtAttestationChallenge
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtAttestationQuote" => {
+                Self::NtAttestationQuote
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtAttestationVerify" => {
+                Self::NtAttestationVerify
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtAttestationEnrollProvider" =>
+            {
+                Self::NtAttestationEnrollProvider
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtAttestationRevokeProvider" =>
+            {
+                Self::NtAttestationRevokeProvider
             }
             ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateEvent" => {
                 Self::NtCreateEvent
@@ -91511,9 +79711,13 @@ impl HostThunk {
             | Self::RtlFreeHeap
             | Self::RtlSizeHeap
             | Self::LdrLockLoaderLock => 12,
+            Self::NtOpenDirectoryObject => 12,
             Self::NtFreeVirtualMemory
             | Self::NtSetInformationThread
             | Self::NtQuerySystemInformation => 16,
+            Self::NtAttestationVerify => 16,
+            Self::NtAttestationEnrollProvider => 16,
+            Self::NtAttestationRevokeProvider => 4,
             Self::NtProtectVirtualMemory
             | Self::NtReadVirtualMemory
             | Self::NtWriteVirtualMemory
@@ -91523,7 +79727,10 @@ impl HostThunk {
             | Self::NtQuerySection
             | Self::NtOpenKey
             | Self::NtQueryKey
-            | Self::NtQueryInformationThread => 20,
+            | Self::NtQueryInformationThread
+            | Self::NtQueryVolumeInformationFile
+            | Self::NtAttestationChallenge => 20,
+            Self::NtAttestationQuote => 24,
             Self::NtAllocateVirtualMemory
             | Self::NtQueryVirtualMemory
             | Self::NtSetValueKey
@@ -91533,7 +79740,10 @@ impl HostThunk {
             | Self::LdrLoadDll
             | Self::LdrGetDllHandle
             | Self::LdrGetProcedureAddress => 16,
-            Self::NtCreateSection | Self::NtDuplicateObject | Self::NtCreateKey => 28,
+            Self::NtCreateSection
+            | Self::NtDuplicateObject
+            | Self::NtCreateKey
+            | Self::NtQueryDirectoryObject => 28,
             Self::NtCreateThreadEx | Self::NtDeviceIoControlFile | Self::NtMapViewOfSection => 40,
             Self::NtCreateFile => 44,
             Self::NtReadFile | Self::NtWriteFile => 36,
@@ -93348,7 +81558,7 @@ enum CrtLengthModifier {
 /// Cursor over an x86-cdecl vararg list (the UCRT `va_list` for x86 guests is
 /// a pointer into the caller's stack).  32-bit values advance 4 bytes; 64-bit
 /// values (ll/I64 integers and doubles) advance 8 bytes across two slots.
-struct CrtVaReader {
+pub(crate) struct CrtVaReader {
     cursor: u64,
     arch: GuestArch,
 }
@@ -95100,6 +83310,48 @@ fn read_xaudio2_buffer(
     Ok((samples, audio_bytes))
 }
 
+/// Collect the decoded blocks of a hot function starting at `entry` by
+/// following decoded static jump targets.  Returns `None` unless at least two
+/// blocks are available (a single block has nothing for whole-function Tier-2
+/// to add over the per-block tiers).
+fn collect_tier2_function_blocks(
+    cache: &U64Map<CachedBlockEntry>,
+    entry: u64,
+) -> Option<Vec<crate::jit_ssa::FunctionBlock>> {
+    const MAX_FUNCTION_BLOCKS: usize = 16;
+    let mut blocks = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut queue = std::collections::VecDeque::from([entry]);
+    while let Some(address) = queue.pop_front() {
+        if blocks.len() >= MAX_FUNCTION_BLOCKS || !seen.insert(address) {
+            continue;
+        }
+        let Some(cached) = cache.get(&address) else {
+            continue;
+        };
+        let ir = cached.cached.translated.ir.clone();
+        if ir.is_empty() {
+            continue;
+        }
+        if let Some(last) = ir.last() {
+            match last {
+                crate::cpu::IrInstruction::Jump { target } => queue.push_back(*target),
+                crate::cpu::IrInstruction::JumpIf {
+                    target,
+                    fallthrough,
+                    ..
+                } => {
+                    queue.push_back(*target);
+                    queue.push_back(*fallthrough);
+                }
+                _ => {}
+            }
+        }
+        blocks.push(crate::jit_ssa::FunctionBlock::new(address, ir));
+    }
+    (blocks.len() > 1).then_some(blocks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95136,6 +83388,53 @@ mod tests {
             ]);
         }
         bytes
+    }
+
+    #[test]
+    fn wbem_connect_server_registry_machine_guid_mismatch_guard() {
+        with_big_stack(|| {
+            let (mut runtime, _temp) = test_runtime("wbem-identity");
+            let mut memory = MemoryImage::default();
+            let thunk = runtime.alloc_host_thunk(HostThunk::WbemLocatorConnectServer);
+            let out_ptr = 0x42_000_u32;
+            memory.map_bytes(out_ptr as u64, &[0u8; 8]);
+            // IWbemLocator::ConnectServer(this, server, user, password, locale,
+            // flags, authority, ctx, ppNamespace).
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                thunk,
+                &[0, 0, 0, 0, 0, 0, 0, 0, out_ptr],
+            );
+            assert_eq!(result, 0); // S_OK
+            let identity = crate::hardware_identity::host_identity();
+            let stored = runtime
+                .win32
+                .ge()
+                .registry_get_value(
+                    "HKLM",
+                    crate::hardware_identity::MACHINE_GUID_KEY,
+                    crate::hardware_identity::MACHINE_GUID_VALUE,
+                    crate::ge::RegistryView::Native,
+                )
+                .expect("registry read")
+                .expect("machine guid is mirrored into the guest registry");
+            assert_eq!(
+                stored.data.as_str(),
+                Some(identity.install.machine_guid.as_str())
+            );
+        })
+    }
+
+    #[test]
+    fn dxgi_adapter_desc_luid_mismatch_guard() {
+        let gpu = crate::hardware_identity::host_identity().gpu.clone();
+        let profile = host_gpu_profile_from_name(&gpu.name);
+        let bytes = build_dxgi_adapter_desc_bytes(&profile.adapter, true, false);
+        let low = u32::from_le_bytes(bytes[296..300].try_into().expect("luid low"));
+        let high = u32::from_le_bytes(bytes[300..304].try_into().expect("luid high")) as i32;
+        assert_eq!(low, gpu.luid_low);
+        assert_eq!(high, gpu.luid_high);
     }
 
     fn read_guest_utf16_string(memory: &MemoryImage, address: u64, max_units: usize) -> String {
@@ -95189,6 +83488,42 @@ mod tests {
         runtime
             .dispatch_import(thunk, &mut state, memory)
             .unwrap_or_else(|e| panic!("dispatch x86 thunk: {e}"));
+        state.get(Register::Rax)
+    }
+
+    fn dispatch_x64_thunk(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thunk: u64,
+        args: &[u64],
+    ) -> u64 {
+        let stack = 0x58_000;
+        memory.map_bytes(stack, &[0_u8; 0x400]);
+        write_u64(memory, stack, 0xDEAD_BEEF);
+        // Win64 shadow space.
+        memory.map_bytes(stack + 8, &[0_u8; 0x20]);
+        for (index, arg) in args.iter().enumerate() {
+            if index >= 4 {
+                write_u64(memory, stack + 0x20 + (index as u64 - 4) * 8, *arg);
+            }
+        }
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rsp, stack);
+        if let Some(arg) = args.first() {
+            state.set(Register::Rcx, *arg);
+        }
+        if let Some(arg) = args.get(1) {
+            state.set(Register::Rdx, *arg);
+        }
+        if let Some(arg) = args.get(2) {
+            state.set(Register::R8, *arg);
+        }
+        if let Some(arg) = args.get(3) {
+            state.set(Register::R9, *arg);
+        }
+        runtime
+            .dispatch_import(thunk, &mut state, memory)
+            .unwrap_or_else(|e| panic!("dispatch x64 thunk: {e}"));
         state.get(Register::Rax)
     }
 
@@ -97893,6 +86228,7 @@ mod tests {
             runtime
                 .bind_imports(mapped.selected_base, &mut memory, &resolved_imports)
                 .expect("bind imports");
+            runtime.record_iat_bindings(mapped.selected_base, &mut memory, &resolved_imports);
 
             let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
             let param = runtime
@@ -115984,14 +104320,36 @@ mod tests {
             let shim: u64 = runtime.alloc_host_thunk(HostThunk::LoadLibraryShim);
 
             let out = 0x41_000_u64;
+            // CLSID_CLRMetaHost {9280188D-0E8E-4867-B30C-7FA83884E8DE}
+            let clsid = 0x41_010_u64;
+            memory.map_bytes(
+                clsid,
+                &[
+                    0x8D, 0x18, 0x20, 0x92, 0x8E, 0x0E, 0x67, 0x48, 0xB3, 0x0C, 0x7F, 0xA8, 0x38,
+                    0x84, 0xE8, 0xDE,
+                ],
+            );
+            // IID_ICLRMetaHost {D332DB9E-B9B3-4125-8207-A14884F53216}
+            let meta_iid = 0x41_020_u64;
+            memory.map_bytes(
+                meta_iid,
+                &[
+                    0x9E, 0xDB, 0x32, 0xD3, 0xB9, 0xB3, 0x25, 0x41, 0x82, 0x07, 0xA1, 0x48, 0x84,
+                    0xF5, 0x32, 0x16,
+                ],
+            );
             let hr = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
                 create,
-                &[0x41_010, 0x41_020, out as u32],
+                &[clsid as u32, meta_iid as u32, out as u32],
             );
-            assert_eq!(hr, 0x8013_1013, "no CLR meta host");
-            assert_eq!(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0);
+            assert_eq!(hr, 0, "real CLR metadata host");
+            assert_ne!(
+                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
+                0,
+                "metadata host object returned"
+            );
 
             assert_eq!(
                 dispatch_x86_thunk(
@@ -117469,6 +105827,7 @@ mod tests {
 
     #[test]
     fn evidence_d3d8thk_esent_wsp_wininet_dinput_surfaces() {
+        crate::runtime::dispatch::d3d8thk::reset_test_facade();
         with_big_stack(|| {
             let (mut runtime, _tmp) = test_runtime("evidence-mixed");
             let mut memory = MemoryImage::default();
@@ -122127,6 +110486,2297 @@ mod tests {
             );
         })
     }
+
+    #[test]
+    fn evidence_core_srw_lock_thunks_round_trip() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-core-srw");
+            let mut memory = MemoryImage::default();
+            let init = runtime.alloc_host_thunk(HostThunk::InitializeSRWLock);
+            let acquire_ex = runtime.alloc_host_thunk(HostThunk::AcquireSRWLockExclusive);
+            let release_ex = runtime.alloc_host_thunk(HostThunk::ReleaseSRWLockExclusive);
+            let try_ex = runtime.alloc_host_thunk(HostThunk::TryAcquireSRWLockExclusive);
+            let acquire_sh = runtime.alloc_host_thunk(HostThunk::AcquireSRWLockShared);
+            let release_sh = runtime.alloc_host_thunk(HostThunk::ReleaseSRWLockShared);
+            let try_sh = runtime.alloc_host_thunk(HostThunk::TryAcquireSRWLockShared);
+            let init_cs_spin =
+                runtime.alloc_host_thunk(HostThunk::InitializeCriticalSectionAndSpinCount);
+            let init_cs_ex = runtime.alloc_host_thunk(HostThunk::InitializeCriticalSectionEx);
+
+            let lock = 0x41_000_u32;
+            memory.map_bytes(lock as u64, &[0xFF; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, init, &[lock]),
+                0
+            );
+            assert_eq!(memory.read_bytes(lock as u64, 4).unwrap(), [0_u8; 4]);
+
+            // Exclusive ownership is exclusive: a second TryAcquire fails until
+            // the release.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, try_ex, &[lock]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, try_ex, &[lock]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release_ex, &[lock]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, try_ex, &[lock]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release_ex, &[lock]),
+                0
+            );
+            // The blocking acquire also round-trips.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, acquire_ex, &[lock]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release_ex, &[lock]),
+                0
+            );
+
+            // Shared ownership admits multiple readers; an exclusive acquire is
+            // refused while readers hold the lock.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, try_sh, &[lock]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, try_sh, &[lock]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, try_ex, &[lock]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release_sh, &[lock]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release_sh, &[lock]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, try_ex, &[lock]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release_ex, &[lock]),
+                0
+            );
+            // The shared blocking acquire round-trips too.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, acquire_sh, &[lock]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release_sh, &[lock]),
+                0
+            );
+
+            // The spin-count initializers register a fresh critical section and
+            // zero the guest structure (spin count at offset 20 on x86).
+            let cs = 0x42_000_u32;
+            memory.map_bytes(cs as u64, &[0xFF; 24]);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, init_cs_spin, &[cs, 0x1000]),
+                1
+            );
+            assert_eq!(
+                runtime.critical_sections.get(&(cs as u64)).copied(),
+                Some(0)
+            );
+            assert_eq!(memory.read_u32(cs as u64 + 20).unwrap(), 0x1000);
+            let cs2 = 0x42_100_u32;
+            memory.map_bytes(cs2 as u64, &[0xFF; 24]);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, init_cs_ex, &[cs2, 0x400, 0]),
+                1
+            );
+            assert_eq!(
+                runtime.critical_sections.get(&(cs2 as u64)).copied(),
+                Some(0)
+            );
+            assert_eq!(memory.read_u32(cs2 as u64 + 20).unwrap(), 0x400);
+        })
+    }
+
+    #[test]
+    fn evidence_core_iocp_thunks_round_trip() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-core-iocp");
+            let mut memory = MemoryImage::default();
+            let create_port = runtime.alloc_host_thunk(HostThunk::CreateIoCompletionPort);
+            let post_status = runtime.alloc_host_thunk(HostThunk::PostQueuedCompletionStatus);
+            let get_status = runtime.alloc_host_thunk(HostThunk::GetQueuedCompletionStatus);
+            let get_status_ex = runtime.alloc_host_thunk(HostThunk::GetQueuedCompletionStatusEx);
+
+            // CreateIoCompletionPort mints a port.
+            let port = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_port,
+                &[u32::MAX, 0, 0x1234, 2],
+            );
+            assert_ne!(port, 0);
+            assert_eq!(runtime.last_error, 0);
+
+            // PostQueuedCompletionStatus enqueues one packet.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    post_status,
+                    &[port as u32, 7, 0x1234, 0x5678]
+                ),
+                1
+            );
+            // GetQueuedCompletionStatus dequeues it into the output pointers.
+            let bytes_ptr = 0x41_000;
+            let key_ptr = 0x41_004;
+            let overlapped_ptr = 0x41_008;
+            memory.map_bytes(bytes_ptr as u64, &[0; 12]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_status,
+                    &[
+                        port as u32,
+                        bytes_ptr as u32,
+                        key_ptr as u32,
+                        overlapped_ptr as u32,
+                        0
+                    ]
+                ),
+                1
+            );
+            assert_eq!(memory.read_u32(bytes_ptr as u64).unwrap(), 7);
+            assert_eq!(memory.read_u32(key_ptr as u64).unwrap(), 0x1234);
+            assert_eq!(memory.read_u32(overlapped_ptr as u64).unwrap(), 0x5678);
+
+            // A second packet dequeues through GetQueuedCompletionStatusEx with
+            // the OVERLAPPED_ENTRY layout (x86 stride 16).
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    post_status,
+                    &[port as u32, 9, 0xCAFE, 0xBEEF]
+                ),
+                1
+            );
+            let entries_ptr = 0x41_100;
+            let removed_ptr = 0x41_200;
+            memory.map_bytes(entries_ptr as u64, &[0; 64]);
+            memory.map_bytes(removed_ptr as u64, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_status_ex,
+                    &[port as u32, entries_ptr as u32, 4, removed_ptr as u32, 0, 0]
+                ),
+                1
+            );
+            assert_eq!(memory.read_u32(removed_ptr as u64).unwrap(), 1);
+            assert_eq!(memory.read_u32(entries_ptr as u64).unwrap(), 0xCAFE);
+            assert_eq!(memory.read_u32(entries_ptr as u64 + 4).unwrap(), 0xBEEF);
+            assert_eq!(memory.read_u32(entries_ptr as u64 + 12).unwrap(), 9);
+        })
+    }
+
+    #[test]
+    fn evidence_core_fiber_thunks_round_trip() {
+        // The merged dispatch match (2000+ HostThunk arms) has a debug-build
+        // stack frame larger than the default test-thread stack; run on the
+        // 8 MiB big-stack thread like the other dispatch-heavy tests.
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-core-fibers");
+            let mut memory = MemoryImage::default();
+            let convert_thread = runtime.alloc_host_thunk(HostThunk::ConvertThreadToFiber);
+            let switch_fiber = runtime.alloc_host_thunk(HostThunk::SwitchToFiber);
+            let convert_fiber = runtime.alloc_host_thunk(HostThunk::ConvertFiberToThread);
+            let delete_fiber = runtime.alloc_host_thunk(HostThunk::DeleteFiber);
+
+            // ConvertThreadToFiber mints the primary fiber handle and tracks it
+            // as the current fiber of this thread.
+            let primary = dispatch_x86_thunk(&mut runtime, &mut memory, convert_thread, &[]);
+            assert_ne!(primary, 0);
+            // Switching to the current fiber round-trips (the manager records
+            // the previous-fiber chain and the runtime saves/restores state).
+            dispatch_x86_thunk(&mut runtime, &mut memory, switch_fiber, &[primary as u32]);
+            assert_eq!(runtime.last_error, 0);
+            // ConvertFiberToThread detaches the current fiber.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, convert_fiber, &[]),
+                1
+            );
+            // DeleteFiber removes the current fiber (the thread-local tracker is
+            // cleared so a stale handle can never be saved into).
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_fiber, &[primary as u32]);
+            assert_eq!(runtime.last_error, 0);
+        })
+    }
+
+    #[test]
+    fn evidence_core_string_and_codepage_thunks() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-core-strings");
+            let mut memory = MemoryImage::default();
+            let lstrlen_a = runtime.alloc_host_thunk(HostThunk::Strlen);
+            let lstrcpy_a = runtime.alloc_host_thunk(HostThunk::LstrcpyA);
+            let lstrcat_w = runtime.alloc_host_thunk(HostThunk::LstrcatW);
+            let lstrcpyn_w = runtime.alloc_host_thunk(HostThunk::LstrcpynW);
+            let mb2wc = runtime.alloc_host_thunk(HostThunk::MultiByteToWideChar);
+            let wc2mb = runtime.alloc_host_thunk(HostThunk::WideCharToMultiByte);
+            let get_string_type = runtime.alloc_host_thunk(HostThunk::GetStringTypeW);
+            let lcmap = runtime.alloc_host_thunk(HostThunk::LCMapStringW);
+            let ods_a = runtime.alloc_host_thunk(HostThunk::OutputDebugStringA);
+            let ods_w = runtime.alloc_host_thunk(HostThunk::OutputDebugStringW);
+
+            // lstrlenA counts ANSI bytes before the NUL.
+            let ascii = 0x41_000;
+            memory.map_bytes(ascii, b"hello\0");
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, lstrlen_a, &[ascii as u32]),
+                5
+            );
+
+            // lstrcpyA copies the NUL-terminated ANSI string and returns dst.
+            let dst = 0x41_100;
+            memory.map_bytes(dst, &[0xFF; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    lstrcpy_a,
+                    &[dst as u32, ascii as u32]
+                ),
+                dst
+            );
+            assert_eq!(read_c_string(&memory, dst).unwrap(), "hello");
+
+            // lstrcatW appends the source to the destination.
+            let wide_ab = 0x41_200;
+            let wide_cd = 0x41_300;
+            memory.map_bytes(wide_ab, &evidence_utf16("ab"));
+            memory.map_bytes(wide_cd, &evidence_utf16("cd"));
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    lstrcat_w,
+                    &[wide_ab as u32, wide_cd as u32]
+                ),
+                wide_ab
+            );
+            assert_eq!(read_utf16_string(&memory, wide_ab).unwrap(), "abcd");
+
+            // lstrcpynW copies at most max_count-1 code units + NUL.
+            let wide_abcdef = 0x41_400;
+            memory.map_bytes(wide_abcdef, &evidence_utf16("abcdef"));
+            let cpy_dst = 0x41_500;
+            memory.map_bytes(cpy_dst, &[0xFF; 32]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    lstrcpyn_w,
+                    &[cpy_dst as u32, wide_abcdef as u32, 4]
+                ),
+                cpy_dst
+            );
+            assert_eq!(read_utf16_string(&memory, cpy_dst).unwrap(), "abc");
+
+            // MultiByteToWideChar size query then fill (CP_ACP → UTF-16).  The
+            // required size counts UTF-16 code units (5 for "hello").
+            let wc_query = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                mb2wc,
+                &[CP_ACP, 0, ascii as u32, 5, 0, 0],
+            );
+            assert_eq!(wc_query, 5);
+            let wc_dst = 0x41_600;
+            memory.map_bytes(wc_dst, &[0; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    mb2wc,
+                    &[CP_ACP, 0, ascii as u32, 5, wc_dst as u32, 5]
+                ),
+                5
+            );
+            assert_eq!(
+                memory.read_bytes(wc_dst, 10).unwrap(),
+                evidence_utf16("hello")
+            );
+
+            // WideCharToMultiByte size query then fill.
+            let mb_query = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wc2mb,
+                &[CP_ACP, 0, wc_dst as u32, 5, 0, 0, 0, 0],
+            );
+            assert_eq!(mb_query, 5);
+            let mb_dst = 0x41_700;
+            memory.map_bytes(mb_dst, &[0; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    wc2mb,
+                    &[CP_ACP, 0, wc_dst as u32, 5, mb_dst as u32, 5, 0, 0]
+                ),
+                5
+            );
+            assert_eq!(read_c_string(&memory, mb_dst).unwrap(), "hello");
+
+            // GetStringTypeW classifies each code unit (C1_* for 'h' non-zero).
+            let st_out = 0x41_800;
+            memory.map_bytes(st_out, &[0; 32]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_string_type,
+                    &[CT_CTYPE1, wc_dst as u32, u32::MAX, st_out as u32]
+                ),
+                1
+            );
+            assert_ne!(memory.read_u16(st_out).unwrap(), 0);
+
+            // LCMapStringW folds case: "ABC" → "abc" (LCMAP_LOWERCASE).
+            let wide_abc = 0x41_900;
+            memory.map_bytes(wide_abc, &evidence_utf16("ABC"));
+            let lc_dst = 0x41_A00;
+            memory.map_bytes(lc_dst, &[0; 16]);
+            let lc_required = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                lcmap,
+                &[0, LCMAP_LOWERCASE, wide_abc as u32, u32::MAX, 0, 0],
+            );
+            assert_eq!(lc_required, 4, "lowercased 'abc' + NUL");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    lcmap,
+                    &[
+                        0,
+                        LCMAP_LOWERCASE,
+                        wide_abc as u32,
+                        u32::MAX,
+                        lc_dst as u32,
+                        4
+                    ]
+                ),
+                4
+            );
+            assert_eq!(read_utf16_string(&memory, lc_dst).unwrap(), "abc");
+
+            // OutputDebugStringA/W are observable no-fault calls.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, ods_a, &[ascii as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, ods_w, &[wc_dst as u32]),
+                0
+            );
+            assert_eq!(runtime.last_error, 0);
+        })
+    }
+
+    #[test]
+    fn anticheat_identity_exports_reject_invalid_arguments_and_report_real_facts() {
+        with_big_stack(|| {
+            let (mut runtime, _temp) = test_runtime("anticheat-identity-exports");
+            let mut memory = MemoryImage::default();
+
+            // CheckRemoteDebuggerPresent reads the live attach state.
+            let check = runtime.alloc_host_thunk(HostThunk::CheckRemoteDebuggerPresent);
+            let out = 0x42_000u64;
+            memory.map_bytes(out, &[0u8; 4]);
+            let process = runtime.win32.current_process_handle();
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, check, &[process, out as u32]),
+                1
+            );
+            assert_eq!(memory.read_u32(out).expect("present"), 0);
+            runtime
+                .anticheat
+                .debug
+                .attach(runtime.guest_pid)
+                .expect("attach debugger");
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, check, &[process, out as u32]),
+                1
+            );
+            assert_eq!(memory.read_u32(out).expect("present"), 1);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, check, &[process, 0]),
+                0
+            );
+            assert_eq!(runtime.last_error, 87, "null out pointer is invalid");
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, check, &[0, out as u32]),
+                0
+            );
+            assert_eq!(runtime.last_error, 6, "zero handle is invalid");
+
+            // GetSystemFirmwareTable serves the real SMBIOS table.
+            let firmware = runtime.alloc_host_thunk(HostThunk::GetSystemFirmwareTable);
+            const RSMB: u32 = 0x5253_4D42;
+            const ACPI: u32 = 0x4143_5049;
+            let required =
+                dispatch_x86_thunk(&mut runtime, &mut memory, firmware, &[RSMB, RSMB, 0, 0]);
+            assert!(required > 0, "SMBIOS table must have a real size");
+            assert_eq!(runtime.last_error, 122, "required size reported");
+            let table = 0x42_100u64;
+            memory.map_bytes(table, &vec![0u8; required as usize]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    firmware,
+                    &[RSMB, RSMB, table as u32, required as u32]
+                ),
+                required
+            );
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(memory.read_u8(table).expect("smbios"), 0, "type 0 BIOS");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    firmware,
+                    &[RSMB, RSMB, table as u32, required.saturating_sub(1) as u32]
+                ),
+                required
+            );
+            assert_eq!(
+                runtime.last_error, 122,
+                "short buffer reports required size"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, firmware, &[ACPI, 0, 0, 0]),
+                0
+            );
+            assert_eq!(runtime.last_error, 50, "ACPI tables are genuinely absent");
+
+            // GetVolumeInformationW reports the real volume identity.
+            let probe = crate::hardware_identity::host_identity();
+            eprintln!(
+                "[identity] disks={} absent={:?}",
+                probe.disks.len(),
+                probe.absent
+            );
+            let volume = runtime.alloc_host_thunk(HostThunk::GetVolumeInformationW);
+            let root = runtime
+                .alloc_utf16_string(&mut memory, "C:\\")
+                .expect("root");
+            let name = 0x42_200u64;
+            let serial = 0x42_300u64;
+            let max_component = 0x42_304u64;
+            let flags = 0x42_308u64;
+            let fs = 0x42_320u64;
+            memory.map_bytes(name, &[0u8; 64]);
+            memory.map_bytes(serial, &[0u8; 16]);
+            memory.map_bytes(fs, &[0u8; 64]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    volume,
+                    &[
+                        root as u32,
+                        name as u32,
+                        32,
+                        serial as u32,
+                        max_component as u32,
+                        flags as u32,
+                        fs as u32,
+                        32,
+                    ]
+                ),
+                1,
+                "last_error={}",
+                runtime.last_error
+            );
+            assert_eq!(runtime.last_error, 0);
+            let identity = crate::hardware_identity::host_identity();
+            let disk = identity.disks.first().expect("mounted volume");
+            assert_eq!(memory.read_u32(serial).expect("serial"), disk.volume_serial);
+            assert_eq!(memory.read_u32(max_component).expect("max"), 255);
+            assert_eq!(memory.read_u32(flags).expect("flags"), 0);
+            assert_eq!(
+                read_utf16_string(&memory, fs).expect("filesystem"),
+                disk.filesystem
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    volume,
+                    &[0, name as u32, 32, serial as u32, 0, 0, fs as u32, 32]
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, 87, "null root is invalid");
+        })
+    }
+
+    #[test]
+    fn firmware_identity_surface_matches_the_smbios_source_and_rejects_short_buffers() {
+        with_big_stack(|| {
+            let (mut runtime, _temp) = test_runtime("firmware-cross-surface");
+            let mut memory = MemoryImage::default();
+            let query = runtime.alloc_host_thunk(HostThunk::NtQuerySystemInformation);
+            let get_table = runtime.alloc_host_thunk(HostThunk::GetSystemFirmwareTable);
+            let identity = crate::hardware_identity::host_identity();
+            let table = crate::hardware_identity::build_smbios_table(identity);
+            const RSMB: u32 = 0x5253_4D42;
+
+            let required = 12 + table.len() as u32;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_table, &[RSMB, RSMB, 0, 0]),
+                u64::from(table.len() as u32),
+                "Win32 and introspection report the same table length"
+            );
+
+            let buffer = 0x4C_000u64;
+            let length_ptr = 0x4D_000u64;
+            memory.map_bytes(buffer, &[0u8; 0x4000]);
+            memory.map_bytes(length_ptr, &[0u8; 4]);
+            write_u32(&mut memory, buffer, RSMB);
+            write_u32(&mut memory, buffer + 4, RSMB);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query,
+                    &[76, buffer as u32, required + 16, length_ptr as u32]
+                ),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert_eq!(memory.read_u32(buffer).expect("provider"), RSMB);
+            assert_eq!(
+                memory.read_u32(buffer + 8).expect("table length"),
+                table.len() as u32
+            );
+            assert_eq!(
+                memory.read_bytes(buffer + 12, table.len()).expect("table"),
+                table,
+                "the introspection table is the SAME SMBIOS bytes"
+            );
+
+            write_u32(&mut memory, buffer, RSMB);
+            write_u32(&mut memory, buffer + 4, RSMB);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query,
+                    &[76, buffer as u32, required - 1, length_ptr as u32]
+                ),
+                u64::from(crate::ntdll::STATUS_INFO_LENGTH_MISMATCH.raw())
+            );
+            assert_eq!(memory.read_u32(length_ptr).expect("required"), required);
+        })
+    }
+
+    #[test]
+    fn attestation_guest_thunks_reject_forgery_replay_and_no_provider() {
+        with_big_stack(|| {
+            let (mut runtime, _temp) = test_runtime("attestation-thunks");
+            let mut memory = MemoryImage::default();
+            let challenge_thunk = runtime.alloc_host_thunk(HostThunk::NtAttestationChallenge);
+            let quote_thunk = runtime.alloc_host_thunk(HostThunk::NtAttestationQuote);
+            let verify_thunk = runtime.alloc_host_thunk(HostThunk::NtAttestationVerify);
+            let verifier = runtime
+                .alloc_c_string(&mut memory, "casa1-guest")
+                .expect("verifier");
+            let provider = runtime
+                .alloc_c_string(&mut memory, "casa1")
+                .expect("provider");
+            let challenge_out = 0x62_000u64;
+            let challenge_required = 0x62_100u64;
+            let quote_out = 0x63_000u64;
+            let quote_required = 0x65_000u64;
+            memory.map_bytes(challenge_out, &[0u8; 64]);
+            memory.map_bytes(challenge_required, &[0u8; 4]);
+            memory.map_bytes(quote_out, &[0u8; 0x2000]);
+            memory.map_bytes(quote_required, &[0u8; 4]);
+
+            // A short challenge buffer reports the exact wire size.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    challenge_thunk,
+                    &[
+                        verifier as u32,
+                        60_000,
+                        challenge_out as u32,
+                        0,
+                        challenge_required as u32
+                    ]
+                ),
+                u64::from(crate::ntdll::STATUS_INFO_LENGTH_MISMATCH.raw())
+            );
+            assert_eq!(memory.read_u32(challenge_required).expect("required"), 48);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    challenge_thunk,
+                    &[verifier as u32, 60_000, 0, 48, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()),
+                "a null challenge output is invalid"
+            );
+            // A null verifier and a zero TTL are invalid parameters.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    challenge_thunk,
+                    &[0, 60_000, challenge_out as u32, 48, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    challenge_thunk,
+                    &[verifier as u32, 0, challenge_out as u32, 48, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+
+            let issue_challenge = |runtime: &mut PeHostRuntime,
+                                   memory: &mut MemoryImage,
+                                   nonce_out: u64|
+             -> Vec<u8> {
+                assert_eq!(
+                    dispatch_x86_thunk(
+                        runtime,
+                        memory,
+                        challenge_thunk,
+                        &[
+                            verifier as u32,
+                            60_000,
+                            nonce_out as u32,
+                            48,
+                            challenge_required as u32
+                        ]
+                    ),
+                    u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+                );
+                let mut bytes = vec![0_u8; 48];
+                memory.read_into(nonce_out, &mut bytes).expect("challenge");
+                bytes
+            };
+            let issue_quote = |runtime: &mut PeHostRuntime,
+                               memory: &mut MemoryImage,
+                               challenge: u64,
+                               out: u64|
+             -> Vec<u8> {
+                // A zero-length quote buffer reports the required size.
+                assert_eq!(
+                    dispatch_x86_thunk(
+                        runtime,
+                        memory,
+                        quote_thunk,
+                        &[
+                            challenge as u32,
+                            48,
+                            provider as u32,
+                            out as u32,
+                            0,
+                            quote_required as u32
+                        ]
+                    ),
+                    u64::from(crate::ntdll::STATUS_INFO_LENGTH_MISMATCH.raw())
+                );
+                let required = memory.read_u32(quote_required).expect("quote size") as usize;
+                assert!(required > 0);
+                assert_eq!(
+                    dispatch_x86_thunk(
+                        runtime,
+                        memory,
+                        quote_thunk,
+                        &[
+                            challenge as u32,
+                            48,
+                            provider as u32,
+                            out as u32,
+                            required as u32,
+                            quote_required as u32
+                        ]
+                    ),
+                    u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+                );
+                let mut bytes = vec![0_u8; required];
+                memory.read_into(out, &mut bytes).expect("quote bytes");
+                bytes
+            };
+
+            memory.map_bytes(challenge_out, &[0u8; 48]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    quote_thunk,
+                    &[
+                        challenge_out as u32,
+                        48,
+                        provider as u32,
+                        quote_out as u32,
+                        0x2000,
+                        quote_required as u32
+                    ]
+                ),
+                0xC000_000D,
+                "an all-zero challenge is malformed"
+            );
+
+            let challenge_one = issue_challenge(&mut runtime, &mut memory, challenge_out);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    quote_thunk,
+                    &[0, 48, provider as u32, quote_out as u32, 0x2000, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    quote_thunk,
+                    &[
+                        challenge_out as u32,
+                        47,
+                        provider as u32,
+                        quote_out as u32,
+                        0x2000,
+                        0
+                    ]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            let empty_provider = runtime
+                .alloc_c_string(&mut memory, "")
+                .expect("empty provider");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    quote_thunk,
+                    &[
+                        challenge_out as u32,
+                        48,
+                        empty_provider as u32,
+                        quote_out as u32,
+                        0x2000,
+                        0
+                    ]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    quote_thunk,
+                    &[challenge_out as u32, 48, provider as u32, 0, 0x2000, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            let quote_one = issue_quote(&mut runtime, &mut memory, challenge_out, quote_out);
+            assert!(
+                serde_json::from_slice::<crate::anticheat::Quote>(&quote_one).is_ok(),
+                "the signed quote must be well-formed JSON"
+            );
+
+            // A fresh runtime has no provider registered: verification is the
+            // documented "cannot attest" failure, never a fabricated verdict.
+            let (mut no_provider, _temp_two) = test_runtime("attestation-no-provider");
+            let mut no_provider_memory = MemoryImage::default();
+            let no_provider_verify = no_provider.alloc_host_thunk(HostThunk::NtAttestationVerify);
+            let no_provider_challenge_out = 0x66_000u64;
+            let no_provider_required = 0x66_100u64;
+            no_provider_memory.map_bytes(no_provider_challenge_out, &[0u8; 48]);
+            no_provider_memory.map_bytes(no_provider_required, &[0u8; 4]);
+            let no_provider_challenge_thunk =
+                no_provider.alloc_host_thunk(HostThunk::NtAttestationChallenge);
+            let no_provider_verifier = no_provider
+                .alloc_c_string(&mut no_provider_memory, "casa1-guest")
+                .expect("verifier");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut no_provider,
+                    &mut no_provider_memory,
+                    no_provider_challenge_thunk,
+                    &[
+                        no_provider_verifier as u32,
+                        60_000,
+                        no_provider_challenge_out as u32,
+                        48,
+                        no_provider_required as u32
+                    ]
+                ),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            let no_provider_quote = 0x67_000u64;
+            no_provider_memory.map_bytes(no_provider_quote, &quote_one);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut no_provider,
+                    &mut no_provider_memory,
+                    no_provider_verify,
+                    &[
+                        no_provider_challenge_out as u32,
+                        48,
+                        no_provider_quote as u32,
+                        quote_one.len() as u32
+                    ]
+                ),
+                0xC000_00BB,
+                "no provider is STATUS_NOT_SUPPORTED"
+            );
+
+            // Genuine quote verifies, then the same challenge replays denied.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[
+                        challenge_out as u32,
+                        48,
+                        quote_out as u32,
+                        quote_one.len() as u32
+                    ]
+                ),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[
+                        challenge_out as u32,
+                        48,
+                        quote_out as u32,
+                        quote_one.len() as u32
+                    ]
+                ),
+                0xC000_0022,
+                "a replayed challenge is STATUS_ACCESS_DENIED"
+            );
+            let _ = challenge_one;
+
+            // A quote whose DER signature was tampered with never verifies.
+            let challenge_two = issue_challenge(&mut runtime, &mut memory, challenge_out);
+            let genuine_two = issue_quote(&mut runtime, &mut memory, challenge_out, quote_out);
+            let mut forged: crate::anticheat::Quote =
+                serde_json::from_slice(&genuine_two).expect("quote json");
+            let signature_len = forged.signature_der.len();
+            forged.signature_der[signature_len - 1] ^= 0x01;
+            let forged = serde_json::to_vec(&forged).expect("forged quote");
+            memory.map_bytes(0x68_000, &forged);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[challenge_out as u32, 48, 0x68_000u32, forged.len() as u32]
+                ),
+                0xC000_0022,
+                "a forged signature is STATUS_ACCESS_DENIED"
+            );
+            let mut impostor: crate::anticheat::Quote =
+                serde_json::from_slice(&genuine_two).expect("quote json");
+            impostor.provider_id = "not-casa1".to_string();
+            let impostor = serde_json::to_vec(&impostor).expect("impostor quote");
+            memory.map_bytes(0x6C_000, &impostor);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[challenge_out as u32, 48, 0x6C_000u32, impostor.len() as u32]
+                ),
+                0xC000_0034,
+                "an unregistered provider is STATUS_OBJECT_NAME_NOT_FOUND"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[
+                        challenge_out as u32,
+                        48,
+                        quote_out as u32,
+                        genuine_two.len() as u32
+                    ]
+                ),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            let _ = challenge_two;
+
+            // A quote bound to a different nonce is a parameter mismatch.
+            let challenge_three = issue_challenge(&mut runtime, &mut memory, challenge_out);
+            let mut other_nonce_challenge = challenge_three.clone();
+            other_nonce_challenge[0] ^= 0xFF;
+            memory.map_bytes(challenge_out, &other_nonce_challenge);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[
+                        challenge_out as u32,
+                        48,
+                        quote_out as u32,
+                        genuine_two.len() as u32
+                    ]
+                ),
+                0xC000_000D,
+                "a quote bound to another nonce is STATUS_INVALID_PARAMETER"
+            );
+
+            // Null/truncated buffers and a malformed quote are invalid
+            // parameters, never a trust verdict.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[0, 48, quote_out as u32, genuine_two.len() as u32]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[challenge_out as u32, 48, 0, genuine_two.len() as u32]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[challenge_out as u32, 48, quote_out as u32, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            memory.map_bytes(0x69_000, &[0u8; 47]);
+            memory.map_bytes(0x6A_000, b"not a quote");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[0x69_000u32, 47, quote_out as u32, genuine_two.len() as u32]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_thunk,
+                    &[challenge_out as u32, 48, 0x6A_000u32, 11]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+        })
+    }
+
+    #[test]
+    fn attestation_provider_enrollment_is_persisted_revocable_and_exact() {
+        with_big_stack(|| {
+            let (mut runtime, _temp) = test_runtime("attestation-enrollment");
+            let mut memory = MemoryImage::default();
+            let enroll = runtime.alloc_host_thunk(HostThunk::NtAttestationEnrollProvider);
+            let revoke = runtime.alloc_host_thunk(HostThunk::NtAttestationRevokeProvider);
+            let verify = runtime.alloc_host_thunk(HostThunk::NtAttestationVerify);
+
+            let key = crate::anticheat::AttestationKeyPair::generate();
+            let spki = key.public_key_spki();
+            let provider = runtime
+                .alloc_c_string(&mut memory, "acme")
+                .expect("provider");
+            let key_ptr = 0x80_000u64;
+            memory.map_bytes(key_ptr, &spki);
+
+            // Malformed ids/keys are exact parameter failures.
+            let empty_id = runtime.alloc_c_string(&mut memory, "").expect("empty id");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enroll,
+                    &[empty_id as u32, key_ptr as u32, spki.len() as u32, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            let traversal = runtime
+                .alloc_c_string(&mut memory, "bad/id")
+                .expect("traversal id");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enroll,
+                    &[traversal as u32, key_ptr as u32, spki.len() as u32, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enroll,
+                    &[provider as u32, key_ptr as u32, 0, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+            let bad_key = 0x81_000u64;
+            memory.map_bytes(bad_key, &[0x00, 0x01, 0x02]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enroll,
+                    &[provider as u32, bad_key as u32, 3, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+
+            // Real enrollment persists the supplied SPKI and is trusted.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enroll,
+                    &[provider as u32, key_ptr as u32, spki.len() as u32, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            let stored = crate::anticheat::InstallIdentityStore::open(
+                runtime.win32.ge().root.join("attestation"),
+            )
+            .load_provider("acme")
+            .expect("load provider")
+            .expect("persisted provider");
+            assert_eq!(stored.public_key_spki, spki);
+            assert_eq!(stored.valid_until_ms, None);
+
+            // A duplicate id is never an overwrite.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enroll,
+                    &[provider as u32, key_ptr as u32, spki.len() as u32, 0]
+                ),
+                u64::from(crate::ntdll::STATUS_OBJECT_NAME_COLLISION.raw())
+            );
+
+            // A runtime that has not yet registered the provider in memory
+            // loads the persisted enrollment before verifying.
+            runtime.anticheat.attestation = crate::anticheat::AttestationRegistry::new();
+
+            let challenge_at = 0x82_000u64;
+            let quote_at = 0x83_000u64;
+            memory.map_bytes(challenge_at, &[0u8; 48]);
+            memory.map_bytes(quote_at, &[0u8; 0x2000]);
+            let write_quote = |runtime: &mut PeHostRuntime,
+                               memory: &mut MemoryImage,
+                               provider_id: &str|
+             -> (u64, usize) {
+                let challenge = crate::anticheat::Challenge::new(
+                    crate::anticheat::ATTESTATION_VERIFIER,
+                    60_000,
+                    runtime.anticheat.clock.tick_count64(),
+                );
+                memory.map_bytes(
+                    challenge_at,
+                    &crate::anticheat::challenge_to_wire(&challenge),
+                );
+                let quote = key.sign_quote(
+                    provider_id,
+                    &crate::anticheat::measure_casa1_build(),
+                    &challenge.nonce,
+                );
+                let bytes = serde_json::to_vec(&quote).expect("quote json");
+                memory.map_bytes(quote_at, &bytes);
+                (challenge_at, bytes.len())
+            };
+            let (challenge, quote_len) = write_quote(&mut runtime, &mut memory, "acme");
+            // An unknown provider is an exact object-name miss.
+            let ghost = runtime.alloc_c_string(&mut memory, "ghost").expect("ghost");
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, revoke, &[ghost as u32]),
+                u64::from(crate::ntdll::STATUS_OBJECT_NAME_NOT_FOUND.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify,
+                    &[challenge as u32, 48, quote_at as u32, quote_len as u32]
+                ),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+
+            // Revocation is persisted and affects the next verification.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, revoke, &[provider as u32]),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert!(
+                crate::anticheat::InstallIdentityStore::open(
+                    runtime.win32.ge().root.join("attestation"),
+                )
+                .is_revoked("acme")
+            );
+            // Drop the in-memory trust again: the persisted revocation alone
+            // must deny the next verification, never fall back to NoProvider.
+            runtime.anticheat.attestation = crate::anticheat::AttestationRegistry::new();
+            let (challenge, quote_len) = write_quote(&mut runtime, &mut memory, "acme");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify,
+                    &[challenge as u32, 48, quote_at as u32, quote_len as u32]
+                ),
+                0xC000_0022,
+                "a revoked provider is STATUS_ACCESS_DENIED"
+            );
+            // Revocation is idempotent and re-enrollment stays refused.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, revoke, &[provider as u32]),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enroll,
+                    &[provider as u32, key_ptr as u32, spki.len() as u32, 0]
+                ),
+                0xC000_0022,
+                "a revoked provider cannot be re-enrolled"
+            );
+
+            // A finite TTL expires the provider key: verification is
+            // STATUS_TIMEOUT, never a trust verdict.
+            let short = runtime
+                .alloc_c_string(&mut memory, "short-lived")
+                .expect("short id");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enroll,
+                    &[short as u32, key_ptr as u32, spki.len() as u32, 1]
+                ),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            let short_key =
+                crate::anticheat::AttestationKeyPair::from_secret_bytes(&key.secret_bytes())
+                    .expect("same key");
+            let challenge = crate::anticheat::Challenge::new(
+                crate::anticheat::ATTESTATION_VERIFIER,
+                60_000,
+                runtime.anticheat.clock.tick_count64(),
+            );
+            memory.map_bytes(
+                challenge_at,
+                &crate::anticheat::challenge_to_wire(&challenge),
+            );
+            let quote = short_key.sign_quote(
+                "short-lived",
+                &crate::anticheat::measure_casa1_build(),
+                &challenge.nonce,
+            );
+            let bytes = serde_json::to_vec(&quote).expect("quote json");
+            memory.map_bytes(quote_at, &bytes);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify,
+                    &[challenge_at as u32, 48, quote_at as u32, bytes.len() as u32]
+                ),
+                0xC000_0102,
+                "an expired provider key is the documented attestation timeout"
+            );
+
+            // A store that cannot be written is an exact I/O failure, never a
+            // fabricated success or a zeroed trust decision.
+            let attestation_root = runtime.win32.ge().root.join("attestation");
+            std::fs::remove_dir_all(&attestation_root).expect("remove store");
+            std::fs::write(&attestation_root, b"not a directory").expect("block store root");
+            let io_provider = runtime
+                .alloc_c_string(&mut memory, "io-failure")
+                .expect("io provider");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enroll,
+                    &[io_provider as u32, key_ptr as u32, spki.len() as u32, 0]
+                ),
+                0xC000_0001
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, revoke, &[short as u32]),
+                0xC000_0001
+            );
+        })
+    }
+
+    #[test]
+    fn extended_process_information_reports_real_stack_bounds_and_refuses_short_or_unbacked() {
+        with_big_stack(|| {
+            let (mut runtime, _temp) = test_runtime("extended-process-info");
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+            let mut memory = MemoryImage::default();
+            let teb = 0x69_000u64;
+            let stack_limit = stack_base_for_arch(GuestArch::X64);
+            let stack_base = stack_limit + STACK_SIZE as u64;
+            memory.map_bytes(teb, &[0u8; 0x100]);
+            write_u64(&mut memory, teb + 0x08, stack_base);
+            write_u64(&mut memory, teb + 0x10, stack_limit);
+            runtime.teb_base = teb;
+
+            let query = runtime.alloc_host_thunk(HostThunk::NtQuerySystemInformation);
+            let buffer = 0x6A_000u64;
+            let length_ptr = 0x6B_000u64;
+            memory.map_bytes(buffer, &[0u8; 0x2000]);
+            memory.map_bytes(length_ptr, &[0u8; 8]);
+            let status = dispatch_x64_thunk(
+                &mut runtime,
+                &mut memory,
+                query,
+                &[57, buffer, 0x2000, length_ptr],
+            );
+            assert_eq!(status, u64::from(crate::ntdll::STATUS_SUCCESS.raw()));
+            let returned = memory.read_u64(length_ptr).expect("returned") as usize;
+            assert!(returned >= 0x100 + 0x88);
+            let mut entry = 0u64;
+            loop {
+                if memory.read_u64(buffer + entry + 0x50).expect("pid")
+                    == u64::from(runtime.guest_pid)
+                {
+                    break;
+                }
+                let next = memory.read_u32(buffer + entry).expect("next") as u64;
+                assert_ne!(next, 0, "the guest process must be in the array");
+                entry += next;
+            }
+            assert_eq!(
+                u32::from_le_bytes(
+                    memory
+                        .read_bytes(buffer + entry + 4, 4)
+                        .expect("thread count")
+                        .try_into()
+                        .unwrap()
+                ),
+                1,
+                "the real thread table has one thread"
+            );
+            assert_eq!(
+                memory
+                    .read_u64(buffer + entry + 0x100 + 0x50)
+                    .expect("stack base"),
+                stack_base
+            );
+            assert_eq!(
+                memory
+                    .read_u64(buffer + entry + 0x100 + 0x58)
+                    .expect("stack limit"),
+                stack_limit
+            );
+            assert_eq!(
+                memory.read_u64(buffer + entry + 0x100 + 0x68).expect("teb"),
+                teb
+            );
+            assert_eq!(
+                memory
+                    .read_u32(buffer + entry + 0x100 + 0x30)
+                    .expect("thread id"),
+                runtime.win32.current_thread_id()
+            );
+
+            // A short buffer reports the exact requirement (extended thread
+            // records, not the plain class-5 size).
+            assert_eq!(
+                dispatch_x64_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query,
+                    &[57, buffer, 0x100, length_ptr]
+                ),
+                u64::from(crate::ntdll::STATUS_INFO_LENGTH_MISMATCH.raw())
+            );
+            assert_eq!(
+                memory.read_u64(length_ptr).expect("required"),
+                returned as u64
+            );
+
+            // Without a backed StackLimit the query is refused, never zeroed.
+            write_u64(&mut memory, teb + 0x10, 0);
+            assert_eq!(
+                dispatch_x64_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query,
+                    &[57, buffer, 0x2000, length_ptr]
+                ),
+                0xC000_00BB,
+                "an unbacked extended field is STATUS_NOT_SUPPORTED"
+            );
+            write_u64(&mut memory, teb + 0x10, stack_limit);
+
+            // The x86 guest uses the real 32-bit extended layout (verified
+            // below), never the x64 layout with truncated pointers.
+            let (mut x86, _temp_two) = test_runtime("extended-process-info-x86");
+            let mut x86_memory = MemoryImage::default();
+            let x86_query = x86.alloc_host_thunk(HostThunk::NtQuerySystemInformation);
+
+            // The plain class still reports the x86 TEB stack bounds and the
+            // real pending-thread table (both x86 and pending branches).
+            let x86_teb = 0x70_000u64;
+            let main_limit = 0x8000u64;
+            let main_base = 0x9000u64;
+            x86_memory.map_bytes(x86_teb, &[0u8; 0x100]);
+            write_u32(&mut x86_memory, x86_teb + 0x04, main_base as u32);
+            write_u32(&mut x86_memory, x86_teb + 0x08, main_limit as u32);
+            x86.teb_base = x86_teb;
+            let pending_teb = 0x71_000u64;
+            x86_memory.map_bytes(pending_teb, &[0u8; 0x100]);
+            write_u32(&mut x86_memory, pending_teb + 0x04, 0xA000);
+            write_u32(&mut x86_memory, pending_teb + 0x08, 0x9000);
+            let mut pending_state = CpuState::new(GuestArch::X86);
+            pending_state.set(Register::Rsp, 0x9F00);
+            x86.pending_guest_threads.push_back(PendingGuestThread {
+                handle: 0x44,
+                thread_id: 2,
+                start_address: 0x401000,
+                parameter: 0,
+                initial_rsp: 0x9F00,
+                started: false,
+                suspended: 0,
+                wake_tick: 0,
+                teb_base: pending_teb,
+                tls_vector_ptr: 0,
+                tls_slots: BTreeMap::new(),
+                fls_slots: BTreeMap::new(),
+                state: pending_state,
+                state_machine: GuestThreadState::Runnable,
+                exit_code_override: None,
+                wait: None,
+                wait_resume: None,
+            });
+            x86_memory.map_bytes(buffer, &[0u8; 0x2000]);
+            x86_memory.map_bytes(length_ptr, &[0u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut x86,
+                    &mut x86_memory,
+                    x86_query,
+                    &[5, buffer as u32, 0x2000, length_ptr as u32]
+                ),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            let mut entry = 0u64;
+            loop {
+                if x86_memory.read_u64(buffer + entry + 0x50).expect("pid")
+                    == u64::from(x86.guest_pid)
+                {
+                    break;
+                }
+                let next = x86_memory.read_u32(buffer + entry).expect("next") as u64;
+                assert_ne!(next, 0, "the guest process must be in the array");
+                entry += next;
+            }
+            assert_eq!(
+                x86_memory
+                    .read_u32(buffer + entry + 4)
+                    .expect("thread count"),
+                2,
+                "the main and pending threads are both real"
+            );
+
+            // SystemExtendedProcessInformation(57) on x86: the 32-bit ABI has
+            // a 0xB8-byte fixed process record and 0x60-byte extended thread
+            // records; the extended tail carries the real x86 stack bounds and
+            // TEB, and the ImageName pointer is a 32-bit guest pointer.
+            x86_memory.map_bytes(buffer, &[0u8; 0x2000]);
+            x86_memory.map_bytes(length_ptr, &[0u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut x86,
+                    &mut x86_memory,
+                    x86_query,
+                    &[57, buffer as u32, 0x2000, length_ptr as u32]
+                ),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            let extended_len = x86_memory.read_u32(length_ptr).expect("required") as usize;
+            assert!(extended_len >= 0xB8 + 2 * 0x60);
+            let mut entry = 0u64;
+            loop {
+                if x86_memory.read_u32(buffer + entry + 0x44).expect("pid") == x86.guest_pid {
+                    break;
+                }
+                let next = x86_memory.read_u32(buffer + entry).expect("next") as u64;
+                assert_ne!(next, 0, "the guest process must be in the x86 array");
+                entry += next;
+            }
+            assert_eq!(
+                x86_memory
+                    .read_u32(buffer + entry + 4)
+                    .expect("thread count"),
+                2
+            );
+            assert_eq!(
+                x86_memory
+                    .read_u32(buffer + entry + 0xB8 + 0x40)
+                    .expect("stack base"),
+                main_base as u32
+            );
+            assert_eq!(
+                x86_memory
+                    .read_u32(buffer + entry + 0xB8 + 0x44)
+                    .expect("stack limit"),
+                main_limit as u32
+            );
+            assert_eq!(
+                x86_memory
+                    .read_u32(buffer + entry + 0xB8 + 0x4C)
+                    .expect("teb"),
+                x86_teb as u32
+            );
+            assert_eq!(
+                x86_memory
+                    .read_u32(buffer + entry + 0xB8 + 0x24)
+                    .expect("thread id"),
+                x86.win32.current_thread_id()
+            );
+            assert_eq!(
+                x86_memory
+                    .read_u32(buffer + entry + 0xB8 + 0x60 + 0x40)
+                    .expect("pending stack base"),
+                0xA000
+            );
+            assert_eq!(
+                x86_memory
+                    .read_u32(buffer + entry + 0xB8 + 0x60 + 0x44)
+                    .expect("pending stack limit"),
+                0x9000
+            );
+            assert_eq!(
+                x86_memory
+                    .read_u32(buffer + entry + 0xB8 + 0x60 + 0x4C)
+                    .expect("pending teb"),
+                pending_teb as u32
+            );
+            let name_len = x86_memory
+                .read_u16(buffer + entry + 0x38)
+                .expect("name length");
+            let name_ptr = x86_memory
+                .read_u32(buffer + entry + 0x3C)
+                .expect("name ptr");
+            assert_eq!(
+                name_ptr as u64,
+                buffer + entry + 0xB8 + 2 * 0x60,
+                "the x86 ImageName.Buffer is the 32-bit in-buffer pointer"
+            );
+            assert_eq!(
+                name_len as usize,
+                x86.main_module_name.encode_utf16().count() * 2
+            );
+
+            // A short x86 buffer reports the exact 32-bit requirement.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut x86,
+                    &mut x86_memory,
+                    x86_query,
+                    &[57, buffer as u32, 0xB7, length_ptr as u32]
+                ),
+                u64::from(crate::ntdll::STATUS_INFO_LENGTH_MISMATCH.raw())
+            );
+            assert_eq!(
+                x86_memory.read_u32(length_ptr).expect("required"),
+                extended_len as u32
+            );
+
+            // An unbacked extended field is refused, never zeroed.
+            write_u32(&mut x86_memory, x86_teb + 0x08, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut x86,
+                    &mut x86_memory,
+                    x86_query,
+                    &[57, buffer as u32, 0x2000, length_ptr as u32]
+                ),
+                0xC000_00BB,
+                "an unbacked x86 extended field is STATUS_NOT_SUPPORTED"
+            );
+        })
+    }
+
+    #[test]
+    fn volume_information_rejects_invalid_handles_and_reports_the_real_volume() {
+        with_big_stack(|| {
+            let (mut runtime, _temp) = test_runtime("volume-information");
+            let mut memory = MemoryImage::default();
+            let thunk = runtime.alloc_host_thunk(HostThunk::NtQueryVolumeInformationFile);
+            let handle = runtime
+                .win32
+                .create_file_w(
+                    "C:\\volume-probe.bin",
+                    FileAccess::read_write(),
+                    ShareMode::all(),
+                    crate::win32::CreationDisposition::CreateAlways,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("create probe file");
+            let buffer = 0x6C_000u64;
+            let iosb = 0x6D_000u64;
+            memory.map_bytes(buffer, &[0u8; 0x200]);
+            memory.map_bytes(iosb, &[0u8; 24]);
+            let query = |runtime: &mut PeHostRuntime,
+                         memory: &mut MemoryImage,
+                         handle: u32,
+                         length: u32,
+                         class: u32|
+             -> u64 {
+                dispatch_x86_thunk(
+                    runtime,
+                    memory,
+                    thunk,
+                    &[handle, iosb as u32, buffer as u32, length, class],
+                )
+            };
+
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0x200, 1),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            let identity = crate::hardware_identity::host_identity();
+            let disk = identity.disks.first().expect("mounted volume");
+            assert_eq!(
+                memory.read_u32(buffer + 8).expect("serial"),
+                disk.volume_serial,
+                "FileFsVolumeInformation serial is the identity serial"
+            );
+            assert_ne!(
+                memory.read_u64(buffer).expect("creation time"),
+                0,
+                "FileFsVolumeInformation carries the real host volume creation time"
+            );
+            assert_eq!(
+                memory.read_u8(buffer + 16).expect("supports objects"),
+                1,
+                "the volume holds real file objects"
+            );
+            let label_len = memory.read_u32(buffer + 12).expect("label length");
+            assert_eq!(
+                label_len as usize,
+                disk.volume_name.encode_utf16().count() * 2
+            );
+            let label: Vec<u16> = memory
+                .read_bytes(buffer + 20, label_len as usize)
+                .expect("label")
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            assert_eq!(String::from_utf16(&label).unwrap(), disk.volume_name);
+
+            let capacity = runtime
+                .win32
+                .volume_capacity(Some("C:\\volume-probe.bin"))
+                .expect("volume capacity");
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0x200, 3),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert_eq!(
+                memory.read_u64(buffer).expect("total clusters"),
+                capacity.total_clusters
+            );
+            assert_eq!(
+                memory.read_u64(buffer + 8).expect("free clusters"),
+                capacity.free_clusters
+            );
+            assert_eq!(
+                memory.read_u32(buffer + 16).expect("sectors"),
+                capacity.sectors_per_cluster
+            );
+            assert_eq!(
+                memory.read_u32(buffer + 20).expect("bytes/sector"),
+                capacity.bytes_per_sector
+            );
+
+            // Every query class the surface implements is backed by the
+            // SAME host volume facts (no per-class fabricated variants).
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0x200, 4),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert_eq!(memory.read_u32(buffer).expect("device type"), 7);
+            assert_ne!(
+                memory.read_u32(buffer + 4).expect("characteristics") & 0x10,
+                0,
+                "the volume is mounted"
+            );
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0x200, 5),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            let fs_name_len = memory.read_u32(buffer + 8).expect("fs name length");
+            let fs_name: Vec<u16> = memory
+                .read_bytes(buffer + 12, fs_name_len as usize)
+                .expect("fs name")
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            assert_eq!(String::from_utf16(&fs_name).unwrap(), disk.filesystem);
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0x200, 7),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert_eq!(
+                memory.read_u64(buffer).expect("total"),
+                capacity.total_clusters
+            );
+            assert_eq!(
+                memory.read_u64(buffer + 8).expect("available"),
+                capacity.free_clusters
+            );
+            assert_eq!(
+                memory.read_u64(buffer + 16).expect("caller available"),
+                capacity.free_clusters
+            );
+            assert_eq!(
+                memory.read_u32(buffer + 24).expect("sectors"),
+                capacity.sectors_per_cluster
+            );
+            assert_eq!(
+                memory.read_u32(buffer + 28).expect("bytes/sector"),
+                capacity.bytes_per_sector
+            );
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0x200, 8),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert_ne!(
+                memory.read_bytes(buffer, 16).expect("object id"),
+                vec![0_u8; 16],
+                "the volume object id is derived from the real volume UUID"
+            );
+            assert_ne!(
+                memory.read_bytes(buffer + 16, 48).expect("extended info"),
+                vec![0_u8; 48],
+                "the volume extended info is derived from the real volume UUID"
+            );
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0x200, 10),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert_eq!(memory.read_u32(buffer).expect("volume flags"), 0);
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0x200, 11),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert_eq!(
+                memory.read_u32(buffer).expect("logical sector"),
+                capacity.bytes_per_sector
+            );
+            assert_eq!(
+                memory.read_u32(buffer + 4).expect("physical sector"),
+                capacity.bytes_per_sector
+            );
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0x200, 2),
+                u64::from(crate::ntdll::STATUS_INVALID_INFO_CLASS.raw()),
+                "label information is set-only"
+            );
+
+            // Short buffer: exact requirement, no partial write.
+            memory.map_bytes(buffer, &[0xAAu8; 0x200]);
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0, 1),
+                u64::from(crate::ntdll::STATUS_INFO_LENGTH_MISMATCH.raw())
+            );
+            assert_eq!(memory.read_u32(iosb + 4).expect("required"), 20 + label_len);
+            assert_eq!(memory.read_u8(buffer).expect("untouched"), 0xAA);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    thunk,
+                    &[handle, iosb as u32, 0, 0x200, 3]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()),
+                "a null volume buffer is invalid"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    thunk,
+                    &[handle, 0, buffer as u32, 0x200, 3]
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()),
+                "a null IO_STATUS_BLOCK is invalid"
+            );
+
+            // Unknown handle / non-file object / unknown class are exact.
+            assert_eq!(
+                query(&mut runtime, &mut memory, 0xDEAD_BEEF, 0x200, 1),
+                u64::from(crate::ntdll::STATUS_INVALID_HANDLE.raw())
+            );
+            assert_eq!(
+                memory.read_u32(iosb).expect("iosb status"),
+                crate::ntdll::STATUS_INVALID_HANDLE.raw()
+            );
+            let (event, _) = runtime.win32.create_event(false, false, false, None);
+            assert_eq!(
+                query(&mut runtime, &mut memory, event, 0x200, 3),
+                u64::from(crate::ntdll::STATUS_OBJECT_TYPE_MISMATCH.raw())
+            );
+            assert_eq!(
+                query(&mut runtime, &mut memory, handle, 0x200, 99),
+                u64::from(crate::ntdll::STATUS_INVALID_INFO_CLASS.raw())
+            );
+
+            // GetVolumeInformationW and NtQueryVolumeInformationFile report
+            // the same identity serial for the same volume.
+            let get_volume = runtime.alloc_host_thunk(HostThunk::GetVolumeInformationW);
+            let root = runtime
+                .alloc_utf16_string(&mut memory, "C:\\")
+                .expect("root");
+            let serial_out = 0x6E_000u64;
+            memory.map_bytes(serial_out, &[0u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_volume,
+                    &[root as u32, 0, 0, serial_out as u32, 0, 0, 0, 0]
+                ),
+                1
+            );
+            assert_eq!(
+                memory.read_u32(serial_out).expect("win32 serial"),
+                disk.volume_serial
+            );
+        })
+    }
+
+    #[test]
+    fn volume_identity_refuses_unpublished_fields_and_derives_stable_object_ids() {
+        let disk = crate::hardware_identity::DiskIdentity {
+            volume_serial: 0x1234_5678,
+            volume_uuid: "00D62C37-D88C-4508-B0E9-E51BD77CBE88".to_string(),
+            volume_name: "Casa".to_string(),
+            filesystem: "APFS".to_string(),
+            ..Default::default()
+        };
+
+        // A genuinely unpublished creation time is refused, never zeroed.
+        assert_eq!(
+            PeHostRuntime::serialize_file_fs_volume_information(&disk, None)
+                .expect_err("creation time absent")
+                .raw(),
+            crate::ntdll::STATUS_NOT_SUPPORTED.raw()
+        );
+        let volume =
+            PeHostRuntime::serialize_file_fs_volume_information(&disk, Some(0x01D0_0000_0000_0000))
+                .expect("published creation time");
+        assert_eq!(
+            u64::from_le_bytes(volume[0..8].try_into().expect("creation")),
+            0x01D0_0000_0000_0000
+        );
+        assert_eq!(
+            u32::from_le_bytes(volume[8..12].try_into().expect("serial")),
+            disk.volume_serial
+        );
+
+        // The object id and extended info are deterministic, UUID-specific
+        // and never zero.
+        let first =
+            PeHostRuntime::serialize_file_fs_object_id_information(&disk).expect("published uuid");
+        let second =
+            PeHostRuntime::serialize_file_fs_object_id_information(&disk).expect("published uuid");
+        assert_eq!(first, second);
+        assert_ne!(first[0..16], [0_u8; 16]);
+        assert_ne!(first[16..64], [0_u8; 48]);
+        let other = crate::hardware_identity::DiskIdentity {
+            volume_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            ..disk.clone()
+        };
+        assert_ne!(
+            first,
+            PeHostRuntime::serialize_file_fs_object_id_information(&other).expect("published uuid")
+        );
+
+        // An unpublished UUID is refused, never a zeroed object id.
+        let no_uuid = crate::hardware_identity::DiskIdentity {
+            volume_uuid: String::new(),
+            ..disk
+        };
+        assert_eq!(
+            PeHostRuntime::serialize_file_fs_object_id_information(&no_uuid)
+                .expect_err("uuid absent")
+                .raw(),
+            crate::ntdll::STATUS_NOT_SUPPORTED.raw()
+        );
+
+        // A host that cannot publish a birth time is an exact refusal.
+        assert_eq!(
+            PeHostRuntime::host_volume_creation_time_ticks(std::path::Path::new(
+                "/casa1/does/not/exist"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn iat_patch_repatch_unpatch_and_unload_are_exact() {
+        let (mut runtime, _temp) = test_runtime("iat-patch-exact");
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        let base = 0x40_0000u64;
+        let rva = 0x1000u32;
+        let slot = base + u64::from(rva);
+        memory.map_bytes(base, &[0u8; 0x2000]);
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetLastError);
+        write_guest_pointer(&mut memory, slot, thunk, GuestArch::X64).expect("seed IAT");
+        let handle = runtime.get_or_create_module_handle("kernel32.dll");
+        let import = ResolvedImport {
+            requested_module: "kernel32.dll".to_string(),
+            resolved_module: "kernel32.dll".to_string(),
+            symbol: crate::pe::ImportSymbol::ByName {
+                hint: 0,
+                name: "GetLastError".to_string(),
+            },
+            iat_rva: rva,
+            export: ExportSymbol {
+                ordinal: 0,
+                name: Some("GetLastError".to_string()),
+                target: ExportTarget::Rva(0),
+            },
+        };
+        runtime.record_iat_bindings(base, &mut memory, &[import]);
+        assert_eq!(runtime.iat_metrics().patched, 1);
+        assert_eq!(runtime.iat_metrics().iat_patched, 1);
+        assert_eq!(
+            runtime
+                .iat_patches
+                .entry(slot)
+                .map(|entry| entry.patched_value),
+            Some(thunk)
+        );
+        assert_eq!(
+            read_guest_pointer(&memory, slot, GuestArch::X64).expect("read IAT"),
+            thunk
+        );
+
+        let replacement = runtime.alloc_host_thunk(HostThunk::SetLastError);
+        assert_eq!(
+            runtime
+                .re_resolve_iat_thunk(thunk, replacement, &mut memory)
+                .expect("repatch"),
+            1
+        );
+        assert_eq!(
+            read_guest_pointer(&memory, slot, GuestArch::X64).expect("read IAT"),
+            replacement
+        );
+        assert_eq!(runtime.iat_metrics().repatched, 1);
+
+        // Guest writes win: a slot the guest changed is not clobbered by a
+        // later thunk replacement.
+        write_guest_pointer(&mut memory, slot, 0xDEAD_BEEF, GuestArch::X64).expect("guest write");
+        assert_eq!(
+            runtime
+                .re_resolve_iat_thunk(replacement, thunk, &mut memory)
+                .expect("repatch"),
+            0
+        );
+        assert_eq!(
+            read_guest_pointer(&memory, slot, GuestArch::X64).expect("read IAT"),
+            0xDEAD_BEEF
+        );
+        // Restore the tracked value for the unload path.
+        write_guest_pointer(&mut memory, slot, replacement, GuestArch::X64).expect("restore IAT");
+
+        assert_eq!(
+            runtime
+                .invalidate_module_iat(handle, &mut memory)
+                .expect("invalidate"),
+            1
+        );
+        let rearmed = read_guest_pointer(&memory, slot, GuestArch::X64).expect("read rearmed IAT");
+        assert_ne!(rearmed, replacement);
+        assert_eq!(runtime.iat_patches.entry(slot).is_none(), true);
+        assert_eq!(runtime.iat_metrics().invalidated, 1);
+    }
+
+    #[test]
+    fn iat_dispatch_bypass_counter_is_exact_and_reset_by_unpatch() {
+        let mut table = IatPatchTable::default();
+        let entry = IatPatchEntry {
+            slot_va: 0x4000,
+            selected_base: 0x4000,
+            iat_rva: 0,
+            module: "kernel32.dll".to_string(),
+            symbol: crate::pe::ImportSymbol::ByName {
+                hint: 0,
+                name: "GetTickCount64".to_string(),
+            },
+            bound_value: 0xABC,
+            patched_value: 0xABC,
+            module_handle: 7,
+        };
+        assert_eq!(table.patch(entry.clone()), true);
+        assert_eq!(table.patch(entry), false, "idempotent re-record");
+        assert_eq!(table.record_dispatch(0xABC), true);
+        assert_eq!(table.record_dispatch(0xABC), true);
+        assert_eq!(table.record_dispatch(0x999), false);
+        assert_eq!(table.metrics().dispatch_bypasses, 2);
+        assert_eq!(table.metrics().iat_dispatch_bypasses, 2);
+        let removed = table.unpatch(0x4000).expect("unpatch");
+        assert_eq!(removed.patched_value, 0xABC);
+        assert_eq!(table.record_dispatch(0xABC), false);
+        assert_eq!(table.metrics().dispatch_bypasses, 2);
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn iat_patch_table_concurrent_patch_and_unpatch_has_no_race() {
+        use std::sync::{Arc, Mutex};
+        let table = Arc::new(Mutex::new(IatPatchTable::default()));
+        let mut threads = Vec::new();
+        for index in 0..8u64 {
+            let table = Arc::clone(&table);
+            threads.push(std::thread::spawn(move || {
+                table.lock().expect("lock").patch(IatPatchEntry {
+                    slot_va: 0x4000 + index,
+                    selected_base: 0x4000,
+                    iat_rva: index as u32,
+                    module: "kernel32.dll".to_string(),
+                    symbol: crate::pe::ImportSymbol::ByName {
+                        hint: 0,
+                        name: format!("fn{index}"),
+                    },
+                    bound_value: index + 1,
+                    patched_value: index + 1,
+                    module_handle: 1,
+                });
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("patch thread");
+        }
+        assert_eq!(table.lock().expect("lock").len(), 8);
+        assert_eq!(table.lock().expect("lock").metrics().patched, 8);
+
+        let mut threads = Vec::new();
+        for index in 0..8u64 {
+            let table = Arc::clone(&table);
+            threads.push(std::thread::spawn(move || {
+                table
+                    .lock()
+                    .expect("lock")
+                    .unpatch(0x4000 + index)
+                    .expect("entry");
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("unpatch thread");
+        }
+        assert_eq!(table.lock().expect("lock").len(), 0);
+        assert_eq!(table.lock().expect("lock").metrics().patched, 8);
+    }
+
+    #[test]
+    fn inlined_api_semantics_match_dispatch_no_mismatch() {
+        let (mut runtime, _temp) = test_runtime("inline-api");
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x5000, &[0u8; 0x100]);
+        memory.map_bytes(0x6000, &[0u8; 0x100]);
+        let mut state = CpuState::new(GuestArch::X64);
+        crate::jit::reset_inline_api_metrics();
+
+        let call_inline = |runtime: &mut PeHostRuntime,
+                           state: &mut CpuState,
+                           memory: &mut MemoryImage,
+                           api: crate::jit::InlineApi| {
+            unsafe {
+                crate::jit::jit_helper_inline_api(
+                    runtime as *mut PeHostRuntime as *mut libc::c_void,
+                    state as *mut CpuState,
+                    memory as *mut MemoryImage,
+                    api.index() as u64,
+                    0,
+                )
+            }
+        };
+
+        // SetLastError / GetLastError.
+        state.set(Register::Rcx, 0x2222);
+        assert_eq!(
+            call_inline(
+                &mut runtime,
+                &mut state,
+                &mut memory,
+                crate::jit::InlineApi::SetLastError
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, 0x2222);
+        state.set(Register::Rcx, 0);
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::GetLastError,
+        );
+        assert_eq!(state.get(Register::Rax), 0x2222);
+
+        // TID / PID.
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::GetCurrentThreadId,
+        );
+        assert_eq!(
+            state.get(Register::Rax),
+            u64::from(runtime.win32.current_thread_id())
+        );
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::GetCurrentProcessId,
+        );
+        assert_eq!(
+            state.get(Register::Rax),
+            u64::from(runtime.win32.current_process_id())
+        );
+
+        // QPC monotonicity and tick coherence against the shared monotonic
+        // clock.
+        state.set(Register::Rcx, 0x5000);
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::QueryPerformanceCounter,
+        );
+        assert_eq!(state.get(Register::Rax), 1);
+        let first = memory.read_u64(0x5000).expect("first qpc");
+        state.set(Register::Rcx, 0x5000);
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::QueryPerformanceCounter,
+        );
+        let second = memory.read_u64(0x5000).expect("second qpc");
+        assert!(first > 0);
+        assert!(second >= first);
+        let tick = runtime.anticheat.clock.tick_count64();
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::GetTickCount64,
+        );
+        assert_eq!(state.get(Register::Rax), tick);
+
+        // Interlocked fast paths, pinned to the exact atomic semantics.
+        memory.write_u32(0x6000, 5);
+        state.set(Register::Rcx, 0x6000);
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::InterlockedIncrement,
+        );
+        assert_eq!(state.get(Register::Rax), 6);
+        assert_eq!(memory.read_u32(0x6000).expect("counter"), 6);
+        state.set(Register::Rcx, 0x6000);
+        state.set(Register::Rdx, 9);
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::InterlockedExchange,
+        );
+        assert_eq!(state.get(Register::Rax), 6);
+        assert_eq!(memory.read_u32(0x6000).expect("counter"), 9);
+
+        // SRW fast paths.
+        state.set(Register::Rcx, 0x7000);
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::InitializeSRWLock,
+        );
+        state.set(Register::Rcx, 0x7000);
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::AcquireSRWLockExclusive,
+        );
+        state.set(Register::Rcx, 0x7000);
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::ReleaseSRWLockExclusive,
+        );
+        state.set(Register::Rcx, 0x7000);
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::TryAcquireSRWLockShared,
+        );
+        assert_eq!(state.get(Register::Rax), 1);
+        state.set(Register::Rcx, 0x7000);
+        let _ = call_inline(
+            &mut runtime,
+            &mut state,
+            &mut memory,
+            crate::jit::InlineApi::ReleaseSRWLockShared,
+        );
+
+        let metrics = crate::jit::inline_api_metrics();
+        assert_eq!(
+            metrics.per_api[crate::jit::InlineApi::SetLastError.index()],
+            1
+        );
+        assert_eq!(
+            metrics.per_api[crate::jit::InlineApi::GetLastError.index()],
+            1
+        );
+        assert_eq!(
+            metrics.per_api[crate::jit::InlineApi::QueryPerformanceCounter.index()],
+            2
+        );
+        assert_eq!(
+            metrics.per_api[crate::jit::InlineApi::GetTickCount64.index()],
+            1
+        );
+    }
+
+    #[test]
+    fn jit_inlined_api_call_site_matches_dispatch_no_mismatch() {
+        let (mut runtime, _temp) = test_runtime("jit-inline-site");
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut jit = crate::jit::JitRuntime::new(GuestArch::X64);
+        crate::jit::register_inline_api_target(0x8000, crate::jit::InlineApi::GetCurrentThreadId);
+        let ir = vec![
+            crate::cpu::IrInstruction::Call {
+                target: 0x8000,
+                return_address: 0x1006,
+            },
+            crate::cpu::IrInstruction::Jump { target: 0x9999 },
+        ];
+        let block = jit
+            .get_or_compile_at_tier(
+                &ir,
+                0x1000,
+                GuestArch::X64,
+                crate::jit::CompilationTier::Tier0,
+                None,
+            )
+            .expect("compile inline call site")
+            .clone();
+        let mut state = CpuState::new(GuestArch::X64);
+        state.rip = 0x1000;
+        let mut memory = MemoryImage::default();
+        let api = crate::jit::InlineApi::GetCurrentThreadId.index();
+        let before = crate::jit::inline_api_metrics().per_api[api];
+        crate::jit::set_pe_runtime_pointer(&mut runtime as *mut PeHostRuntime as *mut libc::c_void);
+        let _ = unsafe { jit.execute_block(&block, &mut state, &mut memory) };
+        crate::jit::set_pe_runtime_pointer(std::ptr::null_mut());
+        let after = crate::jit::inline_api_metrics().per_api[api];
+        assert_eq!(after, before + 1);
+        assert_eq!(
+            state.get(Register::Rax),
+            u64::from(runtime.win32.current_thread_id())
+        );
+    }
+
+    #[test]
+    fn inlined_api_x86_stack_args_preserve_rsp_no_mismatch() {
+        let (mut runtime, _temp) = test_runtime("inline-api-x86");
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1_0000, &[0u8; 0x100]);
+        memory.write_u32(0x1_0000, 0x1234);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, 0x1_0000);
+        let sp_before = state.get(Register::Rsp);
+        unsafe {
+            crate::jit::jit_helper_inline_api(
+                &mut runtime as *mut PeHostRuntime as *mut libc::c_void,
+                &mut state as *mut CpuState,
+                &mut memory as *mut MemoryImage,
+                crate::jit::InlineApi::SetLastError.index() as u64,
+                0,
+            );
+        }
+        assert_eq!(runtime.last_error, 0x1234);
+        assert_eq!(state.get(Register::Rsp), sp_before);
+    }
 }
 
 fn read_d3d12_command_queue_desc(
@@ -122536,10 +113186,11 @@ fn build_dxgi_adapter_desc_bytes(
         let offset = index * 2;
         bytes[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
     }
+    let gpu_identity = &crate::hardware_identity::host_identity().gpu;
     bytes[256..260].copy_from_slice(&adapter.vendor_id.to_le_bytes());
     bytes[260..264].copy_from_slice(&adapter.device_id.to_le_bytes());
-    bytes[264..268].copy_from_slice(&0_u32.to_le_bytes());
-    bytes[268..272].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[264..268].copy_from_slice(&gpu_identity.subsys_id.to_le_bytes());
+    bytes[268..272].copy_from_slice(&gpu_identity.revision.to_le_bytes());
     let dedicated_video_memory = if unified_memory {
         0_u64
     } else {
@@ -122554,8 +113205,10 @@ fn build_dxgi_adapter_desc_bytes(
     bytes[272..280].copy_from_slice(&dedicated_video_memory.to_le_bytes());
     bytes[280..288].copy_from_slice(&dedicated_system_memory.to_le_bytes());
     bytes[288..296].copy_from_slice(&shared_system_memory.to_le_bytes());
-    bytes[296..300].copy_from_slice(&adapter.device_id.to_le_bytes());
-    bytes[300..304].copy_from_slice(&adapter.vendor_id.to_le_bytes());
+    // AdapterLuid: the same LUID the D3DKMT surface reports, derived from the
+    // real Metal registryID + device name, so DXGI and D3DKMT agree.
+    bytes[296..300].copy_from_slice(&gpu_identity.luid_low.to_le_bytes());
+    bytes[300..304].copy_from_slice(&(gpu_identity.luid_high as u32).to_le_bytes());
     if extended {
         bytes[304..308].copy_from_slice(&0_u32.to_le_bytes());
     }
@@ -125717,11 +116370,11 @@ fn write_utf16_fixed(memory: &mut MemoryImage, address: u64, capacity: usize, va
     memory.map_bytes(address, &bytes);
 }
 
-fn write_u32(memory: &mut MemoryImage, address: u64, value: u32) {
+pub(crate) fn write_u32(memory: &mut MemoryImage, address: u64, value: u32) {
     memory.map_bytes(address, &value.to_le_bytes());
 }
 
-fn write_u64(memory: &mut MemoryImage, address: u64, value: u64) {
+pub(crate) fn write_u64(memory: &mut MemoryImage, address: u64, value: u64) {
     memory.write_u64(address, value);
 }
 
@@ -125782,7 +116435,7 @@ fn read_guest_utf16_string(memory: &MemoryImage, ptr: u64, length: i32) -> Strin
 
 /// Resolved pen properties for one drawing call (device-pixel width).
 #[derive(Debug, Clone, Copy)]
-struct GdiplusStrokeStyle {
+pub(crate) struct GdiplusStrokeStyle {
     color: u32,
     width_px: f32,
     dash: u32,
@@ -125816,14 +116469,14 @@ enum GdiplusTargetKind {
 }
 
 #[derive(Debug, Clone)]
-struct GdiplusGraphicsInfo {
+pub(crate) struct GdiplusGraphicsInfo {
     target: Option<GdiplusTargetKind>,
     state: GdiplusRenderState,
 }
 
 /// A decoded GpRegion reference: the infinite region, a rectangle, or a real
 /// scanned region (character-range output / path clip).
-enum GdiplusDecodedRegion {
+pub(crate) enum GdiplusDecodedRegion {
     Infinite,
     Rect((f32, f32, f32, f32)),
     Scanned(Box<crate::user32::GdiplusRegion>),
@@ -127063,7 +117716,7 @@ fn read_guest_pointer(memory: &MemoryImage, address: u64, arch: GuestArch) -> Ap
     }
 }
 
-fn write_guest_pointer(
+pub(crate) fn write_guest_pointer(
     memory: &mut MemoryImage,
     address: u64,
     value: u64,
@@ -127095,7 +117748,11 @@ fn write_guest_pointer(
     }
 }
 
-fn guest_call_arg(state: &CpuState, memory: &MemoryImage, index: usize) -> AppResult<u64> {
+pub(crate) fn guest_call_arg(
+    state: &CpuState,
+    memory: &MemoryImage,
+    index: usize,
+) -> AppResult<u64> {
     match state.arch {
         GuestArch::X64 => match index {
             0 => Ok(state.get(Register::Rcx)),
@@ -134114,6 +124771,46 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                     ordinal: 69,
                     name: Some("NtUnloadDriver".to_string()),
                     target: ExportTarget::Rva(0x2740),
+                },
+                ExportSymbol {
+                    ordinal: 70,
+                    name: Some("NtOpenDirectoryObject".to_string()),
+                    target: ExportTarget::Rva(0x2750),
+                },
+                ExportSymbol {
+                    ordinal: 71,
+                    name: Some("NtQueryDirectoryObject".to_string()),
+                    target: ExportTarget::Rva(0x2760),
+                },
+                ExportSymbol {
+                    ordinal: 72,
+                    name: Some("NtQueryVolumeInformationFile".to_string()),
+                    target: ExportTarget::Rva(0x2770),
+                },
+                ExportSymbol {
+                    ordinal: 73,
+                    name: Some("NtAttestationChallenge".to_string()),
+                    target: ExportTarget::Rva(0x2780),
+                },
+                ExportSymbol {
+                    ordinal: 74,
+                    name: Some("NtAttestationQuote".to_string()),
+                    target: ExportTarget::Rva(0x2790),
+                },
+                ExportSymbol {
+                    ordinal: 75,
+                    name: Some("NtAttestationVerify".to_string()),
+                    target: ExportTarget::Rva(0x27A0),
+                },
+                ExportSymbol {
+                    ordinal: 76,
+                    name: Some("NtAttestationEnrollProvider".to_string()),
+                    target: ExportTarget::Rva(0x27B0),
+                },
+                ExportSymbol {
+                    ordinal: 77,
+                    name: Some("NtAttestationRevokeProvider".to_string()),
+                    target: ExportTarget::Rva(0x27C0),
                 },
                 ExportSymbol {
                     ordinal: 99,

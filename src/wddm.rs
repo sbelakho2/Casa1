@@ -1397,6 +1397,19 @@ impl WddmSubsystem {
         Ok(())
     }
 
+    /// Reset the shared test facade between unit tests (adapters, handles,
+    /// statistics and PnP state).  Production never calls this.
+    #[cfg(test)]
+    pub fn reset_for_tests(&self) {
+        let fresh = Self::with_metal_devices(metal::Device::all());
+        let fresh_state = std::mem::replace(&mut *fresh.state(), WddmState::new());
+        *self.state() = fresh_state;
+        *self
+            .pnp_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
     /// Install the driver island's KMDF `EvtDeviceD0Entry`/`D0Exit` sink.
     ///
     /// The hook is delivered for every real D0 transition (PnP start/stop or

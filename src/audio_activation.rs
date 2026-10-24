@@ -1822,6 +1822,28 @@ impl AudioClientState {
                 if system > 0 {
                     return system.min(self.buffer_frames.max(1));
                 }
+                // No host system audio yet: this runtime's own render frames
+                // are the immediate loopback source.
+                let rate = self
+                    .format
+                    .as_ref()
+                    .map(|format| format.sample_rate)
+                    .unwrap_or(self.device.sample_rate);
+                let channels = self
+                    .format
+                    .as_ref()
+                    .map(|format| format.channels)
+                    .unwrap_or(self.device.channels);
+                let internal = loopback_available_frames(
+                    pid,
+                    &self.device.key,
+                    self.loopback_cursor,
+                    rate,
+                    channels,
+                );
+                if internal > 0 {
+                    return internal.min(self.buffer_frames.max(1));
+                }
                 let available = self
                     .capture_arrived_frames(now)
                     .saturating_sub(self.capture_consumed_frames);
@@ -4098,15 +4120,31 @@ pub(crate) fn capture_get_buffer(pid: u32, service_object: u64) -> Result<Captur
                 source = backend.read_system_loopback_data_for(&state.device.key);
             }
         }
-        let (samples, real_frames) = convert_loopback_frames(
-            &source,
-            source_channels,
-            source_rate,
-            format.channels,
-            format.sample_rate,
-            frames,
-        );
-        (samples, real_frames as usize)
+        if source.is_empty() {
+            // The host tap has not produced frames yet; serve this runtime's
+            // own render frames as the loopback source.
+            let mut cursor = state.loopback_cursor;
+            let (samples, real_frames) = loopback_take_frames(
+                pid,
+                &state.device.key,
+                &mut cursor,
+                format.channels,
+                format.sample_rate,
+                frames,
+            );
+            state.loopback_cursor = cursor;
+            (samples, real_frames as usize)
+        } else {
+            let (samples, real_frames) = convert_loopback_frames(
+                &source,
+                source_channels,
+                source_rate,
+                format.channels,
+                format.sample_rate,
+                frames,
+            );
+            (samples, real_frames as usize)
+        }
     } else if state.loopback {
         let mut cursor = state.loopback_cursor;
         let (samples, real_frames) = loopback_take_frames(

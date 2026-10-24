@@ -87,6 +87,9 @@ const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 /// First handle value minted for an island device namespace open.  This range
 /// is disjoint from the canonical Win32 handle table values.
 const DEVICE_HANDLE_BASE: u32 = 0x7C00_0000;
+/// First handle value minted for an island directory-object open.  This range
+/// is disjoint from both the Win32 handle table and the island device range.
+const DIRECTORY_HANDLE_BASE: u32 = 0x7D00_0000;
 /// `SERVICE_BOOT_START`.
 const SERVICE_BOOT_START: u32 = 0;
 /// `SERVICE_SYSTEM_START`.
@@ -130,6 +133,30 @@ struct IslandDeviceHandle {
     device_id: ObjectId,
 }
 
+/// The crate-visible view of the live island namespace: the loaded driver
+/// islands, every live device they created and every symbolic link they
+/// installed.  Directory-object enumeration is built from this view, so it
+/// always matches the real loaded/removed driver state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IslandNamespace {
+    /// Loaded driver/service names (`\Driver\<name>` entries).
+    pub(crate) drivers: Vec<String>,
+    /// Live device object paths (`\Device\<name>`).
+    pub(crate) devices: Vec<String>,
+    /// Live device object path to the driver that created it, used to
+    /// enumerate the real objects under `\Driver\<name>`.
+    pub(crate) device_drivers: Vec<(String, String)>,
+    /// Live symbolic links as `(link, target)` pairs.
+    pub(crate) symbolic_links: Vec<(String, String)>,
+}
+
+/// A real directory-object handle minted by `NtOpenDirectoryObject`.
+#[derive(Debug, Clone)]
+struct IslandDirectoryHandle {
+    /// Canonical directory path (`\Device`, `\Driver`, `\GLOBAL??`, `\??`).
+    path: String,
+}
+
 /// The island registry of one runtime.  `Rc`-backed island state is not
 /// `Send`, but a runtime itself is single-host-threaded (the guest "threads"
 /// are emulated contexts), so the mutex serializes registry access and the
@@ -147,6 +174,8 @@ struct IslandRegistry {
     services: BTreeMap<usize, BTreeMap<String, SharedIsland>>,
     device_handles: BTreeMap<usize, BTreeMap<u32, IslandDeviceHandle>>,
     next_device_handle: BTreeMap<usize, u32>,
+    directory_handles: BTreeMap<usize, BTreeMap<u32, IslandDirectoryHandle>>,
+    next_directory_handle: BTreeMap<usize, u32>,
 }
 
 fn island_registry() -> &'static Mutex<IslandRegistry> {
@@ -1516,7 +1545,6 @@ impl DriverIsland {
     /// invoke the driver's real `MajorFunction` guest code with the guest IRP
     /// pointer.  Returns `(NTSTATUS, Information)`.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_irp(
         &self,
         runtime: &mut PeHostRuntime,
@@ -1821,7 +1849,6 @@ fn io_stack_location_size(arch: GuestArch) -> usize {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn build_guest_irp(
     memory: &mut MemoryImage,
@@ -5797,6 +5824,249 @@ pub(crate) fn is_island_device_handle(runtime: &PeHostRuntime, handle: u32) -> b
         .is_some_and(|handles| handles.contains_key(&handle))
 }
 
+/// The live island namespace for `runtime`: loaded drivers, their live device
+/// objects and their symbolic links.  This is the crate-visible accessor the
+/// NT directory-object surface enumerates.
+pub(crate) fn island_namespace(runtime: &PeHostRuntime) -> IslandNamespace {
+    let runtime_id = runtime_identity(runtime);
+    let registry = lock_registry();
+    let mut namespace = IslandNamespace::default();
+    for island in registry
+        .services
+        .get(&runtime_id)
+        .into_iter()
+        .flat_map(|services| services.values())
+    {
+        let state = island.0.inner.borrow();
+        namespace.drivers.push(state.driver_name.clone());
+        for device in &state.devices {
+            if !device.deleted && !device.name.is_empty() {
+                namespace.devices.push(device.name.clone());
+                namespace
+                    .device_drivers
+                    .push((device.name.clone(), state.driver_name.clone()));
+            }
+        }
+        namespace
+            .symbolic_links
+            .extend(state.symbolic_links.iter().cloned());
+    }
+    namespace.drivers.sort();
+    namespace.drivers.dedup();
+    namespace.devices.sort();
+    namespace.devices.dedup();
+    namespace.device_drivers.sort();
+    namespace.device_drivers.dedup();
+    namespace.symbolic_links.sort();
+    namespace.symbolic_links.dedup();
+    namespace
+}
+
+/// Normalize an object-directory path: `/` to `\`, trailing separators
+/// removed.  The root object directory stays a single `\`.
+fn normalize_directory_path(raw: &str) -> String {
+    let mut path = raw.trim_matches('\0').trim().replace('/', "\\");
+    if path.len() > 1 {
+        while path.ends_with('\\') {
+            path.pop();
+        }
+    }
+    path
+}
+
+/// Case-insensitive object-path prefix strip.
+fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
+}
+
+/// Canonicalize a directory-object path against the live island namespace.
+///
+/// The root object directory `\`, the four top-level directories and the
+/// per-device / per-driver subtrees are all resolved from real state:
+///
+/// - `\` enumerates the top-level directories;
+/// - `\Device` enumerates live device objects;
+/// - `\Device\<name>` matches a live device object exactly, or an existing
+///   parent of a deeper live device path (a real subtree);
+/// - `\Driver` enumerates loaded drivers;
+/// - `\Driver\<name>` matches a loaded driver case-insensitively.
+///
+/// A miss returns `None`; the caller decides between
+/// `STATUS_OBJECT_NAME_NOT_FOUND` (parent exists) and
+/// `STATUS_OBJECT_PATH_NOT_FOUND` (parent does not).
+pub(crate) fn canonical_directory_name(namespace: &IslandNamespace, raw: &str) -> Option<String> {
+    let path = normalize_directory_path(raw);
+    if path == "\\" {
+        return Some(path);
+    }
+    let upper = path.to_ascii_uppercase();
+    match upper.as_str() {
+        "\\DEVICE" => return Some("\\Device".to_string()),
+        "\\DRIVER" => return Some("\\Driver".to_string()),
+        "\\GLOBAL??" => return Some("\\GLOBAL??".to_string()),
+        "\\??" => return Some("\\??".to_string()),
+        _ => {}
+    }
+    if let Some(rest) = strip_prefix_ci(&path, "\\Device\\") {
+        if rest.is_empty() {
+            return Some("\\Device".to_string());
+        }
+        let prefix = format!("\\Device\\{rest}");
+        // An exact live device object is the canonical spelling the island
+        // registered.
+        if let Some(device) = namespace
+            .devices
+            .iter()
+            .find(|device| device.eq_ignore_ascii_case(&prefix))
+        {
+            return Some(device.clone());
+        }
+        // An intermediate segment of a deeper live device path is a real
+        // subtree even when no device object is registered at that path.
+        let child_prefix = format!("{prefix}\\");
+        if namespace
+            .devices
+            .iter()
+            .any(|device| strip_prefix_ci(device, &child_prefix).is_some())
+        {
+            return Some(prefix);
+        }
+        return None;
+    }
+    if let Some(rest) = strip_prefix_ci(&path, "\\Driver\\") {
+        if rest.is_empty() {
+            return Some("\\Driver".to_string());
+        }
+        return namespace
+            .drivers
+            .iter()
+            .find(|driver| driver.eq_ignore_ascii_case(rest))
+            .map(|driver| format!("\\Driver\\{driver}"));
+    }
+    None
+}
+
+/// The direct child name of `parent` in the full object path `full`, or
+/// `None` when `full` is not strictly under `parent`.
+fn direct_child_name(parent: &str, full: &str) -> Option<String> {
+    let rest = strip_prefix_ci(full, parent)?;
+    let rest = rest.strip_prefix('\\')?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(match rest.split_once('\\') {
+        Some((first, _)) => first.to_string(),
+        None => rest.to_string(),
+    })
+}
+
+/// The entries of one canonical directory object, as `(name, type_name)`
+/// pairs built from the live island registry.
+pub(crate) fn directory_entries(
+    namespace: &IslandNamespace,
+    directory: &str,
+) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    if directory == "\\" {
+        entries.push(("Device".to_string(), "Directory".to_string()));
+        entries.push(("Driver".to_string(), "Directory".to_string()));
+        entries.push(("GLOBAL??".to_string(), "Directory".to_string()));
+        entries.push(("??".to_string(), "SymbolicLink".to_string()));
+    } else if directory == "\\Device" {
+        for device in &namespace.devices {
+            if let Some(name) = direct_child_name("\\Device", device) {
+                entries.push((name, "Device".to_string()));
+            }
+        }
+    } else if directory == "\\Driver" {
+        for driver in &namespace.drivers {
+            entries.push((driver.clone(), "Driver".to_string()));
+        }
+    } else if strip_prefix_ci(directory, "\\Device\\").is_some() {
+        // Per-device subtree: real child device objects (deeper registered
+        // device paths) appear as the next path segment.
+        for device in &namespace.devices {
+            if device.eq_ignore_ascii_case(directory) {
+                continue;
+            }
+            if let Some(name) = direct_child_name(directory, device) {
+                entries.push((name, "Device".to_string()));
+            }
+        }
+    } else if let Some(driver_name) = strip_prefix_ci(directory, "\\Driver\\") {
+        // Per-driver subtree: the live device objects the driver created.
+        for (device, driver) in &namespace.device_drivers {
+            if !driver.eq_ignore_ascii_case(driver_name) {
+                continue;
+            }
+            if let Some(name) = direct_child_name("\\Device", device) {
+                entries.push((name, "Device".to_string()));
+            }
+        }
+    } else {
+        for (link, _) in &namespace.symbolic_links {
+            let name = strip_prefix_ci(link, "\\??\\")
+                .or_else(|| strip_prefix_ci(link, "\\DosDevices\\"))
+                .or_else(|| strip_prefix_ci(link, "\\GLOBAL??\\"));
+            if let Some(name) = name
+                && !name.is_empty()
+            {
+                entries.push((name.to_string(), "SymbolicLink".to_string()));
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    entries.retain(|(name, ty)| seen.insert((name.to_ascii_lowercase(), ty.clone())));
+    entries.sort();
+    entries
+}
+
+/// Mint a directory-object handle for an already-canonical directory name.
+pub(crate) fn open_directory_object(runtime: &PeHostRuntime, path: &str) -> u32 {
+    let runtime_id = runtime_identity(runtime);
+    let mut registry = lock_registry();
+    let counter = registry
+        .next_directory_handle
+        .entry(runtime_id)
+        .or_insert(0);
+    let handle = DIRECTORY_HANDLE_BASE.wrapping_add(*counter);
+    *counter = counter.wrapping_add(1);
+    registry
+        .directory_handles
+        .entry(runtime_id)
+        .or_default()
+        .insert(
+            handle,
+            IslandDirectoryHandle {
+                path: path.to_string(),
+            },
+        );
+    handle
+}
+
+/// The canonical directory path behind a live directory-object handle.
+pub(crate) fn directory_object_path(runtime: &PeHostRuntime, handle: u32) -> Option<String> {
+    let runtime_id = runtime_identity(runtime);
+    lock_registry()
+        .directory_handles
+        .get(&runtime_id)
+        .and_then(|handles| handles.get(&handle))
+        .map(|directory| directory.path.clone())
+}
+
+/// Close a directory-object handle.  Returns `true` only for a live handle
+/// owned by the island namespace (a second close reports `false`).
+pub(crate) fn close_directory_object(runtime: &PeHostRuntime, handle: u32) -> bool {
+    let runtime_id = runtime_identity(runtime);
+    lock_registry()
+        .directory_handles
+        .get_mut(&runtime_id)
+        .and_then(|handles| handles.remove(&handle))
+        .is_some()
+}
+
 /// Close an island device-namespace handle.  Returns `true` when the handle
 /// belonged to the island namespace and was released by this call (a second
 /// close therefore reports `false` and falls through to the invalid-handle
@@ -6734,6 +7004,8 @@ pub(crate) fn forget_runtime(runtime: &PeHostRuntime) {
     registry.services.remove(&runtime_id);
     registry.device_handles.remove(&runtime_id);
     registry.next_device_handle.remove(&runtime_id);
+    registry.directory_handles.remove(&runtime_id);
+    registry.next_directory_handle.remove(&runtime_id);
 }
 
 #[cfg(test)]
@@ -9005,6 +9277,99 @@ mod tests {
         (memory.read_u32(handle_ptr).unwrap_or(0), status)
     }
 
+    fn open_directory_object(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        path: &str,
+        base: u64,
+    ) -> (u32, i32) {
+        let arch = runtime.guest_arch;
+        let name = match arch {
+            GuestArch::X64 => guest_unicode_string(memory, base, path),
+            GuestArch::X86 => guest_unicode_string_x86(memory, base, path),
+        };
+        let attributes = base + 0x1000;
+        write_object_attributes(memory, attributes, name, arch);
+        let handle_ptr = base + 0x2000;
+        memory.map_bytes(handle_ptr, &[0_u8; 8]);
+        let status = dispatch_nt_thunk(
+            runtime,
+            memory,
+            HostThunk::NtOpenDirectoryObject,
+            &[handle_ptr, 0x0001, attributes],
+        );
+        let handle = match arch {
+            GuestArch::X64 => memory.read_u64(handle_ptr).unwrap_or(0) as u32,
+            GuestArch::X86 => memory.read_u32(handle_ptr).unwrap_or(0),
+        };
+        (handle, status)
+    }
+
+    fn query_directory_object(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        handle: u32,
+        index: u32,
+        buffer: u64,
+        length: u32,
+    ) -> (i32, Vec<(String, String)>, u32) {
+        let context = 0x46_000u64;
+        let return_length = 0x46_100u64;
+        memory.map_bytes(context, &index.to_le_bytes());
+        memory.map_bytes(return_length, &[0_u8; 4]);
+        let status = dispatch_nt_thunk(
+            runtime,
+            memory,
+            HostThunk::NtQueryDirectoryObject,
+            &[
+                u64::from(handle),
+                buffer,
+                u64::from(length),
+                1,
+                0,
+                context,
+                return_length,
+            ],
+        );
+        let context_after = memory.read_u32(context).unwrap_or(0);
+        if status != STATUS_SUCCESS {
+            return (status, Vec::new(), context_after);
+        }
+        let used = memory.read_u32(return_length).unwrap_or(0) as usize;
+        let bytes = memory.read_bytes(buffer, used).unwrap_or_default();
+        let (header, wide_width) = match runtime.guest_arch {
+            GuestArch::X64 => (32_usize, 8_usize),
+            GuestArch::X86 => (16_usize, 4_usize),
+        };
+        let read_string = |header_offset: usize| -> String {
+            let name_len =
+                u16::from_le_bytes([bytes[header_offset], bytes[header_offset + 1]]) as usize;
+            let ptr_offset = header_offset + wide_width;
+            let ptr = if wide_width == 8 {
+                u64::from_le_bytes(
+                    bytes[ptr_offset..ptr_offset + 8]
+                        .try_into()
+                        .expect("pointer"),
+                )
+            } else {
+                u32::from_le_bytes(
+                    bytes[ptr_offset..ptr_offset + 4]
+                        .try_into()
+                        .expect("pointer"),
+                ) as u64
+            };
+            let local = (ptr - buffer) as usize;
+            let units: Vec<u16> = bytes[local..local + name_len]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            String::from_utf16(&units).expect("utf16")
+        };
+        let name = read_string(0);
+        let kind = read_string(header / 2);
+        (status, vec![(name, kind)], context_after)
+    }
+
     fn dispatch_nt_thunk(
         runtime: &mut PeHostRuntime,
         memory: &mut MemoryImage,
@@ -9206,6 +9571,413 @@ mod tests {
                 "the failing entry still ran"
             );
         });
+    }
+
+    #[test]
+    fn directory_object_enumeration_matches_loaded_and_removed_island_devices() {
+        with_big_stack(|| {
+            let bytes = build_test_driver(false, false, false);
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                stage_service(ge, "CasaDriver", DRIVER_IMAGE_PATH, &bytes)
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let service_path = guest_unicode_string(
+                &mut memory,
+                0x48_000,
+                "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\CasaDriver",
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtLoadDriver,
+                    &[service_path]
+                ),
+                STATUS_SUCCESS
+            );
+
+            let (device_dir, status) =
+                open_directory_object(&mut runtime, &mut memory, "\\Device", 0x40_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_ne!(device_dir, 0);
+
+            let (out, status) =
+                open_directory_object(&mut runtime, &mut memory, "\\Device\\", 0x4A_000);
+            assert_eq!(status, STATUS_SUCCESS, "a trailing separator is accepted");
+            assert_ne!(out, 0);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(out)]
+                ),
+                STATUS_SUCCESS
+            );
+            let (empty, status) = open_directory_object(&mut runtime, &mut memory, "", 0x49_000);
+            assert_eq!(empty, 0);
+            assert_eq!(status, 0xC000_0033_u32 as i32, "empty object name");
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtOpenDirectoryObject,
+                    &[0, 1, 0x49_000]
+                ),
+                0xC000_000D_u32 as i32,
+                "a null output handle is invalid"
+            );
+            // A malformed OBJECT_ATTRIBUTES name (odd byte length) is
+            // STATUS_OBJECT_NAME_INVALID.
+            let bad_attrs = 0x4B_000u64;
+            let bad_name = 0x4B_100u64;
+            memory.map_bytes(bad_attrs, &[0u8; 48]);
+            memory.map_bytes(bad_name, &[0u8; 16]);
+            memory.write_u32(bad_attrs, 48);
+            memory.write_u64(bad_attrs + 16, bad_name);
+            memory.write_u16(bad_name, 3);
+            memory.write_u16(bad_name + 2, 4);
+            let bad_handle = 0x4B_200u64;
+            memory.map_bytes(bad_handle, &[0u8; 8]);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtOpenDirectoryObject,
+                    &[bad_handle, 1, bad_attrs]
+                ),
+                0xC000_0033_u32 as i32
+            );
+            let (status, entries, next) =
+                query_directory_object(&mut runtime, &mut memory, device_dir, 0, 0x50_000, 0x400);
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_eq!(
+                entries,
+                vec![("CasaTest".to_string(), "Device".to_string())],
+                "the live device the island created is enumerated"
+            );
+            assert_eq!(next, 1, "the context advances past the returned entry");
+            let (status, entries, _) = query_directory_object(
+                &mut runtime,
+                &mut memory,
+                device_dir,
+                next,
+                0x50_000,
+                0x400,
+            );
+            assert_eq!(status, STATUS_NO_MORE_ENTRIES);
+            assert!(entries.is_empty());
+
+            // Invalid handle, missing context, null buffer and short output
+            // are exact refusals.
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtQueryDirectoryObject,
+                    &[0x1234, 0x50_000, 0x400, 1, 0, 0x46_000, 0x46_100],
+                ),
+                0xC000_0008_u32 as i32
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtQueryDirectoryObject,
+                    &[u64::from(device_dir), 0x50_000, 0x400, 1, 0, 0, 0x46_100],
+                ),
+                0xC000_000D_u32 as i32
+            );
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtQueryDirectoryObject,
+                    &[u64::from(device_dir), 0, 0x400, 1, 0, 0x46_000, 0x46_100],
+                ),
+                0xC000_000D_u32 as i32
+            );
+            memory.map_bytes(0x46_000, &0_u32.to_le_bytes());
+            memory.map_bytes(0x46_100, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtQueryDirectoryObject,
+                    &[
+                        u64::from(device_dir),
+                        0x50_000,
+                        0x20,
+                        1,
+                        0,
+                        0x46_000,
+                        0x46_100
+                    ],
+                ),
+                0xC000_0023_u32 as i32,
+                "a buffer too small for one entry is STATUS_BUFFER_TOO_SMALL"
+            );
+            assert_eq!(
+                memory.read_u32(0x46_100).expect("required"),
+                0x20 + "CasaTest".len() as u32 * 2 + "Device".len() as u32 * 2
+            );
+            // RestartScan ignores the context value and ignores a null
+            // context pointer, restarting from the first entry.
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtQueryDirectoryObject,
+                    &[u64::from(device_dir), 0x50_000, 0x400, 1, 1, 0, 0x46_100],
+                ),
+                STATUS_SUCCESS
+            );
+
+            let (driver_dir, status) =
+                open_directory_object(&mut runtime, &mut memory, "\\Driver", 0x41_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            let (status, entries, _) =
+                query_directory_object(&mut runtime, &mut memory, driver_dir, 0, 0x50_000, 0x400);
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_eq!(
+                entries,
+                vec![("CasaDriver".to_string(), "Driver".to_string())]
+            );
+
+            // The root object directory and the per-object subtrees are real
+            // namespaces, not four flat roots.
+            let (root_dir, status) =
+                open_directory_object(&mut runtime, &mut memory, "\\", 0x4C_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            let (status, entries, next) =
+                query_directory_object(&mut runtime, &mut memory, root_dir, 0, 0x50_000, 0x400);
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_eq!(
+                entries,
+                vec![("??".to_string(), "SymbolicLink".to_string())]
+            );
+            assert_eq!(next, 1);
+
+            let (nested_device, status) =
+                open_directory_object(&mut runtime, &mut memory, "\\Device\\CasaTest", 0x4D_000);
+            assert_eq!(status, STATUS_SUCCESS);
+            let (status, entries, _) = query_directory_object(
+                &mut runtime,
+                &mut memory,
+                nested_device,
+                0,
+                0x50_000,
+                0x400,
+            );
+            assert_eq!(status, STATUS_NO_MORE_ENTRIES);
+            assert!(entries.is_empty(), "the leaf device has no child objects");
+
+            let (nested_driver, status) =
+                open_directory_object(&mut runtime, &mut memory, "\\Driver\\casadriver", 0x4E_000);
+            assert_eq!(status, STATUS_SUCCESS, "driver names are case-insensitive");
+            let (status, entries, _) = query_directory_object(
+                &mut runtime,
+                &mut memory,
+                nested_driver,
+                0,
+                0x50_000,
+                0x400,
+            );
+            assert_eq!(status, STATUS_SUCCESS);
+            assert_eq!(
+                entries,
+                vec![("CasaTest".to_string(), "Device".to_string())],
+                "the per-driver subtree enumerates the live device it created"
+            );
+
+            // Nested misses keep the exact NAME/PATH distinction.
+            let (_, status) = open_directory_object(
+                &mut runtime,
+                &mut memory,
+                "\\Device\\CasaTest\\Missing",
+                0x4F_000,
+            );
+            assert_eq!(status, STATUS_OBJECT_NAME_NOT_FOUND);
+            let (_, status) = open_directory_object(
+                &mut runtime,
+                &mut memory,
+                "\\Device\\Missing\\Child",
+                0x4F_800,
+            );
+            assert_eq!(status, 0xC000_003A_u32 as i32);
+
+            for directory in ["\\??", "\\GLOBAL??"] {
+                let (handle, status) = match directory {
+                    "\\??" => open_directory_object(&mut runtime, &mut memory, directory, 0x42_000),
+                    _ => open_directory_object(&mut runtime, &mut memory, directory, 0x43_000),
+                };
+                assert_eq!(status, STATUS_SUCCESS);
+                let (status, entries, _) =
+                    query_directory_object(&mut runtime, &mut memory, handle, 0, 0x50_000, 0x400);
+                assert_eq!(status, STATUS_SUCCESS);
+                assert_eq!(
+                    entries,
+                    vec![("CasaTest".to_string(), "SymbolicLink".to_string())],
+                    "{directory} enumerates the island's real symbolic link"
+                );
+            }
+
+            let (_, status) = open_directory_object(
+                &mut runtime,
+                &mut memory,
+                "\\Device\\MissingDevice",
+                0x44_000,
+            );
+            assert_eq!(status, STATUS_OBJECT_NAME_NOT_FOUND);
+            let (_, status) =
+                open_directory_object(&mut runtime, &mut memory, "\\Missing\\Child", 0x45_000);
+            assert_eq!(status, 0xC000_003A_u32 as i32);
+
+            // Unloading removes the devices and drivers from the live
+            // namespace; the already-open \Device handle now enumerates
+            // nothing (it is not a stale handle).
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtUnloadDriver,
+                    &[service_path]
+                ),
+                STATUS_SUCCESS
+            );
+            let (status, entries, _) =
+                query_directory_object(&mut runtime, &mut memory, device_dir, 0, 0x50_000, 0x400);
+            assert_eq!(status, STATUS_NO_MORE_ENTRIES);
+            assert!(entries.is_empty());
+            let (status, entries, _) = query_directory_object(
+                &mut runtime,
+                &mut memory,
+                nested_device,
+                0,
+                0x50_000,
+                0x400,
+            );
+            assert_eq!(status, STATUS_NO_MORE_ENTRIES);
+            assert!(entries.is_empty());
+
+            assert_eq!(
+                dispatch_nt_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::NtClose,
+                    &[u64::from(device_dir)]
+                ),
+                STATUS_SUCCESS
+            );
+            let (status, _, _) =
+                query_directory_object(&mut runtime, &mut memory, device_dir, 0, 0x50_000, 0x400);
+            assert_eq!(status, 0xC000_0008_u32 as i32, "closed directory handle");
+        });
+    }
+
+    #[test]
+    fn nested_directory_entries_track_live_children_and_reject_stale_paths() {
+        let mut namespace = IslandNamespace {
+            drivers: vec!["CasaDriver".to_string(), "Other".to_string()],
+            devices: vec![
+                "\\Device\\CasaTest".to_string(),
+                "\\Device\\CasaTest\\Child".to_string(),
+                "\\Device\\OtherDev".to_string(),
+            ],
+            device_drivers: vec![
+                ("\\Device\\CasaTest".to_string(), "CasaDriver".to_string()),
+                (
+                    "\\Device\\CasaTest\\Child".to_string(),
+                    "CasaDriver".to_string(),
+                ),
+                ("\\Device\\OtherDev".to_string(), "Other".to_string()),
+            ],
+            symbolic_links: vec![(
+                "\\??\\CasaLink".to_string(),
+                "\\Device\\CasaTest".to_string(),
+            )],
+        };
+
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\").as_deref(),
+            Some("\\")
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\device\\casatest").as_deref(),
+            Some("\\Device\\CasaTest")
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Device\\CasaTest\\Child").as_deref(),
+            Some("\\Device\\CasaTest\\Child")
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Device\\CasaTest\\Missing"),
+            None
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Driver\\casadriver").as_deref(),
+            Some("\\Driver\\CasaDriver")
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Driver\\Unknown"),
+            None
+        );
+
+        assert_eq!(
+            directory_entries(&namespace, "\\"),
+            vec![
+                ("??".to_string(), "SymbolicLink".to_string()),
+                ("Device".to_string(), "Directory".to_string()),
+                ("Driver".to_string(), "Directory".to_string()),
+                ("GLOBAL??".to_string(), "Directory".to_string()),
+            ]
+        );
+        assert_eq!(
+            directory_entries(&namespace, "\\Device"),
+            vec![
+                ("CasaTest".to_string(), "Device".to_string()),
+                ("OtherDev".to_string(), "Device".to_string()),
+            ]
+        );
+        assert_eq!(
+            directory_entries(&namespace, "\\Device\\CasaTest"),
+            vec![("Child".to_string(), "Device".to_string())]
+        );
+        assert!(directory_entries(&namespace, "\\Device\\CasaTest\\Child").is_empty());
+        assert_eq!(
+            directory_entries(&namespace, "\\Driver\\CasaDriver"),
+            vec![("CasaTest".to_string(), "Device".to_string())],
+            "the per-driver subtree reports the direct device it created"
+        );
+        assert_eq!(
+            directory_entries(&namespace, "\\Driver\\Other"),
+            vec![("OtherDev".to_string(), "Device".to_string())]
+        );
+
+        // A device/child disappearance is visible on the next enumeration
+        // and an emptied subtree stops resolving.
+        namespace
+            .devices
+            .retain(|device| device != "\\Device\\CasaTest\\Child");
+        namespace
+            .device_drivers
+            .retain(|(device, _)| device != "\\Device\\CasaTest\\Child");
+        assert!(directory_entries(&namespace, "\\Device\\CasaTest").is_empty());
+        namespace
+            .devices
+            .retain(|device| device != "\\Device\\CasaTest");
+        namespace
+            .device_drivers
+            .retain(|(device, _)| device != "\\Device\\CasaTest");
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Device\\CasaTest"),
+            None
+        );
+        assert_eq!(
+            directory_entries(&namespace, "\\Driver\\CasaDriver"),
+            Vec::<(String, String)>::new()
+        );
     }
 
     #[test]

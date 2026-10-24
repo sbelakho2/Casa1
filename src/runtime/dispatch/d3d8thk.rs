@@ -175,6 +175,12 @@ const KMTQAITYPE_ADAPTERTYPE: u32 = 15;
 
 type KmtResult<T> = Result<T, u32>;
 
+/// Reset the shared WDDM facade between tests (test-only).
+#[cfg(test)]
+pub(crate) fn reset_test_facade() {
+    wddm().reset_for_tests();
+}
+
 fn wddm() -> &'static WddmSubsystem {
     static SUBSYSTEM: OnceLock<WddmSubsystem> = OnceLock::new();
     SUBSYSTEM.get_or_init(WddmSubsystem::new)
@@ -1925,6 +1931,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_luid_open_rejects_unknown_and_closed_adapter_handles() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -2071,6 +2078,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_enum_adapters_rejects_null_and_short_buffers() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -2151,6 +2159,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_device_open_rejects_private_and_stale_handles() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -2293,6 +2302,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_allocation_residency_rejects_budget_overrun_and_double_destroy() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -2535,6 +2545,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_sync_wait_rejects_backwards_signal_and_times_out_exactly_once() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -2678,6 +2689,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_present_rejects_invalid_and_closed_swapchains_and_advances_flip() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -2887,6 +2899,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_descriptors_reject_null_and_unmapped_guest_pointers() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -3360,6 +3373,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_unknown_kmt_types_and_unimplemented_thunks_return_exact_status() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -3459,6 +3473,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_x64_descriptors_reject_bad_luid_and_round_trip_handles() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X64);
             let mut memory = MemoryImage::default();
@@ -3608,6 +3623,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_context_render_modes_priority_and_statistics_errors_are_exact() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -4112,6 +4128,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_resource_mutex_and_sync_arrays_reject_collisions_and_timeouts() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -4471,6 +4488,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_x64_new_descriptors_render_modes_and_arrays_round_trip() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X64);
             let mut memory = MemoryImage::default();
@@ -4693,6 +4711,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_descriptor_write_failures_cleanup_and_reject_exactly() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -4834,6 +4853,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_signal_array_context_errors_reject_before_signal() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -4918,6 +4938,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_statistics_process_segment_aliases_and_unsupported_classes_are_exact() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -5298,6 +5319,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_display_gamma_cursor_pnp_and_mode_buffer_errors_are_exact() {
+        wddm().reset_for_tests();
         with_big_stack(|| {
             let (mut runtime, _directory) = test_runtime(GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -5901,6 +5923,7 @@ mod tests {
 
     #[test]
     fn d3d8thk_unknown_kmt_imports_are_rejected_and_new_names_are_mapped() {
+        wddm().reset_for_tests();
         use crate::pe::{ExportSymbol, ExportTarget, ImportSymbol, ResolvedImport};
 
         fn resolve(name: &str) -> &'static str {

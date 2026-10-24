@@ -749,6 +749,139 @@ fn bench_jit_inline_cache(c: &mut Criterion) {
     group.finish();
 }
 
+/// Production worker slice: call/return-heavy native chain.
+///
+/// The same total number of compiled blocks (4096) runs with three dispatch
+/// chunk sizes.  `chunk_1` reproduces the old "one slice per round" barrier
+/// behaviour; `chunk_512` keeps the worker in one job for 512 blocks.  The
+/// delta is the barrier cost removed by native call/ret chaining.
+fn bench_jit_worker_call_return(c: &mut Criterion) {
+    use casa1::cpu::{GuestArch, IrInstruction, MemoryImage, Register};
+    use casa1::jit::WorkerSliceBenchmark;
+
+    const TOTAL_BLOCKS: u64 = 4096;
+    let arch = GuestArch::X64;
+    let stack = 0x11_000_u64;
+    let mut memory = MemoryImage::default();
+    memory.map_bytes(stack & !0xfff, &[0_u8; 0x1000]);
+    let blocks = vec![
+        (
+            0x1000_u64,
+            vec![IrInstruction::Call {
+                target: 0x2000,
+                return_address: 0x1010,
+            }],
+        ),
+        (0x1010, vec![IrInstruction::Jump { target: 0x1000 }]),
+        (
+            0x2000,
+            vec![
+                IrInstruction::AddImm {
+                    dst: Register::Rcx,
+                    value: 1,
+                    width: 8,
+                },
+                IrInstruction::Return { stack_adjust: 0 },
+            ],
+        ),
+    ];
+    let mut group = c.benchmark_group("jit/worker_call_return");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(3));
+    for chunk in [1_u64, 16, 512] {
+        group.bench_function(format!("chunk_{chunk}"), |b| {
+            let mut harness =
+                WorkerSliceBenchmark::new(arch, &memory, &blocks, 0x1000, stack + 0x800);
+            b.iter(|| {
+                harness.reset();
+                let mut done = 0_u64;
+                while done < TOTAL_BLOCKS {
+                    let (blocks, _instructions, _metrics) =
+                        harness.run(bb(chunk.min(TOTAL_BLOCKS - done)));
+                    done += blocks;
+                    bb(done);
+                }
+                bb(done)
+            })
+        });
+    }
+    group.finish();
+}
+
+/// Production worker slice: indirect-call-heavy chain with a monomorphic site.
+fn bench_jit_worker_indirect(c: &mut Criterion) {
+    use casa1::cpu::{GuestArch, IrInstruction, MemoryImage, Register};
+    use casa1::jit::WorkerSliceBenchmark;
+
+    const TOTAL_BLOCKS: u64 = 4096;
+    let arch = GuestArch::X64;
+    let stack = 0x12_000_u64;
+    let mut memory = MemoryImage::default();
+    memory.map_bytes(stack & !0xfff, &[0_u8; 0x1000]);
+    let blocks = vec![
+        (
+            0x1000_u64,
+            vec![IrInstruction::CallRegister {
+                src: Register::Rax,
+                return_address: 0x1010,
+            }],
+        ),
+        (0x1010, vec![IrInstruction::Jump { target: 0x1000 }]),
+        (
+            0x2000,
+            vec![
+                IrInstruction::AddImm {
+                    dst: Register::Rcx,
+                    value: 1,
+                    width: 8,
+                },
+                IrInstruction::Return { stack_adjust: 0 },
+            ],
+        ),
+    ];
+    let mut group = c.benchmark_group("jit/worker_indirect");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(3));
+    for chunk in [1_u64, 16, 512] {
+        group.bench_function(format!("chunk_{chunk}"), |b| {
+            let mut harness =
+                WorkerSliceBenchmark::new(arch, &memory, &blocks, 0x1000, stack + 0x800);
+            harness.reset();
+            harness.set_rax(0x2000);
+            b.iter(|| {
+                let mut done = 0_u64;
+                while done < TOTAL_BLOCKS {
+                    let (blocks, _instructions, _metrics) =
+                        harness.run(bb(chunk.min(TOTAL_BLOCKS - done)));
+                    done += blocks;
+                    bb(done);
+                }
+                bb(done)
+            });
+            harness.reset();
+        });
+    }
+    group.finish();
+}
+
+/// Return predictor and 2/4-way/megamorphic indirect-cache hot loops.
+fn bench_jit_worker_control_caches(c: &mut Criterion) {
+    use casa1::jit::{bench_indirect_cache, bench_return_predictor};
+
+    let mut group = c.benchmark_group("jit/worker_caches");
+    group.bench_function("return_predictor_4096", |b| {
+        b.iter(|| bb(bench_return_predictor(bb(4096))))
+    });
+    group.bench_function("indirect_megamorphic_4096", |b| {
+        // The helper cycles six targets; the first five populate/promote the
+        // site, so the steady state is the megamorphic hash fallback.
+        b.iter(|| bb(bench_indirect_cache(bb(4096))))
+    });
+    group.finish();
+}
+
 // ===========================================================================
 // 3.  PE LOADING BENCHMARKS
 // ===========================================================================
@@ -1670,6 +1803,91 @@ fn bench_cpu_memory_sync_sparse(c: &mut Criterion) {
     group.finish();
 }
 
+/// Allocation and compiled access for a guest page above 4 GiB.
+///
+/// `alloc_8g_direct_window_page`/`jit_access_8g_direct_window_page` exercise
+/// the new direct window (8 GiB is inside it), while the `_owned_frame_page`
+/// pair uses an address beyond the 256 GiB window, i.e. exactly the owned-frame
+/// fallback the pre-change implementation used for every address at or above
+/// 4 GiB.  The two pairs measure the same work through the old and new paths.
+fn bench_cpu_memory_above_four_gib(c: &mut Criterion) {
+    use casa1::cpu::{CpuState, GuestArch, IrInstruction, MemoryImage, MemoryOperand, Register};
+    use casa1::jit::JitRuntime;
+
+    let direct_address = 0x2_0000_0000_u64;
+    // Beyond the 256 GiB direct window: exercises the owned-frame fallback.
+    let owned_address = 0x41_0000_0000_u64;
+    let operand = |address: u64| MemoryOperand {
+        base: None,
+        index: None,
+        scale: 1,
+        displacement: 0,
+        rip_relative: false,
+        rip_base: 0,
+        segment: None,
+        address_size_32: false,
+        absolute_address: Some(address),
+    };
+    let ir = |address: u64| {
+        vec![IrInstruction::LoadMemory {
+            dst: Register::Rax,
+            address: operand(address),
+            width: 8,
+        }]
+    };
+
+    let mut group = c.benchmark_group("cpu/memory");
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(2));
+
+    for (label, address) in [
+        ("alloc_8g_direct_window_page", direct_address),
+        ("alloc_beyond_window_owned_frame_page", owned_address),
+    ] {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(address, &[0u8; 4096]);
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                memory.unmap_range(address, 4096);
+                memory
+                    .commit_zeroed_pages(address, 4096)
+                    .expect("commit bench page");
+                bb(())
+            })
+        });
+    }
+
+    if casa1::jit::jit_execution_available() {
+        for (label, address) in [
+            ("jit_access_8g_direct_window_page", direct_address),
+            ("jit_access_beyond_window_owned_frame_page", owned_address),
+        ] {
+            let mut runtime = JitRuntime::new(GuestArch::X64);
+            let site = 0x2_0000_5000_u64;
+            runtime
+                .get_or_compile(&ir(address), site, GuestArch::X64, None)
+                .expect("compile bench block");
+            let block = runtime
+                .block_cache
+                .get(&site)
+                .cloned()
+                .expect("cached bench block");
+            let mut state = CpuState::new(GuestArch::X64);
+            let mut memory = MemoryImage::default();
+            memory.map_bytes(address, &[0x11u8; 4096]);
+            group.bench_function(label, |b| {
+                b.iter(|| {
+                    state.set(Register::Rax, 0);
+                    let reason = unsafe { runtime.execute_block(&block, &mut state, &mut memory) };
+                    bb(reason)
+                })
+            });
+        }
+    }
+
+    group.finish();
+}
+
 /// Repeated resolution of a guest thunk address to its host trampoline.
 /// A resolved-target cache should make repeat lookups O(1) and bypass the
 /// linear entry scan + global-map lock.
@@ -1987,12 +2205,1434 @@ fn bench_stress_host_thunk_validations(c: &mut Criterion) {
     group.finish();
 }
 
+/// Native block linking: same guest loop with links enabled vs cleared.
+fn bench_jit_native_linking(c: &mut Criterion) {
+    use casa1::cpu::{ConditionCode, GuestArch, IrInstruction, MemoryImage, Register};
+    use casa1::jit::WorkerSliceBenchmark;
+
+    const TOTAL_BLOCKS: u64 = 4096;
+    let arch = GuestArch::X64;
+    let memory = MemoryImage::default();
+    let blocks = vec![
+        (
+            0x1000_u64,
+            vec![
+                IrInstruction::SubImm {
+                    dst: Register::Rcx,
+                    value: 1,
+                    width: 4,
+                },
+                IrInstruction::Compare {
+                    lhs: casa1::cpu::CompareOperand::Register(Register::Rcx),
+                    rhs: casa1::cpu::CompareOperand::ImmediateU64(0),
+                    width: 4,
+                },
+                IrInstruction::JumpIf {
+                    condition: ConditionCode::NotEqual,
+                    target: 0x1000,
+                    fallthrough: 0x1010,
+                },
+            ],
+        ),
+        (0x1010, vec![IrInstruction::Nop]),
+    ];
+    let mut group = c.benchmark_group("jit/native_linking");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(300));
+    group.measurement_time(std::time::Duration::from_secs(2));
+    for (name, linked) in [("linked", true), ("unlinked", false)] {
+        group.bench_function(name, |b| {
+            let mut harness = WorkerSliceBenchmark::new(arch, &memory, &blocks, 0x1000, 0);
+            harness.set_linking(linked);
+            b.iter(|| {
+                harness.reset();
+                let mut done = 0_u64;
+                while done < TOTAL_BLOCKS {
+                    let (blocks, _instructions, _metrics) = harness.run(bb(TOTAL_BLOCKS - done));
+                    assert_eq!(blocks, TOTAL_BLOCKS - done);
+                    done += blocks;
+                }
+                bb(done)
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Conditional-branch-heavy guest code: one native Jcc per iteration.
+fn bench_jit_conditional_branch_heavy(c: &mut Criterion) {
+    use casa1::cpu::{ConditionCode, GuestArch, IrInstruction, MemoryImage, Register};
+    use casa1::jit::WorkerSliceBenchmark;
+
+    const TOTAL_BLOCKS: u64 = 4096;
+    let arch = GuestArch::X64;
+    let memory = MemoryImage::default();
+    let blocks = vec![
+        (
+            0x1000_u64,
+            vec![
+                IrInstruction::Compare {
+                    lhs: casa1::cpu::CompareOperand::Register(Register::Rcx),
+                    rhs: casa1::cpu::CompareOperand::ImmediateU64(0),
+                    width: 8,
+                },
+                IrInstruction::JumpIf {
+                    condition: ConditionCode::NotEqual,
+                    target: 0x1020,
+                    fallthrough: 0x1010,
+                },
+            ],
+        ),
+        (0x1010, vec![IrInstruction::Jump { target: 0x1030 }]),
+        (
+            0x1020,
+            vec![
+                IrInstruction::SubImm {
+                    dst: Register::Rcx,
+                    value: 1,
+                    width: 8,
+                },
+                IrInstruction::Jump { target: 0x1000 },
+            ],
+        ),
+        (0x1030, vec![IrInstruction::Nop]),
+    ];
+    let mut group = c.benchmark_group("jit/conditional_branch_heavy");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(300));
+    group.measurement_time(std::time::Duration::from_secs(2));
+    for (name, linked) in [("linked", true), ("unlinked", false)] {
+        group.bench_function(name, |b| {
+            let mut harness = WorkerSliceBenchmark::new(arch, &memory, &blocks, 0x1000, 0);
+            harness.set_linking(linked);
+            b.iter(|| {
+                harness.reset();
+                harness.set_rcx(TOTAL_BLOCKS);
+                let expected = TOTAL_BLOCKS * 2 + 3;
+                let mut done = 0_u64;
+                while done < expected {
+                    let (blocks, _instructions, _metrics) = harness.run(64);
+                    if blocks == 0 {
+                        break;
+                    }
+                    done += blocks;
+                }
+                assert_eq!(done, expected);
+                bb(done)
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Persistent AOT cache: hit rate over fresh runtime instances.
+fn bench_jit_aot_cache(c: &mut Criterion) {
+    use casa1::jit::bench_aot_hits;
+    let mut group = c.benchmark_group("jit/aot_cache");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(200));
+    group.measurement_time(std::time::Duration::from_secs(2));
+    group.bench_function("load_hit_rate_8_instances", |b| {
+        b.iter(|| {
+            let metrics = bench_aot_hits(8);
+            assert_eq!(metrics, (8, 1, 0));
+            bb(metrics)
+        })
+    });
+    group.finish();
+}
+
 // ===========================================================================
 // Criterion groups
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// Tier-2 SSA, direct IAT patching and inline API benchmarks
+// ---------------------------------------------------------------------------
+
+fn tier2_loop_blocks(iterations: u64) -> Vec<casa1::jit_ssa::FunctionBlock> {
+    use casa1::cpu::{CompareOperand, ConditionCode, IrInstruction, Register};
+    vec![
+        casa1::jit_ssa::FunctionBlock::new(
+            0x1000,
+            vec![
+                IrInstruction::MovImm {
+                    dst: Register::Rax,
+                    value: 0,
+                },
+                IrInstruction::MovImm {
+                    dst: Register::Rcx,
+                    value: iterations,
+                },
+                IrInstruction::Jump { target: 0x1010 },
+            ],
+        ),
+        casa1::jit_ssa::FunctionBlock::new(
+            0x1010,
+            vec![
+                IrInstruction::AddOperand {
+                    dst: Register::Rax,
+                    src: CompareOperand::Register(Register::Rcx),
+                    width: 8,
+                },
+                IrInstruction::SubImm {
+                    dst: Register::Rcx,
+                    value: 1,
+                    width: 8,
+                },
+                IrInstruction::Compare {
+                    lhs: CompareOperand::Register(Register::Rcx),
+                    rhs: CompareOperand::ImmediateU64(0),
+                    width: 8,
+                },
+                IrInstruction::JumpIf {
+                    condition: ConditionCode::NotEqual,
+                    target: 0x1010,
+                    fallthrough: 0x1020,
+                },
+            ],
+        ),
+        casa1::jit_ssa::FunctionBlock::new(0x1020, vec![IrInstruction::Jump { target: 0x9999 }]),
+    ]
+}
+
+fn run_tier0_loop(
+    blocks: &[casa1::jit_ssa::FunctionBlock],
+    state: &mut casa1::cpu::CpuState,
+    memory: &mut casa1::cpu::MemoryImage,
+) {
+    use std::collections::HashMap;
+    let map: HashMap<u64, &Vec<casa1::cpu::IrInstruction>> = blocks
+        .iter()
+        .map(|block| (block.guest_address, &block.instructions))
+        .collect();
+    state.rip = 0x1000;
+    for _ in 0..10_000_000 {
+        let Some(ir) = map.get(&state.rip) else {
+            return;
+        };
+        casa1::cpu::execute_ir(state, memory, ir).expect("tier0 interp");
+    }
+    panic!("tier0 loop did not terminate");
+}
+
+fn bench_jit_tier2_hot_loop(c: &mut Criterion) {
+    use casa1::cpu::{CpuState, GuestArch, MemoryImage};
+    use casa1::jit::JitRuntime;
+    const ITERS: u64 = 1_000_000;
+    let blocks = tier2_loop_blocks(ITERS);
+    let mut group = c.benchmark_group("jit_tier2_hot_loop");
+    group.sample_size(20);
+
+    group.bench_function("tier0_interpreted_1m", |b| {
+        b.iter(|| {
+            let mut state = CpuState::new(GuestArch::X64);
+            let mut memory = MemoryImage::default();
+            run_tier0_loop(&blocks, &mut state, &mut memory);
+            bb(state.get(casa1::cpu::Register::Rax))
+        })
+    });
+
+    let mut runtime = JitRuntime::new(GuestArch::X64);
+    let compiled = runtime
+        .get_or_compile_function_tier2(&blocks, GuestArch::X64)
+        .expect("tier2 compile")
+        .expect("tier2 promotion")
+        .clone();
+    group.bench_function("tier2_native_1m", |b| {
+        b.iter(|| {
+            let mut state = CpuState::new(GuestArch::X64);
+            let mut memory = MemoryImage::default();
+            state.rip = 0x1000;
+            // SAFETY: the compiled block and state/memory outlive the call.
+            let _ = unsafe { runtime.execute_block(&compiled, &mut state, &mut memory) };
+            bb(state.get(casa1::cpu::Register::Rax))
+        })
+    });
+    group.finish();
+
+    let metrics = casa1::jit_ssa::tier2_metrics();
+    eprintln!(
+        "TIER2_HOT_LOOP hit_rate={:.3} compiled={} fallbacks={} blocks={} sccp={} gvn={} dce={} licm={} load_fwd={} store_elim={} spills={}",
+        if metrics.functions_compiled + metrics.functions_fallback == 0 {
+            0.0
+        } else {
+            metrics.functions_compiled as f64
+                / (metrics.functions_compiled + metrics.functions_fallback) as f64
+        },
+        metrics.functions_compiled,
+        metrics.functions_fallback,
+        metrics.blocks,
+        metrics.sccp_eliminated,
+        metrics.gvn_eliminated,
+        metrics.dce_eliminated,
+        metrics.licm_hoisted,
+        metrics.load_forwarded,
+        metrics.store_eliminated,
+        metrics.register_spills,
+    );
+}
+
+fn bench_jit_iat_dispatch(c: &mut Criterion) {
+    use casa1::pe::ImportSymbol;
+    use casa1::runtime::{IatPatchEntry, IatPatchTable};
+    let mut table = IatPatchTable::default();
+    table.patch(IatPatchEntry {
+        slot_va: 0x4000_1000,
+        selected_base: 0x4000_0000,
+        iat_rva: 0x1000,
+        module: "kernel32.dll".to_string(),
+        symbol: ImportSymbol::ByName {
+            hint: 0,
+            name: "GetTickCount64".to_string(),
+        },
+        bound_value: 0xABC0,
+        patched_value: 0xABC0,
+        module_handle: 1,
+    });
+    let names: BTreeMap<String, u64> = [
+        ("GetTickCount64".to_string(), 0xABC0),
+        ("GetLastError".to_string(), 0xABC1),
+        ("Sleep".to_string(), 0xABC2),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut group = c.benchmark_group("jit_iat_dispatch");
+    group.bench_function("patched_direct_bypass", |b| {
+        b.iter(|| bb(table.record_dispatch(0xABC0)))
+    });
+    group.bench_function("generic_name_lookup", |b| {
+        b.iter(|| bb(names.get("GetTickCount64").copied()))
+    });
+    group.finish();
+    let metrics = table.metrics();
+    eprintln!(
+        "IAT_METRICS patched={} bypasses={} repatched={} invalidated={}",
+        metrics.patched, metrics.dispatch_bypasses, metrics.repatched, metrics.invalidated
+    );
+}
+
+fn bench_jit_inlined_api_dispatch(c: &mut Criterion) {
+    use casa1::jit::{InlineApi, inline_api_for_target, register_inline_api_target};
+    register_inline_api_target(0x9000, InlineApi::GetTickCount64);
+    let names: BTreeMap<String, InlineApi> = [
+        ("GetLastError".to_string(), InlineApi::GetLastError),
+        ("GetTickCount64".to_string(), InlineApi::GetTickCount64),
+        (
+            "QueryPerformanceCounter".to_string(),
+            InlineApi::QueryPerformanceCounter,
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut group = c.benchmark_group("jit_inlined_api_dispatch");
+    group.bench_function("registered_target_lookup", |b| {
+        b.iter(|| bb(inline_api_for_target(0x9000)))
+    });
+    group.bench_function("generic_name_lookup", |b| {
+        b.iter(|| bb(names.get("GetTickCount64").copied()))
+    });
+    group.finish();
+    eprintln!(
+        "INLINE_API_STATS registered_targets=1 inline_metric_total={}",
+        casa1::jit::inline_api_metrics().total
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Performance gate: KPI collection and the defined Criterion subset
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct GateSliceTotals {
+    blocks: u64,
+    instructions: u64,
+    dispatcher_exits: u64,
+    native_chains: u64,
+    indirect_ic_hits: u64,
+    indirect_ic_misses: u64,
+}
+
+impl GateSliceTotals {
+    fn add(&mut self, metrics: casa1::jit::SliceMetrics) {
+        self.blocks += metrics.blocks_executed;
+        self.instructions += metrics.instructions_executed;
+        self.dispatcher_exits += metrics.dispatcher_exits;
+        self.native_chains += metrics.native_chains;
+        self.indirect_ic_hits += metrics.indirect_ic_hits;
+        self.indirect_ic_misses += metrics.indirect_ic_misses;
+    }
+
+    fn dispatcher_exits_per_1000(&self) -> f64 {
+        if self.instructions == 0 {
+            0.0
+        } else {
+            self.dispatcher_exits as f64 * 1000.0 / self.instructions as f64
+        }
+    }
+
+    fn native_chaining_rate(&self) -> f64 {
+        if self.blocks == 0 {
+            0.0
+        } else {
+            self.native_chains as f64 / self.blocks as f64
+        }
+    }
+
+    fn indirect_ic_hit_rate(&self) -> f64 {
+        let total = self.indirect_ic_hits + self.indirect_ic_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.indirect_ic_hits as f64 / total as f64
+        }
+    }
+}
+
+fn gate_kpi_ok(value: f64, unit: &str, direction: &str, source: &str) -> serde_json::Value {
+    serde_json::json!({
+        "available": true,
+        "value": value,
+        "unit": unit,
+        "direction": direction,
+        "source": source,
+    })
+}
+
+fn gate_kpi_missing(reason: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({ "available": false, "reason": reason.into() })
+}
+
+fn gate_slice_workload(
+    blocks: &[(u64, Vec<casa1::cpu::IrInstruction>)],
+    entry: u64,
+    stack: u64,
+    register_value: Option<u64>,
+    total_blocks: u64,
+    budget: u64,
+) -> Result<GateSliceTotals, String> {
+    use casa1::cpu::{GuestArch, MemoryImage};
+    use casa1::jit::WorkerSliceBenchmark;
+
+    let mut memory = MemoryImage::default();
+    memory.map_bytes(stack & !0xfff, &[0_u8; 0x1000]);
+    let mut harness =
+        WorkerSliceBenchmark::new(GuestArch::X64, &memory, blocks, entry, stack + 0x800);
+    harness.reset();
+    if let Some(value) = register_value {
+        harness.set_rax(value);
+    }
+    let mut totals = GateSliceTotals::default();
+    let mut done = 0_u64;
+    while done < total_blocks {
+        let (ran, _instructions, metrics) = harness.run(budget.min(total_blocks - done));
+        totals.add(metrics);
+        if ran == 0 {
+            break;
+        }
+        done += ran;
+    }
+    Ok(totals)
+}
+
+fn gate_worker_kpis() -> Result<(GateSliceTotals, GateSliceTotals), String> {
+    use casa1::cpu::{IrInstruction, Register};
+
+    let call_return_blocks = vec![
+        (
+            0x1000_u64,
+            vec![IrInstruction::Call {
+                target: 0x2000,
+                return_address: 0x1010,
+            }],
+        ),
+        (0x1010, vec![IrInstruction::Jump { target: 0x1000 }]),
+        (
+            0x2000,
+            vec![
+                IrInstruction::AddImm {
+                    dst: Register::Rcx,
+                    value: 1,
+                    width: 8,
+                },
+                IrInstruction::Return { stack_adjust: 0 },
+            ],
+        ),
+    ];
+    let indirect_blocks = vec![
+        (
+            0x1000_u64,
+            vec![IrInstruction::CallRegister {
+                src: Register::Rax,
+                return_address: 0x1010,
+            }],
+        ),
+        (0x1010, vec![IrInstruction::Jump { target: 0x1000 }]),
+        (
+            0x2000,
+            vec![
+                IrInstruction::AddImm {
+                    dst: Register::Rcx,
+                    value: 1,
+                    width: 8,
+                },
+                IrInstruction::Return { stack_adjust: 0 },
+            ],
+        ),
+    ];
+    let call_return = gate_slice_workload(&call_return_blocks, 0x1000, 0x11_000, None, 4096, 512)?;
+    let indirect =
+        gate_slice_workload(&indirect_blocks, 0x1000, 0x12_000, Some(0x2000), 4096, 512)?;
+    Ok((call_return, indirect))
+}
+
+fn gate_generic_helper_rate() -> Result<f64, String> {
+    use casa1::cpu::{GuestArch, IrInstruction};
+    use casa1::jit::{JitRuntime, jit_lowering_telemetry};
+
+    let (native_before, fallback_before) = jit_lowering_telemetry();
+    let mut runtime = JitRuntime::new(GuestArch::X64);
+    let mut ir = vec![IrInstruction::Nop; 64];
+    ir.push(IrInstruction::Hlt);
+    runtime
+        .get_or_compile(&ir, 0x2_0000_6000, GuestArch::X64, None)
+        .map_err(|error| error.message.clone())?;
+    let (native_after, fallback_after) = jit_lowering_telemetry();
+    let native = native_after.saturating_sub(native_before);
+    let fallback = fallback_after.saturating_sub(fallback_before);
+    if native == 0 {
+        return Err("JIT lowering telemetry recorded no instructions".to_string());
+    }
+    Ok(fallback as f64 / native as f64)
+}
+
+fn gate_high_address_metrics() -> Result<(f64, f64), String> {
+    use casa1::cpu::{GuestArch, IrInstruction, MemoryImage, MemoryOperand, Register};
+    use casa1::jit::{
+        WorkerSliceBenchmark, guest_memory_telemetry, jit_execution_available,
+        reset_guest_memory_telemetry,
+    };
+
+    if !jit_execution_available() {
+        return Err("JIT execution capability is unavailable on this host".to_string());
+    }
+    let address = 0x2_0000_0000_u64;
+    let operand = MemoryOperand {
+        base: None,
+        index: None,
+        scale: 1,
+        displacement: 0,
+        rip_relative: false,
+        rip_base: 0,
+        segment: None,
+        address_size_32: false,
+        absolute_address: Some(address),
+    };
+    let blocks = vec![(
+        0x1000_u64,
+        vec![IrInstruction::LoadMemory {
+            dst: Register::Rax,
+            address: operand,
+            width: 8,
+        }],
+    )];
+    let mut memory = MemoryImage::default();
+    memory.map_bytes(address, &[0_u8; 4096]);
+    reset_guest_memory_telemetry();
+    let mut harness = WorkerSliceBenchmark::new(GuestArch::X64, &memory, &blocks, 0x1000, 0);
+    const ACCESSES: u64 = 4096;
+    let mut executed = 0_u64;
+    let mut instructions = 0_u64;
+    for _ in 0..ACCESSES {
+        harness.reset();
+        let (ran, insns, _) = harness.run(1);
+        if ran == 0 {
+            break;
+        }
+        executed += ran;
+        instructions += insns;
+    }
+    if executed == 0 || instructions == 0 {
+        return Err("high-address worker slice did not execute the JIT block".to_string());
+    }
+    let after = guest_memory_telemetry();
+    Ok((
+        after.sync_operations as f64 * 1000.0 / instructions as f64,
+        after.pages_materialised as f64 / executed as f64,
+    ))
+}
+
+fn gate_thunk_generic_rate() -> Result<f64, String> {
+    use casa1::jit::{FastThunkTable, reset_thunk_resolve_telemetry, thunk_resolve_telemetry};
+
+    extern "C" fn gate_thunk_target() -> u64 {
+        0x42
+    }
+    let mut table = FastThunkTable::new();
+    let host_fn = gate_thunk_target as *const () as usize;
+    let mut addresses = Vec::new();
+    for index in 0..256u64 {
+        let guest = 0x100_0000 + index * 0x10;
+        table
+            .register_with_guest_addr(host_fn, guest)
+            .map_err(|error| error.message.clone())?;
+        addresses.push(guest);
+    }
+    reset_thunk_resolve_telemetry();
+    for _ in 0..64 {
+        for guest in &addresses {
+            let _ = table.find_thunk_by_guest(*guest);
+        }
+    }
+    let (hits, misses) = thunk_resolve_telemetry();
+    let total = hits + misses;
+    if total == 0 {
+        return Err("thunk-resolution telemetry recorded no lookups".to_string());
+    }
+    Ok(misses as f64 / total as f64)
+}
+
+fn gate_aot_hit_rate() -> Result<f64, String> {
+    let (hits, misses, rejected) = casa1::jit::bench_aot_hits(8);
+    if rejected != 0 {
+        return Err(format!(
+            "persistent AOT cache rejected {rejected} record(s)"
+        ));
+    }
+    let total = hits + misses;
+    if total == 0 {
+        return Err("persistent AOT cache recorded no loads".to_string());
+    }
+    Ok(hits as f64 / total as f64)
+}
+
+fn gate_percentile(sorted: &[u64], fraction: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let index = ((sorted.len() - 1) as f64 * fraction).round() as usize;
+    sorted[index.min(sorted.len() - 1)] as f64
+}
+
+fn gate_low_fps(samples_ns: &[u64], fraction: f64) -> f64 {
+    if samples_ns.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples_ns.to_vec();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    let count = ((sorted.len() as f64 * fraction).ceil() as usize).max(1);
+    let worst: u64 = sorted[..count].iter().sum();
+    let average_ns = worst as f64 / count as f64;
+    if average_ns == 0.0 {
+        0.0
+    } else {
+        1_000_000_000.0 / average_ns
+    }
+}
+
+struct GateFrameMetrics {
+    present_latency_ns: Vec<u64>,
+    interval_ns: Vec<u64>,
+}
+
+fn gate_frame_metrics() -> Result<GateFrameMetrics, String> {
+    use casa1::gfx::{DxgiFormat, GraphicsBackend, SwapchainDesc};
+
+    let mut backend = GraphicsBackend::new();
+    let swapchain = backend
+        .create_swapchain(SwapchainDesc {
+            width: 320,
+            height: 240,
+            format: DxgiFormat::R8G8B8A8Unorm,
+            buffer_count: 2,
+        })
+        .map_err(|error| error.message.clone())?;
+    for _ in 0..128 {
+        backend
+            .present(swapchain, 1, false)
+            .map_err(|error| error.message.clone())?;
+    }
+    let mut present_latency_ns = Vec::with_capacity(5_000);
+    let mut interval_ns = Vec::with_capacity(5_000);
+    for _ in 0..5_000 {
+        let started = std::time::Instant::now();
+        let result = backend
+            .present(swapchain, 1, false)
+            .map_err(|error| error.message.clone())?;
+        present_latency_ns.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        if result.frame_time_ns > 0 {
+            interval_ns.push(result.frame_time_ns);
+        }
+    }
+    Ok(GateFrameMetrics {
+        present_latency_ns,
+        interval_ns,
+    })
+}
+
+fn gate_pso_metrics() -> Result<(f64, f64), String> {
+    use casa1::metal_backend::MetalGpuBackend;
+
+    let mut gpu = MetalGpuBackend::new().map_err(|error| error.message.clone())?;
+    let source = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void casa1_perf_gate_kernel(device uint *out [[buffer(0)]], uint id [[thread_position_in_grid]]) {
+    out[id] = id;
+}
+"#;
+    let library = gpu
+        .compile_shader(source)
+        .map_err(|error| error.message.clone())?;
+    let started = std::time::Instant::now();
+    gpu.create_compute_pipeline("casa1_perf_gate_kernel", library)
+        .map_err(|error| error.message.clone())?;
+    let compile_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let started = std::time::Instant::now();
+    gpu.create_compute_pipeline("casa1_perf_gate_kernel", library)
+        .map_err(|error| error.message.clone())?;
+    let hit_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    Ok((compile_us, hit_us))
+}
+
+fn gate_encoder_switch_rate() -> Result<f64, String> {
+    use casa1::perf::MetalCommandBatcher;
+
+    let mut batcher = MetalCommandBatcher::new(128);
+    const DRAWS: u64 = 4096;
+    for index in 0..DRAWS {
+        batcher.record_draw(index % 2, 3, 0, 1, 0, 0);
+    }
+    let stats = batcher.stats().clone();
+    if stats.total_draw_calls == 0 {
+        return Err("command batcher recorded no draws".to_string());
+    }
+    Ok(stats.pipeline_changes as f64 * 1000.0 / stats.total_draw_calls as f64)
+}
+
+fn gate_shader_stall_rates() -> Result<(f64, f64), String> {
+    use casa1::shader::{
+        CacheHeader, CachePayload, ShaderCache, ShaderCacheEntry, ShaderStage, compile_with_cache,
+        shader_cache_key,
+    };
+
+    let input = bench_shader_input(make_bench_dxil(5, "cs_main"), ShaderStage::Cs);
+    let requests = [input.clone(), input.clone()];
+    let mut cache = ShaderCache::new(4 * 1024 * 1024);
+    let cold = compile_with_cache(&requests, &mut cache);
+    let cold_rate = cold.compile_stalls as f64 / requests.len() as f64;
+
+    let key = shader_cache_key(&input).map_err(|error| error.message.clone())?;
+    cache.insert(ShaderCacheEntry {
+        header: CacheHeader {
+            magic: "casa1-perf-gate".to_string(),
+            version: 1,
+            key,
+            created_ts: 0,
+            last_used_ts: 0,
+        },
+        payload: CachePayload {
+            mtl_library_bytes: Vec::new(),
+            reflection_json: "{}".to_string(),
+            metal_pipeline_archive: None,
+        },
+        checksum: String::new(),
+    });
+    let warm = compile_with_cache(&requests, &mut cache);
+    if warm.misses != 0 {
+        return Err(format!(
+            "warm shader-cache probe still missed {} of {} requests",
+            warm.misses,
+            requests.len()
+        ));
+    }
+    let warm_rate = warm.compile_stalls as f64 / requests.len() as f64;
+    Ok((cold_rate, warm_rate))
+}
+
+fn gate_upload_copy_rate() -> Result<f64, String> {
+    use casa1::gfx::{
+        BufferRole, DxgiFormat, GraphicsBackend, HeapType, ResourceDesc, ResourceState,
+        ResourceUsageHint,
+    };
+
+    let mut backend = GraphicsBackend::new();
+    let resource = backend
+        .create_resource(ResourceDesc {
+            name: "perf-gate-upload".to_string(),
+            format: DxgiFormat::Unknown,
+            heap: HeapType::Default,
+            size: 4096,
+            subresources: 1,
+            initial_state: ResourceState::Common,
+            usage_hint: ResourceUsageHint::Buffer {
+                role: BufferRole::Constant,
+                cpu_write_frequent: true,
+            },
+        })
+        .map_err(|error| error.message.clone())?;
+    for _ in 0..1000 {
+        backend
+            .update_resource_region(resource, 0, &[0x5A_u8; 64])
+            .map_err(|error| error.message.clone())?;
+    }
+    let stats = backend.translation_stats();
+    let total = stats.zero_copy_updates + stats.staged_copies;
+    if total == 0 {
+        return Err("resource updates recorded no copy path".to_string());
+    }
+    Ok(stats.staged_copies as f64 / total as f64)
+}
+
+fn gate_barrier_rate() -> Result<f64, String> {
+    use casa1::gfx::{
+        BufferRole, DxgiFormat, GraphicsBackend, HeapType, PipelineStateDesc, ResourceDesc,
+        ResourceState, ResourceUsageHint, RootSignatureDesc,
+    };
+
+    let mut backend = GraphicsBackend::new();
+    let make_resource = |backend: &mut GraphicsBackend, name: &str| {
+        backend
+            .create_resource(ResourceDesc {
+                name: name.to_string(),
+                format: DxgiFormat::Unknown,
+                heap: HeapType::Default,
+                size: 4096,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Buffer {
+                    role: BufferRole::Constant,
+                    cpu_write_frequent: false,
+                },
+            })
+            .map_err(|error| error.message.clone())
+    };
+    let resource_a = make_resource(&mut backend, "perf-gate-barrier-a")?;
+    let resource_b = make_resource(&mut backend, "perf-gate-barrier-b")?;
+    let allocator = backend.create_command_allocator();
+    let root_signature = backend.create_root_signature(RootSignatureDesc::default());
+    let pipeline = backend.create_pipeline_state(
+        root_signature,
+        PipelineStateDesc {
+            label: "perf-gate-barriers".to_string(),
+            compute: true,
+            render_target_formats: Vec::new(),
+            depth_format: None,
+        },
+    );
+    let list = backend.create_graphics_command_list(allocator, pipeline, false);
+    backend
+        .record_uav_barrier(list, resource_a)
+        .map_err(|error| error.message.clone())?;
+    backend
+        .record_copy_buffer_region(list, resource_a, 0, resource_b, 0, 8)
+        .map_err(|error| error.message.clone())?;
+    backend
+        .record_uav_barrier(list, resource_a)
+        .map_err(|error| error.message.clone())?;
+    backend
+        .record_aliasing_barrier(list, Some(resource_a), Some(resource_b))
+        .map_err(|error| error.message.clone())?;
+    backend
+        .record_dispatch(list, 1, 1, 1)
+        .map_err(|error| error.message.clone())?;
+    backend
+        .record_aliasing_barrier(list, Some(resource_a), Some(resource_b))
+        .map_err(|error| error.message.clone())?;
+    let stream = backend
+        .close_command_list(list)
+        .map_err(|error| error.message.clone())?;
+    let analysis = backend
+        .analyze_barriers(&[stream])
+        .map_err(|error| error.message.clone())?;
+    let required = analysis.barriers_required
+        + analysis.uav_barriers_required
+        + analysis.aliasing_barriers_required;
+    let considered = analysis.barriers_considered
+        + analysis.uav_barriers_considered
+        + analysis.aliasing_barriers_considered;
+    if considered == 0 {
+        return Err("barrier analysis considered no barriers".to_string());
+    }
+    Ok(required as f64 * 1000.0 / considered as f64)
+}
+
+fn bench_gate_kpis(c: &mut Criterion) {
+    use std::collections::BTreeMap;
+
+    let mut metrics: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let jit_ready = casa1::jit::jit_execution_available();
+
+    if jit_ready {
+        match gate_worker_kpis() {
+            Ok((call_return, indirect)) => {
+                metrics.insert(
+                    "dispatcher_exits_per_1000_instructions".to_string(),
+                    gate_kpi_ok(
+                        call_return.dispatcher_exits_per_1000(),
+                        "exits/1000 IR instructions",
+                        "lower",
+                        "WorkerSliceBenchmark call/return chain (4096 blocks, budget 512)",
+                    ),
+                );
+                metrics.insert(
+                    "native_chaining_rate".to_string(),
+                    gate_kpi_ok(
+                        call_return.native_chaining_rate(),
+                        "fraction of blocks",
+                        "higher",
+                        "WorkerSliceBenchmark call/return chain (4096 blocks, budget 512)",
+                    ),
+                );
+                metrics.insert(
+                    "indirect_ic_hit_rate".to_string(),
+                    gate_kpi_ok(
+                        indirect.indirect_ic_hit_rate(),
+                        "fraction of indirect lookups",
+                        "higher",
+                        "WorkerSliceBenchmark monomorphic indirect call chain (4096 blocks, budget 512)",
+                    ),
+                );
+            }
+            Err(reason) => {
+                for key in [
+                    "dispatcher_exits_per_1000_instructions",
+                    "native_chaining_rate",
+                    "indirect_ic_hit_rate",
+                ] {
+                    metrics.insert(key.to_string(), gate_kpi_missing(reason.clone()));
+                }
+            }
+        }
+    } else {
+        for key in [
+            "dispatcher_exits_per_1000_instructions",
+            "native_chaining_rate",
+            "indirect_ic_hit_rate",
+        ] {
+            metrics.insert(
+                key.to_string(),
+                gate_kpi_missing("JIT execution capability is unavailable on this host"),
+            );
+        }
+    }
+
+    match gate_generic_helper_rate() {
+        Ok(value) => {
+            metrics.insert(
+                "generic_helper_rate".to_string(),
+                gate_kpi_ok(
+                    value,
+                    "fallback/native lowered IR instruction",
+                    "lower",
+                    "jit_lowering_telemetry over the gate translation corpus",
+                ),
+            );
+        }
+        Err(reason) => {
+            metrics.insert("generic_helper_rate".to_string(), gate_kpi_missing(reason));
+        }
+    }
+
+    match gate_high_address_metrics() {
+        Ok((syncs, pages)) => {
+            metrics.insert(
+                "high_address_software_syncs_per_1000_instructions".to_string(),
+                gate_kpi_ok(
+                    syncs,
+                    "sync operations/1000 instructions",
+                    "lower",
+                    "guest_memory_telemetry after 4096 JIT loads at guest 0x2_0000_0000",
+                ),
+            );
+            metrics.insert(
+                "high_address_guest_page_faults_per_access".to_string(),
+                gate_kpi_ok(
+                    pages,
+                    "materialised pages/access after warm-up",
+                    "lower",
+                    "guest_memory_telemetry after 4096 JIT loads at guest 0x2_0000_0000",
+                ),
+            );
+        }
+        Err(reason) => {
+            for key in [
+                "high_address_software_syncs_per_1000_instructions",
+                "high_address_guest_page_faults_per_access",
+            ] {
+                metrics.insert(key.to_string(), gate_kpi_missing(reason.clone()));
+            }
+        }
+    }
+
+    match gate_thunk_generic_rate() {
+        Ok(value) => {
+            metrics.insert(
+                "thunk_generic_dispatch_rate".to_string(),
+                gate_kpi_ok(
+                    value,
+                    "generic fallbacks/lookup",
+                    "lower",
+                    "thunk_resolve_telemetry over 256 registered guest thunk addresses",
+                ),
+            );
+        }
+        Err(reason) => {
+            metrics.insert(
+                "thunk_generic_dispatch_rate".to_string(),
+                gate_kpi_missing(reason),
+            );
+        }
+    }
+
+    match gate_aot_hit_rate() {
+        Ok(value) => {
+            metrics.insert(
+                "persistent_aot_hit_rate".to_string(),
+                gate_kpi_ok(
+                    value,
+                    "hits/(hits+misses)",
+                    "higher",
+                    "JitRuntime::aot_metrics over 8 fresh runtime instances",
+                ),
+            );
+        }
+        Err(reason) => {
+            metrics.insert(
+                "persistent_aot_hit_rate".to_string(),
+                gate_kpi_missing(reason),
+            );
+        }
+    }
+
+    match gate_frame_metrics() {
+        Ok(frame) => {
+            let mut sorted = frame.present_latency_ns.clone();
+            sorted.sort_unstable();
+            for (key, fraction, unit) in [
+                ("frame_latency_p50_us", 0.50, "us"),
+                ("frame_latency_p95_us", 0.95, "us"),
+                ("frame_latency_p99_us", 0.99, "us"),
+                ("frame_latency_p999_us", 0.999, "us"),
+            ] {
+                metrics.insert(
+                    key.to_string(),
+                    gate_kpi_ok(
+                        gate_percentile(&sorted, fraction) / 1000.0,
+                        unit,
+                        "lower",
+                        "GraphicsBackend::present wall-clock latency over 5000 presents (320x240)",
+                    ),
+                );
+            }
+            metrics.insert(
+                "frame_latency_1pct_low_fps".to_string(),
+                gate_kpi_ok(
+                    gate_low_fps(&frame.present_latency_ns, 0.01),
+                    "fps",
+                    "higher",
+                    "1% worst GraphicsBackend::present latencies over 5000 presents (320x240)",
+                ),
+            );
+            metrics.insert(
+                "frame_latency_0p1pct_low_fps".to_string(),
+                gate_kpi_ok(
+                    gate_low_fps(&frame.present_latency_ns, 0.001),
+                    "fps",
+                    "higher",
+                    "0.1% worst GraphicsBackend::present latencies over 5000 presents (320x240)",
+                ),
+            );
+            let mut intervals = frame.interval_ns.clone();
+            intervals.sort_unstable();
+            for (key, fraction, unit) in [
+                ("frame_interval_p50_us", 0.50, "us"),
+                ("frame_interval_p95_us", 0.95, "us"),
+                ("frame_interval_p99_us", 0.99, "us"),
+                ("frame_interval_p999_us", 0.999, "us"),
+            ] {
+                metrics.insert(
+                    key.to_string(),
+                    gate_kpi_ok(
+                        gate_percentile(&intervals, fraction) / 1000.0,
+                        unit,
+                        "lower",
+                        "PresentResult::frame_time_ns between consecutive presents (64x64)",
+                    ),
+                );
+            }
+        }
+        Err(reason) => {
+            for key in [
+                "frame_latency_p50_us",
+                "frame_latency_p95_us",
+                "frame_latency_p99_us",
+                "frame_latency_p999_us",
+                "frame_latency_1pct_low_fps",
+                "frame_latency_0p1pct_low_fps",
+                "frame_interval_p50_us",
+                "frame_interval_p95_us",
+                "frame_interval_p99_us",
+                "frame_interval_p999_us",
+            ] {
+                metrics.insert(key.to_string(), gate_kpi_missing(reason.clone()));
+            }
+        }
+    }
+
+    match gate_pso_metrics() {
+        Ok((compile_us, hit_us)) => {
+            metrics.insert(
+                "pso_compile_us".to_string(),
+                gate_kpi_ok(
+                    compile_us,
+                    "us",
+                    "lower",
+                    "MetalGpuBackend::create_compute_pipeline (first creation, cache miss)",
+                ),
+            );
+            metrics.insert(
+                "pso_cache_hit_us".to_string(),
+                gate_kpi_ok(
+                    hit_us,
+                    "us",
+                    "lower",
+                    "MetalGpuBackend::create_compute_pipeline (identical key, cache hit)",
+                ),
+            );
+        }
+        Err(reason) => {
+            for key in ["pso_compile_us", "pso_cache_hit_us"] {
+                metrics.insert(key.to_string(), gate_kpi_missing(reason.clone()));
+            }
+        }
+    }
+
+    match gate_encoder_switch_rate() {
+        Ok(value) => {
+            metrics.insert(
+                "encoder_switches_per_1000_draws".to_string(),
+                gate_kpi_ok(
+                    value,
+                    "pipeline-state switches/1000 draws",
+                    "lower",
+                    "MetalCommandBatcher over 4096 alternating-pipeline draws",
+                ),
+            );
+        }
+        Err(reason) => {
+            metrics.insert(
+                "encoder_switches_per_1000_draws".to_string(),
+                gate_kpi_missing(reason),
+            );
+        }
+    }
+
+    match gate_shader_stall_rates() {
+        Ok((cold, hot)) => {
+            metrics.insert(
+                "shader_compile_stall_rate_cold".to_string(),
+                gate_kpi_ok(
+                    cold,
+                    "stalls/request",
+                    "lower",
+                    "shader::compile_with_cache over two cache-cold requests",
+                ),
+            );
+            metrics.insert(
+                "shader_compile_stall_rate_warm".to_string(),
+                gate_kpi_ok(
+                    hot,
+                    "stalls/request",
+                    "lower",
+                    "shader::compile_with_cache over two cache-warm requests",
+                ),
+            );
+        }
+        Err(reason) => {
+            for key in [
+                "shader_compile_stall_rate_cold",
+                "shader_compile_stall_rate_warm",
+            ] {
+                metrics.insert(key.to_string(), gate_kpi_missing(reason.clone()));
+            }
+        }
+    }
+
+    match gate_upload_copy_rate() {
+        Ok(value) => {
+            metrics.insert(
+                "gfx_staged_upload_copy_rate".to_string(),
+                gate_kpi_ok(
+                    value,
+                    "staged copies/(zero-copy+staged)",
+                    "lower",
+                    "GraphicsBackend::translation_stats over 1000 dynamic-buffer updates",
+                ),
+            );
+        }
+        Err(reason) => {
+            metrics.insert(
+                "gfx_staged_upload_copy_rate".to_string(),
+                gate_kpi_missing(reason),
+            );
+        }
+    }
+
+    match gate_barrier_rate() {
+        Ok(value) => {
+            metrics.insert(
+                "gfx_barriers_required_per_1000_considered".to_string(),
+                gate_kpi_ok(
+                    value,
+                    "required barriers/1000 considered",
+                    "lower",
+                    "GraphicsBackend::analyze_barriers over a mixed UAV/aliasing/copy stream",
+                ),
+            );
+        }
+        Err(reason) => {
+            metrics.insert(
+                "gfx_barriers_required_per_1000_considered".to_string(),
+                gate_kpi_missing(reason),
+            );
+        }
+    }
+
+    {
+        use casa1::cpu::{CpuState, GuestArch, IrInstruction, MemoryImage, execute_ir};
+        let instructions = vec![IrInstruction::Nop; 1024];
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        for _ in 0..8 {
+            let _ = execute_ir(&mut state, &mut memory, &instructions);
+        }
+        const ITERATIONS: u64 = 1000;
+        let started = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = execute_ir(&mut state, &mut memory, &instructions);
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        if seconds > 0.0 {
+            let mips = (ITERATIONS as f64 * instructions.len() as f64) / seconds / 1_000_000.0;
+            metrics.insert(
+                "legacy_dispatch_mips".to_string(),
+                gate_kpi_ok(
+                    mips,
+                    "M guest instructions/s",
+                    "higher",
+                    "execute_ir NOP dispatch, 1024-instruction block, 1000 iterations",
+                ),
+            );
+        } else {
+            metrics.insert(
+                "legacy_dispatch_mips".to_string(),
+                gate_kpi_missing("legacy dispatch measurement elapsed in zero time"),
+            );
+        }
+    }
+
+    for (key, reason) in [
+        (
+            "gpu_idle_gap_us",
+            "no GPU completion-timestamp history is retained; the queue exposes drain callbacks only, so inter-frame GPU idle gaps cannot be measured without a new timestamp query path",
+        ),
+        (
+            "residency_churn_per_1000_frames",
+            "MTLResidencySet exposes membership and allocated size but no add/remove event counter, and the backend does not record commit churn",
+        ),
+        (
+            "gpu_heap_faults_per_1000_frames",
+            "Metal does not expose MTLHeap page-fault counts; the backend tracks staging fallbacks, not GPU page faults",
+        ),
+    ] {
+        metrics.insert(key.to_string(), gate_kpi_missing(reason));
+    }
+
+    {
+        use casa1::cpu::GuestArch;
+        use casa1::jit::JitRuntime;
+        let blocks = tier2_loop_blocks(1000);
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        let _ = runtime.get_or_compile_function_tier2(&blocks, GuestArch::X64);
+        let metrics = casa1::jit_ssa::tier2_metrics();
+        let hit_rate = if metrics.functions_compiled + metrics.functions_fallback == 0 {
+            0.0
+        } else {
+            metrics.functions_compiled as f64
+                / (metrics.functions_compiled + metrics.functions_fallback) as f64
+        };
+        eprintln!(
+            "TIER2_HOT_LOOP hit_rate={:.3} compiled={} fallbacks={} blocks={} sccp={} gvn={} dce={} licm={} load_fwd={} store_elim={} spills={}",
+            hit_rate,
+            metrics.functions_compiled,
+            metrics.functions_fallback,
+            metrics.blocks,
+            metrics.sccp_eliminated,
+            metrics.gvn_eliminated,
+            metrics.dce_eliminated,
+            metrics.licm_hoisted,
+            metrics.load_forwarded,
+            metrics.store_eliminated,
+            metrics.register_spills,
+        );
+    }
+    {
+        use casa1::pe::ImportSymbol;
+        use casa1::runtime::{IatPatchEntry, IatPatchTable};
+        let mut table = IatPatchTable::default();
+        table.patch(IatPatchEntry {
+            slot_va: 0x5000_1000,
+            selected_base: 0x5000_0000,
+            iat_rva: 0x1000,
+            module: "kernel32.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: "GetTickCount64".to_string(),
+            },
+            bound_value: 0xABC0,
+            patched_value: 0xABC0,
+            module_handle: 1,
+        });
+        let _ = table.record_dispatch(0xABC0);
+        let metrics = table.metrics();
+        eprintln!(
+            "IAT_METRICS patched={} bypasses={} repatched={} invalidated={}",
+            metrics.patched, metrics.dispatch_bypasses, metrics.repatched, metrics.invalidated
+        );
+    }
+    {
+        use casa1::jit::{
+            InlineApi, inline_api_for_target, inline_api_metrics, register_inline_api_target,
+        };
+        register_inline_api_target(0x9100, InlineApi::GetTickCount64);
+        eprintln!(
+            "INLINE_API_STATS registered_targets={} inline_metric_total={}",
+            u64::from(inline_api_for_target(0x9100).is_some()),
+            inline_api_metrics().total
+        );
+    }
+
+    let document = serde_json::json!({
+        "schema": 1,
+        "generated_at": format!("{:?}", std::time::SystemTime::now()),
+        "platform": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        },
+        "metrics": metrics,
+    });
+    let text = serde_json::to_string(&document).unwrap_or_else(|_| "{}".to_string());
+    if let Ok(path) = std::env::var("CASA1_PERF_KPI_OUT") {
+        let _ = std::fs::write(path, &text);
+    }
+    eprintln!("CASA1_PERF_KPI {text}");
+
+    let mut group = c.benchmark_group("gate/kpi");
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_millis(100));
+    group.measurement_time(std::time::Duration::from_millis(500));
+
+    {
+        use casa1::cpu::{CpuState, GuestArch, IrInstruction, MemoryImage, execute_ir};
+        let instructions = vec![IrInstruction::Nop; 1024];
+        group.bench_function("cpu_dispatch_nop_1024", |b| {
+            let mut state = CpuState::new(GuestArch::X64);
+            let mut memory = MemoryImage::default();
+            b.iter(|| bb(execute_ir(&mut state, &mut memory, &instructions).is_ok()))
+        });
+    }
+
+    {
+        use casa1::perf::{GpuUploadStreamer, MetalCommandBatcher};
+        group.bench_function("gfx_upload_allocate_64k", |b| {
+            let mut streamer = GpuUploadStreamer::new(64 * 1024 * 128);
+            let buffer = streamer.create_streaming_buffer(64 * 1024 * 128);
+            b.iter(|| {
+                streamer.advance_frame();
+                bb(streamer.allocate(buffer, 64 * 1024).is_ok())
+            })
+        });
+        group.bench_function("gfx_command_batch_128", |b| {
+            b.iter_with_setup(
+                || MetalCommandBatcher::new(128),
+                |mut batcher| {
+                    for index in 0..384 {
+                        batcher.record_draw(index % 3, 3, 0, 1, 0, 0);
+                    }
+                    bb(batcher.drain_batches().len())
+                },
+            )
+        });
+    }
+
+    {
+        use casa1::pe::parse;
+        let pe = minimal_pe();
+        group.bench_function("pe_parse_minimal", |b| b.iter(|| bb(parse(&pe).is_ok())));
+    }
+
+    {
+        use casa1::gfx::{DxgiFormat, GraphicsBackend, SwapchainDesc};
+        let mut backend = GraphicsBackend::new();
+        let swapchain = backend
+            .create_swapchain(SwapchainDesc {
+                width: 64,
+                height: 64,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("perf gate swapchain");
+        group.bench_function("frame_present_64x64", |b| {
+            b.iter(|| bb(backend.present(swapchain, 1, false).is_ok()))
+        });
+    }
+
+    {
+        use casa1::jit::FastThunkTable;
+        extern "C" fn gate_bench_thunk_target() -> u64 {
+            0x42
+        }
+        let mut table = FastThunkTable::new();
+        let host_fn = gate_bench_thunk_target as *const () as usize;
+        let mut addresses = Vec::new();
+        for index in 0..256u64 {
+            let guest = 0x200_0000 + index * 0x10;
+            table
+                .register_with_guest_addr(host_fn, guest)
+                .expect("register perf gate thunk");
+            addresses.push(guest);
+        }
+        group.bench_function("thunk_resolve_256", |b| {
+            b.iter(|| {
+                let mut acc = 0usize;
+                for guest in &addresses {
+                    acc = acc.wrapping_add(table.find_thunk_by_guest(bb(*guest)).unwrap_or(0));
+                }
+                bb(acc)
+            })
+        });
+    }
+
+    {
+        use casa1::shader::{ShaderCache, ShaderStage, compile_with_cache};
+        let input = bench_shader_input(make_bench_dxil(5, "cs_main"), ShaderStage::Cs);
+        let requests = [input];
+        let mut cache = ShaderCache::new(4 * 1024 * 1024);
+        let _ = compile_with_cache(&requests, &mut cache);
+        group.bench_function("shader_cache_hit", |b| {
+            b.iter(|| bb(compile_with_cache(&requests, &mut cache)))
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_gate_kpis,
     // 1. CPU Engine Throughput
     bench_cpu_decode_nop,
     bench_cpu_decode_alu,
@@ -2008,6 +3648,15 @@ criterion_group!(
     bench_jit_dead_code_elimination,
     bench_jit_tier_promotion,
     bench_jit_inline_cache,
+    bench_jit_worker_call_return,
+    bench_jit_worker_indirect,
+    bench_jit_worker_control_caches,
+    bench_jit_native_linking,
+    bench_jit_conditional_branch_heavy,
+    bench_jit_aot_cache,
+    bench_jit_tier2_hot_loop,
+    bench_jit_iat_dispatch,
+    bench_jit_inlined_api_dispatch,
     // 3. PE Loading
     bench_pe_parse_minimal,
     bench_pe_parse_many_sections,
@@ -2042,6 +3691,7 @@ criterion_group!(
     bench_cpu_decode_throughput,
     // Interpreter memory model (on-demand page materialisation)
     bench_cpu_memory_sync_sparse,
+    bench_cpu_memory_above_four_gib,
     bench_jit_thunk_resolve,
     // Interpreter lazy flag materialisation
     bench_cpu_lazy_flags_alu_chain,

@@ -526,6 +526,30 @@ pub enum Register {
 }
 
 impl Register {
+    /// Reconstruct a `Register` from its architectural index (0..15).  Used
+    /// by the Tier-2 register allocator when lowering SSA locations back to
+    /// IR operands.
+    pub fn from_index(index: usize) -> Self {
+        match index & 0x0f {
+            0 => Self::Rax,
+            1 => Self::Rcx,
+            2 => Self::Rdx,
+            3 => Self::Rbx,
+            4 => Self::Rsp,
+            5 => Self::Rbp,
+            6 => Self::Rsi,
+            7 => Self::Rdi,
+            8 => Self::R8,
+            9 => Self::R9,
+            10 => Self::R10,
+            11 => Self::R11,
+            12 => Self::R12,
+            13 => Self::R13,
+            14 => Self::R14,
+            _ => Self::R15,
+        }
+    }
+
     pub fn index(self) -> usize {
         match self {
             Self::Rax => 0,
@@ -802,6 +826,11 @@ pub struct CpuState {
     /// boundaries — `execute_ir_with_hashing` materialises before returning.
     #[serde(skip)]
     pub(crate) pending_flags: Option<PendingFlags>,
+    /// Tier-2 JIT spill slots.  This is host-only scratch storage: the
+    /// interpreter and every JIT tier preserve it, but it is never part of
+    /// the guest-visible register or memory state (serialization skips it).
+    #[serde(default, skip)]
+    pub(crate) jit_spill: [u64; 32],
 }
 
 impl CpuState {
@@ -832,6 +861,7 @@ impl CpuState {
             jit_pending_fault: None,
             jit_pending_fault_write: false,
             pending_flags: None,
+            jit_spill: [0; 32],
         }
     }
 
@@ -1015,6 +1045,20 @@ impl CpuState {
             stats.skipped += 1;
         }
     }
+
+    /// Materialise any parked arithmetic flags for JIT code.
+    ///
+    /// The interpreter parks ADD/SUB/CMP/LOGIC flag results in
+    /// `CpuState::pending_flags` until the first flag read.  Native conditional
+    /// branches read the six flag bytes directly from `CpuState`, so they must
+    /// first force the parked computation into those bytes.  This is a no-op
+    /// when no computation is pending (the common compiled-code case, because
+    /// `jit_helper_set_flags` writes the flags eagerly and clears the park).
+    pub(crate) fn materialize_pending_flags_for_jit(&mut self) {
+        let mut stats = LazyFlagStats::default();
+        self.materialize_flags(&mut stats);
+        flush_lazy_flag_stats(stats);
+    }
 }
 
 const EFLAGS_CF: u64 = 1 << 0;
@@ -1067,17 +1111,89 @@ const MEMORY_PAGE_SIZE: usize = 4096;
 const MEMORY_PAGE_SHIFT: usize = 12;
 const MEMORY_PAGE_BITMAP_WORDS: usize = MEMORY_PAGE_SIZE / 64;
 const MEMORY_PAGE_MASK: u64 = !(MEMORY_PAGE_SIZE as u64 - 1);
-const LOW_PAGE_DIRECTORY_LEN: usize = (u32::MAX as usize / MEMORY_PAGE_SIZE) + 1;
-const LOW_PAGE_DIRECTORY_MISSING: u32 = u32::MAX;
+const PAGE_DIRECTORY_CHUNK_SHIFT: u64 = 21; // 2 MiB chunks
+const PAGE_DIRECTORY_CHUNK_ENTRIES: usize =
+    1 << (PAGE_DIRECTORY_CHUNK_SHIFT as usize - MEMORY_PAGE_SHIFT);
+const PAGE_DIRECTORY_MISSING: u32 = u32::MAX;
 
-/// Size of the flat guest window shared with the JIT.
+/// Preferred size of the flat guest window shared with the JIT: 256 GiB
+/// (power of two).
 ///
-/// The canonical store owns one `mmap` of this size.  Guest pages below it are
-/// addressed as `flat_base + guest_address`; pages above it (e.g. a PE image
-/// loaded at 0x1800_0000_0000) are backed by individually allocated 4 KiB
-/// frames owned by the same store.  Both views therefore read and write the
-/// SAME bytes; there is no mirror to synchronise.
-const GUEST_FLAT_SIZE: usize = 4 * 1024 * 1024 * 1024;
+/// The canonical store owns one `mmap` of this size when the host can reserve
+/// it; otherwise it falls back to [`GUEST_FLAT_MIN_SIZE`].  Guest pages below
+/// the window are addressed as `flat_base + guest_address`; pages above it
+/// (e.g. a PE image loaded at 0x1800_0000_0000) are backed by individually
+/// allocated 4 KiB frames owned by the same store.  Both views therefore read
+/// and write the SAME bytes; there is no mirror to synchronise.
+pub(crate) const GUEST_FLAT_SIZE: usize = 1 << 38;
+
+/// Minimum direct window guaranteed on every supported host: 128 GiB.  This
+/// keeps the 64 GiB (`0x10_0000_0000`) boundary inside the direct window even
+/// when the preferred 256 GiB reservation is unavailable.
+pub(crate) const GUEST_FLAT_MIN_SIZE: usize = 1 << 37;
+
+/// Alignment of the flat window base.  The mapping is over-reserved and the
+/// unaligned prefix/suffix are released, so `flat_base` stays aligned even
+/// when the kernel returns a lower-aligned address.
+pub(crate) const GUEST_FLAT_ALIGN: usize = 16 * 1024 * 1024;
+
+/// Reserve `size` bytes of sparse anonymous memory with `base` aligned to
+/// `align` (a power of two).  Returns null when the reservation is impossible.
+///
+/// # Safety
+/// The returned pointer is owned by the caller and must be released with
+/// `munmap(pointer, size)` exactly once.
+unsafe fn reserve_flat_window(size: usize, align: usize) -> *mut u8 {
+    debug_assert!(align.is_power_of_two());
+    let Some(total) = size.checked_add(align - 1) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: plain anonymous mmap; fd=-1 with MAP_ANONYMOUS is valid.
+    // MAP_NORESERVE keeps the window virtual until a page is actually
+    // committed, so sparse guests do not reserve swap.
+    let raw = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if raw == libc::MAP_FAILED {
+        return std::ptr::null_mut();
+    }
+    let raw_address = raw as usize;
+    let aligned_address = (raw_address + (align - 1)) & !(align - 1);
+    let prefix = aligned_address - raw_address;
+    let suffix = total - prefix - size;
+    // SAFETY: prefix/suffix are sub-ranges of the live reservation and do not
+    // overlap the [aligned_address, aligned_address + size) window.
+    unsafe {
+        if prefix != 0 {
+            libc::munmap(raw, prefix);
+        }
+        if suffix != 0 {
+            libc::munmap((aligned_address + size) as *mut libc::c_void, suffix);
+        }
+    }
+    aligned_address as *mut u8
+}
+
+/// Reserve the first size in `sizes` that fits, returning the chosen size and
+/// its aligned base (null base when every candidate failed).
+fn reserve_flat_window_candidates(sizes: &[usize], align: usize) -> (usize, *mut u8) {
+    for &size in sizes {
+        // SAFETY: the returned mapping is owned by the caller and released
+        // with `munmap(base, size)`.
+        let base = unsafe { reserve_flat_window(size, align) };
+        if !base.is_null() {
+            return (size, base);
+        }
+    }
+    (sizes[0], std::ptr::null_mut())
+}
 
 /// Canonical guest-memory store.
 ///
@@ -1086,7 +1202,7 @@ const GUEST_FLAT_SIZE: usize = 4 * 1024 * 1024 * 1024;
 /// JIT's flat window is the very same mapping (not a copy), so a store made
 /// through either view is immediately visible through the other.
 ///
-/// Resident memory is strictly sparse: the 4 GiB flat window is mapped with
+/// Resident memory is strictly sparse: the flat window is mapped with
 /// `MAP_NORESERVE` and only pages actually committed by the guest are ever
 /// touched.  Addresses outside the flat window receive one aligned frame each.
 pub(crate) struct GuestMemoryStore {
@@ -1115,33 +1231,22 @@ unsafe impl Sync for GuestMemoryStore {}
 
 impl GuestMemoryStore {
     pub(crate) fn new() -> Self {
-        // SAFETY: plain anonymous mmap; fd=-1 with MAP_ANONYMOUS is valid.
-        // MAP_NORESERVE keeps the 4 GiB window virtual until a page is
-        // actually committed, so sparse guests do not reserve swap.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                GUEST_FLAT_SIZE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        let valid = base != libc::MAP_FAILED;
-        let flat_base = if valid {
-            base as *mut u8
-        } else {
-            std::ptr::null_mut()
-        };
-        let bitmap_words = GUEST_FLAT_SIZE.div_ceil(MEMORY_PAGE_SIZE * 64);
+        // Try the full 256 GiB window first and degrade to the guaranteed
+        // 64 GiB minimum when the host refuses the larger reservation.
+        let (reserved_size, flat_base) = reserve_flat_window_candidates(
+            &[GUEST_FLAT_SIZE, GUEST_FLAT_MIN_SIZE],
+            GUEST_FLAT_ALIGN,
+        );
+        let valid = !flat_base.is_null();
+        let flat_size = reserved_size;
+        let bitmap_words = flat_size.div_ceil(MEMORY_PAGE_SIZE * 64);
         let materialised = (0..bitmap_words)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
             flat_base,
-            flat_size: GUEST_FLAT_SIZE,
+            flat_size,
             valid,
             materialised,
             materialisations: std::sync::atomic::AtomicU64::new(0),
@@ -1183,7 +1288,7 @@ impl GuestMemoryStore {
             // SAFETY: page_base < flat_size and the mapping is live for the
             // store's lifetime, so this page is inside the mapping.
             let pointer = unsafe { self.flat_base.add(page_base as usize) };
-            // SAFETY: the page is inside the 4 GiB mapping and correctly
+            // SAFETY: the page is inside the direct-window mapping and correctly
             // aligned (page_base is a multiple of 4096).
             unsafe {
                 std::ptr::write_bytes(pointer, 0, MEMORY_PAGE_SIZE);
@@ -1272,6 +1377,14 @@ impl GuestMemoryStore {
     pub(crate) fn materialisation_count(&self) -> u64 {
         self.materialisations
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn high_page_count(&self) -> usize {
+        self.high_pages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     #[cfg(test)]
@@ -1608,11 +1721,92 @@ impl MemoryPage {
     }
 }
 
+/// Two-level sparse page directory covering the direct window.
+///
+/// The top level has one entry per 2 MiB chunk of the window (512 KiB for a
+/// 256 GiB window); a second-level table is allocated only when a page in that
+/// chunk is committed.  Lookups are two array indexes, never a hash, and the
+/// directory stays proportional to the touched chunks rather than the window.
+#[derive(Clone)]
+struct PageDirectory {
+    top: Box<[u32]>,
+    #[allow(clippy::vec_box)]
+    tables: Vec<Box<[u32; PAGE_DIRECTORY_CHUNK_ENTRIES]>>,
+}
+
+impl std::fmt::Debug for PageDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PageDirectory")
+            .field("chunk_slots", &self.top.len())
+            .field("allocated_tables", &self.tables.len())
+            .finish()
+    }
+}
+
+impl PageDirectory {
+    fn new(window_size: usize) -> Self {
+        let pages = window_size.div_ceil(MEMORY_PAGE_SIZE) as u64;
+        let chunks = pages.div_ceil(PAGE_DIRECTORY_CHUNK_ENTRIES as u64) as usize;
+        Self {
+            top: vec![PAGE_DIRECTORY_MISSING; chunks].into_boxed_slice(),
+            tables: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn chunk_of(&self, page_base: u64) -> Option<(usize, usize)> {
+        let page = page_base >> MEMORY_PAGE_SHIFT;
+        let chunk = page >> (PAGE_DIRECTORY_CHUNK_SHIFT - MEMORY_PAGE_SHIFT as u64);
+        if chunk >= self.top.len() as u64 {
+            return None;
+        }
+        let entry = (page & (PAGE_DIRECTORY_CHUNK_ENTRIES as u64 - 1)) as usize;
+        Some((chunk as usize, entry))
+    }
+
+    #[inline]
+    fn covers(&self, page_base: u64) -> bool {
+        self.chunk_of(page_base).is_some()
+    }
+
+    #[inline]
+    fn get(&self, page_base: u64) -> Option<usize> {
+        let (chunk, entry) = self.chunk_of(page_base)?;
+        let table_index = self.top[chunk];
+        if table_index == PAGE_DIRECTORY_MISSING {
+            return None;
+        }
+        let index = self.tables.get(table_index as usize)?[entry];
+        (index != PAGE_DIRECTORY_MISSING).then_some(index as usize)
+    }
+
+    fn insert(&mut self, page_base: u64, index: usize) {
+        let (chunk, entry) = self
+            .chunk_of(page_base)
+            .expect("page directory insert requires an in-window page");
+        let mut table_index = self.top[chunk];
+        if table_index == PAGE_DIRECTORY_MISSING {
+            table_index = self.tables.len() as u32;
+            self.tables.push(Box::new(
+                [PAGE_DIRECTORY_MISSING; PAGE_DIRECTORY_CHUNK_ENTRIES],
+            ));
+            self.top[chunk] = table_index;
+        }
+        self.tables[table_index as usize][entry] = index as u32;
+    }
+
+    fn clear(&mut self) {
+        self.top.fill(PAGE_DIRECTORY_MISSING);
+        self.tables.clear();
+    }
+}
+
 #[derive(Debug)]
 pub struct MemoryImage {
     pages: Vec<(u64, MemoryPage)>,
     high_page_lookup: PageLookup,
-    low_page_lookup: Box<[u32]>,
+    page_directory: PageDirectory,
     /// Canonical storage shared with the JIT's flat window.  Every page's
     /// bytes live here; the page table only records which bytes are mapped.
     store: Arc<GuestMemoryStore>,
@@ -1641,15 +1835,26 @@ impl Clone for MemoryImage {
         // A clone is a snapshot: it gets its own canonical store and copies
         // every committed page.  It must never alias the live image.
         let store = GuestMemoryStore::new();
-        let pages = self
+        let pages: Vec<(u64, MemoryPage)> = self
             .pages
             .iter()
             .map(|(page_base, page)| (*page_base, page.snapshot(*page_base, &store)))
             .collect();
+        // Rebuild the lookup against the clone's own window: the clone's
+        // reservation may have fallen back to a smaller size than the source.
+        let mut page_directory = PageDirectory::new(store.flat_size());
+        let mut high_page_lookup = PageLookup::default();
+        for (index, (page_base, _)) in pages.iter().enumerate() {
+            if page_directory.covers(*page_base) {
+                page_directory.insert(*page_base, index);
+            } else {
+                high_page_lookup.insert(*page_base, index);
+            }
+        }
         Self {
             pages,
-            high_page_lookup: self.high_page_lookup.clone(),
-            low_page_lookup: self.low_page_lookup.clone(),
+            high_page_lookup,
+            page_directory,
             store: Arc::new(store),
             vm: self.vm,
         }
@@ -1658,12 +1863,13 @@ impl Clone for MemoryImage {
 
 impl Default for MemoryImage {
     fn default() -> Self {
+        let store = Arc::new(GuestMemoryStore::new());
+        let page_directory = PageDirectory::new(store.flat_size());
         Self {
             pages: Vec::new(),
             high_page_lookup: PageLookup::default(),
-            low_page_lookup: vec![LOW_PAGE_DIRECTORY_MISSING; LOW_PAGE_DIRECTORY_LEN]
-                .into_boxed_slice(),
-            store: Arc::new(GuestMemoryStore::new()),
+            page_directory,
+            store,
             vm: std::ptr::null_mut(),
         }
     }
@@ -1682,17 +1888,9 @@ impl PartialEq for MemoryImage {
 impl Eq for MemoryImage {}
 
 impl MemoryImage {
-    fn low_page_slot(page_base: u64) -> Option<usize> {
-        (page_base <= u32::MAX as u64).then_some((page_base as usize) >> MEMORY_PAGE_SHIFT)
-    }
-
     fn page_lookup_index(&self, page_base: u64) -> Option<usize> {
-        let index = if let Some(slot) = Self::low_page_slot(page_base) {
-            let index = self.low_page_lookup[slot];
-            if index == LOW_PAGE_DIRECTORY_MISSING {
-                return None;
-            }
-            index as usize
+        let index = if self.page_directory.covers(page_base) {
+            self.page_directory.get(page_base)?
         } else {
             *self.high_page_lookup.get(&page_base)?
         };
@@ -1704,8 +1902,8 @@ impl MemoryImage {
     }
 
     fn record_page_index(&mut self, page_base: u64, index: usize) {
-        if let Some(slot) = Self::low_page_slot(page_base) {
-            self.low_page_lookup[slot] = index as u32;
+        if self.page_directory.covers(page_base) {
+            self.page_directory.insert(page_base, index);
         } else {
             self.high_page_lookup.insert(page_base, index);
         }
@@ -1897,7 +2095,7 @@ impl MemoryImage {
             .map(|(i, (base, _))| (*base, i))
             .collect();
         self.high_page_lookup.clear();
-        self.low_page_lookup.fill(LOW_PAGE_DIRECTORY_MISSING);
+        self.page_directory.clear();
         for (base, index) in entries {
             self.record_page_index(base, index);
         }
@@ -4944,6 +5142,27 @@ pub enum IrInstruction {
     /// Triggers STATUS_BREAKPOINT through the SEH subsystem.
     /// Raised by `Int3` (0xCC), `int 0x2d` (0xCD 0x2D), and `int 0x03`.
     Breakpoint,
+    /// Tier-2 register-allocation spill: store a guest register into the
+    /// per-CPU spill area (transparent to the guest register file).
+    SpillStore {
+        slot: u16,
+        src: Register,
+    },
+    /// Tier-2 register-allocation fill: reload a spilled value into a guest
+    /// register from the per-CPU spill area.
+    SpillLoad {
+        slot: u16,
+        dst: Register,
+    },
+    /// Tier-2 explicit x86 flag materialisation for an ALU operation whose
+    /// result is not a CMP/TEST.  `op`: 0=add, 1=sub, 2=logic.
+    ExplicitFlags {
+        op: u8,
+        lhs: Register,
+        rhs: Register,
+        result: Register,
+        width: usize,
+    },
 }
 
 /// Masking/broadcast/rounding info for EVEX-encoded instructions.
@@ -5478,6 +5697,32 @@ impl CpuExecutionEngine {
                             ));
                         }
                     },
+                    crate::jit::JitExitReason::ConditionalTaken { .. }
+                    | crate::jit::JitExitReason::ConditionalNotTaken { .. } => {
+                        let taken =
+                            matches!(&reason, crate::jit::JitExitReason::ConditionalTaken { .. });
+                        match ir.last() {
+                            Some(IrInstruction::JumpIf {
+                                target,
+                                fallthrough,
+                                ..
+                            }) => {
+                                state.rip = if taken { *target } else { *fallthrough };
+                            }
+                            _ => {
+                                return Err(AppError::new(
+                                    ReasonCode::RcUnimplInsn,
+                                    "JIT conditional exit without a JumpIf terminator",
+                                ));
+                            }
+                        }
+                    }
+                    // The prologue guard stopped before the body ran.  RIP was
+                    // set to the guarded block; the outer dispatcher re-enters
+                    // it after this call returns.  SMC invalidation already ran
+                    // inside `execute_block`.
+                    crate::jit::JitExitReason::LinkBudget { .. }
+                    | crate::jit::JitExitReason::CodeEpoch { .. } => {}
                     crate::jit::JitExitReason::Return { .. }
                     | crate::jit::JitExitReason::ThunkDispatch { .. }
                     | crate::jit::JitExitReason::IndirectCall { .. } => match ir.last() {
@@ -19430,6 +19675,62 @@ fn execute_ir_inner(
                 state.set(*dst, next);
             }
             IrInstruction::MovReg8 { dst, src } => state.set_byte(*dst, state.get_byte(*src)),
+            IrInstruction::SpillStore { slot, src } => {
+                let index = *slot as usize;
+                if index >= state.jit_spill.len() {
+                    return Err(AppError::new(
+                        ReasonCode::RcInvalidState,
+                        format!("JIT spill slot {index} out of range"),
+                    ));
+                }
+                state.jit_spill[index] = state.gpr[src.index()];
+            }
+            IrInstruction::SpillLoad { slot, dst } => {
+                let index = *slot as usize;
+                if index >= state.jit_spill.len() {
+                    return Err(AppError::new(
+                        ReasonCode::RcInvalidState,
+                        format!("JIT spill slot {index} out of range"),
+                    ));
+                }
+                let value = state.jit_spill[index];
+                state.gpr[dst.index()] = value & state.arch.register_mask();
+            }
+            IrInstruction::ExplicitFlags {
+                op,
+                lhs,
+                rhs,
+                result,
+                width,
+            } => {
+                let mask = width_mask(*width);
+                let lhs_value = state.get(*lhs) & mask;
+                let rhs_value = state.get(*rhs) & mask;
+                let result_value = state.get(*result) & mask;
+                match op {
+                    0 => state.defer_add_flags(
+                        lhs_value,
+                        rhs_value,
+                        result_value,
+                        *width * 8,
+                        lazy_stats,
+                    ),
+                    1 => state.defer_sub_flags(
+                        lhs_value,
+                        rhs_value,
+                        result_value,
+                        *width * 8,
+                        lazy_stats,
+                    ),
+                    2 => state.defer_logic_flags(result_value, *width * 8, lazy_stats),
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("unsupported explicit flag op {other}"),
+                        ));
+                    }
+                }
+            }
             IrInstruction::AddImm { dst, value, width } => {
                 let mask = width_mask(*width);
                 let lhs = state.get(*dst) & mask;
@@ -25722,6 +26023,51 @@ fn execute_cold_path(
             };
             state.set_xmm(*dst, result);
         }
+        IrInstruction::SpillStore { slot, src } => {
+            let index = *slot as usize;
+            if index >= state.jit_spill.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!("JIT spill slot {index} out of range"),
+                ));
+            }
+            state.jit_spill[index] = state.gpr[src.index()];
+        }
+        IrInstruction::SpillLoad { slot, dst } => {
+            let index = *slot as usize;
+            if index >= state.jit_spill.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!("JIT spill slot {index} out of range"),
+                ));
+            }
+            let value = state.jit_spill[index];
+            state.gpr[dst.index()] = value & state.arch.register_mask();
+        }
+        IrInstruction::ExplicitFlags {
+            op,
+            lhs,
+            rhs,
+            result,
+            width,
+        } => {
+            let mask = width_mask(*width);
+            let lhs_value = state.get(*lhs) & mask;
+            let rhs_value = state.get(*rhs) & mask;
+            let result_value = state.get(*result) & mask;
+            state.pending_flags = None;
+            state.flags = match op {
+                0 => crate::cpu::add_flags(lhs_value, rhs_value, result_value, *width * 8),
+                1 => crate::cpu::sub_flags(lhs_value, rhs_value, result_value, *width * 8),
+                2 => crate::cpu::logic_flags(result_value, *width * 8),
+                other => {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!("unsupported explicit flag op {other}"),
+                    ));
+                }
+            };
+        }
         IrInstruction::Breakpoint => {
             return Err(AppError::new(
                 ReasonCode::RcUnimplInsn,
@@ -29285,12 +29631,14 @@ mod tests {
     #[test]
     fn memory_image_high_pages_use_fallback_lookup() {
         let mut memory = MemoryImage::default();
-        let high_page = 0x1_0000_2000_u64;
+        // Beyond the direct window: this page must use an owned frame.
+        let high_page = (GUEST_FLAT_SIZE as u64) + 0x2000;
 
         memory.map_bytes(high_page, &[0x11, 0x22, 0x33, 0x44]);
 
         assert_eq!(memory.page_index(high_page), Some(0));
         assert_eq!(memory.read_u32(high_page).unwrap(), 0x4433_2211);
+        assert_eq!(memory.canonical_store().high_page_count(), 1);
     }
 
     #[test]
@@ -32644,7 +32992,7 @@ mod tests {
     #[test]
     fn high_address_edge_page_outside_flat_window_is_never_flat_resident() {
         let mut memory = MemoryImage::default();
-        // A dynamic-base x64 PE is routinely mapped above the 4 GiB window.
+        // A dynamic-base x64 PE is routinely mapped above the direct window.
         let address = 0x1800_0000_0000_u64;
         memory.map_bytes(address, &[0x7E; 4096]);
         let store = Arc::clone(memory.canonical_store());
@@ -32824,5 +33172,271 @@ mod tests {
         }
         assert_eq!(store.materialised_page_count(), PAGES);
         assert_eq!(store.materialisation_count(), PAGES);
+    }
+
+    // ── Large sparse direct window ──────────────────────────────────────
+
+    #[test]
+    fn flat_window_reservation_is_aligned_sparse_and_rejects_overflow() {
+        let memory = MemoryImage::default();
+        let store = memory.canonical_store();
+        assert_eq!(
+            store.flat_size() >= GUEST_FLAT_MIN_SIZE,
+            true,
+            "the direct window must be at least 128 GiB (256 GiB preferred)"
+        );
+        assert_eq!(store.flat_size().is_power_of_two(), true);
+        assert_eq!(
+            store.flat_size() % GUEST_FLAT_MIN_SIZE,
+            0,
+            "window sizes must be power-of-two multiples of the minimum"
+        );
+        assert_eq!(store.is_valid(), true);
+        assert_eq!(
+            store.flat_base() % GUEST_FLAT_ALIGN as u64,
+            0,
+            "the flat base must be aligned for direct guest addressing"
+        );
+        assert_eq!(store.flat_base() % 4096, 0);
+        assert_eq!(store.materialised_page_count(), 0);
+        assert_eq!(store.materialisation_count(), 0);
+        assert_eq!(
+            store.resident_flat_page_count(),
+            0,
+            "reserving the window must not commit a single page"
+        );
+        assert_eq!(store.high_page_count(), 0);
+
+        // The reservation must fail cleanly instead of panicking or wrapping.
+        assert_eq!(
+            unsafe { reserve_flat_window(usize::MAX, GUEST_FLAT_ALIGN) }.is_null(),
+            true,
+            "size overflow must be rejected"
+        );
+        assert_eq!(
+            unsafe { reserve_flat_window(usize::MAX - GUEST_FLAT_ALIGN, GUEST_FLAT_ALIGN) }
+                .is_null(),
+            true,
+            "an impossible reservation must fail without committing memory"
+        );
+
+        // When the preferred size is impossible, the next candidate (the
+        // guaranteed 64 GiB minimum) must be reserved instead.
+        let (fallback_size, fallback_base) = reserve_flat_window_candidates(
+            &[usize::MAX - GUEST_FLAT_ALIGN, GUEST_FLAT_MIN_SIZE],
+            GUEST_FLAT_ALIGN,
+        );
+        assert_eq!(fallback_size, GUEST_FLAT_MIN_SIZE);
+        assert_eq!(fallback_base.is_null(), false);
+        assert_eq!(
+            fallback_base as usize % GUEST_FLAT_ALIGN,
+            0,
+            "a fallback reservation must stay aligned"
+        );
+        // SAFETY: the reservation was returned by the helper above and is no
+        // longer used after this release.
+        unsafe {
+            libc::munmap(fallback_base as *mut libc::c_void, fallback_size);
+        }
+
+        // Every candidate failing returns a null base and the preferred size,
+        // never a dangling pointer.
+        let (failed_size, failed_base) =
+            reserve_flat_window_candidates(&[usize::MAX, usize::MAX - 1], GUEST_FLAT_ALIGN);
+        assert_eq!(failed_size, usize::MAX);
+        assert_eq!(failed_base.is_null(), true);
+    }
+
+    #[test]
+    fn page_directory_boundary_reuses_one_table_for_adjacent_high_pages() {
+        let mut memory = MemoryImage::default();
+        let first = 0x2_0000_0000_u64;
+        let second = first + 0x1000;
+        let unmapped_in_chunk = first + 0x2000;
+        memory.map_bytes(first, &[0x10; 16]);
+        memory.map_bytes(second, &[0x20; 16]);
+        assert_eq!(memory.page_index(first), Some(0));
+        assert_eq!(memory.page_index(second), Some(1));
+        assert_eq!(memory.page_index(unmapped_in_chunk), None);
+        assert_eq!(memory.read_u8(first).unwrap(), 0x10);
+        assert_eq!(memory.read_u8(second).unwrap(), 0x20);
+        assert_eq!(
+            memory.read_u8(unmapped_in_chunk).is_err(),
+            true,
+            "an absent entry in an allocated 2 MiB chunk must fault"
+        );
+        assert_eq!(memory.canonical_store().materialisation_count(), 2);
+        assert_eq!(memory.canonical_store().high_page_count(), 0);
+    }
+
+    #[test]
+    fn flat_window_four_gib_and_end_boundary_select_direct_or_owned_frames() {
+        let mut memory = MemoryImage::default();
+        let window_size = memory.canonical_store().flat_size() as u64;
+        let below_four_gib = 0xFFFF_F000_u64;
+        let at_four_gib = 0x1_0000_0000_u64;
+        let at_sixty_four_gib = 0x10_0000_0000_u64;
+        let last_flat_page = window_size - 0x1000;
+        let beyond_window = window_size;
+        let pages = [
+            (below_four_gib, 0x11_u8),
+            (at_four_gib, 0x22),
+            (at_sixty_four_gib, 0x23),
+            (last_flat_page, 0x33),
+            (beyond_window, 0x44),
+        ];
+        for (address, value) in pages {
+            memory.map_bytes(address, &[value; 16]);
+        }
+        let store = Arc::clone(memory.canonical_store());
+        assert_eq!(store.materialised_page_count(), 5);
+        assert_eq!(store.materialisation_count(), 5);
+        assert_eq!(
+            store.high_page_count(),
+            1,
+            "only the page beyond the window may use an owned frame"
+        );
+        assert_eq!(
+            store.resident_flat_page_count(),
+            4,
+            "only the four in-window pages may be resident"
+        );
+        assert_eq!(store.is_page_materialised(below_four_gib), true);
+        assert_eq!(store.is_page_materialised(at_four_gib), true);
+        assert_eq!(store.is_page_materialised(at_sixty_four_gib), true);
+        assert_eq!(store.is_page_materialised(last_flat_page), true);
+        assert_eq!(store.is_page_materialised(beyond_window), true);
+
+        let flat_base = store.flat_base() as usize;
+        for address in [
+            below_four_gib,
+            at_four_gib,
+            at_sixty_four_gib,
+            last_flat_page,
+        ] {
+            assert_eq!(
+                memory.page(address).expect("flat page").bytes.as_ptr() as usize,
+                flat_base + address as usize,
+                "an address below the window must live at flat_base + address"
+            );
+        }
+        assert_ne!(
+            memory
+                .page(beyond_window)
+                .expect("owned frame")
+                .bytes
+                .as_ptr() as usize,
+            flat_base + beyond_window as usize,
+            "an address beyond the window must not alias the flat mapping"
+        );
+
+        // The direct mapping and the interpreter see the same bytes, including
+        // the exact 4 GiB boundary and the last page of the window.
+        for (address, value) in pages {
+            assert_eq!(memory.read_u8(address).unwrap(), value);
+            // SAFETY: every in-window page is backed by the live mapping; the
+            // out-of-window page is deliberately not dereferenced directly.
+            if address < window_size {
+                assert_eq!(
+                    unsafe { std::ptr::read_volatile((flat_base + address as usize) as *const u8) },
+                    value
+                );
+                memory.write_u8(address, value.wrapping_add(1));
+                assert_eq!(
+                    unsafe { std::ptr::read_volatile((flat_base + address as usize) as *const u8) },
+                    value.wrapping_add(1)
+                );
+            }
+        }
+        assert_eq!(store.materialisation_count(), 5);
+    }
+
+    #[test]
+    fn snapshot_above_four_gib_heap_never_observes_stale_live_writes() {
+        let mut memory = MemoryImage::default();
+        let address = 0x2_0000_0000_u64;
+        let high_address = 0x1800_0000_0000_u64;
+        memory.map_bytes(address, &[0x5A; 4096]);
+        memory.map_bytes(high_address, &[0x6B; 4096]);
+        let snapshot = memory.clone();
+        assert_eq!(snapshot.read_u8(address).unwrap(), 0x5A);
+        assert_eq!(
+            snapshot.read_u8(high_address).unwrap(),
+            0x6B,
+            "an owned-frame page must survive the snapshot"
+        );
+        assert_eq!(
+            memory.canonical_store().flat_size() >= GUEST_FLAT_MIN_SIZE,
+            true
+        );
+        assert_eq!(
+            snapshot.canonical_store().flat_size() >= GUEST_FLAT_MIN_SIZE,
+            true
+        );
+        assert_ne!(
+            memory.canonical_store().flat_base(),
+            snapshot.canonical_store().flat_base(),
+            "a clone must own a separate direct window"
+        );
+
+        memory.write_u8(address, 0xA5);
+        memory.write_u8(high_address, 0xB6);
+        assert_eq!(memory.read_u8(address).unwrap(), 0xA5);
+        assert_eq!(memory.read_u8(high_address).unwrap(), 0xB6);
+        assert_eq!(
+            snapshot.read_u8(address).unwrap(),
+            0x5A,
+            "the snapshot must not observe the live image's write"
+        );
+        assert_eq!(
+            snapshot.read_u8(high_address).unwrap(),
+            0x6B,
+            "the snapshot's owned frame must stay independent"
+        );
+        assert_eq!(memory.canonical_store().materialisation_count(), 2);
+        assert_eq!(snapshot.canonical_store().materialisation_count(), 2);
+        assert_eq!(memory.canonical_store().high_page_count(), 1);
+        assert_eq!(snapshot.canonical_store().high_page_count(), 1);
+    }
+
+    #[test]
+    fn concurrent_views_above_four_gib_never_observe_torn_values() {
+        use std::sync::atomic::AtomicU64;
+
+        let mut memory = MemoryImage::default();
+        let address = 0x2_0000_0000_u64;
+        memory.map_bytes(address, &[0; 4096]);
+        let store = memory.canonical_store();
+        let flat_view = (store.flat_base() + address) as usize;
+        let image_view = memory.page(address).expect("page").bytes.as_ptr() as usize;
+        let iterations = 20_000_u64;
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                // SAFETY: the >4 GiB page is committed in the flat window and
+                // both addresses refer to the same 8-byte-aligned atomic.
+                let atomic = unsafe { &*(flat_view as *const AtomicU64) };
+                for value in 1..=iterations {
+                    atomic.store(value, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            // SAFETY: same committed, aligned canonical page as above.
+            let reader = unsafe { &*(image_view as *const AtomicU64) };
+            let mut last = 0_u64;
+            while last < iterations {
+                let observed = reader.load(std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(
+                    observed >= last,
+                    true,
+                    "the image view moved backwards: {observed} < {last}"
+                );
+                last = observed;
+                std::hint::spin_loop();
+            }
+            writer.join().unwrap();
+        });
+        assert_eq!(memory.read_u64(address).unwrap(), iterations);
+        assert_eq!(store.materialisation_count(), 1);
+        assert_eq!(store.high_page_count(), 0);
     }
 }

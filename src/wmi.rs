@@ -7,11 +7,57 @@
 // (sysctl, sw_vers, hostname, etc.).
 
 use crate::error::{AppError, AppResult};
+use crate::hardware_identity::{HardwareIdentity, host_identity};
 use crate::reason::ReasonCode;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The process-wide hardware identity every WMI class is sourced from, so WMI
+/// can never disagree with the registry, the device IOCTLs, the firmware table
+/// or DXGI/D3DKMT.
+fn identity() -> &'static HardwareIdentity {
+    host_identity()
+}
+
+/// A WMI DMTF datetime string from unix seconds (UTC).
+fn unix_to_dmtf(seconds: u64) -> WmiPropertyValue {
+    WmiPropertyValue::DateTime(format_dmtf(seconds as i64))
+}
+
+fn format_dmtf(total_secs: i64) -> String {
+    let total_secs = total_secs.max(0);
+    let days = total_secs / 86400;
+    let time_secs = total_secs % 86400;
+    let hours = time_secs / 3600;
+    let minutes = (time_secs % 3600) / 60;
+    let seconds = time_secs % 60;
+    let mut year = 1970i64;
+    let mut remaining = days;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+    let month_days = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1u32;
+    for days_in_month in month_days {
+        if remaining < days_in_month {
+            break;
+        }
+        remaining -= days_in_month;
+        month += 1;
+    }
+    let day = (remaining + 1) as u32;
+    format!("{year:04}{month:02}{day:02}{hours:02}{minutes:02}{seconds:02}.000000+000")
+}
 
 // ============================================================================
 // macOS System Info Query Helpers
@@ -129,58 +175,6 @@ fn physical_cpu_count() -> u32 {
     sysctl_u32("hw.physicalcpu").unwrap_or(4)
 }
 
-/// Get logical CPU core count.
-fn logical_cpu_count() -> u32 {
-    sysctl_u32("hw.logicalcpu").unwrap_or(8)
-}
-
-/// Get hostname via direct `libc::gethostname()` call.
-fn host_name() -> String {
-    let mut buf = [0i8; 256];
-    // SAFETY: gethostname writes at most 255 bytes + NUL into buf,
-    // which is 256 bytes. The buffer is stack-allocated and valid.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
-    if rc != 0 {
-        return "localhost".to_string();
-    }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..len].iter().map(|&c| c as u8).collect::<Vec<_>>()).to_string()
-}
-
-/// Get macOS version string (e.g., "14.5") via direct sysctl.
-///
-/// Uses `kern.osproductversion` on modern macOS, falling back to
-/// deriving from `kern.osrelease` (Darwin kernel version).
-fn os_version() -> String {
-    // Prefer the macOS-specific sysctl (available since macOS 10.13+)
-    if let Some(v) = sysctl_value("kern.osproductversion") {
-        return v;
-    }
-    // Fallback: kern.osrelease gives Darwin version (e.g., "23.6.0")
-    // macOS 14.x = Darwin 23.x, macOS 13.x = Darwin 22.x, etc.
-    if let Some(darwin) = sysctl_value("kern.osrelease")
-        && let Some(major_str) = darwin.split('.').next()
-        && let Ok(major) = major_str.parse::<u32>()
-    {
-        if major < 20 {
-            // Darwin 17/18/19 correspond to macOS 10.13/10.14/10.15.
-            return format!("10.{}", major.saturating_sub(4));
-        }
-        return format!("{}.0", major.saturating_sub(9));
-    }
-    "14.0".to_string()
-}
-
-/// Get macOS build number (e.g., "23F79") via direct sysctl.
-fn os_build_number() -> String {
-    sysctl_value("kern.osversion").unwrap_or_else(|| "0".to_string())
-}
-
-/// Get current user name.
-fn user_name() -> String {
-    std::env::var("USER").unwrap_or_else(|_| "user".to_string())
-}
-
 /// Generate a macOS marketing name from version string.
 fn os_marketing_name(version: &str) -> String {
     let major: u32 = version
@@ -198,65 +192,6 @@ fn os_marketing_name(version: &str) -> String {
         _ => "macOS",
     }
     .to_string()
-}
-
-/// Get system boot time as DMTF datetime string.
-///
-/// Uses the direct `libc::sysctl` API on `kern.boottime` which returns a
-/// `timeval` struct, avoiding the string-parsing hack needed with the old
-/// `sysctl -n kern.boottime` shell-out.
-fn boot_time_dmtf() -> String {
-    // Use direct sysctl for kern.boottime which returns a struct timeval
-    let raw = sysctl_raw("kern.boottime").unwrap_or_default();
-    // kern.boottime returns struct timeval { tv_sec: i64, tv_usec: i32 }
-    let sec = if raw.len() >= 8 {
-        i64::from_ne_bytes(raw[..8].try_into().unwrap_or([0; 8])) as u64
-    } else {
-        // Fallback: current time minus 1 hour
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        now.as_secs().saturating_sub(3600)
-    };
-
-    // Convert to DMTF datetime: YYYYMMDDHHMMSS.******±UUU
-    let secs = sec as i64;
-    let days = secs / 86400;
-    let time_secs = secs % 86400;
-    let hours = time_secs / 3600;
-    let minutes = (time_secs % 3600) / 60;
-    let seconds = time_secs % 60;
-
-    // Approximate date from days since epoch (1970-01-01)
-    let mut year = 1970i64;
-    let mut remaining_days = days;
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-    let month_days = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut month = 1u32;
-    for &md in &month_days {
-        if remaining_days < md {
-            break;
-        }
-        remaining_days -= md;
-        month += 1;
-    }
-    let day = (remaining_days + 1) as u32;
-
-    format!(
-        "{:04}{:02}{:02}{:02}{:02}{:02}.000000+000",
-        year, month, day, hours, minutes, seconds
-    )
 }
 
 fn is_leap_year(y: i64) -> bool {
@@ -476,24 +411,20 @@ pub struct Win32ComputerSystemProvider;
 
 impl Win32ComputerSystemProvider {
     fn build_object(&self) -> WmiObject {
-        let hostname = host_name();
+        let identity = identity();
         let total_ram = total_physical_memory();
-        let logical = logical_cpu_count();
-        let username = user_name();
-        let domain = "".to_string();
+        let logical = identity.cpu.logical;
 
         WmiObject::new("Win32_ComputerSystem")
-            .set("Name", hostname.clone())
-            .set("Manufacturer", "Apple Inc.")
-            .set(
-                "Model",
-                sysctl_value("hw.model").unwrap_or_else(|| "Mac".to_string()),
-            )
+            .set("Name", identity.os.computer_name.clone())
+            .set("Manufacturer", identity.machine.system_manufacturer.clone())
+            .set("Model", identity.machine.product_name.clone())
             .set("TotalPhysicalMemory", total_ram)
             .set("NumberOfProcessors", logical)
-            .set("Domain", domain)
-            .set("PrimaryOwnerName", username)
+            .set("Domain", identity.os.domain.clone())
+            .set("PrimaryOwnerName", identity.os.user_name.clone())
             .set("SystemType", "ARM64")
+            .set("UserName", identity.os.user_name.clone())
             .clone()
     }
 }
@@ -530,19 +461,29 @@ pub struct Win32ProcessorProvider;
 
 impl Win32ProcessorProvider {
     fn build_object(&self) -> WmiObject {
-        let physical = physical_cpu_count();
-        let logical = logical_cpu_count();
-        let freq = sysctl_u32("hw.cpufrequency").unwrap_or(3200);
+        let identity = identity();
+        let physical = identity.cpu.cores;
+        let logical = identity.cpu.logical;
+        // MaxClockSpeed is in MHz: the measured monotonic (TSC) frequency.
+        let freq = (identity.cpu.tsc_hz / 1_000_000).min(u32::MAX as u64) as u32;
 
         WmiObject::new("Win32_Processor")
-            .set("Name", "Apple Silicon")
+            .set("Name", identity.cpu.brand.clone())
             .set("NumberOfCores", physical)
             .set("NumberOfLogicalProcessors", logical)
             .set("MaxClockSpeed", freq)
             .set("Architecture", 9u16) // 9 = x64
-            .set("ProcessorId", "ARM64")
-            .set("Manufacturer", "Apple")
-            .set("Description", "Apple Silicon Processor")
+            .set(
+                "Family",
+                identity.cpu.family.map_or(2u16, |value| value as u16),
+            )
+            .set(
+                "Stepping",
+                identity.cpu.stepping.map_or(0u16, |value| value as u16),
+            )
+            .set("ProcessorId", format!("{:016X}", identity.gpu_luid()))
+            .set("Manufacturer", identity.cpu.vendor.clone())
+            .set("Description", identity.cpu.brand.clone())
             .clone()
     }
 }
@@ -576,40 +517,41 @@ pub struct Win32OperatingSystemProvider;
 
 impl Win32OperatingSystemProvider {
     fn build_object(&self) -> WmiObject {
-        let version = os_version();
-        let build = os_build_number();
+        let identity = identity();
+        let version = identity.os.version.clone();
+        let build = identity.os.build.clone();
         let marketing = os_marketing_name(&version);
         let total_ram_kb = total_physical_memory() / 1024;
         let avail_ram_kb = available_physical_memory() / 1024;
-        let hostname = host_name();
 
-        WmiObject::new("Win32_OperatingSystem")
-            .set("Caption", format!("{} {}", marketing, version))
+        let mut object = WmiObject::new("Win32_OperatingSystem")
+            .set("Caption", format!("{} {version}", marketing))
             .set("Version", version)
-            .set("BuildNumber", build.clone())
+            .set("BuildNumber", build)
             .set("BuildType", "Release")
             .set("OSArchitecture", "ARM64")
             .set("TotalVisibleMemorySize", total_ram_kb)
             .set("FreePhysicalMemory", avail_ram_kb)
             .set("FreeVirtualMemory", avail_ram_kb)
             .set("TotalVirtualMemorySize", total_ram_kb + 2_097_152) // ~2 GB page file
-            .set(
-                "LastBootUpTime",
-                WmiPropertyValue::DateTime(boot_time_dmtf()),
-            )
-            .set("CSName", hostname)
-            .set("RegisteredUser", user_name())
-            .set("SerialNumber", "00000-00000-00000-00000")
+            .set("LastBootUpTime", unix_to_dmtf(identity.os.boot_time))
+            .set("CSName", identity.os.computer_name.clone())
+            .set("RegisteredUser", identity.os.user_name.clone())
+            .set("SerialNumber", identity.install.product_id.clone())
             .set("Organization", "")
             .set("CountryCode", "1")
-            .set("CurrentTimeZone", -420i32) // UTC-7 in minutes
+            .set("CurrentTimeZone", 0i32)
             .set("NumberOfUsers", 1u32)
             .set("NumberOfProcesses", 512u32)
             .set("ServicePackMajorVersion", 0u16)
             .set("ServicePackMinorVersion", 0u16)
             .set("SuiteMask", 0x0100u16) // VER_SUITE_SINGLEUSERTS
             .set("ProductType", 1u32) // VER_NT_WORKSTATION
-            .clone()
+            .clone();
+        if let Some(install_date) = identity.os.install_date {
+            object.set("InstallDate", unix_to_dmtf(install_date));
+        }
+        object
     }
 }
 
@@ -645,14 +587,32 @@ pub struct Win32VideoControllerProvider;
 impl Win32VideoControllerProvider {
     fn build_object(&self) -> WmiObject {
         let (width, height) = screen_resolution();
+        let identity = identity();
 
-        // Try to get GPU info from system_profiler
-        let gpu_name = Self::get_gpu_name();
-        let vram_bytes = Self::get_vram_bytes();
+        // The GPU identity is sourced from the same Metal/IOKit probe the DXGI
+        // and D3DKMT surfaces use, so the name/VRAM/vendor always agree.
+        let gpu_name = if identity.gpu.name.is_empty() {
+            Self::get_gpu_name()
+        } else {
+            identity.gpu.name.clone()
+        };
+        let vram_bytes = if identity.gpu.vram_bytes == 0 {
+            Self::get_vram_bytes()
+        } else {
+            identity.gpu.vram_bytes
+        };
 
         WmiObject::new("Win32_VideoController")
             .set("Name", gpu_name.clone())
             .set("AdapterRAM", vram_bytes)
+            .set(
+                "PNPDeviceID",
+                format!("Metal\\{:016X}", identity.gpu.registry_id),
+            )
+            .set(
+                "AdapterCompatibility",
+                identity.machine.system_manufacturer.clone(),
+            )
             .set("DriverVersion", "1.0")
             .set("VideoProcessor", "Apple Graphics")
             .set("VideoArchitecture", 1u16) // VGA
@@ -903,23 +863,41 @@ pub struct Win32DiskDriveProvider;
 
 impl Win32DiskDriveProvider {
     fn build_object(&self) -> WmiObject {
-        // Try to get disk info from system_profiler or diskutil
-        let (model, size_bytes, interface, partitions) = Self::get_disk_info();
+        let identity = identity();
+        let (fallback_model, fallback_size, fallback_interface, partitions) = Self::get_disk_info();
+        let disk = identity.disks.first();
+        let model = disk
+            .map(|disk| disk.model.clone())
+            .filter(|model| !model.is_empty())
+            .unwrap_or(fallback_model);
+        let size_bytes = disk
+            .map(|disk| disk.size_bytes)
+            .filter(|size| *size > 0)
+            .unwrap_or(fallback_size);
+        let interface = disk
+            .map(|disk| disk.interface.clone())
+            .filter(|interface| !interface.is_empty())
+            .unwrap_or(fallback_interface);
 
-        WmiObject::new("Win32_DiskDrive")
-            .set("Model", model)
+        let mut object = WmiObject::new("Win32_DiskDrive")
+            .set("Model", model.clone())
             .set("Size", size_bytes)
             .set("InterfaceType", interface)
             .set("MediaType", "Fixed hard disk media")
             .set("Partitions", partitions)
-            .set("Caption", "APPLE SSD")
+            .set("Caption", model)
             .set("Status", "OK")
             .set("BytesPerSector", 512u32)
             .set("SectorsPerTrack", 63u32)
             .set("TotalHeads", 255u32)
             .set("TotalCylinders", 16383u32)
             .set("TracksPerCylinder", 255u32)
-            .clone()
+            .clone();
+        if let Some(disk) = disk {
+            object.set("SerialNumber", disk.serial.clone());
+            object.set("DeviceID", disk.whole_disk.clone());
+        }
+        object
     }
 
     /// Get disk info using `libc::statfs()` and `std::fs` metadata.
@@ -1009,93 +987,59 @@ impl Win32NetworkAdapterProvider {
                 .set("Manufacturer", "Microsoft")
                 .set("NetEnabled", false)
                 .set("Index", 0u32)
+                .set("PermanentAddress", "00:00:00:00:00:00")
+                .set("DHCPEnabled", false)
                 .clone(),
         );
 
-        // Try to get active network interfaces
-        let output = match Command::new("/sbin/ifconfig").output() {
-            Ok(out) => Some(out),
-            Err(e) => {
-                eprintln!("[wmi] network_info: failed to run ifconfig: {e}");
-                None
+        // The guest network surfaces (GetAdaptersAddresses / GetAdaptersInfo /
+        // GetIfTable) all report the guest adapter model; WMI reports the same
+        // model so anti-cheat cannot observe a MAC that disagrees between
+        // iphlpapi and WMI.
+        let config = crate::network::guest_network_config(&identity().os.user_name);
+        for adapter in &config.adapters {
+            if adapter.if_type == 24 {
+                continue; // software loopback: already reported above
             }
-        };
-        if let Some(out) = output {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let mut current_iface: Option<String> = None;
-            let mut current_mac: Option<String> = None;
-            let mut current_ips: Vec<String> = Vec::new();
-            let mut is_up = false;
-
-            for line in text.lines() {
-                if line.is_empty() {
-                    if let Some(name) = current_iface.take()
-                        && name != "lo0"
-                        && !name.starts_with("gif")
-                        && !name.starts_with("stf")
-                        && !name.starts_with("awdl")
-                        && !name.starts_with("llw")
-                    {
-                        let ip_enabled = !current_ips.is_empty();
-                        objects.push(
-                            WmiObject::new("Win32_NetworkAdapter")
-                                .set("Name", name.clone())
-                                .set(
-                                    "MACAddress",
-                                    current_mac
-                                        .clone()
-                                        .unwrap_or_else(|| "00:00:00:00:00:00".to_string()),
-                                )
-                                .set("IPEnabled", ip_enabled)
-                                .set(
-                                    "IPAddress",
-                                    WmiPropertyValue::Array(
-                                        current_ips
-                                            .iter()
-                                            .map(|ip| WmiPropertyValue::String(ip.clone()))
-                                            .collect(),
-                                    ),
-                                )
-                                .set("NetConnectionStatus", if ip_enabled { 2u32 } else { 0u32 }) // 2=connected
-                                .set("AdapterType", "Ethernet 802.3")
-                                .set("Description", name)
-                                .set("Speed", 1000000000u64)
-                                .set("Manufacturer", "Apple")
-                                .set("NetEnabled", is_up)
-                                .set("Index", objects.len() as u32)
-                                .clone(),
-                        );
-                    }
-                    current_ips.clear();
-                    current_mac = None;
-                    is_up = false;
-                    continue;
-                }
-
-                let trimmed = line.trim();
-                if !trimmed.starts_with('\t') && !trimmed.starts_with(' ') {
-                    // Interface name line
-                    let name = trimmed.split(':').next().unwrap_or("").to_string();
-                    current_iface = Some(name);
-                    is_up = trimmed.contains("UP");
-                } else if trimmed.starts_with("ether ") {
-                    let mac = trimmed.trim_start_matches("ether ").trim().to_string();
-                    current_mac = Some(mac);
-                } else if trimmed.starts_with("inet ") {
-                    let ip = trimmed
-                        .trim_start_matches("inet ")
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
-                    if !ip.is_empty() {
-                        current_ips.push(ip);
-                    }
-                }
-            }
+            let mac = adapter
+                .mac
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(":");
+            objects.push(
+                WmiObject::new("Win32_NetworkAdapter")
+                    .set("Name", adapter.description.clone())
+                    .set("NetConnectionID", adapter.friendly_name.clone())
+                    .set("MACAddress", mac.clone())
+                    .set("PermanentAddress", mac)
+                    .set("IPEnabled", adapter.dhcp_enabled)
+                    .set(
+                        "NetConnectionStatus",
+                        if adapter.dhcp_enabled { 2u32 } else { 0u32 },
+                    )
+                    .set("AdapterType", guest_if_type_name(adapter.if_type))
+                    .set("Description", adapter.description.clone())
+                    .set("Speed", adapter.speed)
+                    .set("Manufacturer", "Apple")
+                    .set("NetEnabled", true)
+                    .set("DHCPEnabled", adapter.dhcp_enabled)
+                    .set("Index", adapter.index)
+                    .clone(),
+            );
         }
 
         objects
+    }
+}
+
+/// Map a guest `IF_TYPE` to a Windows adapter-type string.
+fn guest_if_type_name(if_type: u32) -> &'static str {
+    match if_type {
+        6 => "Ethernet 802.3",
+        71 => "Wireless 802.11",
+        24 => "Loopback",
+        _ => "Ethernet 802.3",
     }
 }
 
@@ -1131,27 +1075,30 @@ pub struct Win32BiosProvider;
 
 impl Win32BiosProvider {
     fn build_object(&self) -> WmiObject {
-        // Try to get boot ROM version
-        let boot_args = sysctl_value("kern.bootargs").unwrap_or_default();
-        let version = if boot_args.is_empty() {
-            "APPLE  - 1.0".to_string()
+        let identity = identity();
+        let machine = &identity.machine;
+        // The BIOS image version tracks the installed firmware/build.
+        let version = if machine.bios_version.is_empty() {
+            machine.product_name.clone()
         } else {
-            format!("APPLE Boot ROM - {}", boot_args)
+            machine.bios_version.clone()
         };
-
-        WmiObject::new("Win32_BIOS")
-            .set("Name", "Apple Boot ROM")
-            .set("Version", version)
-            .set("Manufacturer", "Apple Inc.")
-            .set(
-                "ReleaseDate",
-                WmiPropertyValue::DateTime("20230101000000.000000+000".to_string()),
-            )
+        let mut object = WmiObject::new("Win32_BIOS")
+            .set("Name", machine.bios_vendor.clone())
+            .set("Version", version.clone())
+            .set("Manufacturer", machine.bios_vendor.clone())
             .set("Status", "OK")
-            .set("SerialNumber", "000000000000")
-            .set("SMBIOSBIOSVersion", "1.0")
+            .set("SerialNumber", machine.serial_number.clone())
+            .set("SMBIOSBIOSVersion", version)
             .set("PrimaryBIOS", true)
-            .clone()
+            .clone();
+        if !machine.bios_date.is_empty() {
+            object.set(
+                "ReleaseDate",
+                WmiPropertyValue::DateTime(format!("{}.000000+000", machine.bios_date)),
+            );
+        }
+        object
     }
 }
 
@@ -1182,15 +1129,28 @@ pub struct Win32LogicalDiskProvider;
 impl Win32LogicalDiskProvider {
     fn build_object(&self) -> WmiObject {
         let (total_bytes, free_bytes, volume_name) = Self::get_disk_space();
+        let identity = identity();
+        let disk = identity.disks.first();
+        let volume_serial = disk
+            .map(|disk| format!("{:08X}", disk.volume_serial))
+            .unwrap_or_else(|| "00000000".to_string());
+        let filesystem = disk
+            .map(|disk| disk.filesystem.clone())
+            .filter(|filesystem| !filesystem.is_empty())
+            .unwrap_or_else(|| "APFS".to_string());
+        let label = disk
+            .map(|disk| disk.volume_name.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or(volume_name);
 
         WmiObject::new("Win32_LogicalDisk")
             .set("DeviceID", "C:")
             .set("DriveType", 3u32) // DRIVE_FIXED
             .set("Size", total_bytes)
             .set("FreeSpace", free_bytes)
-            .set("VolumeName", volume_name)
-            .set("VolumeSerialNumber", "00000000")
-            .set("FileSystem", "APFS")
+            .set("VolumeName", label)
+            .set("VolumeSerialNumber", volume_serial)
+            .set("FileSystem", filesystem)
             .set("Compressed", false)
             .set("SupportsDiskQuotas", false)
             .set("SupportsFileBasedCompression", false)
@@ -1316,16 +1276,14 @@ pub struct Win32ComputerSystemProductProvider;
 
 impl Win32ComputerSystemProductProvider {
     fn build_object(&self) -> WmiObject {
+        let machine = &identity().machine;
         WmiObject::new("Win32_ComputerSystemProduct")
-            .set("Name", "Mac")
-            .set("IdentifyingNumber", "00000000000000000")
-            .set("SKUNumber", "")
-            .set("Vendor", "Apple Inc.")
-            .set(
-                "Version",
-                sysctl_value("hw.model").unwrap_or_else(|| "Mac".to_string()),
-            )
-            .set("UUID", "00000000-0000-0000-0000-000000000000")
+            .set("Name", machine.product_name.clone())
+            .set("IdentifyingNumber", machine.serial_number.clone())
+            .set("SKUNumber", machine.baseboard_product.clone())
+            .set("Vendor", machine.system_manufacturer.clone())
+            .set("Version", machine.system_version.clone())
+            .set("UUID", machine.uuid.clone())
             .clone()
     }
 }
@@ -1336,6 +1294,45 @@ impl WmiClassProvider for Win32ComputerSystemProductProvider {
     }
     fn class_name(&self) -> &'static str {
         "Win32_ComputerSystemProduct"
+    }
+
+    fn get_object(&self, _key: &str, _value: &str) -> Option<WmiObject> {
+        Some(self.build_object())
+    }
+
+    fn enum_objects(&self) -> AppResult<Vec<WmiObject>> {
+        Ok(vec![self.build_object()])
+    }
+}
+
+// ============================================================================
+// Win32_BaseBoard Provider
+// ============================================================================
+
+#[derive(Clone)]
+pub struct Win32BaseBoardProvider;
+
+impl Win32BaseBoardProvider {
+    fn build_object(&self) -> WmiObject {
+        let machine = &identity().machine;
+        WmiObject::new("Win32_BaseBoard")
+            .set("Manufacturer", machine.baseboard_manufacturer.clone())
+            .set("Product", machine.baseboard_product.clone())
+            .set("Version", machine.baseboard_version.clone())
+            .set("SerialNumber", machine.baseboard_serial.clone())
+            .set("Tag", "Base Board".to_string())
+            .set("HostingBoard", true)
+            .set("PoweredOn", true)
+            .clone()
+    }
+}
+
+impl WmiClassProvider for Win32BaseBoardProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
+    fn class_name(&self) -> &'static str {
+        "Win32_BaseBoard"
     }
 
     fn get_object(&self, _key: &str, _value: &str) -> Option<WmiObject> {
@@ -1725,6 +1722,7 @@ pub fn create_default_wmi_service() -> WbemServices {
     service.register(Box::new(Win32LogicalDiskProvider));
     service.register(Box::new(Win32TimeZoneProvider));
     service.register(Box::new(Win32ComputerSystemProductProvider));
+    service.register(Box::new(Win32BaseBoardProvider));
     service
 }
 
@@ -2161,7 +2159,10 @@ mod tests {
         assert!(!objects.is_empty());
         let obj = &objects[0];
         assert_eq!(obj.class_name, "Win32_Processor");
-        assert_eq!(obj.get_string("Name").as_deref(), Some("Apple Silicon"));
+        assert_eq!(
+            obj.get_string("Name").as_deref(),
+            Some(crate::hardware_identity::host_identity().cpu.brand.as_str())
+        );
         assert!(obj.get_u32("NumberOfCores").unwrap() > 0);
         assert!(obj.get_u32("NumberOfLogicalProcessors").unwrap() > 0);
         assert!(obj.get_u32("MaxClockSpeed").unwrap() > 0);
@@ -2194,13 +2195,9 @@ mod tests {
     #[test]
     fn test_wbem_services_query_with_where() {
         let service = create_default_wmi_service();
-        let objects = service
-            .exec_query(
-                "WQL",
-                "SELECT * FROM Win32_Processor WHERE Name = 'Apple Silicon'",
-                0,
-            )
-            .unwrap();
+        let brand = crate::hardware_identity::host_identity().cpu.brand.clone();
+        let query = format!("SELECT * FROM Win32_Processor WHERE Name = '{brand}'");
+        let objects = service.exec_query("WQL", &query, 0).unwrap();
         assert!(!objects.is_empty());
     }
 
@@ -2212,28 +2209,97 @@ mod tests {
 
     #[test]
     fn test_sysctl_helpers() {
-        // Test that sysctl functions work on macOS
+        // Test that the remaining sysctl helpers work on macOS.
         let mem = total_physical_memory();
         assert!(mem > 0, "Total physical memory should be > 0");
 
         let phys = physical_cpu_count();
         assert!(phys > 0, "Physical CPU count should be > 0");
 
-        let log = logical_cpu_count();
-        assert!(log > 0, "Logical CPU count should be > 0");
-        assert!(log >= phys, "Logical cores >= physical cores");
+        let model = sysctl_value("hw.model");
+        assert!(model.is_some(), "hw.model should not be empty");
+    }
 
-        let host = host_name();
-        assert!(!host.is_empty(), "Hostname should not be empty");
+    #[test]
+    fn win32_bios_serial_mismatch_guard() {
+        let identity = crate::hardware_identity::host_identity();
+        let bios = Win32BiosProvider.build_object();
+        assert_eq!(
+            bios.get_string("SerialNumber").as_deref(),
+            Some(identity.machine.serial_number.as_str())
+        );
+        assert_eq!(
+            bios.get_string("Version").as_deref(),
+            Some(identity.machine.bios_version.as_str())
+        );
+    }
 
-        let user = user_name();
-        assert!(!user.is_empty(), "Username should not be empty");
+    #[test]
+    fn win32_computer_system_product_uuid_mismatch_guard() {
+        let identity = crate::hardware_identity::host_identity();
+        let product = Win32ComputerSystemProductProvider.build_object();
+        assert_eq!(
+            product.get_string("UUID").as_deref(),
+            Some(identity.machine.uuid.as_str())
+        );
+        assert_eq!(
+            product.get_string("IdentifyingNumber").as_deref(),
+            Some(identity.machine.serial_number.as_str())
+        );
+    }
 
-        let os_ver = os_version();
-        assert!(!os_ver.is_empty(), "OS version should not be empty");
+    #[test]
+    fn win32_baseboard_serial_mismatch_guard() {
+        let identity = crate::hardware_identity::host_identity();
+        let board = Win32BaseBoardProvider.build_object();
+        assert_eq!(
+            board.get_string("SerialNumber").as_deref(),
+            Some(identity.machine.baseboard_serial.as_str())
+        );
+        let service = create_default_wmi_service();
+        let objects = service
+            .exec_query("WQL", "SELECT * FROM Win32_BaseBoard", 0)
+            .unwrap();
+        assert_eq!(objects.len(), 1);
+    }
 
-        let build = os_build_number();
-        assert!(!build.is_empty(), "Build number should not be empty");
+    #[test]
+    fn win32_logicaldisk_volume_serial_mismatch_guard() {
+        let identity = crate::hardware_identity::host_identity();
+        let expected = identity
+            .disks
+            .first()
+            .map(|disk| format!("{:08X}", disk.volume_serial))
+            .unwrap_or_else(|| "00000000".to_string());
+        let disk = Win32LogicalDiskProvider.build_object();
+        assert_eq!(
+            disk.get_string("VolumeSerialNumber").as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn win32_networkadapter_mac_mismatch_guard() {
+        // WMI and the iphlpapi guest model must report the same adapters.
+        let config = crate::network::guest_network_config(
+            &crate::hardware_identity::host_identity().os.user_name,
+        );
+        let adapters = Win32NetworkAdapterProvider.build_objects();
+        let primary = config
+            .adapters
+            .iter()
+            .find(|adapter| adapter.if_type != 24)
+            .expect("ethernet adapter");
+        let expected = primary
+            .mac
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let found = adapters
+            .iter()
+            .any(|adapter| adapter.get_string("MACAddress").as_deref() == Some(expected.as_str()));
+        assert_eq!(found, true);
     }
 
     trait WmiObjectExt {

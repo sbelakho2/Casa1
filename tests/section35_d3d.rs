@@ -47,7 +47,7 @@ fn t35_04_d3d10_map_unmap_update_roundtrip() {
 
     // Unmap with modified data
     let modified: Vec<u8> = (128..192).collect();
-    device.unmap(buf_id, &modified).expect("unmap");
+    device.unmap_with_bytes(buf_id, &modified).expect("unmap");
 
     // Re-map and verify the unmapped data was actually persisted at the start
     // of the 256-byte buffer (a map/unmap that drops writes fails here).

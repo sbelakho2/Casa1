@@ -405,6 +405,134 @@ impl SystemLoopbackSink {
     }
 }
 
+/// Where a shared sink writer's frames landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkWritePath {
+    /// Written straight into canonical guest pages (no staging copy).
+    GuestShared,
+    /// The destination was outside/unusable for the guest window, so the
+    /// frames were buffered in host staging memory and counted.
+    Staged,
+}
+
+/// Counters for one shared sink writer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SharedSinkStats {
+    /// Successful writes that landed directly in guest pages.
+    pub shared_writes: u64,
+    /// Writes that needed a host staging fallback. This is always zero: an
+    /// out-of-window or oversized write is refused explicitly instead.
+    pub staging_copies: u64,
+    /// Bytes written through the guest-shared path.
+    pub shared_bytes: u64,
+}
+
+/// Sink writer that publishes interleaved f32 frames directly into canonical
+/// guest pages.
+///
+/// This is the shared path for media/sink-writer uploads: a valid in-window
+/// region is written with one `copy_nonoverlapping`, so the guest observes the
+/// samples without a Vec round-trip. A region outside the window (or a write
+/// larger than the configured capacity) cannot be satisfied zero-copy and is
+/// refused with an exact error instead of being silently staged.
+pub struct SharedSinkWriter {
+    window: crate::metal_backend::GuestMemoryWindow,
+    offset: usize,
+    capacity_bytes: usize,
+    stats: SharedSinkStats,
+}
+
+impl SharedSinkWriter {
+    /// Create a writer over `window[offset..offset+capacity_bytes]`.
+    ///
+    /// An out-of-window/overflowing region is not an error at construction: it
+    /// is reported by [`is_shared`](Self::is_shared) and every write to it is
+    /// refused with the exact region error.
+    pub fn new(
+        window: crate::metal_backend::GuestMemoryWindow,
+        offset: usize,
+        capacity_bytes: usize,
+    ) -> Self {
+        Self {
+            window,
+            offset,
+            capacity_bytes,
+            stats: SharedSinkStats::default(),
+        }
+    }
+
+    /// Whether the guest region is valid for direct writes.
+    pub fn is_shared(&self) -> bool {
+        self.capacity_bytes != 0
+            && self
+                .window
+                .resolve_region(self.offset, self.capacity_bytes)
+                .is_ok()
+    }
+
+    /// Publish interleaved f32 frames, returning the path taken.
+    ///
+    /// The only successful path is [`SinkWritePath::GuestShared`]. A write that
+    /// cannot land directly in guest pages is an explicit error, never a
+    /// counted staging copy.
+    pub fn write_interleaved(&mut self, interleaved: &[f32]) -> AppResult<SinkWritePath> {
+        if interleaved.is_empty() {
+            return Ok(SinkWritePath::GuestShared);
+        }
+        let bytes = interleaved
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcAudioUnsupported,
+                    "shared sink write: byte length overflow",
+                )
+            })?;
+        if bytes > self.capacity_bytes {
+            return Err(AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                format!(
+                    "shared sink write: {} bytes exceed the {}-byte guest capacity",
+                    bytes, self.capacity_bytes
+                ),
+            ));
+        }
+        let destination = self
+            .window
+            .resolve_region(self.offset, bytes)
+            .map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcAudioUnsupported,
+                    format!("shared sink write refused: {}", error.reason()),
+                )
+            })?;
+        // SAFETY: `resolve_region` proved `bytes` are inside the live guest
+        // window; f32s are copied as their native little-endian bytes, which
+        // is the guest's layout on every supported host.
+        unsafe {
+            std::ptr::copy_nonoverlapping(interleaved.as_ptr() as *const u8, destination, bytes);
+        }
+        self.stats.shared_writes += 1;
+        self.stats.shared_bytes += bytes as u64;
+        Ok(SinkWritePath::GuestShared)
+    }
+
+    /// Snapshot of this writer's counters.
+    pub fn stats(&self) -> SharedSinkStats {
+        self.stats
+    }
+}
+
+impl std::fmt::Debug for SharedSinkWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedSinkWriter")
+            .field("offset", &self.offset)
+            .field("capacity_bytes", &self.capacity_bytes)
+            .field("stats", &self.stats)
+            .finish()
+    }
+}
+
 /// One live system-loopback capture session.
 struct SystemLoopbackSession {
     backend: SystemLoopbackBackend,
@@ -9337,5 +9465,108 @@ mod tests {
         assert!(outcome.is_exclusive());
         assert_eq!(driver.set_calls, 0, "hog is not re-taken");
         assert_eq!(driver.rates, vec![96_000.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared guest sink writer (media/sink-writer upload path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn real_audio_shared_sink_writer_fallback_and_concurrent_writes_are_exact() {
+        use crate::metal_backend::{GuestSharedRegion, host_page_size};
+
+        let region = GuestSharedRegion::new(4 * host_page_size()).expect("guest region");
+        let page = host_page_size();
+        let samples = [1.0f32, -2.0, 0.5, 42.0];
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_ne_bytes())
+            .collect();
+
+        let mut writer = SharedSinkWriter::new(region.window(), page, bytes.len());
+        assert_eq!(format!("{writer:?}").contains("SharedSinkWriter"), true);
+        assert_eq!(writer.is_shared(), true);
+        assert_eq!(
+            writer
+                .write_interleaved(&[])
+                .expect("empty shared sink write"),
+            SinkWritePath::GuestShared
+        );
+        assert_eq!(writer.stats(), SharedSinkStats::default());
+        assert_eq!(
+            writer
+                .write_interleaved(&samples)
+                .expect("shared sink write"),
+            SinkWritePath::GuestShared
+        );
+        assert_eq!(
+            writer.stats(),
+            SharedSinkStats {
+                shared_writes: 1,
+                staging_copies: 0,
+                shared_bytes: bytes.len() as u64,
+            }
+        );
+        assert_eq!(&region.as_slice()[page..page + bytes.len()], &bytes);
+
+        // Region larger than the configured capacity: explicit refusal, never
+        // a silent staging copy.
+        let mut oversized = SharedSinkWriter::new(region.window(), page, 4);
+        let error = oversized
+            .write_interleaved(&samples)
+            .expect_err("oversized shared sink write must be refused");
+        assert_eq!(error.code, ReasonCode::RcAudioUnsupported);
+        assert_eq!(
+            error.message,
+            format!(
+                "shared sink write: {} bytes exceed the 4-byte guest capacity",
+                bytes.len()
+            )
+        );
+        assert_eq!(oversized.stats().staging_copies, 0);
+        assert_eq!(oversized.stats().shared_writes, 0);
+
+        // Destination outside the window: explicit refusal, never a write past
+        // the mapping.
+        let mut outside = SharedSinkWriter::new(region.window(), region.len(), 16);
+        assert_eq!(outside.is_shared(), false);
+        let error = outside
+            .write_interleaved(&samples)
+            .expect_err("out-of-window shared sink write must be refused");
+        assert_eq!(error.code, ReasonCode::RcAudioUnsupported);
+        assert_eq!(
+            error.message,
+            "shared sink write refused: guest region outside the canonical window"
+        );
+        assert_eq!(outside.stats().staging_copies, 0);
+
+        // Concurrent writers into disjoint guest windows land independently.
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for line in 0..4usize {
+                let window = region.window();
+                let offset = line * page;
+                handles.push(scope.spawn(move || {
+                    let mut writer = SharedSinkWriter::new(window, offset, 8);
+                    writer
+                        .write_interleaved(&[line as f32; 2])
+                        .expect("concurrent shared write")
+                }));
+            }
+            for handle in handles {
+                assert_eq!(
+                    handle.join().expect("writer thread"),
+                    SinkWritePath::GuestShared
+                );
+            }
+        });
+        for line in 0..4usize {
+            let offset = line * page;
+            let expected: Vec<u8> = [line as f32; 2]
+                .iter()
+                .flat_map(|sample| sample.to_ne_bytes())
+                .collect();
+            assert_eq!(&region.as_slice()[offset..offset + 8], expected.as_slice());
+        }
     }
 }

@@ -392,4 +392,27 @@ mod tests {
             Err(STATUS_INVALID_PARAMETER)
         );
     }
+
+    #[test]
+    fn allocate_reserves_and_commits_through_the_canonical_vm() {
+        let mut vm = test_vm();
+        let (base, size) = nt_allocate_virtual_memory(
+            &mut vm,
+            0,
+            0,
+            0x4000,
+            MEM_COMMIT | MEM_RESERVE,
+            crate::ntdll::PAGE_READWRITE,
+        )
+        .expect("allocate");
+        assert_ne!(base, 0);
+        assert_eq!(base & crate::vm::VM_PAGE_MASK, base);
+        assert_eq!(size, 0x4000);
+        // The canonical VM reflects the reservation + commitment.
+        let query = vm.query(base);
+        assert_eq!(query.state, VmState::Committed);
+        assert_eq!(query.region_size, 0x4000);
+        assert_eq!(query.protection, VmProtection::READ_WRITE);
+        assert!(vm.is_mapped(base));
+    }
 }

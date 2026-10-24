@@ -116,6 +116,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run non-ignored, non-external integration tests
+        env:
+          RUST_TEST_THREADS: "1"
         run: cargo test --tests
 
   docs:

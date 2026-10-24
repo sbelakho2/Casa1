@@ -201,9 +201,11 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
     device
         .update_subresource(staging, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
         .expect("update staging");
-    let mut mapped = device.map(vertex).expect("map vertex buffer");
-    mapped[..4].copy_from_slice(&[1, 2, 3, 4]);
-    device.unmap(vertex, &mapped).expect("unmap vertex buffer");
+    {
+        let mut mapped = device.map(vertex).expect("map vertex buffer");
+        mapped[..4].copy_from_slice(&[1, 2, 3, 4]);
+    }
+    device.unmap(vertex).expect("unmap vertex buffer");
     device
         .copy_subresource_region(staging, mirror, 2, 4, 6)
         .expect("copy region");

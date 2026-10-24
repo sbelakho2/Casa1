@@ -1,5 +1,6 @@
 # Casa1 local CI (Kiwi-CI): adversarial, affected-code-only, 100% coverage of
-# changed executable lines. Run with `kiwi run` (or `kiwi run --job gate`).
+# changed executable lines. Run with `kiwi run` (or `kiwi run --job gate` /
+# `kiwi run --job perf`).
 version: 1
 name: casa1
 jobs:
@@ -16,6 +17,23 @@ jobs:
         run: python3 ci/run_tests.py --lib --affected --coverage
       - name: adversarial-affected-integration
         run: python3 ci/run_tests.py --tests-only --affected
+    cache:
+      - name: cargo-target
+        paths:
+          - target
+        hash_files:
+          - Cargo.lock
+  # Blocking performance gate: runs the defined Criterion subset, parses
+  # target/criterion/**/new/estimates.json, and compares both timing entries
+  # and JIT/scheduler/GPU KPIs against ci/perf-baseline.json. A regression
+  # beyond the per-entry threshold fails the job (exit 2).
+  perf:
+    runtime: native
+    steps:
+      - name: gate-self-tests
+        run: python3 ci/test_perf_gate.py
+      - name: perf-gate
+        run: python3 ci/check_perf.py --runs 3
     cache:
       - name: cargo-target
         paths:

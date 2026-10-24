@@ -257,8 +257,11 @@ pub struct D3d12Runtime {
     /// Bytes delivered by the DirectStorage direct path (file -> MTLBuffer).
     directstorage_bytes: u64,
     /// Bytes that transited a host staging buffer (compressed sources and
-    /// CreateResource initial-data uploads).
+    /// host-owned CreateResource initial-data uploads).
     staging_bytes: u64,
+    /// CreateResource initial-data uploads whose source bytes were canonical
+    /// guest memory (no host copy).
+    guest_initial_uploads: u64,
     /// Async DirectStorage pipeline (queued command buffers + MTLSharedEvent).
     directstorage_queue:
         Option<std::sync::Arc<std::sync::Mutex<crate::metal_backend::DirectStorageUploadQueue>>>,
@@ -369,6 +372,7 @@ impl Default for D3d12Runtime {
             gpu_textures: BTreeMap::new(),
             directstorage_bytes: 0,
             staging_bytes: 0,
+            guest_initial_uploads: 0,
             directstorage_queue: None,
             directstorage_completion: UploadCompletionHook::default(),
             directstorage_pending_resources: Vec::new(),
@@ -414,6 +418,7 @@ impl D3d12Runtime {
             gpu_textures: BTreeMap::new(),
             directstorage_bytes: 0,
             staging_bytes: 0,
+            guest_initial_uploads: 0,
             directstorage_queue: None,
             directstorage_completion: UploadCompletionHook::default(),
             directstorage_pending_resources: Vec::new(),
@@ -1361,8 +1366,51 @@ impl D3d12Runtime {
         Ok(resource)
     }
 
-    /// Open a guest path through the game environment's file table and return
-    /// the host descriptor plus the normalized guest path.
+    /// `CreateResource` with initial data whose texel bytes already live in
+    /// canonical guest memory.
+    ///
+    /// The bytes are blitted from a no-copy MTLBuffer over the guest window, so
+    /// `staging_bytes` does not advance and `guest_initial_uploads` does. A
+    /// destination outside the window or a refused device mapping is an
+    /// explicit error, never a silent host staging copy.
+    pub fn create_committed_resource_with_guest_initial_data(
+        &mut self,
+        desc: ResourceDesc,
+        window: &crate::metal_backend::GuestMemoryWindow,
+        offset: usize,
+        data_len: usize,
+        width: u32,
+        height: u32,
+        format: metal::MTLPixelFormat,
+    ) -> AppResult<ResourceId> {
+        let resource = self.backend.create_resource(desc)?;
+        let upload = match crate::metal_backend::upload_texture_from_guest_bytes(
+            window, offset, data_len, width, height, format,
+        ) {
+            Ok(upload) => upload,
+            Err(error) => {
+                let _ = self.backend.destroy_resource(resource);
+                return Err(error);
+            }
+        };
+        if !upload.stats().guest_backed {
+            let _ = self.backend.destroy_resource(resource);
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "CreateResource guest initial data refused: buffer is not guest backed",
+            ));
+        }
+        self.guest_initial_uploads += 1;
+        self.gpu_textures.insert(resource, upload);
+        Ok(resource)
+    }
+
+    /// Number of `CreateResource` initial-data uploads served directly from
+    /// canonical guest memory.
+    pub fn guest_initial_upload_count(&self) -> u64 {
+        self.guest_initial_uploads
+    }
+
     fn open_directstorage_file(
         ge: &crate::ge::GameEnvironment,
         windows_path: &str,
@@ -1861,6 +1909,9 @@ impl D3d12Runtime {
         if self.write_present_backbuffer_bytes(resource, offset, bytes)? {
             return Ok(());
         }
+        // Upload-heap resources are host-visible: the write lands in the
+        // shared backing and is classified as a zero-copy update (the
+        // backend rejects non-upload heaps with the D3D12 error).
         self.backend.upload_write(resource, offset, bytes)?;
         self.record_cpu_backing_write();
         Ok(())
@@ -1874,7 +1925,11 @@ impl D3d12Runtime {
         if self.write_present_backbuffer_bytes(resource, 0, bytes)? {
             return Ok(());
         }
-        self.backend.overwrite_resource_bytes(resource, bytes)?;
+        // Classify the update by the destination storage mode so a shared
+        // (host-visible) resource records a zero-copy write and a private
+        // one records the staged upload it would need on real Metal.
+        self.backend
+            .overwrite_resource_host_visible(resource, bytes)?;
         self.record_cpu_backing_write();
         Ok(())
     }
@@ -3353,10 +3408,8 @@ mod tests {
     }
 
     /// D3D12_COMPARISON_FUNC: 1=NEVER .. 8=ALWAYS (per d3d12.h).
-
     /// D3D12_STATIC_BORDER_COLOR: 0=TRANSPARENT_BLACK, 1=OPAQUE_BLACK,
     /// 2=OPAQUE_WHITE (per d3d12.h).
-
     /// D3D12_FILTER bit encoding (per d3d12.h): bits 0-1 mip, 2-3 mag, 4-5
     /// min, bit 6 anisotropic, bits 7-8 reduction type. Named constants are
     /// checked against their documented bit patterns, and all four reduction
@@ -3516,7 +3569,6 @@ mod tests {
     /// D3D12_FILTER_REDUCTION_TYPE: 0=STANDARD, 1=COMPARISON, 2=MINIMUM,
     /// 3=MAXIMUM (per d3d12.h). Values outside 0..=3 are undefined — a
     /// validation error on Windows.
-
     /// Out-of-range address modes are rejected by both the validator and the
     /// descriptor builder — exactly the Windows validation behavior.
     #[test]
@@ -4292,7 +4344,10 @@ mod tests {
         assert_eq!(runtime.iosurface_texture_builds(), 2);
         runtime.present(swapchain, 1, false).expect("present NV12");
         assert_eq!(runtime.nv12_present_count(), 1);
-        assert_eq!(runtime.nv12_composite_passes(swapchain), 1);
+        // One composite feeds the drawable present; the later
+        // `presented_nv12_plane_bytes` verification path decodes the planes
+        // again on the GPU (no CPU NV12 decode exists).
+        assert_eq!(runtime.nv12_composite_passes(swapchain), 2);
         assert_eq!(runtime.nv12_drawable_binds(swapchain), 1);
         assert!(runtime.presented_nv12_drawable_ptr(swapchain).is_some());
         let (y, uv) = runtime
@@ -4329,7 +4384,7 @@ mod tests {
             .present(extra, 1, false)
             .expect("present extra NV12");
         assert_eq!(runtime.nv12_present_count(), 2);
-        assert_eq!(runtime.nv12_composite_passes(extra), 1);
+        assert_eq!(runtime.nv12_composite_passes(extra), 2);
         assert_eq!(runtime.presented_frame(extra).unwrap().width, 4);
         let (extra_y, extra_uv) = runtime
             .presented_nv12_plane_bytes(extra)
@@ -4775,6 +4830,7 @@ mod tests {
             let _ = file.write_all(&[0u8; 32]);
         });
         let mut runtime = D3d12Runtime::new();
+        crate::metal_backend::test_set_io_worker_pause(true);
         let ticket = runtime
             .enqueue_file_to_texture(
                 &ge,
@@ -4782,12 +4838,16 @@ mod tests {
                 directstorage_upload_desc(&[0u8; 32], 4, 2, metal::MTLPixelFormat::RGBA8Unorm),
             )
             .expect("enqueue blocked upload");
+        while !crate::metal_backend::test_io_worker_paused() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert_eq!(runtime.directstorage_upload_stats().pending_io, 1);
         let fake = 999_998u64;
         runtime
             .directstorage_pending_resources
             .push((fake, u64::MAX));
         let cancelled = runtime.cancel_pending_directstorage_uploads();
+        crate::metal_backend::test_set_io_worker_pause(false);
         assert_eq!(cancelled, 1);
         assert!(
             runtime
@@ -5345,5 +5405,205 @@ mod tests {
         assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
         assert_eq!(error.message, "resource is not in a readback heap");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn d3d12_update_subresource_direct_shared_backing_rejects_staged_fallback() {
+        let mut runtime = D3d12Runtime::new();
+        let resource = runtime
+            .create_committed_resource(ResourceDesc {
+                name: "d3d12-dynamic-index-buffer".to_string(),
+                format: DxgiFormat::Unknown,
+                heap: HeapType::Upload,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Buffer {
+                    role: crate::gfx::BufferRole::Index,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("create upload buffer");
+        assert_eq!(
+            runtime
+                .resource_storage_mode(resource)
+                .expect("storage mode"),
+            MetalStorageMode::Shared
+        );
+        let first: Vec<u8> = (0..64).map(|index| (index * 5) as u8).collect();
+        runtime
+            .upload_write(resource, 0, &first)
+            .expect("direct upload write");
+        assert_eq!(
+            runtime
+                .backend()
+                .resource_bytes(resource)
+                .expect("shared backing"),
+            first.as_slice()
+        );
+        let stats = runtime.backend().translation_stats();
+        assert_eq!(stats.zero_copy_updates, 1);
+        assert_eq!(stats.staged_copies, 0);
+
+        let second: Vec<u8> = (0..64).map(|index| (index * 7 + 1) as u8).collect();
+        runtime
+            .overwrite_resource_bytes(resource, &second)
+            .expect("direct overwrite");
+        assert_eq!(
+            runtime
+                .backend()
+                .resource_bytes(resource)
+                .expect("shared backing after overwrite"),
+            second.as_slice()
+        );
+        let stats = runtime.backend().translation_stats();
+        assert_eq!(stats.zero_copy_updates, 2);
+        assert_eq!(stats.staged_copies, 0);
+
+        let error = runtime
+            .upload_write(resource, usize::MAX, &[0u8])
+            .expect_err("overflowing upload write must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "upload write range overflow");
+
+        // On unified memory a default-heap texture is shared storage now: the
+        // CPU bytes are the host-visible backing, not a device-private shadow.
+        let shared_texture = runtime
+            .create_committed_resource(ResourceDesc {
+                name: "d3d12-shared-texture".to_string(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                heap: HeapType::Default,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Texture {
+                    sampled: true,
+                    render_target: true,
+                    depth_stencil: false,
+                    cpu_write_frequent: false,
+                },
+            })
+            .expect("shared texture");
+        assert_eq!(
+            runtime
+                .resource_storage_mode(shared_texture)
+                .expect("storage mode"),
+            MetalStorageMode::Shared
+        );
+        runtime
+            .overwrite_resource_bytes(shared_texture, &[0x44; 16])
+            .expect("shared texture update");
+        let stats = runtime.backend().translation_stats();
+        assert_eq!(stats.staged_copies, 0);
+        assert_eq!(stats.zero_copy_updates, 3);
+
+        // A discrete GPU genuinely requires private storage; the same update
+        // is a counted staged upload, not a compatibility gap.
+        let mut discrete =
+            D3d12Runtime::from_backend(crate::gfx::GraphicsBackend::with_host_profile(
+                crate::gfx::host_gpu_profile_from_name("NVIDIA GeForce RTX 4080"),
+            ));
+        let private = discrete
+            .create_committed_resource(ResourceDesc {
+                name: "d3d12-private-texture".to_string(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                heap: HeapType::Default,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Texture {
+                    sampled: true,
+                    render_target: true,
+                    depth_stencil: false,
+                    cpu_write_frequent: false,
+                },
+            })
+            .expect("private texture");
+        assert_eq!(
+            discrete
+                .resource_storage_mode(private)
+                .expect("storage mode"),
+            MetalStorageMode::Private
+        );
+        discrete
+            .overwrite_resource_bytes(private, &[0x44; 16])
+            .expect("private update");
+        let stats = discrete.backend().translation_stats();
+        assert_eq!(stats.staged_copies, 1);
+        assert_eq!(stats.zero_copy_updates, 0);
+    }
+    #[test]
+    fn d3d12_guest_initial_data_rejects_window_edges_and_counts_zero_staging() {
+        let pixels: Vec<u8> = (0..16).map(|index| (index * 3 + 1) as u8).collect();
+        let mut region = crate::metal_backend::GuestSharedRegion::new(
+            3 * crate::metal_backend::host_page_size(),
+        )
+        .expect("guest region");
+        let window = region.window();
+        region.as_mut_slice()[1..1 + pixels.len()].copy_from_slice(&pixels);
+        let mut runtime = D3d12Runtime::new();
+        let resource = runtime
+            .create_committed_resource_with_guest_initial_data(
+                ResourceDesc {
+                    name: "guest-initial-data".to_string(),
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                    heap: HeapType::Default,
+                    size: pixels.len(),
+                    subresources: 1,
+                    initial_state: ResourceState::CopyDest,
+                    usage_hint: ResourceUsageHint::Texture {
+                        sampled: true,
+                        render_target: false,
+                        depth_stencil: false,
+                        cpu_write_frequent: false,
+                    },
+                },
+                &window,
+                1,
+                pixels.len(),
+                2,
+                2,
+                metal::MTLPixelFormat::RGBA8Unorm,
+            )
+            .expect("guest initial data");
+        assert_eq!(runtime.staging_bytes(), 0);
+        assert_eq!(runtime.guest_initial_upload_count(), 1);
+        assert_eq!(
+            runtime
+                .readback_gpu_texture(resource)
+                .expect("guest initial data readback"),
+            pixels
+        );
+        runtime
+            .destroy_resource(resource)
+            .expect("destroy guest initial-data resource");
+
+        let error = runtime
+            .create_committed_resource_with_guest_initial_data(
+                ResourceDesc {
+                    name: "guest-initial-oob".to_string(),
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                    heap: HeapType::Default,
+                    size: pixels.len(),
+                    subresources: 1,
+                    initial_state: ResourceState::CopyDest,
+                    usage_hint: ResourceUsageHint::Generic,
+                },
+                &window,
+                region.len(),
+                pixels.len(),
+                2,
+                2,
+                metal::MTLPixelFormat::RGBA8Unorm,
+            )
+            .expect_err("out-of-window guest initial data must be refused");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "initial data: guest initial data refused: guest region outside the canonical window"
+        );
+        assert_eq!(runtime.guest_initial_upload_count(), 1);
+        assert_eq!(runtime.staging_bytes(), 0);
+        assert_eq!(runtime.directstorage_live_texture_count(), 0);
     }
 }

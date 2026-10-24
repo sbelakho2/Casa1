@@ -119,6 +119,46 @@ pub const X64_CONTEXT_GPR_OFFSETS: [u64; 16] = [
     0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98,
 ];
 
+/// The x64 CONTEXT debug-register offsets (winnt.h `_CONTEXT`, AMD64):
+/// `Dr0`-`Dr3`, `Dr6` and `Dr7` live immediately after the four home slots.
+pub const X64_CONTEXT_DR0_OFFSET: u64 = 0x48;
+pub const X64_CONTEXT_DR1_OFFSET: u64 = 0x50;
+pub const X64_CONTEXT_DR2_OFFSET: u64 = 0x58;
+pub const X64_CONTEXT_DR3_OFFSET: u64 = 0x60;
+pub const X64_CONTEXT_DR6_OFFSET: u64 = 0x68;
+pub const X64_CONTEXT_DR7_OFFSET: u64 = 0x70;
+
+/// The six x64 debug registers in `Dr0..Dr3, Dr6, Dr7` order, paired with
+/// their canonical CONTEXT offsets.
+pub const X64_CONTEXT_DEBUG_OFFSETS: [u64; 6] = [
+    X64_CONTEXT_DR0_OFFSET,
+    X64_CONTEXT_DR1_OFFSET,
+    X64_CONTEXT_DR2_OFFSET,
+    X64_CONTEXT_DR3_OFFSET,
+    X64_CONTEXT_DR6_OFFSET,
+    X64_CONTEXT_DR7_OFFSET,
+];
+
+/// The i386 CONTEXT debug-register offsets (winnt.h `_CONTEXT`, i386):
+/// `ContextFlags` is at 0x00 and `Dr0`-`Dr7` follow it.
+pub const X86_CONTEXT_DR0_OFFSET: u64 = 0x04;
+pub const X86_CONTEXT_DR1_OFFSET: u64 = 0x08;
+pub const X86_CONTEXT_DR2_OFFSET: u64 = 0x0C;
+pub const X86_CONTEXT_DR3_OFFSET: u64 = 0x10;
+pub const X86_CONTEXT_DR6_OFFSET: u64 = 0x14;
+pub const X86_CONTEXT_DR7_OFFSET: u64 = 0x18;
+
+/// The six i386 debug registers in `Dr0..Dr3, Dr6, Dr7` order, paired with
+/// their canonical CONTEXT offsets.
+pub const X86_CONTEXT_DEBUG_OFFSETS: [u64; 6] = [
+    X86_CONTEXT_DR0_OFFSET,
+    X86_CONTEXT_DR1_OFFSET,
+    X86_CONTEXT_DR2_OFFSET,
+    X86_CONTEXT_DR3_OFFSET,
+    X86_CONTEXT_DR6_OFFSET,
+    X86_CONTEXT_DR7_OFFSET,
+];
+
 /// The i386 CONTEXT integer-register offsets (winnt.h _CONTEXT, i386).
 pub const X86_CONTEXT_FLAGS_OFFSET: u64 = 0x00;
 pub const X86_CONTEXT_EDI_OFFSET: u64 = 0xA0;
@@ -132,11 +172,17 @@ pub const X86_CONTEXT_EIP_OFFSET: u64 = 0xBC;
 pub const X86_CONTEXT_EFLAGS_OFFSET: u64 = 0xC4;
 pub const X86_CONTEXT_ESP_OFFSET: u64 = 0xC8;
 
-/// The thread info classes `NtSetInformationThread` accepts (priority and
-/// affinity mask).
+/// The thread info classes `NtSetInformationThread` accepts (priority,
+/// affinity mask, and the null-buffer `ThreadHideFromDebugger`).
+///
+/// `ThreadHideFromDebugger` (17) is the class the anti-debug surface models:
+/// Windows accepts it only with a zero-length buffer, and it is the only way
+/// a thread asks not to be seen by an attached debugger.
 pub fn validate_set_thread_information_class(info_class: u32) -> Result<(), NtStatus> {
     match info_class {
-        crate::ntdll::THREAD_PRIORITY_CLASS | crate::ntdll::THREAD_AFFINITY_MASK_CLASS => Ok(()),
+        crate::ntdll::THREAD_PRIORITY_CLASS
+        | crate::ntdll::THREAD_AFFINITY_MASK_CLASS
+        | crate::ntdll::THREAD_HIDE_FROM_DEBUGGER_CLASS => Ok(()),
         _ => Err(crate::ntdll::STATUS_INVALID_INFO_CLASS),
     }
 }
@@ -174,9 +220,15 @@ mod tests {
         assert_eq!(crate::ntdll::THREAD_AFFINITY_MASK_CLASS, 4);
         assert_eq!(crate::ntdll::THREAD_IS_TERMINATED_CLASS, 20);
         assert_eq!(crate::ntdll::THREAD_SUSPEND_COUNT_CLASS, 35);
-        // The set surface: ThreadPriority + ThreadAffinityMask.
+        // The set surface: ThreadPriority + ThreadAffinityMask + the
+        // null-buffer ThreadHideFromDebugger.
         assert!(validate_set_thread_information_class(2).is_ok());
         assert!(validate_set_thread_information_class(4).is_ok());
+        assert!(validate_set_thread_information_class(17).is_ok());
+        assert_eq!(X64_CONTEXT_DR0_OFFSET, 0x48);
+        assert_eq!(X64_CONTEXT_DR7_OFFSET, 0x70);
+        assert_eq!(X86_CONTEXT_DR0_OFFSET, 0x04);
+        assert_eq!(X86_CONTEXT_DR7_OFFSET, 0x18);
         assert_eq!(
             validate_set_thread_information_class(0),
             Err(crate::ntdll::STATUS_INVALID_INFO_CLASS)

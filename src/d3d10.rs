@@ -1256,15 +1256,22 @@ impl D3d10Device {
     }
 
     /// ID3D10Device::Map
-    pub fn map(&mut self, resource_id: u64) -> AppResult<Vec<u8>> {
+    pub fn map(&mut self, resource_id: u64) -> AppResult<crate::d3d11::D3d11Map<'_>> {
         let d3d11_id = self.get_d3d11_resource_id(resource_id)?;
         self.d3d11_device.map(d3d11_id)
     }
 
     /// ID3D10Device::Unmap
-    pub fn unmap(&mut self, resource_id: u64, data: &[u8]) -> AppResult<()> {
+    pub fn unmap(&mut self, resource_id: u64) -> AppResult<()> {
         let d3d11_id = self.get_d3d11_resource_id(resource_id)?;
-        self.d3d11_device.unmap(d3d11_id, data)
+        self.d3d11_device.unmap(d3d11_id)
+    }
+
+    /// ID3D10Device::Unmap with an explicit payload (the mapped backing was
+    /// not written through the returned borrow).
+    pub fn unmap_with_bytes(&mut self, resource_id: u64, data: &[u8]) -> AppResult<()> {
+        let d3d11_id = self.get_d3d11_resource_id(resource_id)?;
+        self.d3d11_device.unmap_with_bytes(d3d11_id, data)
     }
 
     /// ID3D10Device::GenerateMips

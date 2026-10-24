@@ -10462,4 +10462,13 @@ mod tests {
         );
         let _ = win32.close_handle(handle);
     }
+
+    #[test]
+    fn code_page_conversion_empty_input() {
+        let result = iconv_ffi::convert_to_utf8(CP_WIN1252, &[]);
+        // Should return Some("") or None depending on platform
+        if let Some(s) = result {
+            assert!(s.is_empty(), "empty input should produce empty output");
+        }
+    }
 }

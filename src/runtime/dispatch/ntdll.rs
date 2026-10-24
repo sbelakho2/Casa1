@@ -19,6 +19,7 @@ use super::final_scraps::{
     native_child_thread_handles_for_process, native_child_thread_info, native_child_thread_retain,
     native_child_thread_take, section_image_register,
 };
+use crate::casak::introspection as kintro;
 use crate::ntdll as nt;
 use crate::pe::ImportSymbol;
 
@@ -566,6 +567,11 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let handle = guest_call_arg_u32(state, memory, 0)?;
+        if crate::driver_island::close_directory_object(self, handle) {
+            state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
         if crate::driver_island::close_island_device_handle(self, handle) {
             state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
             self.last_error = 0;
@@ -739,6 +745,889 @@ impl PeHostRuntime {
                 );
             }
         }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    // ── Directory objects + volume information ──────────────────────────────
+
+    /// `NtOpenDirectoryObject` — open the root object directory `\`, one of
+    /// the live top-level directories (`\Device`, `\Driver`, `\GLOBAL??`,
+    /// `\??`) or a real per-object subtree (`\Device\<name>`,
+    /// `\Driver\<name>`, including deeper device paths).
+    ///
+    /// The names in those directories are enumerated live from the driver
+    /// island registry: devices the loaded islands created, the loaded
+    /// drivers themselves and the symbolic links they installed.  An unknown
+    /// child of an existing directory is `STATUS_OBJECT_NAME_NOT_FOUND`; a
+    /// name whose parent directory does not exist is
+    /// `STATUS_OBJECT_PATH_NOT_FOUND` (never a fabricated handle).
+    pub(crate) fn dispatch_nt_open_directory_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let handle_ptr = guest_call_arg(state, memory, 0)?;
+        let _desired_access = guest_call_arg_u32(state, memory, 1)?;
+        let object_attributes = guest_call_arg(state, memory, 2)?;
+        if handle_ptr == 0 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let raw_name = match object_attributes_name(memory, object_attributes, self.guest_arch) {
+            Ok(name) => name,
+            Err(_) => {
+                state.set(
+                    Register::Rax,
+                    u64::from(nt::STATUS_OBJECT_NAME_INVALID.raw()),
+                );
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let path = raw_name.replace('/', "\\");
+        let path = {
+            let mut trimmed = path.trim_matches('\0').trim().to_string();
+            if trimmed.len() > 1 {
+                while trimmed.ends_with('\\') {
+                    trimmed.pop();
+                }
+            }
+            trimmed
+        };
+        if path.is_empty() {
+            state.set(
+                Register::Rax,
+                u64::from(nt::STATUS_OBJECT_NAME_INVALID.raw()),
+            );
+            self.last_error = 0;
+            return Ok(());
+        }
+        let namespace = crate::driver_island::island_namespace(self);
+        if let Some(directory) = crate::driver_island::canonical_directory_name(&namespace, &path) {
+            let handle = crate::driver_island::open_directory_object(self, &directory);
+            write_guest_pointer(memory, handle_ptr, u64::from(handle), self.guest_arch)?;
+            state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        // A missing child of an existing directory is NAME_NOT_FOUND; a name
+        // whose immediate parent is itself absent is PATH_NOT_FOUND.
+        let (parent, _child) = path.rsplit_once('\\').unwrap_or(("", path.as_str()));
+        let parent_exists = parent.is_empty()
+            || parent == "\\"
+            || crate::driver_island::canonical_directory_name(&namespace, parent).is_some();
+        let status = if parent_exists {
+            nt::STATUS_OBJECT_NAME_NOT_FOUND
+        } else {
+            nt::STATUS_OBJECT_PATH_NOT_FOUND
+        };
+        state.set(Register::Rax, u64::from(status.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `NtQueryDirectoryObject` — enumerate one directory object.
+    ///
+    /// The output is an array of `OBJECT_DIRECTORY_INFORMATION` records
+    /// (`UNICODE_STRING Name; UNICODE_STRING TypeName;`) followed by the
+    /// strings; `Context` is the resumable index.  Enumeration reads the live
+    /// island registry on every call, so a device deleted, a child removed or
+    /// a driver unloaded between calls disappears from the next result.  The
+    /// root reports the four top-level namespaces; per-device subtrees report
+    /// real child device objects and per-driver subtrees report the live
+    /// devices the driver created.
+    pub(crate) fn dispatch_nt_query_directory_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let handle = guest_call_arg_u32(state, memory, 0)?;
+        let buffer = guest_call_arg(state, memory, 1)?;
+        let length = guest_call_arg_u32(state, memory, 2)?;
+        let return_single = guest_call_arg_u32(state, memory, 3)? != 0;
+        let restart = guest_call_arg_u32(state, memory, 4)? != 0;
+        let context_ptr = guest_call_arg(state, memory, 5)?;
+        let return_length_ptr = guest_call_arg(state, memory, 6)?;
+
+        let Some(directory) = crate::driver_island::directory_object_path(self, handle) else {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_HANDLE.raw()));
+            self.last_error = 0;
+            return Ok(());
+        };
+        if context_ptr == 0 && !restart {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        if buffer == 0 && length != 0 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let index = if restart {
+            0
+        } else {
+            read_u32(memory, context_ptr)? as usize
+        };
+        let namespace = crate::driver_island::island_namespace(self);
+        let entries = crate::driver_island::directory_entries(&namespace, &directory);
+        if index >= entries.len() {
+            if context_ptr != 0 {
+                write_u32(memory, context_ptr, index as u32);
+            }
+            if return_length_ptr != 0 {
+                write_u32(memory, return_length_ptr, 0);
+            }
+            state.set(Register::Rax, u64::from(nt::STATUS_NO_MORE_ENTRIES.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+
+        let header = match self.guest_arch {
+            GuestArch::X64 => 32_u64,
+            GuestArch::X86 => 16_u64,
+        };
+        let mut chosen: Vec<(String, String, u64, u64)> = Vec::new();
+        let mut name_bytes = 0_u64;
+        let mut required = 0_u64;
+        for (name, type_name) in entries.iter().skip(index) {
+            let name_units: Vec<u16> = name.encode_utf16().collect();
+            let type_units: Vec<u16> = type_name.encode_utf16().collect();
+            let name_len = name_units.len() as u64 * 2;
+            let type_len = type_units.len() as u64 * 2;
+            let candidate_headers = (chosen.len() as u64 + 1) * header;
+            let candidate = candidate_headers + name_bytes + name_len + type_len;
+            if candidate > u64::from(length) {
+                if chosen.is_empty() {
+                    required = candidate;
+                }
+                break;
+            }
+            chosen.push((name.clone(), type_name.clone(), name_len, type_len));
+            name_bytes += name_len + type_len;
+            if return_single {
+                break;
+            }
+        }
+        if chosen.is_empty() {
+            if return_length_ptr != 0 {
+                write_u32(memory, return_length_ptr, required as u32);
+            }
+            state.set(Register::Rax, u64::from(nt::STATUS_BUFFER_TOO_SMALL.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+
+        let total = chosen.len() as u64 * header + name_bytes;
+        memory.map_bytes(buffer, &vec![0_u8; total as usize]);
+        let mut string_cursor = buffer + chosen.len() as u64 * header;
+        for (entry_index, (name, type_name, name_len, type_len)) in chosen.iter().enumerate() {
+            let entry = buffer + entry_index as u64 * header;
+            let name_ptr = string_cursor;
+            string_cursor += name_len;
+            let type_ptr = string_cursor;
+            string_cursor += type_len;
+            write_unicode_header(
+                memory,
+                entry,
+                name_ptr,
+                *name_len as u16,
+                *name_len as u16,
+                self.guest_arch,
+            );
+            let type_entry = entry
+                + match self.guest_arch {
+                    GuestArch::X64 => 16,
+                    GuestArch::X86 => 8,
+                };
+            write_unicode_header(
+                memory,
+                type_entry,
+                type_ptr,
+                *type_len as u16,
+                *type_len as u16,
+                self.guest_arch,
+            );
+            for (unit_index, unit) in name.encode_utf16().enumerate() {
+                write_u16(memory, name_ptr + unit_index as u64 * 2, unit);
+            }
+            for (unit_index, unit) in type_name.encode_utf16().enumerate() {
+                write_u16(memory, type_ptr + unit_index as u64 * 2, unit);
+            }
+        }
+        let next = index + chosen.len();
+        if context_ptr != 0 {
+            write_u32(memory, context_ptr, next as u32);
+        }
+        if return_length_ptr != 0 {
+            write_u32(memory, return_length_ptr, total as u32);
+        }
+        state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// The host volume's creation time as Windows FILETIME ticks.
+    ///
+    /// The probe walks from `host_path` up to its mount root (the nearest
+    /// ancestor on the same device) and reads the host-published birth time
+    /// (`st_birthtime` on macOS, the value IOKit/diskutil expose when they
+    /// publish one).  If the host genuinely does not publish it — or the path
+    /// does not exist — the caller must report `STATUS_NOT_SUPPORTED` rather
+    /// than inventing a zero.
+    pub(crate) fn host_volume_creation_time_ticks(host_path: &std::path::Path) -> Option<u64> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !host_path.exists() {
+                return None;
+            }
+            let device = std::fs::metadata(host_path).ok()?.dev();
+            let mut root = host_path.to_path_buf();
+            while let Some(parent) = root.parent() {
+                match std::fs::metadata(parent) {
+                    Ok(metadata) if metadata.dev() == device => root = parent.to_path_buf(),
+                    _ => break,
+                }
+            }
+            let created = std::fs::metadata(&root).ok()?.created().ok()?;
+            let duration = created.duration_since(std::time::UNIX_EPOCH).ok()?;
+            Some(
+                WINDOWS_EPOCH_OFFSET_100NS
+                    .saturating_add(duration.as_nanos().div_euclid(100) as u64),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = host_path;
+            None
+        }
+    }
+
+    /// `FILE_FS_VOLUME_INFORMATION` with the real creation time, serial,
+    /// label and object support flag.  A volume whose creation time the host
+    /// does not publish is `STATUS_NOT_SUPPORTED`, never a zeroed field.
+    pub(crate) fn serialize_file_fs_volume_information(
+        disk: &crate::hardware_identity::DiskIdentity,
+        creation_ticks: Option<u64>,
+    ) -> Result<Vec<u8>, nt::NtStatus> {
+        let creation = creation_ticks.ok_or(nt::STATUS_NOT_SUPPORTED)?;
+        let label: Vec<u16> = disk.volume_name.encode_utf16().collect();
+        let mut bytes = vec![0_u8; 20 + label.len() * 2];
+        bytes[0..8].copy_from_slice(&creation.to_le_bytes());
+        bytes[8..12].copy_from_slice(&disk.volume_serial.to_le_bytes());
+        bytes[12..16].copy_from_slice(&((label.len() * 2) as u32).to_le_bytes());
+        bytes[16] = 1; // SupportsObjects: the volume holds real file objects.
+        for (index, unit) in label.iter().enumerate() {
+            bytes[20 + index * 2..20 + index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+
+    /// `FILE_FS_OBJECTID_INFORMATION` with the real volume object id and
+    /// extended info derived from the host-published volume UUID.  A volume
+    /// with no published UUID is `STATUS_NOT_SUPPORTED`, never a zeroed id.
+    pub(crate) fn serialize_file_fs_object_id_information(
+        disk: &crate::hardware_identity::DiskIdentity,
+    ) -> Result<Vec<u8>, nt::NtStatus> {
+        if disk.volume_uuid.is_empty() {
+            return Err(nt::STATUS_NOT_SUPPORTED);
+        }
+        let mut bytes = vec![0_u8; 64];
+        let object_id = crate::anticheat::sha256(
+            format!("casa1-volume-object-id:{}", disk.volume_uuid).as_bytes(),
+        );
+        bytes[0..16].copy_from_slice(&object_id[0..16]);
+        let extended = crate::anticheat::sha256(
+            format!(
+                "casa1-volume-extended-object-id:{}:{:08X}",
+                disk.volume_uuid, disk.volume_serial
+            )
+            .as_bytes(),
+        );
+        bytes[16..48].copy_from_slice(&extended);
+        let extended_tail = crate::anticheat::sha256(
+            format!("casa1-volume-extended-object-id-2:{}", disk.volume_uuid).as_bytes(),
+        );
+        bytes[48..64].copy_from_slice(&extended_tail[0..16]);
+        Ok(bytes)
+    }
+
+    /// `NtQueryVolumeInformationFile` — the real volume identity/storage
+    /// facts for the volume holding `FileHandle`.
+    ///
+    /// Identity (label, serial, filesystem, object id) comes from the ONE
+    /// process-wide hardware identity; storage (allocation units, sector
+    /// geometry) comes from the host `statvfs` accounting the Win32
+    /// `GetDiskFreeSpace*` surface also reads.  A handle that is not a file
+    /// handle is `STATUS_OBJECT_TYPE_MISMATCH`; an unknown handle is
+    /// `STATUS_INVALID_HANDLE`.
+    pub(crate) fn dispatch_nt_query_volume_information_file(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let handle = guest_call_arg_u32(state, memory, 0)?;
+        let io_status_block = guest_call_arg(state, memory, 1)?;
+        let buffer = guest_call_arg(state, memory, 2)?;
+        let length = guest_call_arg_u32(state, memory, 3)?;
+        let info_class = guest_call_arg_u32(state, memory, 4)?;
+
+        let arch = self.guest_arch;
+        let finish = |state: &mut CpuState,
+                      memory: &mut MemoryImage,
+                      status: nt::NtStatus,
+                      information: u64|
+         -> AppResult<()> {
+            write_io_status_block(state, memory, io_status_block, status, information, arch)?;
+            state.set(Register::Rax, u64::from(status.raw()));
+            Ok(())
+        };
+        if io_status_block == 0 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let object_type = match self.win32.handle_object_type(handle) {
+            Ok(object_type) => object_type,
+            Err(_) => {
+                self.last_error = 0;
+                return finish(state, memory, nt::STATUS_INVALID_HANDLE, 0);
+            }
+        };
+        if object_type != crate::runtime::object_manager::ObjectType::File {
+            self.last_error = 0;
+            return finish(state, memory, nt::STATUS_OBJECT_TYPE_MISMATCH, 0);
+        }
+        let file_path = match self.win32.file_state(handle) {
+            Ok(file) => file.normalized_path,
+            Err(_) => {
+                self.last_error = 0;
+                return finish(state, memory, nt::STATUS_INVALID_HANDLE, 0);
+            }
+        };
+        if buffer == 0 {
+            self.last_error = 0;
+            return finish(state, memory, nt::STATUS_INVALID_PARAMETER, 0);
+        }
+        let identity = crate::hardware_identity::host_identity();
+        let Some(disk) = identity.disks.first() else {
+            self.last_error = 0;
+            return finish(state, memory, nt::STATUS_NOT_SUPPORTED, 0);
+        };
+        let capacity = match self.win32.volume_capacity(Some(&file_path)) {
+            Ok(capacity) => capacity,
+            Err(_) => {
+                self.last_error = 0;
+                return finish(state, memory, nt::STATUS_OBJECT_PATH_NOT_FOUND, 0);
+            }
+        };
+        let creation_ticks = self
+            .win32
+            .ge()
+            .host_path_for_windows_path(&file_path)
+            .ok()
+            .and_then(|host_path| Self::host_volume_creation_time_ticks(&host_path));
+
+        // FILE_FS_VOLUME_INFORMATION
+        const FS_VOLUME: u32 = 1;
+        const FS_SIZE: u32 = 3;
+        const FS_DEVICE: u32 = 4;
+        const FS_ATTRIBUTE: u32 = 5;
+        const FS_FULL_SIZE: u32 = 7;
+        const FS_OBJECT_ID: u32 = 8;
+        const FS_VOLUME_FLAGS: u32 = 10;
+        const FS_SECTOR_SIZE: u32 = 11;
+        const FILE_DEVICE_DISK: u32 = 7;
+        const FILE_DEVICE_IS_MOUNTED: u32 = 0x10;
+        const FILE_REMOVABLE_MEDIA: u32 = 0x1;
+        const FILE_CASE_PRESERVED_NAMES: u32 = 0x2;
+        const FILE_UNICODE_ON_DISK: u32 = 0x4;
+
+        let bytes = match info_class {
+            FS_VOLUME => match Self::serialize_file_fs_volume_information(disk, creation_ticks) {
+                Ok(bytes) => bytes,
+                Err(status) => {
+                    self.last_error = 0;
+                    return finish(state, memory, status, 0);
+                }
+            },
+            FS_SIZE => {
+                let mut bytes = vec![0_u8; 24];
+                bytes[0..8].copy_from_slice(&capacity.total_clusters.to_le_bytes());
+                bytes[8..16].copy_from_slice(&capacity.free_clusters.to_le_bytes());
+                bytes[16..20].copy_from_slice(&capacity.sectors_per_cluster.to_le_bytes());
+                bytes[20..24].copy_from_slice(&capacity.bytes_per_sector.to_le_bytes());
+                bytes
+            }
+            FS_DEVICE => {
+                let mut bytes = vec![0_u8; 8];
+                bytes[0..4].copy_from_slice(&FILE_DEVICE_DISK.to_le_bytes());
+                let characteristics = FILE_DEVICE_IS_MOUNTED
+                    | if disk.removable {
+                        FILE_REMOVABLE_MEDIA
+                    } else {
+                        0
+                    };
+                bytes[4..8].copy_from_slice(&characteristics.to_le_bytes());
+                bytes
+            }
+            FS_ATTRIBUTE => {
+                let name: Vec<u16> = disk.filesystem.encode_utf16().collect();
+                let mut bytes = vec![0_u8; 12 + name.len() * 2];
+                let attributes = FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK;
+                bytes[0..4].copy_from_slice(&attributes.to_le_bytes());
+                bytes[4..8].copy_from_slice(&255_i32.to_le_bytes());
+                bytes[8..12].copy_from_slice(&((name.len() * 2) as u32).to_le_bytes());
+                for (index, unit) in name.iter().enumerate() {
+                    bytes[12 + index * 2..12 + index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+                }
+                bytes
+            }
+            FS_FULL_SIZE => {
+                let mut bytes = vec![0_u8; 32];
+                bytes[0..8].copy_from_slice(&capacity.total_clusters.to_le_bytes());
+                bytes[8..16].copy_from_slice(&capacity.free_clusters.to_le_bytes());
+                bytes[16..24].copy_from_slice(&capacity.free_clusters.to_le_bytes());
+                bytes[24..28].copy_from_slice(&capacity.sectors_per_cluster.to_le_bytes());
+                bytes[28..32].copy_from_slice(&capacity.bytes_per_sector.to_le_bytes());
+                bytes
+            }
+            FS_OBJECT_ID => match Self::serialize_file_fs_object_id_information(disk) {
+                Ok(bytes) => bytes,
+                Err(status) => {
+                    self.last_error = 0;
+                    return finish(state, memory, status, 0);
+                }
+            },
+            FS_VOLUME_FLAGS => vec![0_u8; 4],
+            FS_SECTOR_SIZE => {
+                let mut bytes = vec![0_u8; 24];
+                bytes[0..4].copy_from_slice(&capacity.bytes_per_sector.to_le_bytes());
+                bytes[4..8].copy_from_slice(&capacity.bytes_per_sector.to_le_bytes());
+                bytes
+            }
+            _ => {
+                self.last_error = 0;
+                return finish(state, memory, nt::STATUS_INVALID_INFO_CLASS, 0);
+            }
+        };
+        if u64::from(length) < bytes.len() as u64 {
+            self.last_error = 0;
+            return finish(
+                state,
+                memory,
+                nt::STATUS_INFO_LENGTH_MISMATCH,
+                bytes.len() as u64,
+            );
+        }
+        memory.map_bytes(buffer, &bytes);
+        self.last_error = 0;
+        finish(state, memory, nt::STATUS_SUCCESS, bytes.len() as u64)
+    }
+
+    // ── Attestation: nonce challenge, signed quote, provider verification ────
+
+    /// The install identity store backing guest attestation enrollment.
+    fn attestation_store(&self) -> crate::anticheat::InstallIdentityStore {
+        crate::anticheat::InstallIdentityStore::open(self.win32.ge().root.join("attestation"))
+    }
+
+    /// Bring one provider's persisted enrollment/revocation into the live
+    /// registry before a verification decision.
+    fn sync_attestation_provider(&mut self, provider_id: &str) {
+        let store = self.attestation_store();
+        if store.is_revoked(provider_id) {
+            self.anticheat.attestation.revoke_provider(provider_id);
+        }
+        if self.anticheat.attestation.provider(provider_id).is_none()
+            && let Ok(Some(key)) = store.load_provider(provider_id)
+        {
+            let _ = self.anticheat.attestation.register_provider(key);
+        }
+    }
+
+    /// `NtAttestationEnrollProvider` — enroll a real provider public key.
+    ///
+    /// `(ProviderId UTF-8*, PublicKey SPKI DER*, KeyLength, TTL ms)`.  The id
+    /// is validated before it becomes an install-store file name, the key
+    /// must parse as a P-256 SubjectPublicKeyInfo, and the enrollment is
+    /// persisted before it becomes trusted.  A duplicate id is
+    /// `STATUS_OBJECT_NAME_COLLISION`, a malformed id/key is
+    /// `STATUS_INVALID_PARAMETER`, and a revoked id is
+    /// `STATUS_ACCESS_DENIED`.  A zero TTL means no expiry.
+    pub(crate) fn dispatch_nt_attestation_enroll_provider(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let provider_ptr = guest_call_arg(state, memory, 0)?;
+        let key_ptr = guest_call_arg(state, memory, 1)?;
+        let key_length = guest_call_arg_u32(state, memory, 2)?;
+        let ttl_ms = guest_call_arg(state, memory, 3)?;
+
+        let provider = match read_c_string(memory, provider_ptr) {
+            Ok(provider) if crate::anticheat::is_valid_provider_id(&provider) => provider,
+            _ => {
+                state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        if key_ptr == 0 || key_length == 0 || key_length as usize > 4096 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let mut public_key = vec![0_u8; key_length as usize];
+        memory.read_into(key_ptr, &mut public_key)?;
+
+        let store = self.attestation_store();
+        if store.is_revoked(&provider) {
+            self.anticheat.attestation.revoke_provider(&provider);
+            state.set(
+                Register::Rax,
+                u64::from(crate::anticheat::attestation_ntstatus(
+                    &crate::anticheat::AttestationError::RevokedProvider,
+                )),
+            );
+            self.last_error = 0;
+            return Ok(());
+        }
+        let duplicate = self.anticheat.attestation.provider(&provider).is_some()
+            || store.load_provider(&provider).ok().flatten().is_some();
+        if duplicate {
+            state.set(
+                Register::Rax,
+                u64::from(crate::anticheat::attestation_ntstatus(
+                    &crate::anticheat::AttestationError::DuplicateProvider,
+                )),
+            );
+            self.last_error = 0;
+            return Ok(());
+        }
+        let now = self.anticheat.clock.tick_count64();
+        let valid_until_ms = (ttl_ms != 0).then(|| now.saturating_add(ttl_ms));
+        let key = match store.enroll_provider_key(&provider, &public_key, valid_until_ms, now) {
+            Ok(key) => key,
+            Err(error) => {
+                state.set(
+                    Register::Rax,
+                    u64::from(crate::anticheat::attestation_ntstatus(&error)),
+                );
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        self.anticheat
+            .attestation
+            .register_provider(key)
+            .expect("enrollment prechecks duplicate and revocation");
+        state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `NtAttestationRevokeProvider` — revoke a provider and persist the
+    /// revocation.  An unknown id is `STATUS_OBJECT_NAME_NOT_FOUND`; an
+    /// already-revoked id succeeds (revocation is idempotent).
+    pub(crate) fn dispatch_nt_attestation_revoke_provider(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let provider_ptr = guest_call_arg(state, memory, 0)?;
+        let provider = match read_c_string(memory, provider_ptr) {
+            Ok(provider) if crate::anticheat::is_valid_provider_id(&provider) => provider,
+            _ => {
+                state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let store = self.attestation_store();
+        let known = self.anticheat.attestation.provider(&provider).is_some()
+            || store.load_provider(&provider).ok().flatten().is_some();
+        if !known {
+            state.set(
+                Register::Rax,
+                u64::from(crate::anticheat::attestation_ntstatus(
+                    &crate::anticheat::AttestationError::UnknownProvider,
+                )),
+            );
+            self.last_error = 0;
+            return Ok(());
+        }
+        if let Err(error) = store.revoke_provider(&provider) {
+            state.set(
+                Register::Rax,
+                u64::from(crate::anticheat::attestation_ntstatus(&error)),
+            );
+            self.last_error = 0;
+            return Ok(());
+        }
+        self.anticheat.attestation.revoke_provider(&provider);
+        state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `NtAttestationChallenge` — issue a real nonce challenge.
+    ///
+    /// `(Verifier UTF-8*, TTL ms, Challenge out*, Challenge length,
+    /// Required* )`.  The nonce comes from the OS CSPRNG and the issue time
+    /// from the runtime's monotonic guest clock; a zero TTL or empty
+    /// verifier is `STATUS_INVALID_PARAMETER`, a short buffer is
+    /// `STATUS_INFO_LENGTH_MISMATCH` with the exact required size.
+    pub(crate) fn dispatch_nt_attestation_challenge(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let verifier_ptr = guest_call_arg(state, memory, 0)?;
+        let ttl_ms = guest_call_arg(state, memory, 1)?;
+        let output = guest_call_arg(state, memory, 2)?;
+        let output_length = guest_call_arg_u32(state, memory, 3)?;
+        let required_ptr = guest_call_arg(state, memory, 4)?;
+
+        if output == 0 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let verifier = match read_c_string(memory, verifier_ptr) {
+            Ok(verifier) if !verifier.is_empty() => verifier,
+            _ => {
+                state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        if ttl_ms == 0 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let required = crate::anticheat::ATTESTATION_CHALLENGE_WIRE_SIZE;
+        if (output_length as usize) < required {
+            if required_ptr != 0 {
+                write_u32(memory, required_ptr, required as u32);
+            }
+            state.set(
+                Register::Rax,
+                u64::from(nt::STATUS_INFO_LENGTH_MISMATCH.raw()),
+            );
+            self.last_error = 0;
+            return Ok(());
+        }
+        let challenge = crate::anticheat::Challenge::new(
+            &verifier,
+            ttl_ms,
+            self.anticheat.clock.tick_count64(),
+        );
+        let bytes = crate::anticheat::challenge_to_wire(&challenge);
+        memory.map_bytes(output, &bytes);
+        if required_ptr != 0 {
+            write_u32(memory, required_ptr, required as u32);
+        }
+        state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `NtAttestationQuote` — sign a real measurement of the Casa1 build for
+    /// a guest-supplied challenge.
+    ///
+    /// `(Challenge*, Challenge length, Provider UTF-8*, Quote out*, Quote
+    /// length, Required*)`.  The signing key is derived from the persisted
+    /// install identity and registered as that provider's real P-256 key; a
+    /// malformed challenge is `STATUS_INVALID_PARAMETER`, a short quote
+    /// buffer is `STATUS_INFO_LENGTH_MISMATCH`.
+    pub(crate) fn dispatch_nt_attestation_quote(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let challenge_ptr = guest_call_arg(state, memory, 0)?;
+        let challenge_length = guest_call_arg_u32(state, memory, 1)?;
+        let provider_ptr = guest_call_arg(state, memory, 2)?;
+        let output = guest_call_arg(state, memory, 3)?;
+        let output_length = guest_call_arg_u32(state, memory, 4)?;
+        let required_ptr = guest_call_arg(state, memory, 5)?;
+
+        let mut challenge_bytes = vec![0_u8; crate::anticheat::ATTESTATION_CHALLENGE_WIRE_SIZE];
+        if challenge_ptr == 0
+            || (challenge_length as usize) < crate::anticheat::ATTESTATION_CHALLENGE_WIRE_SIZE
+        {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        memory.read_into(challenge_ptr, &mut challenge_bytes)?;
+        let challenge = match crate::anticheat::challenge_from_wire(&challenge_bytes) {
+            Ok(challenge) => challenge,
+            Err(error) => {
+                state.set(
+                    Register::Rax,
+                    u64::from(crate::anticheat::attestation_ntstatus(&error)),
+                );
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let provider = match read_c_string(memory, provider_ptr) {
+            Ok(provider) if !provider.is_empty() => provider,
+            _ => {
+                state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        if output == 0 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        if self.anticheat.attestation_key.is_none() {
+            let install_id = crate::hardware_identity::host_identity()
+                .install
+                .install_id
+                .clone();
+            match crate::anticheat::install_attestation_key(&install_id) {
+                Ok(key) => self.anticheat.attestation_key = Some(key),
+                Err(error) => {
+                    state.set(
+                        Register::Rax,
+                        u64::from(crate::anticheat::attestation_ntstatus(&error)),
+                    );
+                    self.last_error = 0;
+                    return Ok(());
+                }
+            }
+        }
+        let key = self
+            .anticheat
+            .attestation_key
+            .as_ref()
+            .expect("the signing key was just installed");
+        let now = self.anticheat.clock.tick_count64();
+        if self.anticheat.attestation.provider(&provider).is_none() {
+            let provider_key = crate::anticheat::ProviderKey {
+                provider_id: provider.clone(),
+                public_key_spki: key.public_key_spki(),
+                registered_at_ms: now,
+                valid_until_ms: None,
+            };
+            if let Err(error) = self.anticheat.attestation.register_provider(provider_key) {
+                state.set(
+                    Register::Rax,
+                    u64::from(crate::anticheat::attestation_ntstatus(&error)),
+                );
+                self.last_error = 0;
+                return Ok(());
+            }
+        }
+        let measurement = crate::anticheat::measure_casa1_build();
+        let quote = key.sign_quote(&provider, &measurement, &challenge.nonce);
+        let bytes = match serde_json::to_vec(&quote) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        if bytes.len() > output_length as usize {
+            if required_ptr != 0 {
+                write_u32(memory, required_ptr, bytes.len() as u32);
+            }
+            state.set(
+                Register::Rax,
+                u64::from(nt::STATUS_INFO_LENGTH_MISMATCH.raw()),
+            );
+            self.last_error = 0;
+            return Ok(());
+        }
+        memory.map_bytes(output, &bytes);
+        if required_ptr != 0 {
+            write_u32(memory, required_ptr, bytes.len() as u32);
+        }
+        state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `NtAttestationVerify` — verify a quote against a challenge.
+    ///
+    /// `(Challenge*, Challenge length, Quote*, Quote length)` returns the
+    /// exact NTSTATUS from [`crate::anticheat::attestation_ntstatus`].  A
+    /// fresh runtime with no registered provider returns
+    /// `STATUS_NOT_SUPPORTED`; a forged, mismatched, expired or replayed
+    /// quote never reports success.
+    pub(crate) fn dispatch_nt_attestation_verify(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let challenge_ptr = guest_call_arg(state, memory, 0)?;
+        let challenge_length = guest_call_arg_u32(state, memory, 1)?;
+        let quote_ptr = guest_call_arg(state, memory, 2)?;
+        let quote_length = guest_call_arg_u32(state, memory, 3)?;
+
+        if challenge_ptr == 0
+            || quote_ptr == 0
+            || (challenge_length as usize) < crate::anticheat::ATTESTATION_CHALLENGE_WIRE_SIZE
+            || quote_length == 0
+        {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let mut challenge_bytes = vec![0_u8; crate::anticheat::ATTESTATION_CHALLENGE_WIRE_SIZE];
+        memory.read_into(challenge_ptr, &mut challenge_bytes)?;
+        let challenge = match crate::anticheat::challenge_from_wire(&challenge_bytes) {
+            Ok(challenge) => challenge,
+            Err(error) => {
+                state.set(
+                    Register::Rax,
+                    u64::from(crate::anticheat::attestation_ntstatus(&error)),
+                );
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let mut quote_bytes = vec![0_u8; quote_length as usize];
+        memory.read_into(quote_ptr, &mut quote_bytes)?;
+        let quote: crate::anticheat::Quote = match serde_json::from_slice(&quote_bytes) {
+            Ok(quote) => quote,
+            Err(_) => {
+                state.set(
+                    Register::Rax,
+                    u64::from(crate::anticheat::attestation_ntstatus(
+                        &crate::anticheat::AttestationError::MalformedQuote,
+                    )),
+                );
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let expected = crate::anticheat::measure_casa1_build();
+        let now = self.anticheat.clock.tick_count64();
+        self.sync_attestation_provider(&quote.provider_id);
+        let status =
+            match self
+                .anticheat
+                .attestation
+                .verify_quote(&quote, &challenge, Some(&expected), now)
+            {
+                Ok(_) => nt::STATUS_SUCCESS,
+                Err(error) => {
+                    nt::NtStatus::from_raw(crate::anticheat::attestation_ntstatus(&error))
+                }
+            };
+        state.set(Register::Rax, u64::from(status.raw()));
         self.last_error = 0;
         Ok(())
     }
@@ -1988,14 +2877,38 @@ impl PeHostRuntime {
                 write_return_length(memory, required as u32);
                 state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
             }
-            nt::PROCESS_DEBUG_PORT_CLASS => {
-                if info_length >= 4 {
-                    write_u32(memory, info_ptr, 0);
+            nt::PROCESS_DEBUG_PORT_CLASS
+            | nt::process::PROCESS_DEBUG_OBJECT_HANDLE_CLASS
+            | nt::process::PROCESS_DEBUG_FLAGS_CLASS => {
+                let value = match self.anticheat.debug.query_information_process(info_class) {
+                    Ok(value) => value,
+                    Err(status) => {
+                        state.set(Register::Rax, u64::from(status));
+                        return Ok(());
+                    }
+                };
+                let required = match info_class {
+                    nt::process::PROCESS_DEBUG_FLAGS_CLASS => 4,
+                    _ if self.guest_arch == GuestArch::X64 => 8,
+                    _ => 4,
+                };
+                if info_length < required {
+                    write_return_length(memory, required as u32);
+                    state.set(
+                        Register::Rax,
+                        u64::from(nt::STATUS_INFO_LENGTH_MISMATCH.raw()),
+                    );
+                    return Ok(());
                 }
-                write_return_length(memory, 4);
+                if info_class == nt::process::PROCESS_DEBUG_FLAGS_CLASS {
+                    write_u32(memory, info_ptr, value as u32);
+                } else {
+                    write_guest_pointer(memory, info_ptr, value, self.guest_arch)?;
+                }
+                write_return_length(memory, required as u32);
                 state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
             }
-            nt::PROCESS_IMAGE_FILE_NAME_CLASS => {
+            nt::process::PROCESS_IMAGE_FILE_NAME_CLASS => {
                 // The current process image path as a UNICODE_STRING.
                 let image_path =
                     resolve_full_guest_path(&self.current_directory, &self.main_module_name);
@@ -2327,8 +3240,22 @@ impl PeHostRuntime {
                     );
                     return Ok(());
                 }
-                // BOOLEAN: the thread is not hidden from debuggers.
-                memory.map_bytes(info_ptr, &[0_u8; 1]);
+                let thread_id = match self.win32.thread_id_for_handle(thread_handle) {
+                    Ok(thread_id) => thread_id,
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(nt::STATUS_INVALID_HANDLE.raw()));
+                        return Ok(());
+                    }
+                };
+                let hidden = self
+                    .anticheat
+                    .debug
+                    .query_information_thread(
+                        thread_id,
+                        crate::anticheat::THREAD_HIDE_FROM_DEBUGGER,
+                    )
+                    .unwrap_or(0);
+                memory.map_bytes(info_ptr, &[hidden as u8]);
                 if return_length_ptr != 0 {
                     write_u32(memory, return_length_ptr, REQUIRED as u32);
                 }
@@ -2793,6 +3720,27 @@ impl PeHostRuntime {
                 let _affinity = read_u64(memory, info_ptr)?;
                 state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
             }
+            nt::THREAD_HIDE_FROM_DEBUGGER_CLASS => {
+                let thread_id = match self.win32.thread_id_for_handle(thread_handle) {
+                    Ok(thread_id) => thread_id,
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(nt::STATUS_INVALID_HANDLE.raw()));
+                        return Ok(());
+                    }
+                };
+                match self.anticheat.debug.set_information_thread(
+                    thread_id,
+                    crate::anticheat::THREAD_HIDE_FROM_DEBUGGER,
+                    info_length as usize,
+                ) {
+                    Ok(()) => {
+                        state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+                    }
+                    Err(status) => {
+                        state.set(Register::Rax, u64::from(status));
+                    }
+                }
+            }
             _ => {
                 state.set(
                     Register::Rax,
@@ -2817,13 +3765,6 @@ impl PeHostRuntime {
         let length = guest_call_arg(state, memory, 2)?;
         let return_length_ptr = guest_call_arg(state, memory, 3)?;
 
-        if nt::system::validate_system_information_class(info_class).is_err() {
-            state.set(
-                Register::Rax,
-                u64::from(nt::STATUS_INVALID_INFO_CLASS.raw()),
-            );
-            return Ok(());
-        }
         match info_class {
             nt::SYSTEM_BASIC_INFORMATION_CLASS => {
                 const REQUIRED: u64 = 100;
@@ -2902,14 +3843,243 @@ impl PeHostRuntime {
                 state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
             }
             _ => {
-                state.set(
-                    Register::Rax,
-                    u64::from(nt::STATUS_INVALID_INFO_CLASS.raw()),
-                );
+                // Every other class is served from the LIVE kernel state
+                // (loader tables, the one handle table, the guest scheduler's
+                // thread set and the guest clock) through the CasaK
+                // introspection serializer.  A class the serializer does not
+                // back with real state is STATUS_INVALID_INFO_CLASS, never a
+                // fabricated value; a short buffer is
+                // STATUS_INFO_LENGTH_MISMATCH with the exact required length.
+                let mut snapshot = self.build_kernel_snapshot(memory);
+                if info_class == kintro::SYSTEM_FIRMWARE_TABLE_INFORMATION_CLASS {
+                    // The caller supplies (ProviderSignature, TableID) in the
+                    // input buffer; the output echoes them with the real
+                    // table payload (empty when Casa1 exposes no table).
+                    snapshot.firmware_provider = read_u32(memory, buffer)?;
+                    snapshot.firmware_table_id = read_u32(memory, buffer + 4)?;
+                    // RSMB is the SMBIOS provider the Win32
+                    // GetSystemFirmwareTable thunk serves from the SAME
+                    // hardware identity; ACPI tables are genuinely absent.
+                    const RSMB: u32 = 0x5253_4D42;
+                    if snapshot.firmware_provider == RSMB {
+                        snapshot.firmware_table = crate::hardware_identity::build_smbios_table(
+                            crate::hardware_identity::host_identity(),
+                        );
+                    }
+                }
+                let result = if info_class == kintro::SYSTEM_EXTENDED_PROCESS_INFORMATION_CLASS
+                    && self.guest_arch == GuestArch::X86
+                {
+                    // The 32-bit extended layout is a real, distinct ABI
+                    // (0xB8-byte process record, 0x60-byte extended thread
+                    // record), never the x64 layout with truncated pointers.
+                    match kintro::serialize_extended_process_information_x86(
+                        &snapshot.processes,
+                        buffer,
+                    ) {
+                        Some(bytes) => {
+                            let required = bytes.len() as u64;
+                            if length < required {
+                                kintro::SysInfoSerialized {
+                                    status: kintro::STATUS_INFO_LENGTH_MISMATCH,
+                                    required,
+                                    bytes: Vec::new(),
+                                }
+                            } else {
+                                kintro::SysInfoSerialized {
+                                    status: kintro::STATUS_SUCCESS,
+                                    required,
+                                    bytes,
+                                }
+                            }
+                        }
+                        None => kintro::SysInfoSerialized {
+                            status: kintro::STATUS_NOT_SUPPORTED,
+                            required: 0,
+                            bytes: Vec::new(),
+                        },
+                    }
+                } else {
+                    kintro::serialize_system_information(info_class, &snapshot, length, buffer)
+                };
+                match result.status {
+                    kintro::STATUS_SUCCESS => {
+                        memory.map_bytes(buffer, &result.bytes);
+                        if return_length_ptr != 0 {
+                            write_guest_pointer(
+                                memory,
+                                return_length_ptr,
+                                result.required,
+                                self.guest_arch,
+                            )?;
+                        }
+                    }
+                    kintro::STATUS_INFO_LENGTH_MISMATCH => {
+                        if return_length_ptr != 0 {
+                            write_guest_pointer(
+                                memory,
+                                return_length_ptr,
+                                result.required,
+                                self.guest_arch,
+                            )?;
+                        }
+                    }
+                    _ => {}
+                }
+                state.set(Register::Rax, u64::from(result.status as u32));
             }
         }
         self.last_error = 0;
         Ok(())
+    }
+
+    /// Build a plain-value snapshot of the LIVE kernel state for the
+    /// introspection serializers.  Every field is read from a canonical
+    /// table — the loader's module tables (base addresses and sizes are the
+    /// real mappings), the single Win32 handle table, the guest scheduler's
+    /// threads, the guest VM accounting and the guest clock — so the
+    /// serialized structures are internally consistent with the rest of the
+    /// runtime (see [`crate::casak::introspection`]).
+    pub(crate) fn build_kernel_snapshot(&self, memory: &MemoryImage) -> kintro::KernelSnapshot {
+        let system_time = guest_filetime_ticks(&self.win32) as i64;
+        let uptime_100ns = self.win32.get_tick_count64().saturating_mul(10_000);
+        let boot_time = system_time.saturating_sub(uptime_100ns as i64);
+        let committed = self.win32.address_space().committed_bytes();
+        let times = crate::runtime::guest_thread_times_filetimes(self.dtm);
+
+        // ── Modules: the loader's real image tables ─────────────────────────
+        let dlls: Vec<(u64, u32, String, u16, u32)> = self
+            .dll_info_table
+            .iter()
+            .map(|(handle, info)| {
+                (
+                    *handle,
+                    info.image_size as u32,
+                    info.module_name.clone(),
+                    info.load_count.min(u16::MAX as u32) as u16,
+                    info.entry_point_rva,
+                )
+            })
+            .collect();
+        let modules = kintro::assemble_modules(
+            self.mapped_image_base,
+            self.mapped_image_size as u32,
+            &self.main_module_path,
+            &self.main_module_name,
+            &dlls,
+            &self.module_names_by_handle,
+        );
+
+        // ── Handles: every live handle in the one Win32 handle table ────────
+        let mut handles: Vec<kintro::KernelHandle> = Vec::new();
+        let next = self.win32.next_handle_value();
+        for value in (4..next).step_by(4) {
+            let Ok((descriptor, object)) =
+                self.win32.describe_handle(value).and_then(|descriptor| {
+                    self.win32
+                        .handle_object_identity(value)
+                        .map(|object| (descriptor, object))
+                })
+            else {
+                continue;
+            };
+            handles.push(kintro::KernelHandle {
+                handle: value,
+                object: object.0,
+                process_id: self.guest_pid,
+                access: descriptor.access_mask,
+                object_type_index: kintro::object_type_index(descriptor.object_type),
+                pointer_count: descriptor.refcount,
+                handle_count: 1,
+            });
+        }
+
+        // ── Processes / threads: the real guest thread + process set ────────
+        let pending: Vec<(u32, u64, u32, u64, u64, u64)> = self
+            .pending_guest_threads
+            .iter()
+            .map(|thread| {
+                let (stack_base, stack_limit) =
+                    teb_stack_bounds(memory, thread.teb_base, self.guest_arch).unwrap_or((0, 0));
+                (
+                    thread.thread_id,
+                    thread.start_address,
+                    thread.suspended,
+                    thread.teb_base,
+                    stack_base,
+                    stack_limit,
+                )
+            })
+            .collect();
+        // The main thread's stack is the region the run loop maps and the
+        // TEB records.  A runtime with no TEB (a bare unit runtime) still has
+        // the real main-stack region mapped; a TEB that exists but records no
+        // bounds is NOT silently replaced (the extended query refuses it).
+        let main_stack = if self.teb_base == 0 {
+            let limit = stack_base_for_arch(self.guest_arch);
+            (limit + STACK_SIZE as u64, limit)
+        } else {
+            teb_stack_bounds(memory, self.teb_base, self.guest_arch).unwrap_or((0, 0))
+        };
+        let threads = kintro::assemble_threads(
+            (self.win32.current_thread_id(), self.teb_base),
+            main_stack,
+            &pending,
+            times,
+        );
+        let mut toolhelp: Vec<(u32, String)> = self
+            .win32
+            .create_toolhelp_snapshot()
+            .processes
+            .into_iter()
+            .map(|entry| (entry.process_id, entry.executable))
+            .collect();
+        // The toolhelp snapshot enumerates process *objects*; this runtime's
+        // own process is always part of the real process set even before a
+        // process handle exists, so it is reported from the loader's image
+        // name when the snapshot has no entry for it.
+        if !toolhelp.iter().any(|(pid, _)| *pid == self.guest_pid) {
+            toolhelp.push((self.guest_pid, self.main_module_name.clone()));
+        }
+        let processes = kintro::assemble_processes(
+            self.guest_pid,
+            std::process::id(),
+            handles.len() as u32,
+            &threads,
+            &toolhelp,
+            times,
+            committed,
+        );
+
+        // ── Pool / page file: real guest VM accounting ──────────────────────
+        let committed_pages = (committed / 4096).min(u64::from(u32::MAX)) as u32;
+        kintro::KernelSnapshot {
+            processor_count: 8,
+            active_processor_mask: self.process_affinity_mask,
+            system_time,
+            boot_time,
+            range_start: kintro::system_range_start(self.guest_arch == GuestArch::X64),
+            modules,
+            processes,
+            handles,
+            pool_tags: Vec::new(),
+            pool_used_bytes: committed,
+            pool_budget_bytes: committed,
+            lookaside: Vec::new(),
+            debugger_present: self.debugger_present,
+            debugger_enabled: self.debugger_present,
+            // Casa1 enforces no code-integrity policy on its own images: the
+            // truthful options word is zero (no CI enforcement).
+            code_integrity_options: 0,
+            firmware_provider: 0,
+            firmware_table_id: 0,
+            firmware_table: Vec::new(),
+            page_file_path: "C:\\pagefile.sys".to_string(),
+            page_file_total_pages: committed_pages,
+            page_file_in_use_pages: committed_pages,
+            page_file_peak_pages: committed_pages,
+            installed_memory_bytes: committed,
+        }
     }
 
     /// `NtQueryPerformanceCounter` — the guest counter + frequency.
@@ -4057,6 +5227,56 @@ fn apply_context_from_guest(
                     apply_guest_eflags(target, u64::from(eflags));
                 }
             }
+        }
+    }
+}
+
+/// Read a thread's real stack bounds from its TEB.
+///
+/// x64: `StackBase` at +0x08 and `StackLimit` at +0x10.  x86: `StackBase` at
+/// +0x04 and `StackLimit` at +0x08.  Returns `None` when the TEB is not
+/// mapped or records no bounds, so callers can refuse to fabricate them.
+fn teb_stack_bounds(memory: &MemoryImage, teb_base: u64, arch: GuestArch) -> Option<(u64, u64)> {
+    if teb_base == 0 {
+        return None;
+    }
+    let (base, limit) = match arch {
+        GuestArch::X64 => (
+            memory.read_u64(teb_base + 0x08).ok()?,
+            memory.read_u64(teb_base + 0x10).ok()?,
+        ),
+        GuestArch::X86 => (
+            u64::from(memory.read_u32(teb_base + 0x04).ok()?),
+            u64::from(memory.read_u32(teb_base + 0x08).ok()?),
+        ),
+    };
+    (base != 0 && limit != 0 && base > limit).then_some((base, limit))
+}
+
+/// The live anti-cheat state of one guest runtime: the debugger-attach state
+/// machine and the single monotonic clock every timing surface reads.
+///
+/// Every Win32/Nt* arm that answers an anti-debug, timing or attestation
+/// question must read this state so the API families cannot disagree.
+pub(crate) struct GuestAnticheatState {
+    /// Debugger attach/detach, debug objects and per-thread contexts.
+    pub(crate) debug: crate::anticheat::AntiDebugSurface,
+    /// The one monotonic clock (measured counter frequency, invariant TSC).
+    pub(crate) clock: std::sync::Arc<crate::anticheat::MonotonicClock>,
+    /// Trusted attestation providers registered for this guest runtime.
+    pub(crate) attestation: crate::anticheat::AttestationRegistry,
+    /// The real signing key the quote thunk uses (derived lazily from the
+    /// persisted install identity; never a fabricated constant).
+    pub(crate) attestation_key: Option<crate::anticheat::AttestationKeyPair>,
+}
+
+impl GuestAnticheatState {
+    pub(crate) fn new(guest_pid: u32) -> Self {
+        Self {
+            debug: crate::anticheat::AntiDebugSurface::new(guest_pid),
+            clock: std::sync::Arc::new(crate::anticheat::MonotonicClock::new()),
+            attestation: crate::anticheat::AttestationRegistry::new(),
+            attestation_key: None,
         }
     }
 }

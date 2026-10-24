@@ -7859,6 +7859,21 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:msi_reads_real_compound_database",
     ),
     conformance(
+        "kernel32.dll",
+        "CheckRemoteDebuggerPresent",
+        "casa1-conformance:anticheat_identity_exports_reject_invalid_arguments_and_report_real_facts",
+    ),
+    conformance(
+        "kernel32.dll",
+        "GetSystemFirmwareTable",
+        "casa1-conformance:anticheat_identity_exports_reject_invalid_arguments_and_report_real_facts",
+    ),
+    conformance(
+        "kernel32.dll",
+        "GetVolumeInformationW",
+        "casa1-conformance:anticheat_identity_exports_reject_invalid_arguments_and_report_real_facts",
+    ),
+    conformance(
         "x3daudio1_7.dll",
         "X3DAudioInitialize",
         "casa1-conformance:evidence_final_scraps_surfaces",

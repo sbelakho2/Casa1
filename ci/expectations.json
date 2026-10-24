@@ -4,6 +4,11 @@
   "( dispatch_x86( &mut fixture, HostThunk::WicFrameEncodeUnsupported, &[frame as u32, THUMBNAIL_OUT as u32] ), u64::from(WIC_E_CODECNOTHANDLED) )",
   "(read_ptr(&fixture, THUMBNAIL_OUT), 0)"
  ],
+ "absent_serial_uuid_error_status_is_pinned": [
+  "( identity.require_serial().unwrap_err(), IdentityError::FactAbsent(\"IOPlatformSerialNumber\") )",
+  "( identity.require_uuid().unwrap_err(), IdentityError::FactAbsent(\"IOPlatformUUID\") )",
+  "( identity.primary_volume_serial().unwrap_err(), IdentityError::FactAbsent(\"root volume\") )"
+ ],
  "activation_capture_guid_path_resolves_or_reports_device_error": [
   "(hr, u64::from(ACTIVATION_S_OK))",
   "(result_hr, ACTIVATION_S_OK)",
@@ -123,6 +128,13 @@
   "( subsystem .d3dkmt_open_adapter_from_device_name(\"metal#ffffffffffffffff\") .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )",
   "( subsystem .d3dkmt_open_adapter_from_device_name(\"not a gpu\") .unwrap_err() .status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER )"
  ],
+ "adapter_type_and_description_reject_unknown_names_with_defaults": [
+  "(adapter_type_for_name(\"utun0\"), \"Tunnel\")",
+  "(adapter_type_for_name(\"bridge0\"), \"Bridge\")",
+  "(adapter_type_for_name(\"zzz9\"), \"Ethernet 802.3\")",
+  "(adapter_description(\"utun0\"), \"VPN Tunnel Adapter\")",
+  "(adapter_description(\"weird0\"), \"Network Adapter\")"
+ ],
  "add_ref_pins_and_remove_ref_unpins": [
   "( runtime.dll_info_table.get(&handle).unwrap().load_count, u32::MAX )",
   "(runtime.dll_info_table.get(&handle).unwrap().load_count, 1)",
@@ -216,6 +228,13 @@
   "(state.num_heaps, 1)",
   "(state.get_debug_port(), 0)"
  ],
+ "anticheat_identity_exports_reject_invalid_arguments_and_report_real_facts": [
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, check, &[process, out as u32]), 1 )",
+  "(memory.read_u32(out).expect(\"present\"), 0)",
+  "(memory.read_u32(out).expect(\"present\"), 1)",
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, check, &[process, 0]), 0 )",
+  "(runtime.last_error, 87, \"null out pointer is invalid\")"
+ ],
  "apc_queue_deliver_returns_entries": [
   "(apcs.len(), 3)",
   "(apcs[0].callback, 0x3000)",
@@ -302,6 +321,30 @@
   "(vz_config.memory_size, 8192 * 1024 * 1024)",
   "(vz_config.devices.len(), 4)"
  ],
+ "assemble_modules_skips_duplicate_main_image_and_flags_kernel_drivers": [
+  "( modules.len(), 4, \"main + 3 distinct DLLs (the duplicate is skipped)\" )",
+  "(modules[0].base, 0x1000)",
+  "(modules[0].path, r\"C:\\Game\\game.exe\")",
+  "( modules[1].path, r\"C:\\Game\\lib.dll\", \"name table wins over the stale entry\" )",
+  "( modules[2].path, \"fallback.dll\", \"no name-table entry falls back\" )",
+  "(modules[0].path, \"game.exe\")"
+ ],
+ "assemble_processes_rejects_the_host_entry_and_zeroes_unknown_handles": [
+  "(processes.len(), 2, \"the host provenance entry is filtered\")",
+  "(processes[0].pid, 100)",
+  "( processes[0].handle_count, 7, \"self gets the real live count\" )",
+  "(processes[0].threads.len(), 1)",
+  "(processes[1].pid, 200)",
+  "( processes[1].handle_count, 0, \"other processes have no observed handles\" )"
+ ],
+ "assemble_threads_boundary_suspended_and_runnable_wait_reasons_are_exact": [
+  "(threads.len(), 3)",
+  "(threads[0].thread_id, 100)",
+  "(threads[0].wait_reason, 0, \"the main thread is runnable\")",
+  "(threads[0].stack_base, 0x3000)",
+  "(threads[0].stack_limit, 0x1000)",
+  "(threads[1].wait_reason, 0)"
+ ],
  "async_operation_cancel_is_real": [
   "(peer.cancel_async_operation(pending), S_OK)",
   "( peer.cancel_async_operation(pending), DPNERR_INVALIDHANDLE, \"an already cancelled handle is gone\" )",
@@ -326,6 +369,57 @@
   "(compiler.thread_handle.is_none(), true)",
   "(compiler.sender.is_none(), true)",
   "(compiler.poll_completed().len(), 0)"
+ ],
+ "attestation_guest_thunks_reject_forgery_replay_and_no_provider": [
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, challenge_thunk, &[ verifier as u32, 60_000, challenge_out as u32, 0, challenge_required as u32 ] ), u64::from(crate::ntdll::STATUS_INFO_LENGTH_MISMATCH.raw()) )",
+  "(memory.read_u32(challenge_required).expect(\"required\"), 48)",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, challenge_thunk, &[verifier as u32, 60_000, 0, 48, 0] ), u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()), \"a null challenge output is invalid\" )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, challenge_thunk, &[0, 60_000, challenge_out as u32, 48, 0] ), u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, challenge_thunk, &[verifier as u32, 0, challenge_out as u32, 48, 0] ), u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()) )",
+  "( dispatch_x86_thunk( runtime, memory, challenge_thunk, &[ verifier as u32, 60_000, nonce_out as u32, 48, challenge_required as u32 ] ), u64::from(crate::ntdll::STATUS_SUCCESS.raw()) )"
+ ],
+ "attestation_key_pair_rejects_malformed_secret_bytes": [
+  "( AttestationKeyPair::from_secret_bytes(&[0u8; 32]).err(), Some(AttestationError::MalformedKey) )",
+  "(restored.public_key_spki(), key_pair.public_key_spki())",
+  "(key_pair.secret_bytes(), [0u8; 32])"
+ ],
+ "attestation_provider_enrollment_is_persisted_revocable_and_exact": [
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, enroll, &[empty_id as u32, key_ptr as u32, spki.len() as u32, 0] ), u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, enroll, &[traversal as u32, key_ptr as u32, spki.len() as u32, 0] ), u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, enroll, &[provider as u32, key_ptr as u32, 0, 0] ), u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, enroll, &[provider as u32, bad_key as u32, 3, 0] ), u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, enroll, &[provider as u32, key_ptr as u32, spki.len() as u32, 0] ), u64::from(crate::ntdll::STATUS_SUCCESS.raw()) )",
+  "(stored.public_key_spki, spki)"
+ ],
+ "attestation_quote_verification_rejects_forged_and_replayed_quotes": [
+  "(verified.provider_id, \"casa1\")",
+  "(verified.nonce, challenge.nonce)",
+  "( registry.verify_quote(&quote, &challenge, Some(&measurement), 2_000), Err(AttestationError::ChallengeReplayed) )",
+  "( registry.verify_quote(&quote, &other_nonce, None, 3_000), Err(AttestationError::NonceMismatch) )",
+  "( registry.verify_quote(&empty_quote, &fresh, None, 2_000), Err(AttestationError::MalformedQuote) )",
+  "( registry.verify_quote(&forged, &forged_challenge, None, 2_000), Err(AttestationError::InvalidSignature) )"
+ ],
+ "attestation_registry_rejects_revoked_expired_unknown_and_mismatched_keys": [
+  "( registry.verify_quote(&unknown_quote, &unknown_challenge, None, 1), Err(AttestationError::UnknownProvider) )",
+  "( registry.verify_quote(&mismatch_quote, &mismatch_challenge, None, 1), Err(AttestationError::KeyMismatch) )",
+  "( registry.verify_quote(&expired_quote, &expired_challenge, None, 1_000), Err(AttestationError::ProviderKeyExpired) )",
+  "( registry.verify_quote(&revoked_quote, &revoked_challenge, None, 1), Err(AttestationError::RevokedProvider) )",
+  "( registry.register_provider(ProviderKey { provider_id: \"casa1\".to_string(), public_key_spki: key_pair.public_key_spki(), registered_at_ms: 0, valid_until_ms: None, }), Err(AttestationError::RevokedProvider) )"
+ ],
+ "attestation_wire_rejects_malformed_challenges_and_pins_statuses": [
+  "(wire.len(), ATTESTATION_CHALLENGE_WIRE_SIZE)",
+  "(restored.nonce, challenge.nonce)",
+  "(restored.issued_at_ms, 17)",
+  "(restored.ttl_ms, 60_000)",
+  "(restored.verifier, ATTESTATION_VERIFIER)",
+  "( challenge_from_wire(&wire[..ATTESTATION_CHALLENGE_WIRE_SIZE - 1]).err(), Some(AttestationError::MalformedChallenge) )"
+ ],
+ "attestation_without_provider_returns_cannot_attest_failure": [
+  "( registry.verify_quote(&quote, &challenge, None, 0), Err(AttestationError::NoProvider) )",
+  "( cannot_attest(&AttestationError::NoProvider), \"cannot attest: no provider registered or installed\" )",
+  "( attestation_error(&AttestationError::NoProvider).code, ReasonCode::RcInvalidState )",
+  "(registry.provider_count(), 0)",
+  "( cannot_attest(&AttestationError::InvalidSignature), \"attestation failed\" )"
  ],
  "audio_client2_and_3_extension_methods_are_real": [
   "(hr, 0, \"GetSharedModeEnginePeriod succeeds\")",
@@ -352,6 +446,14 @@
   "(hr, 0, \"Start succeeds\")",
   "(data, buffer_address, \"GetBuffer hands out the bound buffer\")",
   "(hr, 0, \"ReleaseBuffer accepts the written frames\")"
+ ],
+ "audio_endpoint_activation_and_client_lifecycle": [
+  "( call( &mut session, HostThunk::ActivateAudioInterfaceAsync, &[0, riid, 0, handler_object, operation_out], ), 0 )",
+  "(read_u32(&session, marker), 0)",
+  "( call(&mut session, HostThunk::SetTimer, &[hwnd as u64, 1, 100, 0]), 1 )",
+  "( call(&mut session, HostThunk::GetMessageA, &[message, 0, 0, 0]), 1 )",
+  "(read_u32(&session, marker), 1)",
+  "( call( &mut session, HostThunk::AudioActivationOperationGetActivateResult, &[operation, activate_result, activate_interface], ), 0 )"
  ],
  "auto_unavailable_host_and_deterministic_modes_fall_back": [
   "( crate::runtime::jit_construction_selected(&JitMode::Auto, false, false), false )",
@@ -383,6 +485,14 @@
   "( dispatch_x86_thunk(&mut runtime, &mut memory, destroy_key, &[rsa_key as u32]), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, open, &[aes_provider_out as u32, aes_alg as u32, 0, 0], ), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, import_key, &[ aes_provider as u32, 0, 0, imported_out as u32, 0, 0, blob as u32, 16, 0, ], ), 0 )"
+ ],
+ "bigpool_information_reports_no_entries_without_a_tagged_pool_and_rejects_short_buffers": [
+  "(pool.len(), 8 + 32 * 2)",
+  "(u32::from_le_bytes(pool[0..4].try_into().unwrap()), 2)",
+  "( u64::from_le_bytes(pool[8 + 16..8 + 24].try_into().unwrap()), 0x2000 )",
+  "(&pool[8 + 24..8 + 28], b\"Kasa\")",
+  "( u64::from_le_bytes(pool[8 + 32..8 + 40].try_into().unwrap()), 0 )",
+  "(empty.len(), 8)"
  ],
  "bitmap_lock_commits_writes_and_invalidates": [
   "( dispatch_x86( &mut fixture, HostThunk::WicBitmapLock, &[ bitmap as u32, RECT as u32, WIC_BITMAP_LOCK_WRITE, LOCK_OUT as u32 ] ), 0 )",
@@ -506,6 +616,13 @@
   "(legacy.os_edition, \"\")",
   "(legacy.arch, \"\")",
   "(legacy.target_triple, \"\")"
+ ],
+ "casa1_build_measurement_rejects_stale_digest_mismatch": [
+  "(measurement.build_id, crate::BUILD_ID)",
+  "(measurement.modules.len(), 1)",
+  "( measurement_digest(&measurement), measurement_digest(&measurement.clone()) )",
+  "(measurement.modules[0].sha256, [0u8; 32])",
+  "( measurement_digest(&measurement), measurement_digest(&sample_measurement()) )"
  ],
  "ccitt_2d_rejects_invalid_modes_and_bounds": [
   "( wic_ccitt_decode_2d( &mut ccitt_bits(&ccitt_pack(&[\"1\"])), 4, &reference, &mut row ), Some(()) )",
@@ -632,6 +749,17 @@
  "certificate_from_der_wrong_tag": [
   "(cert.thumbprint.len(), 20)"
  ],
+ "challenge_validity_rejects_malformed_and_expired": [
+  "(challenge.is_well_formed(), true)",
+  "(challenge.is_expired(1_100), false)",
+  "(challenge.is_expired(1_101), true)",
+  "(zero_ttl.is_well_formed(), false)"
+ ],
+ "chassis_type_fallback_for_absent_target": [
+  "(chassis_type_for_target(\"\"), 0x02)",
+  "(chassis_type_for_target(\"J714s\"), 0x03)",
+  "(chassis_type_for_target(\"MacBookPro18,3\"), 0x0A)"
+ ],
  "check_access_faults_on_unmapped_guard_and_write_to_read_only": [
   "(fault.address, 0x1000)",
   "(fault.address, base + 0x2000)",
@@ -712,6 +840,82 @@
   "(second, first, \"closed values are recycled FIFO\")",
   "( table.handle_generation(second), Some(1), \"reuse gets a fresh generation\" )"
  ],
+ "clr_create_instance_rejects_unknown_ids_and_nulls_with_zeroed_out": [
+  "( dispatch_x86( &mut fixture, HostThunk::ClrCreateInstance, &[clsid as u32, riid as u32, 0], ), u64::from(E_POINTER) )",
+  "( dispatch_x86( &mut fixture, HostThunk::ClrCreateInstance, &[wrong_clsid as u32, riid as u32, out as u32], ), u64::from(E_NOINTERFACE) )",
+  "(read_ptr_at(&fixture.memory, out), 0)",
+  "( dispatch_x86( &mut fixture, HostThunk::ClrCreateInstance, &[clsid as u32, wrong_riid as u32, out as u32], ), u64::from(E_NOINTERFACE) )",
+  "( dispatch_x86( &mut fixture, HostThunk::ClrCreateInstance, &[0, riid as u32, out as u32], ), u64::from(E_POINTER) )"
+ ],
+ "clr_enumeration_lifetime_query_interface_and_absent_items_are_exact": [
+  "( call_method(&mut fixture, meta, 5, &[0]), u64::from(E_POINTER) )",
+  "(call_method(&mut fixture, meta, 5, &[out as u32]), 0)",
+  "( call_method(&mut fixture, enumerator, 0, &[iid as u32, out as u32]), 0 )",
+  "(read_ptr_at(&fixture.memory, out), enumerator)",
+  "(call_method(&mut fixture, enumerator, 1, &[]), 3)",
+  "(call_method(&mut fixture, enumerator, 2, &[]), 2)"
+ ],
+ "clr_get_runtime_rejects_malformed_and_absent_versions": [
+  "( call_method( &mut fixture, meta, 3, &[version as u32, riid as u32, out as u32] ), u64::from(E_INVALIDARG) )",
+  "( call_method(&mut fixture, meta, 3, &[0, riid as u32, out as u32]), u64::from(E_INVALIDARG) )",
+  "( call_method(&mut fixture, meta, 3, &[version as u32, riid as u32, 0]), u64::from(E_POINTER) )",
+  "( call_method( &mut fixture, meta, 3, &[absent as u32, riid as u32, out as u32] ), u64::from(CLR_E_SHIM_RUNTIMENOTFOUND) )",
+  "(read_ptr_at(&fixture.memory, out), 0)",
+  "(hr, 0)"
+ ],
+ "clr_get_version_from_file_matches_managed_and_rejects_non_managed": [
+  "( call_method(&mut fixture, meta, 4, &[path as u32, 0, size as u32]), 0 )",
+  "(read_u32_at(&fixture.memory, size), 11)",
+  "( call_method( &mut fixture, meta, 4, &[path as u32, buffer as u32, size as u32] ), u64::from(HRESULT_INSUFFICIENT_BUFFER) )",
+  "( call_method( &mut fixture, meta, 4, &[path as u32, buffer as u32, size as u32] ), 0 )"
+ ],
+ "clr_host_export_thunk_rejects_malformed_absent_and_unknown_symbols": [
+  "( call_thunk( &mut fixture, HostThunk::ClrHostExport { runtime_version: \"v8\".to_string(), symbol: \"coreclr_set_error_writer\".to_string(), }, &[] ), u64::from(HRESULT_PROC_NOT_FOUND), \"a malformed runtime version cannot resolve a host export\" )",
+  "( call_thunk( &mut fixture, HostThunk::ClrHostExport { runtime_version: \"999.0.0\".to_string(), symbol: \"coreclr_set_error_writer\".to_string(), }, &[] ), u64::from(HRESULT_PROC_NOT_FOUND) )",
+  "( call_thunk( &mut fixture, HostThunk::ClrHostExport { runtime_version: real_version(), symbol: \"casa1_no_such_clr_export_42\".to_string(), }, &[] ), u64::from(HRESULT_PROC_NOT_FOUND), \"a symbol missing from the real dylib is rejected at call time\" )"
+ ],
+ "clr_host_export_x64_passes_register_arguments_without_abi_mismatch": [
+  "(state.get(Register::Rax), 0)"
+ ],
+ "clr_loaded_notification_refuses_duplicates_and_invokes_the_real_callback": [
+  "( call_method(&mut fixture, meta, 7, &[0]), u64::from(E_INVALIDARG) )",
+  "( call_method(&mut fixture, meta, 7, &[callback_address as u32]), 0 )",
+  "( call_method(&mut fixture, meta, 7, &[callback_address as u32]), u64::from(E_UNEXPECTED), \"the CLR permits exactly one loaded callback\" )",
+  "( fixture .runtime .notify_clr_runtime_loaded(&mut state, &mut fixture.memory, \"v8\") .expect(\"malformed version\"), false )",
+  "( fixture .runtime .notify_clr_runtime_loaded(&mut state, &mut fixture.memory, \"999.0.0\") .expect(\"absent version\"), false )",
+  "( fixture .runtime .notify_clr_runtime_loaded(&mut state, &mut fixture.memory, &version) .expect(\"loaded runtime\"), true )"
+ ],
+ "clr_meta_host_legacy_binding_and_exit_are_framework_absent": [
+  "( call_method(&mut fixture, meta, 8, &[iid as u32, out as u32]), u64::from(E_NOINTERFACE) )",
+  "(read_ptr_at(&fixture.memory, out), 0)",
+  "( call_method(&mut fixture, meta, 8, &[iid as u32, 0]), u64::from(E_POINTER) )",
+  "(call_method(&mut fixture, meta, 9, &[7]), 0)",
+  "(fixture.runtime.process_exit_requested, Some(7))",
+  "( fixture .runtime .notify_clr_runtime_loaded(&mut state, &mut fixture.memory, &real_version()) .expect(\"loaded without callback\"), true )"
+ ],
+ "clr_meta_host_qoi_and_refcounts_are_exact": [
+  "( call_method(&mut fixture, meta, 0, &[iid as u32, out as u32]), 0 )",
+  "(read_ptr_at(&fixture.memory, out), meta)",
+  "(call_method(&mut fixture, meta, 2, &[]), 1)",
+  "(call_method(&mut fixture, meta, 1, &[]), 2)",
+  "( call_method(&mut fixture, meta, 0, &[iid as u32, out as u32]), u64::from(E_NOINTERFACE) )"
+ ],
+ "clr_runtime_info_rejects_hosting_interfaces_and_reports_real_proc_address": [
+  "(hr, 0)",
+  "( call_method(&mut fixture, info, 0, &[qi_iid as u32, qi_out as u32]), 0 )",
+  "(read_ptr_at(&fixture.memory, qi_out), info)",
+  "(call_method(&mut fixture, info, 1, &[]), 3)",
+  "(call_method(&mut fixture, info, 2, &[]), 2)",
+  "(call_method(&mut fixture, info, 2, &[]), 1)"
+ ],
+ "clr_runtime_info_unknown_objects_are_rejected": [
+  "( call_thunk( &mut fixture, HostThunk::ClrRuntimeInfoGetVersionString, &[0xDEAD_0000, buffer as u32, size as u32] ), u64::from(E_UNEXPECTED) )",
+  "( call_thunk( &mut fixture, HostThunk::ClrRuntimeInfoGetRuntimeDirectory, &[0xDEAD_0000, buffer as u32, size as u32] ), u64::from(E_UNEXPECTED) )",
+  "( call_thunk( &mut fixture, HostThunk::ClrRuntimeInfoLoadErrorString, &[0xDEAD_0000, 0, buffer as u32, size as u32, 0] ), u64::from(E_UNEXPECTED) )",
+  "( call_thunk( &mut fixture, HostThunk::ClrRuntimeInfoGetProcAddress, &[0xDEAD_0000, symbol as u32, size as u32] ), u64::from(E_UNEXPECTED) )",
+  "( call_thunk( &mut fixture, HostThunk::ClrRuntimeInfoAddRef, &[0xDEAD_0000] ), 0, \"an unknown object has no refcount\" )",
+  "( call_thunk( &mut fixture, HostThunk::ClrRuntimeInfoRelease, &[0xDEAD_0000] ), 0 )"
+ ],
  "cng_audit_log_appends_real_records": [
   "(ret, u64::from(ERROR_SUCCESS))",
   "(runtime.last_error, 0)",
@@ -719,6 +923,20 @@
   "(records[0].provider, 0x0001_2345)",
   "(records[0].action, 0x1)",
   "(records[0].result, 0)"
+ ],
+ "code_integrity_hash_mismatch_is_detected": [
+  "(code_hash(&memory, base, 4).expect(\"hash\"), expected)",
+  "( verify_code_hash(&memory, base, 4, &expected).expect(\"verify\"), true )",
+  "( verify_code_hash(&memory, base, 4, &[0u8; 32]).expect(\"verify\"), false )",
+  "( verify_code_hash(&memory, base, 4, &expected).expect(\"verify\"), false )"
+ ],
+ "code_integrity_options_are_zero_and_a_short_buffer_is_rejected": [
+  "(u32::from_le_bytes(integrity[0..4].try_into().unwrap()), 8)",
+  "(u32::from_le_bytes(integrity[4..8].try_into().unwrap()), 0)",
+  "(result.status, STATUS_SUCCESS)",
+  "(result.bytes, integrity)",
+  "(short.status, STATUS_INFO_LENGTH_MISMATCH)",
+  "(short.required, 8)"
  ],
  "code_page_conversion_from_utf8_large_input_does_not_overflow": [
   "(bytes.len(), 1024 * 1024)"
@@ -866,6 +1084,12 @@
   "( call_slot( &mut fixture, item_moniker, 16, &[item_moniker as u32, OUT as u32] ), 0 )",
   "(fixture.memory.read_u32(OUT).unwrap(), 4)"
  ],
+ "concurrent_enumeration_and_refcounts_are_atomic": [
+  "(installed_runtimes(), expected)",
+  "(objects.refcount(4242, 0x1000), Some(1))",
+  "(objects.release(4242, 0x1000), Some(0))",
+  "( objects.release(4242, 0x1000), None, \"an object cannot be released twice\" )"
+ ],
  "concurrent_flat_and_image_atomic_views_never_observe_stale_or_torn_values": [
   "(memory.read_u32(address).unwrap(), iterations)",
   "(store.materialisation_count(), 1)"
@@ -883,6 +1107,12 @@
   "(wakes.load(Ordering::SeqCst), WAITERS)",
   "(statistics.wait_count, WAITERS as u64)",
   "(statistics.timeout_count, 0)"
+ ],
+ "concurrent_views_above_four_gib_never_observe_torn_values": [
+  "( observed >= last, true, \"the image view moved backwards: {observed} < {last}\" )",
+  "(memory.read_u64(address).unwrap(), iterations)",
+  "(store.materialisation_count(), 1)",
+  "(store.high_page_count(), 0)"
  ],
  "concurrent_wait_timeouts_are_per_waiter_and_exact": [
   "(error.status(), STATUS_TIMEOUT)",
@@ -953,10 +1183,10 @@
  "cooperative_and_production_guest_loops_no_races_byte_identical": [
   "( read_u32_guest(&cooperative, SLICE_COUNTER_A), iterations, \"cooperative loop did not finish in {rounds} rounds\" )",
   "(reports.len(), 1)",
-  "( reports[0].state.rip, SLICE_CODE + 21, \"loop must fall through to ret after {iterations} iterations (exit {:?})\", reports[0].exit )",
+  "( reports[0].state.rip, 0, \"the worker chain must run all {iterations} iterations and the final ret (exit {:?})\", reports[0].exit )",
+  "( reports[0].exit, GuestSliceExit::HostBarrier { rip: 0 }, \"the completed loop returns to the zero stack sentinel\" )",
   "( session_pending_rips(&production), Vec::<u64>::new(), \"production thread did not exit after {rounds} rounds\" )",
-  "( read_u32_guest(&cooperative, SLICE_COUNTER_A), iterations, \"cooperative result\" )",
-  "( read_u32_guest(&production, SLICE_COUNTER_A), iterations, \"production result\" )"
+  "( read_u32_guest(&cooperative, SLICE_COUNTER_A), iterations, \"cooperative result\" )"
  ],
  "cooperative_pump_driven_idle_poll_race_remains_bounded": [
   "(session.runtime.scheduler_mode(), SchedulerMode::Cooperative)",
@@ -1003,6 +1233,9 @@
   "( wic_copy_source_pixels(&objects, &clipper, 0, 0, 1, 1), Vec::<u8>::new(), \"a clipper without its wrapped source yields no pixels\" )",
   "( wic_copy_source_pixels(&objects, &scaler, 0, 0, 1, 1), Vec::<u8>::new(), \"a scaler without its wrapped source yields no pixels\" )",
   "( wic_copy_source_pixels(&objects, &rotator, 0, 0, 1, 1), Vec::<u8>::new(), \"a flip-rotator without its wrapped source yields no pixels\" )"
+ ],
+ "corrupt_machine_guid_is_replaced_not_reused": [
+  "( store.get(MACHINE_GUID_VALUE).as_deref(), Some(identity.machine_guid.as_str()) )"
  ],
  "counter_pipeline_reports_real_host_values": [
   "(cpu, PDH_COUNTER_HANDLE_BASE)",
@@ -1283,6 +1516,21 @@
   "( renderer.pool_cursor.load(Ordering::Relaxed), 10 * std::mem::size_of::<D2DVertex>(), \"draw_line must append six pooled vertices\" )",
   "(renderer.upload_vertex_data(&[1u64]).is_none(), true)"
  ],
+ "d3d11_device_and_buffer_map_unmap_bytes": [
+  "(device.feature_level(), FeatureLevel::Level10_1)",
+  "(mapped.len(), 64)",
+  "(&*mapped, &[0_u8; 64])",
+  "(&mapped[..8], &bytes)",
+  "(&mapped[8..], &vec![0_u8; 56])"
+ ],
+ "d3d11_map_unmap_direct_shared_backing_rejects_staged_fallback": [
+  "(&*mapped, &[0u8; 64])",
+  "(&*mapped, first.as_slice())",
+  "( mapped.as_ptr(), first_pointer, \"Map must return a stable borrow into the same backing\" )",
+  "(stats.zero_copy_updates, 1)",
+  "(stats.staged_copies, 0)",
+  "(&*mapped, second.as_slice())"
+ ],
  "d3d12_build_bottom_level_acceleration_structure": [
   "(gpu_addr, 0x1000)",
   "(accel.gpu_address, 0x1000)"
@@ -1296,11 +1544,34 @@
   "(info.adapter.name, \"NVIDIA GeForce RTX 4080\")",
   "(info.adapter.metal_family, \"apple8\")"
  ],
+ "d3d12_device_queue_and_allocation_bytes": [
+  "(runtime.fence_value(fence).unwrap(), 1)",
+  "(readback.len(), 64)",
+  "(&readback[..8], &payload)",
+  "(&readback[8..], &[0_u8; 56])",
+  "(queue, 0)",
+  "(allocator, 0)"
+ ],
+ "d3d12_guest_initial_data_rejects_window_edges_and_counts_zero_staging": [
+  "(runtime.staging_bytes(), 0)",
+  "(runtime.guest_initial_upload_count(), 1)",
+  "( runtime .readback_gpu_texture(resource) .expect(\"guest initial data readback\"), pixels )",
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "( error.message, \"initial data: guest initial data refused: guest region outside the canonical window\" )"
+ ],
  "d3d12_present_falls_back_when_iosurface_is_unavailable": [
   "(runtime.fallback_upload_count(), backbuffers)",
   "(runtime.iosurface_present_count(), 0)",
   "(runtime.surface_writes(), 0)",
   "(&frame.bytes[..pixels.len()], &pixels)"
+ ],
+ "d3d12_update_subresource_direct_shared_backing_rejects_staged_fallback": [
+  "( runtime .resource_storage_mode(resource) .expect(\"storage mode\"), MetalStorageMode::Shared )",
+  "( runtime .backend() .resource_bytes(resource) .expect(\"shared backing\"), first.as_slice() )",
+  "(stats.zero_copy_updates, 1)",
+  "(stats.staged_copies, 0)",
+  "( runtime .backend() .resource_bytes(resource) .expect(\"shared backing after overwrite\"), second.as_slice() )",
+  "(stats.zero_copy_updates, 2)"
  ],
  "d3d8thk_allocation_residency_rejects_budget_overrun_and_double_destroy": [
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTQueryAdapterInfo, &[query] ), 0 )",
@@ -1472,6 +1743,29 @@
   "(parsed[\"instruction_count\"], 123_456)",
   "( parsed[\"network_summary\"][0][\"host\"], \"store.steampowered.com\" )",
   "(parsed[\"network_summary\"][0][\"port\"], 443)"
+ ],
+ "debugger_attach_detach_reject_invalid_transitions": [
+  "(surface.detach(4242), Err(DebugError::NotAttached))",
+  "(object.process_id, 4242)",
+  "(surface.attach(4242), Err(DebugError::AlreadyAttached))",
+  "(surface.attach(7), Err(DebugError::ProcessNotFound))",
+  "(surface.detach(7), Err(DebugError::ProcessNotFound))",
+  "(surface.detach(4242), Ok(()))"
+ ],
+ "debugger_exception_dispatch_mismatch_when_thread_hidden": [
+  "( surface.dispatch_exception(1, EXCEPTION_BREAKPOINT, true), ExceptionDisposition::DeliveredToGuest )",
+  "( surface.dispatch_exception(1, EXCEPTION_BREAKPOINT, false), ExceptionDisposition::ProcessTerminated )",
+  "( surface.dispatch_exception(1, EXCEPTION_BREAKPOINT, false), ExceptionDisposition::HandledByDebugger )",
+  "(surface.exception_dispatch_count(), 4)",
+  "( surface.resolve_exception(DBG_CONTINUE), ExceptionDisposition::HandledByDebugger )"
+ ],
+ "debugger_flags_and_query_classes_mismatch_once_attached": [
+  "(surface.being_debugged(), 0)",
+  "(surface.nt_global_flag(), 0)",
+  "(surface.heap_flags(), HEAP_GROWABLE)",
+  "( surface.query_information_process(PROCESS_DEBUG_FLAGS), Ok(1) )",
+  "(surface.query_information_process(PROCESS_DEBUG_PORT), Ok(0))",
+  "( surface.query_information_process(PROCESS_DEBUG_OBJECT_HANDLE), Ok(0) )"
  ],
  "dec_flags_does_not_affect_carry": [
   "(state.get(Register::Rax), 0xFFFF_FFFF)"
@@ -1665,6 +1959,12 @@
  "default_depth_stencil_state": [
   "(ds.depth_func, ComparisonFunc::Less)"
  ],
+ "default_heap_resource_has_no_device_private_shadow_fallback_on_unified_memory": [
+  "( backend.resource_storage_mode(resource).expect(\"storage\"), MetalStorageMode::Shared )",
+  "(path, ResourceUpdatePath::HostVisibleInPlace)",
+  "(backend.translation_stats().staged_copies, 0)",
+  "(backend.translation_stats().zero_copy_updates, 1)"
+ ],
  "deferred_context_double_finish_clears_commands": [
   "(list.commands.len(), 1)"
  ],
@@ -1719,6 +2019,10 @@
   "( error.message, \"invalid depth bounds: [-0.25, 0.5] (must be in [0.0, 1.0] with min <= max)\" )",
   "(error.code, ReasonCode::RcInvalidState)",
   "( error.message, \"set_depth_bounds: emulated depth bounds testing requires patching \\ the fragment shader entry point and recompiling the pipeline, which \\ this API cannot do; the depth bounds are not applied\" )"
+ ],
+ "derived_user_sid_uid_boundary": [
+  "(a, b)",
+  "(a, c)"
  ],
  "destroy_descriptor_heap_recovers_from_panicked_cache_lock": [
   "( backend .translate_descriptor_heap(heap) .expect(\"translate before destroy\") .len(), 1 )",
@@ -1834,6 +2138,14 @@
   "(output[\"find_succeeded\"], json!(false), \"{}\", vector.id)",
   "(output[\"invalid_handle\"], json!(true), \"{}\", vector.id)"
  ],
+ "directory_object_enumeration_matches_loaded_and_removed_island_devices": [
+  "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path] ), STATUS_SUCCESS )",
+  "(status, STATUS_SUCCESS)",
+  "(status, STATUS_SUCCESS, \"a trailing separator is accepted\")",
+  "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtClose, &[u64::from(out)] ), STATUS_SUCCESS )",
+  "(empty, 0)",
+  "(status, 0xC000_0033_u32 as i32, \"empty object name\")"
+ ],
  "directstorage_and_readback_reject_missing_path_and_nonreadback_heap": [
   "(error.code, ReasonCode::RcFsNotFound)",
   "(error.message, \"C:\\\\absent.bin was not found\")",
@@ -1856,6 +2168,14 @@
   "(stats.retained_buffers, 0)",
   "(stats.retained_textures, 0)",
   "(stats.cancelled, 1)"
+ ],
+ "directstorage_async_guest_mmap_and_zlib_paths_are_zero_copy": [
+  "(upload.stats().guest_backed, true)",
+  "(&region.as_slice()[1..1 + pixels.len()], pixels.as_slice())",
+  "( &*upload.read_back_buffer(0).expect(\"guest readback\"), &pixels )",
+  "(stats.guest_uploads, 1)",
+  "(stats.mmap_sources, 0)",
+  "(stats.zlib_streams, 0)"
  ],
  "directstorage_async_rejects_format_without_dxgi_and_cancels_cleanly": [
   "(error.code, ReasonCode::RcD3dFeatureUnsupported)",
@@ -1947,6 +2267,14 @@
   "(error.code, ReasonCode::RcD3dInvalidState)",
   "(error.code, ReasonCode::RcD3dFeatureUnsupported)",
   "(runtime.directstorage_live_texture_count(), 0)"
+ ],
+ "directstorage_guest_upload_rejects_window_edges_refusals_and_short_sources": [
+  "(upload.stats().guest_backed, true)",
+  "(upload.stats().staging_fallbacks, 0)",
+  "(upload.stats().staging_bytes, 0)",
+  "(upload.stats().directstorage_bytes, 4)",
+  "(&region.as_slice()[..4], &pixels)",
+  "( &*upload.read_back_buffer(0).expect(\"zero-copy readback\"), &pixels )"
  ],
  "directstorage_listener_callback_duplicate_or_loss_is_exactly_once": [
   "( Instant::now() < deadline, true, \"IO worker never reached the gate\" )",
@@ -2058,6 +2386,22 @@
   "(stats.retained_textures, 0)",
   "(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0)"
  ],
+ "discovery_rejects_non_runtime_dirs_and_unparseable_names": [
+  "(runtimes, vec![valid_runtime(&good, \"8.0.31\")])",
+  "( runtimes_under_root(&temp.path().join(\"missing\")), Vec::new() )"
+ ],
+ "diskutil_malformed_plist_is_rejected": [
+  "(error, IdentityError::Malformed(\"diskutil plist\"))"
+ ],
+ "diskutil_missing_volume_uuid_reports_absent": [
+  "(error, IdentityError::FactAbsent(\"VolumeUUID\"))"
+ ],
+ "diskutil_parser_volume_serial_mismatch_guard": [
+  "(disk.volume_uuid, \"00D62C37-D88C-4508-B0E9-E51BD77CBE88\")",
+  "(disk.device_identifier, \"disk3s1s1\")",
+  "(disk.size_bytes, 994610155520)",
+  "( disk.volume_serial, volume_serial_from_uuid(\"00D62C37-D88C-4508-B0E9-E51BD77CBE88\") )"
+ ],
  "dll_entry_module_discovery_rejects_unreadable_and_wrong_modules": [
   "( call_slot( &mut fixture, type_info, 13, &[ type_info as u32, 1, 0, OUT as u32, (OUT + 4) as u32, (OUT + 8) as u32, ] ), S_OK, \"descriptor fallback for mismatched modules\" )",
   "( read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 4)).unwrap(), \"DllGetClassObject\" )",
@@ -2075,6 +2419,10 @@
  "dns_resolver_resolves_unbracketed_ipv6": [
   "(addrs[0].ip, \"::1\")",
   "(addrs[0].port, 8080)"
+ ],
+ "domain_name_splits_suffix_and_rejects_bare_host": [
+  "(domain_name(\"host.example.com\"), \"example.com\")",
+  "(domain_name(\"localhost\"), \"\")"
  ],
  "dont_care_pixel_format_is_rejected": [
   "( dispatch_x86( &mut fixture, HostThunk::WicFactoryCreateBitmap, &[factory as u32, 2, 2, FORMAT as u32, 0, BITMAP_OUT as u32] ), u64::from(WIC_E_UNSUPPORTEDPIXELFORMAT) )"
@@ -2170,6 +2518,22 @@
   "( pe_image_arch(&unknown), Err(\"driver island rejects machine 0x1234\".to_string()) )",
   "(pe_layout_hint(&short), None)"
  ],
+ "driver_island_loads_marker_driver_creates_device_and_unloads": [
+  "( call(&mut session, HostThunk::NtLoadDriver, &[service_path]), STATUS_SUCCESS as u64 )",
+  "(read_u32(&session, image_base + 0x3030), 0xCA5A_0001)",
+  "( call(&mut session, HostThunk::NtLoadDriver, &[service_path]), STATUS_IMAGE_ALREADY_LOADED as u32 as u64 )",
+  "( call( &mut session, HostThunk::NtCreateFile, &[ handle_out, 0x0012_0000, attributes, iosb, 0, 0, 0, 1, 0, 0, 0, ], ), STATUS_SUCCESS as u64 )",
+  "( call(&mut session, HostThunk::NtUnloadDriver, &[service_path]), STATUS_DEVICE_BUSY as u32 as u64 )",
+  "( call(&mut session, HostThunk::NtClose, &[handle as u64]), STATUS_SUCCESS as u64 )"
+ ],
+ "driver_provider_detection_rejects_unknown_or_wrong_names": [
+  "( detect_provider(r\"C:\\Windows\\System32\\drivers\\EasyAntiCheat.sys\"), AntiCheatProvider::EasyAntiCheat )",
+  "(detect_provider(\"vgk.sys\"), AntiCheatProvider::RiotVanguard)",
+  "(detect_provider(\"bedaisy.sys\"), AntiCheatProvider::BattlEye)",
+  "(detect_provider(\"xhunter1.sys\"), AntiCheatProvider::Xigncode)",
+  "(detect_provider(\"faceit.sys\"), AntiCheatProvider::Faceit)",
+  "( detect_provider(\"mhyprot2.sys\"), AntiCheatProvider::Hoyoverse )"
+ ],
  "driver_required_titles_fail_fast_with_stable_reason_code_and_actionable_hint": [
   "( error.reason_code, ReasonCode::RcAnticheatDriverDetected.as_u32() )"
  ],
@@ -2243,6 +2607,10 @@
   "( dispatch_x86_thunk( &mut runtime, &mut memory, get, &[ 0x10_000, 4, /* DWMWA_CAPTION_BUTTON_BOUNDS */ bounds as u32, 16 ] ), 0, \"DwmGetWindowAttribute(DWMWA_CAPTION_BUTTON_BOUNDS) returns S_OK\" )",
   "( memory.read_u32(bounds).expect(\"rect left\"), 0, \"the caption bounds rect is written\" )"
  ],
+ "dxgi_adapter_desc_luid_mismatch_guard": [
+  "(low, gpu.luid_low)",
+  "(high, gpu.luid_high)"
+ ],
  "dxgi_create_factory2_writes_a_managed_factory_object": [
   "(result, 0)",
   "(runtime.last_error, 0)",
@@ -2286,6 +2654,14 @@
  "e7_quic_protocol_flags_with_config": [
   "(protocol, casa1::network::HttpProtocol::Http3)",
   "(protocol2, casa1::network::HttpProtocol::Http11)"
+ ],
+ "empty_module_and_handle_lists_report_zero_counts_and_are_never_stale": [
+  "(modules.len(), 8)",
+  "(u32::from_le_bytes(modules[0..4].try_into().unwrap()), 0)",
+  "(handles.len(), 8)",
+  "(u32::from_le_bytes(handles[0..4].try_into().unwrap()), 0)",
+  "(extended.len(), 16)",
+  "(u64::from_le_bytes(extended[0..8].try_into().unwrap()), 0)"
  ],
  "empty_paths_fail_remaining_path_thunks_with_path_not_found": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, create_dir, &[empty_path as u32]), 0 )",
@@ -2400,6 +2776,13 @@
   "( dispatch_x86( &mut fixture, HostThunk::PdhEnumCounters, &[0, 0, OBJECT_NAME as u32, BUFFER as u32, SIZE_OUT as u32, 0] ), 0 )",
   "( dispatch_x86( &mut fixture, HostThunk::PdhEnumCounters, &[0, 0, OBJECT_NAME as u32, BUFFER as u32, SIZE_OUT as u32, 0] ), u64::from(PDH_CSTATUS_NO_OBJECT) )"
  ],
+ "enumerator_state_edges_are_exact": [
+  "(objects.enum_kind(7, 0x2000), Some(ClrEnumKind::Installed))",
+  "(objects.next_enum_item(7, 0x2000), Some(runtime.clone()))",
+  "( objects.next_enum_item(7, 0x2000), None, \"a drained enumerator yields no more items\" )",
+  "(objects.skip_enum_items(7, 0x2000, 4), Some(0))",
+  "(objects.reset_enum(7, 0x2000), Some(()))"
+ ],
  "environment_runtime_matches_reference_derived_truth": [
   "(output[\"found\"], json!(true), \"{}\", vector.id)",
   "( output[\"retrieved\"], json!(\"Alpha Beta Gamma\"), \"{}\", vector.id )",
@@ -2421,6 +2804,14 @@
   "(rax, 2)",
   "(rax, 87)"
  ],
+ "error_reason_codes_and_last_errors_are_exact": [
+  "(IdentityError::UnsupportedHost.last_error(), 50)",
+  "( IdentityError::BufferTooSmall { required: 1 }.last_error(), 122 )",
+  "( IdentityError::UnknownTable { provider: 0, table_id: 0 } .last_error(), 87 )",
+  "( IdentityError::FactAbsent(\"x\").reason(), ReasonCode::RcNotFound )",
+  "( IdentityError::Store(\"x\".to_string()).reason(), ReasonCode::RcInvalidState )",
+  "( IdentityError::Registry(\"x\".to_string()).reason(), ReasonCode::RcRegistryNotFound )"
+ ],
  "event_handle_rejected_without_event_callback_flag": [
   "( set_event_handle(pid, object, 0xABC), AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED )"
  ],
@@ -2435,6 +2826,14 @@
   "( rax, 0x102, \"WAIT_TIMEOUT \u2014 the auto-reset signal was consumed\" )",
   "(NtStatus::from_raw(rax as u32), STATUS_SUCCESS)",
   "( rax, 0, \"WAIT_OBJECT_0 \u2014 the Nt-set signal wakes the Win32 wait\" )"
+ ],
+ "every_class_rejects_a_buffer_one_byte_short_with_the_exact_required_length": [
+  "(full.status, STATUS_SUCCESS, \"class {class}\")",
+  "(full.required, full.bytes.len() as u64, \"class {class}\")",
+  "(short.status, STATUS_INFO_LENGTH_MISMATCH, \"class {class}\")",
+  "(short.required, full.required, \"class {class}\")",
+  "(exact.status, STATUS_SUCCESS, \"class {class}\")",
+  "(exact.bytes, full.bytes, \"class {class}\")"
  ],
  "evidence_com_guid_string_conversions_and_task_allocator": [
   "(memory.read_u8(out_ptr).unwrap(), 0x78)",
@@ -2871,6 +3270,30 @@
   "(wic_exif_tag_name(33432), Some(\"Copyright\"))",
   "(wic_exif_tag_name(36867), Some(\"DateTimeOriginal\"))"
  ],
+ "extended_handle_information_reports_pointer_counts_and_rejects_a_short_buffer": [
+  "(extended.len(), 16 + 40)",
+  "(u64::from_le_bytes(extended[0..8].try_into().unwrap()), 1)",
+  "( u64::from_le_bytes(extended[16..24].try_into().unwrap()), 0xFFFF_8000_0000_2000 )",
+  "( u64::from_le_bytes(extended[32..40].try_into().unwrap()), 0x1C )",
+  "( u32::from_le_bytes(extended[52..56].try_into().unwrap()), 9, \"HandleCount carries the object's real live handle count\" )",
+  "(short.status, STATUS_INFO_LENGTH_MISMATCH)"
+ ],
+ "extended_process_information_rejects_unbacked_fields_and_short_buffers_exactly": [
+  "( first_next as usize, align8( 0x100 + SYSTEM_EXTENDED_THREAD_INFORMATION_SIZE + \"game.exe\".encode_utf16().count() * 2 ), \"the next-entry offset accounts for the extended thread record and name\" )",
+  "(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1)",
+  "( u64::from_le_bytes(bytes[0x100 + 0x50..0x100 + 0x58].try_into().unwrap()), 0x1000_0000, \"StackBase\" )",
+  "( u64::from_le_bytes(bytes[0x100 + 0x58..0x100 + 0x60].try_into().unwrap()), 0x0FFF_0000, \"StackLimit\" )",
+  "( u64::from_le_bytes(bytes[0x100 + 0x60..0x100 + 0x68].try_into().unwrap()), 0x1000, \"Win32StartAddress\" )",
+  "( u64::from_le_bytes(bytes[0x100 + 0x68..0x100 + 0x70].try_into().unwrap()), 0x7FFD_0000, \"TebBase\" )"
+ ],
+ "extended_process_information_reports_real_stack_bounds_and_refuses_short_or_unbacked": [
+  "(status, u64::from(crate::ntdll::STATUS_SUCCESS.raw()))",
+  "( u32::from_le_bytes( memory .read_bytes(buffer + entry + 4, 4) .expect(\"thread count\") .try_into() .unwrap() ), 1, \"the real thread table has one thread\" )",
+  "( memory .read_u64(buffer + entry + 0x100 + 0x50) .expect(\"stack base\"), stack_base )",
+  "( memory .read_u64(buffer + entry + 0x100 + 0x58) .expect(\"stack limit\"), stack_limit )",
+  "( memory.read_u64(buffer + entry + 0x100 + 0x68).expect(\"teb\"), teb )",
+  "( memory .read_u32(buffer + entry + 0x100 + 0x30) .expect(\"thread id\"), runtime.win32.current_thread_id() )"
+ ],
  "extra_pixel_transfer_resize_fallbacks_pin_exact_channels": [
   "(device.nv12_texture_builds(secondary), 0)",
   "(transferred.len(), 32)",
@@ -2921,6 +3344,42 @@
  "find_named_ge_in_workspace_errors_on_ambiguous_legacy_matches": [
   "(error.code, ReasonCode::RcCliInvalid)"
  ],
+ "firmware_acpi_table_is_unsupported_not_fabricated": [
+  "(error, IdentityError::FactAbsent(\"ACPI firmware table\"))",
+  "(error.last_error(), 50)"
+ ],
+ "firmware_buffer_too_small_error_required_size": [
+  "(error.last_error(), 122)"
+ ],
+ "firmware_empty_buffer_boundary_matches_table": [
+  "(written, required)",
+  "(&buffer, &build_smbios_table(&identity))"
+ ],
+ "firmware_identity_surface_matches_the_smbios_source_and_rejects_short_buffers": [
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, get_table, &[RSMB, RSMB, 0, 0]), u64::from(table.len() as u32), \"Win32 and introspection report the same table length\" )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, query, &[76, buffer as u32, required + 16, length_ptr as u32] ), u64::from(crate::ntdll::STATUS_SUCCESS.raw()) )",
+  "(memory.read_u32(buffer).expect(\"provider\"), RSMB)",
+  "( memory.read_u32(buffer + 8).expect(\"table length\"), table.len() as u32 )",
+  "( memory.read_bytes(buffer + 12, table.len()).expect(\"table\"), table, \"the introspection table is the SAME SMBIOS bytes\" )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, query, &[76, buffer as u32, required - 1, length_ptr as u32] ), u64::from(crate::ntdll::STATUS_INFO_LENGTH_MISMATCH.raw()) )"
+ ],
+ "firmware_size_query_boundary_reports_required": [
+  "(error.last_error(), 122)"
+ ],
+ "firmware_smbios_table_serial_uuid_mismatch_guard": [
+  "(table[0], 0)"
+ ],
+ "firmware_table_information_echoes_the_query_and_rejects_a_short_buffer": [
+  "( u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0x4143_5049 )",
+  "(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 7)",
+  "(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 4)",
+  "(&bytes[12..16], &[1, 2, 3, 4])",
+  "(short.status, STATUS_INFO_LENGTH_MISMATCH)",
+  "(short.required, 12 + 2)"
+ ],
+ "firmware_unknown_provider_is_rejected": [
+  "( error, IdentityError::UnknownTable { provider: 0xDEAD_BEEF, table_id: 0x1234 } )"
+ ],
  "first_failure_records_only_first_per_category": [
   "(first.guest_pc, 0x4010)",
   "(first.thread_id, 1)",
@@ -2933,6 +3392,22 @@
   "(first.guest_pc, 0x1111, \"first failure's guest_pc kept\")",
   "(first.detail, \"first cef failure\")",
   "(first.api.as_deref(), Some(\"CefInitialize\"))"
+ ],
+ "flat_window_four_gib_and_end_boundary_select_direct_or_owned_frames": [
+  "(store.materialised_page_count(), 5)",
+  "(store.materialisation_count(), 5)",
+  "( store.high_page_count(), 1, \"only the page beyond the window may use an owned frame\" )",
+  "( store.resident_flat_page_count(), 4, \"only the four in-window pages may be resident\" )",
+  "(store.is_page_materialised(below_four_gib), true)",
+  "(store.is_page_materialised(at_four_gib), true)"
+ ],
+ "flat_window_reservation_is_aligned_sparse_and_rejects_overflow": [
+  "( store.flat_size() >= GUEST_FLAT_MIN_SIZE, true, \"the direct window must be at least 128 GiB (256 GiB preferred)\" )",
+  "(store.flat_size().is_power_of_two(), true)",
+  "( store.flat_size() % GUEST_FLAT_MIN_SIZE, 0, \"window sizes must be power-of-two multiples of the minimum\" )",
+  "(store.is_valid(), true)",
+  "( store.flat_base() % GUEST_FLAT_ALIGN as u64, 0, \"the flat base must be aligned for direct guest addressing\" )",
+  "(store.flat_base() % 4096, 0)"
  ],
  "flush_file_buffers_requires_write_access": [
   "( result.expect_err(\"read-only flush must fail\").code, ReasonCode::RcHelperPermissionDenied, \"FlushFileBuffers on a read-only handle must be ERROR_ACCESS_DENIED\" )"
@@ -3195,6 +3670,13 @@
   "( u16::from_le_bytes(rtl[0x114..0x116].try_into().unwrap()), u16::from_le_bytes(win32[0x114..0x116].try_into().unwrap()), \"wServicePackMajor agrees\" )",
   "(rtl[0x11A], win32[0x11A], \"wProductType agrees\")"
  ],
+ "gfx_shared_dynamic_buffer_update_fallback_counts_are_exact": [
+  "(storage, MetalStorageMode::Shared)",
+  "(path, ResourceUpdatePath::HostVisibleInPlace)",
+  "(stats.zero_copy_updates, 2)",
+  "(stats.staged_copies, 0)",
+  "( backend.resource_bytes(buffer).expect(\"bytes\")[..16], [0x22u8; 16] )"
+ ],
  "gif_and_tiff_metadata_reader_and_malformed_metadata_rejected": [
   "( metadata_query(&mut fixture, reader, \"FrameCount\"), (0, Some(\"2\".to_string())) )",
   "( metadata_query(&mut fixture, reader, \"FrameDelay1\"), (0, Some(\"100\".to_string())) )",
@@ -3359,6 +3841,29 @@
   "(peer.host(&DplayAppDesc::new(name, 8), localhost()), S_OK)",
   "(peer.close(), S_OK)"
  ],
+ "guest_backed_buffer_concurrent_guest_and_gpu_writes_stay_coherent": [
+  "(placement, GuestPlacement::ZeroCopy)",
+  "( backend.read_buffer_region(id, 0, 64).expect(\"guest read\"), pattern )",
+  "(gpu_read, pattern)",
+  "(&region.as_slice()[..64], &[0xA5u8; 64])",
+  "( backend.read_buffer_region(id, start, 64).expect(\"line\"), vec![line as u8; 64] )"
+ ],
+ "guest_backed_buffer_destroy_releases_ownership_without_leak": [
+  "(placement, GuestPlacement::ZeroCopy)",
+  "(backend.live_guest_backed_buffers(), 1)",
+  "( backend .write_buffer_region(id, usize::MAX, &[0u8]) .expect_err(\"write offset overflow\") .message, \"buffer write range overflow\" )",
+  "( backend .write_buffer_region(id, page - 1, &[0u8; 2]) .expect_err(\"write past the guest backing\") .message, format!( \"buffer write out of bounds: {} exceeds guest-backed length {page}\", page + 1 ) )",
+  "( backend .read_buffer_region(id, usize::MAX, 1) .expect_err(\"read offset overflow\") .message, \"buffer read range overflow\" )",
+  "( backend .read_buffer_region(id, page, 1) .expect_err(\"read past the guest backing\") .message, \"buffer read out of bounds\" )"
+ ],
+ "guest_backed_buffer_rejects_alignment_and_ownership_with_exact_fallbacks": [
+  "(region.base().is_null(), false)",
+  "(region.is_empty(), false)",
+  "(region.window().is_empty(), false)",
+  "(backend.guest_window().is_some(), true)",
+  "(format!(\"{region:?}\").contains(\"GuestSharedRegion\"), true)",
+  "(GuestSharedRegion::new(0).is_none(), true)"
+ ],
  "guest_build_address_from_direct_play4_address": [
   "( dispatch_x86( &mut fixture, HostThunk::DirectPlayCreate, &[0, out as u32, 0] ), u64::from(S_OK) )",
   "( guest_call(&mut fixture, legacy, IFACE_LEGACY, 23, &[0]), u64::from(S_OK) )",
@@ -3396,6 +3901,14 @@
   "( guest_call( &mut fixture, 0x2000, IFACE_PEER, 19, &[group, members as u32, count as u32] ), u64::from(S_OK) )",
   "(guest_read_u32(&mut fixture.memory, count), 1)"
  ],
+ "guest_initial_upload_rejects_window_edges_and_keeps_zero_staging": [
+  "(upload.stats().guest_backed, true)",
+  "(upload.stats().staging_bytes, 0)",
+  "(upload.stats().staging_fallbacks, 0)",
+  "(&*upload.read_back_buffer(0).expect(\"readback\"), &pixels)",
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "( error.message, \"initial data: guest initial data refused: guest region outside the canonical window\" )"
+ ],
  "guest_ioctl_read_and_write_dispatch_real_irps": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS )",
   "(devices, 1, \"DriverEntry created the device: {names:?}\")",
@@ -3415,6 +3928,14 @@
   "(buf, [0x01, 0x02])",
   "(fault.address, 0x3004, \"precise first-unmapped byte\")",
   "(fault.address, 0x9_0000)"
+ ],
+ "guest_slice_memory_above_four_gib_is_direct_and_window_end_faults_exactly": [
+  "(view.flat_size(), window_size)",
+  "(view.flat_size() / 4096, window_size / 4096)",
+  "( view.flat_base() % GUEST_FLAT_ALIGN as u64, 0, \"the JIT base must be aligned for direct guest addressing\" )",
+  "(view.load(address, 8).expect(\"direct load\"), 0)",
+  "( view.store(address, &0x1122_3344_5566_7788_u64.to_le_bytes()) .expect(\"direct store\"), true, \"a store to a >4 GiB code page must report the SMC write\" )",
+  "( view.load(address, 8).expect(\"direct reload\"), 0x1122_3344_5566_7788 )"
  ],
  "guest_slice_memory_boundary_overflow_and_empty_range_faults_are_exact": [
   "(view.range_available(0x1000, 0), false)",
@@ -3452,10 +3973,26 @@
   "( read_u32(&basic, 0), OBJ_INHERIT, \"NtQueryObject reports the Win32-set inheritable flag\" )",
   "(session.call(close_handle, &[duplicated as u64]), 1)"
  ],
+ "handle_information_rejects_a_short_buffer_and_entry_layout_is_exact": [
+  "(basic.len(), 8 + 24 * 2)",
+  "(u32::from_le_bytes(basic[0..4].try_into().unwrap()), 2)",
+  "(u16::from_le_bytes(basic[8..10].try_into().unwrap()), 0x1234)",
+  "(basic[12], 2, \"ObjectTypeIndex\")",
+  "(u16::from_le_bytes(basic[14..16].try_into().unwrap()), 0x1C)",
+  "( u32::from_le_bytes(basic[24..28].try_into().unwrap()), 0x001F_0003 )"
+ ],
  "handle_table_generations_are_recycled_safely": [
   "(generation, 0, \"generations start at zero\")",
   "( recycled, event, \"closed handle values are recycled FIFO like Windows\" )",
   "( win32.handle_generation(recycled), Some(1), \"reuse gets a fresh generation\" )"
+ ],
+ "hardware_breakpoints_reject_invalid_slot_condition_and_length": [
+  "( surface.set_hardware_breakpoint(7, 4, 0x1000, 1, 4), Err(STATUS_INVALID_PARAMETER) )",
+  "( surface.set_hardware_breakpoint(7, 0, 0x1000, 9, 4), Err(STATUS_INVALID_PARAMETER) )",
+  "( surface.set_hardware_breakpoint(7, 0, 0x1000, 1, 3), Err(STATUS_INVALID_PARAMETER) )",
+  "( surface.clear_hardware_breakpoint(7, 9), Err(STATUS_INVALID_PARAMETER) )",
+  "( surface.set_hardware_breakpoint(7, slot, 0x1000 + slot as u64, condition, length), Ok(()) )",
+  "(context.breakpoint_address(0), Some(0x1000))"
  ],
  "harness_deadline_is_documented_stage_missing_when_mandatory_pending": [
   "(result.missing, vec![Stage::S10, Stage::S11, Stage::S13])"
@@ -3521,6 +4058,10 @@
  "host_busy_port_reports_addressing": [
   "( peer.host(&DplayAppDesc::new(\"Busy\", 4), addr), DPNERR_ADDRESSING, \"a busy port is a real addressing failure\" )"
  ],
+ "host_module_integrity_rejects_mismatch_and_missing_files": [
+  "(size, 0)",
+  "(hash, [0u8; 32])"
+ ],
  "host_send_paths_pin_network_failures_and_async_completion": [
   "( host.host(&DplayAppDesc::new(\"Send Paths\", 8), localhost()), S_OK )",
   "(host.send_to(DPNID_ALL_PLAYERS_GROUP, b\"broadcast\"), S_OK)",
@@ -3562,6 +4103,11 @@
   "(report.exit_code, 0)",
   "(crash_codes.len(), 24)"
  ],
+ "iat_patch_table_concurrent_patch_and_unpatch_has_no_race": [
+  "(table.lock().expect(\"lock\").len(), 8)",
+  "(table.lock().expect(\"lock\").metrics().patched, 8)",
+  "(table.lock().expect(\"lock\").len(), 0)"
+ ],
  "idispatch_assigns_dispids_and_invokes_the_same_state_as_the_vtable": [
   "( call_slot( &mut fixture, server, 5, &[server as u32, 0, NAMES as u32, 3, 0, IDS as u32] ), DISP_E_UNKNOWNNAME, \"GetIDsOfNames reports the unknown name\" )",
   "(fixture.memory.read_u32(IDS).unwrap(), 1, \"Value\")",
@@ -3598,6 +4144,13 @@
  "inc_flags_does_not_affect_carry": [
   "(state.get(Register::Rax), 0)"
  ],
+ "indirect_inline_cache_polymorphic_boundary_and_megamorphic_counts_are_exact": [
+  "(cache.lookup(site, 0xA), None)",
+  "(cache.lookup(site, 0xA), Some(0xAA))",
+  "(cache.lookup(site, 0xB), None)",
+  "(cache.lookup(site, 0xB), Some(0xBB))",
+  "( ( cache.hits(), cache.misses(), cache.megamorphic_sites(), cache.megamorphic_hits(), cache.is_megamorphic(site), ), (3, 2, 0, 0, false), \"a 2-way code path must stay polymorphic (monomorphic first)\" )"
+ ],
  "initial_data_failure_rolls_back_resource_and_counts_staging": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
   "(runtime.staging_bytes(), 0)",
@@ -3623,6 +4176,18 @@
  "inline_cache_invalidate_all": [
   "(cache.entries.len(), 2)"
  ],
+ "inlined_api_semantics_match_dispatch_no_mismatch": [
+  "( call_inline( &mut runtime, &mut state, &mut memory, crate::jit::InlineApi::SetLastError ), 0 )",
+  "(runtime.last_error, 0x2222)",
+  "(state.get(Register::Rax), 0x2222)",
+  "( state.get(Register::Rax), u64::from(runtime.win32.current_thread_id()) )",
+  "( state.get(Register::Rax), u64::from(runtime.win32.current_process_id()) )",
+  "(state.get(Register::Rax), 1)"
+ ],
+ "inlined_api_x86_stack_args_preserve_rsp_no_mismatch": [
+  "(runtime.last_error, 0x1234)",
+  "(state.get(Register::Rsp), sp_before)"
+ ],
  "input_primitive_vertex_counts_reject_zero_and_pin_adjacency_exactly": [
   "(InputPrimitive::Point.vertex_count(), 1)",
   "(InputPrimitive::Line.vertex_count(), 2)",
@@ -3630,6 +4195,19 @@
   "(InputPrimitive::LineAdjacency.vertex_count(), 4)",
   "(InputPrimitive::TriangleAdjacency.vertex_count(), 6)",
   "( primitive.vertex_count(), 0, \"no input primitive may report zero vertices\" )"
+ ],
+ "install_identity_store_persists_and_rejects_malformed_state": [
+  "(store.root(), dir.as_path())",
+  "(first.public_key_spki(), second.public_key_spki())",
+  "(store.load_provider(\"acme\").expect(\"load missing\"), None)",
+  "(installed.provider_id, \"acme\")",
+  "(loaded.public_key_spki, installed.public_key_spki)",
+  "( store.install_provider(\"acme\", None, 6), Err(AttestationError::RevokedProvider) )"
+ ],
+ "installed_runtimes_match_real_directories_without_duplicate_versions": [
+  "( runtime .directory .file_name() .map(|name| name.to_string_lossy().into_owned()), Some(runtime.version_string()), \"the version must be the real directory name\" )",
+  "(versions, sorted, \"runtime enumeration is highest-first\")",
+  "( versions.len(), runtimes.len(), \"duplicate Homebrew kegs collapse to one runtime per directory\" )"
  ],
  "interior_commit_of_a_reservation": [
   "(reservation, 0x7400_0000)",
@@ -3664,6 +4242,11 @@
   "(stats.pages_materialised, 0)",
   "(stats.bytes_copied, 0)"
  ],
+ "invalid_information_class_is_status_invalid_info_class_not_a_fabricated_value": [
+  "(result.status, STATUS_INVALID_INFO_CLASS)",
+  "(result.required, 0)",
+  "( serialize_system_information(class, &snapshot, u64::MAX, 0x1000).status, STATUS_INVALID_INFO_CLASS, \"class {class} must be backed\" )"
+ ],
  "invalid_luid_and_adapter_handles_are_rejected_with_graphics_status": [
   "(empty.d3dkmt_enum_adapters(), Vec::new())",
   "(missing.status(), STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER)",
@@ -3675,6 +4258,12 @@
  "invalid_param_constructor_sets_correct_code": [
   "(err.code, ReasonCode::RcInvalidParameter)",
   "(err.message, \"hFile: expected non-zero handle\")"
+ ],
+ "invalid_small_flat_view_bitmap_is_grown_on_attach": [
+  "(flat.materialised.len(), 1)",
+  "(flat.is_page_materialised(0), false)",
+  "(flat.materialised.len(), required_words)",
+  "( required_words >= GUEST_FLAT_MIN_SIZE.div_ceil(4096 * 64), true, \"the attached bitmap must cover at least the 128 GiB minimum\" )"
  ],
  "invalidate_window_queues_paint_once": [
   "( kinds .iter() .filter(|kind| **kind == MessageKind::Paint) .count(), 1 )"
@@ -3817,7 +4406,7 @@
   "( runtime .block_cache .get(&0x6000) .expect(\"source cached\") .link_target .load(Ordering::Acquire), 0, \"a rejected chain must not publish a target\" )"
  ],
  "jit_block_and_interpreter_store_never_observe_a_stale_canonical_page": [
-  "( runtime.flat_memory.base(), memory.canonical_store().flat_base(), \"both views must share the same 4 GiB mapping\" )",
+  "( runtime.flat_memory.base(), memory.canonical_store().flat_base(), \"both views must share the same direct-window mapping\" )",
   "(memory.canonical_store().materialisation_count(), 1)",
   "(memory.read_u64(address).unwrap(), 0x1111_2222_3333_4444)",
   "(flat_value, 0x5555_6666_7777_8888)",
@@ -3901,12 +4490,12 @@
   "(JitExecMechanism::Unavailable.to_string(), \"unavailable\")"
  ],
  "jit_exec_probe_matrix_macos_aarch64": [
-  "( matrix.mprotect_rx, JitExecProbeOutcome::Executed(42), \"mmap RW -> mprotect RX must execute the ARM64 stub: {}\", matrix.mprotect_rx )",
   "( matrix.map_jit_wx_write_protect, JitExecProbeOutcome::Executed(42), \"MAP_JIT RWX + pthread_jit_write_protect_np must execute the ARM64 stub: {}\", matrix.map_jit_wx_write_protect )",
   "( matrix.selected, JitExecMechanism::MapJitWx, \"the JIT must prefer the W^X MAP_JIT mechanism when it executes\" )",
   "( matrix.map_jit_wx_write_protect, JitExecProbeOutcome::Executed(42), \"selected MAP_JIT but its probe did not execute\" )",
   "( matrix.mprotect_rx, JitExecProbeOutcome::Executed(42), \"selected mprotect RX but its probe did not execute\" )",
-  "(value, 42, \"{name} executed a stub that must return 42\")"
+  "(value, 42, \"{name} executed a stub that must return 42\")",
+  "( matrix.selected, JitExecMechanism::Unavailable, \"an unavailable capability must report unavailable\" )"
  ],
  "jit_exec_probe_outcome_display_reports_exact_failures": [
   "( JitExecProbeOutcome::Executed(42).to_string(), \"executed, returned 42\" )",
@@ -3965,6 +4554,10 @@
   "( state.jit_pending_fault, Some(0x4001), \"fault address must be the first guarded byte\" )",
   "( memory.read_u8(0x4000).unwrap(), 0x11, \"no partial write before the faulting byte\" )"
  ],
+ "jit_inlined_api_call_site_matches_dispatch_no_mismatch": [
+  "(after, before + 1)",
+  "( state.get(Register::Rax), u64::from(runtime.win32.current_thread_id()) )"
+ ],
  "jit_install_code_rejects_foreign_writable_page": [
   "(error.code, ReasonCode::RcJitCodeAllocFailed)",
   "(error.message, \"JIT: executable code page is not writable\")"
@@ -3983,9 +4576,22 @@
   "( code.windows(4) .filter(|word| *word == movz_exit_jump) .count(), 1, \"an unlinked jump must return EXIT_JUMP exactly once\" )",
   "( &code[code.len() - 4..], &0xd65f_03c0u32.to_le_bytes(), \"the unlinked jump arm must end in RET\" )"
  ],
+ "jit_loop_with_heap_above_four_gib_executes_without_fault_or_overflow": [
+  "(block.worker_safe, true)",
+  "(branches, vec![true, true, false])",
+  "(state.get(Register::Rcx), 0)",
+  "( memory.read_u64(heap).unwrap(), 3, \"each dispatched loop iteration must increment the >4 GiB heap word\" )",
+  "(memory.canonical_store().materialisation_count(), 1)"
+ ],
  "jit_lowering_telemetry_counts_native_and_helper_fallback_per_opcode": [
   "(block.instruction_count, 16)",
   "assert!( JIT_NATIVE_LOWERED[native_op].load(Ordering::Relaxed)"
+ ],
+ "jit_memory_helpers_above_four_gib_and_high_frame_fallback_are_exact": [
+  "(reason, JitExitReason::Normal { new_rip: state.rip })",
+  "(state.get(Register::Rax), 0x0102_0304_0506_0708)",
+  "( state.get(Register::Rax), 0x2122_2324_2526_2728, \"a 64 GiB address must be served directly by the window\" )",
+  "( state.get(Register::Rax), 0x1112_1314_1516_1718, \"addresses beyond the window must keep using MemoryImage frames\" )"
  ],
  "jit_memory_manager_mprotect_rejects_foreign_mappings": [
   "(manager.mechanism(), JitExecMechanism::MprotectRx)",
@@ -4168,6 +4774,67 @@
   "(program.flat_base, program.memory.flat_base())",
   "(program.flat_base == 0, false)"
  ],
+ "jit_ssa_dce_removes_only_overwritten_exact_count": [
+  "(result.metrics.dce_eliminated, 2)"
+ ],
+ "jit_ssa_gvn_keeps_duplicate_after_register_overwrite_no_stale_mismatch": [
+  "(result.metrics.gvn_eliminated, 0)"
+ ],
+ "jit_ssa_gvn_rewrites_cross_register_duplicate_to_exact_copy": [
+  "(result.metrics.gvn_eliminated, 1)"
+ ],
+ "jit_ssa_incoming_spill_registers_are_not_clobbered_no_mismatch": [
+  "(state.get(Register::R13), 111)",
+  "(state.get(Register::R14), 222)",
+  "(state.get(Register::R15), 333)",
+  "(state.get(Register::Rax), 111)",
+  "(state.get(Register::Rbx), 222)",
+  "(state.get(Register::Rcx), 333)"
+ ],
+ "jit_ssa_licm_hoisted_value_survives_back_edge_no_mismatch": [
+  "(optimized.metrics.licm_hoisted, 1)",
+  "(state.get(Register::Rax), 7)",
+  "(state.get(Register::Rdx), 7)"
+ ],
+ "jit_ssa_licm_hoists_exact_invariant_boundary_count": [
+  "(result.metrics.licm_hoisted, 1)"
+ ],
+ "jit_ssa_load_store_forwarding_keeps_destination_no_mismatch": [
+  "(result.metrics.store_eliminated, 1)",
+  "(result.metrics.load_forwarded, 1)"
+ ],
+ "jit_ssa_rejects_cpuid_with_exact_reason": [
+  "(error.reason, \"unsupported opcode: Cpuid\")"
+ ],
+ "jit_ssa_rejects_rip_relative_memory_with_exact_reason": [
+  "(error.reason, \"rip-relative memory\")"
+ ],
+ "jit_ssa_sccp_overflow_constant_chain_exact_count": [
+  "(result.metrics.sccp_eliminated, 4)"
+ ],
+ "jit_ssa_spilled_registers_round_trip_no_mismatch": [
+  "(tier0_state.get(Register::R13), 12)",
+  "(tier0_state.get(Register::R14), 112)",
+  "(tier0_state.get(Register::R15), 1112)",
+  "(tier2_state.get(Register::R13), 12)",
+  "(tier2_state.get(Register::R14), 112)",
+  "(tier2_state.get(Register::R15), 1112)"
+ ],
+ "jit_ssa_tier2_vs_tier0_arithmetic_branch_loop_no_mismatch": [
+  "(reason, crate::jit::JitExitReason::Jump { target: 0x9999 })",
+  "(tier0_state.get(Register::Rax), 15)",
+  "( tier2_state.get(Register::Rax), tier0_state.get(Register::Rax) )",
+  "( tier2_memory.read_u64(0x3000).unwrap(), tier0_memory.read_u64(0x3000).unwrap() )",
+  "(tier2_state.get(Register::Rcx), 0)"
+ ],
+ "jit_ssa_tier2_vs_tier0_load_store_alu_flags_no_mismatch": [
+  "(reason, crate::jit::JitExitReason::Jump { target: 0x9999 })",
+  "(tier2_state.get(Register::Rbx), 8)",
+  "(tier2_state.get(Register::Rcx), 0)",
+  "(tier2_memory.read_u64(0x3010).unwrap(), 0)",
+  "(tier2_memory.read_u64(0x3008).unwrap(), 8)",
+  "( tier2_memory.read_u64(0x3000).unwrap(), tier0_memory.read_u64(0x3000).unwrap() )"
+ ],
  "jit_thunk_registration_rejects_unknown_indices_and_pins_guest_addrs": [
   "( runtime.register_host_thunk_for_guest( jit_self_test_host_thunk as *const () as usize, guest ), Some(0) )",
   "( runtime.guest_thunk_addrs(), HashSet::from([guest]), \"guest_addrs must include registered guest targets\" )",
@@ -4192,6 +4859,60 @@
  "jit_unavailable_capability_returns_null_allocation": [
   "(manager.mechanism(), JitExecMechanism::Unavailable)"
  ],
+ "jit_worker_aot_cache_round_trip_across_process_boundaries_loads_exact_code": [
+  "(run_aot_probe(&mut runtime, &memory), (1, 42))",
+  "(status.success(), true)",
+  "(runtime.aot_metrics(), (1, 0, 0))"
+ ],
+ "jit_worker_aot_corrupt_and_wrong_version_cache_are_rejected_with_counters": [
+  "(path.is_file(), true)",
+  "(corrupt.aot_metrics(), (0, 0, 1))",
+  "(wrong.aot_metrics(), (0, 0, 1))"
+ ],
+ "jit_worker_aot_relocations_rebind_link_slots_exactly": [
+  "(on_disk != 0, true)",
+  "(reader.aot_metrics(), (2, 0, 0))",
+  "(relocated, Arc::as_ptr(&loaded.link_target) as u64)",
+  "(relocated != on_disk, true)",
+  "(a, b, \"non-relocated byte {index:#x} changed\")",
+  "( original_rd, relocated_rd, \"relocation must preserve its destination register\" )"
+ ],
+ "jit_worker_concurrent_in_flight_linked_blocks_are_exact": [
+  "(results, vec![(50, 50), (50, 50), (50, 50), (50, 50)])"
+ ],
+ "jit_worker_conditional_flags_equivalence_all_conditions_is_exact": [
+  "( actual, crate::cpu::evaluate_condition(*condition, &state.flags), \"condition {condition:?} with flags {bits:#07b}\" )",
+  "(checks, 16 * 32)"
+ ],
+ "jit_worker_host_call_barrier_pushes_return_exactly_once": [
+  "(report.stop, SliceStop::HostBarrier { rip: 0x9000 })",
+  "(report.blocks_executed, 1)",
+  "(state.get(Register::Rsp), 0x77f8)",
+  "(memory.read_u64(0x77f8).expect(\"mapped stack\"), 0x4010)",
+  "( thread.return_predictor.hits() + thread.return_predictor.misses(), 0 )"
+ ],
+ "jit_worker_lazy_flags_materialize_before_native_jcc_exactly": [
+  "(state.pending_flags.is_some(), true)",
+  "(state.pending_flags.is_none(), true)",
+  "( outcome.reason, JitExitReason::ConditionalTaken { rip: address }, \"lazy flags must be materialised before the native branch\" )",
+  "( cases[index].1, crate::cpu::evaluate_condition(*condition, &state.flags) )",
+  "( crate::cpu::lazy_flag_telemetry().materialised, materialised_before + 3 )"
+ ],
+ "jit_worker_linked_loop_and_call_return_match_unlinked_exactly": [
+  "( (linked_report.blocks_executed, linked_rcx), (8, 100 - 8), \"linked loop must execute exactly the slice budget\" )",
+  "( (unlinked_report.blocks_executed, unlinked_rcx), (8, 100 - 8), \"unlinked execution must reach the identical guest state\" )",
+  "(linked_report.metrics.native_chains, 7)",
+  "(unlinked_report.metrics.native_chains, 0)",
+  "(linked_report.metrics.instructions_executed, 24)",
+  "(unlinked_report.metrics.instructions_executed, 24)"
+ ],
+ "jit_worker_safepoint_stop_is_observed_within_the_link_budget": [
+  "(report.stop, SliceStop::Safepoint)",
+  "(report.blocks_executed, 0)",
+  "(state.rip, 0x1100)",
+  "(state.get(Register::Rcx), 10)",
+  "(flag.load(Ordering::Acquire), true)"
+ ],
  "jit_worker_slice_load_success_and_fault_are_exact": [
   "(value, 0)",
   "(state.jit_pending_fault, None)",
@@ -4212,6 +4933,14 @@
   "(view.take_code_writes(), vec![(0x1000, 1)])",
   "(state.jit_pending_fault, Some(0x9000))",
   "(state.jit_pending_fault_write, true)"
+ ],
+ "jit_worker_smc_write_invalidates_native_links_exactly": [
+  "(link.load(Ordering::Acquire) != 0, true)",
+  "(report.stop, SliceStop::CodeWrite)",
+  "(report.blocks_executed, 1)",
+  "(report.code_writes, vec![(0x3000, 1)])",
+  "(state.rip, 0x3000)",
+  "(JIT_CODE_EPOCH.load(Ordering::Acquire) > epoch_before, true)"
  ],
  "join_of_active_pumped_thread_returns_timeout_without_hang": [
   "(runtime.pending_guest_threads.len(), 1)",
@@ -4423,6 +5152,14 @@
   "( image.dpi_y, WIC_DEFAULT_DPI, \"a non-JFIF APP0 must not claim the JFIF density\" )",
   "( image.dpi_x, WIC_DEFAULT_DPI, \"a truncated APP0 must not claim a density\" )",
   "( image.dpi_y, WIC_DEFAULT_DPI, \"a truncated APP0 must not claim a density\" )"
+ ],
+ "kernel_debugger_information_is_truthful_for_attached_and_detached_states": [
+  "( serialize_kernel_debugger_information(false, true), vec![0, 1] )",
+  "( serialize_kernel_debugger_information(true, false), vec![1, 0] )",
+  "(result.status, STATUS_SUCCESS)",
+  "(result.bytes, vec![0, 1], \"the live state has no debugger\")",
+  "(short.status, STATUS_INFO_LENGTH_MISMATCH)",
+  "(short.required, 2)"
  ],
  "keyed_mutex_timeout_release_errors_and_exactly_once_wake_are_exact": [
   "( subsystem .d3dkmt_open_keyed_mutex(device, private, 0x55) .unwrap_err() .status(), STATUS_ACCESS_DENIED )",
@@ -4817,6 +5554,14 @@
   "(list.free(second), Err(STATUS_INVALID_ADDRESS))",
   "(reused.ptr, first.ptr)"
  ],
+ "lookaside_information_is_a_zeroed_row_without_a_list_and_short_buffers_are_rejected": [
+  "(bytes.len(), 40)",
+  "(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1)",
+  "(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 9)",
+  "(&bytes[28..32], b\"Kasa\")",
+  "(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 48)",
+  "(serialize_lookaside_information(None), vec![0_u8; 40])"
+ ],
  "lookaside_reuses_freed_block_by_pointer": [
   "((list.misses(), list.hits()), (1, 0))",
   "(list.in_use(), 1)",
@@ -4833,19 +5578,17 @@
   "(capture_next_packet_size(pid, service), Ok(80))",
   "(packet.frames, 80)"
  ],
- "loopback_capture_reads_real_render_client_frames": [
-  "(hr, 0, \"render Initialize\")",
-  "( audio_client_call( &mut runtime, &mut memory, HostThunk::AudioClientStart, &[render as u32], ), 0 )",
-  "( audio_client_call( &mut runtime, &mut memory, HostThunk::AudioClientGetService, &[ render as u32, AUDIO_CLIENT_RIID_ADDR as u32, AUDIO_CLIENT_OUT_ADDR as u32, ], ), 0 )",
-  "( audio_client_call( &mut runtime, &mut memory, HostThunk::AudioRenderClientGetBuffer, &[ render_service as u32, buffer_frames, AUDIO_CLIENT_OUT_ADDR as u32, ], ), 0 )",
-  "( audio_client_call( &mut runtime, &mut memory, HostThunk::AudioRenderClientReleaseBuffer, &[render_service as u32, buffer_frames, 0], ), 0, \"the render client releases real frames\" )",
-  "(hr, 0, \"loopback Initialize\")"
- ],
  "loopback_is_rejected_for_exclusive_mode": [
   "( plan_initialize( pid, object, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_LOOPBACK, 100_000, 0, &mix, ), Err(AUDCLNT_E_INVALID_STREAM_FLAG), \"loopback is a shared-mode capture path\" )"
  ],
  "loopback_is_rejected_on_a_capture_endpoint": [
   "( plan_initialize( pid, object, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 100_000, 0, &format, ), Err(AUDCLNT_E_WRONG_ENDPOINT_TYPE), \"loopback on a true capture endpoint is the wrong endpoint type\" )"
+ ],
+ "machine_guid_reuse_across_reopen_rejects_new_install_mismatch": [
+  "(first.machine_guid, second.machine_guid)",
+  "(first.install_id, second.install_id)",
+  "(first.product_id, second.product_id)",
+  "(first.machine_guid, fresh.machine_guid)"
  ],
  "malformed_cdn_routing_empty": [
   "(result.unwrap().len(), 0)"
@@ -4855,6 +5598,23 @@
   "( create_decoder_from_stream(&mut fixture, factory, stream).0, u64::from(WINCODEC_ERR_BADIMAGE), \"progressive JPEG without tables or scans\" )",
   "(hr, 0)",
   "( dispatch_x86( &mut fixture, HostThunk::WicDecoderGetFrame, &[bitmap as u32, 0, FRAME_OUT as u32] ), u64::from(WINCODEC_ERR_NOTINITIALIZED), \"GetFrame on a plain bitmap\" )"
+ ],
+ "malformed_install_state_is_reported_as_no_state": [
+  "(parse_install_state(\"{ not json\"), None)",
+  "(parse_install_state(\"[1,2,3]\"), None)",
+  "(parse_install_state(\"{\\\"k\\\": 5}\"), None)"
+ ],
+ "malformed_or_absent_runtime_requests_never_match_installed_dirs": [
+  "( select_runtime( &ClrVersion::parse_request(\"v999.0.0\").expect(\"valid\"), &installed ), None )",
+  "( select_runtime( &ClrVersion::parse_request(\"8.0.32\").expect(\"valid\"), &installed ), None )",
+  "( select_runtime( &ClrVersion::parse_request(\"8.0.31.1\").expect(\"valid\"), &installed ), None, \"a request with more components than the installed runtime never matches\" )",
+  "(exact.version_string(), \"8.0.31\")",
+  "(floating.version_string(), \"8.0.31\")"
+ ],
+ "malformed_version_strings_are_rejected_without_guessing": [
+  "( ClrVersion::parse_request(malformed), None, \"malformed version {malformed:?} must be rejected\" )",
+  "(ClrVersion::parse_directory_name(\"v8.0.31\"), None)",
+  "(ClrVersion::parse_directory_name(\"v\"), None)"
  ],
  "manifest_file_information_gate": [
   "(info.size, 266, \"manifest size via FileBasicInfo\")",
@@ -4884,12 +5644,12 @@
   "(manual.data, b\"handler-first\")"
  ],
  "map_and_transfer_reject_missing_extra_channel_and_read_surfaces": [
-  "( device.map(primary_backbuffer).expect(\"map primary\").len(), 32 )",
-  "( device.map(primary_backbuffer).expect(\"map surface\"), frame_pixels )",
+  "(mapped.len(), pitch * 2)",
+  "(pitch % 4, 0)",
+  "(tight, frame_pixels)",
   "(device.surface_writes(), 1)",
-  "( device .map(secondary_backbuffers[0]) .expect(\"map extra surface\") .len(), 32 )",
-  "(fallback, vec![0u8; 32])",
-  "(device.cpu_backing_writes(), before + 1)"
+  "(mapped.len(), mapped.row_pitch().max(16) * 2)",
+  "(&*fallback, &[0u8; 32])"
  ],
  "map_and_unmap_a_view": [
   "(view_size, 0x1000)",
@@ -4927,12 +5687,21 @@
   "(guest_ptr(&fixture, OUT), server)",
   "(stream, 0)"
  ],
+ "media_foundation_objects_and_byte_stream": [
+  "( call(&mut session, HostThunk::MfStartup, &[0x0007_0000, 0]), 0 )",
+  "( call( &mut session, HostThunk::MfCreateAttributes, &[attributes_out, 0], ), 0 )",
+  "( call( &mut session, HostThunk::MfCreateMediaType, &[media_type_out] ), 0 )",
+  "( call( &mut session, HostThunk::MfAttrSetUint32, &[media_type, sample_rate_key, 48_000], ), 0 )",
+  "( call( &mut session, HostThunk::MfAttrGetUint32, &[media_type, sample_rate_key, uint_out], ), 0 )",
+  "(read_u32(&session, uint_out), 48_000)"
+ ],
  "memory_image_commit_zeroed_pages_creates_missing_pages": [
   "(memory.read_u8(0x5000).unwrap(), 0)"
  ],
  "memory_image_high_pages_use_fallback_lookup": [
   "(memory.page_index(high_page), Some(0))",
-  "(memory.read_u32(high_page).unwrap(), 0x4433_2211)"
+  "(memory.read_u32(high_page).unwrap(), 0x4433_2211)",
+  "(memory.canonical_store().high_page_count(), 1)"
  ],
  "memory_image_page_index_handles_out_of_order_low_pages": [
   "(memory.page_index(hot_page), Some(0))",
@@ -4953,6 +5722,12 @@
   "(win32.sleep_drift_log().len(), 1)",
   "( win32 .sleep_ex(50, true, Some(alertable_thread)) .expect(\"alertable sleep\"), WaitStatus::IoCompletion )",
   "( win32 .wide_char_to_multi_byte(CP_UTF8, &wide) .expect(\"UTF-16 to UTF-8\"), \"Cafe \u20ac\".as_bytes() )"
+ ],
+ "memoryless_resource_cpu_update_is_refused_exactly": [
+  "( backend .resource_storage_mode(resource) .expect(\"storage mode\"), MetalStorageMode::Memoryless )",
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "( error.message, \"memoryless resource cannot be updated from the CPU\" )",
+  "(backend.translation_stats().staged_copies, 0)"
  ],
  "mesh_pipeline_graceful_fallback": [
   "( after.0 - before.0, after.1 - before.1, \"every created encoder must be ended (created {} -> {}, ended {} -> {})\", before.0, after.0, before.1, after.1 )"
@@ -5014,6 +5789,14 @@
   "( metadata_query(&mut fixture, reader, \"/tEXt/{str=Comment}\"), (0, Some(\"wave-eight\".to_string())) )",
   "( metadata_query(&mut fixture, reader, \"Missing\"), (u64::from(WINCODEC_ERR_PROPERTYNOTFOUND), None) )",
   "( metadata_query(&mut fixture, reader, \"Make\"), (0, Some(\"CasaCam\".to_string())) )"
+ ],
+ "metadata_root_errors_are_exact": [
+  "( metadata_version_from_root(&root), Ok(\"v4.0.30319\".to_string()) )",
+  "( metadata_version_from_root(&root[..8]), Err(ClrMetaError::InvalidMetadata) )",
+  "( metadata_version_from_root(&bad_signature), Err(ClrMetaError::InvalidMetadata) )",
+  "( metadata_version_from_root(&zero_length), Err(ClrMetaError::InvalidMetadata) )",
+  "( metadata_version_from_root(&oversized), Err(ClrMetaError::InvalidMetadata) )",
+  "( metadata_version_from_root(&truncated), Err(ClrMetaError::InvalidMetadata) )"
  ],
  "metadata_writer_rejects_malformed_values_and_copies_readers": [
   "( dispatch_x86( &mut fixture, HostThunk::WicFactoryCreateQueryWriter, &[factory as u32, FORMAT as u32, 0, META_WRITER_OUT as u32] ), u64::from(WIC_E_CODECNOTHANDLED), \"an unknown metadata format is not handled\" )",
@@ -5178,6 +5961,14 @@
  "mmapped_file_empty_file": [
   "(mf.size, 0)"
  ],
+ "module_information_truncates_a_maximum_path_and_keeps_the_base_and_size_exact": [
+  "(bytes.len(), 8 + SYSTEM_MODULE_ENTRY_SIZE * 2)",
+  "(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 2)",
+  "( u64::from_le_bytes(bytes[8 + 16..8 + 24].try_into().unwrap()), 0x1_4000_0000 )",
+  "( u32::from_le_bytes(bytes[8 + 24..8 + 28].try_into().unwrap()), 0x1234 )",
+  "( u16::from_le_bytes(bytes[8 + 36..8 + 38].try_into().unwrap()), 5, \"LoadCount is the loader entry's real count\" )",
+  "( offset, 43, \"C:\\\\ prefix is 3 bytes past the FullPathName start\" )"
+ ],
  "moniker_and_container_queries_reject_wrong_interfaces": [
   "( call_slot( &mut fixture, container, 0, &[container as u32, IID_PTR as u32, OUT as u32] ), S_OK )",
   "(guest_ptr(&fixture, OUT), container)",
@@ -5199,6 +5990,14 @@
   "(user32.monitor_from_window(None, 0x1), 1)",
   "(user32.monitor_from_window(Some(0xdead_beef), 0x2), 1)",
   "(user32.monitor_from_window(None, 0), 0)"
+ ],
+ "monotonic_clock_cross_thread_tsc_incoherence_is_rejected": [
+  "( clock.query_performance_frequency(), clock.frequency_hz() as i64 )",
+  "(qpc >= 0, true)",
+  "(verify_coherence(&sample), Ok(()))",
+  "(sample.qpc, sample.tsc as i64)",
+  "(ticks_to_nanos(0, 0), 0)",
+  "(first_aux, aux)"
  ],
  "more_processing_required_stalls_then_resumes_exactly_once": [
   "( core.complete(irp, STATUS_SUCCESS, 8).unwrap(), STATUS_MORE_PROCESSING_REQUIRED )",
@@ -5444,8 +6243,23 @@
   "(manager.set_event(file), Err(STATUS_OBJECT_TYPE_MISMATCH))",
   "(manager.release_object(file).unwrap(), 1)"
  ],
+ "native_export_resolution_rejects_absent_symbols_and_empty_dirs": [
+  "(native_export_available(runtime, \"coreclr_initialize\"), true)",
+  "( native_export_available(runtime, \"casa1_no_such_clr_export_42\"), false )",
+  "(native_export_available(runtime, \"\"), false)",
+  "( native_export_available(&empty, \"coreclr_initialize\"), false, \"a directory without a real CLR library exports nothing\" )",
+  "( native_export_available( &valid_runtime(&hostfxr_dir, \"1.0.0\"), \"hostfxr_initialize_for_runtime_config\" ), false )"
+ ],
  "neg_flags_zero_result": [
   "(state.get(Register::Rax), 0)"
+ ],
+ "nested_directory_entries_track_live_children_and_reject_stale_paths": [
+  "( canonical_directory_name(&namespace, \"\\\\\").as_deref(), Some(\"\\\\\") )",
+  "( canonical_directory_name(&namespace, \"\\\\device\\\\casatest\").as_deref(), Some(\"\\\\Device\\\\CasaTest\") )",
+  "( canonical_directory_name(&namespace, \"\\\\Device\\\\CasaTest\\\\Child\").as_deref(), Some(\"\\\\Device\\\\CasaTest\\\\Child\") )",
+  "( canonical_directory_name(&namespace, \"\\\\Device\\\\CasaTest\\\\Missing\"), None )",
+  "( canonical_directory_name(&namespace, \"\\\\Driver\\\\casadriver\").as_deref(), Some(\"\\\\Driver\\\\CasaDriver\") )",
+  "( canonical_directory_name(&namespace, \"\\\\Driver\\\\Unknown\"), None )"
  ],
  "nested_storage_destroy_copy_and_error_paths_persist": [
   "( cfb_open_storage_hr(&mut fixture, reopened, \"Missing\"), STG_E_FILENOTFOUND )",
@@ -5708,6 +6522,16 @@
   "(gpu_y, y)",
   "(gpu_uv, uv)"
  ],
+ "nv12_gpu_conversion_matches_cpu_reference_and_rejects_bad_lengths": [
+  "(channel.rgb_to_nv12_passes(), 1)",
+  "( &*channel.read_plane(0).expect(\"luma\"), expected_y.as_slice() )",
+  "( &*channel.read_plane(1).expect(\"chroma\"), expected_uv.as_slice() )",
+  "(channel.rgb_to_nv12_passes(), 2)"
+ ],
+ "nv12_gpu_decode_matches_cpu_reference_exactly": [
+  "(channel.composite_passes(), 1)",
+  "(decoded, expected)"
+ ],
  "nv12_present_channel_rejects_invalid_dimensions_and_device_failures": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
   "( error.message, format!( \"NV12 present channel: dimensions {width}x{height} must be non-zero and even\" ) )",
@@ -5719,16 +6543,15 @@
   "(runtime.nv12_texture_builds(swapchain), 2)",
   "(runtime.iosurface_texture_builds(), 2)",
   "(runtime.nv12_present_count(), 1)",
-  "(runtime.nv12_composite_passes(swapchain), 1)",
+  "(runtime.nv12_composite_passes(swapchain), 2)",
   "(runtime.nv12_drawable_binds(swapchain), 1)"
  ],
  "nv12_present_rejects_count_and_dimension_mismatches": [
   "(device.nv12_fallback_count(), 0, \"host must expose NV12\")",
-  "(mapped.len(), 32)",
-  "(mapped[3], 255)",
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "( error.message, \"NV12 Map is not zero-copy: the IOSurface has two plane mappings\" )",
   "(frame.width, 4)",
-  "(frame.format, DxgiFormat::R8G8B8A8Unorm)",
-  "(error.code, ReasonCode::RcD3dInvalidState)"
+  "(frame.format, DxgiFormat::R8G8B8A8Unorm)"
  ],
  "nv12_resize_rejects_mismatched_odd_dimensions": [
   "(runtime.swapchain_state(swapchain).unwrap().desc.width, 4)"
@@ -5775,6 +6598,13 @@
   "( win32 .describe_handle(event) .expect(\"descriptor\") .object_type, casa1::win32::ObjectType::Event )",
   "( win32 .describe_handle(mutex) .expect(\"descriptor\") .object_type, casa1::win32::ObjectType::Mutex )",
   "( win32 .wait_for_single_object(opened_event, 0, false, None) .expect(\"wait via opened handle\"), casa1::win32::WaitStatus::Object0, \"the event opened through the namespace is the SAME object\" )"
+ ],
+ "object_type_index_mismatch_for_the_file_family_is_intentional_and_distinct_elsewhere": [
+  "(object_type_index(crate::win32::ObjectType::File), 3)",
+  "(object_type_index(crate::win32::ObjectType::Pipe), 3)",
+  "(object_type_index(crate::win32::ObjectType::Socket), 3)",
+  "( object_type_index(crate::win32::ObjectType::DirectorySearch), 3 )",
+  "( unique.len(), distinct.len(), \"no two distinct kernel types may share an index\" )"
  ],
  "ole32_ole_initialize_uninitialize_dispatch": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, init, &[0, 0]), 0, \"OleInitialize returns S_OK\" )",
@@ -5864,15 +6694,32 @@
  ],
  "overwrite_resource_host_visible_recovers_panicked_stats_lock": [
   "(poisoned.is_err(), true)",
+  "(path, ResourceUpdatePath::HostVisibleInPlace)",
   "(path, ResourceUpdatePath::StagedUpload)",
   "( backend.resource_bytes(resource).expect(\"resource bytes\"), &[0x5A; 64] )",
-  "(stats.staged_copies, 1)",
-  "(stats.zero_copy_updates, 0)"
+  "(stats.zero_copy_updates, 1)",
+  "(stats.staged_copies, 0)"
  ],
  "package_writability_probe_gate": [
   "( written as usize, payload.len(), \"full payload must be written\" )",
   "( read_back, payload, \"probe payload must survive close/reopen\" )",
   "( final_bytes, manifest_bytes, \"manifest must be unchanged by the package writability probe\" )"
+ ],
+ "page_directory_boundary_reuses_one_table_for_adjacent_high_pages": [
+  "(memory.page_index(first), Some(0))",
+  "(memory.page_index(second), Some(1))",
+  "(memory.page_index(unmapped_in_chunk), None)",
+  "(memory.read_u8(first).unwrap(), 0x10)",
+  "(memory.read_u8(second).unwrap(), 0x20)",
+  "( memory.read_u8(unmapped_in_chunk).is_err(), true, \"an absent entry in an allocated 2 MiB chunk must fault\" )"
+ ],
+ "pagefile_information_rejects_a_short_buffer_and_names_the_file": [
+  "(u32::from_le_bytes(pagefile[0..4].try_into().unwrap()), 0)",
+  "( u32::from_le_bytes(pagefile[4..8].try_into().unwrap()), 0x40000 )",
+  "( u32::from_le_bytes(pagefile[8..12].try_into().unwrap()), 0x1000 )",
+  "( u32::from_le_bytes(pagefile[12..16].try_into().unwrap()), 0x2000 )",
+  "( name_len, r\"C:\\pagefile.sys\".encode_utf16().count() as u16 * 2 )",
+  "(short.status, STATUS_INFO_LENGTH_MISMATCH)"
  ],
  "palette_collection_rejects_unknown_formats_and_deduplicates": [
   "( wic_collect_palette(&invalid), Vec::<u32>::new(), \"an unknown format has no palette\" )",
@@ -6026,6 +6873,14 @@
   "(recycled_pipe, pipe, \"closed pipe value is recycled FIFO\")",
   "(err.code, ReasonCode::RcWin32InvalidHandle)",
   "( win32 .wait_for_single_object(event, 0, false, None) .expect(\"wait\"), WaitStatus::Timeout, \"original event must not be signaled by the stale completion\" )"
+ ],
+ "performance_information_derives_counts_and_rejects_a_short_buffer": [
+  "(bytes.len(), SYSTEM_PERFORMANCE_INFORMATION_SIZE)",
+  "( u32::from_le_bytes(bytes[0x2C..0x30].try_into().unwrap()), (16 * 1024 * 1024 * 1024u64 / 4096) as u32 )",
+  "(u32::from_le_bytes(bytes[0x30..0x34].try_into().unwrap()), 1)",
+  "( u32::from_le_bytes(bytes[0x34..0x38].try_into().unwrap()), 0x10 )",
+  "(result.status, STATUS_SUCCESS)",
+  "(result.required, SYSTEM_PERFORMANCE_INFORMATION_SIZE as u64)"
  ],
  "performance_profile_disables_debug": [
   "(profile.instruction_budget, 0)"
@@ -6407,6 +7262,15 @@
   "( present_texture_to_layer(&texture, &bare_layer).expect(\"bare layer fallback\"), false, \"a layer with no device must not hand out a drawable\" )",
   "( present_texture_to_layer(&texture, swapchain.layer()).expect(\"clamped present\"), true, \"an 8x8 source must blit into a 4x2 drawable region\" )"
  ],
+ "probe_cpu_model_absence_edge_not_fabricated": [
+  "( identity.is_absent(\"machdep.cpu.model\"), identity.cpu.model.is_none() )"
+ ],
+ "probe_repeated_queries_stability_and_absence_boundary": [
+  "(first.install.machine_guid, second.install.machine_guid)",
+  "(first.machine.uuid, second.machine.uuid)",
+  "(first.machine.serial_number, second.machine.serial_number)",
+  "(first.gpu.registry_id, second.gpu.registry_id)"
+ ],
  "process_close_and_inheritance": [
   "(manager.handle_count(7), 2)",
   "(inherited.len(), 1)",
@@ -6416,12 +7280,28 @@
   "(manager.close_process(7).unwrap(), 2)"
  ],
  "process_info_classes_validate": [
-  "( validate_process_information_class(99), Err(crate::ntdll::STATUS_INVALID_INFO_CLASS) )"
+  "( validate_process_information_class(99), Err(crate::ntdll::STATUS_INVALID_INFO_CLASS) )",
+  "(PROCESS_DEBUG_OBJECT_HANDLE_CLASS, 30)",
+  "(PROCESS_DEBUG_FLAGS_CLASS, 31)",
+  "(PROCESS_IMAGE_FILE_NAME_CLASS, 27)"
+ ],
+ "process_information_rejects_a_truncated_buffer_and_chains_entries_with_real_ids": [
+  "(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1)",
+  "( u64::from_le_bytes(bytes[0x50..0x58].try_into().unwrap()), 100 )",
+  "(name_len, \"game.exe\".encode_utf16().count() as u16 * 2)",
+  "(String::from_utf16(&wide).unwrap(), \"game.exe\")",
+  "( u64::from_le_bytes(bytes[0x100 + 48..0x100 + 56].try_into().unwrap()), 101, \"UniqueThread\" )",
+  "( u32::from_le_bytes(bytes[second..second + 4].try_into().unwrap()), 0 )"
  ],
  "process_operations_enforce_access": [
   "( win32 .get_exit_code_process(result.process_handle) .expect(\"exit code\"), None )",
   "(err.code, ReasonCode::RcHelperPermissionDenied)",
   "( win32 .get_exit_code_process(result.process_handle) .expect(\"exit code after terminate\"), Some(1) )"
+ ],
+ "product_id_determinism_mismatch_guard": [
+  "(a, b)",
+  "(a.len(), 23)",
+  "(a, c)"
  ],
  "production_alertable_apc_race_resumes_with_io_completion": [
   "( read_u32_guest(&session, APC_FLAG_PTR), 1, \"the APC callback ran before the wait reported\" )",
@@ -6593,7 +7473,7 @@
  ],
  "production_slice_missing_exit_metadata_is_host_barrier": [
   "( completion.exit, GuestSliceExit::HostBarrier { rip: SLICE_JUMPIF_CODE }, \"conditional exit metadata loss must never fabricate a RIP\" )",
-  "( completion.state.rip, SLICE_JUMPIF_CODE, \"the owner re-dispatches the original block address\" )"
+  "( completion.slot.state.rip, SLICE_JUMPIF_CODE, \"the owner re-dispatches the original block address\" )"
  ],
  "production_slice_race_two_guest_loops_overlap_with_exact_counters": [
   "( requests .iter() .map(|request| request.state.rip) .collect::<Vec<_>>(), vec![SLICE_CODE, SLICE_CODE_2] )",
@@ -6614,7 +7494,7 @@
  "production_slice_safepoint_exit_race_consumes_request": [
   "(reports.len(), 1)",
   "( reports[0].exit, GuestSliceExit::Safepoint, \"the worker must stop at the safepoint, not run guest code\" )",
-  "( reports[0].blocks_executed, 1, \"the safepoint is observed after the block prologue ran\" )"
+  "( reports[0].blocks_executed, 0, \"the entry safepoint poll stops before the block body executes\" )"
  ],
  "production_slice_start_gate_over_arrival_race_returns_without_deadlock": [
   "( *gate .remaining .lock() .unwrap_or_else(|poisoned| poisoned.into_inner()), 0, \"an over-arrival must observe the already-emptied gate\" )",
@@ -6623,7 +7503,7 @@
  "production_slice_straight_line_fallback_is_host_barrier": [
   "( completion.exit, GuestSliceExit::HostBarrier { rip: SLICE_STRAIGHT_CODE }, \"a straight-line exit must return to the runtime owner\" )",
   "( completion.blocks_executed, 1, \"the straight-line block executed exactly once\" )",
-  "( completion.state.get(Register::Rax), 0x1234, \"the worker applied the block result before the barrier\" )"
+  "( completion.slot.state.get(Register::Rax), 0x1234, \"the worker applied the block result before the barrier\" )"
  ],
  "production_terminate_race_prunes_parked_wait_and_never_resumes": [
   "(session.runtime.production_waits.len(), 1)",
@@ -6648,11 +7528,19 @@
  ],
  "production_worker_barrier_never_double_dispatches_host_thunk": [
   "(reports.len(), 1)",
-  "( reports[0].exit, GuestSliceExit::HostBarrier { rip: SLICE_CODE_2 } )",
-  "(reports[0].blocks_executed, 0)",
+  "( reports[0].exit, GuestSliceExit::HostBarrier { rip: thunk }, \"the worker resolves the indirect call target and yields at the thunk\" )",
+  "( reports[0].blocks_executed, 1, \"the call block runs natively; only the thunk itself is owner work\" )",
+  "( reports[0].state.rip, thunk, \"RIP points at the unresolved host thunk, with the return address already pushed\" )",
   "( trace_calls(&session, \"time\", \"GetTickCount64\"), before, \"a production worker must never run the host thunk\" )",
-  "( trace_calls(&session, \"time\", \"GetTickCount64\"), before + 1, \"the runtime owner executes the thunk exactly once\" )",
-  "(session.runtime.pending_guest_threads.len(), 0)"
+  "( trace_calls(&session, \"time\", \"GetTickCount64\"), before + 1, \"the runtime owner executes the thunk exactly once\" )"
+ ],
+ "production_worker_call_return_chain_no_races_matches_cooperative_exactly": [
+  "( read_u32_guest(&cooperative, SLICE_CALL_COUNTER), iterations, \"cooperative call/ret loop must finish in {rounds} rounds\" )",
+  "(reports.len(), 1)",
+  "( reports[0].blocks_executed, 3 * u64::from(iterations) + 1, \"the whole call/ret loop must run in one worker job\" )",
+  "( ( reports[0].metrics.return_predictions, reports[0].metrics.return_hits, reports[0].metrics.return_misses, reports[0].metrics.return_mispredictions, reports[0].metrics.indirect_ic_hits, reports[0].metrics.indirect_ic_misses, ), (u64::from(iterations) + 1, u64::from(iterations), 1, 0, 0, 0), \"one prediction per call plus the thread-return miss\" )",
+  "( reports[0].metrics.native_chains, 3 * u64::from(iterations), \"every block after the first is a native chain\" )",
+  "( reports[0].exit, GuestSliceExit::HostBarrier { rip: 0 }, \"the balanced chain unwinds to the zero return address and yields\" )"
  ],
  "production_worker_guest_fault_boundary_is_reported_to_the_owner": [
   "(reports.len(), 1)",
@@ -6667,6 +7555,14 @@
   "(ids, BTreeSet::from([first_id, second_id]))",
   "(scheduler.active_job_count(), 0)",
   "( after.worker_overlaps, before.worker_overlaps, \"overlap accounting must observe concurrency\" )"
+ ],
+ "production_worker_slots_persist_predictor_tls_and_wait_until_termination_wake": [
+  "(reports.len(), 1)",
+  "(slot.thread_id, 0xD12)",
+  "(slot.slices, round)",
+  "( slot.fs_base, session.runtime.teb_base, \"the slot must keep the guest TEB/TLS base\" )",
+  "( slot.metrics.blocks_executed, round, \"metrics must accumulate on the persistent slot\" )",
+  "(slot.has_wait, false)"
  ],
  "profiles_are_internally_consistent": [
   "(desktop.windows_version, WindowsVersion::Win11)",
@@ -6701,6 +7597,14 @@
   "(provenance.ge_hash, \"\")",
   "(provenance.steam_executable_hash, \"\")",
   "(full.fixture_hash.len(), 64, \"sha256 hex length\")"
+ ],
+ "provider_enrollment_rejects_duplicate_malformed_and_revoked_ids_exactly": [
+  "( store.enroll_provider_key(\"\", &spki, None, 0).err(), Some(AttestationError::MalformedKey) )",
+  "( store.enroll_provider_key(\"acme\", &[], None, 0).err(), Some(AttestationError::MalformedKey) )",
+  "( store .enroll_provider_key(\"acme\", &[0x00, 0x01], None, 0) .err(), Some(AttestationError::MalformedKey) )",
+  "(key_record.provider_id, \"acme\")",
+  "(key_record.public_key_spki, spki)",
+  "(key_record.valid_until_ms, Some(10_000))"
  ],
  "proxy_env_proxy_appears_in_traces": [
   "( traces.last().unwrap().proxy.as_deref(), Some(\"http://proxy.env:8080\") )"
@@ -6795,6 +7699,14 @@
  "read_utf16z_unmapped_page_mid_string_is_error": [
   "(error.code, ReasonCode::RcUnimplInsn)"
  ],
+ "real_audio_shared_sink_writer_fallback_and_concurrent_writes_are_exact": [
+  "(format!(\"{writer:?}\").contains(\"SharedSinkWriter\"), true)",
+  "(writer.is_shared(), true)",
+  "( writer .write_interleaved(&[]) .expect(\"empty shared sink write\"), SinkWritePath::GuestShared )",
+  "(writer.stats(), SharedSinkStats::default())",
+  "( writer .write_interleaved(&samples) .expect(\"shared sink write\"), SinkWritePath::GuestShared )",
+  "( writer.stats(), SharedSinkStats { shared_writes: 1, staging_copies: 0, shared_bytes: bytes.len() as u64, } )"
+ ],
  "real_external_windows_d3d11_create_device_without_swapchain_traces_through_pe_runtime": [
   "(canonical_output.exit_code, 0)"
  ],
@@ -6813,6 +7725,14 @@
  ],
  "real_external_windows_xaudio2_imports_trace_through_pe_runtime": [
   "(canonical_output.exit_code, 0)"
+ ],
+ "real_managed_assembly_metadata_matches_and_non_pe_is_rejected": [
+  "( version_from_file(&assembly), Ok(\"v4.0.30319\".to_string()), \"CoreCLR assemblies carry the real CLI metadata version\" )",
+  "(version_from_file(&text), Err(ClrMetaError::InvalidPe))",
+  "( version_from_file(&native_pe), Err(ClrMetaError::NotManaged), \"a native PE has no CLI metadata runtime version\" )",
+  "( version_from_file(&missing), Err(ClrMetaError::Io(HRESULT_FILE_NOT_FOUND)) )",
+  "( ClrMetaError::Io(HRESULT_FILE_NOT_FOUND).hresult(), HRESULT_FILE_NOT_FOUND )",
+  "( version_from_file(&directory), Err(ClrMetaError::Io(HRESULT_GEN_FAILURE)), \"a non-file read failure is a generic host I/O failure\" )"
  ],
  "real_win32_class_object_token_overflow_wraps_to_zero": [
   "( first, u32::MAX, \"the first token must be the boundary value\" )",
@@ -6861,12 +7781,27 @@
  "register_touch_window_creates_entry": [
   "(user32.registered_windows(), &[0x1234])"
  ],
+ "registry_create_set_query_enumerate_delete": [
+  "( call( &mut session, HostThunk::RegCreateKeyExW, &[ HKEY_CURRENT_USER, subkey, 0, 0, 0, 0x20019, 0, key_out, disposition, ], ), 0 )",
+  "(read_u32(&session, disposition), REG_CREATED_NEW_KEY)",
+  "( call( &mut session, HostThunk::RegSetValueExW, &[ key as u64, greeting, 0, REG_SZ as u64, greeting_data, greeting_bytes.len() as u64, ], ), 0 )",
+  "( call( &mut session, HostThunk::RegSetValueExW, &[key as u64, answer, 0, REG_DWORD as u64, answer_data, 4], ), 0 )",
+  "( call( &mut session, HostThunk::RegQueryValueExW, &[key as u64, greeting, 0, type_out, data_out, length_out], ), 0 )",
+  "(read_u32(&session, type_out), REG_SZ)"
+ ],
  "registry_eviction_boundary_removes_oldest_without_leak": [
   "(registry.len(), MAX_REGISTRY_ENTRIES + 2)",
   "(registry.len(), MAX_REGISTRY_ENTRIES - 1)",
   "( registry.keys().next().copied(), Some(3), \"eviction must remove the oldest handles first\" )",
   "(below.len(), MAX_REGISTRY_ENTRIES - 1)",
   "( below.len(), MAX_REGISTRY_ENTRIES - 1, \"a registry below capacity must not be evicted\" )"
+ ],
+ "registry_machine_guid_reread_mismatch_guard": [
+  "(read, identity)",
+  "(again.machine_guid, \"0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9\")"
+ ],
+ "registry_missing_machine_guid_is_absent": [
+  "(error, IdentityError::FactAbsent(\"registry MachineGuid\"))"
  ],
  "registry_ops_validate_handles": [
   "( nt_set_value_key(&win32, 0xBAD, \"x\", REG_SZ, b\"x\\0\\0\"), STATUS_INVALID_HANDLE )",
@@ -7052,6 +7987,14 @@
   "(client.send_to(HOST_PLAYER_ID, b\"never delivered\"), S_OK)",
   "(failures, vec![(context, DPNERR_CONNECTIONLOST)])"
  ],
+ "return_predictor_misprediction_edge_boundary_is_exact": [
+  "(predictor.on_return(0x10), false)",
+  "( ( predictor.hits(), predictor.misses(), predictor.mispredictions() ), (0, 1, 0), \"a return without a call is a miss, not a misprediction\" )",
+  "(predictor.on_return(0x10), true)",
+  "(predictor.on_return(0x30), true)",
+  "(predictor.on_return(0x99), false)",
+  "( ( predictor.hits(), predictor.misses(), predictor.mispredictions() ), (2, 2, 1), \"the real guest return address must be authoritative\" )"
+ ],
  "roundtrip_hresult_to_dos_to_errno": [
   "(dos, ERROR_NOT_ENOUGH_MEMORY)",
   "(dos_error_to_errno(dos), libc::ENOMEM)"
@@ -7075,6 +8018,17 @@
   "( call_slot(&mut fixture, rot, 5, &[rot as u32, unknown as u32]), 0, \"IsRunning(unknown)\" )",
   "( call_slot( &mut fixture, rot, 6, &[rot as u32, unknown as u32, OUT as u32] ), MK_E_UNAVAILABLE )",
   "( call_slot(&mut fixture, rot, 6, &[rot as u32, unknown as u32, 0]), E_POINTER )"
+ ],
+ "runtime_root_precedence_rejects_missing_duplicate_and_relative_roots": [
+  "( roots.first(), Some(&first.canonicalize().expect(\"canonical\")) )",
+  "( roots.contains(&home.join(\".dotnet\")), false, \"a home directory without .dotnet is not a CLR root\" )",
+  "( dotnet_roots_from(Some(missing), None) .contains(&first.canonicalize().expect(\"canonical\")), false )",
+  "( duplicate.iter().filter(|root| **root == canonical).count(), 1, \"a canonical root is never enumerated twice\" )"
+ ],
+ "rva_mapping_rejects_unbacked_and_out_of_range_sections": [
+  "( rva_to_file_offset(&bytes, &[section.clone()], 0x2010), Some(0x110) )",
+  "( rva_to_file_offset(&bytes, &[section.clone()], 0x1050), None, \"an RVA outside every section maps to no file offset\" )",
+  "( rva_to_file_offset(&bytes, &[huge], 0x2000), None, \"an unbacked section never yields an offset\" )"
  ],
  "scancode_events_for_frame_deduplicate_alias_keys": [
   "(pressed, vec![0x1e])"
@@ -7355,32 +8309,15 @@
  "shift_flags_carry_from_sar": [
   "(state.get_byte(ByteRegister::Al), 0xC0)"
  ],
- "shim_add_remove_module": [
-  "(shim.modules.len(), initial_count + 1)",
-  "(shim.modules.len(), initial_count)"
- ],
- "shim_integrity_check": [
-  "(result.region_size, 4)",
-  "(shim.integrity_check_count, 1)"
- ],
- "shim_load_unload": [
-  "(shim.state, ShimState::NotLoaded)",
-  "(shim.state, ShimState::Active)",
-  "(shim.state, ShimState::Unloaded)"
- ],
- "shim_module_list": [
-  "(shim.module_query_count, 0)",
-  "(shim.module_query_count, 1)",
-  "(ntdll.unwrap().image_path, r\"C:\\Windows\\System32\\ntdll.dll\")"
- ],
- "shim_registry": [
-  "(registry.count(), 0)",
-  "(registry.count(), 1)",
-  "(registry.count(), 2)",
-  "(shim.provider, AntiCheatProvider::EasyAntiCheat)"
- ],
  "shim_x86_arg_bytes_abi_mismatch_or_zero_width_rejects": [
   "( shim.x86_arg_bytes(), want, \"{shim:?} must pop its exact stdcall byte count\" )"
+ ],
+ "sigbus_fallback_above_four_gib_uses_the_direct_window": [
+  "(SIGBUS_PAGE_FOUND.load(Ordering::Relaxed), before + 1)",
+  "(runtime.flat_memory.is_page_materialised(page), true)",
+  "(byte, 0x5A)",
+  "(memory.read_u8(page).unwrap(), 0x5A)",
+  "(memory.canonical_store().materialisation_count(), 1)"
  ],
  "sigbus_fallback_never_corrupts_committed_bytes_and_handles_partial_and_absent_pages": [
   "(first, 0xAB, \"servicing must never zero committed bytes\")",
@@ -7449,6 +8386,22 @@
   "(state.watched_count.load(Ordering::Acquire), SMC_WATCH_SLOTS)",
   "(state.watch_overflow.load(Ordering::Acquire), true)",
   "( state.is_watched(0xFFFF_FFFF_FFFF_F000), true, \"overflow must conservatively watch unknown pages\" )"
+ ],
+ "snapshot_above_four_gib_heap_never_observes_stale_live_writes": [
+  "(snapshot.read_u8(address).unwrap(), 0x5A)",
+  "( snapshot.read_u8(high_address).unwrap(), 0x6B, \"an owned-frame page must survive the snapshot\" )",
+  "( memory.canonical_store().flat_size() >= GUEST_FLAT_MIN_SIZE, true )",
+  "( snapshot.canonical_store().flat_size() >= GUEST_FLAT_MIN_SIZE, true )",
+  "(memory.read_u8(address).unwrap(), 0xA5)",
+  "(memory.read_u8(high_address).unwrap(), 0xB6)"
+ ],
+ "snapshot_cross_surface_mismatch_guard": [
+  "(snapshot.system_serial, \"GMW4J2RWR1\")",
+  "(snapshot.system_uuid, \"0CF5170C-4E78-547D-8F8F-246C9A40E80F\")",
+  "(snapshot.volume_serial, \"DEADBEEF\")",
+  "(snapshot.primary_mac, \"AA:BB:CC:DD:EE:FF\")",
+  "(snapshot.gpu_luid, 0x3333_4444_1111_2222)",
+  "(snapshot.gpu_registry_id, 7)"
  ],
  "socket_duplicate_bind_returns_addr_in_use": [
   "(network.wsa_get_last_error(), 10048)"
@@ -7691,6 +8644,29 @@
   "( seen.lock() .unwrap_or_else(|poisoned| poisoned.into_inner()) .len(), 1, \"a repeated load must not fire a second synthetic init callback\" )",
   "(handle, 0, \"a synthetic module must receive a real handle\")"
  ],
+ "system_bigpool_and_lookaside_are_truthfully_empty_without_a_tagged_pool": [
+  "(status, STATUS_SUCCESS.raw())",
+  "(read_u32(&session.read_guest(ARENA, 8), 0), 0)",
+  "(session.read_guest(ARENA2, 40), vec![0_u8; 40])"
+ ],
+ "system_code_integrity_information_reports_zero_enforcement": [
+  "(status, STATUS_SUCCESS.raw())",
+  "(read_u32(&bytes, 0), 8, \"Length\")",
+  "(read_u32(&bytes, 4), 0, \"no code-integrity enforcement\")"
+ ],
+ "system_firmware_table_information_echoes_the_query_and_never_fabricates_a_table": [
+  "(status, STATUS_SUCCESS.raw())",
+  "(read_u32(&bytes, 0), 0x4143_5049, \"provider echoed\")",
+  "(read_u32(&bytes, 4), 7, \"table id echoed\")",
+  "(read_u32(&bytes, 8), 0, \"no fabricated firmware table\")"
+ ],
+ "system_handle_information_drops_a_closed_handle_and_matches_the_live_table": [
+  "(status, STATUS_SUCCESS.raw())",
+  "(read_u32(&bytes, 0), 2, \"two live handles\")",
+  "(read_u32(&session.read_guest(len_ptr, 4), 0), 8 + 24 * 2)",
+  "(session.call(close_handle, &[first]), 1)",
+  "(read_u32(&bytes, 0), 1, \"the closed handle is gone\")"
+ ],
  "system_info_classes_validate_and_counter_layout_is_canonical": [
   "( validate_system_information_class(99), Err(crate::ntdll::STATUS_INVALID_INFO_CLASS) )",
   "(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 12345)",
@@ -7703,6 +8679,17 @@
   "( read_u32(&basic, 8), win32_nprocs, \"the Nt serializer reports the same processor count as GetSystemInfo\" )",
   "(read_u32(&basic, 24), win32_nprocs)",
   "(read_u32(&basic, 60), win32_nprocs)"
+ ],
+ "system_information_rejects_an_invalid_class_with_status_invalid_info_class": [
+  "(status, STATUS_INVALID_INFO_CLASS.raw())",
+  "(session.read_guest(ARENA, 1), vec![0xAB], \"no bytes written\")",
+  "( read_u32(&session.read_guest(len_ptr, 4), 0), 0, \"no length written\" )"
+ ],
+ "system_kernel_debugger_information_is_truthful_without_a_debugger": [
+  "(status, STATUS_SUCCESS.raw())",
+  "(session.read_guest(ARENA, 2), vec![0, 1])",
+  "(status, STATUS_INFO_LENGTH_MISMATCH.raw())",
+  "(read_u32(&session.read_guest(len_ptr, 4), 0), 2)"
  ],
  "system_loopback_aggregate_creation_failure_is_pinned": [
   "( backend.start_system_loopback(), Err(SystemLoopbackFailure::AggregateCreation(-4)) )",
@@ -7935,6 +8922,51 @@
   "( backend.start_system_loopback_for_device(&second), Ok(SystemLoopbackBackend::CoreAudioProcessTap) )",
   "(platform::fake::tap_targets(), vec![3, 4])",
   "(platform::fake::destroy_counts(), (2, 2, 2))"
+ ],
+ "system_module_information_reports_the_real_loaded_module_and_rejects_a_seven_byte_buffer": [
+  "(status, STATUS_SUCCESS.raw())",
+  "( name_bytes, b\"kernel32.dll\", \"the file name is the loaded image\" )",
+  "(status, STATUS_INFO_LENGTH_MISMATCH.raw())",
+  "( read_u32(&session.read_guest(len_ptr, 4), 0) as usize, 8 + 296 * count )",
+  "(handle, 0, \"LoadLibraryW returns a module handle\")"
+ ],
+ "system_pagefile_information_names_the_real_page_file": [
+  "(status, STATUS_SUCCESS.raw())",
+  "(read_u32(&bytes, 0), 0, \"single entry: NextEntryOffset = 0\")",
+  "( name_len, r\"C:\\pagefile.sys\".encode_utf16().count() as u16 * 2 )",
+  "(String::from_utf16(&wide).unwrap(), r\"C:\\pagefile.sys\")",
+  "( read_u32(&session.read_guest(len_ptr, 4), 0) as usize, 18 + name_len as usize, \"the required length is the whole single-entry structure\" )"
+ ],
+ "system_process_information_does_not_duplicate_the_entry_once_the_process_handle_exists": [
+  "(status, STATUS_SUCCESS.raw())",
+  "(read_u64(&bytes, 0x50), u64::from(session.guest_pid()))",
+  "(matches, 1, \"the guest process appears exactly once\")",
+  "(handle, 0)"
+ ],
+ "system_process_information_is_stable_across_repeated_calls_and_reports_the_guest_pid": [
+  "(status, STATUS_SUCCESS.raw())",
+  "( read_u64(&first, 0x50), u64::from(guest_pid), \"UniqueProcessId is the guest pid\" )",
+  "(first[0..0x40], second[0..0x40])",
+  "(first[0x48..], second[0x48..])",
+  "(status, STATUS_INFO_LENGTH_MISMATCH.raw())"
+ ],
+ "system_process_information_reports_a_suspended_pending_thread_and_rejects_truncation": [
+  "(NtStatus::from_raw(rax), STATUS_SUCCESS)",
+  "(suspended, 1, \"exactly one suspended pending thread\")",
+  "(read_u32(&session.read_guest(handle_ptr, 4), 0), 0)"
+ ],
+ "system_range_start_boundary_follows_the_architecture_split": [
+  "(system_range_start(true), 0xFFFF_8000_0000_0000)",
+  "(system_range_start(false), 0x8000_0000)",
+  "( u64::from_le_bytes(range[..8].try_into().unwrap()), 0xFFFF_8000_0000_0000 )",
+  "(short.status, STATUS_INFO_LENGTH_MISMATCH)",
+  "(short.required, 8)"
+ ],
+ "system_range_start_information_rejects_a_short_buffer_and_reports_the_x64_split": [
+  "(status, STATUS_SUCCESS.raw())",
+  "(read_u64(&session.read_guest(ARENA, 8), 0), X64_RANGE_START)",
+  "(status, STATUS_INFO_LENGTH_MISMATCH.raw())",
+  "(read_u32(&session.read_guest(len_ptr, 4), 0), 8)"
  ],
  "system_time_and_timer_resolution_domains_are_consistent": [
   "( read_u64(&session.read_guest(ft_ptr, 8), 0), read_u64(&session.read_guest(win32_ft_ptr, 8), 0) )",
@@ -8626,6 +9658,10 @@
  "t_shader_cache_insert_and_get": [
   "(retrieved.unwrap().payload.mtl_library_bytes, vec![1, 2, 3])"
  ],
+ "telemetry_id_rejects_foreign_machine_guid": [
+  "(a, b)",
+  "(a, c)"
+ ],
  "terminate_suspended_thread_succeeds_and_thread_never_starts": [
   "(prev, 0)",
   "( session .win32() .thread_suspend_count(thread_id) .expect(\"count\"), 1 )",
@@ -9121,7 +10157,7 @@
  ],
  "test_win32_processor_properties": [
   "(obj.class_name, \"Win32_Processor\")",
-  "(obj.get_string(\"Name\").as_deref(), Some(\"Apple Silicon\"))",
+  "( obj.get_string(\"Name\").as_deref(), Some(crate::hardware_identity::host_identity().cpu.brand.as_str()) )",
   "(obj.get_u16(\"Architecture\"), Some(9))"
  ],
  "test_wrap_io_surface_in_pixel_buffer_roundtrip": [
@@ -9154,6 +10190,14 @@
   "( manager.evict_mip_levels(1), 4_096, \"one mip step frees 4096 bytes and the next candidate must break\" )",
   "(manager.textures.get(&first).expect(\"first\").loaded_mips, 1)",
   "( manager.textures.get(&second).expect(\"second\").loaded_mips, 2 )"
+ ],
+ "thread_hide_from_debugger_rejects_bad_length_and_class": [
+  "( surface.set_information_thread(7, THREAD_HIDE_FROM_DEBUGGER, 4), Err(STATUS_INFO_LENGTH_MISMATCH) )",
+  "( surface.set_information_thread(7, 0x99, 0), Err(STATUS_INVALID_INFO_CLASS) )",
+  "( surface.set_information_thread(7, THREAD_HIDE_FROM_DEBUGGER, 0), Ok(()) )",
+  "( surface.query_information_thread(7, THREAD_HIDE_FROM_DEBUGGER), Ok(1) )",
+  "( surface.query_information_thread(8, THREAD_HIDE_FROM_DEBUGGER), Ok(0) )",
+  "( surface.query_information_thread(7, 0x99), Err(STATUS_INVALID_INFO_CLASS) )"
  ],
  "thread_info_classes_validate": [
   "( validate_thread_information_class(99), Err(crate::ntdll::STATUS_INVALID_INFO_CLASS) )",
@@ -9399,6 +10443,12 @@
   "(timeout_100ns_to_ticks(10_001), Some(2))",
   "(timeout_100ns_to_ticks(1_000_000), Some(100))"
  ],
+ "timing_coherence_rejects_mismatched_tsc_and_qpc": [
+  "(verify_coherence(&coherent), Ok(()))",
+  "( verify_coherence(&mismatch), Err(TimingError::IncoherentTscQpc { tsc: 1_000, qpc: 999 }) )",
+  "( verify_coherence(&zero_frequency), Err(TimingError::FrequencyZero) )",
+  "( verify_coherence(&negative), Err(TimingError::NegativeInterval) )"
+ ],
  "tls_alloc_exhaustion_reports_not_enough_memory": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, alloc_thunk, &[]), u64::from(expected) )",
   "(runtime.last_error, 0)",
@@ -9507,6 +10557,14 @@
   "( call_slot(&mut fixture, typelib, 9, &[typelib as u32, 99, 0, 0, 0, 0]), TYPE_E_ELEMENTNOTFOUND )",
   "( call_slot( &mut fixture, typelib, 5, &[typelib as u32, index, OUT as u32] ), 0, \"GetTypeInfoType({index})\" )",
   "(fixture.memory.read_u32(OUT).unwrap(), expected)"
+ ],
+ "unknown_object_operations_are_rejected": [
+  "( objects.with_runtime_info(1, 0x1000, 0, |_| ()), None, \"a meta host is not a runtime info object\" )",
+  "(objects.next_enum_item(1, 0x1000), None)",
+  "(objects.skip_enum_items(1, 0x1000, 1), None)",
+  "(objects.reset_enum(1, 0x1000), None)",
+  "(objects.clone_enum(1, 0x1000), None)",
+  "(objects.load_error(1, 0x1000), None)"
  ],
  "unknown_store_handle_keeps_the_real_error": [
   "(select_certificate(&mut runtime, &mut memory), 0)",
@@ -9636,6 +10694,10 @@
  "user32_track_popup_menu_invalid_hwnd_and_zero_target_edges": [
   "( kinds .iter() .filter(|kind| **kind == MessageKind::Paint) .count(), 0, \"a null owner window must not queue a paint\" )"
  ],
+ "uuid_encoding_mixed_endian_garbage_rejected": [
+  "( bytes, [ 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff ] )",
+  "(uuid_smbios_bytes(\"garbage\"), [0u8; 16])"
+ ],
  "variable_rate_shading": [
   "(rate_map.width, 16)",
   "(rate_map.height, 16)",
@@ -9671,6 +10733,34 @@
   "( memory.read_u32(len_ptr).expect(\"fixed len\"), 52, \"sizeof(VS_FIXEDFILEINFO)\" )",
   "(signature, 0xfeef_04bd, \"VS_FIXEDFILEINFO signature\")"
  ],
+ "version_parsing_real_directory_forms_and_edge_components": [
+  "(version.as_string(), \"8.0.31\")",
+  "(version.component_count(), 3)",
+  "( ClrVersion::parse_directory_name(\"8.0.31\").expect(\"valid dir\"), version )",
+  "( ClrVersion::parse_request(\"4.0.30319\") .expect(\"framework form\") .as_string(), \"4.0.30319\" )",
+  "( ClrVersion::parse_request(\"10.0\") .expect(\"two components\") .as_string(), \"10.0\" )",
+  "( ClrVersion::parse_request(\"10.0.4.1\") .expect(\"four components\") .as_string(), \"10.0.4.1\" )"
+ ],
+ "video_decoder_guest_surface_bgra_roundtrip_and_unaligned_fallback_are_exact": [
+  "(layout.nv12, false)",
+  "(layout.guest_backed, true)",
+  "(layout.bytes, (width * height * 4) as usize)",
+  "(&region.as_slice()[page..end], expected.as_slice())",
+  "(unaligned.guest_backed, true)",
+  "(unaligned.staging_fallbacks, 0)"
+ ],
+ "video_decoder_guest_surface_nv12_boundary_roundtrip_matches_planes_exactly": [
+  "( layout, GuestSurfaceLayout { width, height, bytes: y_len + uv_len, nv12: true, guest_backed: true, staging_fallbacks: 0, } )",
+  "(after.guest_surface_frames, before.guest_surface_frames + 1)",
+  "(after.staging_fallbacks, before.staging_fallbacks)",
+  "(&region.as_slice()[offset..offset + y_len], &y_plane)",
+  "( &region.as_slice()[offset + y_len..offset + y_len + uv_len], &uv_plane )"
+ ],
+ "video_decoder_guest_surface_rejects_cpu_only_frame_without_conversion": [
+  "(error.code, ReasonCode::RcMediaInvalid)",
+  "( error.message, \"guest surface copy: frame has no IOSurface texture\" )",
+  "(error.message, \"guest surface copy: zero-sized frame\")"
+ ],
  "video_present_rejects_empty_frame": [
   "(ctx.video_present_stats().cpu_upload_presents, 0)"
  ],
@@ -9694,9 +10784,37 @@
   "(read_u64(&mbi, 24), 0x3000, \"RegionSize\")",
   "(read_u32(&mbi, 32), MEM_COMMIT_STATE, \"State = MEM_COMMIT\")"
  ],
+ "virtual_memory_protection_round_trip_mismatch_is_reported": [
+  "(base, 0x7400_0000)",
+  "(previous, VmProtection::READ)",
+  "(query.protection, VmProtection::READ_WRITE_EXECUTE)",
+  "(query.state, VmState::Committed)",
+  "(range.base, base)",
+  "(range.size, 0x2000)"
+ ],
  "virtual_memory_runtime_executor_matches_reference_derived_truth": [
   "(results.len(), expected.len())",
   "( result, &expected[index], \"vector {} ({}) must match the reference-derived truth\", vector.id, vector.input[\"operation\"] )"
+ ],
+ "volume_identity_refuses_unpublished_fields_and_derives_stable_object_ids": [
+  "( PeHostRuntime::serialize_file_fs_volume_information(&disk, None) .expect_err(\"creation time absent\") .raw(), crate::ntdll::STATUS_NOT_SUPPORTED.raw() )",
+  "( u64::from_le_bytes(volume[0..8].try_into().expect(\"creation\")), 0x01D0_0000_0000_0000 )",
+  "( u32::from_le_bytes(volume[8..12].try_into().expect(\"serial\")), disk.volume_serial )",
+  "(first, second)",
+  "( PeHostRuntime::serialize_file_fs_object_id_information(&no_uuid) .expect_err(\"uuid absent\") .raw(), crate::ntdll::STATUS_NOT_SUPPORTED.raw() )",
+  "( PeHostRuntime::host_volume_creation_time_ticks(std::path::Path::new( \"/casa1/does/not/exist\" )), None )"
+ ],
+ "volume_information_rejects_invalid_handles_and_reports_the_real_volume": [
+  "( query(&mut runtime, &mut memory, handle, 0x200, 1), u64::from(crate::ntdll::STATUS_SUCCESS.raw()) )",
+  "( memory.read_u32(buffer + 8).expect(\"serial\"), disk.volume_serial, \"FileFsVolumeInformation serial is the identity serial\" )",
+  "( memory.read_u8(buffer + 16).expect(\"supports objects\"), 1, \"the volume holds real file objects\" )",
+  "( label_len as usize, disk.volume_name.encode_utf16().count() * 2 )",
+  "(String::from_utf16(&label).unwrap(), disk.volume_name)",
+  "( query(&mut runtime, &mut memory, handle, 0x200, 3), u64::from(crate::ntdll::STATUS_SUCCESS.raw()) )"
+ ],
+ "volume_serial_boundary_and_uniqueness": [
+  "(a, b)",
+  "(a, c)"
  ],
  "vulkan_state_creates_successfully": [
   "(state.instance_count(), 0)",
@@ -9773,6 +10891,18 @@
   "( parse_wave_format(&seven_bits), Err(AUDCLNT_E_UNSUPPORTED_FORMAT) )",
   "( parse_wave_format(&bad_align), Err(AUDCLNT_E_UNSUPPORTED_FORMAT) )",
   "( parse_wave_format(&extensible), Err(AUDCLNT_E_UNSUPPORTED_FORMAT) )"
+ ],
+ "wbem_connect_server_registry_machine_guid_mismatch_guard": [
+  "(result, 0)",
+  "( stored.data.as_str(), Some(identity.install.machine_guid.as_str()) )"
+ ],
+ "wddm_adapter_device_allocation_residency_and_fence": [
+  "(info.shareable, false)",
+  "(info.owner_process, 7)",
+  "( subsystem .d3dkmt_query_allocation_residency(allocation) .unwrap(), 0 )",
+  "(subsystem.d3dkmt_make_resident(allocation, 7).unwrap(), 1)",
+  "( subsystem .d3dkmt_query_allocation_residency(allocation) .unwrap(), 1 )",
+  "(subsystem.d3dkmt_evict(allocation, 7).unwrap(), 0)"
  ],
  "wddm_adapter_name_edges_reject_unknown_and_non_display_names": [
   "( subsystem .d3dkmt_query_adapter_info(by_display_name) .expect(\"opened adapter info\") .luid, snapshot.luid )",
@@ -10002,10 +11132,36 @@
   "(second.pixels, blue)",
   "( wic_decode_tiff_frame(&encoded[..8], 1).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a truncated multi-page TIFF has no second page\" )"
  ],
+ "win32_baseboard_serial_mismatch_guard": [
+  "( board.get_string(\"SerialNumber\").as_deref(), Some(identity.machine.baseboard_serial.as_str()) )",
+  "(objects.len(), 1)"
+ ],
+ "win32_bios_serial_mismatch_guard": [
+  "( bios.get_string(\"SerialNumber\").as_deref(), Some(identity.machine.serial_number.as_str()) )",
+  "( bios.get_string(\"Version\").as_deref(), Some(identity.machine.bios_version.as_str()) )"
+ ],
+ "win32_computer_system_product_uuid_mismatch_guard": [
+  "( product.get_string(\"UUID\").as_deref(), Some(identity.machine.uuid.as_str()) )",
+  "( product.get_string(\"IdentifyingNumber\").as_deref(), Some(identity.machine.serial_number.as_str()) )"
+ ],
  "win32_directory_handle_rejects_invalid_backup_semantics": [
   "( err.code, ReasonCode::RcIo, \"missing FILE_FLAG_BACKUP_SEMANTICS must be a directory-handle error\" )",
   "( err.code, ReasonCode::RcIo, \"CreateNew on an existing directory must be a directory-handle error\" )",
   "(info.normalized_path, \"C:\\\\dir-handle\")"
+ ],
+ "win32_logicaldisk_volume_serial_mismatch_guard": [
+  "( disk.get_string(\"VolumeSerialNumber\").as_deref(), Some(expected.as_str()) )"
+ ],
+ "win32_move_file_ex_rename_and_replace": [
+  "( call(&mut session, HostThunk::CreateDirectoryW, &[directory_path]), 1 )",
+  "( call( &mut session, HostThunk::WriteFile, &[handle, buffer, 5, written, 0], ), 1 )",
+  "(call(&mut session, HostThunk::CloseHandle, &[handle]), 1)",
+  "( call( &mut session, HostThunk::MoveFileExW, &[source, destination, 0], ), 1 )",
+  "( fs::read( session .win32() .guest_path_to_host_path(\"C:\\\\positive\\\\dest.bin\") .unwrap() ) .unwrap(), b\"first\" )",
+  "( call( &mut session, HostThunk::WriteFile, &[handle, buffer, 6, written, 0], ), 1 )"
+ ],
+ "win32_networkadapter_mac_mismatch_guard": [
+  "(found, true)"
  ],
  "win32_read_file_overlapped_full_missing_host_file_is_io_error": [
   "( err.code, ReasonCode::RcIo, \"a removed backing file must surface as an I/O error\" )"
@@ -10081,13 +11237,42 @@
   "( parse_group(&wire_group_member(GROUP_OP_REMOVE_MEMBER, 5, 9, 7, 8)), Some(GroupWire::RemoveMember { sender: 5, sequence: 9, group_id: 7, members: vec![8], }) )",
   "(parse_group(&datagram), None)"
  ],
- "worker_safe_classification_rejects_host_barriers_and_helper_fallback": [
+ "worker_chained_code_safepoint_and_smc_stop_before_the_next_block": [
+  "(report.stop, SliceStop::Budget)",
+  "(state.rip, 0x2000)",
+  "( report.stop, SliceStop::Safepoint, \"a chained callee must poll the safepoint at its block entry\" )",
+  "( report.blocks_executed, 0, \"the callee's entry safepoint poll must stop before its body runs\" )",
+  "(report.stop, SliceStop::CodeWrite)"
+ ],
+ "worker_indirect_calls_use_monomorphic_polymorphic_and_megamorphic_caches": [
+  "(report.stop, SliceStop::Budget)",
+  "(state.rip, target)",
+  "(report.metrics.indirect_megamorphic_sites, 0)",
+  "( ( thread.metrics.indirect_ic_hits, thread.metrics.indirect_ic_misses, thread.metrics.indirect_megamorphic_sites, thread.metrics.indirect_megamorphic_hits, ), (5, 4, 0, 0), \"four distinct call targets stay inside the 4-way polymorphic cache\" )",
+  "(report.metrics.indirect_megamorphic_sites, 1)",
+  "(report.metrics.indirect_ic_misses, 1)"
+ ],
+ "worker_mispredicted_return_follows_the_real_guest_address": [
+  "( report.stop, SliceStop::Budget, \"execution must continue at the real return address, not the prediction\" )",
+  "(state.rip, 0x2020)",
+  "( ( report.metrics.return_hits, report.metrics.return_misses, report.metrics.return_mispredictions, ), (0, 1, 1), \"the overwritten return address must be a counted misprediction\" )",
+  "(report.metrics.native_chains, 2)"
+ ],
+ "worker_recursion_uses_native_call_ret_chain_and_exact_predictor_counters": [
+  "( report.stop, SliceStop::HostBarrier { rip: 0xDEAD }, \"the balanced recursion must unwind to the caller's sentinel\" )",
+  "(state.get(Register::Rcx), 0)",
+  "(report.blocks_executed, 10)",
+  "( ( report.metrics.return_predictions, report.metrics.return_hits, report.metrics.return_misses, report.metrics.return_mispredictions, report.metrics.native_chains, ), (4, 3, 1, 0, 9), \"three calls and four returns must be predicted exactly\" )",
+  "(report.metrics.blocks_executed, 10)",
+  "( report.metrics.dispatcher_exits, 1, \"the balanced recursion is one native chain\" )"
+ ],
+ "worker_safe_classification_accepts_native_control_transfer_rejects_mid_block_exits": [
   "(block_is_worker_safe(&[IrInstruction::Nop], true), false)",
   "(block_is_worker_safe(&[IrInstruction::Cpuid], false), false)",
-  "( block_is_worker_safe( &[IrInstruction::Call { target: 0x1000, return_address: 0x1005, }], false, ), false )",
-  "( block_is_worker_safe( &[IrInstruction::CallRegister { src: Register::Rax, return_address: 0x1005, }], false, ), false )",
-  "( block_is_worker_safe(&[IrInstruction::Return { stack_adjust: 0 }], false), false )",
-  "( block_is_worker_safe( &[ IrInstruction::MovImm { dst: Register::Rax, value: 1, }, IrInstruction::Nop, ], false, ), true )"
+  "(block_is_worker_safe(&[IrInstruction::Xgetbv], false), false)",
+  "( block_is_worker_safe( &[IrInstruction::Fxsave { address: crate::cpu::MemoryOperand { base: None, index: None, scale: 1, displacement: 0, rip_relative: false, rip_base: 0, segment: None, address_size_32: false, absolute_address: None, } }], false ), false )",
+  "( block_is_worker_safe( &[IrInstruction::Call { target: 0x1000, return_address: 0x1005, }], false, ), true )",
+  "( block_is_worker_safe( &[IrInstruction::CallRegister { src: Register::Rax, return_address: 0x1005, }], false, ), true )"
  ],
  "write_file_denied_on_read_only_handle": [
   "(runtime.last_error, 0)",
@@ -10113,6 +11298,14 @@
   "(wsa_error_to_dos_error(10038), ERROR_INVALID_HANDLE)",
   "(wsa_error_to_dos_error(10060), ERROR_TIMEOUT)",
   "(wsa_error_to_dos_error(99999), ERROR_INVALID_PARAMETER)"
+ ],
+ "x86_extended_process_information_uses_the_real_32_bit_layout_and_rejects_invalid_unbacked_fields": [
+  "(SYSTEM_PROCESS_INFORMATION_FIXED_SIZE_X86, 0xB8)",
+  "(SYSTEM_THREAD_INFORMATION_SIZE_X86, 0x40)",
+  "(SYSTEM_EXTENDED_THREAD_INFORMATION_SIZE_X86, 0x60)",
+  "( first_next as usize, align8( SYSTEM_PROCESS_INFORMATION_FIXED_SIZE_X86 + SYSTEM_EXTENDED_THREAD_INFORMATION_SIZE_X86 + \"game.exe\".encode_utf16().count() * 2 ), \"the x86 next-entry offset accounts for the 0xB8/0x60 records\" )",
+  "(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1)",
+  "( u32::from_le_bytes(bytes[0x44..0x48].try_into().unwrap()), 100, \"UniqueProcessId is a 32-bit HANDLE at 0x44\" )"
  ],
  "x86_kmdf_layout_paths_and_shims_reject_malformed_blocks": [
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceInitSetDeviceType, &[0xDEAD, 1], ) .expect(\"x86 missing init\"), STATUS_INVALID_PARAMETER )",

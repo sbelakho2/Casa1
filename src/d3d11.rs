@@ -851,6 +851,74 @@ struct ResourceRecord {
     digest: Option<String>,
 }
 
+/// A borrow returned by [`D3d11Device::map`].
+///
+/// Non-present resources borrow their shared `bytes` backing directly. Present
+/// backbuffers on the zero-copy path borrow the locked IOSurface mapping, so a
+/// Map/Unmap round-trip never materializes a `Vec` copy.
+pub enum D3d11Map<'a> {
+    Bytes(&'a mut [u8]),
+    Surface(crate::metal_backend::IoSurfacePixelsMut),
+}
+
+impl D3d11Map<'_> {
+    /// Real row pitch of the borrowed backing; `0` means tightly packed
+    /// (non-surface resources).
+    pub fn row_pitch(&self) -> usize {
+        match self {
+            Self::Bytes(_) => 0,
+            Self::Surface(surface) => surface.row_pitch(),
+        }
+    }
+
+    /// Number of rows in a surface mapping; `0` for tight byte buffers.
+    pub fn height(&self) -> usize {
+        match self {
+            Self::Bytes(_) => 0,
+            Self::Surface(surface) => surface.height(),
+        }
+    }
+}
+
+impl std::fmt::Debug for D3d11Map<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("D3d11Map")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl std::ops::Deref for D3d11Map<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Surface(surface) => surface,
+        }
+    }
+}
+
+impl std::ops::DerefMut for D3d11Map<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Surface(surface) => surface,
+        }
+    }
+}
+
+impl AsRef<[u8]> for D3d11Map<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl AsMut<[u8]> for D3d11Map<'_> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ViewRecord {
     info: ViewInfo,
@@ -2025,37 +2093,95 @@ impl D3d11Device {
         Ok(())
     }
 
-    /// Maps a resource for CPU access, returning a full copy of its bytes.
-    /// The full-buffer clone doubles memory traffic for large per-frame
-    /// mappings; callers that only write a subset should prefer
-    /// `update_subresource`.
-    pub fn map(&mut self, resource: D3d11ResourceId) -> AppResult<Vec<u8>> {
-        let pixels = if let Some((swapchain, index)) = self.present_backbuffer_index(resource) {
-            if let Some(channel) = self.nv12_channel(swapchain) {
-                let _ = index;
-                channel.to_rgba8()?
-            } else if self.swapchain == Some(swapchain) {
-                self.iosurface_channels[index].read_pixels()?
+    /// Map a resource for CPU access, returning a borrow into its real shared
+    /// backing (the CPU byte storage or the locked IOSurface), not a copy.
+    ///
+    /// The borrow aliases the backing until it is dropped; call
+    /// [`unmap`](Self::unmap) afterwards to clear the mapped state and publish
+    /// the bytes to the translation backend.
+    pub fn map(&mut self, resource: D3d11ResourceId) -> AppResult<D3d11Map<'_>> {
+        if let Some((swapchain, index)) = self.present_backbuffer_index(resource) {
+            if self.nv12_channel(swapchain).is_some() {
+                // An NV12 IOSurface is two independent plane mappings; it
+                // cannot be exposed as one contiguous D3D11 NV12 mapping
+                // without a copy. Refuse explicitly instead of silently
+                // staging the whole surface.
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "NV12 Map is not zero-copy: the IOSurface has two plane mappings",
+                ));
+            }
+            self.resource_mut(resource)?.mapped = true;
+            let surface = if self.swapchain == Some(swapchain) {
+                self.iosurface_channels
+                    .get(index)
+                    .map(|channel| channel.map_pixels_mut())
             } else {
-                match self
-                    .extra_swapchains
+                self.extra_swapchains
                     .get(&swapchain)
                     .and_then(|set| set.pixel.get(index))
-                {
-                    Some(channel) => channel.read_pixels()?,
-                    None => self.resource(resource)?.bytes.clone(),
-                }
+                    .map(|channel| channel.map_pixels_mut())
+            };
+            match surface {
+                Some(Ok(view)) => return Ok(D3d11Map::Surface(view)),
+                Some(Err(error)) => return Err(error),
+                None => {}
             }
-        } else {
-            self.resource(resource)?.bytes.clone()
-        };
-        self.resource_mut(resource)?.mapped = true;
-        Ok(pixels)
+        }
+        let record = self.resource_mut(resource)?;
+        record.mapped = true;
+        Ok(D3d11Map::Bytes(record.bytes.as_mut_slice()))
     }
 
-    pub fn unmap(&mut self, resource: D3d11ResourceId, bytes: &[u8]) -> AppResult<()> {
+    /// Unmap a resource whose shared backing was written through [`map`].
+    ///
+    /// The large per-frame `Vec` that the old API accepted is gone: the bytes
+    /// already live in the mapped backing. The translation backend is updated
+    /// from that same storage and the update is classified by the backend
+    /// (shared resources record a zero-copy update, private ones a staged
+    /// upload).
+    pub fn unmap(&mut self, resource: D3d11ResourceId) -> AppResult<()> {
         let mapped = self.resource(resource)?.mapped;
         if !mapped {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "resource {} is not mapped",
+                    self.resource(resource)?.desc.label
+                ),
+            ));
+        }
+        self.resource_mut(resource)?.mapped = false;
+        if self.present_backbuffer_index(resource).is_some() {
+            // The mapped slice aliased the surface; the write already landed.
+            self.surface_writes += 1;
+            self.record_cpu_backing_write();
+            return Ok(());
+        }
+        // Move the record out so its backing can be borrowed without cloning,
+        // then publish the exact same bytes to the translation backend.
+        let record = self.resources.remove(&resource).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown resource {resource}"),
+            )
+        })?;
+        let backend_id = record.backend_id;
+        let result = self
+            .backend
+            .overwrite_resource_host_visible(backend_id, record.bytes.as_slice());
+        self.resources.insert(resource, record);
+        result?;
+        self.record_cpu_backing_write();
+        self.promote_texture_cpu_write_usage(resource)?;
+        Ok(())
+    }
+
+    /// Unmap with an explicit payload. Kept for callers that already own the
+    /// written bytes; the payload is copied into the shared backing before the
+    /// mapped state is cleared.
+    pub fn unmap_with_bytes(&mut self, resource: D3d11ResourceId, bytes: &[u8]) -> AppResult<()> {
+        if !self.resource(resource)?.mapped {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 format!(
@@ -2073,26 +2199,14 @@ impl D3d11Device {
                 ),
             ));
         }
-        self.resource_mut(resource)?.mapped = false;
         if self.write_present_backbuffer_bytes(resource, 0, bytes)? {
+            self.resource_mut(resource)?.mapped = false;
             self.resource_mut(resource)?.digest = None;
             self.promote_texture_cpu_write_usage(resource)?;
             return Ok(());
         }
-        let backend_id = {
-            let record = self.resource_mut(resource)?;
-            record.bytes[..bytes.len()].copy_from_slice(bytes);
-            record.digest = None;
-            record.backend_id
-        };
-        self.record_cpu_backing_write();
-        self.promote_texture_cpu_write_usage(resource)?;
-        // Mapped memory is host-visible by definition: classify the write so
-        // host-visible resources are counted as zero-copy updates and
-        // device-private resources as staged uploads.
-        self.backend
-            .overwrite_resource_host_visible(backend_id, bytes)?;
-        Ok(())
+        self.resource_mut(resource)?.bytes[..bytes.len()].copy_from_slice(bytes);
+        self.unmap(resource)
     }
 
     pub fn copy_resource(&mut self, src: D3d11ResourceId, dst: D3d11ResourceId) -> AppResult<()> {
@@ -6388,17 +6502,28 @@ mod tests {
         .expect("create primary");
         let primary_backbuffer = device.swapchain_backbuffer(0).expect("primary backbuffer");
         let frame_pixels: Vec<u8> = (0..32).map(|index| (index * 3) as u8).collect();
-        assert_eq!(
-            device.map(primary_backbuffer).expect("map primary").len(),
-            32
-        );
+        {
+            let mut mapped = device.map(primary_backbuffer).expect("map primary");
+            let pitch = mapped.row_pitch().max(4 * 4);
+            assert_eq!(mapped.len(), pitch * 2);
+            assert_eq!(pitch % 4, 0);
+            for row in 0..2 {
+                let start = row * pitch;
+                mapped[start..start + 16].copy_from_slice(&frame_pixels[row * 16..(row + 1) * 16]);
+            }
+        }
         device
-            .unmap(primary_backbuffer, &frame_pixels)
+            .unmap(primary_backbuffer)
             .expect("publish primary frame");
-        assert_eq!(
-            device.map(primary_backbuffer).expect("map surface"),
-            frame_pixels
-        );
+        {
+            let mapped = device.map(primary_backbuffer).expect("map surface");
+            let pitch = mapped.row_pitch().max(4 * 4);
+            let mut tight = Vec::new();
+            for row in 0..2 {
+                tight.extend_from_slice(&mapped[row * pitch..row * pitch + 16]);
+            }
+            assert_eq!(tight, frame_pixels);
+        }
         assert_eq!(device.surface_writes(), 1);
 
         let secondary = device
@@ -6410,26 +6535,27 @@ mod tests {
             })
             .expect("create secondary");
         let secondary_backbuffers = device.swapchain_state_for(secondary).unwrap().backbuffers;
-        assert_eq!(
-            device
+        {
+            let mapped = device
                 .map(secondary_backbuffers[0])
-                .expect("map extra surface")
-                .len(),
-            32
-        );
+                .expect("map extra surface");
+            assert_eq!(mapped.len(), mapped.row_pitch().max(16) * 2);
+        }
         device
             .extra_swapchains
             .get_mut(&secondary)
             .unwrap()
             .pixel
             .pop();
-        let fallback = device
-            .map(secondary_backbuffers[1])
-            .expect("missing channel maps CPU backing");
-        assert_eq!(fallback, vec![0u8; 32]);
+        {
+            let fallback = device
+                .map(secondary_backbuffers[1])
+                .expect("missing channel maps CPU backing");
+            assert_eq!(&*fallback, &[0u8; 32]);
+        }
         let before = device.cpu_backing_writes();
         device
-            .unmap(secondary_backbuffers[1], &fallback)
+            .unmap(secondary_backbuffers[1])
             .expect("missing channel unmaps to CPU backing");
         assert_eq!(device.cpu_backing_writes(), before + 1);
 
@@ -6480,9 +6606,14 @@ mod tests {
             .expect("create NV12 swapchain");
         assert_eq!(device.nv12_fallback_count(), 0, "host must expose NV12");
         let backbuffer = device.swapchain_backbuffer(0).expect("backbuffer");
-        let mapped = device.map(backbuffer).expect("map NV12 channel");
-        assert_eq!(mapped.len(), 32);
-        assert_eq!(mapped[3], 255);
+        let error = device
+            .map(backbuffer)
+            .expect_err("two-plane NV12 Map cannot be one contiguous borrow");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "NV12 Map is not zero-copy: the IOSurface has two plane mappings"
+        );
         let frame = device
             .presented_frame_for(swapchain)
             .expect("NV12 presented frame");
@@ -6866,5 +6997,76 @@ mod tests {
             .resource_bytes_for_transfer(backbuffer)
             .expect("CPU backing fallback");
         assert_eq!(bytes, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn d3d11_map_unmap_direct_shared_backing_rejects_staged_fallback() {
+        let mut device = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
+        )
+        .expect("create device");
+        let buffer = device
+            .create_buffer(
+                "dynamic-constant-buffer",
+                64,
+                ResourceUsageHint::Buffer {
+                    role: crate::gfx::BufferRole::Constant,
+                    cpu_write_frequent: true,
+                },
+            )
+            .expect("create dynamic buffer");
+        let first: Vec<u8> = (0..64).map(|index| (index * 3) as u8).collect();
+        let first_pointer;
+        {
+            let mut mapped = device.map(buffer).expect("map zeroed buffer");
+            assert_eq!(&*mapped, &[0u8; 64]);
+            first_pointer = mapped.as_ptr();
+            mapped.copy_from_slice(&first);
+        }
+        device.unmap(buffer).expect("unmap direct write");
+        {
+            let mapped = device.map(buffer).expect("map after unmap");
+            assert_eq!(&*mapped, first.as_slice());
+            assert_eq!(
+                mapped.as_ptr(),
+                first_pointer,
+                "Map must return a stable borrow into the same backing"
+            );
+        }
+        let stats = device.backend().translation_stats();
+        assert_eq!(stats.zero_copy_updates, 1);
+        assert_eq!(stats.staged_copies, 0);
+
+        let second: Vec<u8> = (0..64).map(|index| (255 - index) as u8).collect();
+        device
+            .update_subresource(buffer, &second)
+            .expect("record update");
+        device.submit_immediate().expect("execute update");
+        {
+            let mapped = device.map(buffer).expect("map after update");
+            assert_eq!(&*mapped, second.as_slice());
+            assert_eq!(
+                mapped.as_ptr(),
+                first_pointer,
+                "writes must not move the mapped backing"
+            );
+        }
+        let stats = device.backend().translation_stats();
+        assert_eq!(stats.zero_copy_updates, 2);
+        assert_eq!(stats.staged_copies, 0);
+
+        device.unmap(buffer).expect("clear mapped state");
+        let error = device
+            .unmap(buffer)
+            .expect_err("unmap without map must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "resource dynamic-constant-buffer is not mapped"
+        );
     }
 }

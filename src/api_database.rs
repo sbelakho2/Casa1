@@ -1453,17 +1453,20 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "CLRCreateInstance",
         None,
         SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "Models a Windows machine with no .NET CLR installed: activation answers \
-         COR_E_CLRNOTAVAILABLE.  Export dispatch is callable; the CLR capability is \
-         absent (see KNOWN_LIMITATIONS: .NET applications do not run).",
+        SubsystemCapability::Partial,
+        "Models a Windows machine with no .NET Framework CLR installed for the \
+         Framework hosting contract: CLRCreateInstance answers \
+         COR_E_CLRNOTAVAILABLE.  Separately, managed images carrying a CLI header \
+         execute on the host-installed CoreCLR (dotnet 8) through the real managed \
+         execution path, so the CLR capability is partial: .NET (Core) images run, \
+         .NET Framework-only images do not.",
     ),
     semantic_override(
         "mscoree.dll",
         "CorBindToRuntime",
         None,
         SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
+        SubsystemCapability::Partial,
         "Models a Windows machine with no .NET CLR installed: activation answers \
          COR_E_CLRNOTAVAILABLE.",
     ),
@@ -1472,7 +1475,7 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "CorBindToRuntimeEx",
         None,
         SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
+        SubsystemCapability::Partial,
         "Models a Windows machine with no .NET CLR installed: activation answers \
          COR_E_CLRNOTAVAILABLE.",
     ),

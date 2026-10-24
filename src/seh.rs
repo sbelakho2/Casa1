@@ -2461,7 +2461,6 @@ mod tests {
 
     /// Test: Stack pointer validation in virtual_unwind.
     /// A zero or misaligned RSP should return NotFound.
-
     /// Test: Pending guest VEH callback limit is enforced.
     #[test]
     fn test_pending_guest_veh_limit() {
@@ -2544,10 +2543,8 @@ mod tests {
     /// Prolog: `push rbp; sub rsp, 0x20; lea rbp, [rsp+0x20]` — the frame
     /// register is established as RBP = RSP_final + 0x20, so unwinding must
     /// set RSP = RBP - 0x20. The header byte encodes frame_offset=2 (2*16).
-
     /// Test: the unwind cache is keyed per image — two images sharing the
     /// same unwind RVA must never return each other's unwind info.
-
     /// Test: `dispatch` actually queues an EHANDLER frame's language handler
     /// for guest invocation (via the pending guest VEH queue) instead of
     /// silently swallowing the exception.

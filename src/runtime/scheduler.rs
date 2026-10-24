@@ -1521,6 +1521,10 @@ const MAX_PRODUCTION_WORKERS: usize = 64;
 /// guest thread back to the scheduler.  Bounds slice latency without a host
 /// poll (the block prologue's safepoint check remains the hard interrupt).
 const PRODUCTION_SLICE_BLOCKS: u64 = 512;
+/// Upper bound on statically reachable blocks precompiled per worker round.
+/// Bounds cold-start work for a large call graph; further targets are compiled
+/// by later owner rounds as the slice reaches them.
+const SLICE_REACHABLE_BLOCKS: usize = 256;
 /// Upper bound on how long the runtime owner waits for one parallel slice
 /// round; a stuck worker is a bug, not a scheduling policy.
 const PRODUCTION_SLICE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1798,6 +1802,12 @@ struct ProductionState {
     completions: VecDeque<WaitCompletion>,
     slice_queue: VecDeque<GuestSliceJob>,
     slice_completions: VecDeque<GuestSliceCompletion>,
+    /// Long-lived per-guest-thread worker slots.  A slot keeps the guest
+    /// `CpuState` (including TEB/TLS bases), the return predictor, the
+    /// indirect inline caches, the slice-cache generation, and the wait
+    /// object across slice rounds, so a guest thread never restarts cold
+    /// merely because a budget boundary was reached.
+    slots: BTreeMap<u32, GuestThreadSlot>,
     shutdown: bool,
     active_jobs: usize,
     next_job_id: u64,
@@ -1820,8 +1830,10 @@ struct ProductionShared {
 pub(crate) enum GuestSliceExit {
     /// The per-slice block budget was exhausted; the thread is runnable.
     Budget,
-    /// The next block needs the runtime owner (host thunk/call/ret/indirect
-    /// jump or an uncompiled block).  No host code ran on the worker.
+    /// The next transfer needs the runtime owner: an uncompiled/dynamic
+    /// target, a host thunk, or a block that is not worker-safe.  Native
+    /// calls, returns, and indirect transfers do not reach this exit when
+    /// their target was precompiled.  No host code ran on the worker.
     HostBarrier { rip: u64 },
     /// The guest load/store hit memory the worker view cannot service; the
     /// runtime owner retries it with the full page table/VM.
@@ -1850,12 +1862,55 @@ pub(crate) struct GuestSliceReport {
     pub(crate) blocks_executed: u64,
     pub(crate) worker_index: usize,
     pub(crate) code_writes: Vec<(u64, usize)>,
+    /// Control-flow counters accumulated by this slice round.
+    pub(crate) metrics: crate::jit::SliceMetrics,
+}
+
+/// A persistent worker slot for one guest thread.  It is removed from the
+/// scheduler's slot map while a job runs on a worker and put back when the
+/// job completes, so exactly one host thread owns the guest state at a time.
+struct GuestThreadSlot {
+    thread_id: u32,
+    state: CpuState,
+    control: crate::jit::SliceThreadState,
+    /// Park signal of the current production wait, retained with the slot so
+    /// the wait object survives a slice-budget boundary.
+    wait: Option<Arc<ParkSignal>>,
+    /// Native worker that last ran this slot (affinity hint).
+    worker_index: Option<usize>,
+    /// Completed slice rounds on this slot.
+    slices: u64,
+}
+
+impl GuestThreadSlot {
+    fn new(thread_id: u32, state: CpuState) -> Self {
+        Self {
+            thread_id,
+            state,
+            control: crate::jit::SliceThreadState::default(),
+            wait: None,
+            worker_index: None,
+            slices: 0,
+        }
+    }
+}
+
+/// Point-in-time view of a persistent worker slot (diagnostics/tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GuestSlotSnapshot {
+    pub(crate) thread_id: u32,
+    pub(crate) rip: u64,
+    pub(crate) fs_base: u64,
+    pub(crate) slices: u64,
+    pub(crate) worker_index: Option<usize>,
+    pub(crate) has_wait: bool,
+    pub(crate) translation_epoch: u64,
+    pub(crate) metrics: crate::jit::SliceMetrics,
 }
 
 struct GuestSliceJob {
     job_id: u64,
-    thread_id: u32,
-    state: CpuState,
+    slot: GuestThreadSlot,
     program: Arc<crate::jit::GuestSliceProgram>,
     budget: u64,
     /// Optional simultaneous-start gate shared by all jobs of one round, so
@@ -1905,12 +1960,12 @@ impl SliceStartGate {
 
 struct GuestSliceCompletion {
     job_id: u64,
-    thread_id: u32,
-    state: CpuState,
+    slot: GuestThreadSlot,
     exit: GuestSliceExit,
     blocks_executed: u64,
     worker_index: usize,
     code_writes: Vec<(u64, usize)>,
+    metrics: crate::jit::SliceMetrics,
 }
 
 /// Bounded native host worker pool for parked guest waits.  Dropping the pool
@@ -1994,10 +2049,14 @@ impl ProductionScheduler {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let job_id = shared.next_slice_id;
         shared.next_slice_id = shared.next_slice_id.wrapping_add(1);
+        let mut slot = shared
+            .slots
+            .remove(&thread_id)
+            .unwrap_or_else(|| GuestThreadSlot::new(thread_id, state.clone()));
+        slot.state = state;
         shared.slice_queue.push_back(GuestSliceJob {
             job_id,
-            thread_id,
-            state,
+            slot,
             program,
             budget,
             start,
@@ -2023,6 +2082,76 @@ impl ProductionScheduler {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.slice_completions.drain(..).collect()
+    }
+
+    /// Create a persistent slot for a guest thread that has not run a slice
+    /// yet (for example a thread that blocks before its first slice).
+    fn ensure_slot(&self, thread_id: u32, state: &CpuState) {
+        let mut shared = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        shared
+            .slots
+            .entry(thread_id)
+            .or_insert_with(|| GuestThreadSlot::new(thread_id, state.clone()));
+    }
+
+    /// Retain the wait object on the guest thread's persistent slot.
+    fn set_slot_wait(&self, thread_id: u32, signal: Arc<ParkSignal>) {
+        let mut shared = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(slot) = shared.slots.get_mut(&thread_id) {
+            slot.wait = Some(signal);
+        }
+    }
+
+    /// Clear the wait object when the wait completes (or is abandoned).
+    fn clear_slot_wait(&self, thread_id: u32) {
+        let mut shared = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(slot) = shared.slots.get_mut(&thread_id) {
+            slot.wait = None;
+        }
+    }
+
+    /// Drop persistent slots for guest threads that no longer exist.  This is
+    /// the termination wake for persistent state: the slot's wait object and
+    /// JIT control caches are released with it.
+    fn retire_slots(&self, live: &BTreeSet<u32>) {
+        let mut shared = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        shared.slots.retain(|thread_id, _| live.contains(thread_id));
+    }
+
+    /// Snapshot of one persistent slot (diagnostics/tests).
+    #[allow(dead_code)] // exposed for scheduler diagnostics/tests
+    pub(crate) fn slot_snapshot(&self, thread_id: u32) -> Option<GuestSlotSnapshot> {
+        let shared = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        shared.slots.get(&thread_id).map(|slot| GuestSlotSnapshot {
+            thread_id: slot.thread_id,
+            rip: slot.state.rip,
+            fs_base: slot.state.segment_bases.fs,
+            slices: slot.slices,
+            worker_index: slot.worker_index,
+            has_wait: slot.wait.is_some(),
+            translation_epoch: slot.control.epoch(),
+            metrics: slot.control.metrics,
+        })
     }
 
     fn wait_for_completion(&self, timeout: Option<Duration>) -> bool {
@@ -2090,13 +2219,24 @@ impl ProductionScheduler {
             }
             for completion in self.take_slice_completions() {
                 if pending.remove(&completion.job_id) {
+                    let thread_id = completion.slot.thread_id;
+                    let state = completion.slot.state.clone();
+                    // Return the persistent slot to the map so the next round
+                    // reuses its predictor, inline caches and TEB/TLS state.
+                    self.shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .slots
+                        .insert(thread_id, completion.slot);
                     reports.push(GuestSliceReport {
-                        thread_id: completion.thread_id,
-                        state: completion.state,
+                        thread_id,
+                        state,
                         exit: completion.exit,
                         blocks_executed: completion.blocks_executed,
                         worker_index: completion.worker_index,
                         code_writes: completion.code_writes,
+                        metrics: completion.metrics,
                     });
                 }
             }
@@ -2159,6 +2299,25 @@ enum ProductionJob {
     Slice(GuestSliceJob),
 }
 
+/// Prefer a queued slice whose persistent slot last ran on this worker, so a
+/// guest thread keeps its host-thread affinity (TLS-heavy code, predictor
+/// warmth).  Falls back to the oldest job when no affine job is queued, which
+/// prevents a busy affine worker from starving the thread.
+fn pop_affine_slice(
+    queue: &mut std::collections::VecDeque<GuestSliceJob>,
+    worker_index: usize,
+) -> Option<GuestSliceJob> {
+    let affine = queue.iter().position(|job| {
+        job.slot
+            .worker_index
+            .is_some_and(|assigned| assigned == worker_index)
+    });
+    match affine {
+        Some(index) => queue.remove(index),
+        None => queue.pop_front(),
+    }
+}
+
 fn production_worker(shared: Arc<ProductionShared>, worker_index: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     SCHEDULER_COUNTERS.note_host_worker_identity();
@@ -2173,8 +2332,9 @@ fn production_worker(shared: Arc<ProductionShared>, worker_index: usize) {
                     return;
                 }
                 let thread_id;
-                let job = if let Some(job) = state.slice_queue.pop_front() {
-                    thread_id = job.thread_id;
+                let job = if let Some(job) = pop_affine_slice(&mut state.slice_queue, worker_index)
+                {
+                    thread_id = job.slot.thread_id;
                     ProductionJob::Slice(job)
                 } else if let Some(job) = state.queue.pop_front() {
                     thread_id = job.thread_id;
@@ -2231,105 +2391,55 @@ fn production_worker(shared: Arc<ProductionShared>, worker_index: usize) {
 }
 
 fn run_guest_slice_job(
-    job: GuestSliceJob,
+    mut job: GuestSliceJob,
     shutdown: &std::sync::atomic::AtomicBool,
     worker_index: usize,
 ) -> GuestSliceCompletion {
     use std::sync::atomic::Ordering;
-    let mut state = job.state;
-    let mut blocks_executed = 0_u64;
     if let Some(start) = job.start.as_ref() {
         start.arrive_and_wait(shutdown);
     }
-    let exit;
-    let guard = crate::jit::WorkerSliceGuard::install(&job.program.memory);
-    loop {
-        if shutdown.load(Ordering::Acquire) {
-            exit = GuestSliceExit::Shutdown;
-            break;
+    job.slot.worker_index = Some(worker_index);
+    job.slot.slices = job.slot.slices.saturating_add(1);
+    // SAFETY: the blocks belong to this worker program (compiled and
+    // finalized by the runtime owner), the slot is removed from the scheduler
+    // map for the duration of the job, and the memory view is installed by
+    // `run_slice` for the whole slice.
+    let report = unsafe {
+        crate::jit::run_slice(
+            &job.program,
+            &mut job.slot.state,
+            &mut job.slot.control,
+            job.budget,
+            shutdown,
+        )
+    };
+    let exit = match report.stop {
+        crate::jit::SliceStop::Budget => GuestSliceExit::Budget,
+        crate::jit::SliceStop::HostBarrier { rip } => GuestSliceExit::HostBarrier { rip },
+        crate::jit::SliceStop::GuestFault { address, write } => {
+            GuestSliceExit::GuestFault { address, write }
         }
-        if blocks_executed >= job.budget {
-            exit = GuestSliceExit::Budget;
-            break;
+        crate::jit::SliceStop::CodeWrite => GuestSliceExit::CodeWrite,
+        crate::jit::SliceStop::Safepoint => {
+            // Same protocol as the blocking dispatcher: the request is
+            // consumed when the block yields, unless the pool is shutting
+            // down (Drop sets both).
+            if !shutdown.load(Ordering::Acquire) {
+                crate::jit::JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+            }
+            GuestSliceExit::Safepoint
         }
-        let Some(block) = job.program.block(state.rip) else {
-            exit = GuestSliceExit::HostBarrier { rip: state.rip };
-            break;
-        };
-        if !block.worker_safe {
-            exit = GuestSliceExit::HostBarrier { rip: state.rip };
-            break;
-        }
-        let mut exit_slot = [u64::MAX, job.program.flat_base];
-        // SAFETY: the block belongs to this worker program (compiled and
-        // finalized by the runtime owner), `state` is owned by this job, and
-        // the memory view is installed for the whole slice.
-        let outcome = unsafe {
-            crate::jit::execute_slice_block(&job.program, block, &mut state, &mut exit_slot)
-        };
-        blocks_executed += 1;
-        if guard.code_written() {
-            exit = GuestSliceExit::CodeWrite;
-            break;
-        }
-        match outcome.reason {
-            crate::jit::JitExitReason::Jump { target } => {
-                state.rip = target;
-            }
-            crate::jit::JitExitReason::ConditionalBranch { taken, .. } => {
-                let info = job
-                    .program
-                    .block(outcome.final_block)
-                    .and_then(|block| block.last_exit_info)
-                    .or(block.last_exit_info);
-                match info {
-                    Some(crate::jit::BlockExitInfo::JumpIf {
-                        target,
-                        fallthrough,
-                        ..
-                    }) => {
-                        state.rip = if taken { target } else { fallthrough };
-                    }
-                    _ => {
-                        exit = GuestSliceExit::HostBarrier { rip: state.rip };
-                        break;
-                    }
-                }
-            }
-            crate::jit::JitExitReason::Safepoint => {
-                exit = GuestSliceExit::Safepoint;
-                // Same protocol as the blocking dispatcher: the request is
-                // consumed when the block yields, unless the pool is shutting
-                // down (Drop sets both).
-                if !shutdown.load(Ordering::Acquire) {
-                    crate::jit::JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
-                }
-                break;
-            }
-            crate::jit::JitExitReason::GuestFault => {
-                let address = state.jit_pending_fault.take().unwrap_or(state.rip);
-                let write = std::mem::take(&mut state.jit_pending_fault_write);
-                exit = GuestSliceExit::GuestFault { address, write };
-                break;
-            }
-            _ => {
-                // Host thunk/call/ret/indirect/unimplemented or a normal
-                // straight-line exit: all require the runtime owner.
-                exit = GuestSliceExit::HostBarrier { rip: state.rip };
-                break;
-            }
-        }
-    }
-    let code_writes = job.program.memory.take_code_writes();
-    drop(guard);
+        crate::jit::SliceStop::Shutdown => GuestSliceExit::Shutdown,
+    };
     GuestSliceCompletion {
         job_id: job.job_id,
-        thread_id: job.thread_id,
-        state,
+        slot: job.slot,
         exit,
-        blocks_executed,
+        blocks_executed: report.blocks_executed,
         worker_index,
-        code_writes,
+        code_writes: report.code_writes,
+        metrics: report.metrics,
     }
 }
 
@@ -2485,6 +2595,70 @@ impl PeHostRuntime {
         Ok(block.worker_safe)
     }
 
+    /// Ensure a slice block and every statically reachable successor (jump,
+    /// conditional branch, direct call) is compiled before a worker round.
+    /// This is what lets `call`/`ret` chains continue natively inside one
+    /// worker job instead of hitting an uncompiled-block barrier every hop.
+    /// Dynamic targets (indirect call/jump/ret) are resolved by the worker
+    /// and barrier only if the target was never compiled.
+    fn ensure_slice_blocks_for(&mut self, memory: &mut MemoryImage, entry: u64) -> AppResult<bool> {
+        let mut work = vec![entry];
+        let mut seen = BTreeSet::new();
+        let mut entry_safe = None;
+        while let Some(rip) = work.pop() {
+            if seen.len() >= SLICE_REACHABLE_BLOCKS || !seen.insert(rip) {
+                continue;
+            }
+            if self.host_thunks.contains_key(&rip) {
+                continue;
+            }
+            let safe = match self.ensure_slice_block(memory, rip) {
+                Ok(safe) => safe,
+                // A non-entry decode/compile failure is a runtime barrier for
+                // that path, not a reason to abort the whole round.
+                Err(error) if rip == entry => return Err(error),
+                Err(_) => continue,
+            };
+            if rip == entry {
+                entry_safe = Some(safe);
+            }
+            if !safe {
+                continue;
+            }
+            let exit_info = self
+                .jit_runtime
+                .as_ref()
+                .and_then(|jit| jit.slice_block(rip))
+                .and_then(|block| block.last_exit_info);
+            match exit_info {
+                Some(crate::jit::BlockExitInfo::Jump { target }) => work.push(target),
+                Some(crate::jit::BlockExitInfo::JumpIf {
+                    target,
+                    fallthrough,
+                    ..
+                }) => {
+                    work.push(target);
+                    work.push(fallthrough);
+                }
+                Some(crate::jit::BlockExitInfo::Call {
+                    target,
+                    return_address,
+                }) => {
+                    work.push(target);
+                    // The continuation after the call is a static block too;
+                    // precompiling it lets the callee's `ret` continue
+                    // natively instead of hitting a cold-block barrier.
+                    work.push(return_address);
+                }
+                Some(crate::jit::BlockExitInfo::CallIndirect { return_address }) => {
+                    work.push(return_address);
+                }
+                _ => {}
+            }
+        }
+        Ok(entry_safe.unwrap_or(false))
+    }
+
     /// Execute one round of guest-code slices for the supplied guest threads
     /// on the production worker pool.  The runtime owner remains the only
     /// thread that touches runtime state: worker completions are returned for
@@ -2502,7 +2676,7 @@ impl PeHostRuntime {
             return Ok(Vec::new());
         }
         for request in &requests {
-            self.ensure_slice_block(memory, request.state.rip)?;
+            self.ensure_slice_blocks_for(memory, request.state.rip)?;
         }
         let program = Arc::new(
             self.jit_runtime
@@ -2514,21 +2688,33 @@ impl PeHostRuntime {
         let reports = scheduler.run_guest_slices(requests, program, budget);
         if let Some(jit) = self.jit_runtime.as_mut() {
             let mut wrote_code = false;
+            let mut pages = BTreeSet::new();
             for report in &reports {
+                if report.code_writes.is_empty() && matches!(report.exit, GuestSliceExit::CodeWrite)
+                {
+                    // A worker's SMC epoch guard fired without this program
+                    // recording the exact store (e.g. the write came from a
+                    // sibling program sharing the canonical store).  Invalidate
+                    // conservatively at the guarded block's page.
+                    let page = report.state.rip & !0xfff;
+                    pages.insert(page);
+                    wrote_code = true;
+                }
                 for &(address, length) in &report.code_writes {
                     let start = address & !0xfff;
                     let end = (address + length as u64 - 1) & !0xfff;
                     let mut page = start;
-                    let mut pages = BTreeSet::new();
                     while page <= end {
                         pages.insert(page);
                         page += 0x1000;
                     }
-                    let _ = jit.invalidate_blocks_on_pages(&pages);
                     wrote_code = true;
                 }
             }
             if wrote_code {
+                let _ = jit.invalidate_blocks_on_pages(&pages);
+                // `invalidate_blocks_on_pages` clears slice links for an
+                // overlapping page; a conservative epoch guard always does.
                 jit.clear_slice_blocks();
             }
         } // coverage: unreachable — jit_runtime was required (unwrapped) before the dispatch, so this if-let cannot take its None path
@@ -2773,7 +2959,24 @@ impl PeHostRuntime {
         let Some(scheduler) = self.production_scheduler.as_ref() else {
             return false; // coverage: unreachable (Production mode owns a pool)
         };
-        let job_id = scheduler.submit(thread_id, signal, observed_generation, kind, deadline);
+        let job_id = scheduler.submit(
+            thread_id,
+            Arc::clone(&signal),
+            observed_generation,
+            kind,
+            deadline,
+        );
+        // A thread may block before its first slice: create its persistent
+        // slot so the wait object (and later predictor/IC state) survives.
+        if let Some(thread) = self
+            .pending_guest_threads
+            .iter()
+            .find(|thread| thread.thread_id == thread_id)
+        {
+            let state = thread.state.clone();
+            scheduler.ensure_slot(thread_id, &state);
+        }
+        scheduler.set_slot_wait(thread_id, signal);
         self.production_waits
             .insert(thread_id, ProductionWait { job_id });
         true
@@ -2783,14 +2986,19 @@ impl PeHostRuntime {
     /// (TerminateThread, process-exit abandonment).  Late completions for the
     /// removed job are ignored by the completion pass.
     fn prune_orphan_production_waits(&mut self) {
-        if self.production_waits.is_empty() {
-            return;
-        }
         let live: BTreeSet<u32> = self
             .pending_guest_threads
             .iter()
             .map(|thread| thread.thread_id)
             .collect();
+        // Persistent slots outlive waits, so retire them on every pass (a
+        // terminating thread may never have had a production wait).
+        if let Some(scheduler) = self.production_scheduler.as_ref() {
+            scheduler.retire_slots(&live);
+        }
+        if self.production_waits.is_empty() {
+            return;
+        }
         self.production_waits
             .retain(|thread_id, _| live.contains(thread_id));
     }
@@ -2835,6 +3043,9 @@ impl PeHostRuntime {
             .remove(index)
             .expect("checked parked thread index");
         self.production_waits.remove(&completion.thread_id);
+        if let Some(scheduler) = self.production_scheduler.as_ref() {
+            scheduler.clear_slot_wait(completion.thread_id);
+        }
         let Some(wait) = thread.wait.clone() else {
             self.pending_guest_threads.push_back(thread); // coverage: unreachable
             return Ok(true); // coverage: unreachable
@@ -4741,6 +4952,8 @@ mod tests {
     const SLICE_STACK_A: u64 = 0x10_E00;
     const SLICE_STACK_B: u64 = 0x10_F00;
     const SLICE_THUNK_SLOT: u64 = 0x30_F00;
+    const SLICE_CALL_CODE: u64 = 0x39_000;
+    const SLICE_CALL_COUNTER: u64 = 0x42_000;
 
     fn install_jit(session: &mut NtThunkSession) {
         if session.runtime.jit_runtime.is_none() {
@@ -4955,14 +5168,23 @@ mod tests {
             assert_eq!(reports.len(), 1);
             assert_eq!(
                 reports[0].exit,
-                GuestSliceExit::HostBarrier { rip: SLICE_CODE_2 }
+                GuestSliceExit::HostBarrier { rip: thunk },
+                "the worker resolves the indirect call target and yields at the thunk"
             );
-            assert_eq!(reports[0].blocks_executed, 0);
+            assert_eq!(
+                reports[0].blocks_executed, 1,
+                "the call block runs natively; only the thunk itself is owner work"
+            );
+            assert_eq!(
+                reports[0].state.rip, thunk,
+                "RIP points at the unresolved host thunk, with the return address already pushed"
+            );
             assert_eq!(
                 trace_calls(&session, "time", "GetTickCount64"),
                 before,
                 "a production worker must never run the host thunk"
             );
+            session.runtime.pending_guest_threads[0].state = reports[0].state.clone();
             let mut rounds = 0;
             while pump_once(&mut session) {
                 rounds += 1;
@@ -5028,10 +5250,14 @@ mod tests {
             .expect("production slice");
         assert_eq!(reports.len(), 1);
         assert_eq!(
-            reports[0].state.rip,
-            SLICE_CODE + 21,
-            "loop must fall through to ret after {iterations} iterations (exit {:?})",
+            reports[0].state.rip, 0,
+            "the worker chain must run all {iterations} iterations and the final ret (exit {:?})",
             reports[0].exit
+        );
+        assert_eq!(
+            reports[0].exit,
+            GuestSliceExit::HostBarrier { rip: 0 },
+            "the completed loop returns to the zero stack sentinel"
         );
         production.runtime.pending_guest_threads[0].state = reports[0].state.clone();
         rounds = 0;
@@ -5064,6 +5290,250 @@ mod tests {
         );
         drop(coop_dir);
         drop(prod_dir);
+    }
+
+    fn call_return_loop(counter: u64, iterations: u32) -> Vec<u8> {
+        let mut code = Vec::new();
+        // mov ecx, iterations
+        code.push(0xB9);
+        code.extend_from_slice(&iterations.to_le_bytes());
+        // xor eax, eax
+        code.extend_from_slice(&[0x31, 0xC0]);
+        let loop_start = code.len() as u64;
+        // call func (patched below)
+        code.push(0xE8);
+        let call_disp_at = code.len();
+        code.extend_from_slice(&0i32.to_le_bytes());
+        // sub ecx, 1; cmp ecx, 0; jnz loop_start
+        code.extend_from_slice(&[0x83, 0xE9, 0x01, 0x83, 0xF9, 0x00]);
+        code.push(0x75);
+        let jnz_at = code.len();
+        code.push(0);
+        // mov [counter], eax; ret
+        code.push(0xA3);
+        code.extend_from_slice(&(counter as u32).to_le_bytes());
+        code.push(0xC3);
+        let func = code.len() as u64;
+        // add eax, 1; ret
+        code.extend_from_slice(&[0x83, 0xC0, 0x01, 0xC3]);
+        let call_next = call_disp_at as u64 + 4;
+        let call_disp = (func as i64 - call_next as i64) as i32;
+        code[call_disp_at..call_disp_at + 4].copy_from_slice(&call_disp.to_le_bytes());
+        let jnz_next = jnz_at as u64 + 1;
+        let jnz_disp = (loop_start as i64 - jnz_next as i64) as i8;
+        code[jnz_at] = jnz_disp as u8;
+        code
+    }
+
+    #[test]
+    fn production_worker_call_return_chain_no_races_matches_cooperative_exactly() {
+        let _guard = test_guard();
+        let iterations = 4_u32;
+        let code = call_return_loop(SLICE_CALL_COUNTER, iterations);
+
+        let (coop_dir, mut cooperative) = test_session();
+        cooperative.map_guest(SLICE_CALL_CODE, &code);
+        cooperative.map_guest(SLICE_CALL_COUNTER & !0xfff, &vec![0_u8; 0x1000]);
+        cooperative.map_guest(SLICE_STACK_A & !0xfff, &[0_u8; 0x1000]);
+        push_guest_thread(
+            &mut cooperative,
+            0xA10,
+            0xD10,
+            SLICE_CALL_CODE,
+            SLICE_STACK_A,
+            0,
+        );
+        let mut rounds = 0;
+        while pump_once(&mut cooperative) && rounds < 10_000 {
+            rounds += 1;
+        }
+        assert_eq!(
+            read_u32_guest(&cooperative, SLICE_CALL_COUNTER),
+            iterations,
+            "cooperative call/ret loop must finish in {rounds} rounds"
+        );
+
+        let (prod_dir, mut production) = test_session();
+        install_jit(&mut production);
+        production.map_guest(SLICE_CALL_CODE, &code);
+        production.map_guest(SLICE_CALL_COUNTER & !0xfff, &vec![0_u8; 0x1000]);
+        production.map_guest(SLICE_STACK_A & !0xfff, &[0_u8; 0x1000]);
+        push_guest_thread(
+            &mut production,
+            0xA11,
+            0xD11,
+            SLICE_CALL_CODE,
+            SLICE_STACK_A,
+            0,
+        );
+        assert!(
+            production
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let request = GuestSliceRequest {
+            thread_id: 0xD11,
+            state: production.runtime.pending_guest_threads[0].state.clone(),
+        };
+        let reports = production
+            .runtime
+            .dispatch_parallel_guest_slices(&mut production.memory, vec![request], 4_096)
+            .expect("production call/ret slice");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].blocks_executed,
+            3 * u64::from(iterations) + 1,
+            "the whole call/ret loop must run in one worker job"
+        );
+        assert_eq!(
+            (
+                reports[0].metrics.return_predictions,
+                reports[0].metrics.return_hits,
+                reports[0].metrics.return_misses,
+                reports[0].metrics.return_mispredictions,
+                reports[0].metrics.indirect_ic_hits,
+                reports[0].metrics.indirect_ic_misses,
+            ),
+            (u64::from(iterations) + 1, u64::from(iterations), 1, 0, 0, 0),
+            "one prediction per call plus the thread-return miss"
+        );
+        assert_eq!(
+            reports[0].metrics.native_chains,
+            3 * u64::from(iterations),
+            "every block after the first is a native chain"
+        );
+        assert_eq!(
+            reports[0].exit,
+            GuestSliceExit::HostBarrier { rip: 0 },
+            "the balanced chain unwinds to the zero return address and yields"
+        );
+        production.runtime.pending_guest_threads[0].state = reports[0].state.clone();
+        rounds = 0;
+        while pump_once(&mut production) && rounds < 100 {
+            rounds += 1;
+        }
+        assert_eq!(
+            production.runtime.pending_guest_threads.len(),
+            0,
+            "the guest thread must terminate after the chain"
+        );
+        assert_eq!(
+            read_u32_guest(&cooperative, SLICE_CALL_COUNTER),
+            read_u32_guest(&production, SLICE_CALL_COUNTER),
+            "cooperative and production modes must produce identical bytes"
+        );
+        assert_eq!(
+            cooperative.read_guest(SLICE_CALL_COUNTER, 4),
+            production.read_guest(SLICE_CALL_COUNTER, 4)
+        );
+        assert_eq!(
+            reports[0].state.get(Register::Rax),
+            u64::from(iterations),
+            "the final guest EAX is the loop count"
+        );
+        drop(coop_dir);
+        drop(prod_dir);
+    }
+
+    #[test]
+    fn production_worker_slots_persist_predictor_tls_and_wait_until_termination_wake() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        session.map_guest(SLICE_CALL_CODE, &call_return_loop(SLICE_CALL_COUNTER, 2));
+        session.map_guest(SLICE_CALL_COUNTER & !0xfff, &vec![0_u8; 0x1000]);
+        session.map_guest(SLICE_STACK_A & !0xfff, &[0_u8; 0x1000]);
+        push_guest_thread(
+            &mut session,
+            0xA12,
+            0xD12,
+            SLICE_CALL_CODE,
+            SLICE_STACK_A,
+            0,
+        );
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let mut state = session.runtime.pending_guest_threads[0].state.clone();
+        for round in 1..=3_u64 {
+            let request = GuestSliceRequest {
+                thread_id: 0xD12,
+                state: state.clone(),
+            };
+            let reports = session
+                .runtime
+                .dispatch_parallel_guest_slices(&mut session.memory, vec![request], 1)
+                .expect("single-block worker round");
+            assert_eq!(reports.len(), 1);
+            state = reports[0].state.clone();
+            let slot = session
+                .runtime
+                .production_scheduler
+                .as_ref()
+                .expect("production scheduler")
+                .slot_snapshot(0xD12)
+                .expect("persistent slot");
+            assert_eq!(slot.thread_id, 0xD12);
+            assert_eq!(slot.slices, round);
+            assert_eq!(
+                slot.fs_base, session.runtime.teb_base,
+                "the slot must keep the guest TEB/TLS base"
+            );
+            assert_eq!(
+                slot.metrics.blocks_executed, round,
+                "metrics must accumulate on the persistent slot"
+            );
+            assert_eq!(slot.has_wait, false);
+        }
+        let scheduler = session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler");
+        scheduler.set_slot_wait(0xD12, Arc::new(ParkSignal::new()));
+        assert_eq!(
+            scheduler.slot_snapshot(0xD12).expect("slot").has_wait,
+            true,
+            "the wait object must live with the persistent slot"
+        );
+        scheduler.clear_slot_wait(0xD12);
+        assert_eq!(
+            scheduler.slot_snapshot(0xD12).expect("slot").has_wait,
+            false
+        );
+        // Terminating the guest thread must retire its slot (the termination
+        // wake releases the wait object and all JIT control state).
+        session.runtime.pending_guest_threads.clear();
+        session.runtime.prune_orphan_production_waits();
+        assert_eq!(
+            session
+                .runtime
+                .production_scheduler
+                .as_ref()
+                .expect("production scheduler")
+                .slot_snapshot(0xD12),
+            None,
+            "an orphaned persistent slot must be retired with its thread"
+        );
+        session
+            .runtime
+            .production_scheduler
+            .as_ref()
+            .expect("production scheduler")
+            .set_slot_wait(0xD12, Arc::new(ParkSignal::new()));
+        assert_eq!(
+            session
+                .runtime
+                .production_scheduler
+                .as_ref()
+                .expect("production scheduler")
+                .slot_snapshot(0xD12)
+                .is_none(),
+            true,
+            "a retired slot must not be resurrected by a stale wait"
+        );
     }
 
     #[test]
@@ -5294,8 +5764,7 @@ mod tests {
     ) -> GuestSliceJob {
         GuestSliceJob {
             job_id: 0,
-            thread_id,
-            state,
+            slot: GuestThreadSlot::new(thread_id, state),
             program,
             budget,
             start: None,
@@ -5305,12 +5774,12 @@ mod tests {
     fn slice_completion(job_id: u64, thread_id: u32, state: CpuState) -> GuestSliceCompletion {
         GuestSliceCompletion {
             job_id,
-            thread_id,
-            state,
+            slot: GuestThreadSlot::new(thread_id, state),
             exit: GuestSliceExit::Budget,
             blocks_executed: 1,
             worker_index: 0,
             code_writes: Vec::new(),
+            metrics: crate::jit::SliceMetrics::default(),
         }
     }
 
@@ -5539,8 +6008,8 @@ mod tests {
             "the worker must stop at the safepoint, not run guest code"
         );
         assert_eq!(
-            reports[0].blocks_executed, 1,
-            "the safepoint is observed after the block prologue ran"
+            reports[0].blocks_executed, 0,
+            "the entry safepoint poll stops before the block body executes"
         );
         crate::jit::JIT_SAFEPOINT_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
         session.runtime.pending_guest_threads.clear();
@@ -5589,7 +6058,7 @@ mod tests {
             "the straight-line block executed exactly once"
         );
         assert_eq!(
-            completion.state.get(Register::Rax),
+            completion.slot.state.get(Register::Rax),
             0x1234,
             "the worker applied the block result before the barrier"
         );
@@ -5636,7 +6105,7 @@ mod tests {
             "conditional exit metadata loss must never fabricate a RIP"
         );
         assert_eq!(
-            completion.state.rip, SLICE_JUMPIF_CODE,
+            completion.slot.state.rip, SLICE_JUMPIF_CODE,
             "the owner re-dispatches the original block address"
         );
     }

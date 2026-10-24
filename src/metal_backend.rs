@@ -619,6 +619,410 @@ impl std::fmt::Display for MetalCapabilityReport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Guest-memory-backed GPU buffers (zero-copy upload surfaces)
+// ---------------------------------------------------------------------------
+
+/// The host VM page size, which is the alignment unit Metal's
+/// `newBufferWithBytesNoCopy` is documented to require. On Apple Silicon this
+/// is 16 KiB even though guest pages are 4 KiB, so a guest resource whose base
+/// is only 4 KiB-aligned cannot be placed as a no-copy view and must be staged.
+pub(crate) fn host_page_size() -> usize {
+    static PAGE: OnceLock<usize> = OnceLock::new();
+    *PAGE.get_or_init(|| {
+        let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if value <= 0 { 4096 } else { value as usize }
+    })
+}
+
+/// A canonical guest-memory window that Metal buffers may view without copying.
+///
+/// The window is a borrowed view of host memory owned elsewhere (the canonical
+/// guest store). Creating a Metal buffer over it never transfers ownership to
+/// Metal: the deallocator is `NULL`, so destroying the buffer leaves the guest
+/// mapping untouched. The window must outlive every buffer created over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestMemoryWindow {
+    base: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the window is an immutable (base, len) descriptor; the canonical
+// store behind it is itself `Send + Sync`, and sharing the descriptor
+// introduces no data races.
+unsafe impl Send for GuestMemoryWindow {}
+// SAFETY: see the `Send` impl above.
+unsafe impl Sync for GuestMemoryWindow {}
+
+impl GuestMemoryWindow {
+    /// Wrap an existing host mapping.
+    ///
+    /// Returns `None` for a null base or an empty window.
+    ///
+    /// # Safety
+    /// `base` must point to `len` bytes of live host memory that stays mapped
+    /// and unfreed for as long as any buffer created over this window is alive,
+    /// and must be aligned to the host page size.
+    pub unsafe fn from_raw(base: *mut u8, len: usize) -> Option<Self> {
+        if base.is_null() || len == 0 {
+            return None;
+        }
+        Some(Self { base, len })
+    }
+
+    /// Build a window over the canonical guest store's flat window.
+    ///
+    /// Returns `None` when the store has no live flat mapping (see
+    /// [`crate::cpu::GuestMemoryStore`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_canonical_store(store: &crate::cpu::GuestMemoryStore) -> Option<Self> {
+        if !store.is_valid() {
+            return None;
+        }
+        let base = store.flat_base() as *mut u8;
+        let len = store.flat_size();
+        if base.is_null() || len == 0 {
+            return None;
+        }
+        Some(Self { base, len })
+    }
+
+    /// Base address of the window in the host address space.
+    pub fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    /// Size of the window in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the window is empty (never true for a constructed window).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Resolve the host pointer for `[offset, offset + length)` inside the
+    /// window without requiring page alignment.
+    ///
+    /// This is the ownership/bounds check for byte-oriented consumers (audio
+    /// sink writers, media plane copies) that write guest bytes directly and
+    /// do not hand the pointer to Metal.
+    pub(crate) fn resolve_region(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> Result<*mut u8, GuestBackingRefusal> {
+        if length == 0 {
+            return Err(GuestBackingRefusal::EmptyLength);
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or(GuestBackingRefusal::ArithmeticOverflow)?;
+        if end > self.len {
+            return Err(GuestBackingRefusal::OutOfWindow {
+                end,
+                window_len: self.len,
+            });
+        }
+        let address = (self.base as usize)
+            .checked_add(offset)
+            .ok_or(GuestBackingRefusal::ArithmeticOverflow)?;
+        Ok(address as *mut u8)
+    }
+
+    /// Resolve the host pointer for `[offset, offset + length)`, applying the
+    /// alignment/ownership rules a no-copy Metal buffer requires.
+    ///
+    /// The region must be wholly inside the window (canonical guest pages own
+    /// it), the resulting host address must be host-page aligned, and the
+    /// host-page-rounded end must also stay inside the window so Metal never
+    /// maps host pages the guest does not own.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolve(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> Result<*mut u8, GuestBackingRefusal> {
+        let span = self.resolve_aligned(offset, length)?;
+        Ok(span.pointer)
+    }
+
+    /// Resolve `[offset, offset + length)` to a host-page-aligned no-copy span.
+    ///
+    /// A no-copy MTLBuffer can only start on a host page boundary, while guest
+    /// resources are usually only 4 KiB aligned (or arbitrarily offset). This
+    /// widens the region down to the enclosing page and returns the leading
+    /// byte count the caller must add to reach the requested bytes. The whole
+    /// widened span stays inside the window, so Metal never maps host pages the
+    /// guest does not own. This is what makes an unaligned guest destination
+    /// usable without a staging copy: the caller blits/reads at `leading`.
+    pub(crate) fn resolve_aligned(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> Result<GuestAlignedSpan, GuestBackingRefusal> {
+        if length == 0 {
+            return Err(GuestBackingRefusal::EmptyLength);
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or(GuestBackingRefusal::ArithmeticOverflow)?;
+        if end > self.len {
+            return Err(GuestBackingRefusal::OutOfWindow {
+                end,
+                window_len: self.len,
+            });
+        }
+        let page = host_page_size();
+        let leading = offset % page;
+        let aligned_offset = offset - leading;
+        let aligned_address = (self.base as usize)
+            .checked_add(aligned_offset)
+            .ok_or(GuestBackingRefusal::ArithmeticOverflow)?;
+        // `self.len` is host-page rounded for every canonical mapping, so
+        // round_up(end, page) <= self.len whenever end <= self.len.
+        let buffer_len = end
+            .checked_add(page - 1)
+            .map(|value| value & !(page - 1))
+            .ok_or(GuestBackingRefusal::ArithmeticOverflow)?
+            .checked_sub(aligned_offset)
+            .ok_or(GuestBackingRefusal::ArithmeticOverflow)?;
+        Ok(GuestAlignedSpan {
+            pointer: aligned_address as *mut u8,
+            leading,
+            len: buffer_len,
+            requested_len: length,
+        })
+    }
+}
+
+/// A host-page-aligned no-copy span around a guest region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestAlignedSpan {
+    /// Host-page-aligned start address handed to Metal.
+    pub pointer: *mut u8,
+    /// Byte offset from `pointer` to the requested guest bytes.
+    pub leading: usize,
+    /// Total mapped span from `pointer` (host-page rounded, inside the window).
+    pub len: usize,
+    /// Requested (not rounded) guest byte count.
+    pub requested_len: usize,
+}
+
+// SAFETY: the span is an immutable address descriptor over the canonical guest
+// store, which is itself `Send + Sync`.
+unsafe impl Send for GuestAlignedSpan {}
+// SAFETY: see the `Send` impl above.
+unsafe impl Sync for GuestAlignedSpan {}
+
+/// Why a no-copy guest-backed placement was refused (and a host copy used
+/// instead). Every variant is an exact, testable outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestBackingRefusal {
+    /// A zero-length region cannot back a buffer.
+    EmptyLength,
+    /// There is no canonical guest window to place the resource over.
+    NoGuestWindow,
+    /// The region is not wholly inside the window: no canonical guest pages
+    /// own it (high/GPA addresses outside the flat window).
+    OutOfWindow { end: usize, window_len: usize },
+    /// The region's host address is not aligned to the host page size, so
+    /// Metal would have to map guest pages the resource does not own.
+    UnalignedPointer { offset: usize },
+    /// `offset + length` (or the page-rounded end) overflowed the address
+    /// space.
+    ArithmeticOverflow,
+    /// Metal declined the no-copy buffer (the host refused the memory).
+    DeviceRefused,
+}
+
+impl GuestBackingRefusal {
+    /// Stable, human-readable reason for diagnostics and counters.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::EmptyLength => "zero-length guest region",
+            Self::NoGuestWindow => "no canonical guest window",
+            Self::OutOfWindow { .. } => "guest region outside the canonical window",
+            Self::UnalignedPointer { .. } => "guest region not host-page aligned",
+            Self::ArithmeticOverflow => "guest region address overflow",
+            Self::DeviceRefused => "Metal refused the no-copy buffer",
+        }
+    }
+}
+
+impl std::fmt::Display for GuestBackingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// Owned host mapping that backs guest-visible Metal buffers without copying.
+///
+/// The canonical guest store owns its own mapping; this type is the explicit
+/// equivalent for callers that have a guest region but no full
+/// [`crate::cpu::GuestMemoryStore`] (media surfaces, tests). The mapping is
+/// page aligned and zero filled, and is released exactly once on drop.
+pub struct GuestSharedRegion {
+    base: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the region owns an anonymous mapping; sharing the descriptor lets
+// multiple threads read/write disjoint guest bytes as they would a normal
+// guest store. Metal buffers created over the window never free the mapping.
+unsafe impl Send for GuestSharedRegion {}
+// SAFETY: see the `Send` impl above.
+unsafe impl Sync for GuestSharedRegion {}
+
+impl GuestSharedRegion {
+    /// Reserve an anonymous, host-page-aligned mapping of at least `len` bytes.
+    ///
+    /// Returns `None` for a zero length, an overflowing round-up, or a host
+    /// that refuses the mapping.
+    pub fn new(len: usize) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+        let page = host_page_size();
+        let rounded = len.checked_add(page - 1)? & !(page - 1);
+        // SAFETY: plain anonymous mmap; MAP_ANONYMOUS with fd=-1 is valid.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                rounded,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Self {
+            base: base as *mut u8,
+            len: rounded,
+        })
+    }
+
+    /// Borrow this region as a Metal guest window.
+    pub fn window(&self) -> GuestMemoryWindow {
+        // SAFETY: `base` is a live, page-aligned mapping of `len` bytes owned
+        // by `self`; every buffer created over the window must not outlive it.
+        unsafe { GuestMemoryWindow::from_raw(self.base, self.len) }
+            .expect("GuestSharedRegion always has a live non-empty mapping")
+    }
+
+    /// Base address of the mapping.
+    pub fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    /// Mapped length in bytes (host-page rounded).
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the mapping is empty (never true for a constructed region).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Borrow the mapped bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the mapping is live for `len` bytes for the lifetime of `self`.
+        unsafe { std::slice::from_raw_parts(self.base, self.len) }
+    }
+
+    /// Mutably borrow the mapped bytes.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: see `as_slice`; `&mut self` excludes aliasing host borrows.
+        unsafe { std::slice::from_raw_parts_mut(self.base, self.len) }
+    }
+}
+
+impl std::fmt::Debug for GuestSharedRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuestSharedRegion")
+            .field("base", &self.base)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl Drop for GuestSharedRegion {
+    fn drop(&mut self) {
+        if !self.base.is_null() && self.len != 0 {
+            // SAFETY: the mapping was created by `GuestSharedRegion::new` and
+            // is released exactly once here.
+            unsafe {
+                libc::munmap(self.base as *mut libc::c_void, self.len);
+            }
+        }
+    }
+}
+
+impl MetalDevice {
+    /// Create a Metal buffer that is a no-copy view of a canonical guest
+    /// mapping region.
+    ///
+    /// Guest writes into `window[offset..offset + length]` are visible to the
+    /// GPU without any staging copy, and GPU writes are visible to the guest.
+    /// The buffer shares storage with the guest pages; Metal is given a `NULL`
+    /// deallocator so the guest mapping is never freed by the GPU.
+    pub fn create_buffer_over_guest_memory(
+        &self,
+        window: &GuestMemoryWindow,
+        offset: usize,
+        length: usize,
+    ) -> Result<metal::Buffer, GuestBackingRefusal> {
+        let span = window.resolve_aligned(offset, length)?;
+        self.create_buffer_over_aligned_guest_span(&span)
+    }
+
+    /// Create the no-copy MTLBuffer for an already-resolved aligned span.
+    ///
+    /// The buffer covers the whole host-page-rounded span; the caller addresses
+    /// the requested guest bytes at `span.leading` (for example as a blit
+    /// source offset or by adding `leading` to the host mapping pointer).
+    pub fn create_buffer_over_aligned_guest_span(
+        &self,
+        span: &GuestAlignedSpan,
+    ) -> Result<metal::Buffer, GuestBackingRefusal> {
+        create_aligned_guest_buffer(self.metal_device(), span)
+    }
+}
+
+/// Create a no-copy shared `MTLBuffer` for a resolved guest span on a raw
+/// `MTLDevice` (used by the async queue, which owns a `metal::Device`).
+fn create_aligned_guest_buffer(
+    device: &metal::DeviceRef,
+    span: &GuestAlignedSpan,
+) -> Result<metal::Buffer, GuestBackingRefusal> {
+    // A test seam modelling a host that refuses the shared mapping.
+    #[cfg(test)]
+    if test_faults::guest_buffer_refusal() {
+        return Err(GuestBackingRefusal::DeviceRefused);
+    }
+    let options = metal::MTLResourceOptions::StorageModeShared;
+    // SAFETY: the span was resolved against a live guest window, its start is
+    // host-page aligned and its host-page-rounded length stays inside the
+    // window; the NULL deallocator keeps Metal from freeing guest memory.
+    let raw: *mut objc::runtime::Object = unsafe {
+        msg_send![device,
+            newBufferWithBytesNoCopy: span.pointer
+            length: span.len
+            options: options
+            deallocator: std::ptr::null::<objc::runtime::Object>()]
+    };
+    if raw.is_null() {
+        return Err(GuestBackingRefusal::DeviceRefused);
+    }
+    // SAFETY: `raw` is a non-null +1 MTLBuffer returned by the device.
+    Ok(unsafe { metal::Buffer::from_ptr(raw as *mut _) })
+}
+
 /// Query the system default Metal device and produce a capability report.
 ///
 /// Returns an error if no Metal device is available. This function is
@@ -1776,6 +2180,8 @@ mod test_faults {
         static NO_METAL_DEVICE: Cell<bool> = const { Cell::new(false) };
         static COMPOSITE_PIPELINE_FAULT: Cell<u8> = const { Cell::new(0) };
         static PRIVATE_STAGING: Cell<bool> = const { Cell::new(false) };
+        static GUEST_BUFFER_REFUSAL: Cell<bool> = const { Cell::new(false) };
+        static BUFFER_MAPPING_UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
         static FILE_CLONE_FAILURE: Cell<bool> = const { Cell::new(false) };
         static ARCHIVE_OPTIONS_UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
         static MESH_PIPELINE_CREATION_UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
@@ -1830,6 +2236,18 @@ mod test_faults {
     }
     pub(super) fn private_staging() -> bool {
         PRIVATE_STAGING.with(Cell::get)
+    }
+    pub(super) fn set_guest_buffer_refusal(value: bool) {
+        GUEST_BUFFER_REFUSAL.with(|flag| flag.set(value));
+    }
+    pub(super) fn guest_buffer_refusal() -> bool {
+        GUEST_BUFFER_REFUSAL.with(Cell::get)
+    }
+    pub(super) fn set_buffer_mapping_unavailable(value: bool) {
+        BUFFER_MAPPING_UNAVAILABLE.with(|flag| flag.set(value));
+    }
+    pub(super) fn buffer_mapping_unavailable() -> bool {
+        BUFFER_MAPPING_UNAVAILABLE.with(Cell::get)
     }
     pub(super) fn set_file_clone_failure(value: bool) {
         FILE_CLONE_FAILURE.with(|flag| flag.set(value));
@@ -1912,6 +2330,8 @@ mod test_faults {
         set_no_metal_device(false);
         set_composite_pipeline_fault(0);
         set_private_staging(false);
+        set_guest_buffer_refusal(false);
+        set_buffer_mapping_unavailable(false);
         set_file_clone_failure(false);
         set_archive_options_unavailable(false);
         set_mesh_pipeline_creation_unavailable(false);
@@ -1943,6 +2363,21 @@ mod test_faults {
 
 #[cfg(test)]
 use test_faults as faults;
+
+/// Test-only gate: pause the DirectStorage IO worker before it processes the
+/// next job. Used by cross-module cancellation tests to keep a job in the
+/// pending-IO window deterministically.
+#[cfg(test)]
+pub(crate) fn test_set_io_worker_pause(pause: bool) {
+    test_faults::IO_WORKER_PAUSE.store(pause, Ordering::SeqCst);
+    test_faults::IO_WORKER_PAUSED.store(false, Ordering::SeqCst);
+}
+
+/// Test-only: whether the IO worker reached the pause gate.
+#[cfg(test)]
+pub(crate) fn test_io_worker_paused() -> bool {
+    test_faults::IO_WORKER_PAUSED.load(Ordering::SeqCst)
+}
 
 fn cv_api() -> Option<&'static CvApi> {
     #[cfg(test)]
@@ -2708,6 +3143,76 @@ impl IoSurfacePresentChannel {
         Ok(())
     }
 
+    /// Lock the surface and borrow its tightly packed pixels for a real
+    /// D3D11-style Map: the returned slice aliases the present surface itself,
+    /// so no `Vec` copy exists. A padded stride cannot be represented as one
+    /// contiguous slice and is refused explicitly.
+    pub fn map_pixels(&self) -> AppResult<IoSurfacePixels> {
+        self.map_pixels_locked(1)
+    }
+
+    /// Mutable variant of [`map_pixels`](Self::map_pixels) for a Map that
+    /// writes in place.
+    pub fn map_pixels_mut(&self) -> AppResult<IoSurfacePixelsMut> {
+        unsafe {
+            let guard = self.lock_for_map(0)?;
+            let base = IOSurfaceGetBaseAddress(self.surface.as_ptr()) as *mut u8;
+            let stride = IOSurfaceGetBytesPerRow(self.surface.as_ptr());
+            if base.is_null() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "IOSurface base address is null",
+                ));
+            }
+            Ok(IoSurfacePixelsMut {
+                _surface: self.surface.clone(),
+                _guard: guard,
+                base,
+                len: stride * self.height as usize,
+                row_pitch: stride,
+                height: self.height as usize,
+            })
+        }
+    }
+
+    fn map_pixels_locked(&self, options: u32) -> AppResult<IoSurfacePixels> {
+        unsafe {
+            let guard = self.lock_for_map(options)?;
+            let base = IOSurfaceGetBaseAddress(self.surface.as_ptr()) as *const u8;
+            let stride = IOSurfaceGetBytesPerRow(self.surface.as_ptr());
+            if base.is_null() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "IOSurface base address is null",
+                ));
+            }
+            // The mapping is returned with its real row pitch; a padded
+            // IOSurface is still borrowed in place (never copied to make it
+            // tight). Callers that need tight rows use `row_slice`.
+            Ok(IoSurfacePixels {
+                _surface: self.surface.clone(),
+                _guard: guard,
+                base,
+                len: stride * self.height as usize,
+                row_pitch: stride,
+                height: self.height as usize,
+            })
+        }
+    }
+
+    fn lock_for_map(&self, options: u32) -> AppResult<IoSurfaceLockGuard> {
+        unsafe {
+            let lock_rc = IOSurfaceLock(self.surface.as_ptr(), options, std::ptr::null_mut());
+            if lock_rc != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("IOSurface Map lock failed ({lock_rc:#x})"),
+                ));
+            }
+            Ok(IoSurfaceLockGuard::new(self.surface.as_ptr(), options))
+        }
+    }
+
     /// Read the current surface contents as tightly packed bytes. Used for
     /// verification/export; the present path itself never calls this.
     pub fn read_pixels(&self) -> AppResult<Vec<u8>> {
@@ -2792,10 +3297,121 @@ impl IoSurfacePresentChannel {
     }
 }
 
+/// A D3D11-style Map borrow of an IOSurface's tightly packed pixels. The
+/// surface stays locked for the guard's lifetime; writes through the mutable
+/// variant land in the surface itself with no staging copy.
+pub struct IoSurfacePixels {
+    /// A retained surface reference keeps the mapping alive independently of
+    /// the channel that created it.
+    _surface: IoSurfaceRef,
+    _guard: IoSurfaceLockGuard,
+    base: *const u8,
+    len: usize,
+    row_pitch: usize,
+    height: usize,
+}
+
+impl std::ops::Deref for IoSurfacePixels {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `_surface` retains the IOSurface, `_guard` keeps it locked,
+        // and `base`/`len` describe the mapped pixel range for the guard's
+        // lifetime.
+        unsafe { std::slice::from_raw_parts(self.base, self.len) }
+    }
+}
+
+impl AsRef<[u8]> for IoSurfacePixels {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl IoSurfacePixels {
+    /// Row pitch of the borrowed surface (may exceed the tight row bytes).
+    pub fn row_pitch(&self) -> usize {
+        self.row_pitch
+    }
+
+    /// Number of rows in the mapping.
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Borrow one row without copying.
+    pub fn row_slice(&self, row: usize) -> Option<&[u8]> {
+        if row >= self.height {
+            return None;
+        }
+        let start = row.checked_mul(self.row_pitch)?;
+        let end = start.checked_add(self.row_pitch)?;
+        self.get(start..end)
+    }
+}
+
+/// Mutable Map borrow of an IOSurface.
+pub struct IoSurfacePixelsMut {
+    _surface: IoSurfaceRef,
+    _guard: IoSurfaceLockGuard,
+    base: *mut u8,
+    len: usize,
+    row_pitch: usize,
+    height: usize,
+}
+
+impl std::ops::Deref for IoSurfacePixelsMut {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: see `IoSurfacePixels::deref`.
+        unsafe { std::slice::from_raw_parts(self.base as *const u8, self.len) }
+    }
+}
+
+impl std::ops::DerefMut for IoSurfacePixelsMut {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the mutable Map borrow is unique; the surface is retained and
+        // locked by this guard.
+        unsafe { std::slice::from_raw_parts_mut(self.base, self.len) }
+    }
+}
+
+impl AsRef<[u8]> for IoSurfacePixelsMut {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl AsMut<[u8]> for IoSurfacePixelsMut {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
+impl IoSurfacePixelsMut {
+    /// Row pitch of the borrowed surface (may exceed the tight row bytes).
+    pub fn row_pitch(&self) -> usize {
+        self.row_pitch
+    }
+
+    /// Number of rows in the mapping.
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Borrow one row mutably without copying.
+    pub fn row_slice_mut(&mut self, row: usize) -> Option<&mut [u8]> {
+        if row >= self.height {
+            return None;
+        }
+        let start = row.checked_mul(self.row_pitch)?;
+        let end = start.checked_add(self.row_pitch)?;
+        <Self as AsMut<[u8]>>::as_mut(self).get_mut(start..end)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NV12 present channel (DXGI_FORMAT_NV12 swapchain backbuffers)
 // ---------------------------------------------------------------------------
-
 /// An IOSurface-backed NV12 present channel: one CoreVideo pixel buffer plus
 /// the two Metal plane textures that alias it.
 ///
@@ -2812,7 +3428,12 @@ pub struct Nv12PresentChannel {
     /// the texture rebound as the present drawable's contents.
     drawable: metal::Texture,
     composite_pipeline: metal::ComputePipelineState,
+    /// GPU RGBA -> NV12 conversions (separate kernels for the two DXGI
+    /// channel orders). The CPU never converts pixels on the write path.
+    rgba_to_nv12_pipeline: metal::ComputePipelineState,
+    bgra_to_nv12_pipeline: metal::ComputePipelineState,
     composite_passes: std::sync::Arc<AtomicU64>,
+    rgb_to_nv12_passes: std::sync::Arc<AtomicU64>,
     drawable_binds: std::sync::Arc<AtomicU64>,
     width: u32,
     height: u32,
@@ -2826,6 +3447,7 @@ impl std::fmt::Debug for Nv12PresentChannel {
             .field("height", &self.height)
             .field("texture_builds", &self.texture_builds)
             .field("composite_passes", &self.composite_passes())
+            .field("rgb_to_nv12_passes", &self.rgb_to_nv12_passes())
             .field("drawable_binds", &self.drawable_binds())
             .finish()
     }
@@ -2899,6 +3521,153 @@ vertex float4 nv12_not_a_kernel() {
             })
     }
 
+    /// Build the Metal compute pipelines that convert an RGBA8/BGRA8 source
+    /// texture into the two NV12 plane textures. The kernels mirror the CPU
+    /// `nv12_from_channels` arithmetic (full-range BT.601, round-half-up).
+    fn rgb_to_nv12_pipeline(
+        device: &metal::DeviceRef,
+        function_name: &str,
+    ) -> AppResult<metal::ComputePipelineState> {
+        const SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline float luma_of(float r, float g, float b) {
+    return floor(clamp(0.299 * r + 0.587 * g + 0.114 * b, 0.0, 255.0) + 0.5);
+}
+
+kernel void rgba_to_nv12(texture2d<float, access::read> source [[texture(0)]],
+                         texture2d<float, access::write> luma [[texture(1)]],
+                         texture2d<float, access::write> chroma [[texture(2)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= luma.get_width() || gid.y >= luma.get_height()) {
+        return;
+    }
+    float4 pixel = floor(source.read(gid) * 255.0 + 0.5);
+    float r = pixel.r;
+    float g = pixel.g;
+    float b = pixel.b;
+    float y = luma_of(r, g, b);
+    luma.write(float4(y / 255.0, 0.0, 0.0, 1.0), gid);
+    if ((gid.x % 2u) == 0u && (gid.y % 2u) == 0u) {
+        float u = floor(clamp(-0.169 * r - 0.331 * g + 0.5 * b + 128.0, 0.0, 255.0) + 0.5);
+        float v = floor(clamp(0.5 * r - 0.419 * g - 0.081 * b + 128.0, 0.0, 255.0) + 0.5);
+        chroma.write(float4(u / 255.0, v / 255.0, 0.0, 1.0),
+                     uint2(gid.x / 2u, gid.y / 2u));
+    }
+}
+
+kernel void bgra_to_nv12(texture2d<float, access::read> source [[texture(0)]],
+                         texture2d<float, access::write> luma [[texture(1)]],
+                         texture2d<float, access::write> chroma [[texture(2)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= luma.get_width() || gid.y >= luma.get_height()) {
+        return;
+    }
+    float4 pixel = floor(source.read(gid) * 255.0 + 0.5);
+    // MTLPixelFormatBGRA8Unorm swizzles on read: .r is the red byte even though
+    // it is stored third in memory, so the arithmetic matches the RGBA kernel.
+    float r = pixel.r;
+    float g = pixel.g;
+    float b = pixel.b;
+    float y = luma_of(r, g, b);
+    luma.write(float4(y / 255.0, 0.0, 0.0, 1.0), gid);
+    if ((gid.x % 2u) == 0u && (gid.y % 2u) == 0u) {
+        float u = floor(clamp(-0.169 * r - 0.331 * g + 0.5 * b + 128.0, 0.0, 255.0) + 0.5);
+        float v = floor(clamp(0.5 * r - 0.419 * g - 0.081 * b + 128.0, 0.0, 255.0) + 0.5);
+        chroma.write(float4(u / 255.0, v / 255.0, 0.0, 1.0),
+                     uint2(gid.x / 2u, gid.y / 2u));
+    }
+}
+"#;
+        let options = metal::CompileOptions::new();
+        let library = device
+            .new_library_with_source(SHADER, &options)
+            .map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("NV12 convert: shader compilation failed: {error}"),
+                )
+            })?;
+        let function = library.get_function(function_name, None).map_err(|error| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("NV12 convert: kernel lookup failed: {error}"),
+            )
+        })?;
+        device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("NV12 convert: pipeline creation failed: {error}"),
+                )
+            })
+    }
+
+    /// Upload host pixels into a shared source texture. This is the caller's
+    /// ownership upload (the API takes `&[u8]`); the RGB -> NV12 conversion
+    /// itself runs on the GPU.
+    fn source_texture(
+        device: &metal::DeviceRef,
+        width: u32,
+        height: u32,
+        format: metal::MTLPixelFormat,
+        pixels: &[u8],
+    ) -> AppResult<metal::Texture> {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_texture_type(metal::MTLTextureType::D2);
+        descriptor.set_pixel_format(format);
+        descriptor.set_width(width as u64);
+        descriptor.set_height(height as u64);
+        descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        descriptor.set_sample_count(1);
+        let texture = device.new_texture(&descriptor);
+        let bytes_per_row = width as usize * 4;
+        texture.replace_region(
+            metal::MTLRegion {
+                origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                size: metal::MTLSize {
+                    width: width as u64,
+                    height: height as u64,
+                    depth: 1,
+                },
+            },
+            0,
+            pixels.as_ptr() as *const std::ffi::c_void,
+            bytes_per_row as u64,
+        );
+        Ok(texture)
+    }
+
+    /// Run the GPU RGB -> NV12 conversion into the IOSurface-backed planes.
+    fn convert_to_nv12(
+        &self,
+        pipeline: &metal::ComputePipelineState,
+        source: &metal::TextureRef,
+    ) -> AppResult<()> {
+        let device = self.luma.device();
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        {
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_texture(0, Some(source));
+            encoder.set_texture(1, Some(&self.luma));
+            encoder.set_texture(2, Some(&self.chroma));
+            encoder.dispatch_threads(
+                metal::MTLSize::new(self.width as u64, self.height as u64, 1),
+                metal::MTLSize::new(8, 8, 1),
+            );
+            encoder.end_encoding();
+        }
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        self.rgb_to_nv12_passes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Allocate an NV12 (`'420f'`, full range) IOSurface and build both plane
     /// textures. `width` and `height` must be non-zero and even: NV12 has no
     /// representation for a partial chroma pair, so an odd dimension is
@@ -2955,6 +3724,8 @@ vertex float4 nv12_not_a_kernel() {
             )
         })?;
         let composite_pipeline = Self::composite_pipeline(&device)?;
+        let rgba_to_nv12_pipeline = Self::rgb_to_nv12_pipeline(&device, "rgba_to_nv12")?;
+        let bgra_to_nv12_pipeline = Self::rgb_to_nv12_pipeline(&device, "bgra_to_nv12")?;
         let drawable_descriptor = metal::TextureDescriptor::new();
         drawable_descriptor.set_texture_type(metal::MTLTextureType::D2);
         drawable_descriptor.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm);
@@ -2974,7 +3745,10 @@ vertex float4 nv12_not_a_kernel() {
             chroma,
             drawable,
             composite_pipeline,
+            rgba_to_nv12_pipeline,
+            bgra_to_nv12_pipeline,
             composite_passes: std::sync::Arc::new(AtomicU64::new(0)),
+            rgb_to_nv12_passes: std::sync::Arc::new(AtomicU64::new(0)),
             drawable_binds: std::sync::Arc::new(AtomicU64::new(0)),
             width,
             height,
@@ -3038,6 +3812,12 @@ vertex float4 nv12_not_a_kernel() {
     /// Number of real GPU composite passes run for this channel.
     pub fn composite_passes(&self) -> u64 {
         self.composite_passes.load(Ordering::Relaxed)
+    }
+
+    /// Number of real GPU RGB/BGRA -> NV12 conversion passes run for this
+    /// channel. A CPU conversion would leave this untouched, so tests pin it.
+    pub fn rgb_to_nv12_passes(&self) -> u64 {
+        self.rgb_to_nv12_passes.load(Ordering::Relaxed)
     }
 
     /// Number of presents that bound the composited RGBA drawable texture.
@@ -3172,7 +3952,9 @@ vertex float4 nv12_not_a_kernel() {
         }
     }
 
-    /// Convert a full RGBA8 frame (D3D clear/update convention) into NV12.
+    /// Convert a full RGBA8 frame (D3D clear/update convention) into NV12 on
+    /// the GPU. The host bytes are uploaded once into a source texture; no CPU
+    /// RGB -> NV12 conversion runs.
     pub fn write_rgba_pixels(&self, rgba: &[u8]) -> AppResult<()> {
         let expected = self.width as usize * self.height as usize * 4;
         if rgba.len() != expected {
@@ -3186,11 +3968,19 @@ vertex float4 nv12_not_a_kernel() {
                 ),
             ));
         }
-        let (y, uv) = nv12_from_rgba(rgba, self.width, self.height);
-        self.fill_nv12(&y, &uv)
+        let device = self.luma.device();
+        let source = Self::source_texture(
+            device,
+            self.width,
+            self.height,
+            metal::MTLPixelFormat::RGBA8Unorm,
+            rgba,
+        )?;
+        self.convert_to_nv12(&self.rgba_to_nv12_pipeline, &source)
     }
 
-    /// Convert a full BGRA8 frame (DXGI B8G8R8A8 convention) into NV12.
+    /// Convert a full BGRA8 frame (DXGI B8G8R8A8 convention) into NV12 on the
+    /// GPU. No CPU channel swap or RGB -> NV12 conversion runs.
     pub fn write_bgra_pixels(&self, bgra: &[u8]) -> AppResult<()> {
         let expected = self.width as usize * self.height as usize * 4;
         if bgra.len() != expected {
@@ -3204,8 +3994,15 @@ vertex float4 nv12_not_a_kernel() {
                 ),
             ));
         }
-        let (y, uv) = nv12_from_bgra(bgra, self.width, self.height);
-        self.fill_nv12(&y, &uv)
+        let device = self.luma.device();
+        let source = Self::source_texture(
+            device,
+            self.width,
+            self.height,
+            metal::MTLPixelFormat::BGRA8Unorm,
+            bgra,
+        )?;
+        self.convert_to_nv12(&self.bgra_to_nv12_pipeline, &source)
     }
 
     /// Convert full-frame pixels laid out in a DXGI color format into NV12.
@@ -3222,31 +4019,12 @@ vertex float4 nv12_not_a_kernel() {
         }
     }
 
-    /// Decode NV12 back to tight RGBA8 (used by `presented_frame` consumers
-    /// that speak RGBA).
+    /// Decode NV12 back to tight RGBA8 on the GPU (used by `presented_frame`
+    /// consumers that speak RGBA). The composite compute pass writes the RGBA
+    /// drawable; only the final readback is a host transfer.
     pub fn to_rgba8(&self) -> AppResult<Vec<u8>> {
-        let y = self.read_plane(0)?;
-        let uv = self.read_plane(1)?;
-        let mut rgba = vec![0u8; self.width as usize * self.height as usize * 4];
-        let uv_stride = self.width as usize;
-        for row in 0..self.height as usize {
-            for col in 0..self.width as usize {
-                let luma = y[row * self.width as usize + col] as f32;
-                let uv_index = (row / 2) * uv_stride + (col / 2) * 2;
-                let u = uv[uv_index] as f32 - 128.0;
-                let v = uv[uv_index + 1] as f32 - 128.0;
-                let c = (luma - 16.0).max(0.0);
-                let r = (1.164 * c + 1.596 * v).clamp(0.0, 255.0) as u8;
-                let g = (1.164 * c - 0.392 * u - 0.813 * v).clamp(0.0, 255.0) as u8;
-                let b = (1.164 * c + 2.017 * u).clamp(0.0, 255.0) as u8;
-                let offset = (row * self.width as usize + col) * 4;
-                rgba[offset] = r;
-                rgba[offset + 1] = g;
-                rgba[offset + 2] = b;
-                rgba[offset + 3] = 255;
-            }
-        }
-        Ok(rgba)
+        self.composite_to_drawable()?;
+        self.read_drawable_rgba()
     }
 }
 
@@ -3539,6 +4317,13 @@ pub struct DirectStorageStats {
     pub staging_bytes: u64,
     pub source_bytes: u64,
     pub blits: u64,
+    /// True when the destination buffer aliases canonical guest pages: the
+    /// file bytes landed directly in guest memory and the GPU read them from
+    /// that same mapping.
+    pub guest_backed: bool,
+    /// Uploads that fell back to CPU staging because the guest destination was
+    /// unaligned, outside the window, or refused by the device.
+    pub staging_fallbacks: u64,
 }
 
 /// A texture uploaded through the DirectStorage-style path. The MTLTexture is
@@ -3554,6 +4339,10 @@ pub struct DirectStorageTexture {
     format: metal::MTLPixelFormat,
     dxgi_format: Option<crate::gfx::DxgiFormat>,
     stats: DirectStorageStats,
+    /// Host-ownership copies requested by `read_back*` (the `Vec` variants).
+    /// The zero-copy verification API (`read_back_buffer*`) never increments
+    /// this counter because it borrows the shared readback buffer.
+    readback_host_copies: std::sync::Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for DirectStorageTexture {
@@ -3662,12 +4451,13 @@ impl DirectStorageTexture {
         }
     }
 
-    /// Blit one plane into a shared buffer and return tightly packed bytes.
-    /// Plane 1 exists only for NV12 uploads and is
-    /// `(width / 2) * (height / 2) * 2` bytes.
-    pub fn read_back_plane(&self, plane: usize) -> AppResult<Vec<u8>> {
+    /// GPU readback of one plane directly into a shared `MTLBuffer`.
+    ///
+    /// The GPU→host step is one blit; no intermediate `Vec` is allocated for
+    /// the transfer. Borrow [`TextureReadback::as_slice`] to inspect it.
+    pub fn read_back_plane_buffer(&self, plane: usize) -> AppResult<TextureReadback> {
         match plane {
-            0 => read_texture_pixels(
+            0 => read_texture_readback(
                 self.texture.device(),
                 &self.texture,
                 self.width as u64,
@@ -3681,7 +4471,7 @@ impl DirectStorageTexture {
                         "DirectStorage: upload has no NV12 chroma plane",
                     )
                 })?;
-                read_texture_pixels(
+                read_texture_readback(
                     chroma.device(),
                     chroma,
                     self.width.div_ceil(2) as u64,
@@ -3696,6 +4486,25 @@ impl DirectStorageTexture {
         }
     }
 
+    /// Alias for [`read_back_plane_buffer`](Self::read_back_plane_buffer) used
+    /// by verification callers that name the plane explicitly.
+    pub fn read_back_buffer(&self, plane: usize) -> AppResult<TextureReadback> {
+        self.read_back_plane_buffer(plane)
+    }
+
+    /// Blit one plane into a shared buffer and return tightly packed bytes.
+    /// Plane 1 exists only for NV12 uploads and is
+    /// `(width / 2) * (height / 2) * 2` bytes.
+    ///
+    /// This is the host-ownership variant; the `Vec` copy is counted in
+    /// [`readback_host_copies`](Self::readback_host_copies) and is not part of
+    /// the GPU→host transfer.
+    pub fn read_back_plane(&self, plane: usize) -> AppResult<Vec<u8>> {
+        let readback = self.read_back_plane_buffer(plane)?;
+        self.readback_host_copies.fetch_add(1, Ordering::Relaxed);
+        Ok(readback.to_vec())
+    }
+
     /// Blit the private texture into a shared buffer and return tight rows.
     /// For a two-plane NV12 upload this is the full NV12 byte layout: the
     /// luma plane followed by the interleaved UV plane.
@@ -3705,13 +4514,16 @@ impl DirectStorageTexture {
             bytes.extend_from_slice(&self.read_back_plane(1)?);
             return Ok(bytes);
         }
-        read_texture_pixels(
-            self.texture.device(),
-            &self.texture,
-            self.width as u64,
-            self.height as u64,
-            self.format,
-        )
+        let readback = self.read_back_plane_buffer(0)?;
+        self.readback_host_copies.fetch_add(1, Ordering::Relaxed);
+        Ok(readback.to_vec())
+    }
+
+    /// Number of host-owned `Vec` copies handed out by `read_back*`.
+    ///
+    /// A zero-copy verification path (`read_back_buffer*`) leaves this at zero.
+    pub fn readback_host_copies(&self) -> u64 {
+        self.readback_host_copies.load(Ordering::Relaxed)
     }
 }
 
@@ -3732,16 +4544,267 @@ pub fn metal_format_bytes_per_pixel(format: metal::MTLPixelFormat) -> Option<usi
     }
 }
 
-/// GPU-side readback: blit `texture` into a shared buffer and copy the tight
-/// rows into a Vec. This is the verification path for uploaded textures; it
-/// never reads the CPU shadow.
-pub fn read_texture_pixels(
+/// Count of unaligned texture-upload destinations refused because the format
+/// is wider than one byte. This is the only remaining physical Metal blit
+/// restriction: such an offset cannot be represented without a host copy, so
+/// it is reported (and counted) instead of silently staged.
+static ALIGNMENT_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of unaligned texture uploads refused by the Metal alignment contract.
+pub fn alignment_refusal_count() -> u64 {
+    ALIGNMENT_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Reset the alignment-refusal counter (tests).
+pub fn reset_alignment_refusal_count() {
+    ALIGNMENT_REFUSALS.store(0, Ordering::Relaxed);
+}
+
+/// Encode a buffer→texture copy that tolerates an unaligned source offset.
+///
+/// A Metal blit requires the source offset to be aligned to the pixel size, so
+/// a guest destination that starts mid-page (or any mmap lead-in) can be one
+/// byte off that alignment. For 8-bit-per-channel formats the bytes are copied
+/// by a compute kernel that reads at an arbitrary byte offset; every other
+/// unaligned case is refused explicitly (a genuine Metal alignment contract,
+/// never a silent staging copy).
+fn encode_plane_copy(
+    command_buffer: &metal::CommandBufferRef,
+    buffer: &metal::BufferRef,
+    buffer_offset: u64,
+    bytes_per_row: u64,
+    width: u64,
+    height: u64,
+    format: metal::MTLPixelFormat,
+    texture: &metal::TextureRef,
+) -> AppResult<()> {
+    use metal::MTLPixelFormat as F;
+    let bytes_per_pixel = metal_format_bytes_per_pixel(format).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!("texture upload: unsupported format {format:?}"),
+        )
+    })?;
+    if buffer_offset % bytes_per_pixel as u64 == 0 {
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_buffer_to_texture(
+            buffer,
+            buffer_offset,
+            bytes_per_row,
+            bytes_per_row * height,
+            metal::MTLSize {
+                width,
+                height,
+                depth: 1,
+            },
+            texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLBlitOption::None,
+        );
+        blit.end_encoding();
+        return Ok(());
+    }
+    let function_name = match format {
+        F::RGBA8Unorm => "copy_rgba8",
+        F::BGRA8Unorm => "copy_bgra8",
+        F::R8Unorm => "copy_r8",
+        F::RG8Unorm => "copy_rg8",
+        other => {
+            ALIGNMENT_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "texture upload: a {other:?} source offset of {buffer_offset} bytes is not \
+                     representable by a Metal blit; align the guest destination to {} bytes",
+                    bytes_per_pixel
+                ),
+            ));
+        }
+    };
+    const SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void copy_rgba8(device const uchar* source [[buffer(0)]],
+                       constant uint& base [[buffer(1)]],
+                       constant uint& row [[buffer(2)]],
+                       texture2d<float, access::write> destination [[texture(0)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= destination.get_width() || gid.y >= destination.get_height()) {
+        return;
+    }
+    uint offset = base + gid.y * row + gid.x * 4u;
+    destination.write(float4(source[offset], source[offset + 1u],
+                             source[offset + 2u], source[offset + 3u]) / 255.0,
+                      gid);
+}
+
+kernel void copy_bgra8(device const uchar* source [[buffer(0)]],
+                       constant uint& base [[buffer(1)]],
+                       constant uint& row [[buffer(2)]],
+                       texture2d<float, access::write> destination [[texture(0)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= destination.get_width() || gid.y >= destination.get_height()) {
+        return;
+    }
+    uint offset = base + gid.y * row + gid.x * 4u;
+    destination.write(float4(source[offset + 2u], source[offset + 1u],
+                             source[offset], source[offset + 3u]) / 255.0,
+                      gid);
+}
+
+kernel void copy_r8(device const uchar* source [[buffer(0)]],
+                    constant uint& base [[buffer(1)]],
+                    constant uint& row [[buffer(2)]],
+                    texture2d<float, access::write> destination [[texture(0)]],
+                    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= destination.get_width() || gid.y >= destination.get_height()) {
+        return;
+    }
+    uint offset = base + gid.y * row + gid.x;
+    destination.write(float4(source[offset] / 255.0, 0.0, 0.0, 1.0), gid);
+}
+
+kernel void copy_rg8(device const uchar* source [[buffer(0)]],
+                     constant uint& base [[buffer(1)]],
+                     constant uint& row [[buffer(2)]],
+                     texture2d<float, access::write> destination [[texture(0)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= destination.get_width() || gid.y >= destination.get_height()) {
+        return;
+    }
+    uint offset = base + gid.y * row + gid.x * 2u;
+    destination.write(float4(source[offset] / 255.0,
+                             source[offset + 1u] / 255.0, 0.0, 1.0),
+                      gid);
+}
+"#;
+    let options = metal::CompileOptions::new();
+    let library = buffer
+        .device()
+        .new_library_with_source(SHADER, &options)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("texture upload: compute shader compilation failed: {error}"),
+            )
+        })?;
+    let function = library.get_function(function_name, None).map_err(|error| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!("texture upload: kernel lookup failed: {error}"),
+        )
+    })?;
+    let pipeline = buffer
+        .device()
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("texture upload: compute pipeline creation failed: {error}"),
+            )
+        })?;
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(buffer), 0);
+    let base = u32::try_from(buffer_offset).map_err(|_| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            "texture upload: source offset exceeds u32",
+        )
+    })?;
+    let row = u32::try_from(bytes_per_row).map_err(|_| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            "texture upload: row bytes exceed u32",
+        )
+    })?;
+    encoder.set_bytes(
+        1,
+        std::mem::size_of::<u32>() as u64,
+        &base as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        2,
+        std::mem::size_of::<u32>() as u64,
+        &row as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_texture(0, Some(texture));
+    encoder.dispatch_threads(
+        metal::MTLSize::new(width, height, 1),
+        metal::MTLSize::new(8, 8, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
+/// A GPU readback that owns the shared `MTLBuffer` the blit filled.
+///
+/// The GPU→host transfer is the single blit into this buffer; reading the
+/// bytes is a borrow of the shared mapping, not a second copy. Callers that
+/// need an owned `Vec` (host APIs that return ownership) use
+/// [`TextureReadback::to_vec`] and that copy is theirs, not an intermediate
+/// staging step.
+pub struct TextureReadback {
+    buffer: metal::Buffer,
+    len: usize,
+}
+
+impl std::fmt::Debug for TextureReadback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextureReadback")
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl TextureReadback {
+    /// Borrow the readback bytes directly from the shared buffer mapping.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the blit into this shared buffer completed before the guard
+        // was constructed, and the buffer owns `len` bytes.
+        unsafe { std::slice::from_raw_parts(self.buffer.contents() as *const u8, self.len) }
+    }
+
+    /// Byte count of the readback.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the readback is empty (never true for a constructed readback).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Copy the bytes into an owned `Vec` (host-ownership request).
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_slice().to_vec()
+    }
+}
+
+impl AsRef<[u8]> for TextureReadback {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::Deref for TextureReadback {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+/// GPU-side readback without a host staging copy: blit `texture` into a shared/// buffer and return the buffer itself.
+pub fn read_texture_readback(
     device: &metal::DeviceRef,
     texture: &metal::TextureRef,
     width: u64,
     height: u64,
     format: metal::MTLPixelFormat,
-) -> AppResult<Vec<u8>> {
+) -> AppResult<TextureReadback> {
     let bytes_per_pixel = metal_format_bytes_per_pixel(format).ok_or_else(|| {
         AppError::new(
             ReasonCode::RcD3dInvalidState,
@@ -3787,23 +4850,28 @@ pub fn read_texture_pixels(
     }
     command_buffer.commit();
     command_buffer.wait_until_completed();
-    let mut pixels = vec![0u8; size];
-    // SAFETY: the blit completed and the shared buffer owns `size` bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(buffer.contents() as *const u8, pixels.as_mut_ptr(), size);
-    }
-    Ok(pixels)
+    Ok(TextureReadback { buffer, len: size })
 }
 
-/// Upload a region of an already-open file straight into a Metal buffer and
-/// blit it into a private texture. No guest-visible staging Vec holds the
-/// pixel bytes on the uncompressed path.
-pub fn upload_texture_from_file(
-    file: &mut std::fs::File,
-    desc: DirectStorageUploadDesc,
-) -> AppResult<DirectStorageTexture> {
-    use std::io::{Read, Seek, SeekFrom};
+/// GPU-side readback: blit `texture` into a shared buffer and copy the tight
+/// rows into a Vec. This is the verification path for uploaded textures; it
+/// never reads the CPU shadow. Callers that only inspect the bytes should use
+/// [`read_texture_readback`] to avoid this host-owned copy.
+pub fn read_texture_pixels(
+    device: &metal::DeviceRef,
+    texture: &metal::TextureRef,
+    width: u64,
+    height: u64,
+    format: metal::MTLPixelFormat,
+) -> AppResult<Vec<u8>> {
+    Ok(read_texture_readback(device, texture, width, height, format)?.to_vec())
+}
 
+/// Validate a DirectStorage upload descriptor, returning its bytes per pixel.
+///
+/// The exact diagnostics are shared by the staging and guest-backed upload
+/// paths so a refused guest placement cannot change the caller-visible error.
+fn validate_directstorage_upload(desc: &DirectStorageUploadDesc) -> AppResult<usize> {
     let bytes_per_pixel = metal_format_bytes_per_pixel(desc.format).ok_or_else(|| {
         AppError::new(
             ReasonCode::RcD3dInvalidState,
@@ -3835,7 +4903,19 @@ pub fn upload_texture_from_file(
             "DirectStorage: empty or overflowing source region",
         ));
     }
+    Ok(bytes_per_pixel)
+}
 
+/// Upload a region of an already-open file straight into a Metal buffer and
+/// blit it into a private texture. No guest-visible staging Vec holds the
+/// pixel bytes on the uncompressed path.
+pub fn upload_texture_from_file(
+    file: &mut std::fs::File,
+    desc: DirectStorageUploadDesc,
+) -> AppResult<DirectStorageTexture> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let bytes_per_pixel = validate_directstorage_upload(&desc)?;
     let device = MetalDevice::system_default()?;
     let texture = device.create_texture(
         desc.width as u64,
@@ -3878,16 +4958,13 @@ pub fn upload_texture_from_file(
             )
         })?;
 
+    let destination = unsafe {
+        std::slice::from_raw_parts_mut(staging.contents() as *mut u8, desc.output_len as usize)
+    };
     match desc.compression {
         DirectStorageCompression::None => {
             // Direct: the kernel fills the MTLBuffer mapping itself. No
             // intermediate Vec ever owns the pixel bytes.
-            let destination = unsafe {
-                std::slice::from_raw_parts_mut(
-                    staging.contents() as *mut u8,
-                    desc.output_len as usize,
-                )
-            };
             file.read_exact(destination).map_err(|error| {
                 AppError::from_io(
                     ReasonCode::RcIo,
@@ -3901,24 +4978,24 @@ pub fn upload_texture_from_file(
             stats.directstorage_bytes = desc.output_len;
         }
         DirectStorageCompression::Zlib => {
-            let mut compressed = vec![0u8; desc.source_len as usize];
-            file.read_exact(&mut compressed).map_err(|error| {
-                AppError::from_io(
+            let file_len = file
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or(u64::MAX);
+            if desc.file_offset.saturating_add(desc.source_len) > file_len {
+                return Err(AppError::new(
                     ReasonCode::RcIo,
                     format!(
                         "DirectStorage: file is too short for {} compressed bytes at offset {}",
                         desc.source_len, desc.file_offset
                     ),
-                    &error,
-                )
-            })?;
-            let destination = unsafe {
-                std::slice::from_raw_parts_mut(
-                    staging.contents() as *mut u8,
-                    desc.output_len as usize,
-                )
-            };
-            let mut decoder = flate2::read::ZlibDecoder::new(&compressed[..]);
+                ));
+            }
+            // Stream the inflater straight into the destination buffer: the
+            // compressed bytes are consumed from the file handle, never staged
+            // in a `Vec`, and the decompressed plane only exists in its final
+            // Metal backing.
+            let mut decoder = flate2::read::ZlibDecoder::new(file.by_ref().take(desc.source_len));
             decoder.read_exact(destination).map_err(|error| {
                 AppError::from_io(
                     ReasonCode::RcIo,
@@ -3967,6 +5044,143 @@ pub fn upload_texture_from_file(
         format: desc.format,
         dxgi_format: metal_to_dxgi_format(desc.format),
         stats,
+        readback_host_copies: std::sync::Arc::new(AtomicU64::new(0)),
+    })
+}
+
+/// DirectStorage upload whose destination buffer aliases canonical guest
+/// pages: the file is read directly into `window[offset..offset+output_len]`
+/// and the same bytes are blitted to the GPU from a no-copy MTLBuffer.
+///
+/// Alignment is handled by widening the no-copy buffer down to the enclosing
+/// host page and blitting from the returned leading offset; an ownership
+/// violation or a device refusal is an explicit error, never a silent staging
+/// copy. Short files keep the same real IO error as the staging path.
+pub fn upload_texture_from_file_into_guest(
+    file: &mut std::fs::File,
+    desc: DirectStorageUploadDesc,
+    window: &GuestMemoryWindow,
+    offset: usize,
+) -> AppResult<DirectStorageTexture> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let bytes_per_pixel = validate_directstorage_upload(&desc)?;
+    let span = window
+        .resolve_aligned(offset, desc.output_len as usize)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("DirectStorage: guest upload refused: {}", error.reason()),
+            )
+        })?;
+
+    let device = MetalDevice::system_default()?;
+    let texture = device.create_texture(
+        desc.width as u64,
+        desc.height as u64,
+        desc.format,
+        metal::MTLTextureUsage::ShaderRead
+            | metal::MTLTextureUsage::ShaderWrite
+            | metal::MTLTextureUsage::RenderTarget,
+        metal::MTLStorageMode::Private,
+    );
+    let mut stats = DirectStorageStats {
+        source_bytes: desc.source_len,
+        guest_backed: true,
+        ..DirectStorageStats::default()
+    };
+
+    file.seek(SeekFrom::Start(desc.file_offset))
+        .map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcIo,
+                "DirectStorage: seek to source region failed",
+                &error,
+            )
+        })?;
+    // The destination is the canonical guest mapping itself, addressed past the
+    // page-alignment lead-in. No host copy exists anywhere on this path.
+    let destination = unsafe {
+        std::slice::from_raw_parts_mut(span.pointer.add(span.leading), desc.output_len as usize)
+    };
+    match desc.compression {
+        DirectStorageCompression::None => {
+            file.read_exact(destination).map_err(|error| {
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    format!(
+                        "DirectStorage: file is too short for {} bytes at offset {}",
+                        desc.output_len, desc.file_offset
+                    ),
+                    &error,
+                )
+            })?;
+            stats.directstorage_bytes = desc.output_len;
+        }
+        DirectStorageCompression::Zlib => {
+            let file_len = file
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or(u64::MAX);
+            if desc.file_offset.saturating_add(desc.source_len) > file_len {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "DirectStorage: file is too short for {} compressed bytes at offset {}",
+                        desc.source_len, desc.file_offset
+                    ),
+                ));
+            }
+            // Stream-inflate straight into guest pages: neither the compressed
+            // stream nor the decompressed plane is ever held in a Vec.
+            let mut decoder = flate2::read::ZlibDecoder::new(file.by_ref().take(desc.source_len));
+            decoder.read_exact(destination).map_err(|error| {
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    "DirectStorage: zlib decode failed",
+                    &error,
+                )
+            })?;
+            stats.staging_bytes = desc.source_len;
+            stats.directstorage_bytes = desc.output_len;
+        }
+    }
+
+    let staging = device
+        .create_buffer_over_aligned_guest_span(&span)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("DirectStorage: guest upload refused: {}", error.reason()),
+            )
+        })?;
+
+    let bytes_per_row = desc.width as u64 * bytes_per_pixel as u64;
+    let queue = device.create_command_queue();
+    let command_buffer = queue.new_command_buffer();
+    encode_plane_copy(
+        command_buffer,
+        &staging,
+        span.leading as u64,
+        bytes_per_row,
+        desc.width as u64,
+        desc.height as u64,
+        desc.format,
+        &texture,
+    )?;
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    stats.blits = 1;
+
+    Ok(DirectStorageTexture {
+        texture,
+        chroma: None,
+        width: desc.width,
+        height: desc.height,
+        format: desc.format,
+        dxgi_format: metal_to_dxgi_format(desc.format),
+        stats,
+        readback_host_copies: std::sync::Arc::new(AtomicU64::new(0)),
     })
 }
 
@@ -4039,19 +5253,112 @@ pub fn upload_texture_from_bytes(
         height,
         format,
         dxgi_format: metal_to_dxgi_format(format),
+        readback_host_copies: std::sync::Arc::new(AtomicU64::new(0)),
         stats: DirectStorageStats {
             directstorage_bytes: 0,
             staging_bytes: data.len() as u64,
             source_bytes: data.len() as u64,
             blits: 1,
+            guest_backed: false,
+            staging_fallbacks: 0,
         },
+    })
+}
+
+/// `CreateResource` initial data whose source bytes already live in canonical
+/// guest pages: the bytes are blitted from a no-copy MTLBuffer over the guest
+/// window, so there is no host-side copy. An ownership/alignment refusal is an
+/// explicit error (widening a sub-page offset is handled by the aligned span).
+pub fn upload_texture_from_guest_bytes(
+    window: &GuestMemoryWindow,
+    offset: usize,
+    data_len: usize,
+    width: u32,
+    height: u32,
+    format: metal::MTLPixelFormat,
+) -> AppResult<DirectStorageTexture> {
+    let bytes_per_pixel = metal_format_bytes_per_pixel(format).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!("initial data: unsupported texture format {format:?}"),
+        )
+    })?;
+    let expected = width as usize * height as usize * bytes_per_pixel;
+    if width == 0 || height == 0 || data_len != expected {
+        return Err(AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!(
+                "initial data: {data_len} bytes do not match {width}x{height} {format:?} ({expected} bytes)"
+            ),
+        ));
+    }
+    let span = window.resolve_aligned(offset, data_len).map_err(|error| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!(
+                "initial data: guest initial data refused: {}",
+                error.reason()
+            ),
+        )
+    })?;
+    let device = MetalDevice::system_default()?;
+    let texture = device.create_texture(
+        width as u64,
+        height as u64,
+        format,
+        metal::MTLTextureUsage::ShaderRead
+            | metal::MTLTextureUsage::ShaderWrite
+            | metal::MTLTextureUsage::RenderTarget,
+        metal::MTLStorageMode::Private,
+    );
+    let buffer = device
+        .create_buffer_over_aligned_guest_span(&span)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "initial data: guest initial data refused: {}",
+                    error.reason()
+                ),
+            )
+        })?;
+    let bytes_per_row = width as u64 * bytes_per_pixel as u64;
+    let queue = device.create_command_queue();
+    let command_buffer = queue.new_command_buffer();
+    encode_plane_copy(
+        command_buffer,
+        &buffer,
+        span.leading as u64,
+        bytes_per_row,
+        width as u64,
+        height as u64,
+        format,
+        &texture,
+    )?;
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    Ok(DirectStorageTexture {
+        texture,
+        chroma: None,
+        width,
+        height,
+        format,
+        dxgi_format: metal_to_dxgi_format(format),
+        stats: DirectStorageStats {
+            directstorage_bytes: 0,
+            staging_bytes: 0,
+            source_bytes: data_len as u64,
+            blits: 1,
+            guest_backed: true,
+            staging_fallbacks: 0,
+        },
+        readback_host_copies: std::sync::Arc::new(AtomicU64::new(0)),
     })
 }
 
 // ---------------------------------------------------------------------------
 // Asynchronous (queued + fenced) DirectStorage upload pipeline
 // ---------------------------------------------------------------------------
-
 /// Snapshot of the asynchronous upload pipeline. `queued` counts uploads
 /// accepted since the queue was created, `completed` counts uploads whose GPU
 /// work the shared event has observed, and `in_flight` is the number of
@@ -4072,6 +5379,14 @@ pub struct DirectStorageQueueStats {
     pub pending_io: u64,
     pub io_bytes_pending: u64,
     pub io_completed: u64,
+    /// Uncompressed sources read through a no-copy `mmap` MTLBuffer.
+    pub mmap_sources: u64,
+    /// Compressed sources stream-inflated directly into the destination.
+    pub zlib_streams: u64,
+    /// Uploads whose destination buffer aliases canonical guest pages.
+    pub guest_uploads: u64,
+    /// Counted host fallbacks that could not use a no-copy source/destination.
+    pub staging_fallbacks: u64,
     pub fence_value: u64,
     pub retained_buffers: u64,
     pub retained_textures: u64,
@@ -4080,9 +5395,111 @@ pub struct DirectStorageQueueStats {
 /// One committed upload awaiting GPU completion.
 struct PendingUpload {
     value: u64,
-    buffers: Vec<metal::Buffer>,
+    buffers: Vec<UploadBuffer>,
     textures: Vec<metal::Texture>,
     _command_buffer: metal::CommandBuffer,
+    /// Guest windows whose pages the retained buffers alias. Holding the
+    /// descriptor keeps the destination ownership explicit until the GPU work
+    /// completes (the canonical store itself owns the mapping).
+    _guest_windows: Vec<GuestMemoryWindow>,
+}
+
+/// A GPU-visible source/destination buffer plus the host mapping that backs it.
+///
+/// A guest-backed buffer needs no mapping owner (the canonical store owns it).
+/// An `mmap` source buffer must keep its mapping alive until the GPU command
+/// buffer completes, so the mapping is an `Arc` retained here.
+struct UploadBuffer {
+    buffer: metal::Buffer,
+    /// Offset of the plane's first byte inside `buffer` (page lead-in for guest
+    /// destinations and `mmap` sources; zero for a freshly allocated buffer).
+    source_offset: usize,
+    _mapping: Option<std::sync::Arc<MappedRegion>>,
+}
+
+/// A read-only host mapping of a file region, released exactly once on drop.
+struct MappedRegion {
+    pointer: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the mapping is immutable (`PROT_READ`, `MAP_PRIVATE`) and owned by the
+// `Arc`; sharing the descriptor lets the GPU and the worker read the same
+// pages. It is never mutated, so there is no data race.
+unsafe impl Send for MappedRegion {}
+// SAFETY: see the `Send` impl above.
+unsafe impl Sync for MappedRegion {}
+
+impl Drop for MappedRegion {
+    fn drop(&mut self) {
+        if !self.pointer.is_null() && self.len != 0 {
+            // SAFETY: the pointer and length came from a successful `mmap` and
+            // this is the single owning drop.
+            unsafe {
+                libc::munmap(self.pointer as *mut libc::c_void, self.len);
+            }
+        }
+    }
+}
+
+/// Map `[offset, offset + length)` of `file` read-only, page-aligning the
+/// leading edge. Returns the mapping, the delta to the requested bytes, and the
+/// mapped length.
+fn map_file_region(
+    file: &std::fs::File,
+    offset: u64,
+    length: u64,
+) -> Option<(std::sync::Arc<MappedRegion>, usize, usize)> {
+    use std::os::unix::io::AsRawFd;
+    if length == 0 {
+        return None;
+    }
+    let page = host_page_size() as u64;
+    let aligned_offset = offset - (offset % page);
+    let leading = usize::try_from(offset - aligned_offset).ok()?;
+    let requested = usize::try_from(length).ok()?;
+    let span = leading.checked_add(requested)?;
+    let map_len_u64 = (span as u64).checked_add(page - 1)? & !(page - 1);
+    let map_len = usize::try_from(map_len_u64).ok()?;
+    // SAFETY: plain read-only private mapping of a live file descriptor. The
+    // kernel checks that the range lies in the file; a short file yields
+    // MAP_FAILED and the caller falls back to a real read error.
+    let pointer = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            aligned_offset as libc::off_t,
+        )
+    };
+    if pointer == libc::MAP_FAILED {
+        return None;
+    }
+    Some((
+        std::sync::Arc::new(MappedRegion {
+            pointer: pointer as *mut u8,
+            len: map_len,
+        }),
+        leading,
+        map_len,
+    ))
+}
+
+/// Destination of one plane in the background worker.
+enum PlaneDestination {
+    /// A host staging buffer is allocated (the source cannot be viewed
+    /// no-copy, or the upload is compressed).
+    Host,
+    /// The destination is canonical guest memory; the no-copy MTLBuffer was
+    /// created at enqueue time so alignment/ownership failures are reported to
+    /// the caller instead of becoming a silent staging copy.
+    Guest {
+        buffer: metal::Buffer,
+        leading: usize,
+        window: GuestMemoryWindow,
+    },
 }
 
 /// Mutex-guarded state shared by the queue, its IO worker and its completion
@@ -4096,6 +5513,10 @@ struct QueueState {
     committed: u64,
     io_bytes_pending: u64,
     io_completed: u64,
+    mmap_sources: u64,
+    zlib_streams: u64,
+    guest_uploads: u64,
+    staging_fallbacks: u64,
     /// Fence value -> uncommitted IO reservation. Cancellation removes entries
     /// from this map before the worker can commit them.
     pending_io: BTreeMap<u64, PendingIo>,
@@ -4145,7 +5566,8 @@ struct PlaneJob {
     width: u64,
     height: u64,
     bytes_per_row: u64,
-    bytes_per_image: u64,
+    format: metal::MTLPixelFormat,
+    destination: PlaneDestination,
 }
 
 /// Work item handed to the background reader. The file descriptor is a
@@ -4233,6 +5655,10 @@ impl DirectStorageUploadQueue {
                 committed: 0,
                 io_bytes_pending: 0,
                 io_completed: 0,
+                mmap_sources: 0,
+                zlib_streams: 0,
+                guest_uploads: 0,
+                staging_fallbacks: 0,
                 pending_io: BTreeMap::new(),
                 pending: Vec::new(),
                 completed_values: BTreeSet::new(),
@@ -4294,6 +5720,10 @@ impl DirectStorageUploadQueue {
             pending_io: state.pending_io.len() as u64,
             io_bytes_pending: state.io_bytes_pending,
             io_completed: state.io_completed,
+            mmap_sources: state.mmap_sources,
+            zlib_streams: state.zlib_streams,
+            guest_uploads: state.guest_uploads,
+            staging_fallbacks: state.staging_fallbacks,
             fence_value: self.core.event.signaled_value(),
             retained_buffers: state
                 .pending
@@ -4329,8 +5759,11 @@ impl DirectStorageUploadQueue {
         texture_descriptor.set_pixel_format(format);
         texture_descriptor.set_width(width as u64);
         texture_descriptor.set_height(height as u64);
-        texture_descriptor
-            .set_usage(metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget);
+        texture_descriptor.set_usage(
+            metal::MTLTextureUsage::ShaderRead
+                | metal::MTLTextureUsage::ShaderWrite
+                | metal::MTLTextureUsage::RenderTarget,
+        );
         texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
         texture_descriptor.set_sample_count(1);
         self.core.device.new_texture(&texture_descriptor)
@@ -4443,7 +5876,8 @@ impl DirectStorageUploadQueue {
                 width: desc.width as u64,
                 height: desc.height as u64,
                 bytes_per_row,
-                bytes_per_image: bytes_per_row * desc.height as u64,
+                format: desc.format,
+                destination: PlaneDestination::Host,
             }],
             textures: vec![texture.clone()],
             read_bytes,
@@ -4466,6 +5900,7 @@ impl DirectStorageUploadQueue {
             height: desc.height,
             format: desc.format,
             dxgi_format: metal_to_dxgi_format(desc.format),
+            readback_host_copies: std::sync::Arc::new(AtomicU64::new(0)),
             stats: DirectStorageStats {
                 directstorage_bytes: desc.output_len,
                 staging_bytes: match desc.compression {
@@ -4474,6 +5909,8 @@ impl DirectStorageUploadQueue {
                 },
                 source_bytes: desc.source_len,
                 blits: 1,
+                guest_backed: false,
+                staging_fallbacks: 0,
             },
         };
         Ok((value, upload))
@@ -4589,7 +6026,8 @@ impl DirectStorageUploadQueue {
                     width: desc.width as u64,
                     height: desc.height as u64,
                     bytes_per_row: luma_row,
-                    bytes_per_image: luma_row * desc.height as u64,
+                    format: metal::MTLPixelFormat::R8Unorm,
+                    destination: PlaneDestination::Host,
                 },
                 PlaneJob {
                     file_offset: desc.chroma.file_offset,
@@ -4598,7 +6036,8 @@ impl DirectStorageUploadQueue {
                     width: desc.width as u64 / 2,
                     height: desc.height as u64 / 2,
                     bytes_per_row: chroma_row,
-                    bytes_per_image: chroma_row * (desc.height as u64 / 2),
+                    format: metal::MTLPixelFormat::RG8Unorm,
+                    destination: PlaneDestination::Host,
                 },
             ],
             textures: vec![luma.clone(), chroma.clone()],
@@ -4622,6 +6061,7 @@ impl DirectStorageUploadQueue {
             height: desc.height,
             format: metal::MTLPixelFormat::R8Unorm,
             dxgi_format: metal_to_dxgi_format(metal::MTLPixelFormat::R8Unorm),
+            readback_host_copies: std::sync::Arc::new(AtomicU64::new(0)),
             stats: DirectStorageStats {
                 directstorage_bytes: desc.luma.output_len + desc.chroma.output_len,
                 staging_bytes: match desc.compression {
@@ -4630,9 +6070,348 @@ impl DirectStorageUploadQueue {
                 },
                 source_bytes: read_bytes,
                 blits: 2,
+                guest_backed: false,
+                staging_fallbacks: 0,
             },
         };
         Ok((value, upload))
+    }
+
+    /// Enqueue one file upload whose destination is canonical guest memory.
+    ///
+    /// The no-copy MTLBuffer is created at enqueue time, so an out-of-window
+    /// or device-refused destination is reported to the caller instead of
+    /// becoming a silent host staging copy. The `ReadJob` carries the guest
+    /// window; the committed upload retains the descriptor (and the no-copy
+    /// buffer) until the GPU work completes. `GuestMemoryWindow` is a
+    /// non-owning view, so the caller must keep the canonical mapping alive
+    /// until [`wait_for_value`](Self::wait_for_value) reports completion or
+    /// the upload is cancelled.
+    /// Uncompressed sources are read straight into those pages and
+    /// zlib sources are stream-inflated into them.
+    pub fn enqueue_file_into_guest(
+        &mut self,
+        file: &mut std::fs::File,
+        desc: DirectStorageUploadDesc,
+        window: GuestMemoryWindow,
+        offset: usize,
+    ) -> AppResult<(u64, DirectStorageTexture)> {
+        let bytes_per_pixel = metal_format_bytes_per_pixel(desc.format).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "DirectStorage async: unsupported texture format {:?}",
+                    desc.format
+                ),
+            )
+        })?;
+        if desc.width == 0 || desc.height == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "DirectStorage async: zero texture dimensions",
+            ));
+        }
+        let expected_output = desc.width as u64 * desc.height as u64 * bytes_per_pixel as u64;
+        if desc.output_len != expected_output {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "DirectStorage async: output_len {} does not match {}x{} {:?} ({expected_output} bytes)",
+                    desc.output_len, desc.width, desc.height, desc.format
+                ),
+            ));
+        }
+        if desc.source_len == 0 || desc.file_offset.checked_add(desc.source_len).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "DirectStorage async: empty or overflowing source region",
+            ));
+        }
+        let span = window
+            .resolve_aligned(offset, desc.output_len as usize)
+            .map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "DirectStorage async: guest destination refused: {}",
+                        error.reason()
+                    ),
+                )
+            })?;
+        let destination =
+            create_aligned_guest_buffer(&self.core.device, &span).map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "DirectStorage async: guest destination refused: {}",
+                        error.reason()
+                    ),
+                )
+            })?;
+        let worker_file = self.clone_directstorage_file(file, "DirectStorage async")?;
+        let texture = self.create_private_texture(desc.width, desc.height, desc.format);
+        let read_bytes = desc.source_len;
+        let (value, read_bytes) = self.reserve_value(read_bytes, 1, 1);
+        let bytes_per_row = desc.width as u64 * bytes_per_pixel as u64;
+        let job = ReadJob {
+            value,
+            file: worker_file,
+            compression: desc.compression,
+            planes: vec![PlaneJob {
+                file_offset: desc.file_offset,
+                source_len: desc.source_len,
+                output_len: desc.output_len,
+                width: desc.width as u64,
+                height: desc.height as u64,
+                bytes_per_row,
+                format: desc.format,
+                destination: PlaneDestination::Guest {
+                    buffer: destination,
+                    leading: span.leading,
+                    window,
+                },
+            }],
+            textures: vec![texture.clone()],
+            read_bytes,
+        };
+        self.dispatch_or_rollback(value, read_bytes, job, "DirectStorage async")?;
+        let upload = DirectStorageTexture {
+            texture,
+            chroma: None,
+            width: desc.width,
+            height: desc.height,
+            format: desc.format,
+            dxgi_format: metal_to_dxgi_format(desc.format),
+            readback_host_copies: std::sync::Arc::new(AtomicU64::new(0)),
+            stats: DirectStorageStats {
+                directstorage_bytes: desc.output_len,
+                staging_bytes: match desc.compression {
+                    DirectStorageCompression::None => 0,
+                    DirectStorageCompression::Zlib => desc.source_len,
+                },
+                source_bytes: desc.source_len,
+                blits: 1,
+                guest_backed: true,
+                staging_fallbacks: 0,
+            },
+        };
+        Ok((value, upload))
+    }
+
+    /// Enqueue one logical NV12 upload whose two planes are written straight
+    /// into canonical guest pages (`luma_offset` and `chroma_offset` are
+    /// independent guest offsets). Neither plane is staged on the host.
+    pub fn enqueue_nv12_file_into_guest(
+        &mut self,
+        file: &mut std::fs::File,
+        desc: DirectStorageNv12UploadDesc,
+        window: GuestMemoryWindow,
+        luma_offset: usize,
+        chroma_offset: usize,
+    ) -> AppResult<(u64, DirectStorageTexture)> {
+        if desc.width == 0 || desc.height == 0 || desc.width % 2 != 0 || desc.height % 2 != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "DirectStorage NV12: dimensions {}x{} must be non-zero and even",
+                    desc.width, desc.height
+                ),
+            ));
+        }
+        if desc.luma.format != metal::MTLPixelFormat::R8Unorm
+            || desc.chroma.format != metal::MTLPixelFormat::RG8Unorm
+        {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "DirectStorage NV12: planes must be R8Unorm luma and RG8Unorm chroma",
+            ));
+        }
+        let (luma_span, chroma_span) =
+            self.validate_nv12_guest_destination(&desc, &window, luma_offset, chroma_offset)?;
+        let luma_buffer =
+            create_aligned_guest_buffer(&self.core.device, &luma_span).map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "DirectStorage NV12: guest destination refused: {}",
+                        error.reason()
+                    ),
+                )
+            })?;
+        let chroma_buffer =
+            create_aligned_guest_buffer(&self.core.device, &chroma_span).map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "DirectStorage NV12: guest destination refused: {}",
+                        error.reason()
+                    ),
+                )
+            })?;
+        let worker_file = self.clone_directstorage_file(file, "DirectStorage NV12")?;
+        let luma =
+            self.create_private_texture(desc.width, desc.height, metal::MTLPixelFormat::R8Unorm);
+        let chroma = self.create_private_texture(
+            desc.width / 2,
+            desc.height / 2,
+            metal::MTLPixelFormat::RG8Unorm,
+        );
+        let read_bytes = desc.luma.source_len + desc.chroma.source_len;
+        let (value, read_bytes) = self.reserve_value(read_bytes, 2, 2);
+        let luma_row = desc.width as u64;
+        let chroma_row = (desc.width as u64 / 2) * 2;
+        let job = ReadJob {
+            value,
+            file: worker_file,
+            compression: desc.compression,
+            planes: vec![
+                PlaneJob {
+                    file_offset: desc.luma.file_offset,
+                    source_len: desc.luma.source_len,
+                    output_len: desc.luma.output_len,
+                    width: desc.width as u64,
+                    height: desc.height as u64,
+                    bytes_per_row: luma_row,
+                    format: metal::MTLPixelFormat::R8Unorm,
+                    destination: PlaneDestination::Guest {
+                        buffer: luma_buffer,
+                        leading: luma_span.leading,
+                        window,
+                    },
+                },
+                PlaneJob {
+                    file_offset: desc.chroma.file_offset,
+                    source_len: desc.chroma.source_len,
+                    output_len: desc.chroma.output_len,
+                    width: desc.width as u64 / 2,
+                    height: desc.height as u64 / 2,
+                    bytes_per_row: chroma_row,
+                    format: metal::MTLPixelFormat::RG8Unorm,
+                    destination: PlaneDestination::Guest {
+                        buffer: chroma_buffer,
+                        leading: chroma_span.leading,
+                        window,
+                    },
+                },
+            ],
+            textures: vec![luma.clone(), chroma.clone()],
+            read_bytes,
+        };
+        self.dispatch_or_rollback(value, read_bytes, job, "DirectStorage NV12")?;
+        let upload = DirectStorageTexture {
+            texture: luma,
+            chroma: Some(chroma),
+            width: desc.width,
+            height: desc.height,
+            format: metal::MTLPixelFormat::R8Unorm,
+            dxgi_format: metal_to_dxgi_format(metal::MTLPixelFormat::R8Unorm),
+            readback_host_copies: std::sync::Arc::new(AtomicU64::new(0)),
+            stats: DirectStorageStats {
+                directstorage_bytes: desc.luma.output_len + desc.chroma.output_len,
+                staging_bytes: match desc.compression {
+                    DirectStorageCompression::None => 0,
+                    DirectStorageCompression::Zlib => read_bytes,
+                },
+                source_bytes: read_bytes,
+                blits: 2,
+                guest_backed: true,
+                staging_fallbacks: 0,
+            },
+        };
+        Ok((value, upload))
+    }
+
+    fn clone_directstorage_file(
+        &self,
+        file: &mut std::fs::File,
+        label: &str,
+    ) -> AppResult<std::fs::File> {
+        #[cfg(test)]
+        let result = if faults::file_clone_failure() {
+            Err(std::io::Error::other(
+                "injected file handle duplication failure",
+            ))
+        } else {
+            file.try_clone()
+        };
+        #[cfg(not(test))]
+        let result = file.try_clone();
+        result.map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("{label}: failed to duplicate the source file handle"),
+                &error,
+            )
+        })
+    }
+
+    fn dispatch_or_rollback(
+        &mut self,
+        value: u64,
+        read_bytes: u64,
+        job: ReadJob,
+        label: &str,
+    ) -> AppResult<()> {
+        let dispatched = match self.worker_tx.as_ref() {
+            Some(sender) => sender.send(job).is_ok(),
+            None => false,
+        };
+        if !dispatched {
+            self.rollback_reservation(value, read_bytes);
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("{label}: IO worker is not running"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_nv12_guest_destination(
+        &self,
+        desc: &DirectStorageNv12UploadDesc,
+        window: &GuestMemoryWindow,
+        luma_offset: usize,
+        chroma_offset: usize,
+    ) -> AppResult<(GuestAlignedSpan, GuestAlignedSpan)> {
+        let luma_expected = desc.width as u64 * desc.height as u64;
+        let chroma_expected = (desc.width as u64 / 2) * (desc.height as u64 / 2) * 2;
+        if desc.luma.output_len != luma_expected || desc.chroma.output_len != chroma_expected {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "DirectStorage NV12: plane output_len does not match the plane dimensions",
+            ));
+        }
+        for (plane, label) in [(desc.luma, "luma"), (desc.chroma, "chroma")] {
+            if plane.source_len == 0 || plane.file_offset.checked_add(plane.source_len).is_none() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("DirectStorage NV12: empty or overflowing {label} source region"),
+                ));
+            }
+        }
+        let luma_span = window
+            .resolve_aligned(luma_offset, desc.luma.output_len as usize)
+            .map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "DirectStorage NV12: guest luma destination refused: {}",
+                        error.reason()
+                    ),
+                )
+            })?;
+        let chroma_span = window
+            .resolve_aligned(chroma_offset, desc.chroma.output_len as usize)
+            .map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "DirectStorage NV12: guest chroma destination refused: {}",
+                        error.reason()
+                    ),
+                )
+            })?;
+        Ok((luma_span, chroma_span))
     }
 
     /// Register a drain callback slot fired once whenever the queue becomes
@@ -4982,81 +6761,252 @@ fn io_worker_loop(core: std::sync::Arc<QueueCore>, jobs: std::sync::mpsc::Receiv
             read_bytes,
         } = job;
         let mut buffers = Vec::with_capacity(planes.len());
+        let mut windows = Vec::new();
         let mut failure: Option<AppError> = None;
+        let mut job_mmap = 0u64;
+        let mut job_zlib = 0u64;
+        let mut job_guest = 0u64;
+        let mut job_staging = 0u64;
         for plane in &planes {
-            let buffer = core.device.new_buffer(
-                plane.output_len,
-                metal::MTLResourceOptions::StorageModeShared,
-            );
-            #[cfg(test)]
-            let buffer_contents = if test_faults::IO_WORKER_PRIVATE_BUFFER.load(Ordering::SeqCst) {
-                std::ptr::null_mut()
-            } else {
-                buffer.contents()
-            };
-            #[cfg(not(test))]
-            let buffer_contents = buffer.contents();
-            if buffer_contents.is_null() {
-                failure = Some(AppError::new(
-                    ReasonCode::RcOutOfMemory,
-                    "DirectStorage async: Metal refused the upload buffer mapping",
-                ));
-                break;
-            }
-            if let Err(error) = file.seek(SeekFrom::Start(plane.file_offset)) {
-                failure = Some(AppError::from_io(
-                    ReasonCode::RcIo,
-                    "DirectStorage async: seek to source region failed",
-                    &error,
-                ));
-                break;
-            }
-            let destination = unsafe {
-                std::slice::from_raw_parts_mut(
-                    buffer_contents as *mut u8,
-                    plane.output_len as usize,
-                )
-            };
-            let read_result = match compression {
-                DirectStorageCompression::None => file.read_exact(destination).map_err(|error| {
-                    AppError::from_io(
-                        ReasonCode::RcIo,
-                        format!(
-                            "DirectStorage async: file is too short for {} bytes at offset {}",
-                            plane.output_len, plane.file_offset
-                        ),
-                        &error,
-                    )
-                }),
-                DirectStorageCompression::Zlib => (|| {
-                    let mut compressed = vec![0u8; plane.source_len as usize];
-                    file.read_exact(&mut compressed).map_err(|error| {
-                        AppError::from_io(
+            match &plane.destination {
+                PlaneDestination::Guest {
+                    buffer,
+                    leading,
+                    window,
+                } => {
+                    let buffer_contents = buffer.contents();
+                    if buffer_contents.is_null() {
+                        failure = Some(AppError::new(
+                            ReasonCode::RcOutOfMemory,
+                            "DirectStorage async: Metal refused the guest buffer mapping",
+                        ));
+                        break;
+                    }
+                    if let Err(error) = file.seek(SeekFrom::Start(plane.file_offset)) {
+                        failure = Some(AppError::from_io(
                             ReasonCode::RcIo,
-                            format!(
-                                "DirectStorage async: file is too short for {} compressed bytes at offset {}",
-                                plane.source_len, plane.file_offset
-                            ),
+                            "DirectStorage async: seek to source region failed",
                             &error,
+                        ));
+                        break;
+                    }
+                    let destination = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (buffer_contents as *mut u8).add(*leading),
+                            plane.output_len as usize,
                         )
-                    })?;
-                    let mut decoder = flate2::read::ZlibDecoder::new(&compressed[..]);
-                    decoder.read_exact(destination).map_err(|error| {
-                        AppError::from_io(
+                    };
+                    let read_result = match compression {
+                        DirectStorageCompression::None => {
+                            file.read_exact(destination).map_err(|error| {
+                                AppError::from_io(
+                                    ReasonCode::RcIo,
+                                    format!(
+                                        "DirectStorage async: file is too short for {} bytes at offset {}",
+                                        plane.output_len, plane.file_offset
+                                    ),
+                                    &error,
+                                )
+                            })
+                        }
+                        DirectStorageCompression::Zlib => {
+                            job_zlib += 1;
+                            let file_len =
+                                file.metadata().map(|metadata| metadata.len()).unwrap_or(u64::MAX);
+                            if plane.file_offset.saturating_add(plane.source_len) > file_len {
+                                failure = Some(AppError::new(
+                                    ReasonCode::RcIo,
+                                    format!(
+                                        "DirectStorage async: file is too short for {} compressed bytes at offset {}",
+                                        plane.source_len, plane.file_offset
+                                    ),
+                                ));
+                                break;
+                            }
+                            let mut decoder = flate2::read::ZlibDecoder::new(
+                                file.by_ref().take(plane.source_len),
+                            );
+                            decoder.read_exact(destination).map_err(|error| {
+                                AppError::from_io(
+                                    ReasonCode::RcIo,
+                                    "DirectStorage async: zlib decode failed",
+                                    &error,
+                                )
+                            })
+                        }
+                    };
+                    if let Err(error) = read_result {
+                        failure = Some(error);
+                        break;
+                    }
+                    buffers.push(UploadBuffer {
+                        buffer: buffer.to_owned(),
+                        source_offset: *leading,
+                        _mapping: None,
+                    });
+                    windows.push(*window);
+                    job_guest += 1;
+                }
+                PlaneDestination::Host => {
+                    // Uncompressed host destinations use the file mapping
+                    // directly: Metal reads the exact file pages, so no read
+                    // and no intermediate host buffer exist.
+                    #[cfg(test)]
+                    let mmap_allowed =
+                        !test_faults::IO_WORKER_PRIVATE_BUFFER.load(Ordering::SeqCst);
+                    #[cfg(not(test))]
+                    let mmap_allowed = true;
+                    if compression == DirectStorageCompression::None && mmap_allowed {
+                        let in_file = plane
+                            .file_offset
+                            .checked_add(plane.output_len)
+                            .map(|end| {
+                                file.metadata()
+                                    .map(|metadata| end <= metadata.len())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if in_file {
+                            if let Some((mapping, delta, map_len)) =
+                                map_file_region(&file, plane.file_offset, plane.output_len)
+                            {
+                                let raw: *mut objc::runtime::Object = unsafe {
+                                    msg_send![&*core.device,
+                                        newBufferWithBytesNoCopy: mapping.pointer
+                                        length: map_len
+                                        options: metal::MTLResourceOptions::StorageModeShared
+                                        deallocator: std::ptr::null::<objc::runtime::Object>()]
+                                };
+                                if !raw.is_null() {
+                                    // SAFETY: `raw` is a non-null +1 MTLBuffer
+                                    // returned by the device; `mapping` is kept
+                                    // alive in the UploadBuffer until the GPU
+                                    // command buffer completes.
+                                    let buffer = unsafe { metal::Buffer::from_ptr(raw as *mut _) };
+                                    buffers.push(UploadBuffer {
+                                        buffer,
+                                        source_offset: delta,
+                                        _mapping: Some(mapping),
+                                    });
+                                    job_mmap += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    let buffer = core.device.new_buffer(
+                        plane.output_len,
+                        metal::MTLResourceOptions::StorageModeShared,
+                    );
+                    #[cfg(test)]
+                    let buffer_contents =
+                        if test_faults::IO_WORKER_PRIVATE_BUFFER.load(Ordering::SeqCst) {
+                            std::ptr::null_mut()
+                        } else {
+                            buffer.contents()
+                        };
+                    #[cfg(not(test))]
+                    let buffer_contents = buffer.contents();
+                    if buffer_contents.is_null() {
+                        failure = Some(AppError::new(
+                            ReasonCode::RcOutOfMemory,
+                            "DirectStorage async: Metal refused the upload buffer mapping",
+                        ));
+                        break;
+                    }
+                    if let Err(error) = file.seek(SeekFrom::Start(plane.file_offset)) {
+                        failure = Some(AppError::from_io(
                             ReasonCode::RcIo,
-                            "DirectStorage async: zlib decode failed",
+                            "DirectStorage async: seek to source region failed",
                             &error,
+                        ));
+                        break;
+                    }
+                    let destination = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            buffer_contents as *mut u8,
+                            plane.output_len as usize,
                         )
-                    })
-                })(),
-            };
-            if let Err(error) = read_result {
-                failure = Some(error);
-                break;
+                    };
+                    let read_result = match compression {
+                        DirectStorageCompression::None => {
+                            job_staging += 1;
+                            file.read_exact(destination).map_err(|error| {
+                                AppError::from_io(
+                                    ReasonCode::RcIo,
+                                    format!(
+                                        "DirectStorage async: file is too short for {} bytes at offset {}",
+                                        plane.output_len, plane.file_offset
+                                    ),
+                                    &error,
+                                )
+                            })
+                        }
+                        DirectStorageCompression::Zlib => {
+                            job_zlib += 1;
+                            let file_len = file
+                                .metadata()
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(u64::MAX);
+                            if plane.file_offset.saturating_add(plane.source_len) > file_len {
+                                failure = Some(AppError::new(
+                                    ReasonCode::RcIo,
+                                    format!(
+                                        "DirectStorage async: file is too short for {} compressed bytes at offset {}",
+                                        plane.source_len, plane.file_offset
+                                    ),
+                                ));
+                                break;
+                            }
+                            let mut decoder = flate2::read::ZlibDecoder::new(
+                                file.by_ref().take(plane.source_len),
+                            );
+                            decoder.read_exact(destination).map_err(|error| {
+                                AppError::from_io(
+                                    ReasonCode::RcIo,
+                                    "DirectStorage async: zlib decode failed",
+                                    &error,
+                                )
+                            })
+                        }
+                    };
+                    if let Err(error) = read_result {
+                        failure = Some(error);
+                        break;
+                    }
+                    buffers.push(UploadBuffer {
+                        buffer,
+                        source_offset: 0,
+                        _mapping: None,
+                    });
+                }
             }
-            buffers.push(buffer);
         }
 
+        let mut prepared_command = None;
+        if failure.is_none() {
+            let command_buffer = core.queue.new_command_buffer().to_owned();
+            let mut encode_failure = None;
+            for (index, plane) in planes.iter().enumerate() {
+                if let Err(error) = encode_plane_copy(
+                    &command_buffer,
+                    &buffers[index].buffer,
+                    buffers[index].source_offset as u64,
+                    plane.bytes_per_row,
+                    plane.width,
+                    plane.height,
+                    plane.format,
+                    &textures[index],
+                ) {
+                    encode_failure = Some(error);
+                    break;
+                }
+            }
+            match encode_failure {
+                Some(error) => failure = Some(error),
+                None => prepared_command = Some(command_buffer),
+            }
+        }
         let mut state = core.lock();
         let reserved = state.pending_io.remove(&value);
         if let Some(reservation) = &reserved {
@@ -5067,29 +7017,11 @@ fn io_worker_loop(core: std::sync::Arc<QueueCore>, jobs: std::sync::mpsc::Receiv
         match (failure, reserved) {
             (None, Some(_)) => {
                 state.io_completed += read_bytes;
-                let command_buffer = core.queue.new_command_buffer().to_owned();
-                {
-                    let blit = command_buffer.new_blit_command_encoder();
-                    for (index, plane) in planes.iter().enumerate() {
-                        blit.copy_from_buffer_to_texture(
-                            &buffers[index],
-                            0,
-                            plane.bytes_per_row,
-                            plane.bytes_per_image,
-                            metal::MTLSize {
-                                width: plane.width,
-                                height: plane.height,
-                                depth: 1,
-                            },
-                            &textures[index],
-                            0,
-                            0,
-                            metal::MTLOrigin { x: 0, y: 0, z: 0 },
-                            metal::MTLBlitOption::None,
-                        );
-                    }
-                    blit.end_encoding();
-                }
+                state.mmap_sources += job_mmap;
+                state.zlib_streams += job_zlib;
+                state.guest_uploads += job_guest;
+                state.staging_fallbacks += job_staging;
+                let command_buffer = prepared_command.expect("encoded GPU copy");
                 command_buffer.encode_signal_event(&core.event, value);
                 command_buffer.commit();
                 state.committed += 1;
@@ -5098,6 +7030,7 @@ fn io_worker_loop(core: std::sync::Arc<QueueCore>, jobs: std::sync::mpsc::Receiv
                     buffers,
                     textures,
                     _command_buffer: command_buffer,
+                    _guest_windows: windows,
                 });
             }
             (None, None) => {
@@ -5221,6 +7154,39 @@ pub struct MetalGpuBackend {
     pub pipeline_archive_records: u64,
     /// Successful `serialize_archive` writes.
     pub pipeline_archive_serializations: u64,
+    /// Buffers created as no-copy views of canonical guest pages. The
+    /// zero-copy upload surface counter: it advances only when no host copy is
+    /// made.
+    pub guest_backed_buffers: u64,
+    /// Uploads that fell back to a host staging copy because a guest-backed
+    /// placement was refused (see [`GuestBackingRefusal`]).
+    pub staging_copies: u64,
+    /// Live guest-backed buffers keyed by registered buffer id. Records the
+    /// window identity and the guest range so ownership can be verified and
+    /// the mapping released with the buffer (no leak across create/destroy).
+    guest_backings: BTreeMap<u64, GuestBufferBacking>,
+    /// Canonical guest window attached by the runtime. When present, upload
+    /// buffers are placed as no-copy views of these guest pages (alignment and
+    /// ownership permitting) instead of host staging copies.
+    guest_window: Option<GuestMemoryWindow>,
+}
+
+/// The guest range and window identity behind a zero-copy buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestBufferBacking {
+    window_base: usize,
+    window_len: usize,
+    offset: usize,
+    length: usize,
+}
+
+/// Outcome of an upload-buffer placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestPlacement {
+    /// The buffer is a no-copy view of canonical guest pages.
+    ZeroCopy,
+    /// The placement was refused; the bytes were staged through a host copy.
+    Staged(GuestBackingRefusal),
 }
 
 /// Cache key for a render pipeline state: the pipeline output configuration
@@ -5320,7 +7286,247 @@ impl MetalGpuBackend {
             pipeline_archive_unverified: 0,
             pipeline_archive_records: 0,
             pipeline_archive_serializations: 0,
+            guest_backed_buffers: 0,
+            staging_copies: 0,
+            guest_backings: BTreeMap::new(),
+            guest_window: None,
         })
+    }
+
+    /// Attach the canonical guest window whose pages upload resources may
+    /// alias without a copy.
+    ///
+    /// The window must outlive this backend: the canonical guest store owns
+    /// the mapping and Metal is given a NULL deallocator, so dropping the
+    /// backend (or a buffer) never frees guest memory.
+    pub fn attach_guest_window(&mut self, window: GuestMemoryWindow) {
+        self.guest_window = Some(window);
+    }
+
+    /// The guest window uploads currently alias, if one is attached.
+    pub fn guest_window(&self) -> Option<GuestMemoryWindow> {
+        self.guest_window
+    }
+
+    /// Number of live buffers that alias canonical guest pages (ownership
+    /// bookkeeping; zero after every guest-backed buffer is destroyed).
+    pub fn live_guest_backed_buffers(&self) -> usize {
+        self.guest_backings.len()
+    }
+
+    /// Create and register an upload buffer over canonical guest pages.
+    ///
+    /// When the region is inside the attached window and the device accepts the
+    /// shared mapping, the returned buffer is a no-copy view. A region whose
+    /// base is not host-page aligned is widened down to the enclosing host page
+    /// (the buffer starts at that page and the registered resource range still
+    /// starts at `offset`), so alignment no longer forces a staging copy.
+    /// `guest_backed_buffers` advances and `staging_copies` stays untouched.
+    ///
+    /// Every genuine refusal (no window, out of window, overflow, or a device
+    /// refusal) falls back to a host buffer of `length` bytes and increments
+    /// `staging_copies`; the exact reason is returned in
+    /// [`GuestPlacement::Staged`].
+    pub fn create_guest_backed_buffer(
+        &mut self,
+        offset: usize,
+        length: usize,
+        options: metal::MTLResourceOptions,
+    ) -> (u64, GuestPlacement) {
+        if let Some(window) = self.guest_window {
+            match window.resolve_aligned(offset, length) {
+                Ok(span) => match self.device.create_buffer_over_aligned_guest_span(&span) {
+                    Ok(buffer) => {
+                        let id = self.register_buffer(buffer);
+                        self.guest_backings.insert(
+                            id,
+                            GuestBufferBacking {
+                                window_base: window.base() as usize,
+                                window_len: window.len(),
+                                offset,
+                                length,
+                            },
+                        );
+                        self.guest_backed_buffers += 1;
+                        return (id, GuestPlacement::ZeroCopy);
+                    }
+                    Err(reason) => {
+                        // A zero-length fallback still needs a real allocation:
+                        // Metal returns nil for a zero-length buffer, and a nil
+                        // Buffer must never enter the registry.
+                        let id = self.create_empty_buffer(length.max(1) as u64, options);
+                        self.staging_copies += 1;
+                        return (id, GuestPlacement::Staged(reason));
+                    }
+                },
+                Err(reason) => {
+                    let id = self.create_empty_buffer(length.max(1) as u64, options);
+                    self.staging_copies += 1;
+                    return (id, GuestPlacement::Staged(reason));
+                }
+            }
+        }
+        let id = self.create_empty_buffer(length.max(1) as u64, options);
+        self.staging_copies += 1;
+        (
+            id,
+            GuestPlacement::Staged(GuestBackingRefusal::NoGuestWindow),
+        )
+    }
+
+    /// Write a byte range directly into a registered buffer's backing.
+    ///
+    /// A guest-backed buffer is written through the canonical guest mapping,
+    /// so the write is immediately visible to the guest without a staging
+    /// copy. A host buffer is written through its shared `contents()` mapping.
+    /// Device-private buffers have no host mapping and are rejected.
+    pub fn write_buffer_region(&mut self, id: u64, offset: usize, bytes: &[u8]) -> AppResult<()> {
+        let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+            AppError::new(ReasonCode::RcD3dInvalidState, "buffer write range overflow")
+        })?;
+        if let Some(backing) = self.guest_backings.get(&id).copied() {
+            if end > backing.length {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "buffer write out of bounds: {end} exceeds guest-backed length {}",
+                        backing.length
+                    ),
+                ));
+            }
+            let address = backing
+                .window_base
+                .checked_add(backing.offset)
+                .and_then(|base| base.checked_add(offset))
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "buffer write address overflow",
+                    )
+                })?;
+            // SAFETY: the backing was validated against a live guest window
+            // at creation and `end <= length` keeps the range inside it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
+            }
+            return Ok(());
+        }
+        let buffer = self.buffers.get(&id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown buffer {id}"),
+            )
+        })?;
+        if end > buffer.length() as usize {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "buffer write out of bounds",
+            ));
+        }
+        #[cfg(test)]
+        let contents = if test_faults::buffer_mapping_unavailable() {
+            std::ptr::null_mut()
+        } else {
+            buffer.contents() as *mut u8
+        };
+        #[cfg(not(test))]
+        let contents = buffer.contents() as *mut u8;
+        if contents.is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "buffer is not host visible",
+            ));
+        }
+        // SAFETY: a non-null shared MTLBuffer mapping owns `buffer.length()`
+        // bytes and `end` was bounds checked.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents.add(offset), bytes.len());
+        }
+        Ok(())
+    }
+
+    /// Read a byte range from a registered buffer's backing.
+    ///
+    /// Guest-backed buffers read the canonical guest pages (GPU writes land
+    /// there because the buffer aliases them); host buffers read their shared
+    /// mapping. No staging copy is created on either path.
+    pub fn read_buffer_region(&self, id: u64, offset: usize, length: usize) -> AppResult<Vec<u8>> {
+        let end = offset.checked_add(length).ok_or_else(|| {
+            AppError::new(ReasonCode::RcD3dInvalidState, "buffer read range overflow")
+        })?;
+        if let Some(backing) = self.guest_backings.get(&id).copied() {
+            if end > backing.length {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "buffer read out of bounds",
+                ));
+            }
+            let address = backing
+                .window_base
+                .checked_add(backing.offset)
+                .and_then(|base| base.checked_add(offset))
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "buffer read address overflow",
+                    )
+                })?;
+            let mut out = vec![0u8; length];
+            // SAFETY: bounds were checked against the backing length and the
+            // window is live for the lifetime of the backend.
+            unsafe {
+                std::ptr::copy_nonoverlapping(address as *const u8, out.as_mut_ptr(), length);
+            }
+            return Ok(out);
+        }
+        let buffer = self.buffers.get(&id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown buffer {id}"),
+            )
+        })?;
+        if end > buffer.length() as usize {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "buffer read out of bounds",
+            ));
+        }
+        #[cfg(test)]
+        let contents = if test_faults::buffer_mapping_unavailable() {
+            std::ptr::null()
+        } else {
+            buffer.contents() as *const u8
+        };
+        #[cfg(not(test))]
+        let contents = buffer.contents() as *const u8;
+        if contents.is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "buffer is not host visible",
+            ));
+        }
+        let mut out = vec![0u8; length];
+        // SAFETY: the shared mapping owns `buffer.length()` bytes and the
+        // range was bounds checked.
+        unsafe {
+            std::ptr::copy_nonoverlapping(contents.add(offset), out.as_mut_ptr(), length);
+        }
+        Ok(out)
+    }
+
+    /// Register a Metal buffer and evict the oldest entry (and its guest
+    /// ownership record) once the registry is full.
+    fn register_buffer(&mut self, buffer: metal::Buffer) -> u64 {
+        while self.buffers.len() >= MAX_REGISTRY_ENTRIES {
+            let Some(oldest) = self.buffers.keys().next().copied() else {
+                break;
+            };
+            self.buffers.remove(&oldest);
+            self.guest_backings.remove(&oldest);
+        }
+        let id = alloc_gpu_id();
+        self.buffers.insert(id, buffer);
+        id
     }
 
     /// Create a swapchain with the specified dimensions, flip model, and colour space.
@@ -5363,19 +7569,13 @@ impl MetalGpuBackend {
     /// Create and register a buffer with data.
     pub fn create_buffer(&mut self, data: &[u8], options: metal::MTLResourceOptions) -> u64 {
         let buffer = self.device.create_buffer_with_data(data, options);
-        let id = alloc_gpu_id();
-        cap_registry(&mut self.buffers);
-        self.buffers.insert(id, buffer);
-        id
+        self.register_buffer(buffer)
     }
 
     /// Create and register a zero-initialized buffer.
     pub fn create_empty_buffer(&mut self, length: u64, options: metal::MTLResourceOptions) -> u64 {
         let buffer = self.device.create_buffer(length, options);
-        let id = alloc_gpu_id();
-        cap_registry(&mut self.buffers);
-        self.buffers.insert(id, buffer);
-        id
+        self.register_buffer(buffer)
     }
 
     /// Get a buffer by ID.
@@ -5639,6 +7839,7 @@ impl MetalGpuBackend {
     /// and the buffer is purged from every residency set before its Metal
     /// object is released. Destroying an unknown id is a no-op.
     pub fn destroy_buffer(&mut self, id: u64) {
+        self.guest_backings.remove(&id);
         if let Some(buffer) = self.buffers.remove(&id) {
             let ptr =
                 metal::foreign_types::ForeignType::as_ptr(&buffer) as *mut objc::runtime::Object;
@@ -14553,6 +16754,8 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
                 staging_bytes: 4,
                 source_bytes: 4,
                 blits: 1,
+                guest_backed: false,
+                staging_fallbacks: 0,
             }
         );
         assert_eq!(texture.texture().width(), 1);
@@ -19914,5 +22117,691 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
             manager.textures.get(&second).expect("second").loaded_mips,
             2
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Guest-page-backed upload buffers (zero-copy guest/GPU unification)
+    // -----------------------------------------------------------------------
+
+    fn guest_region(len: usize) -> GuestSharedRegion {
+        GuestSharedRegion::new(len).expect("anonymous guest mapping")
+    }
+
+    fn gpu_fill(buffer: &metal::Buffer, value: u8, device: &metal::DeviceRef) {
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        {
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.fill_buffer(
+                buffer,
+                metal::NSRange {
+                    location: 0,
+                    length: buffer.length(),
+                },
+                value,
+            );
+            blit.end_encoding();
+        }
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
+
+    fn gpu_copy_into(source: &metal::Buffer, destination: &metal::Buffer, bytes: u64) {
+        let queue = source.device().new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        {
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.copy_from_buffer(source, 0, destination, 0, bytes);
+            blit.end_encoding();
+        }
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
+
+    #[test]
+    fn guest_backed_buffer_rejects_alignment_and_ownership_with_exact_fallbacks() {
+        let region = guest_region(4 * host_page_size());
+        let mut backend = create_backend();
+        backend.attach_guest_window(region.window());
+        let page = host_page_size();
+        assert_eq!(region.base().is_null(), false);
+        assert_eq!(region.is_empty(), false);
+        assert_eq!(region.window().is_empty(), false);
+        assert_eq!(backend.guest_window().is_some(), true);
+        assert_eq!(format!("{region:?}").contains("GuestSharedRegion"), true);
+        assert_eq!(GuestSharedRegion::new(0).is_none(), true);
+        assert_eq!(GuestSharedRegion::new(usize::MAX).is_none(), true);
+        assert_eq!(
+            region.window().resolve_region(0, 0),
+            Err(GuestBackingRefusal::EmptyLength)
+        );
+        assert_eq!(
+            region.window().resolve_region(usize::MAX, 1),
+            Err(GuestBackingRefusal::ArithmeticOverflow)
+        );
+
+        let (zero_copy, placement) = backend.create_guest_backed_buffer(
+            page,
+            page,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        assert_eq!(placement, GuestPlacement::ZeroCopy);
+        assert_eq!(backend.guest_backed_buffers, 1);
+        assert_eq!(backend.staging_copies, 0);
+        assert_eq!(backend.live_guest_backed_buffers(), 1);
+
+        // An unaligned guest offset is widened to the enclosing host page; the
+        // buffer still aliases the guest bytes, so it is zero-copy.
+        let (unaligned_id, unaligned) =
+            backend.create_guest_backed_buffer(1, 16, metal::MTLResourceOptions::StorageModeShared);
+        assert_eq!(unaligned, GuestPlacement::ZeroCopy);
+        assert_eq!(backend.guest_backed_buffers, 2);
+        assert_eq!(backend.staging_copies, 0);
+        backend.destroy_buffer(unaligned_id);
+
+        let (_, outside) = backend.create_guest_backed_buffer(
+            region.len(),
+            16,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        assert_eq!(
+            outside,
+            GuestPlacement::Staged(GuestBackingRefusal::OutOfWindow {
+                end: region.len() + 16,
+                window_len: region.len(),
+            })
+        );
+        assert_eq!(backend.staging_copies, 1);
+
+        let (_, empty) =
+            backend.create_guest_backed_buffer(0, 0, metal::MTLResourceOptions::StorageModeShared);
+        assert_eq!(
+            empty,
+            GuestPlacement::Staged(GuestBackingRefusal::EmptyLength)
+        );
+        assert_eq!(backend.guest_backed_buffers, 2);
+        assert_eq!(backend.staging_copies, 2);
+
+        test_faults::set_guest_buffer_refusal(true);
+        let (_, refused) = backend.create_guest_backed_buffer(
+            page,
+            page,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        test_faults::set_guest_buffer_refusal(false);
+        assert_eq!(
+            refused,
+            GuestPlacement::Staged(GuestBackingRefusal::DeviceRefused)
+        );
+        assert_eq!(backend.guest_backed_buffers, 2);
+        assert_eq!(backend.staging_copies, 3);
+
+        let (_, overflow) = backend.create_guest_backed_buffer(
+            usize::MAX,
+            8,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        assert_eq!(
+            overflow,
+            GuestPlacement::Staged(GuestBackingRefusal::ArithmeticOverflow)
+        );
+        assert_eq!(backend.staging_copies, 4);
+
+        // A backend without an attached window is the NoGuestWindow fallback.
+        let mut detached = create_backend();
+        let (_, no_window) = detached.create_guest_backed_buffer(
+            0,
+            16,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        assert_eq!(
+            no_window,
+            GuestPlacement::Staged(GuestBackingRefusal::NoGuestWindow)
+        );
+        assert_eq!(detached.guest_backed_buffers, 0);
+        assert_eq!(detached.staging_copies, 1);
+        assert_eq!(detached.guest_window().is_none(), true);
+        detached.destroy_buffer(zero_copy);
+        assert_eq!(detached.live_guest_backed_buffers(), 0);
+
+        // The canonical guest store itself is usable as the window: a buffer
+        // aliases its flat pages directly.
+        let image = crate::cpu::MemoryImage::default();
+        let canonical = GuestMemoryWindow::from_canonical_store(image.canonical_store())
+            .expect("canonical guest window");
+        let mut canonical_backend = create_backend();
+        canonical_backend.attach_guest_window(canonical);
+        let (canonical_buffer, canonical_placement) = canonical_backend.create_guest_backed_buffer(
+            0,
+            page,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        assert_eq!(canonical_placement, GuestPlacement::ZeroCopy);
+        canonical_backend.destroy_buffer(canonical_buffer);
+        assert_eq!(canonical_backend.live_guest_backed_buffers(), 0);
+    }
+
+    #[test]
+    fn guest_backed_buffer_concurrent_guest_and_gpu_writes_stay_coherent() {
+        let mut region = guest_region(4 * host_page_size());
+        let mut backend = create_backend();
+        backend.attach_guest_window(region.window());
+        let page = host_page_size();
+        let (id, placement) = backend.create_guest_backed_buffer(
+            0,
+            page,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        assert_eq!(placement, GuestPlacement::ZeroCopy);
+
+        // Guest write -> GPU read: a real blit copies the aliased bytes into a
+        // shared readback buffer.
+        let pattern: Vec<u8> = (0..64).map(|value| value as u8).collect();
+        region.as_mut_slice()[..64].copy_from_slice(&pattern);
+        assert_eq!(
+            backend.read_buffer_region(id, 0, 64).expect("guest read"),
+            pattern
+        );
+        let guest_buffer = backend.get_buffer(id).expect("buffer").to_owned();
+        let readback = backend
+            .device()
+            .create_buffer(64, metal::MTLResourceOptions::StorageModeShared);
+        gpu_copy_into(&guest_buffer, &readback, 64);
+        let mut gpu_read = vec![0u8; 64];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                readback.contents() as *const u8,
+                gpu_read.as_mut_ptr(),
+                64,
+            );
+        }
+        assert_eq!(gpu_read, pattern);
+
+        // GPU write -> guest read: fill_buffer runs on the GPU and the guest
+        // observes the value through the canonical pages.
+        gpu_fill(&guest_buffer, 0xA5, backend.device().metal_device());
+        assert_eq!(&region.as_slice()[..64], &[0xA5u8; 64]);
+
+        // Concurrent guest writers touch disjoint lines; the aliased buffer
+        // sees every write without a syncing copy.
+        std::thread::scope(|scope| {
+            for line in 0..8usize {
+                let base = line * 64;
+                let window = region.window();
+                scope.spawn(move || {
+                    let pointer = window.resolve_region(base, 64).expect("line region");
+                    unsafe {
+                        std::ptr::write_bytes(pointer, line as u8, 64);
+                    }
+                });
+            }
+        });
+        for line in 0..8usize {
+            let start = line * 64;
+            assert_eq!(
+                backend.read_buffer_region(id, start, 64).expect("line"),
+                vec![line as u8; 64]
+            );
+        }
+    }
+
+    #[test]
+    fn guest_backed_buffer_destroy_releases_ownership_without_leak() {
+        let mut region = guest_region(2 * host_page_size());
+        let mut backend = create_backend();
+        backend.attach_guest_window(region.window());
+        let page = host_page_size();
+        let (id, placement) = backend.create_guest_backed_buffer(
+            0,
+            page,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        assert_eq!(placement, GuestPlacement::ZeroCopy);
+        assert_eq!(backend.live_guest_backed_buffers(), 1);
+        assert_eq!(
+            backend
+                .write_buffer_region(id, usize::MAX, &[0u8])
+                .expect_err("write offset overflow")
+                .message,
+            "buffer write range overflow"
+        );
+        assert_eq!(
+            backend
+                .write_buffer_region(id, page - 1, &[0u8; 2])
+                .expect_err("write past the guest backing")
+                .message,
+            format!(
+                "buffer write out of bounds: {} exceeds guest-backed length {page}",
+                page + 1
+            )
+        );
+        assert_eq!(
+            backend
+                .read_buffer_region(id, usize::MAX, 1)
+                .expect_err("read offset overflow")
+                .message,
+            "buffer read range overflow"
+        );
+        assert_eq!(
+            backend
+                .read_buffer_region(id, page, 1)
+                .expect_err("read past the guest backing")
+                .message,
+            "buffer read out of bounds"
+        );
+        let mut detached = create_backend();
+        let (private_id, private_placement) = detached.create_guest_backed_buffer(
+            0,
+            16,
+            metal::MTLResourceOptions::StorageModePrivate,
+        );
+        assert_eq!(
+            private_placement,
+            GuestPlacement::Staged(GuestBackingRefusal::NoGuestWindow)
+        );
+        test_faults::set_buffer_mapping_unavailable(true);
+        assert_eq!(
+            detached
+                .write_buffer_region(private_id, 0, &[0u8])
+                .expect_err("private fallback has no host mapping")
+                .message,
+            "buffer is not host visible"
+        );
+        assert_eq!(
+            detached
+                .read_buffer_region(private_id, 0, 1)
+                .expect_err("private fallback has no host mapping")
+                .message,
+            "buffer is not host visible"
+        );
+        test_faults::set_buffer_mapping_unavailable(false);
+        backend.destroy_buffer(id);
+        assert_eq!(backend.live_guest_backed_buffers(), 0);
+        assert_eq!(backend.guest_backed_buffers, 1);
+        // Destroying twice is a no-op and the guest mapping stays valid.
+        backend.destroy_buffer(id);
+        region.as_mut_slice()[0] = 0x5A;
+        assert_eq!(region.as_slice()[0], 0x5A);
+        assert_eq!(
+            backend
+                .read_buffer_region(id, 0, 1)
+                .expect_err("destroyed buffer is unknown")
+                .message,
+            format!("unknown buffer {id}")
+        );
+    }
+
+    #[test]
+    fn directstorage_async_guest_mmap_and_zlib_paths_are_zero_copy() {
+        use std::io::Write;
+        let pixels: Vec<u8> = (0..16).map(|index| (index * 9 + 1) as u8).collect();
+        let host_path = unique_temp_file("directstorage-async-host");
+        std::fs::write(&host_path, &pixels).expect("write host source");
+        let region = guest_region(4 * host_page_size());
+        let window = region.window();
+        let desc = DirectStorageUploadDesc {
+            file_offset: 0,
+            source_len: pixels.len() as u64,
+            output_len: pixels.len() as u64,
+            width: 4,
+            height: 1,
+            format: metal::MTLPixelFormat::RGBA8Unorm,
+            compression: DirectStorageCompression::None,
+        };
+        let mut queue = DirectStorageUploadQueue::new().expect("async queue");
+
+        // Guest destination, unaligned offset: the worker reads directly into
+        // the guest pages; there is no host staging buffer.
+        let mut guest_file = std::fs::File::open(&host_path).expect("open guest source");
+        let (value, upload) = queue
+            .enqueue_file_into_guest(&mut guest_file, desc, window, 1)
+            .expect("guest enqueue");
+        assert_eq!(upload.stats().guest_backed, true);
+        queue
+            .wait_for_value(value, 5_000_000_000)
+            .expect("guest upload completion");
+        assert_eq!(&region.as_slice()[1..1 + pixels.len()], pixels.as_slice());
+        assert_eq!(
+            &*upload.read_back_buffer(0).expect("guest readback"),
+            &pixels
+        );
+        let stats = queue.stats();
+        assert_eq!(stats.guest_uploads, 1);
+        assert_eq!(stats.mmap_sources, 0);
+        assert_eq!(stats.zlib_streams, 0);
+        assert_eq!(stats.staging_fallbacks, 0);
+
+        // Host destination, uncompressed: the source file is mmap'd and viewed
+        // by a no-copy MTLBuffer, so no read into a staging buffer exists.
+        let mut host_file = std::fs::File::open(&host_path).expect("open host source");
+        let (value, _) = queue
+            .enqueue_file(&mut host_file, desc)
+            .expect("host enqueue");
+        queue
+            .wait_for_value(value, 5_000_000_000)
+            .expect("host upload completion");
+        let stats = queue.stats();
+        assert_eq!(stats.mmap_sources, 1);
+        assert_eq!(stats.staging_fallbacks, 0);
+        assert_eq!(stats.guest_uploads, 1);
+
+        // Zlib streams straight into guest pages; no compressed or
+        // decompressed Vec exists.
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&pixels).expect("zlib encode");
+        let compressed = encoder.finish().expect("finish zlib");
+        let zlib_path = unique_temp_file("directstorage-async-zlib");
+        std::fs::write(&zlib_path, &compressed).expect("write zlib source");
+        let zlib_desc = DirectStorageUploadDesc {
+            source_len: compressed.len() as u64,
+            compression: DirectStorageCompression::Zlib,
+            ..desc
+        };
+        let mut zlib_file = std::fs::File::open(&zlib_path).expect("open zlib source");
+        let (value, upload) = queue
+            .enqueue_file_into_guest(&mut zlib_file, zlib_desc, window, 0)
+            .expect("zlib guest enqueue");
+        queue
+            .wait_for_value(value, 5_000_000_000)
+            .expect("zlib upload completion");
+        assert_eq!(&region.as_slice()[..pixels.len()], pixels.as_slice());
+        assert_eq!(
+            &*upload.read_back_buffer(0).expect("zlib readback"),
+            &pixels
+        );
+        let stats = queue.stats();
+        assert_eq!(stats.zlib_streams, 1);
+        assert_eq!(stats.guest_uploads, 2);
+        assert_eq!(stats.staging_fallbacks, 0);
+
+        // Two-plane NV12 also writes both planes straight into guest pages.
+        let luma: Vec<u8> = (0..16).map(|index| index as u8).collect();
+        let chroma: Vec<u8> = (0..8).map(|index| (index * 2 + 1) as u8).collect();
+        let mut combined = luma.clone();
+        combined.extend_from_slice(&chroma);
+        let nv12_path = unique_temp_file("directstorage-async-nv12");
+        std::fs::write(&nv12_path, &combined).expect("write NV12 source");
+        let nv12_desc = DirectStorageNv12UploadDesc::new(4, 4, 0, 16, 16, 8);
+        let mut nv12_file = std::fs::File::open(&nv12_path).expect("open NV12 source");
+        let (value, upload) = queue
+            .enqueue_nv12_file_into_guest(&mut nv12_file, nv12_desc, window, 0, 16)
+            .expect("NV12 guest enqueue");
+        queue
+            .wait_for_value(value, 5_000_000_000)
+            .expect("NV12 upload completion");
+        assert_eq!(&region.as_slice()[..16], luma.as_slice());
+        assert_eq!(&region.as_slice()[16..24], chroma.as_slice());
+        assert_eq!(
+            &*upload.read_back_plane_buffer(0).expect("luma readback"),
+            luma.as_slice()
+        );
+        assert_eq!(
+            &*upload.read_back_plane_buffer(1).expect("chroma readback"),
+            chroma.as_slice()
+        );
+        let stats = queue.stats();
+        assert_eq!(stats.guest_uploads, 4);
+        assert_eq!(stats.staging_fallbacks, 0);
+        let _ = std::fs::remove_file(&nv12_path);
+
+        // A destination outside the window is refused at enqueue time.
+        let mut outside_file = std::fs::File::open(&host_path).expect("open outside source");
+        let error = queue
+            .enqueue_file_into_guest(&mut outside_file, desc, window, region.len())
+            .expect_err("out-of-window async guest enqueue must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "DirectStorage async: guest destination refused: guest region outside the canonical window"
+        );
+
+        let _ = std::fs::remove_file(&host_path);
+        let _ = std::fs::remove_file(&zlib_path);
+    }
+
+    #[test]
+    fn guest_initial_upload_rejects_window_edges_and_keeps_zero_staging() {
+        let pixels = [3u8, 14, 15, 92];
+        let mut region = guest_region(3 * host_page_size());
+        let window = region.window();
+        region.as_mut_slice()[1..5].copy_from_slice(&pixels);
+        let upload = upload_texture_from_guest_bytes(
+            &window,
+            1,
+            pixels.len(),
+            1,
+            1,
+            metal::MTLPixelFormat::RGBA8Unorm,
+        )
+        .expect("unaligned guest initial data");
+        assert_eq!(upload.stats().guest_backed, true);
+        assert_eq!(upload.stats().staging_bytes, 0);
+        assert_eq!(upload.stats().staging_fallbacks, 0);
+        assert_eq!(&*upload.read_back_buffer(0).expect("readback"), &pixels);
+
+        let error = upload_texture_from_guest_bytes(
+            &window,
+            region.len(),
+            pixels.len(),
+            1,
+            1,
+            metal::MTLPixelFormat::RGBA8Unorm,
+        )
+        .expect_err("out-of-window initial data must be refused");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "initial data: guest initial data refused: guest region outside the canonical window"
+        );
+
+        let error =
+            upload_texture_from_guest_bytes(&window, 0, 3, 1, 1, metal::MTLPixelFormat::RGBA8Unorm)
+                .expect_err("short initial data must be refused");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "initial data: 3 bytes do not match 1x1 RGBA8Unorm (4 bytes)"
+        );
+
+        // A 16-bit format at a one-byte guest offset is the one genuine
+        // Metal blit restriction; it is refused explicitly and counted, never
+        // silently staged.
+        reset_alignment_refusal_count();
+        let error =
+            upload_texture_from_guest_bytes(&window, 1, 2, 1, 1, metal::MTLPixelFormat::R16Float)
+                .expect_err("unaligned multi-byte format must be refused");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "texture upload: a R16Float source offset of 1 bytes is not representable by a Metal blit; align the guest destination to 2 bytes"
+        );
+        assert_eq!(alignment_refusal_count(), 1);
+    }
+
+    #[test]
+    fn nv12_gpu_conversion_matches_cpu_reference_and_rejects_bad_lengths() {
+        let channel = match Nv12PresentChannel::new(4, 2) {
+            Ok(channel) => channel,
+            Err(_) => return,
+        };
+        let rgba: Vec<u8> = (0..32).map(|index| (index * 7 + 3) as u8).collect();
+        channel.write_rgba_pixels(&rgba).expect("GPU RGBA -> NV12");
+        assert_eq!(channel.rgb_to_nv12_passes(), 1);
+        let (expected_y, expected_uv) = nv12_from_rgba(&rgba, 4, 2);
+        assert_eq!(
+            &*channel.read_plane(0).expect("luma"),
+            expected_y.as_slice()
+        );
+        assert_eq!(
+            &*channel.read_plane(1).expect("chroma"),
+            expected_uv.as_slice()
+        );
+
+        let bgra: Vec<u8> = (0..32).map(|index| (255 - index) as u8).collect();
+        channel.write_bgra_pixels(&bgra).expect("GPU BGRA -> NV12");
+        assert_eq!(channel.rgb_to_nv12_passes(), 2);
+        let (expected_y, expected_uv) = nv12_from_bgra(&bgra, 4, 2);
+        assert_eq!(
+            &*channel.read_plane(0).expect("luma"),
+            expected_y.as_slice()
+        );
+        assert_eq!(
+            &*channel.read_plane(1).expect("chroma"),
+            expected_uv.as_slice()
+        );
+
+        let error = channel
+            .write_rgba_pixels(&[0u8; 31])
+            .expect_err("short RGBA frame must be refused");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "NV12 present channel: 4x2 requires 32 RGBA bytes, got 31"
+        );
+        let error = channel
+            .write_bgra_pixels(&[0u8; 33])
+            .expect_err("long BGRA frame must be refused");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "NV12 present channel: 4x2 requires 32 BGRA bytes, got 33"
+        );
+    }
+
+    #[test]
+    fn nv12_gpu_decode_matches_cpu_reference_exactly() {
+        let channel = match Nv12PresentChannel::new(4, 2) {
+            Ok(channel) => channel,
+            Err(_) => return,
+        };
+        let luma = [16u8, 40, 80, 140, 200, 235, 81, 145];
+        let chroma = [90u8, 200, 91, 201];
+        channel.fill_nv12(&luma, &chroma).expect("fill planes");
+        let decoded = channel.to_rgba8().expect("GPU NV12 -> RGBA");
+        assert_eq!(channel.composite_passes(), 1);
+        let mut expected = vec![0u8; 4 * 2 * 4];
+        for row in 0..2usize {
+            for col in 0..4usize {
+                let y = luma[row * 4 + col] as f32;
+                let uv_index = (row / 2) * 4 + (col / 2) * 2;
+                let u = chroma[uv_index] as f32 - 128.0;
+                let v = chroma[uv_index + 1] as f32 - 128.0;
+                let c = (y - 16.0).max(0.0);
+                let offset = (row * 4 + col) * 4;
+                expected[offset] = (1.164 * c + 1.596 * v).clamp(0.0, 255.0) as u8;
+                expected[offset + 1] = (1.164 * c - 0.392 * u - 0.813 * v).clamp(0.0, 255.0) as u8;
+                expected[offset + 2] = (1.164 * c + 2.017 * u).clamp(0.0, 255.0) as u8;
+                expected[offset + 3] = 255;
+            }
+        }
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn directstorage_guest_upload_rejects_window_edges_refusals_and_short_sources() {
+        use std::io::Write;
+        let pixels = [11u8, 22, 33, 44];
+        let path = unique_temp_file("directstorage-guest");
+        std::fs::write(&path, pixels).expect("write source");
+        let region = guest_region(3 * host_page_size());
+        let window = region.window();
+        let desc = DirectStorageUploadDesc {
+            file_offset: 0,
+            source_len: 4,
+            output_len: 4,
+            width: 1,
+            height: 1,
+            format: metal::MTLPixelFormat::RGBA8Unorm,
+            compression: DirectStorageCompression::None,
+        };
+
+        let mut file = std::fs::File::open(&path).expect("open aligned source");
+        let upload = upload_texture_from_file_into_guest(&mut file, desc, &window, 0)
+            .expect("aligned guest upload");
+        assert_eq!(upload.stats().guest_backed, true);
+        assert_eq!(upload.stats().staging_fallbacks, 0);
+        assert_eq!(upload.stats().staging_bytes, 0);
+        assert_eq!(upload.stats().directstorage_bytes, 4);
+        assert_eq!(&region.as_slice()[..4], &pixels);
+        // The GPU→host step is a single shared-buffer blit; the verification
+        // path borrows it without a Vec copy.
+        assert_eq!(
+            &*upload.read_back_buffer(0).expect("zero-copy readback"),
+            &pixels
+        );
+        assert_eq!(upload.readback_host_copies(), 0);
+
+        // A sub-page destination is widened to the enclosing host page and
+        // still read straight into guest memory (no staging copy).
+        let mut unaligned_file = std::fs::File::open(&path).expect("open unaligned source");
+        let unaligned = upload_texture_from_file_into_guest(&mut unaligned_file, desc, &window, 1)
+            .expect("unaligned guest upload");
+        assert_eq!(unaligned.stats().guest_backed, true);
+        assert_eq!(unaligned.stats().staging_fallbacks, 0);
+        assert_eq!(unaligned.stats().staging_bytes, 0);
+        assert_eq!(&region.as_slice()[1..5], &pixels);
+        assert_eq!(&*unaligned.read_back_buffer(0).expect("readback"), &pixels);
+
+        let outside_offset = region.len();
+        let mut outside_file = std::fs::File::open(&path).expect("open outside source");
+        let error =
+            upload_texture_from_file_into_guest(&mut outside_file, desc, &window, outside_offset)
+                .expect_err("out-of-window guest upload must be refused");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "DirectStorage: guest upload refused: guest region outside the canonical window"
+        );
+
+        // A compressed guest upload is stream-inflated straight into the guest
+        // pages; only the compressed source size is accounted.
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&pixels).expect("zlib encode");
+        let compressed = encoder.finish().expect("finish zlib");
+        let compressed_path = unique_temp_file("directstorage-guest-zlib");
+        std::fs::write(&compressed_path, &compressed).expect("write zlib");
+        let zlib_desc = DirectStorageUploadDesc {
+            source_len: compressed.len() as u64,
+            compression: DirectStorageCompression::Zlib,
+            ..desc
+        };
+        let mut zlib_file = std::fs::File::open(&compressed_path).expect("open zlib");
+        let zlib = upload_texture_from_file_into_guest(&mut zlib_file, zlib_desc, &window, 0)
+            .expect("zlib guest upload");
+        assert_eq!(zlib.stats().guest_backed, true);
+        assert_eq!(zlib.stats().staging_fallbacks, 0);
+        assert_eq!(zlib.stats().staging_bytes, compressed.len() as u64);
+        assert_eq!(&*zlib.read_back_buffer(0).expect("zlib readback"), &pixels);
+
+        // A device refusal is an explicit, tested error, never a silent host
+        // staging copy.
+        let mut refused_file = std::fs::File::open(&path).expect("open refused source");
+        test_faults::set_guest_buffer_refusal(true);
+        let error = upload_texture_from_file_into_guest(&mut refused_file, desc, &window, 0)
+            .expect_err("device-refused guest upload must fail");
+        test_faults::set_guest_buffer_refusal(false);
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "DirectStorage: guest upload refused: Metal refused the no-copy buffer"
+        );
+
+        // Short sources fail with the exact DirectStorage IO error.
+        let short_path = unique_temp_file("directstorage-guest-short");
+        std::fs::write(&short_path, [1u8, 2]).expect("write short");
+        let mut short_file = std::fs::File::open(&short_path).expect("open short");
+        let error = upload_texture_from_file_into_guest(&mut short_file, desc, &window, 0)
+            .expect_err("short guest source must fail");
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message,
+            "DirectStorage: file is too short for 4 bytes at offset 0"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&compressed_path);
+        let _ = std::fs::remove_file(&short_path);
     }
 }

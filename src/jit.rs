@@ -184,6 +184,7 @@ pub unsafe extern "C" fn jit_helper_store(
             Ok(code_write) => {
                 if code_write {
                     WORKER_SLICE_CODE_WRITTEN.with(|flag| flag.set(true));
+                    JIT_CODE_EPOCH.fetch_add(1, Ordering::AcqRel);
                 }
             }
             Err(fault) => {
@@ -343,9 +344,433 @@ pub unsafe extern "C" fn jit_helper_set_flags(
     }
 }
 
+/// Materialise any parked lazy flags before compiled code reads flag bytes.
+///
+/// # Safety
+/// `state` must be null or point at a live `CpuState` owned by the executing
+/// block for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_helper_materialize_flags(state: *mut CpuState) {
+    if state.is_null() {
+        return;
+    }
+    unsafe { (*state).materialize_pending_flags_for_jit() };
+}
+
+/// Trivial Win32 APIs that the JIT can service with a direct native helper
+/// instead of the generic `dispatch_import` name lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u64)]
+pub enum InlineApi {
+    GetLastError = 0,
+    SetLastError = 1,
+    GetCurrentThreadId = 2,
+    GetCurrentProcessId = 3,
+    GetCurrentThread = 4,
+    GetCurrentProcess = 5,
+    QueryPerformanceCounter = 6,
+    GetTickCount64 = 7,
+    InterlockedIncrement = 8,
+    InterlockedDecrement = 9,
+    InterlockedExchange = 10,
+    InterlockedExchangeAdd = 11,
+    InterlockedCompareExchange = 12,
+    InitializeSRWLock = 13,
+    AcquireSRWLockExclusive = 14,
+    ReleaseSRWLockExclusive = 15,
+    AcquireSRWLockShared = 16,
+    ReleaseSRWLockShared = 17,
+    TryAcquireSRWLockExclusive = 18,
+    TryAcquireSRWLockShared = 19,
+    CurrentTeb = 20,
+    CurrentPeb = 21,
+}
+
+impl InlineApi {
+    pub const COUNT: usize = 22;
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::GetLastError => "GetLastError",
+            Self::SetLastError => "SetLastError",
+            Self::GetCurrentThreadId => "GetCurrentThreadId",
+            Self::GetCurrentProcessId => "GetCurrentProcessId",
+            Self::GetCurrentThread => "GetCurrentThread",
+            Self::GetCurrentProcess => "GetCurrentProcess",
+            Self::QueryPerformanceCounter => "QueryPerformanceCounter",
+            Self::GetTickCount64 => "GetTickCount64",
+            Self::InterlockedIncrement => "InterlockedIncrement",
+            Self::InterlockedDecrement => "InterlockedDecrement",
+            Self::InterlockedExchange => "InterlockedExchange",
+            Self::InterlockedExchangeAdd => "InterlockedExchangeAdd",
+            Self::InterlockedCompareExchange => "InterlockedCompareExchange",
+            Self::InitializeSRWLock => "InitializeSRWLock",
+            Self::AcquireSRWLockExclusive => "AcquireSRWLockExclusive",
+            Self::ReleaseSRWLockExclusive => "ReleaseSRWLockExclusive",
+            Self::AcquireSRWLockShared => "AcquireSRWLockShared",
+            Self::ReleaseSRWLockShared => "ReleaseSRWLockShared",
+            Self::TryAcquireSRWLockExclusive => "TryAcquireSRWLockExclusive",
+            Self::TryAcquireSRWLockShared => "TryAcquireSRWLockShared",
+            Self::CurrentTeb => "CurrentTeb",
+            Self::CurrentPeb => "CurrentPeb",
+        }
+    }
+
+    /// Return the inline identity of a canonical host thunk, if it is one of
+    /// the trivial APIs.
+    pub fn from_thunk(thunk: &crate::runtime::HostThunk) -> Option<Self> {
+        use crate::runtime::HostThunk;
+        Some(match thunk {
+            HostThunk::GetLastError => Self::GetLastError,
+            HostThunk::SetLastError => Self::SetLastError,
+            HostThunk::GetCurrentThreadId => Self::GetCurrentThreadId,
+            HostThunk::GetCurrentProcessId => Self::GetCurrentProcessId,
+            HostThunk::GetCurrentThread => Self::GetCurrentThread,
+            HostThunk::GetCurrentProcess => Self::GetCurrentProcess,
+            HostThunk::QueryPerformanceCounter => Self::QueryPerformanceCounter,
+            HostThunk::GetTickCount64 => Self::GetTickCount64,
+            HostThunk::InterlockedIncrement => Self::InterlockedIncrement,
+            HostThunk::InterlockedDecrement => Self::InterlockedDecrement,
+            HostThunk::InterlockedExchange => Self::InterlockedExchange,
+            HostThunk::InterlockedExchangeAdd => Self::InterlockedExchangeAdd,
+            HostThunk::InterlockedCompareExchange => Self::InterlockedCompareExchange,
+            HostThunk::InitializeSRWLock => Self::InitializeSRWLock,
+            HostThunk::AcquireSRWLockExclusive => Self::AcquireSRWLockExclusive,
+            HostThunk::ReleaseSRWLockExclusive => Self::ReleaseSRWLockExclusive,
+            HostThunk::AcquireSRWLockShared => Self::AcquireSRWLockShared,
+            HostThunk::ReleaseSRWLockShared => Self::ReleaseSRWLockShared,
+            HostThunk::TryAcquireSRWLockExclusive => Self::TryAcquireSRWLockExclusive,
+            HostThunk::TryAcquireSRWLockShared => Self::TryAcquireSRWLockShared,
+            _ => return None,
+        })
+    }
+}
+
+static INLINE_API_TARGETS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<u64, (InlineApi, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Register a resolved host-thunk address as an inline-able API target.
+pub fn register_inline_api_target(address: u64, api: InlineApi) {
+    register_inline_api_target_for(address, api, 0);
+}
+
+/// Register an inline-able target owned by a particular runtime.  The owner id
+/// prevents a runtime teardown from unregistering a concurrently live
+/// runtime's mapping at the same synthetic address.
+pub fn register_inline_api_target_for(address: u64, api: InlineApi, owner: u64) {
+    if let Ok(mut targets) = INLINE_API_TARGETS.write() {
+        targets.insert(address, (api, owner));
+    }
+}
+
+pub fn inline_api_for_target(address: u64) -> Option<InlineApi> {
+    INLINE_API_TARGETS
+        .read()
+        .ok()
+        .and_then(|targets| targets.get(&address).map(|(api, _)| *api))
+}
+
+/// Remove a stale inline-API target when a runtime is torn down.
+pub fn unregister_inline_api_target(address: u64, owner: u64) {
+    if let Ok(mut targets) = INLINE_API_TARGETS.write()
+        && let Some((_, registered_owner)) = targets.get(&address)
+        && *registered_owner == owner
+    {
+        targets.remove(&address);
+    }
+}
+
+pub static INLINED_API_CALLS: [AtomicU64; InlineApi::COUNT] =
+    [const { AtomicU64::new(0) }; InlineApi::COUNT];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineApiMetrics {
+    pub total: u64,
+    pub per_api: [u64; InlineApi::COUNT],
+}
+
+pub fn inline_api_metrics() -> InlineApiMetrics {
+    let mut per_api = [0u64; InlineApi::COUNT];
+    let mut total = 0;
+    for (index, counter) in INLINED_API_CALLS.iter().enumerate() {
+        per_api[index] = counter.load(Ordering::Relaxed);
+        total += per_api[index];
+    }
+    InlineApiMetrics { total, per_api }
+}
+
+pub fn reset_inline_api_metrics() {
+    for counter in &INLINED_API_CALLS {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Native helper for the inlined trivial APIs.  Runs with the same
+/// `(runtime, state, memory)` inputs as the fast-thunk bridge but performs the
+/// whole API semantic inline (no `dispatch_import` match, no name lookup).
+///
+/// # Safety
+/// `runtime`, `state` and `memory` must point at live objects owned by the
+/// executing block for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_helper_inline_api(
+    runtime: *mut libc::c_void,
+    state: *mut CpuState,
+    memory: *mut MemoryImage,
+    api: u64,
+    return_address: u64,
+) -> i64 {
+    if runtime.is_null() || state.is_null() || memory.is_null() {
+        return -1;
+    }
+    let runtime = unsafe { &mut *(runtime as *mut crate::runtime::PeHostRuntime) };
+    let state = unsafe { &mut *state };
+    let memory = unsafe { &mut *memory };
+    let api = match api {
+        0 => InlineApi::GetLastError,
+        1 => InlineApi::SetLastError,
+        2 => InlineApi::GetCurrentThreadId,
+        3 => InlineApi::GetCurrentProcessId,
+        4 => InlineApi::GetCurrentThread,
+        5 => InlineApi::GetCurrentProcess,
+        6 => InlineApi::QueryPerformanceCounter,
+        7 => InlineApi::GetTickCount64,
+        8 => InlineApi::InterlockedIncrement,
+        9 => InlineApi::InterlockedDecrement,
+        10 => InlineApi::InterlockedExchange,
+        11 => InlineApi::InterlockedExchangeAdd,
+        12 => InlineApi::InterlockedCompareExchange,
+        13 => InlineApi::InitializeSRWLock,
+        14 => InlineApi::AcquireSRWLockExclusive,
+        15 => InlineApi::ReleaseSRWLockExclusive,
+        16 => InlineApi::AcquireSRWLockShared,
+        17 => InlineApi::ReleaseSRWLockShared,
+        18 => InlineApi::TryAcquireSRWLockExclusive,
+        19 => InlineApi::TryAcquireSRWLockShared,
+        20 => InlineApi::CurrentTeb,
+        21 => InlineApi::CurrentPeb,
+        _ => return -1,
+    };
+    let _ = return_address;
+    INLINED_API_CALLS[api.index()].fetch_add(1, Ordering::Relaxed);
+    // `guest_call_arg` defines the emulator's call ABI (Win64 registers, x86
+    // stack args at RSP).  The inline call therefore leaves RSP untouched,
+    // exactly as a returned leaf call would.
+    unsafe { inline_api_semantics(runtime, state, memory, api) }
+}
+
+unsafe fn inline_api_semantics(
+    runtime: &mut crate::runtime::PeHostRuntime,
+    state: &mut CpuState,
+    memory: &mut MemoryImage,
+    api: InlineApi,
+) -> i64 {
+    let arg = |index: usize| crate::runtime::guest_call_arg(state, memory, index).unwrap_or(0);
+    match api {
+        InlineApi::GetLastError => {
+            state.set(Register::Rax, u64::from(runtime.last_error));
+        }
+        InlineApi::SetLastError => {
+            runtime.last_error = arg(0) as u32;
+            state.set(Register::Rax, 0);
+        }
+        InlineApi::GetCurrentThreadId => {
+            state.set(Register::Rax, u64::from(runtime.win32.current_thread_id()));
+            runtime.last_error = 0;
+        }
+        InlineApi::GetCurrentProcessId => {
+            state.set(Register::Rax, u64::from(runtime.win32.current_process_id()));
+            runtime.last_error = 0;
+        }
+        InlineApi::GetCurrentThread => {
+            let handle = runtime.win32.current_thread_handle();
+            state.set(Register::Rax, u64::from(handle));
+            runtime.last_error = 0;
+        }
+        InlineApi::GetCurrentProcess => {
+            let handle = runtime.win32.current_process_handle();
+            state.set(Register::Rax, u64::from(handle));
+            runtime.last_error = 0;
+        }
+        InlineApi::QueryPerformanceCounter => {
+            let counter_ptr = arg(0);
+            if counter_ptr == 0 {
+                state.set(Register::Rax, 0);
+                runtime.last_error = 87; // ERROR_INVALID_PARAMETER
+            } else {
+                let counter = runtime.anticheat.clock.query_performance_counter() as u64;
+                let _ = crate::runtime::write_u64(memory, counter_ptr, counter);
+                state.set(Register::Rax, 1);
+                runtime.last_error = 0;
+            }
+        }
+        InlineApi::GetTickCount64 => {
+            state.set(Register::Rax, runtime.anticheat.clock.tick_count64());
+            runtime.last_error = 0;
+        }
+        InlineApi::InterlockedIncrement => {
+            let destination = arg(0);
+            match memory.interlocked_increment_u32(destination) {
+                Ok(value) => {
+                    state.set(Register::Rax, u64::from(value));
+                    runtime.last_error = 0;
+                }
+                Err(_) => {
+                    state.set(Register::Rax, 0);
+                    runtime.last_error = 87;
+                }
+            }
+        }
+        InlineApi::InterlockedDecrement => {
+            let destination = arg(0);
+            match memory.interlocked_decrement_u32(destination) {
+                Ok(value) => {
+                    state.set(Register::Rax, u64::from(value));
+                    runtime.last_error = 0;
+                }
+                Err(_) => {
+                    state.set(Register::Rax, 0);
+                    runtime.last_error = 87;
+                }
+            }
+        }
+        InlineApi::InterlockedExchange => {
+            let destination = arg(0);
+            let value = arg(1) as u32;
+            match memory.interlocked_exchange_u32(destination, value) {
+                Ok(previous) => {
+                    state.set(Register::Rax, u64::from(previous));
+                    runtime.last_error = 0;
+                }
+                Err(_) => {
+                    state.set(Register::Rax, 0);
+                    runtime.last_error = 87;
+                }
+            }
+        }
+        InlineApi::InterlockedExchangeAdd => {
+            let destination = arg(0);
+            let addend = arg(1) as u32;
+            match memory.interlocked_exchange_add_u32(destination, addend) {
+                Ok(previous) => {
+                    state.set(Register::Rax, u64::from(previous));
+                    runtime.last_error = 0;
+                }
+                Err(_) => {
+                    state.set(Register::Rax, 0);
+                    runtime.last_error = 87;
+                }
+            }
+        }
+        InlineApi::InterlockedCompareExchange => {
+            let destination = arg(0);
+            let exchange = arg(1) as u32;
+            let comparand = arg(2) as u32;
+            match memory.interlocked_compare_exchange_u32(destination, exchange, comparand) {
+                Ok(previous) => {
+                    state.set(Register::Rax, u64::from(previous));
+                    runtime.last_error = 0;
+                }
+                Err(_) => {
+                    state.set(Register::Rax, 0);
+                    runtime.last_error = 87;
+                }
+            }
+        }
+        InlineApi::InitializeSRWLock => {
+            let lock = arg(0);
+            runtime.srw_locks.insert(
+                lock,
+                std::sync::Arc::new(crate::threads::GuestSRWLock::new()),
+            );
+            let _ = crate::runtime::write_guest_pointer(memory, lock, 0, state.arch);
+            state.set(Register::Rax, 0);
+            runtime.last_error = 0;
+        }
+        InlineApi::AcquireSRWLockExclusive => {
+            let lock = arg(0);
+            let srw = runtime
+                .srw_locks
+                .entry(lock)
+                .or_insert_with(|| std::sync::Arc::new(crate::threads::GuestSRWLock::new()))
+                .clone();
+            srw.acquire_exclusive();
+            state.set(Register::Rax, 0);
+            runtime.last_error = 0;
+        }
+        InlineApi::ReleaseSRWLockExclusive => {
+            let lock = arg(0);
+            if let Some(srw) = runtime.srw_locks.get(&lock) {
+                srw.release_exclusive();
+            }
+            state.set(Register::Rax, 0);
+            runtime.last_error = 0;
+        }
+        InlineApi::AcquireSRWLockShared => {
+            let lock = arg(0);
+            let srw = runtime
+                .srw_locks
+                .entry(lock)
+                .or_insert_with(|| std::sync::Arc::new(crate::threads::GuestSRWLock::new()))
+                .clone();
+            srw.acquire_shared();
+            state.set(Register::Rax, 0);
+            runtime.last_error = 0;
+        }
+        InlineApi::ReleaseSRWLockShared => {
+            let lock = arg(0);
+            if let Some(srw) = runtime.srw_locks.get(&lock) {
+                srw.release_shared();
+            }
+            state.set(Register::Rax, 0);
+            runtime.last_error = 0;
+        }
+        InlineApi::TryAcquireSRWLockExclusive => {
+            let lock = arg(0);
+            let acquired = if let Some(srw) = runtime.srw_locks.get(&lock) {
+                srw.try_acquire_exclusive()
+            } else {
+                let srw = std::sync::Arc::new(crate::threads::GuestSRWLock::new());
+                let acquired = srw.try_acquire_exclusive();
+                runtime.srw_locks.insert(lock, srw);
+                acquired
+            };
+            state.set(Register::Rax, u64::from(acquired));
+            runtime.last_error = 0;
+        }
+        InlineApi::TryAcquireSRWLockShared => {
+            let lock = arg(0);
+            let acquired = if let Some(srw) = runtime.srw_locks.get(&lock) {
+                srw.try_acquire_shared()
+            } else {
+                let srw = std::sync::Arc::new(crate::threads::GuestSRWLock::new());
+                let acquired = srw.try_acquire_shared();
+                runtime.srw_locks.insert(lock, srw);
+                acquired
+            };
+            state.set(Register::Rax, u64::from(acquired));
+            runtime.last_error = 0;
+        }
+        InlineApi::CurrentTeb => {
+            state.set(Register::Rax, runtime.teb_base);
+            runtime.last_error = 0;
+        }
+        InlineApi::CurrentPeb => {
+            state.set(Register::Rax, runtime.peb_base);
+            runtime.last_error = 0;
+        }
+    }
+    0
+}
+
 /// Number of `IrInstruction` variants — the size of the per-opcode JIT
 /// lowering telemetry arrays.
-pub const IR_OPCODE_COUNT: usize = 361;
+pub const IR_OPCODE_COUNT: usize = 364;
 
 /// Per-opcode counters of IR instructions lowered to native ARM64 emission
 /// by [`JitCompiler::compile_instruction`].  Indexed by
@@ -729,6 +1154,9 @@ pub fn ir_opcode_index(insn: &IrInstruction) -> usize {
         IrInstruction::Sha256Msg1 { .. } => 358,
         IrInstruction::Sha256Msg2 { .. } => 359,
         IrInstruction::Breakpoint => 360,
+        IrInstruction::SpillStore { .. } => 361,
+        IrInstruction::SpillLoad { .. } => 362,
+        IrInstruction::ExplicitFlags { .. } => 363,
     }
 }
 
@@ -1923,6 +2351,12 @@ static SIGBUS_JIT_MEMORY: AtomicPtr<MemoryImage> = AtomicPtr::new(std::ptr::null
 /// argument (runtime_ptr) to the fast-thunk bridge function.
 /// Set by pe_runtime.rs before calling `execute_with_jit`.
 static SIGBUS_PE_RUNTIME: AtomicPtr<libc::c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// Publish the live `PeHostRuntime` pointer for JIT call sites that service
+/// Win32 APIs directly (fast thunks and inlined trivial APIs).  The caller
+/// must clear it with a null pointer when the runtime borrow ends.
+pub fn set_pe_runtime_pointer(pointer: *mut libc::c_void) {
+    SIGBUS_PE_RUNTIME.store(pointer, Ordering::Release);
+}
 
 /// SIGBUS loop detection: tracks the last fault address and a consecutive
 /// hit counter. If the same page faults more than MAX_CONSECUTIVE_FAULTS
@@ -2211,6 +2645,108 @@ pub static JIT_CHAIN_LINKS_BROKEN: AtomicU64 = AtomicU64::new(0);
 /// Number of guest Call sites compiled to a direct resolved-thunk call.
 pub static JIT_THUNK_DIRECT_CALLS: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic epoch of guest code writes.
+///
+/// Every compiled block's prologue compares this value with the epoch captured
+/// by its execution chain.  A write to a compiled-code page bumps the epoch, so
+/// the next block entry in an otherwise native chain exits to its dispatcher
+/// before the stale block can run.  Combined with [`LINK_BUDGET`] this makes
+/// per-block SMC checks and safepoint polling non-skippable even when blocks
+/// branch directly into one another.
+pub static JIT_CODE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum number of native block entries between two returns to the worker
+/// loop (or the cooperative dispatcher).  The counter lives in the per-chain
+/// [`ChainState`] and is decremented by every block prologue; reaching zero
+/// forces a dispatch boundary where the safepoint and SMC checks are
+/// re-evaluated by the host.
+pub(crate) const LINK_BUDGET: u64 = 256;
+
+/// Byte offsets into the `#[repr(C)]` [`ChainState`] that are embedded in
+/// compiled code.  Keeping them as named constants makes the ABI auditable and
+/// keeps the emitter, the executor and the relocation writer in sync.
+pub(crate) mod chain_offsets {
+    pub(crate) const CURRENT_BLOCK: u32 = 0;
+    pub(crate) const FLAT_BASE: u32 = 8;
+    pub(crate) const PAYLOAD: u32 = 16;
+    pub(crate) const LINK_BUDGET: u32 = 24;
+    pub(crate) const BLOCKS: u32 = 32;
+    pub(crate) const INSTRUCTIONS: u32 = 40;
+    pub(crate) const SMC_EPOCH: u32 = 48;
+    pub(crate) const RETURN_DEPTH: u32 = 56;
+    pub(crate) const NATIVE_CALLS: u32 = 64;
+    pub(crate) const NATIVE_RETURN_HITS: u32 = 72;
+    pub(crate) const NATIVE_RETURN_MISSES: u32 = 80;
+    pub(crate) const NATIVE_RETURN_MISPREDICTS: u32 = 88;
+    pub(crate) const RETURN_STACK: u32 = 96;
+}
+
+/// Maximum depth of the native direct-call return stack carried by one chain.
+pub(crate) const CHAIN_RETURN_DEPTH: usize = 16;
+
+/// Per-execution state shared with compiled code through `x3`/`x23`.
+///
+/// This replaces the legacy four-word exit cell.  It is a plain (non-atomic)
+/// stack object owned exclusively by the thread executing the chain, so the
+/// emitted loads/stores never race: a worker owns its state for the duration
+/// of a slice, and the cooperative dispatcher owns it for one block chain.
+#[repr(C)]
+pub(crate) struct ChainState {
+    pub(crate) current_block: u64,
+    pub(crate) flat_base: u64,
+    pub(crate) payload: u64,
+    pub(crate) link_budget: u64,
+    pub(crate) blocks: u64,
+    pub(crate) instructions: u64,
+    pub(crate) smc_epoch: u64,
+    pub(crate) return_depth: u64,
+    pub(crate) native_calls: u64,
+    pub(crate) native_return_hits: u64,
+    pub(crate) native_return_misses: u64,
+    pub(crate) native_return_mispredicts: u64,
+    /// `(guest return address, compiled entry)` pairs, newest at
+    /// `return_depth - 1`.  A caller pushes the statically known return
+    /// address; a native `ret` pops it only when the guest stack agrees.
+    pub(crate) return_stack: [[u64; 2]; CHAIN_RETURN_DEPTH],
+}
+
+impl ChainState {
+    pub(crate) fn new(flat_base: u64, block_address: u64, link_budget: u64) -> Self {
+        Self {
+            current_block: block_address,
+            flat_base,
+            payload: 0,
+            link_budget,
+            blocks: 0,
+            instructions: 0,
+            smc_epoch: JIT_CODE_EPOCH.load(Ordering::Acquire),
+            return_depth: 0,
+            native_calls: 0,
+            native_return_hits: 0,
+            native_return_misses: 0,
+            native_return_mispredicts: 0,
+            return_stack: [[0; 2]; CHAIN_RETURN_DEPTH],
+        }
+    }
+
+    pub(crate) fn push_return(&mut self, target: u64, entry: u64) {
+        if self.return_depth as usize >= CHAIN_RETURN_DEPTH {
+            return;
+        }
+        self.return_stack[self.return_depth as usize] = [target, entry];
+        self.return_depth += 1;
+    }
+
+    #[allow(dead_code)] // used by native/AOT diagnostics
+    pub(crate) fn return_entry(&self, target: u64) -> Option<u64> {
+        if self.return_depth == 0 {
+            return None;
+        }
+        let top = self.return_stack[self.return_depth as usize - 1];
+        (top[0] == target && top[1] != 0).then_some(top[1])
+    }
+}
+
 /// Record a guest write to `[address, address + length)`.
 ///
 /// Called from `jit_helper_store` for every native guest store.  The fast path
@@ -2250,6 +2786,7 @@ pub fn note_guest_code_write(address: u64, length: usize) {
     }
     if observed {
         SMC_WRITES_OBSERVED.fetch_add(1, Ordering::Relaxed);
+        JIT_CODE_EPOCH.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -2383,8 +2920,8 @@ extern "C" fn sigbus_sa_handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut
                 let flat_base = runtime.flat_memory.base() as *mut u8;
                 let flat_size = runtime.flat_memory.size();
                 // Zero-fill the whole faulting page in the flat mirror so the
-                // retrying load/store succeeds.  The page is within the 4GB
-                // mmap (fault_addr was validated in-range below for prior
+                // retrying load/store succeeds.  The page is within the
+                // direct-window mmap (fault_addr was validated in-range for prior
                 // faults; defensively bounds-check here too).
                 let page_off = page as usize;
                 if page_off
@@ -2591,6 +3128,7 @@ mod regmap {
     pub const X1: u32 = 1;
     pub const X2: u32 = 2;
     pub const X3: u32 = 3;
+    pub const X9: u32 = 9;
     pub const X21: u32 = 21;
     pub const X22: u32 = 22;
     pub const X23: u32 = 23;
@@ -2649,7 +3187,7 @@ impl Emitter {
         self.emit(0xf2800000 | (hw << 21) | ((imm16 as u32) << 5) | rd);
     }
 
-    /// Move a 64-bit immediate into register using MOVZ + MOVK sequence
+    /// Move a 64-bit immediate into register using MOVZ + MOVK sequence.
     fn mov_imm64(&mut self, rd: u32, value: u64) {
         let chunks: [(u16, u32); 4] = [
             ((value & 0xffff) as u16, 0),
@@ -2664,6 +3202,19 @@ impl Emitter {
                 self.movk(rd, imm, shift);
             }
         }
+    }
+
+    /// Fixed-width 64-bit immediate load (always four instructions).
+    ///
+    /// AOT-cached code embeds absolute addresses that change between address
+    /// spaces.  A fixed four-instruction encoding gives every relocation a
+    /// constant size, so the loader can re-bind it in place without shifting
+    /// the surrounding code.
+    fn mov_imm64_fixed(&mut self, rd: u32, value: u64) {
+        self.movz(rd, (value & 0xffff) as u16, 0);
+        self.movk(rd, ((value >> 16) & 0xffff) as u16, 16);
+        self.movk(rd, ((value >> 32) & 0xffff) as u16, 32);
+        self.movk(rd, ((value >> 48) & 0xffff) as u16, 48);
     }
 
     // -- ALU --
@@ -2691,6 +3242,11 @@ impl Emitter {
     /// AND Xd, Xn, Xm
     fn and_reg(&mut self, rd: u32, rn: u32, rm: u32) {
         self.emit(0x8a000000 | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// ANDS Xd, Xn, Xm (logical AND setting NZCV).
+    fn ands_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0xea000000 | (rm << 16) | (rn << 5) | rd);
     }
 
     /// ORR Xd, Xn, Xm
@@ -3499,7 +4055,7 @@ impl Drop for JitMemoryManager {
 
 /// The JIT's flat view of the canonical guest address space.
 ///
-/// This is **not** a mirror: it aliases the very same 4 GiB `mmap` owned by
+/// This is **not** a mirror: it aliases the very same large `mmap` owned by
 /// [`crate::cpu::GuestMemoryStore`].  A guest store executed by JIT-compiled
 /// code and a store performed through the interpreter's [`MemoryImage`] touch
 /// the same bytes, so no post-execution copy-back exists.
@@ -3524,7 +4080,7 @@ unsafe impl Sync for FlatGuestMemory {}
 impl FlatGuestMemory {
     pub fn new(_arch: GuestArch) -> Self {
         let store = Arc::new(GuestMemoryStore::new());
-        // 4 GiB / 4 KiB = 1,048,576 pages → 16,384 u64 words (128 KiB).
+        // One bit per page; the window is at most 256 GiB (8 MiB bitmap).
         let bitmap_words = store.flat_size().div_ceil(4096 * 64);
         let materialised = (0..bitmap_words)
             .map(|_| AtomicU64::new(0))
@@ -3546,8 +4102,16 @@ impl FlatGuestMemory {
             return;
         }
         self.store = Arc::clone(store);
-        for word in &self.materialised {
-            word.store(0, Ordering::Relaxed);
+        let required_words = store.flat_size().div_ceil(4096 * 64);
+        if self.materialised.len() != required_words {
+            self.materialised = (0..required_words)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+        } else {
+            for word in &self.materialised {
+                word.store(0, Ordering::Relaxed);
+            }
         }
     }
 
@@ -3566,7 +4130,7 @@ impl FlatGuestMemory {
         self.store.is_valid()
     }
 
-    /// Number of 4 KiB pages in the flat window (the whole 4 GiB range).
+    /// Number of 4 KiB pages in the flat window (the whole direct range).
     pub fn total_page_count(&self) -> u64 {
         (self.store.flat_size() / 4096) as u64
     }
@@ -3907,17 +4471,22 @@ impl GuestSliceMemory {
 
 /// Immutable execution plan handed to a production worker.
 ///
-/// The blocks are compiled into a dedicated, deliberately unlinked cache
-/// (worker dispatches one block at a time, so a slice budget is exact and no
-/// chained loop can bypass the thunk barrier).  The program is `Send + Sync`
-/// because every field is immutable shared state; `JitCompiledBlock` stores
-/// its entry as an address and the code pages are immutable after
-/// `finalize_code`.
+/// The blocks are compiled into a dedicated, deliberately unlinked cache:
+/// the worker resolves control flow itself (budget, safepoint, per-block SMC
+/// checks and host-thunk barriers stay exact), while calls, returns and
+/// indirect transfers continue inside the same worker job.  The program is
+/// `Send + Sync` because every field is immutable shared state;
+/// `JitCompiledBlock` stores its entry as an address and the code pages are
+/// immutable after `finalize_code`.
 pub(crate) struct GuestSliceProgram {
     pub(crate) blocks: HashMap<u64, JitCompiledBlock>,
     pub(crate) memory: Arc<GuestSliceMemory>,
     pub(crate) flat_base: u64,
     pub(crate) mechanism: JitExecMechanism,
+    /// Generation of the runtime's slice-block cache.  A persistent worker
+    /// slot resets its predictor/inline caches when this changes, because
+    /// cached code entries could otherwise point at invalidated blocks.
+    pub(crate) epoch: u64,
 }
 
 impl GuestSliceProgram {
@@ -3945,7 +4514,7 @@ pub(crate) unsafe fn execute_slice_block(
     program: &GuestSliceProgram,
     block: &JitCompiledBlock,
     state: &mut CpuState,
-    exit_slot: &mut [u64; 2],
+    chain: &mut ChainState,
 ) -> SliceBlockOutcome {
     JitMemoryManager::prepare_execution_for_mechanism(program.mechanism);
     let entry = block.published_entry();
@@ -3955,29 +4524,866 @@ pub(crate) unsafe fn execute_slice_block(
             final_block: block.guest_address,
         };
     }
+    chain.current_block = block.guest_address;
     // SAFETY: the caller guarantees the entry points at finalized immutable
     // code.  The ABI is the block entry ABI (state, flat base, unused
-    // MemoryImage pointer, per-thread exit cell).
-    let entry_fn: unsafe extern "C" fn(*mut CpuState, u64, *mut MemoryImage, *mut u64) -> u64 =
-        unsafe { std::mem::transmute(entry) };
+    // MemoryImage pointer, per-chain state).
+    let entry_fn: unsafe extern "C" fn(
+        *mut CpuState,
+        u64,
+        *mut MemoryImage,
+        *mut ChainState,
+    ) -> u64 = unsafe { std::mem::transmute(entry) };
     let result = unsafe {
         entry_fn(
             state as *mut CpuState,
             program.flat_base,
             ptr::null_mut(),
-            exit_slot.as_mut_ptr(),
+            chain as *mut ChainState,
         )
     };
-    let final_block = exit_slot[0];
+    let final_block = chain.current_block;
+    let payload = chain.payload;
+    // Every native exit reports the block that actually ran; callers may
+    // still override this with a control-flow successor.
+    state.rip = final_block;
     let exit_info = program
         .blocks
         .get(&final_block)
         .map(|final_block| final_block.last_exit_info)
         .unwrap_or(block.last_exit_info);
     SliceBlockOutcome {
-        reason: map_exit_reason(result, state, result, exit_info),
+        reason: map_exit_reason(result, state, result, exit_info, payload),
         final_block,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent production-worker control-flow state and slice driver
+// ---------------------------------------------------------------------------
+
+/// Number of polymorphic ways a worker indirect-site cache holds before it
+/// becomes megamorphic.
+pub(crate) const INDIRECT_POLY_WAYS: usize = 4;
+
+/// Return-stack predictor for guest `ret`.
+///
+/// Every worker `call` pushes its statically known return address; every
+/// `ret` predicts the top entry and compares it with the real address loaded
+/// from guest `[rsp]`.  A misprediction is counted, the predictor is
+/// resynchronised to the real return address, and execution continues at the
+/// *guest* value — the prediction is only a hint, never the authority.
+#[derive(Debug, Clone)]
+pub(crate) struct ReturnPredictor {
+    stack: VecDeque<u64>,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+    mispredictions: u64,
+}
+
+impl Default for ReturnPredictor {
+    fn default() -> Self {
+        Self::new(64)
+    }
+}
+
+impl ReturnPredictor {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            stack: VecDeque::with_capacity(capacity.max(1)),
+            capacity: capacity.max(1),
+            hits: 0,
+            misses: 0,
+            mispredictions: 0,
+        }
+    }
+
+    pub(crate) fn on_call(&mut self, return_address: u64) {
+        if self.stack.len() == self.capacity {
+            self.stack.pop_front();
+        }
+        self.stack.push_back(return_address);
+    }
+
+    /// Account for a `ret` whose real guest return address is `actual`.
+    /// Returns whether the top-of-stack prediction matched.
+    pub(crate) fn on_return(&mut self, actual: u64) -> bool {
+        let prediction = self.stack.pop_back();
+        match prediction {
+            Some(predicted) if predicted == actual => {
+                self.hits += 1;
+                true
+            }
+            Some(_) => {
+                self.misses += 1;
+                self.mispredictions += 1;
+                // A mismatched return means the guest stack and the predictor
+                // diverged (e.g. a non-local unwind).  Re-synchronise when the
+                // real return address is still on the predicted stack.
+                if let Some(position) = self.stack.iter().rposition(|entry| *entry == actual) {
+                    self.stack.truncate(position + 1);
+                }
+                false
+            }
+            None => {
+                self.misses += 1;
+                false
+            }
+        }
+    }
+
+    pub(crate) fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    pub(crate) fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    pub(crate) fn mispredictions(&self) -> u64 {
+        self.mispredictions
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.stack.clear();
+        self.hits = 0;
+        self.misses = 0;
+        self.mispredictions = 0;
+    }
+}
+
+/// One indirect-site inline cache: monomorphic until a second target appears,
+/// then 2..=[`INDIRECT_POLY_WAYS`]-way polymorphic, then a hash-table
+/// megamorphic fallback.  Entries map a guest target address to the compiled
+/// block entry so a hit can dispatch without touching the program map.
+#[derive(Debug, Default)]
+struct IndirectSiteCache {
+    targets: [u64; INDIRECT_POLY_WAYS],
+    entries: [usize; INDIRECT_POLY_WAYS],
+    len: u8,
+    megamorphic: bool,
+    mega: HashMap<u64, usize>,
+    hits: u64,
+    misses: u64,
+    megamorphic_hits: u64,
+}
+
+impl IndirectSiteCache {
+    fn lookup(&mut self, target: u64) -> Option<usize> {
+        if self.megamorphic {
+            return match self.mega.get(&target) {
+                Some(entry) => {
+                    self.megamorphic_hits += 1;
+                    Some(*entry)
+                }
+                None => {
+                    self.misses += 1;
+                    None
+                }
+            };
+        }
+        for index in 0..self.len as usize {
+            if self.targets[index] == target {
+                self.hits += 1;
+                return Some(self.entries[index]);
+            }
+        }
+        self.misses += 1;
+        None
+    }
+
+    fn insert(&mut self, target: u64, entry: usize) {
+        if self.megamorphic {
+            self.mega.insert(target, entry);
+            return;
+        }
+        if (self.len as usize) < INDIRECT_POLY_WAYS {
+            let index = self.len as usize;
+            self.targets[index] = target;
+            self.entries[index] = entry;
+            self.len += 1;
+            return;
+        }
+        self.megamorphic = true;
+        for index in 0..INDIRECT_POLY_WAYS {
+            self.mega.insert(self.targets[index], self.entries[index]);
+        }
+        self.mega.insert(target, entry);
+    }
+}
+
+/// Per-worker-slot indirect call/jump cache, keyed by the block that performed
+/// the transfer.  A site is monomorphic for one target, polymorphic for 2-4,
+/// and megamorphic beyond that.
+#[derive(Debug, Default)]
+pub(crate) struct IndirectInlineCache {
+    sites: HashMap<u64, IndirectSiteCache>,
+}
+
+impl IndirectInlineCache {
+    pub(crate) fn lookup(&mut self, site: u64, target: u64) -> Option<usize> {
+        let cache = self.sites.entry(site).or_default();
+        cache.lookup(target)
+    }
+
+    pub(crate) fn insert(&mut self, site: u64, target: u64, entry: usize) {
+        let cache = self.sites.entry(site).or_default();
+        cache.insert(target, entry);
+    }
+
+    pub(crate) fn hits(&self) -> u64 {
+        self.sites.values().map(|cache| cache.hits).sum()
+    }
+
+    pub(crate) fn misses(&self) -> u64 {
+        self.sites.values().map(|cache| cache.misses).sum()
+    }
+
+    pub(crate) fn megamorphic_sites(&self) -> u64 {
+        self.sites
+            .values()
+            .filter(|cache| cache.megamorphic)
+            .count() as u64
+    }
+
+    pub(crate) fn megamorphic_hits(&self) -> u64 {
+        self.sites
+            .values()
+            .map(|cache| cache.megamorphic_hits)
+            .sum()
+    }
+
+    #[allow(dead_code)] // diagnostics/tests
+    pub(crate) fn is_megamorphic(&self, site: u64) -> bool {
+        self.sites.get(&site).is_some_and(|cache| cache.megamorphic)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.sites.clear();
+    }
+}
+
+/// Cumulative control-flow metrics for one persistent worker slot.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SliceMetrics {
+    pub blocks_executed: u64,
+    pub instructions_executed: u64,
+    pub dispatcher_exits: u64,
+    pub native_chains: u64,
+    pub return_predictions: u64,
+    pub return_hits: u64,
+    pub return_misses: u64,
+    pub return_mispredictions: u64,
+    pub indirect_ic_hits: u64,
+    pub indirect_ic_misses: u64,
+    pub indirect_megamorphic_sites: u64,
+    pub indirect_megamorphic_hits: u64,
+}
+
+#[allow(dead_code)] // rates are the scheduler/benchmark diagnostic surface
+impl SliceMetrics {
+    /// Compiled-code exits back to the worker dispatcher per 1000 guest IR
+    /// instructions (0 when nothing ran).
+    pub(crate) fn dispatcher_exits_per_1000_instructions(&self) -> f64 {
+        if self.instructions_executed == 0 {
+            0.0
+        } else {
+            self.dispatcher_exits as f64 * 1000.0 / self.instructions_executed as f64
+        }
+    }
+
+    /// Fraction of executed blocks that were reached as a native chain (i.e.
+    /// without returning to a *scheduler* round).  A single-block slice is 0.
+    pub(crate) fn native_chaining_rate(&self) -> f64 {
+        if self.blocks_executed == 0 {
+            0.0
+        } else {
+            self.native_chains as f64 / self.blocks_executed as f64
+        }
+    }
+
+    pub(crate) fn return_hit_rate(&self) -> f64 {
+        if self.return_predictions == 0 {
+            0.0
+        } else {
+            self.return_hits as f64 / self.return_predictions as f64
+        }
+    }
+
+    pub(crate) fn indirect_ic_hit_rate(&self) -> f64 {
+        let total = self.indirect_ic_hits + self.indirect_ic_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.indirect_ic_hits as f64 / total as f64
+        }
+    }
+
+    pub(crate) fn indirect_megamorphic_rate(&self) -> f64 {
+        let total = self.indirect_ic_hits + self.indirect_ic_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.indirect_megamorphic_hits as f64 / total as f64
+        }
+    }
+
+    pub(crate) fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            blocks_executed: self.blocks_executed - earlier.blocks_executed,
+            instructions_executed: self.instructions_executed - earlier.instructions_executed,
+            dispatcher_exits: self.dispatcher_exits - earlier.dispatcher_exits,
+            native_chains: self.native_chains - earlier.native_chains,
+            return_predictions: self.return_predictions - earlier.return_predictions,
+            return_hits: self.return_hits - earlier.return_hits,
+            return_misses: self.return_misses - earlier.return_misses,
+            return_mispredictions: self.return_mispredictions - earlier.return_mispredictions,
+            indirect_ic_hits: self.indirect_ic_hits - earlier.indirect_ic_hits,
+            indirect_ic_misses: self.indirect_ic_misses - earlier.indirect_ic_misses,
+            indirect_megamorphic_sites: self.indirect_megamorphic_sites
+                - earlier.indirect_megamorphic_sites,
+            indirect_megamorphic_hits: self.indirect_megamorphic_hits
+                - earlier.indirect_megamorphic_hits,
+        }
+    }
+}
+
+/// Persistent per-guest-thread execution state owned by a worker slot.
+#[derive(Debug, Default)]
+pub(crate) struct SliceThreadState {
+    epoch: u64,
+    initialised: bool,
+    pub(crate) return_predictor: ReturnPredictor,
+    pub(crate) indirect_cache: IndirectInlineCache,
+    pub(crate) metrics: SliceMetrics,
+    /// Return accounting performed entirely inside native chains (calls and
+    /// returns that never re-entered the worker loop).
+    native_return_hits: u64,
+    native_return_misses: u64,
+    native_return_mispredicts: u64,
+}
+
+impl SliceThreadState {
+    /// Drop cached code-entry state when the runtime invalidated slice blocks.
+    /// Cumulative metrics survive because they describe guest behaviour, not
+    /// code addresses.
+    pub(crate) fn prepare(&mut self, epoch: u64) {
+        if !self.initialised || self.epoch != epoch {
+            self.epoch = epoch;
+            self.initialised = true;
+            self.return_predictor.reset();
+            self.indirect_cache.reset();
+            self.native_return_hits = 0;
+            self.native_return_misses = 0;
+            self.native_return_mispredicts = 0;
+            // Cached-entry counters restart with the caches.
+            self.metrics.return_predictions = 0;
+            self.metrics.return_hits = 0;
+            self.metrics.return_misses = 0;
+            self.metrics.return_mispredictions = 0;
+            self.metrics.indirect_ic_hits = 0;
+            self.metrics.indirect_ic_misses = 0;
+            self.metrics.indirect_megamorphic_sites = 0;
+            self.metrics.indirect_megamorphic_hits = 0;
+        }
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    fn refresh_cache_metrics(&mut self) {
+        self.metrics.return_hits = self.return_predictor.hits() + self.native_return_hits;
+        self.metrics.return_misses = self.return_predictor.misses() + self.native_return_misses;
+        self.metrics.return_predictions = self.metrics.return_hits + self.metrics.return_misses;
+        self.metrics.return_mispredictions =
+            self.return_predictor.mispredictions() + self.native_return_mispredicts;
+        self.metrics.indirect_ic_hits = self.indirect_cache.hits();
+        self.metrics.indirect_ic_misses = self.indirect_cache.misses();
+        self.metrics.indirect_megamorphic_sites = self.indirect_cache.megamorphic_sites();
+        self.metrics.indirect_megamorphic_hits = self.indirect_cache.megamorphic_hits();
+    }
+}
+
+/// Why a worker slice stopped.  Mirrors the scheduler's `GuestSliceExit`
+/// without making the JIT depend on the runtime module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SliceStop {
+    Budget,
+    HostBarrier { rip: u64 },
+    GuestFault { address: u64, write: bool },
+    CodeWrite,
+    Safepoint,
+    Shutdown,
+}
+
+/// Result of [`run_slice`].
+#[derive(Debug)]
+pub(crate) struct SliceRunReport {
+    pub(crate) stop: SliceStop,
+    pub(crate) blocks_executed: u64,
+    pub(crate) metrics: SliceMetrics,
+    pub(crate) code_writes: Vec<(u64, usize)>,
+}
+
+fn slice_push_return(
+    program: &GuestSliceProgram,
+    state: &mut CpuState,
+    return_address: u64,
+) -> Result<(), (u64, bool)> {
+    let pointer_bytes = state.arch.pointer_bytes();
+    let rsp = state.get(Register::Rsp).wrapping_sub(pointer_bytes as u64);
+    let bytes = return_address.to_le_bytes();
+    let touched_code = program
+        .memory
+        .store(rsp, &bytes[..pointer_bytes])
+        .map_err(|fault| (fault.address, fault.write))?;
+    if touched_code {
+        WORKER_SLICE_CODE_WRITTEN.with(|flag| flag.set(true));
+        JIT_CODE_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
+    state.set(Register::Rsp, rsp);
+    Ok(())
+}
+
+fn slice_resolve_target(
+    program: &GuestSliceProgram,
+    state: &CpuState,
+    target: u64,
+    target_is_pointer: bool,
+) -> Result<u64, (u64, bool)> {
+    if !target_is_pointer {
+        return Ok(target);
+    }
+    let pointer_bytes = state.arch.pointer_bytes();
+    program
+        .memory
+        .load(target, pointer_bytes)
+        .map_err(|fault| (fault.address, fault.write))
+}
+
+/// Run one production worker slice: execute compiled worker blocks until the
+/// budget, a host barrier, a safepoint, a guest fault, a code write, or pool
+/// shutdown.  Direct/conditional jumps, calls, indirect transfers and returns
+/// are resolved here and continue in the same native worker — they never yield
+/// to the runtime owner merely for control flow.
+///
+/// # Safety
+/// `program` must outlive the call, its blocks must be finalized worker
+/// blocks, and `state` must be exclusively owned by this worker.
+pub(crate) unsafe fn run_slice(
+    program: &GuestSliceProgram,
+    state: &mut CpuState,
+    thread: &mut SliceThreadState,
+    budget: u64,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> SliceRunReport {
+    use std::sync::atomic::Ordering;
+    thread.prepare(program.epoch);
+    let metrics_before = thread.metrics;
+    let guard = WorkerSliceGuard::install(&program.memory);
+    let mut chain = ChainState::new(program.flat_base, state.rip, budget.min(LINK_BUDGET));
+    let mut blocks_executed = 0_u64;
+    let mut dispatches = 0_u64;
+    let stop = loop {
+        if shutdown.load(Ordering::Acquire) {
+            break SliceStop::Shutdown;
+        }
+        if blocks_executed >= budget {
+            break SliceStop::Budget;
+        }
+        let Some(block) = program.block(state.rip) else {
+            break SliceStop::HostBarrier { rip: state.rip };
+        };
+        if !block.worker_safe {
+            break SliceStop::HostBarrier { rip: state.rip };
+        }
+        // Never let a native chain outlive the slice budget or the link
+        // budget.  `link_budget` is also the check counter that guarantees a
+        // dispatch boundary (safepoint + SMC re-evaluation) even in a loop of
+        // direct branches.
+        chain.link_budget = (budget - blocks_executed).min(LINK_BUDGET);
+        let before_blocks = chain.blocks;
+        let before_instructions = chain.instructions;
+        // SAFETY: the block came from the caller's finalized worker program
+        // and the worker owns `state` and `chain`.
+        let outcome = unsafe { execute_slice_block(program, block, state, &mut chain) };
+        let delta_blocks = chain.blocks - before_blocks;
+        let delta_instructions = chain.instructions - before_instructions;
+        blocks_executed += delta_blocks;
+        thread.metrics.blocks_executed += delta_blocks;
+        thread.metrics.instructions_executed += delta_instructions;
+        if delta_blocks > 0 {
+            dispatches += 1;
+            thread.metrics.dispatcher_exits += 1;
+            thread.metrics.native_chains += delta_blocks.saturating_sub(1);
+        }
+        let code_written = guard.code_written();
+        let SliceBlockOutcome {
+            reason,
+            final_block,
+        } = outcome;
+        let final_exit_info = program
+            .blocks
+            .get(&final_block)
+            .and_then(|block| block.last_exit_info)
+            .or(block.last_exit_info);
+        let conditional_taken = match &reason {
+            JitExitReason::ConditionalBranch { taken, .. } => Some(*taken),
+            JitExitReason::ConditionalTaken { .. } => Some(true),
+            JitExitReason::ConditionalNotTaken { .. } => Some(false),
+            _ => None,
+        };
+        match reason {
+            JitExitReason::Jump { target } => {
+                state.rip = target;
+            }
+            JitExitReason::ConditionalBranch { .. }
+            | JitExitReason::ConditionalTaken { .. }
+            | JitExitReason::ConditionalNotTaken { .. } => {
+                let taken = conditional_taken.unwrap_or(false);
+                let Some(BlockExitInfo::JumpIf {
+                    target,
+                    fallthrough,
+                    ..
+                }) = final_exit_info
+                else {
+                    break SliceStop::HostBarrier { rip: state.rip };
+                };
+                state.rip = if taken { target } else { fallthrough };
+            }
+            JitExitReason::DirectCall {
+                target,
+                return_address,
+            } => {
+                if let Err((address, write)) = slice_push_return(program, state, return_address) {
+                    break SliceStop::GuestFault { address, write };
+                }
+                thread.return_predictor.on_call(return_address);
+                state.rip = target;
+            }
+            JitExitReason::DirectCallPushed {
+                target,
+                return_address: _,
+            } => {
+                // The compiled block already pushed the guest return address
+                // and recorded the call in the chain's native return stack.
+                state.rip = target;
+            }
+            JitExitReason::IndirectCall {
+                target,
+                return_address,
+                target_is_pointer,
+            } => {
+                let target = match slice_resolve_target(program, state, target, target_is_pointer) {
+                    Ok(target) => target,
+                    Err((address, write)) => break SliceStop::GuestFault { address, write },
+                };
+                if let Err((address, write)) = slice_push_return(program, state, return_address) {
+                    break SliceStop::GuestFault { address, write };
+                }
+                thread.return_predictor.on_call(return_address);
+                if thread.indirect_cache.lookup(final_block, target).is_none()
+                    && let Some(callee) = program.blocks.get(&target)
+                {
+                    thread
+                        .indirect_cache
+                        .insert(final_block, target, callee.entry() as usize);
+                }
+                state.rip = target;
+            }
+            JitExitReason::IndirectJump {
+                target,
+                target_is_pointer,
+            } => {
+                let target = match slice_resolve_target(program, state, target, target_is_pointer) {
+                    Ok(target) => target,
+                    Err((address, write)) => break SliceStop::GuestFault { address, write },
+                };
+                if thread.indirect_cache.lookup(final_block, target).is_none()
+                    && let Some(target_block) = program.blocks.get(&target)
+                {
+                    thread.indirect_cache.insert(
+                        final_block,
+                        target,
+                        target_block.entry() as usize,
+                    );
+                }
+                state.rip = target;
+            }
+            JitExitReason::Return { .. } => {
+                let pointer_bytes = state.arch.pointer_bytes();
+                let rsp = state.get(Register::Rsp);
+                let actual = match program.memory.load(rsp, pointer_bytes) {
+                    Ok(actual) => actual,
+                    Err(fault) => {
+                        break SliceStop::GuestFault {
+                            address: fault.address,
+                            write: fault.write,
+                        };
+                    }
+                };
+                let stack_adjust = match final_exit_info {
+                    Some(BlockExitInfo::Return { stack_adjust }) => stack_adjust,
+                    _ => 0,
+                };
+                thread.return_predictor.on_return(actual);
+                state.set(
+                    Register::Rsp,
+                    rsp.wrapping_add(pointer_bytes as u64 + stack_adjust),
+                );
+                // Warm the chain return stack so the next visit can link
+                // natively without leaving the worker.
+                let entry = program
+                    .blocks
+                    .get(&actual)
+                    .filter(|block| block.worker_safe)
+                    .map(|block| block.entry() as u64)
+                    .unwrap_or(0);
+                chain.push_return(actual, entry);
+                state.rip = actual;
+            }
+            JitExitReason::ReturnResolved { target } => {
+                // Native return prediction/accounting already ran inside the
+                // compiled block (see the chain counters merged below).
+                state.rip = target;
+            }
+            JitExitReason::Safepoint => {
+                state.rip = final_block;
+                break SliceStop::Safepoint;
+            }
+            JitExitReason::LinkBudget { .. } => {
+                // The block at `final_block` did not execute.  Re-enter it
+                // with a fresh check budget, unless the slice budget is spent.
+                state.rip = final_block;
+                if blocks_executed >= budget {
+                    break SliceStop::Budget;
+                }
+            }
+            JitExitReason::CodeEpoch { .. } => {
+                state.rip = final_block;
+                break SliceStop::CodeWrite;
+            }
+            JitExitReason::GuestFault => {
+                let address = state.jit_pending_fault.take().unwrap_or(state.rip);
+                let write = std::mem::take(&mut state.jit_pending_fault_write);
+                break SliceStop::GuestFault { address, write };
+            }
+            JitExitReason::Normal { .. }
+            | JitExitReason::ThunkDispatch { .. }
+            | JitExitReason::UnimplementedInstruction { .. }
+            | JitExitReason::MemoryAccess { .. }
+            | JitExitReason::Cpuid
+            | JitExitReason::Exception { .. } => {
+                // A straight-line worker block has no static successor.  Stop
+                // at the block that actually ran and let the owner re-decode
+                // (this is the documented host barrier for these blocks).
+                state.rip = final_block;
+                break SliceStop::HostBarrier { rip: state.rip };
+            }
+        }
+        if code_written {
+            break SliceStop::CodeWrite;
+        }
+        if program
+            .block(state.rip)
+            .map_or(true, |block| !block.worker_safe)
+        {
+            break SliceStop::HostBarrier { rip: state.rip };
+        }
+    };
+    let _ = dispatches;
+    thread.native_return_hits += chain.native_return_hits;
+    thread.native_return_misses += chain.native_return_misses;
+    thread.native_return_mispredicts += chain.native_return_mispredicts;
+    thread.refresh_cache_metrics();
+    let code_writes = program.memory.take_code_writes();
+    drop(guard);
+    SliceRunReport {
+        stop,
+        blocks_executed,
+        metrics: thread.metrics.delta_since(metrics_before),
+        code_writes,
+    }
+}
+
+/// Benchmark-only AOT cache probe: compile once, then load the persisted
+/// block through `rounds` fresh runtime instances.  Returns the accumulated
+/// `(hits, misses, rejected)` counters.
+#[doc(hidden)]
+pub fn bench_aot_hits(rounds: u64) -> (u64, u64, u64) {
+    let directory = std::env::temp_dir().join(format!(
+        "casa1-aot-bench-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let ir = [IrInstruction::Nop];
+    let address = 0x1000;
+    let mut totals = (0_u64, 0_u64, 0_u64);
+    {
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        runtime.set_aot_cache_dir(Some(directory.clone()));
+        let _ = runtime.get_or_compile_slice_block(&ir, address, GuestArch::X64);
+        let metrics = runtime.aot_metrics();
+        totals = (
+            totals.0 + metrics.0,
+            totals.1 + metrics.1,
+            totals.2 + metrics.2,
+        );
+    }
+    for _ in 0..rounds {
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        runtime.set_aot_cache_dir(Some(directory.clone()));
+        let _ = runtime.get_or_compile_slice_block(&ir, address, GuestArch::X64);
+        let metrics = runtime.aot_metrics();
+        totals = (
+            totals.0 + metrics.0,
+            totals.1 + metrics.1,
+            totals.2 + metrics.2,
+        );
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+    totals
+}
+
+/// Benchmark-only harness for production worker slices.  It keeps the
+/// `JitRuntime` alive because the compiled entry addresses live in its
+/// executable mappings.
+#[doc(hidden)]
+pub struct WorkerSliceBenchmark {
+    _runtime: JitRuntime,
+    program: GuestSliceProgram,
+    state: CpuState,
+    thread: SliceThreadState,
+    shutdown: AtomicBool,
+    entry: u64,
+    rsp: u64,
+}
+
+#[doc(hidden)]
+impl WorkerSliceBenchmark {
+    pub fn new(
+        arch: GuestArch,
+        memory: &MemoryImage,
+        blocks: &[(u64, Vec<IrInstruction>)],
+        entry: u64,
+        rsp: u64,
+    ) -> Self {
+        let mut runtime = JitRuntime::new(arch);
+        runtime.set_aot_cache_dir(None);
+        for (address, ir) in blocks {
+            runtime
+                .get_or_compile_slice_block(ir, *address, arch)
+                .expect("compile benchmark worker block");
+        }
+        let program = runtime.build_slice_program(memory);
+        let mut state = CpuState::new(arch);
+        state.set(Register::Rsp, rsp);
+        Self {
+            _runtime: runtime,
+            program,
+            state,
+            thread: SliceThreadState::default(),
+            shutdown: AtomicBool::new(false),
+            entry,
+            rsp,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.state.rip = self.entry;
+        self.state.set(Register::Rsp, self.rsp);
+        self.state.set(Register::Rcx, 0);
+        self.thread = SliceThreadState::default();
+    }
+
+    pub fn set_rax(&mut self, value: u64) {
+        self.state.set(Register::Rax, value);
+    }
+
+    /// Seed the guest loop counter (RCX) for benchmark workloads.
+    pub fn set_rcx(&mut self, value: u64) {
+        self.state.set(Register::Rcx, value);
+    }
+
+    /// Enable or disable native block linking for this benchmark harness.
+    ///
+    /// Disabling clears every worker link slot; execution still produces the
+    /// same guest state but dispatches each block separately.  This is the
+    /// measurement control for the linked-loop benchmark.
+    pub fn set_linking(&mut self, enabled: bool) {
+        if enabled {
+            self._runtime.publish_slice_links();
+        } else {
+            for block in self.program.blocks.values() {
+                block.link_target.store(0, Ordering::Release);
+                block.taken_link.store(0, Ordering::Release);
+                block.fallthrough_link.store(0, Ordering::Release);
+                block.call_link.store(0, Ordering::Release);
+                block.return_entry_link.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    /// Borrow the guest state (benchmark inspection).
+    pub fn state(&self) -> &CpuState {
+        &self.state
+    }
+
+    pub fn run(&mut self, budget: u64) -> (u64, u64, SliceMetrics) {
+        // SAFETY: the harness owns the runtime, the program was built from it,
+        // and `state` is exclusively borrowed for the call.
+        let report = unsafe {
+            run_slice(
+                &self.program,
+                &mut self.state,
+                &mut self.thread,
+                budget,
+                &self.shutdown,
+            )
+        };
+        (
+            report.blocks_executed,
+            report.metrics.instructions_executed,
+            report.metrics,
+        )
+    }
+}
+
+/// Benchmark-only indirect-cache workload: returns the accumulated hit count.
+#[doc(hidden)]
+pub fn bench_indirect_cache(iterations: u64) -> u64 {
+    let mut cache = IndirectInlineCache::default();
+    let mut hits = 0_u64;
+    for index in 0..iterations {
+        let target = 0x2000 + (index % 6) * 0x1000;
+        if let Some(entry) = cache.lookup(0x1000, target) {
+            hits = hits.wrapping_add(entry as u64);
+        } else {
+            cache.insert(0x1000, target, target as usize);
+        }
+    }
+    hits.wrapping_add(cache.hits())
+}
+
+/// Benchmark-only return-predictor workload: returns the accumulated hit count.
+#[doc(hidden)]
+pub fn bench_return_predictor(iterations: u64) -> u64 {
+    let mut predictor = ReturnPredictor::default();
+    let mut hits = 0_u64;
+    for index in 0..iterations {
+        let return_address = 0x1000 + (index % 64) * 0x10;
+        predictor.on_call(return_address);
+        if predictor.on_return(return_address) {
+            hits = hits.wrapping_add(1);
+        }
+    }
+    hits
 }
 
 // ---------------------------------------------------------------------------
@@ -4027,6 +5433,14 @@ pub struct JitCompiledBlock {
     /// never patches code — it publishes a pointer with Release, so no other
     /// thread can observe a torn instruction sequence.
     pub link_target: Arc<AtomicU64>,
+    /// `Jcc` taken/fallthrough successor entries (worker slices).
+    pub(crate) taken_link: Arc<AtomicU64>,
+    pub(crate) fallthrough_link: Arc<AtomicU64>,
+    /// Direct-call successor entry (worker slices).
+    pub(crate) call_link: Arc<AtomicU64>,
+    /// Entry of the statically known return successor of a direct call.
+    /// Emitted call sites push this into the chain return stack.
+    pub(crate) return_entry_link: Arc<AtomicU64>,
     /// True when a production worker may execute this block without touching
     /// runtime-owned host state: no interpreter fallback, no host call/return
     /// terminator, and no unresolved jump target.  Worker slices execute only
@@ -4047,6 +5461,10 @@ impl Clone for JitCompiledBlock {
             compile_tier: self.compile_tier,
             ends_in_control_flow: self.ends_in_control_flow,
             link_target: Arc::clone(&self.link_target),
+            taken_link: Arc::clone(&self.taken_link),
+            fallthrough_link: Arc::clone(&self.fallthrough_link),
+            call_link: Arc::clone(&self.call_link),
+            return_entry_link: Arc::clone(&self.return_entry_link),
             worker_safe: self.worker_safe,
         }
     }
@@ -4084,10 +5502,28 @@ fn block_ends_in_control_flow(ir: &[IrInstruction]) -> bool {
     ir.last().is_some_and(instruction_controls_rip)
 }
 
+/// Conservative guest-byte extent of a translated block.
+///
+/// IR does not retain each x86 instruction's encoded length, so the extent is
+/// bounded by the architectural maximum (15 bytes) per instruction.  This is
+/// used only for self-modifying-code page attribution; over-approximating can
+/// invalidate a neighbouring block conservatively, never miss a real write.
+fn block_guest_span(block: &JitCompiledBlock) -> u64 {
+    (block.instruction_count as u64).saturating_mul(15).max(1)
+}
+
 /// A production worker slice may execute a block only when it is fully
 /// self-contained: no interpreter-helper fallback (which needs a live
-/// `MemoryImage`), and no host-call / return / indirect-jump terminator.
-/// Any other block is a barrier that yields to the runtime owner.
+/// `MemoryImage`), and no instruction that exits the block MID-WAY for the
+/// interpreter to re-run (which would double-execute the already-run prefix).
+///
+/// Guest `call`/`ret`/indirect `jmp` are NOT barriers any more: the
+/// worker-program compiler lowers them to self-contained native exits whose
+/// target is carried in the per-thread exit cell, and the worker resolves the
+/// continuation itself (return-stack predictor / inline cache).  A direct
+/// `Call` whose target is a HOST thunk still yields at run time, because the
+/// worker finds no compiled block for it and reports a host barrier — the
+/// runtime owner then executes the thunk exactly once.
 fn block_is_worker_safe(ir: &[IrInstruction], used_interpreter_helper: bool) -> bool {
     if used_interpreter_helper {
         return false;
@@ -4095,13 +5531,7 @@ fn block_is_worker_safe(ir: &[IrInstruction], used_interpreter_helper: bool) -> 
     !ir.iter().any(|insn| {
         matches!(
             insn,
-            IrInstruction::Call { .. }
-                | IrInstruction::CallRegister { .. }
-                | IrInstruction::CallMemory { .. }
-                | IrInstruction::Return { .. }
-                | IrInstruction::JumpRegister { .. }
-                | IrInstruction::JumpMemory { .. }
-                | IrInstruction::Cpuid
+            IrInstruction::Cpuid
                 | IrInstruction::Xgetbv
                 | IrInstruction::Fxsave { .. }
                 | IrInstruction::Fxrstor { .. }
@@ -4120,9 +5550,34 @@ pub enum JitExitReason {
     UnimplementedInstruction { rip: u64, opcode: u8 },
     /// Block hit a conditional branch (needs host flag computation).
     ConditionalBranch { rip: u64, taken: bool },
+    /// Block hit a direct CALL to a known guest address.
+    ///
+    /// The worker pushes `return_address` on the guest stack and continues at
+    /// `target` when that address has a compiled worker block; when it does
+    /// not (e.g. a host thunk), the worker reports a host barrier with the
+    /// thunk as RIP so the runtime owner executes it exactly once.
+    DirectCall { target: u64, return_address: u64 },
     /// Block hit a CALL instruction to an indirect target.
-    IndirectCall { target: u64, return_address: u64 },
-    /// Block hit a RET instruction.
+    ///
+    /// `target` is the resolved callee address.  When `target_is_pointer` is
+    /// true the compiled block could not dereference the memory operand itself
+    /// (no live `MemoryImage` on a production worker), so the worker must load
+    /// the callee address from guest memory at `target` before transferring.
+    IndirectCall {
+        target: u64,
+        return_address: u64,
+        target_is_pointer: bool,
+    },
+    /// Block hit an indirect JMP (register or memory operand).  See
+    /// [`Self::IndirectCall`] for the `target_is_pointer` convention.
+    IndirectJump {
+        target: u64,
+        target_is_pointer: bool,
+    },
+    /// Block hit a RET instruction.  The compiled gate stores the raw exit
+    /// code in `return_rip`; a production worker reads the real return address
+    /// from guest `[rsp]` (via the slice memory view) and pops the stack, so
+    /// this field is diagnostic only on the worker path.
     Return { return_rip: u64 },
     /// Block needs host-side memory access (slow path).
     MemoryAccess {
@@ -4138,6 +5593,25 @@ pub enum JitExitReason {
     /// state.rip for jumps, so the dispatcher must set RIP to `target`
     /// and dispatch the target block next.
     Jump { target: u64 },
+    /// A native `Jcc` decided the branch was taken.  `rip` is the block's
+    /// address; the dispatcher derives target/fallthrough from the block's
+    /// static [`BlockExitInfo`].
+    ConditionalTaken { rip: u64 },
+    /// A native `Jcc` decided the branch was not taken.
+    ConditionalNotTaken { rip: u64 },
+    /// The link budget was exhausted at a block entry.  The block did not run;
+    /// the dispatcher refills the budget and re-dispatches `rip`.
+    LinkBudget { rip: u64 },
+    /// A guest store changed compiled-code bytes.  The block at `rip` did not
+    /// run; the dispatcher must invalidate stale translations before
+    /// re-dispatching it.
+    CodeEpoch { rip: u64 },
+    /// A direct call whose return address was already pushed by the compiled
+    /// block.  The worker must not push again.
+    DirectCallPushed { target: u64, return_address: u64 },
+    /// A native worker return that already popped the guest stack.  `target`
+    /// is the return address read from guest `[rsp]`.
+    ReturnResolved { target: u64 },
     /// Block hit the host safepoint flag (see `JIT_SAFEPOINT_REQUESTED`):
     /// the dispatcher must run the host-side safepoint body (pump pending
     /// guest threads, drain timers/APCs, advance the guest clock) and then
@@ -4168,6 +5642,18 @@ pub enum BlockExitInfo {
         target: u64,
         fallthrough: u64,
     },
+    /// Last instruction was a `Return` (guest `ret [imm16]`).  The worker pops
+    /// the return address from guest `[rsp]` and adds `8 + stack_adjust` to
+    /// `rsp`, matching the interpreter.
+    Return { stack_adjust: u64 },
+    /// Last instruction was a direct `Call` to `target`.  The worker pushes
+    /// `return_address` (already the address after the `call`) so a matching
+    /// `Return` can pop it from the return-stack predictor / guest stack.
+    Call { target: u64, return_address: u64 },
+    /// Last instruction was an indirect `CallRegister` / `CallMemory`.  The
+    /// callee target arrives in the [`JitExitReason::IndirectCall`] payload;
+    /// `return_address` is static.
+    CallIndirect { return_address: u64 },
 }
 
 /// Extract the [`BlockExitInfo`] for a compiled IR sequence, if its final
@@ -4184,6 +5670,22 @@ fn block_exit_info(ir: &[IrInstruction]) -> Option<BlockExitInfo> {
             target: *target,
             fallthrough: *fallthrough,
         }),
+        Some(IrInstruction::Return { stack_adjust }) => Some(BlockExitInfo::Return {
+            stack_adjust: *stack_adjust,
+        }),
+        Some(IrInstruction::Call {
+            target,
+            return_address,
+        }) => Some(BlockExitInfo::Call {
+            target: *target,
+            return_address: *return_address,
+        }),
+        Some(IrInstruction::CallRegister { return_address, .. })
+        | Some(IrInstruction::CallMemory { return_address, .. }) => {
+            Some(BlockExitInfo::CallIndirect {
+                return_address: *return_address,
+            })
+        }
         _ => None,
     }
 }
@@ -4246,6 +5748,475 @@ const EXIT_SAFEPOINT: u64 = 10;
 /// (+ `jit_pending_fault_write`) and raises the same access-violation error
 /// the interpreter produces.
 const EXIT_GUEST_FAULT: u64 = 11;
+/// Production-worker indirect control transfers.  The compiled block cannot
+/// write `state.rip` (unstable repr(Rust) offset) and has no live
+/// `MemoryImage`, so it publishes the resolved target (register operand) or the
+/// guest address the target must be loaded from (memory operand) into the
+/// per-thread cell word `cell[2]` and exits with one of these codes.  The
+/// worker resolves the target and continues natively (inline cache) instead of
+/// yielding to the runtime owner.
+const EXIT_INDIRECT_JUMP_REG: u64 = 12;
+const EXIT_INDIRECT_CALL_REG: u64 = 13;
+const EXIT_INDIRECT_JUMP_MEM: u64 = 14;
+const EXIT_INDIRECT_CALL_MEM: u64 = 15;
+/// Production-worker direct `call target`: the static target is published in
+/// the per-thread exit cell payload (same convention as the indirect codes).
+/// The worker pushes the static return address and either chains to the
+/// compiled callee block or reports the target as a host barrier.
+const EXIT_CALL_DIRECT: u64 = 16;
+/// Direct call whose return address was already pushed natively by the
+/// compiled block.  The worker must not push it a second time.
+const EXIT_CALL_PUSHED: u64 = 17;
+/// The compiled block's link-budget counter reached zero.  The current block
+/// has NOT executed; the dispatcher refills the counter and re-enters it.
+const EXIT_LINK_BUDGET: u64 = 18;
+/// The block's prologue observed a guest-code write epoch change.  The block
+/// has NOT executed; the dispatcher invalidates stale translated code.
+const EXIT_CODE_EPOCH: u64 = 19;
+/// A native `Jcc` determined the branch was taken / not taken.  The host no
+/// longer re-evaluates the condition; it only maps the outcome to RIP.
+const EXIT_COND_TAKEN: u64 = 20;
+const EXIT_COND_NOT_TAKEN: u64 = 21;
+/// Native worker `ret`: the return address was already loaded from guest
+/// `[rsp]`, `rsp` was advanced, and the result is in the payload word.
+const EXIT_RET_RESOLVED: u64 = 22;
+
+/// Byte offset (within the per-thread exit cell) of the indirect payload word.
+pub(crate) const EXIT_CELL_PAYLOAD_OFFSET: u64 = 16;
+
+/// Atomic link slots belonging to one block.  Each slot is published by the
+/// runtime after translation (and cleared on invalidation) and read by the
+/// compiled block with an acquire load.  Keeping every edge separate means a
+/// direct call or a two-way conditional branch can be linked independently
+/// without patching instruction memory (which would race executors).
+#[derive(Clone)]
+struct LinkSlots {
+    jump: Arc<AtomicU64>,
+    taken: Arc<AtomicU64>,
+    fallthrough: Arc<AtomicU64>,
+    call: Arc<AtomicU64>,
+    return_entry: Arc<AtomicU64>,
+}
+
+impl LinkSlots {
+    fn new() -> Self {
+        Self {
+            jump: Arc::new(AtomicU64::new(0)),
+            taken: Arc::new(AtomicU64::new(0)),
+            fallthrough: Arc::new(AtomicU64::new(0)),
+            call: Arc::new(AtomicU64::new(0)),
+            return_entry: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// Helper functions whose absolute address is embedded in translated code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AotHelper {
+    Load,
+    Store,
+    ExecuteInsn,
+    SegmentBase,
+    SetFlags,
+    MaterializeFlags,
+}
+
+impl AotHelper {
+    fn address(self) -> u64 {
+        match self {
+            Self::Load => jit_helper_load as *const () as u64,
+            Self::Store => jit_helper_store as *const () as u64,
+            Self::ExecuteInsn => jit_helper_execute_insn as *const () as u64,
+            Self::SegmentBase => jit_helper_segment_base as *const () as u64,
+            Self::SetFlags => jit_helper_set_flags as *const () as u64,
+            Self::MaterializeFlags => jit_helper_materialize_flags as *const () as u64,
+        }
+    }
+
+    fn code(self) -> u32 {
+        match self {
+            Self::Load => 1,
+            Self::Store => 2,
+            Self::ExecuteInsn => 3,
+            Self::SegmentBase => 4,
+            Self::SetFlags => 5,
+            Self::MaterializeFlags => 6,
+        }
+    }
+
+    fn from_code(code: u32) -> Option<Self> {
+        Some(match code {
+            1 => Self::Load,
+            2 => Self::Store,
+            3 => Self::ExecuteInsn,
+            4 => Self::SegmentBase,
+            5 => Self::SetFlags,
+            6 => Self::MaterializeFlags,
+            _ => return None,
+        })
+    }
+}
+
+/// One absolute value embedded in translated code that must be re-bound when
+/// the block is loaded from the persistent AOT cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AotRelocation {
+    /// Byte offset of the fixed four-instruction `movz`/`movk` sequence.
+    offset: u32,
+    kind: AotRelocKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AotRelocKind {
+    SafepointFlag,
+    CodeEpoch,
+    JumpLink,
+    TakenLink,
+    FallthroughLink,
+    CallLink,
+    ReturnEntryLink,
+    Helper(AotHelper),
+}
+
+impl AotRelocKind {
+    fn code(self) -> u32 {
+        match self {
+            Self::SafepointFlag => 0,
+            Self::CodeEpoch => 1,
+            Self::JumpLink => 2,
+            Self::TakenLink => 3,
+            Self::FallthroughLink => 4,
+            Self::CallLink => 5,
+            Self::ReturnEntryLink => 6,
+            Self::Helper(helper) => 0x100 + helper.code(),
+        }
+    }
+
+    fn from_code(code: u32) -> Option<Self> {
+        Some(match code {
+            0 => Self::SafepointFlag,
+            1 => Self::CodeEpoch,
+            2 => Self::JumpLink,
+            3 => Self::TakenLink,
+            4 => Self::FallthroughLink,
+            5 => Self::CallLink,
+            6 => Self::ReturnEntryLink,
+            other => Self::Helper(AotHelper::from_code(other.checked_sub(0x100)?)?),
+        })
+    }
+}
+
+/// Persistent-cache format version.  Bumped whenever the emitted-code ABI
+/// (chain-state offsets, exit codes, relocation layout) changes.
+pub const AOT_FORMAT_VERSION: u32 = 1;
+/// Cache key component: bump when code generation changes without changing the
+/// IR hash (e.g. an emitter fix).  A stale file is rejected, never executed.
+pub const AOT_TRANSLATOR_VERSION: u32 = 5;
+
+/// Optimization-profile key component for worker-slice Tier0 blocks.
+const AOT_SLICE_OPT_PROFILE: u32 = 1;
+
+/// Absolute target CPU profile stored in the AOT key.
+pub fn aot_target_cpu_profile() -> u64 {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in arch.bytes().chain(os.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+/// A serializer/deserializer for one translated block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AotRecord {
+    format: u32,
+    translator: u32,
+    machine: u64,
+    cpu_profile: u64,
+    optimization_profile: u32,
+    guest_address: u64,
+    code_hash: u64,
+    logical_code_hash: u64,
+    instruction_count: u64,
+    code_size: u32,
+    worker_safe: bool,
+    exit_info: Option<BlockExitInfo>,
+    code: Vec<u8>,
+    relocations: Vec<AotRelocation>,
+}
+
+impl AotRecord {
+    const MAGIC: &'static [u8; 8] = b"C1AOTC\0\0";
+
+    fn machine_tag() -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in std::env::consts::ARCH
+            .bytes()
+            .chain(std::env::consts::OS.bytes())
+            .chain(std::env::consts::FAMILY.bytes())
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(96 + self.code.len() + self.relocations.len() * 8);
+        out.extend_from_slice(Self::MAGIC);
+        out.extend_from_slice(&self.format.to_le_bytes());
+        out.extend_from_slice(&self.translator.to_le_bytes());
+        out.extend_from_slice(&self.machine.to_le_bytes());
+        out.extend_from_slice(&self.cpu_profile.to_le_bytes());
+        out.extend_from_slice(&self.optimization_profile.to_le_bytes());
+        out.extend_from_slice(&self.guest_address.to_le_bytes());
+        out.extend_from_slice(&self.code_hash.to_le_bytes());
+        out.extend_from_slice(&self.logical_code_hash.to_le_bytes());
+        out.extend_from_slice(&self.instruction_count.to_le_bytes());
+        out.extend_from_slice(&self.code_size.to_le_bytes());
+        out.push(u8::from(self.worker_safe));
+        encode_exit_info(&mut out, self.exit_info);
+        out.extend_from_slice(&(self.relocations.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.code);
+        for relocation in &self.relocations {
+            out.extend_from_slice(&relocation.offset.to_le_bytes());
+            out.extend_from_slice(&relocation.kind.code().to_le_bytes());
+        }
+        let checksum = fnv1a(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
+        if bytes.len() < 8 + 4 * 10 + 1 + 1 + 4 + 8 {
+            return Err("truncated record header");
+        }
+        if &bytes[..8] != Self::MAGIC {
+            return Err("bad magic");
+        }
+        let payload_end = bytes.len() - 8;
+        let expected = u64::from_le_bytes(
+            bytes[payload_end..]
+                .try_into()
+                .map_err(|_| "truncated checksum")?,
+        );
+        if fnv1a(&bytes[..payload_end]) != expected {
+            return Err("checksum mismatch");
+        }
+        let mut cursor = 8;
+        let read_u32 = |cursor: &mut usize| -> Result<u32, &'static str> {
+            let value = u32::from_le_bytes(
+                bytes
+                    .get(*cursor..*cursor + 4)
+                    .ok_or("truncated u32")?
+                    .try_into()
+                    .map_err(|_| "truncated u32")?,
+            );
+            *cursor += 4;
+            Ok(value)
+        };
+        let read_u64 = |cursor: &mut usize| -> Result<u64, &'static str> {
+            let value = u64::from_le_bytes(
+                bytes
+                    .get(*cursor..*cursor + 8)
+                    .ok_or("truncated u64")?
+                    .try_into()
+                    .map_err(|_| "truncated u64")?,
+            );
+            *cursor += 8;
+            Ok(value)
+        };
+        let format = read_u32(&mut cursor)?;
+        let translator = read_u32(&mut cursor)?;
+        let machine = read_u64(&mut cursor)?;
+        let cpu_profile = read_u64(&mut cursor)?;
+        let optimization_profile = read_u32(&mut cursor)?;
+        let guest_address = read_u64(&mut cursor)?;
+        let code_hash = read_u64(&mut cursor)?;
+        let logical_code_hash = read_u64(&mut cursor)?;
+        let instruction_count = read_u64(&mut cursor)?;
+        let code_size = read_u32(&mut cursor)?;
+        let worker_safe = *bytes.get(cursor).ok_or("truncated flag")? != 0;
+        cursor += 1;
+        let exit_info = decode_exit_info(bytes, &mut cursor)?;
+        let relocation_count = read_u32(&mut cursor)? as usize;
+        let code_end = cursor
+            .checked_add(code_size as usize)
+            .ok_or("code size overflow")?;
+        let code = bytes
+            .get(cursor..code_end)
+            .ok_or("truncated code")?
+            .to_vec();
+        cursor = code_end;
+        let table_end = cursor
+            .checked_add(relocation_count * 8)
+            .ok_or("relocation overflow")?;
+        if table_end > payload_end {
+            return Err("truncated relocation table");
+        }
+        let mut relocations = Vec::with_capacity(relocation_count);
+        for _ in 0..relocation_count {
+            let offset = read_u32(&mut cursor)?;
+            let kind = AotRelocKind::from_code(read_u32(&mut cursor)?).ok_or("unknown reloc")?;
+            relocations.push(AotRelocation { offset, kind });
+        }
+        if cursor != payload_end {
+            return Err("trailing bytes");
+        }
+        Ok(Self {
+            format,
+            translator,
+            machine,
+            cpu_profile,
+            optimization_profile,
+            guest_address,
+            code_hash,
+            logical_code_hash,
+            instruction_count,
+            code_size,
+            worker_safe,
+            exit_info,
+            code,
+            relocations,
+        })
+    }
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn encode_exit_info(out: &mut Vec<u8>, info: Option<BlockExitInfo>) {
+    match info {
+        None => out.push(0),
+        Some(BlockExitInfo::Jump { target }) => {
+            out.push(1);
+            out.extend_from_slice(&target.to_le_bytes());
+        }
+        Some(BlockExitInfo::JumpIf {
+            condition,
+            target,
+            fallthrough,
+        }) => {
+            out.push(2);
+            out.push(condition_code_tag(condition));
+            out.extend_from_slice(&target.to_le_bytes());
+            out.extend_from_slice(&fallthrough.to_le_bytes());
+        }
+        Some(BlockExitInfo::Return { stack_adjust }) => {
+            out.push(3);
+            out.extend_from_slice(&stack_adjust.to_le_bytes());
+        }
+        Some(BlockExitInfo::Call {
+            target,
+            return_address,
+        }) => {
+            out.push(4);
+            out.extend_from_slice(&target.to_le_bytes());
+            out.extend_from_slice(&return_address.to_le_bytes());
+        }
+        Some(BlockExitInfo::CallIndirect { return_address }) => {
+            out.push(5);
+            out.extend_from_slice(&return_address.to_le_bytes());
+        }
+    }
+}
+
+fn decode_exit_info(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<Option<BlockExitInfo>, &'static str> {
+    let tag = *bytes.get(*cursor).ok_or("truncated exit info")?;
+    *cursor += 1;
+    let read_u64 = |cursor: &mut usize| -> Result<u64, &'static str> {
+        let value = u64::from_le_bytes(
+            bytes
+                .get(*cursor..*cursor + 8)
+                .ok_or("truncated exit info value")?
+                .try_into()
+                .map_err(|_| "truncated exit info value")?,
+        );
+        *cursor += 8;
+        Ok(value)
+    };
+    Ok(Some(match tag {
+        0 => return Ok(None),
+        1 => BlockExitInfo::Jump {
+            target: read_u64(cursor)?,
+        },
+        2 => {
+            let condition = condition_from_tag(*bytes.get(*cursor).ok_or("truncated condition")?)
+                .ok_or("unknown condition")?;
+            *cursor += 1;
+            BlockExitInfo::JumpIf {
+                condition,
+                target: read_u64(cursor)?,
+                fallthrough: read_u64(cursor)?,
+            }
+        }
+        3 => BlockExitInfo::Return {
+            stack_adjust: read_u64(cursor)?,
+        },
+        4 => BlockExitInfo::Call {
+            target: read_u64(cursor)?,
+            return_address: read_u64(cursor)?,
+        },
+        5 => BlockExitInfo::CallIndirect {
+            return_address: read_u64(cursor)?,
+        },
+        _ => return Err("unknown exit info tag"),
+    }))
+}
+
+fn condition_code_tag(condition: ConditionCode) -> u8 {
+    match condition {
+        ConditionCode::Equal => 0,
+        ConditionCode::NotEqual => 1,
+        ConditionCode::Overflow => 2,
+        ConditionCode::NotOverflow => 3,
+        ConditionCode::Below => 4,
+        ConditionCode::NotBelow => 5,
+        ConditionCode::Above => 6,
+        ConditionCode::NotAbove => 7,
+        ConditionCode::Sign => 8,
+        ConditionCode::NotSign => 9,
+        ConditionCode::Less => 10,
+        ConditionCode::GreaterEqual => 11,
+        ConditionCode::LessEqual => 12,
+        ConditionCode::Greater => 13,
+        ConditionCode::Parity => 14,
+        ConditionCode::NotParity => 15,
+    }
+}
+
+fn condition_from_tag(tag: u8) -> Option<ConditionCode> {
+    Some(match tag {
+        0 => ConditionCode::Equal,
+        1 => ConditionCode::NotEqual,
+        2 => ConditionCode::Overflow,
+        3 => ConditionCode::NotOverflow,
+        4 => ConditionCode::Below,
+        5 => ConditionCode::NotBelow,
+        6 => ConditionCode::Above,
+        7 => ConditionCode::NotAbove,
+        8 => ConditionCode::Sign,
+        9 => ConditionCode::NotSign,
+        10 => ConditionCode::Less,
+        11 => ConditionCode::GreaterEqual,
+        12 => ConditionCode::LessEqual,
+        13 => ConditionCode::Greater,
+        14 => ConditionCode::Parity,
+        15 => ConditionCode::NotParity,
+        _ => return None,
+    })
+}
 
 /// Compiles a sequence of IR instructions into ARM64 machine code.
 pub struct JitCompiler {
@@ -4264,15 +6235,25 @@ pub struct JitCompiler {
     /// each load/store helper call; all patched to the single fault-exit
     /// stub by `finish_fault_stub` once the block body has been emitted.
     fault_cbnz_patches: Vec<usize>,
-    /// Link slot belonging to the block currently being compiled.  The
-    /// unconditional-jump arm embeds its address and reads it at run time;
-    /// `chain_blocks` publishes a target entry into it with Release ordering.
-    link_slot: Option<Arc<AtomicU64>>,
+    /// Link slots belonging to the block currently being compiled.
+    link_slots: Option<LinkSlots>,
+    /// Relocations for every absolute address embedded in the emitted code.
+    /// Used to serialize translated blocks into the persistent AOT cache and
+    /// to re-bind them after loading into a new address space.
+    relocations: Vec<AotRelocation>,
     /// True when the block currently being compiled used the universal
     /// single-instruction interpreter helper, which needs a live
     /// `MemoryImage` pointer and therefore may not run on a production
     /// worker.
     used_interpreter_helper: bool,
+    /// True while compiling a production-worker (slice) block.  In this mode
+    /// indirect `call`/`jmp` and `ret` lower to self-contained native exits
+    /// that publish the resolved target in the per-thread cell instead of
+    /// calling the `MemoryImage`-dependent interpreter helper, so the worker
+    /// can keep them out of the owner's dispatch loop.  Cooperative
+    /// (`block_cache`) compilation leaves this false and is byte-identical to
+    /// before.
+    worker_program: bool,
 }
 
 impl Default for JitCompiler {
@@ -4289,9 +6270,30 @@ impl JitCompiler {
             helper_insns: Vec::new(),
             safepoint_cbnz_patch: None,
             fault_cbnz_patches: Vec::new(),
-            link_slot: None,
+            link_slots: None,
+            relocations: Vec::new(),
             used_interpreter_helper: false,
+            worker_program: false,
         }
+    }
+
+    /// Compile a block for a production worker slice.
+    ///
+    /// Identical to [`Self::compile_block`] except that indirect `call`/`jmp`
+    /// lower to native exits that publish the resolved target into the
+    /// per-thread exit cell (no `MemoryImage` helper), so the worker can
+    /// resolve them with an inline cache and continue natively.  The flag is
+    /// scoped to this call, so cooperative compilation is unaffected.
+    pub(crate) fn compile_worker_block(
+        &mut self,
+        ir: &[IrInstruction],
+        guest_address: u64,
+        arch: GuestArch,
+    ) -> AppResult<JitCompiledBlock> {
+        self.worker_program = true;
+        let result = self.compile_block(ir, guest_address, arch, None);
+        self.worker_program = false;
+        result
     }
 
     /// Compile a block of IR instructions into executable ARM64 code.
@@ -4359,6 +6361,123 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// Install a translated block deserialized from the persistent AOT cache.
+    ///
+    /// The loader validates the record's logical code hash (with relocation
+    /// sites zeroed), re-binds every embedded absolute address to this
+    /// process's helpers/link slots, then finalizes the page executable.  On
+    /// any mismatch it fails before touching executable memory, so the caller
+    /// falls back to compiling from IR.
+    fn install_aot_record(&mut self, record: &AotRecord) -> AppResult<JitCompiledBlock> {
+        if record.format != AOT_FORMAT_VERSION
+            || record.translator != AOT_TRANSLATOR_VERSION
+            || record.machine != AotRecord::machine_tag()
+            || record.cpu_profile != aot_target_cpu_profile()
+        {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                "AOT record key mismatch",
+            ));
+        }
+        if record.code_size as usize != record.code.len() || record.code.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                "AOT record code size mismatch",
+            ));
+        }
+        let mut code = record.code.clone();
+        for relocation in &record.relocations {
+            let offset = relocation.offset as usize;
+            if offset % 4 != 0 || offset.checked_add(16).is_none_or(|end| end > code.len()) {
+                return Err(AppError::new(
+                    ReasonCode::RcJitCompilationError,
+                    "AOT relocation out of range",
+                ));
+            }
+            code[offset..offset + 16].fill(0);
+        }
+        if fnv1a(&code) != record.logical_code_hash {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                "AOT logical code hash mismatch",
+            ));
+        }
+
+        let link_slots = LinkSlots::new();
+        for relocation in &record.relocations {
+            let value = match relocation.kind {
+                AotRelocKind::SafepointFlag => &JIT_SAFEPOINT_REQUESTED as *const AtomicBool as u64,
+                AotRelocKind::CodeEpoch => &JIT_CODE_EPOCH as *const AtomicU64 as u64,
+                AotRelocKind::JumpLink => Arc::as_ptr(&link_slots.jump) as u64,
+                AotRelocKind::TakenLink => Arc::as_ptr(&link_slots.taken) as u64,
+                AotRelocKind::FallthroughLink => Arc::as_ptr(&link_slots.fallthrough) as u64,
+                AotRelocKind::CallLink => Arc::as_ptr(&link_slots.call) as u64,
+                AotRelocKind::ReturnEntryLink => Arc::as_ptr(&link_slots.return_entry) as u64,
+                AotRelocKind::Helper(helper) => helper.address(),
+            };
+            let offset = relocation.offset as usize;
+            // Preserve the destination register chosen by the emitter: most
+            // absolute loads target x26, but link exits load their slot into
+            // x9 (a caller-saved scratch that survives frame restoration).
+            let original = u32::from_le_bytes(
+                record.code[offset..offset + 4]
+                    .try_into()
+                    .expect("validated relocation width"),
+            );
+            let destination = original & 0x1f;
+            let mut emitter = Emitter::new();
+            emitter.mov_imm64_fixed(destination, value);
+            code[offset..offset + 16].copy_from_slice(&emitter.code);
+        }
+
+        let code_size = code.len();
+        let code_ptr = self.memory_manager.allocate_code_space(code_size);
+        if code_ptr.is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcJitCodeAllocFailed,
+                "AOT: failed to allocate executable memory",
+            ));
+        }
+        let _install = JIT_CODE_INSTALL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: code_ptr was allocated for at least code_size bytes and the
+        // code vector has exactly code_size bytes.
+        unsafe {
+            if !self.memory_manager.make_writable(code_ptr, code_size) {
+                return Err(AppError::new(
+                    ReasonCode::RcJitCodeAllocFailed,
+                    "AOT: executable code page is not writable",
+                ));
+            }
+            ptr::copy_nonoverlapping(code.as_ptr(), code_ptr, code_size);
+            if !self.memory_manager.finalize_code(code_ptr, code_size) {
+                return Err(AppError::new(
+                    ReasonCode::RcJitCodeAllocFailed,
+                    "AOT: failed to make loaded block executable",
+                ));
+            }
+        }
+
+        Ok(JitCompiledBlock {
+            entry_addr: code_ptr as usize,
+            entry_atomic: AtomicPtr::new(code_ptr),
+            code_size,
+            guest_address: record.guest_address,
+            instruction_count: record.instruction_count as usize,
+            source_hash: record.code_hash,
+            last_exit_info: record.exit_info,
+            compile_tier: CompilationTier::Tier0,
+            ends_in_control_flow: record.exit_info.is_some(),
+            link_target: link_slots.jump,
+            taken_link: link_slots.taken,
+            fallthrough_link: link_slots.fallthrough,
+            call_link: link_slots.call,
+            return_entry_link: link_slots.return_entry,
+            worker_safe: record.worker_safe,
+        })
+    }
+
     pub fn compile_block(
         &mut self,
         ir: &[IrInstruction],
@@ -4368,27 +6487,35 @@ impl JitCompiler {
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
         self.used_interpreter_helper = false;
-        let link_target = Arc::new(AtomicU64::new(0));
-        self.link_slot = Some(Arc::clone(&link_target));
+        self.relocations.clear();
+        let link_slots = LinkSlots::new();
+        self.link_slots = Some(link_slots.clone());
 
         // Prologue: save callee-saved registers and set up frame
         self.emit_prologue(arch);
         self.emit_current_block_tag(guest_address);
 
         // Load guest GPRs from CpuState into ARM64 registers
-        // x0 = &CpuState, x1 = memory base, x2 = &MemoryImage, x3 = &exit_reason
+        // x0 = &CpuState, x1 = memory base, x2 = &MemoryImage, x3 = &ChainState
         self.emit_load_guest_registers(arch);
+
+        // Per-block accounting, SMC epoch and link-budget checks.  These run
+        // only when `x3` is a real `ChainState` (always true for the executor
+        // in this module); the branch targets are emitted inline.
+        self.emit_chain_guard(ir.len() as u64, arch);
 
         // Host safepoint check: every compiled block polls the safepoint
         // flag at entry, so a chained loop re-entering its first block is
         // still interruptible by the scheduler.  The stub is emitted and
         // the branch patched after the body below.
         self.emit_safepoint_check(arch);
+        self.emit_block_accounting(ir.len() as u64);
 
         // Compile each IR instruction, optionally using fast-thunk info
         // to emit direct calls for known host thunks.
-        for insn in ir {
-            self.compile_instruction(insn, arch, fast_thunk_addrs)?;
+        let last = ir.len().saturating_sub(1);
+        for (index, insn) in ir.iter().enumerate() {
+            self.compile_instruction(insn, arch, fast_thunk_addrs, index == last)?;
         }
 
         // Epilogue: store guest GPRs back to CpuState and return
@@ -4426,7 +6553,7 @@ impl JitCompiler {
         let source_hash = compute_ir_hash(ir, guest_address);
         let last_exit_info = block_exit_info(ir);
         let worker_safe = block_is_worker_safe(ir, self.used_interpreter_helper);
-        self.link_slot = None;
+        self.link_slots = None;
 
         Ok(JitCompiledBlock {
             entry_addr: code_ptr as usize,
@@ -4438,7 +6565,11 @@ impl JitCompiler {
             last_exit_info,
             compile_tier: CompilationTier::Tier0,
             ends_in_control_flow: block_ends_in_control_flow(ir),
-            link_target,
+            link_target: link_slots.jump,
+            taken_link: link_slots.taken,
+            fallthrough_link: link_slots.fallthrough,
+            call_link: link_slots.call,
+            return_entry_link: link_slots.return_entry,
             worker_safe,
         })
     }
@@ -4461,14 +6592,276 @@ impl JitCompiler {
         //     movz x0, EXIT_SAFEPOINT
         //     epilogue
         //
-        // x26 is a scratch temp (guest GPRs live in x4-x17) and is
+        // x26 is a scratch temp (guest GPRs live in x4-x20) and is
         // initialized by the block body before any use, so the check
         // clobbering it at block entry is safe.
         let flag_addr = &JIT_SAFEPOINT_REQUESTED as *const AtomicBool as u64;
-        self.emitter.mov_imm64(regmap::X26, flag_addr);
+        self.emit_reloc_imm64(regmap::X26, flag_addr, AotRelocKind::SafepointFlag);
         self.emitter.ldr8(regmap::X26, regmap::X26, 0);
         self.safepoint_cbnz_patch = Some(self.emitter.len());
         self.emitter.cbnz(regmap::X26, 0);
+    }
+
+    /// Emit an absolute 64-bit immediate and record it for AOT relocation.
+    fn emit_reloc_imm64(&mut self, rd: u32, value: u64, kind: AotRelocKind) {
+        let offset = self.emitter.len() as u32;
+        self.emitter.mov_imm64_fixed(rd, value);
+        self.relocations.push(AotRelocation { offset, kind });
+    }
+
+    /// Write a guest RIP value into `CpuState` so a whole-function exit is
+    /// decoded with the correct target even though a function has multiple
+    /// static exits (the single `last_exit_info` slot cannot represent them).
+    fn emit_set_state_rip(&mut self, target: u64) {
+        self.emitter.mov_imm64(regmap::X26, target);
+        self.emitter.str64(
+            regmap::X26,
+            regmap::X0,
+            std::mem::offset_of!(CpuState, rip) as u32,
+        );
+    }
+
+    /// Seed the Tier-2 spill slots that back guest R13/R14/R15 from the
+    /// incoming register values.  Without this, a function that reads those
+    /// registers would observe stale host scratch state.
+    fn emit_spill_slots_init(&mut self, _arch: GuestArch) {
+        for (slot, guest) in [(0u32, 13usize), (1, 14), (2, 15)] {
+            let arm = regmap::guest_to_arm(guest);
+            self.emitter
+                .str64(arm, regmap::X0, Self::SPILL_BASE + slot * 8);
+        }
+    }
+
+    /// Emit the per-block guard: counters, SMC epoch comparison and the link
+    /// budget.  All exits are taken BEFORE the block body runs, so a dispatch
+    /// boundary never re-executes guest instructions.
+    fn emit_chain_guard(&mut self, _instruction_count: u64, arch: GuestArch) {
+        // if code_epoch != chain.smc_epoch -> exit EXIT_CODE_EPOCH
+        let epoch_addr = &JIT_CODE_EPOCH as *const AtomicU64 as u64;
+        self.emit_reloc_imm64(regmap::X26, epoch_addr, AotRelocKind::CodeEpoch);
+        self.emitter.ldr64(regmap::X21, regmap::X26, 0);
+        self.emitter
+            .ldr64(regmap::X22, regmap::X23, chain_offsets::SMC_EPOCH);
+        self.emitter.subs_reg(31, regmap::X21, regmap::X22);
+        let epoch_ok = self.emitter.len();
+        self.emitter.bcond(0, 0); // EQ placeholder
+        self.emit_guard_exit(EXIT_CODE_EPOCH, arch);
+        self.patch_bcond(epoch_ok, self.emitter.len());
+
+        // if link_budget == 0 -> exit EXIT_LINK_BUDGET, else decrement.
+        self.emitter
+            .ldr64(regmap::X21, regmap::X23, chain_offsets::LINK_BUDGET);
+        let budget_pos = self.emitter.len();
+        self.emitter.cbnz(regmap::X21, 0);
+        self.emit_guard_exit(EXIT_LINK_BUDGET, arch);
+        self.patch_cbnz(budget_pos, self.emitter.len());
+        self.emitter.sub_imm(regmap::X21, regmap::X21, 1);
+        self.emitter
+            .str64(regmap::X21, regmap::X23, chain_offsets::LINK_BUDGET);
+    }
+
+    /// Account for a block that passed every entry guard and is about to run.
+    fn emit_block_accounting(&mut self, instruction_count: u64) {
+        self.emitter
+            .ldr64(regmap::X21, regmap::X23, chain_offsets::BLOCKS);
+        self.emitter.add_imm(regmap::X21, regmap::X21, 1);
+        self.emitter
+            .str64(regmap::X21, regmap::X23, chain_offsets::BLOCKS);
+        self.emitter
+            .ldr64(regmap::X22, regmap::X23, chain_offsets::INSTRUCTIONS);
+        self.emitter.mov_imm64(regmap::X21, instruction_count);
+        self.emitter.add_reg(regmap::X22, regmap::X22, regmap::X21);
+        self.emitter
+            .str64(regmap::X22, regmap::X23, chain_offsets::INSTRUCTIONS);
+    }
+
+    /// Inline guard exit: store guest registers and return `exit_code`.
+    fn emit_guard_exit(&mut self, exit_code: u64, arch: GuestArch) {
+        self.emit_store_guest_registers(arch);
+        self.emitter.movz(regmap::X0, exit_code as u16, 0);
+        self.emit_epilogue();
+    }
+
+    fn patch_bcond(&mut self, position: usize, target: usize) {
+        let offset = (target as i32 - position as i32) / 4;
+        debug_assert!(offset > 0 && (offset as u32) <= 0x7ffff);
+        let condition = self.emitter.code[position] & 0x0f;
+        let insn = 0x5400_0000u32 | (((offset as u32) & 0x7ffff) << 5) | u32::from(condition);
+        self.emitter.code[position..position + 4].copy_from_slice(&insn.to_le_bytes());
+    }
+
+    fn patch_cbnz(&mut self, position: usize, target: usize) {
+        let offset = (target as i32 - position as i32) / 4;
+        debug_assert!(offset > 0 && (offset as u32) <= 0x7ffff);
+        let register = self.emitter.code[position] & 0x1f;
+        let insn = 0xb500_0000u32 | (((offset as u32) & 0x7ffff) << 5) | u32::from(register);
+        self.emitter.code[position..position + 4].copy_from_slice(&insn.to_le_bytes());
+    }
+
+    /// Materialise parked interpreter flags before a native flag read.
+    fn emit_materialize_flags(&mut self) {
+        self.emitter.mov_reg(regmap::X24, regmap::X0);
+        self.emitter.mov_reg(regmap::X28, regmap::X2);
+        self.emit_bl_to(AotHelper::MaterializeFlags);
+        self.emitter.mov_reg(regmap::X0, regmap::X24);
+        self.emitter.mov_reg(regmap::X2, regmap::X28);
+    }
+
+    /// Load the six x86 flag bytes into scratch registers x10-x14.
+    ///
+    /// **Callers must have stored guest registers first**: x10-x15 hold guest
+    /// RSI/RDI/R8-R11 and are clobbered here.  This is only emitted for a
+    /// block-terminating `Jcc`, where either exit reloads the state or the
+    /// linked target's prologue does.
+    fn emit_x86_flag_loads(&mut self) {
+        let base = std::mem::offset_of!(CpuState, flags) as u32;
+        let cf = base + std::mem::offset_of!(crate::cpu::Flags, cf) as u32;
+        let pf = base + std::mem::offset_of!(crate::cpu::Flags, pf) as u32;
+        let zf = base + std::mem::offset_of!(crate::cpu::Flags, zf) as u32;
+        let sf = base + std::mem::offset_of!(crate::cpu::Flags, sf) as u32;
+        let of = base + std::mem::offset_of!(crate::cpu::Flags, of) as u32;
+        self.emitter.ldr8(10, regmap::X0, cf);
+        self.emitter.ldr8(11, regmap::X0, pf);
+        self.emitter.ldr8(12, regmap::X0, zf);
+        self.emitter.ldr8(13, regmap::X0, sf);
+        self.emitter.ldr8(14, regmap::X0, of);
+    }
+
+    /// Emit a real ARM64 conditional branch implementing an x86 `Jcc`
+    /// condition.  Returns the byte position of the `b.cond` so the caller can
+    /// patch it to the taken path once that path has been emitted.
+    fn emit_x86_condition_branch(&mut self, condition: ConditionCode) -> usize {
+        const EQ: u32 = 0;
+        const NE: u32 = 1;
+        match condition {
+            ConditionCode::Equal => {
+                self.emitter.subs_imm(31, 12, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotEqual => {
+                self.emitter.subs_imm(31, 12, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+            ConditionCode::Overflow => {
+                self.emitter.subs_imm(31, 14, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotOverflow => {
+                self.emitter.subs_imm(31, 14, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+            ConditionCode::Below => {
+                self.emitter.subs_imm(31, 10, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotBelow => {
+                self.emitter.subs_imm(31, 10, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+            ConditionCode::Above => {
+                self.emitter.movz(15, 1, 0);
+                self.emitter.eor_reg(9, 10, 15);
+                self.emitter.eor_reg(15, 12, 15);
+                self.emitter.and_reg(9, 9, 15);
+                self.emitter.subs_imm(31, 9, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotAbove => {
+                self.emitter.orr_reg(9, 10, 12);
+                self.emitter.subs_imm(31, 9, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::Sign => {
+                self.emitter.subs_imm(31, 13, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotSign => {
+                self.emitter.subs_imm(31, 13, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+            ConditionCode::Less => {
+                self.emitter.subs_reg(31, 13, 14);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::GreaterEqual => {
+                self.emitter.subs_reg(31, 13, 14);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+            ConditionCode::LessEqual => {
+                self.emitter.eor_reg(9, 13, 14);
+                self.emitter.orr_reg(9, 12, 9);
+                self.emitter.subs_imm(31, 9, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::Greater => {
+                self.emitter.eor_reg(9, 13, 14);
+                self.emitter.movz(15, 1, 0);
+                self.emitter.eor_reg(9, 9, 15);
+                self.emitter.eor_reg(15, 12, 15);
+                self.emitter.and_reg(9, 9, 15);
+                self.emitter.subs_imm(31, 9, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::Parity => {
+                self.emitter.subs_imm(31, 11, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotParity => {
+                self.emitter.subs_imm(31, 11, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+        }
+    }
+
+    /// Emit a native link exit for a worker block: branch to the successor's
+    /// entry when the slot is published, otherwise return `exit_code` with the
+    /// already-stored guest state.
+    fn emit_link_exit(&mut self, slot: &Arc<AtomicU64>, kind: AotRelocKind, exit_code: u64) {
+        // Restore the flat-mirror base and hand the chain pointer to the
+        // target prologue.  x1/x3 are caller-saved and may have been clobbered
+        // by helper calls earlier in the block.
+        self.emitter
+            .ldr64(regmap::X1, regmap::X23, chain_offsets::FLAT_BASE);
+        self.emitter.mov_reg(regmap::X3, regmap::X23);
+        self.emit_reloc_imm64(regmap::X9, Arc::as_ptr(slot) as u64, kind);
+        self.emitter.ldar64(regmap::X9, regmap::X9);
+        self.emit_frame_restore();
+        self.emitter.cbz(regmap::X9, 8);
+        self.emitter.br(regmap::X9);
+        self.emitter.movz(regmap::X0, exit_code as u16, 0);
+        self.emitter.ret();
     }
 
     /// Emit the safepoint stub (store guest registers, return EXIT_SAFEPOINT)
@@ -4498,7 +6891,8 @@ impl JitCompiler {
     fn emit_current_block_tag(&mut self, guest_address: u64) {
         self.emitter.mov_reg(regmap::X23, regmap::X3);
         self.emitter.mov_imm64(10, guest_address);
-        self.emitter.str64(10, regmap::X23, 0);
+        self.emitter
+            .str64(10, regmap::X23, chain_offsets::CURRENT_BLOCK);
     }
 
     fn emit_prologue(&mut self, arch: GuestArch) {
@@ -4537,14 +6931,212 @@ impl JitCompiler {
         self.emitter.ret();
     }
 
-    /// Emit a `BL` (branch-with-link) to an absolute function pointer.  Used to
-    /// call the safe MemoryImage helper functions from JIT-compiled code.
-    /// The helper's return restores LR, so the JIT block continues after the BL.
-    fn emit_bl_to(&mut self, fn_ptr: usize) {
-        // Load the function pointer into X26 and BLR X26.
-        // We use X26 (a temp not holding guest state) as a scratch.
-        self.emitter.mov_imm64(26, fn_ptr as u64);
-        self.emitter.blr(26);
+    /// Emit a worker indirect control-transfer exit.
+    ///
+    /// Publishes `payload_reg` (the resolved target, or the guest address the
+    /// target must be loaded from) into word 2 of the per-thread exit cell
+    /// (`x23`, set by `emit_current_block_tag`), stores guest registers, and
+    /// returns `exit_code` in `x0`.  `x23` is callee-saved and survives every
+    /// helper call in the block, so it still points at the cell here.
+    fn emit_indirect_exit(&mut self, payload_reg: u32, exit_code: u64, arch: GuestArch) {
+        self.emitter
+            .str64(payload_reg, regmap::X23, EXIT_CELL_PAYLOAD_OFFSET as u32);
+        self.emit_store_guest_registers(arch);
+        self.emitter.movz(regmap::X0, exit_code as u16, 0);
+        self.emit_epilogue();
+    }
+
+    /// Emit a native worker direct call.
+    ///
+    /// The return address is pushed through the fault-checked store helper (so
+    /// a guest-stack fault aborts before the callee runs), the statically known
+    /// return successor is pushed onto the chain's return stack, and the call
+    /// branches straight into the compiled callee when its link slot is
+    /// published.  When the target is a host thunk or an uncompiled block the
+    /// block exits with `EXIT_CALL_PUSHED`: the return address is already on
+    /// the guest stack, so the worker must not push it again.
+    fn emit_worker_call(&mut self, target: u64, return_address: u64, arch: GuestArch) {
+        let arm_sp = regmap::guest_to_arm(4);
+        self.emitter.sub_imm(arm_sp, arm_sp, 8);
+        self.emitter.mov_imm64(regmap::X25, return_address);
+        self.emit_helper_store(arm_sp, regmap::X25, 8, arch);
+
+        // Push (return_address, compiled return entry) onto the chain stack.
+        // x9 is a scratch here (guest RBP was already spilled by the store
+        // helper).
+        self.emitter
+            .ldr64(regmap::X21, regmap::X23, chain_offsets::RETURN_DEPTH);
+        self.emitter
+            .subs_imm(31, regmap::X21, CHAIN_RETURN_DEPTH as u32);
+        let full = self.emitter.len();
+        self.emitter.bcond(2, 0); // HS: depth >= capacity
+        self.emitter
+            .mov_imm64(regmap::X22, chain_offsets::RETURN_STACK as u64);
+        self.emitter.add_reg(regmap::X22, regmap::X23, regmap::X22);
+        self.emitter.lsl_imm(regmap::X9, regmap::X21, 4);
+        self.emitter.add_reg(regmap::X22, regmap::X22, regmap::X9);
+        self.emitter.mov_imm64(regmap::X25, return_address);
+        self.emitter.str64(regmap::X25, regmap::X22, 0);
+        if let Some(slots) = self.link_slots.as_ref() {
+            let return_entry = Arc::clone(&slots.return_entry);
+            self.emit_reloc_imm64(
+                regmap::X26,
+                Arc::as_ptr(&return_entry) as u64,
+                AotRelocKind::ReturnEntryLink,
+            );
+            self.emitter.ldar64(regmap::X26, regmap::X26);
+            self.emitter.str64(regmap::X26, regmap::X22, 8);
+        } else {
+            self.emitter.movz(regmap::X26, 0, 0);
+            self.emitter.str64(regmap::X26, regmap::X22, 8);
+        }
+        self.emitter.add_imm(regmap::X21, regmap::X21, 1);
+        self.emitter
+            .str64(regmap::X21, regmap::X23, chain_offsets::RETURN_DEPTH);
+        self.patch_bcond(full, self.emitter.len());
+        self.emitter
+            .ldr64(regmap::X21, regmap::X23, chain_offsets::NATIVE_CALLS);
+        self.emitter.add_imm(regmap::X21, regmap::X21, 1);
+        self.emitter
+            .str64(regmap::X21, regmap::X23, chain_offsets::NATIVE_CALLS);
+
+        if let Some(slots) = self.link_slots.as_ref() {
+            let call = Arc::clone(&slots.call);
+            self.emit_link_exit(&call, AotRelocKind::CallLink, EXIT_CALL_PUSHED);
+        } else {
+            self.emitter.movz(regmap::X0, EXIT_CALL_PUSHED as u16, 0);
+            self.emit_epilogue();
+        }
+        let _ = target;
+    }
+
+    /// Emit a native worker `ret`: read guest `[rsp]`, advance `rsp`, then
+    /// branch to the return-stack entry when the guest stack agrees with the
+    /// statically pushed prediction.  A miss returns `EXIT_RET_RESOLVED` so
+    /// the worker can resolve the dynamic target and continue.
+    fn emit_worker_return(&mut self, stack_adjust: u64, arch: GuestArch) {
+        let arm_sp = regmap::guest_to_arm(4);
+        self.emit_helper_load(regmap::X9, arm_sp, 8, arch);
+        let slot = match arch {
+            GuestArch::X86 => 4,
+            GuestArch::X64 => 8,
+        };
+        self.emitter
+            .add_imm(arm_sp, arm_sp, (slot + stack_adjust) as u32);
+
+        self.emitter
+            .ldr64(regmap::X21, regmap::X23, chain_offsets::RETURN_DEPTH);
+        let depth_zero = self.emitter.len();
+        self.emitter.cbz(regmap::X21, 0);
+        self.emitter.sub_imm(regmap::X21, regmap::X21, 1);
+        self.emitter
+            .mov_imm64(regmap::X22, chain_offsets::RETURN_STACK as u64);
+        self.emitter.add_reg(regmap::X22, regmap::X23, regmap::X22);
+        self.emitter.lsl_imm(regmap::X25, regmap::X21, 4);
+        self.emitter.add_reg(regmap::X22, regmap::X22, regmap::X25);
+        self.emitter.ldr64(regmap::X25, regmap::X22, 0);
+        self.emitter.ldr64(10, regmap::X22, 8);
+        self.emitter.subs_reg(31, regmap::X25, regmap::X9);
+        let mismatch = self.emitter.len();
+        self.emitter.bcond(1, 0); // NE: guest stack disagrees
+
+        // Matched prediction: count a hit, pop, and branch to the linked
+        // successor when its entry is known.  x21 holds the popped depth;
+        // use x22 for the counter so the depth is not clobbered.
+        self.emitter
+            .ldr64(regmap::X22, regmap::X23, chain_offsets::NATIVE_RETURN_HITS);
+        self.emitter.add_imm(regmap::X22, regmap::X22, 1);
+        self.emitter
+            .str64(regmap::X22, regmap::X23, chain_offsets::NATIVE_RETURN_HITS);
+        self.emitter
+            .str64(regmap::X21, regmap::X23, chain_offsets::RETURN_DEPTH);
+        let no_entry = self.emitter.len();
+        self.emitter.cbz(10, 0);
+
+        // Linked return.
+        self.emit_store_guest_registers(arch);
+        self.emitter
+            .ldr64(regmap::X1, regmap::X23, chain_offsets::FLAT_BASE);
+        self.emitter.mov_reg(regmap::X3, regmap::X23);
+        self.emit_frame_restore();
+        self.emitter.br(10);
+
+        // Mismatched prediction: count a miss and mispredict, do not pop, and
+        // fall through to the resolved-exit path (the real guest stack wins).
+        let mismatch_label = self.emitter.len();
+        self.patch_bcond(mismatch, mismatch_label);
+        self.emitter.ldr64(
+            regmap::X21,
+            regmap::X23,
+            chain_offsets::NATIVE_RETURN_MISSES,
+        );
+        self.emitter.add_imm(regmap::X21, regmap::X21, 1);
+        self.emitter.str64(
+            regmap::X21,
+            regmap::X23,
+            chain_offsets::NATIVE_RETURN_MISSES,
+        );
+        self.emitter.ldr64(
+            regmap::X21,
+            regmap::X23,
+            chain_offsets::NATIVE_RETURN_MISPREDICTS,
+        );
+        self.emitter.add_imm(regmap::X21, regmap::X21, 1);
+        self.emitter.str64(
+            regmap::X21,
+            regmap::X23,
+            chain_offsets::NATIVE_RETURN_MISPREDICTS,
+        );
+
+        let exit_label = self.emitter.len();
+        self.patch_cbz(no_entry, exit_label);
+        self.emit_store_guest_registers(arch);
+        self.emitter
+            .str64(regmap::X9, regmap::X23, chain_offsets::PAYLOAD);
+        self.emitter.movz(regmap::X0, EXIT_RET_RESOLVED as u16, 0);
+        self.emit_epilogue();
+
+        // Underflow: a return with no prediction is a miss, not a
+        // misprediction, and still publishes the real target.
+        let zero_stub = self.emitter.len();
+        self.patch_cbz(depth_zero, zero_stub);
+        self.emitter.ldr64(
+            regmap::X21,
+            regmap::X23,
+            chain_offsets::NATIVE_RETURN_MISSES,
+        );
+        self.emitter.add_imm(regmap::X21, regmap::X21, 1);
+        self.emitter.str64(
+            regmap::X21,
+            regmap::X23,
+            chain_offsets::NATIVE_RETURN_MISSES,
+        );
+        self.emit_store_guest_registers(arch);
+        self.emitter
+            .str64(regmap::X9, regmap::X23, chain_offsets::PAYLOAD);
+        self.emitter.movz(regmap::X0, EXIT_RET_RESOLVED as u16, 0);
+        self.emit_epilogue();
+    }
+
+    fn patch_cbz(&mut self, position: usize, target: usize) {
+        let offset = (target as i32 - position as i32) / 4;
+        debug_assert!(offset > 0 && (offset as u32) <= 0x7ffff);
+        let register = self.emitter.code[position] & 0x1f;
+        let insn = 0xb400_0000u32 | (((offset as u32) & 0x7ffff) << 5) | u32::from(register);
+        self.emitter.code[position..position + 4].copy_from_slice(&insn.to_le_bytes());
+    }
+
+    /// Emit a `BL` (branch-with-link) to a known helper.  The helper's
+    /// address is embedded through the relocation table so an AOT-loaded
+    /// block re-binds to the current process's helper.
+    fn emit_bl_to(&mut self, helper: AotHelper) {
+        let offset = self.emitter.len() as u32;
+        self.emitter.mov_imm64_fixed(regmap::X26, helper.address());
+        self.relocations.push(AotRelocation {
+            offset,
+            kind: AotRelocKind::Helper(helper),
+        });
+        self.emitter.blr(regmap::X26);
     }
 
     /// Emit a call to `jit_helper_load(state, memory, address, width) -> u64`,
@@ -4570,7 +7162,7 @@ impl JitCompiler {
         self.emitter.mov_reg(1, 28); // x1 = MemoryImage ptr
         self.emitter.mov_reg(2, 27); // x2 = address
         self.emitter.movz(3, width as u16, 0); // x3 = width
-        self.emit_bl_to(jit_helper_load as *const () as usize);
+        self.emit_bl_to(AotHelper::Load);
         // Result in x0 → save to x27 (callee-saved).
         self.emitter.mov_reg(27, 0);
         // Restore x0 = CpuState, then reload guest GPRs.
@@ -4601,7 +7193,7 @@ impl JitCompiler {
         self.emitter.mov_reg(2, 27); // x2 = address
         self.emitter.mov_reg(3, 25); // x3 = value
         self.emitter.movz(4, width as u16, 0); // x4 = width
-        self.emit_bl_to(jit_helper_store as *const () as usize);
+        self.emit_bl_to(AotHelper::Store);
         // Restore x0 = CpuState, then reload guest GPRs.
         self.emitter.mov_reg(0, 24);
         self.emit_load_guest_registers(arch);
@@ -4741,7 +7333,7 @@ impl JitCompiler {
         self.emitter.mov_reg(24, 0);
         self.emitter.mov_reg(0, 24);
         self.emitter.movz(1, seg_code as u16, 0);
-        self.emit_bl_to(jit_helper_segment_base as *const () as usize);
+        self.emit_bl_to(AotHelper::SegmentBase);
         self.emitter.mov_reg(27, 0);
         self.emitter.mov_reg(0, 24);
         self.emit_load_guest_registers(arch);
@@ -4760,6 +7352,7 @@ impl JitCompiler {
         width: u64,
         arch: GuestArch,
     ) {
+        self.emitter.mov_reg(28, 2); // save MemoryImage ptr
         self.emit_store_guest_registers(arch);
         self.emitter.mov_reg(24, 0); // save CpuState
         // Save the operand regs into callee-saved (they're guest regs that
@@ -4794,9 +7387,67 @@ impl JitCompiler {
         self.emitter.mov_reg(3, rhs_reg);
         self.emitter.mov_reg(4, 21); // x4 = op
         self.emitter.mov_reg(5, 22); // x5 = width
-        self.emit_bl_to(jit_helper_set_flags as *const () as usize);
+        self.emit_bl_to(AotHelper::SetFlags);
         self.emitter.mov_reg(0, 24); // restore CpuState
         self.emit_load_guest_registers(arch);
+        self.emitter.mov_reg(2, 28); // restore MemoryImage ptr
+    }
+
+    /// Emit a native register/immediate-source ALU operation.
+    /// op: 0=add, 1=sub, 2=and, 3=or, 4=xor.
+    fn emit_native_alu_reg(
+        &mut self,
+        insn: &IrInstruction,
+        dst: Register,
+        src: &crate::cpu::CompareOperand,
+        width: usize,
+        op: u8,
+        arch: GuestArch,
+    ) {
+        use crate::cpu::CompareOperand;
+        let dst_arm = regmap::guest_to_arm(dst.index());
+        let src_arm = match src {
+            CompareOperand::Register(reg) => regmap::guest_to_arm(reg.index()),
+            CompareOperand::ImmediateU64(value) => {
+                self.emitter.mov_imm64(regmap::X21, *value);
+                regmap::X21
+            }
+            _ => {
+                // Memory-source ALU forms keep the interpreter helper.
+                let _ = self.emit_interpreter_fallback(insn, arch);
+                return;
+            }
+        };
+        if width == 4 {
+            // 32-bit x86 ops ignore the upper halves and zero-extend.
+            self.emitter.uxtw_reg(dst_arm, dst_arm);
+            self.emitter.uxtw_reg(src_arm, src_arm);
+        } else if width == 2 {
+            self.emitter.mov_imm64(regmap::X22, 0xffff);
+            self.emitter.and_reg(dst_arm, dst_arm, regmap::X22);
+            self.emitter.and_reg(src_arm, src_arm, regmap::X22);
+        } else if width == 1 {
+            self.emitter.mov_imm64(regmap::X22, 0xff);
+            self.emitter.and_reg(dst_arm, dst_arm, regmap::X22);
+            self.emitter.and_reg(src_arm, src_arm, regmap::X22);
+        }
+        match op {
+            0 => self.emitter.add_reg(dst_arm, dst_arm, src_arm),
+            1 => self.emitter.sub_reg(dst_arm, dst_arm, src_arm),
+            2 => self.emitter.and_reg(dst_arm, dst_arm, src_arm),
+            3 => self.emitter.orr_reg(dst_arm, dst_arm, src_arm),
+            4 => self.emitter.eor_reg(dst_arm, dst_arm, src_arm),
+            _ => unreachable!("invalid ALU op"),
+        }
+        if width == 4 {
+            self.emitter.uxtw_reg(dst_arm, dst_arm);
+        } else if width == 2 {
+            self.emitter.mov_imm64(regmap::X22, 0xffff);
+            self.emitter.and_reg(dst_arm, dst_arm, regmap::X22);
+        } else if width == 1 {
+            self.emitter.mov_imm64(regmap::X22, 0xff);
+            self.emitter.and_reg(dst_arm, dst_arm, regmap::X22);
+        }
     }
 
     /// Emit a Compare or Test instruction: evaluate operands, call set_flags.
@@ -4887,6 +7538,7 @@ impl JitCompiler {
         insn: &IrInstruction,
         arch: GuestArch,
         fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
+        is_last: bool,
     ) -> AppResult<()> {
         match insn {
             IrInstruction::Nop => {
@@ -4926,6 +7578,16 @@ impl JitCompiler {
                 self.emitter.uxtb(arm_dst, arm_src);
             }
 
+            // ── Native register-source ALU forms ──────────────────────────
+            // Without these, a loop like `add rax, rcx` fell back to the
+            // interpreter helper on every iteration, making Tier-2 slower than
+            // the dispatcher.  Flags are materialised separately when live.
+            IrInstruction::AddOperand { dst, src, width } => {
+                self.emit_native_alu_reg(insn, *dst, src, *width, 0, arch);
+            }
+            IrInstruction::SubOperand { dst, src, width } => {
+                self.emit_native_alu_reg(insn, *dst, src, *width, 1, arch);
+            }
             IrInstruction::AddImm { dst, value, width } => {
                 let arm_dst = regmap::guest_to_arm(dst.index());
                 if *value <= 0xfff {
@@ -5116,16 +7778,14 @@ impl JitCompiler {
                 self.emitter.add_imm(arm_sp, arm_sp, 8);
             }
 
-            IrInstruction::Return { stack_adjust: _ } => {
-                // A guest `ret` reads the return address from [RSP] and sets
-                // RIP to it.  Correctly writing that into CpuState.rip from
-                // native code requires the RIP field offset (unstable under
-                // repr(Rust)), and the previous emission read from the wrong
-                // base ([mem_base + rsp] via ldr64_reg(X21, X1, sp)) which
-                // faulted forever.  Instead we signal EXIT_RET and let the
-                // IR interpreter execute the ret (it reads [rsp], sets rip,
-                // pops the stack correctly).  The block's straight-line
-                // instructions before the ret still ran natively.
+            IrInstruction::Return { stack_adjust } => {
+                if self.worker_program {
+                    self.emit_worker_return(*stack_adjust, arch);
+                    return Ok(());
+                }
+                // Cooperative fallback: let the dispatcher execute the `ret`
+                // through the IR interpreter (it reads [rsp], sets rip and
+                // pops the stack).  The prefix before the ret already ran.
                 self.emit_store_guest_registers(arch);
                 self.emitter.movz(regmap::X0, EXIT_RET as u16, 0);
                 self.emit_epilogue();
@@ -5135,6 +7795,56 @@ impl JitCompiler {
                 target,
                 return_address,
             } => {
+                // Trivial-API inlining: a call to one of the hot leaf APIs
+                // goes straight to a native helper.  The helper performs the
+                // exact Win32 semantic against the live runtime (last error,
+                // thread/process identity, monotonic clock, interlocked and
+                // SRW fast paths), so no generic name lookup or dispatch match
+                // is executed.
+                if let Some(api) = inline_api_for_target(*target) {
+                    // x0..x3 hold the JIT ABI context.  The helper itself
+                    // pushes/pops the x86 return address through MemoryImage,
+                    // so this call site never depends on the flat-base
+                    // register (which earlier helper calls may clobber).
+                    self.emitter.mov_reg(regmap::X21, regmap::X0);
+                    self.emitter.mov_reg(regmap::X22, regmap::X1);
+                    self.emitter.mov_reg(regmap::X25, regmap::X2);
+                    self.emitter.mov_reg(regmap::X24, regmap::X3);
+                    let runtime_static = &SIGBUS_PE_RUNTIME as *const _ as u64;
+                    self.emitter.mov_imm64(regmap::X26, runtime_static);
+                    self.emitter.ldr64(regmap::X0, regmap::X26, 0);
+                    self.emitter.mov_reg(regmap::X1, regmap::X21);
+                    self.emitter.mov_reg(regmap::X2, regmap::X25);
+                    self.emitter.mov_imm64(regmap::X3, api.index() as u64);
+                    self.emitter.mov_imm64(4, *return_address);
+                    self.emitter
+                        .mov_imm64(regmap::X26, jit_helper_inline_api as *const () as u64);
+                    self.emitter.blr(regmap::X26);
+                    self.emitter.mov_reg(regmap::X0, regmap::X21);
+                    self.emitter.mov_reg(regmap::X1, regmap::X22);
+                    self.emitter.mov_reg(regmap::X2, regmap::X25);
+                    self.emitter.mov_reg(regmap::X3, regmap::X24);
+                    let gpr_base: u32 = Self::GPR_BASE;
+                    for i in (0..16).step_by(2) {
+                        let arm_lo = regmap::guest_to_arm(i);
+                        let arm_hi = regmap::guest_to_arm(i + 1);
+                        let offset = gpr_base + (i as u32) * 8;
+                        self.emitter
+                            .ldp64(arm_lo, arm_hi, regmap::X0, offset as i32);
+                    }
+                    return Ok(());
+                }
+
+                // Production workers resolve the call themselves: push the
+                // static return address natively, push the return link onto
+                // the chain stack, then branch directly into the compiled
+                // callee when the call slot is published.  Only an unlinked
+                // call (host thunk / cold callee) returns to the worker.
+                if self.worker_program {
+                    self.emit_worker_call(*target, *return_address, arch);
+                    return Ok(());
+                }
+
                 // Fast-thunk path: if a host thunk with an ARM64 trampoline
                 // is registered for this call target, emit a direct `blr` to
                 // the trampoline instead of returning EXIT_THUNK. This
@@ -5237,40 +7947,14 @@ impl JitCompiler {
                 // Unconditional jump.  When a link has been published in this
                 // block's atomic link slot, branch straight into the target
                 // block's entry (no dispatcher round-trip).  The target's
-                // prologue reloads guest registers and polls the host
-                // safepoint flag, so this preserves safepoint semantics.
-                //
-                // The source block pops its own host frame BEFORE the branch:
-                // every block's prologue pushes one frame, so a chained loop
-                // would otherwise leak 96 bytes of host stack per hop.  x9
-                // (caller-saved scratch, guest state already stored) carries
-                // the target entry across the frame restore; x0/x2 still hold
-                // the CpuState/MemoryImage pointers expected by the target.
+                // prologue reloads guest registers, checks the SMC epoch /
+                // link budget and polls the host safepoint flag, so chaining
+                // preserves every dispatch invariant.
                 let _ = target;
                 self.emit_store_guest_registers(arch);
-                if let Some(slot) = self.link_slot.as_ref() {
-                    // Restore the flat-mirror base in x1 (the block entry ABI
-                    // passes it; helper calls clobber caller-saved registers).
-                    // x23 points at this thread's [current_block, flat_base]
-                    // cell, so no process-global base can race other threads.
-                    self.emitter.ldr64(regmap::X1, regmap::X23, 8);
-                    let slot_addr = Arc::as_ptr(slot) as u64;
-                    self.emitter.mov_imm64(9, slot_addr);
-                    self.emitter.ldar64(9, 9);
-                    // Hand the per-thread current-block cell pointer to the
-                    // target prologue (x3 is caller-saved and helpers clobber
-                    // it; x23 still holds it here).
-                    self.emitter.mov_reg(regmap::X3, regmap::X23);
-                    // Pop this block's frame BEFORE either exit.  The linked
-                    // path then branches into the target's prologue; the
-                    // unlinked path returns EXIT_JUMP with the frame already
-                    // restored (so the stub below must not pop again).
-                    self.emit_frame_restore();
-                    // Skip the branch (8 bytes) when the slot is still zero.
-                    self.emitter.cbz(9, 8);
-                    self.emitter.br(9);
-                    self.emitter.movz(regmap::X0, EXIT_JUMP as u16, 0);
-                    self.emitter.ret();
+                if let Some(slots) = self.link_slots.as_ref() {
+                    let jump = Arc::clone(&slots.jump);
+                    self.emit_link_exit(&jump, AotRelocKind::JumpLink, EXIT_JUMP);
                 } else {
                     self.emitter.movz(regmap::X0, EXIT_JUMP as u16, 0);
                     self.emit_epilogue();
@@ -5281,15 +7965,47 @@ impl JitCompiler {
                 target,
                 fallthrough,
             } => {
-                // Conditional jump: store guest registers and exit with
-                // EXIT_COND_BRANCH.  The dispatcher evaluates the x86 condition
-                // (from state.flags) and sets rip to target or fallthrough.
-                // (We can't easily read state.flags from native code because
-                // the Flags field offset is unstable under repr(Rust).)
-                let _ = (condition, target, fallthrough);
+                // Real ARM64 conditional branch.  Flags are materialised from
+                // CpuState (including any parked lazy computation) and tested
+                // natively; the host no longer evaluates the condition.  The
+                // two successor edges have independent link slots so either
+                // direction can chain without patching code.
+                let _ = (target, fallthrough);
+                if !is_last {
+                    // A non-terminating conditional branch would need an
+                    // in-block merge label; decoded basic blocks always put a
+                    // Jcc last, so retain the host-evaluated fallback for this
+                    // defensive case.
+                    self.emit_store_guest_registers(arch);
+                    self.emitter.movz(regmap::X0, EXIT_COND_BRANCH as u16, 0);
+                    self.emit_epilogue();
+                    return Ok(());
+                }
                 self.emit_store_guest_registers(arch);
-                self.emitter.movz(regmap::X0, EXIT_COND_BRANCH as u16, 0);
-                self.emit_epilogue();
+                self.emit_materialize_flags();
+                self.emit_x86_flag_loads();
+                let taken_branch = self.emit_x86_condition_branch(*condition);
+                // Fallthrough path.
+                if let Some(slots) = self.link_slots.as_ref() {
+                    let fallthrough = Arc::clone(&slots.fallthrough);
+                    self.emit_link_exit(
+                        &fallthrough,
+                        AotRelocKind::FallthroughLink,
+                        EXIT_COND_NOT_TAKEN,
+                    );
+                } else {
+                    self.emitter.movz(regmap::X0, EXIT_COND_NOT_TAKEN as u16, 0);
+                    self.emit_epilogue();
+                }
+                // Taken path.
+                self.patch_bcond(taken_branch, self.emitter.len());
+                if let Some(slots) = self.link_slots.as_ref() {
+                    let taken = Arc::clone(&slots.taken);
+                    self.emit_link_exit(&taken, AotRelocKind::TakenLink, EXIT_COND_TAKEN);
+                } else {
+                    self.emitter.movz(regmap::X0, EXIT_COND_TAKEN as u16, 0);
+                    self.emit_epilogue();
+                }
             }
 
             IrInstruction::Cpuid => {
@@ -5461,6 +8177,86 @@ impl JitCompiler {
                 return Ok(());
             }
 
+            // ── Indirect control transfer (production-worker lowering) ────
+            // Guest `jmp reg` / `call reg` / `jmp [mem]` / `call [mem]`.  On
+            // the cooperative path these use the universal interpreter helper
+            // (which needs a live `MemoryImage`).  On a production worker the
+            // block is self-contained: it publishes the resolved target (for a
+            // register operand) or the guest address the target must be loaded
+            // from (memory operand) into the per-thread exit cell and exits,
+            // letting the worker resolve it with an inline cache and continue
+            // natively.  A rip-relative memory operand has no resolvable
+            // effective address at IR level, so it stays a helper (and thus a
+            // worker host barrier).
+            IrInstruction::JumpRegister { src } if self.worker_program => {
+                self.emit_indirect_exit(
+                    regmap::guest_to_arm(src.index()),
+                    EXIT_INDIRECT_JUMP_REG,
+                    arch,
+                );
+            }
+            IrInstruction::CallRegister { src, .. } if self.worker_program => {
+                self.emit_indirect_exit(
+                    regmap::guest_to_arm(src.index()),
+                    EXIT_INDIRECT_CALL_REG,
+                    arch,
+                );
+            }
+            IrInstruction::JumpMemory { address }
+                if self.worker_program && !address.rip_relative =>
+            {
+                self.emit_effective_address(address, 25, 0, arch);
+                self.emit_indirect_exit(25, EXIT_INDIRECT_JUMP_MEM, arch);
+            }
+            IrInstruction::CallMemory { address, .. }
+                if self.worker_program && !address.rip_relative =>
+            {
+                self.emit_effective_address(address, 25, 0, arch);
+                self.emit_indirect_exit(25, EXIT_INDIRECT_CALL_MEM, arch);
+            }
+
+            // ── Tier-2 register-allocation spills ────────────────────────
+            // These only touch the host-side spill area in CpuState; they are
+            // never guest-visible memory and do not perturb guest registers
+            // beyond the explicit src/dst.
+            IrInstruction::SpillStore { slot, src } => {
+                if (*slot as usize) >= crate::jit_ssa::SPILL_SLOTS {
+                    self.emit_interpreter_fallback(insn, arch)?;
+                } else {
+                    let arm_src = regmap::guest_to_arm(src.index());
+                    let offset = Self::SPILL_BASE + (*slot as u32) * 8;
+                    self.emitter.str64(arm_src, regmap::X0, offset);
+                }
+            }
+            IrInstruction::SpillLoad { slot, dst } => {
+                if (*slot as usize) >= crate::jit_ssa::SPILL_SLOTS {
+                    self.emit_interpreter_fallback(insn, arch)?;
+                } else {
+                    let arm_dst = regmap::guest_to_arm(dst.index());
+                    let offset = Self::SPILL_BASE + (*slot as u32) * 8;
+                    self.emitter.ldr64(arm_dst, regmap::X0, offset);
+                    if arch == GuestArch::X86 {
+                        self.emitter.uxtw_reg(arm_dst, arm_dst);
+                    }
+                }
+            }
+            IrInstruction::ExplicitFlags {
+                op,
+                lhs,
+                rhs,
+                result,
+                width,
+            } => {
+                self.emit_set_flags(
+                    regmap::guest_to_arm(result.index()),
+                    regmap::guest_to_arm(lhs.index()),
+                    regmap::guest_to_arm(rhs.index()),
+                    *op as u64,
+                    *width as u64,
+                    arch,
+                );
+            }
+
             // Universal catch-all: for any instruction without a dedicated
             // JIT arm, emit a call to jit_helper_execute_insn(state, memory,
             // &insn) so the interpreter executes it with identical semantics.
@@ -5495,7 +8291,7 @@ impl JitCompiler {
         self.emitter.mov_reg(0, 24); // x0 = CpuState
         self.emitter.mov_reg(1, 28); // x1 = MemoryImage
         self.emitter.mov_imm64(2, insn_ptr); // x2 = &insn
-        self.emit_bl_to(jit_helper_execute_insn as *const () as usize);
+        self.emit_bl_to(AotHelper::ExecuteInsn);
         self.emitter.mov_reg(0, 24); // restore CpuState
         self.emit_load_guest_registers(arch);
         self.emitter.mov_reg(2, 28); // restore MemoryImage ptr
@@ -5517,6 +8313,8 @@ impl JitCompiler {
     /// this field (the `Option<u64>` tag byte: 0 when no fault is pending, 1
     /// when one is) and branches to the fault-exit stub when nonzero.
     const JIT_FAULT_BASE: u32 = std::mem::offset_of!(CpuState, jit_pending_fault) as u32;
+    /// Byte offset of the host-only Tier-2 spill area within CpuState.
+    const SPILL_BASE: u32 = std::mem::offset_of!(CpuState, jit_spill) as u32;
 
     /// Get reference to the memory manager.
     pub fn memory_manager(&self) -> &JitMemoryManager {
@@ -5543,6 +8341,10 @@ pub struct JitRuntime {
     /// Kept separate from `block_cache` so worker execution never inherits a
     /// published chain that could bypass the per-slice budget/thunk barrier.
     pub(crate) slice_block_cache: HashMap<u64, JitCompiledBlock>,
+    /// Monotonic generation of the worker slice cache.  Bumped whenever a
+    /// cached worker block is removed, so a persistent worker slot can drop
+    /// stale return-predictor/inline-cache entries before reusing them.
+    slice_epoch: u64,
     /// FIFO access-order queue for LRU eviction of compiled blocks.
     /// Front = least recently used (next to evict), back = most recently used.
     pub block_access_order: VecDeque<u64>,
@@ -5563,12 +8365,23 @@ pub struct JitRuntime {
     pub tier0_compiles: u64,
     pub tier1_compiles: u64,
     pub tier2_compiles: u64,
+    /// Whole-function Tier-2 promotions (multi-block SSA compiles).
+    pub tier2_function_compiles: u64,
+    /// Tier-2 function attempts that fell back to Tier-0.
+    pub tier2_function_fallbacks: u64,
     /// Links published / cleared in this runtime.
     pub chain_links_formed: u64,
     pub chain_links_broken: u64,
     /// Blocks that took the fault-equivalent fallback path (invalid block
     /// installation / faulted entry) and were handed to the interpreter.
     pub fault_fallbacks: u64,
+    /// Persistent AOT translated-code cache counters.
+    pub aot_hits: u64,
+    pub aot_misses: u64,
+    pub aot_rejected: u64,
+    /// Directory used to persist/reload translated worker blocks.  `None`
+    /// disables the cache (useful for deterministic tests).
+    pub(crate) aot_cache_dir: Option<std::path::PathBuf>,
     /// Guest addresses permanently barred from native compilation after a
     /// fault-equivalent event; the interpreter handles them for the rest of
     /// the run.
@@ -5602,11 +8415,22 @@ pub struct JitRuntime {
 
 impl JitRuntime {
     pub fn new(arch: GuestArch) -> Self {
+        let aot_cache_dir = match std::env::var("CASA1_AOT_CACHE_DIR") {
+            Ok(value) if value.eq_ignore_ascii_case("off") => None,
+            Ok(value) if !value.is_empty() => Some(std::path::PathBuf::from(value)),
+            // Tests opt into the cache explicitly with a fresh directory, so a
+            // run can never observe code persisted by an older build.
+            #[cfg(test)]
+            _ => None,
+            #[cfg(not(test))]
+            _ => Some(std::env::temp_dir().join(format!("casa1-aot-v{AOT_TRANSLATOR_VERSION}"))),
+        };
         Self {
             compiler: JitCompiler::new(),
             flat_memory: FlatGuestMemory::new(arch),
             block_cache: HashMap::new(),
             slice_block_cache: HashMap::new(),
+            slice_epoch: 0,
             block_access_order: VecDeque::new(),
             max_blocks: 8192,
             blocks_compiled: 0,
@@ -5617,9 +8441,15 @@ impl JitRuntime {
             tier0_compiles: 0,
             tier1_compiles: 0,
             tier2_compiles: 0,
+            tier2_function_compiles: 0,
+            tier2_function_fallbacks: 0,
             chain_links_formed: 0,
             chain_links_broken: 0,
             fault_fallbacks: 0,
+            aot_hits: 0,
+            aot_misses: 0,
+            aot_rejected: 0,
+            aot_cache_dir,
             faulted_blocks: BTreeSet::new(),
             block_chains: BTreeMap::new(),
             fast_thunk_table: FastThunkTable::new(),
@@ -5629,6 +8459,16 @@ impl JitRuntime {
             synced_pages: BTreeSet::new(),
             sigbus_installed: false,
         }
+    }
+
+    /// Override (or disable) the persistent AOT cache directory.
+    pub fn set_aot_cache_dir(&mut self, directory: Option<std::path::PathBuf>) {
+        self.aot_cache_dir = directory;
+    }
+
+    /// `(hits, misses, rejected)` for the persistent AOT cache.
+    pub fn aot_metrics(&self) -> (u64, u64, u64) {
+        (self.aot_hits, self.aot_misses, self.aot_rejected)
     }
 
     /// Get or compile a JIT block for the given guest address.
@@ -5656,14 +8496,66 @@ impl JitRuntime {
         )
     }
 
+    /// Compile (or reuse) a whole hot function at Tier-2.
+    ///
+    /// `blocks` is ordered with the entry block first, exactly as produced by
+    /// [`crate::jit_ssa::optimize_function`].  Returns `None` when the SSA
+    /// front end rejected the function (unsupported construct); the caller
+    /// then keeps per-block Tier-0/Tier-1 code.
+    pub fn get_or_compile_function_tier2(
+        &mut self,
+        blocks: &[crate::jit_ssa::FunctionBlock],
+        arch: GuestArch,
+    ) -> AppResult<Option<&JitCompiledBlock>> {
+        let Some(entry) = blocks.first().map(|block| block.guest_address) else {
+            return Ok(None);
+        };
+        if let Some(existing) = self.block_cache.get(&entry)
+            && existing.compile_tier == CompilationTier::Tier2
+        {
+            return Ok(self.block_cache.get(&entry));
+        }
+        let compiled = self.compiler.compile_function_tier2(blocks, arch)?;
+        if compiled.compile_tier != CompilationTier::Tier2 {
+            self.tier2_function_fallbacks += 1;
+            return Ok(None);
+        }
+        self.tier2_function_compiles += 1;
+        self.blocks_compiled += 1;
+        for block in blocks {
+            let page = block.guest_address & !0xfff;
+            self.code_pages.insert(page);
+        }
+        self.block_access_order.retain(|address| *address != entry);
+        self.block_access_order.push_back(entry);
+        let guest_end = blocks
+            .iter()
+            .map(|block| block.guest_address + (block.instructions.len() as u64) * 15)
+            .max()
+            .unwrap_or(entry + 1);
+        self.unwind_table.register_block(entry, guest_end);
+        self.block_cache.insert(entry, compiled);
+        self.smc.rebuild_watch(self.code_pages.iter());
+        Ok(self.block_cache.get(&entry))
+    }
+
+    /// Snapshot of the global SSA metrics plus this runtime's Tier-2 function
+    /// counters.
+    pub fn tier2_metrics_snapshot(&self) -> crate::jit_ssa::Tier2Metrics {
+        let mut metrics = crate::jit_ssa::tier2_metrics();
+        metrics.functions_compiled = self.tier2_function_compiles;
+        metrics.functions_fallback = self.tier2_function_fallbacks;
+        metrics
+    }
+
     /// Get or compile a block at an explicit optimization tier.
     ///
     /// The PE dispatcher calls this when [`TieredCompiler::record_execution`]
     /// crosses a threshold (Tier0 at 50 dispatches, Tier1 at 500): an already
     /// cached block compiled at a lower tier is invalidated and recompiled
-    /// with the real optimizer (`constant_fold` + DCE at Tier1,
-    /// `constant_fold` + loop unrolling at Tier2) instead of returning the
-    /// identical Tier0 code.
+    /// with the real optimizer (`constant_fold` + DCE at Tier1; whole-block
+    /// SSA with GVN/SCCP/DCE/LICM and load-store forwarding at Tier2) instead
+    /// of returning the identical Tier0 code.
     pub fn get_or_compile_at_tier(
         &mut self,
         ir: &[IrInstruction],
@@ -5779,12 +8671,11 @@ impl JitRuntime {
                     )?
                 }
             };
-            let code_size = block.code_size;
             self.blocks_compiled += 1;
 
             // Track which 4K guest pages this compiled block occupies,
             // for self-modifying code detection.
-            let guest_end = guest_address + code_size as u64;
+            let guest_end = guest_address + (ir.len() as u64).saturating_mul(15).max(1);
             let start_page = guest_address & !0xfff;
             let end_page = (guest_end - 1) & !0xfff;
             let mut page = start_page;
@@ -5831,9 +8722,13 @@ impl JitRuntime {
     }
 
     /// Compile (or fetch) a deliberately unlinked block for production worker
-    /// slices.  Worker blocks never use resolved fast-thunk trampolines and
-    /// never publish chain links, so each worker dispatch executes exactly one
-    /// block and the slice budget/thunk barrier stays exact.
+    /// slices.
+    ///
+    /// The persistent AOT cache is consulted first: a record keyed by guest
+    /// code hash + translator version + target CPU + optimization profile is
+    /// loaded, validated and re-bound to this process.  A missing record
+    /// compiles normally and is persisted; a corrupt/incompatible record is
+    /// counted as `aot_rejected` and compilation proceeds from IR.
     pub(crate) fn get_or_compile_slice_block(
         &mut self,
         ir: &[IrInstruction],
@@ -5841,8 +8736,44 @@ impl JitRuntime {
         arch: GuestArch,
     ) -> AppResult<&JitCompiledBlock> {
         if !self.slice_block_cache.contains_key(&guest_address) {
-            let block = self.compiler.compile_block(ir, guest_address, arch, None)?;
-            self.slice_block_cache.insert(guest_address, block);
+            let source_hash = compute_ir_hash(ir, guest_address);
+            let cache_enabled = self.aot_cache_dir.is_some();
+            if cache_enabled {
+                match self.load_aot_slice_block(ir, guest_address, source_hash, arch) {
+                    Ok(Some(block)) => {
+                        self.aot_hits += 1;
+                        self.note_slice_code_pages(&block);
+                        self.slice_block_cache.insert(guest_address, block);
+                    }
+                    Ok(None) => {
+                        self.aot_misses += 1;
+                        let block = self
+                            .compiler
+                            .compile_worker_block(ir, guest_address, arch)?;
+                        self.persist_aot_slice_block(&block, source_hash);
+                        self.slice_block_cache.insert(guest_address, block);
+                    }
+                    Err(error) => {
+                        self.aot_rejected += 1;
+                        eprintln!("[jit] AOT cache rejected for {guest_address:#x}: {error}");
+                        if let Some(path) = self.aot_path(source_hash, guest_address) {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        let block = self
+                            .compiler
+                            .compile_worker_block(ir, guest_address, arch)?;
+                        self.persist_aot_slice_block(&block, source_hash);
+                        self.note_slice_code_pages(&block);
+                        self.slice_block_cache.insert(guest_address, block);
+                    }
+                }
+            } else {
+                let block = self
+                    .compiler
+                    .compile_worker_block(ir, guest_address, arch)?;
+                self.note_slice_code_pages(&block);
+                self.slice_block_cache.insert(guest_address, block);
+            }
         }
         Ok(self
             .slice_block_cache
@@ -5850,23 +8781,214 @@ impl JitRuntime {
             .expect("slice block inserted above"))
     }
 
+    fn note_slice_code_pages(&mut self, block: &JitCompiledBlock) {
+        let end = block.guest_address.saturating_add(block_guest_span(block));
+        let mut page = block.guest_address & !0xfff;
+        let last = end.saturating_sub(1) & !0xfff;
+        while page <= last {
+            self.code_pages.insert(page);
+            page = page.saturating_add(0x1000);
+        }
+        self.smc.rebuild_watch(self.code_pages.iter());
+    }
+
+    fn aot_path(&self, code_hash: u64, guest_address: u64) -> Option<std::path::PathBuf> {
+        self.aot_cache_dir.as_ref().map(|directory| {
+            directory.join(format!(
+                "aot-{code_hash:016x}-{guest_address:016x}-t{}-c{:016x}-o{}.bin",
+                AOT_TRANSLATOR_VERSION,
+                aot_target_cpu_profile(),
+                AOT_SLICE_OPT_PROFILE
+            ))
+        })
+    }
+
+    fn load_aot_slice_block(
+        &mut self,
+        ir: &[IrInstruction],
+        guest_address: u64,
+        source_hash: u64,
+        _arch: GuestArch,
+    ) -> AppResult<Option<JitCompiledBlock>> {
+        let Some(path) = self.aot_path(source_hash, guest_address) else {
+            return Ok(None);
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(AppError::new(
+                    ReasonCode::RcJitCompilationError,
+                    format!("AOT cache read failed: {error}"),
+                ));
+            }
+        };
+        // Bound the read before decoding; a cache file is code-sized.
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                "AOT cache record is implausibly large",
+            ));
+        }
+        let record = AotRecord::decode(&bytes).map_err(|reason| {
+            AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!("malformed AOT cache record: {reason}"),
+            )
+        })?;
+        if record.optimization_profile != AOT_SLICE_OPT_PROFILE
+            || record.guest_address != guest_address
+            || record.code_hash != source_hash
+            || record.instruction_count != ir.len() as u64
+        {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                "AOT cache record does not match this translation",
+            ));
+        }
+        self.compiler.install_aot_record(&record).map(Some)
+    }
+
+    fn persist_aot_slice_block(&mut self, block: &JitCompiledBlock, source_hash: u64) {
+        if !block.worker_safe {
+            return;
+        }
+        let Some(path) = self.aot_path(source_hash, block.guest_address) else {
+            return;
+        };
+        let Some(directory) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(directory).is_err() {
+            return;
+        }
+        let entry = block.published_entry();
+        if entry.is_null() {
+            return;
+        }
+        // SAFETY: the entry was produced by this runtime and finalized; its
+        // code_size bytes remain mapped and immutable for the block lifetime.
+        let code =
+            unsafe { std::slice::from_raw_parts(entry as *const u8, block.code_size) }.to_vec();
+        let relocations = self.compiler.relocations.clone();
+        if relocations
+            .iter()
+            .any(|relocation| relocation.offset as usize + 16 > code.len())
+        {
+            return;
+        }
+        let mut logical = code.clone();
+        for relocation in &relocations {
+            let offset = relocation.offset as usize;
+            logical[offset..offset + 16].fill(0);
+        }
+        let record = AotRecord {
+            format: AOT_FORMAT_VERSION,
+            translator: AOT_TRANSLATOR_VERSION,
+            machine: AotRecord::machine_tag(),
+            cpu_profile: aot_target_cpu_profile(),
+            optimization_profile: AOT_SLICE_OPT_PROFILE,
+            guest_address: block.guest_address,
+            code_hash: source_hash,
+            logical_code_hash: fnv1a(&logical),
+            instruction_count: block.instruction_count as u64,
+            code_size: code.len() as u32,
+            worker_safe: block.worker_safe,
+            exit_info: block.last_exit_info,
+            code,
+            relocations,
+        };
+        let encoded = record.encode();
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        if std::fs::write(&temporary, encoded).is_ok() {
+            let _ = std::fs::rename(&temporary, &path);
+        }
+    }
+
     pub(crate) fn slice_block(&self, guest_address: u64) -> Option<&JitCompiledBlock> {
         self.slice_block_cache.get(&guest_address)
     }
 
     pub(crate) fn clear_slice_blocks(&mut self) {
+        for block in self.slice_block_cache.values() {
+            block.link_target.store(0, Ordering::Release);
+            block.taken_link.store(0, Ordering::Release);
+            block.fallthrough_link.store(0, Ordering::Release);
+            block.call_link.store(0, Ordering::Release);
+            block.return_entry_link.store(0, Ordering::Release);
+        }
         self.slice_block_cache.clear();
+        self.slice_epoch = self.slice_epoch.wrapping_add(1);
+        JIT_CODE_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Publish every static successor edge between cached worker blocks.
+    ///
+    /// Direct jumps, both `Jcc` arms, direct calls and their static return
+    /// successors get independent atomic link slots.  Nothing here patches
+    /// instruction memory: an executor either observes the old zero slot or
+    /// the new entry, and invalidation clears the slots before the cache is
+    /// dropped.
+    fn publish_slice_links(&self) {
+        // Only blocks whose terminator is statically described may be a
+        // native link target: entering a straight-line block would leave the
+        // worker without a successor RIP and force a re-dispatch of code it
+        // already executed.
+        let entries: HashMap<u64, u64> = self
+            .slice_block_cache
+            .iter()
+            .filter(|(_, block)| block.worker_safe && block.last_exit_info.is_some())
+            .map(|(address, block)| (*address, block.entry() as u64))
+            .collect();
+        for block in self.slice_block_cache.values() {
+            if !block.worker_safe {
+                continue;
+            }
+            let entry = |target: &u64| entries.get(target).copied().unwrap_or(0);
+            match block.last_exit_info {
+                Some(BlockExitInfo::Jump { target }) => {
+                    block.link_target.store(entry(&target), Ordering::Release);
+                }
+                Some(BlockExitInfo::JumpIf {
+                    target,
+                    fallthrough,
+                    ..
+                }) => {
+                    block.taken_link.store(entry(&target), Ordering::Release);
+                    block
+                        .fallthrough_link
+                        .store(entry(&fallthrough), Ordering::Release);
+                }
+                Some(BlockExitInfo::Call {
+                    target,
+                    return_address,
+                }) => {
+                    block.call_link.store(entry(&target), Ordering::Release);
+                    block
+                        .return_entry_link
+                        .store(entry(&return_address), Ordering::Release);
+                }
+                Some(BlockExitInfo::CallIndirect { return_address }) => {
+                    block
+                        .return_entry_link
+                        .store(entry(&return_address), Ordering::Release);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Build the immutable program a production worker executes.  The
     /// memory view aliases the canonical store; no bytes are copied.
     pub(crate) fn build_slice_program(&self, memory: &MemoryImage) -> GuestSliceProgram {
+        self.publish_slice_links();
         let view = Arc::new(GuestSliceMemory::new(memory, self.code_pages.clone()));
         GuestSliceProgram {
             blocks: self.slice_block_cache.clone(),
             flat_base: view.flat_base(),
             memory: view,
             mechanism: self.compiler.memory_manager.mechanism(),
+            epoch: self.slice_epoch,
         }
     }
 
@@ -5933,7 +9055,14 @@ impl JitRuntime {
     /// The caller is responsible for syncing the updated unwind table to the
     /// SEH subsystem via [`JitUnwindTable::register_with_seh`].
     pub fn invalidate_block(&mut self, guest_address: u64) {
-        self.slice_block_cache.remove(&guest_address);
+        if let Some(block) = self.slice_block_cache.remove(&guest_address) {
+            block.link_target.store(0, Ordering::Release);
+            block.taken_link.store(0, Ordering::Release);
+            block.fallthrough_link.store(0, Ordering::Release);
+            block.call_link.store(0, Ordering::Release);
+            block.return_entry_link.store(0, Ordering::Release);
+            self.slice_epoch = self.slice_epoch.wrapping_add(1);
+        }
         if let Some(block) = self.block_cache.remove(&guest_address) {
             // Remove from the access-order queue so stale entries don't
             // accumulate and cause incorrect evictions.
@@ -6014,7 +9143,7 @@ impl JitRuntime {
         self.code_pages.clear();
         for block in self.block_cache.values() {
             let start_page = block.guest_address & !0xfff;
-            let end_page = (block.guest_address + block.code_size as u64 - 1) & !0xfff;
+            let end_page = (block.guest_address + block_guest_span(block) - 1) & !0xfff;
             let mut page = start_page;
             while page <= end_page {
                 self.code_pages.insert(page);
@@ -6067,7 +9196,7 @@ impl JitRuntime {
                     Some(b) => b,
                     None => return false,
                 };
-                let block_end = block.guest_address.saturating_add(block.code_size as u64);
+                let block_end = block.guest_address.saturating_add(block_guest_span(block));
                 // Overlap if: write_start < block_end AND write_end > block_start
                 address < block_end && write_end > block.guest_address
             })
@@ -6104,7 +9233,9 @@ impl JitRuntime {
         &mut self,
         dirty_pages: &std::collections::BTreeSet<u64>,
     ) -> Vec<u64> {
-        if dirty_pages.is_empty() || self.block_cache.is_empty() {
+        if dirty_pages.is_empty()
+            || (self.block_cache.is_empty() && self.slice_block_cache.is_empty())
+        {
             return Vec::new();
         }
 
@@ -6120,8 +9251,9 @@ impl JitRuntime {
             return Vec::new();
         }
         // Worker slice blocks compile from the same source pages; a code
-        // write invalidates them just like dispatcher blocks.
-        self.slice_block_cache.clear();
+        // write invalidates them just like dispatcher blocks and clears every
+        // native link so no stale entry can be observed.
+        self.clear_slice_blocks();
 
         let affected: Vec<u64> = self
             .block_cache
@@ -6133,7 +9265,7 @@ impl JitRuntime {
                     None => return false,
                 };
                 let start_page = block.guest_address & !0xfff;
-                let end_page = (block.guest_address + block.code_size as u64 - 1) & !0xfff;
+                let end_page = (block.guest_address + block_guest_span(block) - 1) & !0xfff;
                 let mut page = start_page;
                 while page <= end_page {
                     if dirty_pages.contains(&page) {
@@ -6336,11 +9468,11 @@ impl JitRuntime {
         // code (written by every prologue), [1] is this runtime's flat-mirror
         // base (read by chained jump exits to restore x1).  Both values are
         // thread-local because the cell lives on this stack.
-        let mut exec_slot: [u64; 2] = [u64::MAX, self.flat_memory.base()];
+        let mut chain = ChainState::new(self.flat_memory.base(), block.guest_address, LINK_BUDGET);
         let state_ptr = state as *mut CpuState;
-        let mem_base = exec_slot[1];
+        let mem_base = chain.flat_base;
         let mem_image_ptr = memory as *mut MemoryImage;
-        let exit_ptr = exec_slot.as_mut_ptr();
+        let exit_ptr = &mut chain as *mut ChainState;
 
         // SAFETY: block.entry() points to JIT-compiled ARM64 code that was
         // written by this compiler and finalized (icache flushed, executable
@@ -6375,7 +9507,7 @@ impl JitRuntime {
                 *mut CpuState,
                 u64,
                 *mut MemoryImage,
-                *mut u64,
+                *mut ChainState,
             ) -> u64 = std::mem::transmute(entry_ptr);
 
             let result = entry_fn(state_ptr, mem_base, mem_image_ptr, exit_ptr);
@@ -6386,7 +9518,7 @@ impl JitRuntime {
             // prologue wrote the address into the per-thread cell) — using
             // the source's target here would re-dispatch (double-execute) the
             // chained target.
-            let final_address = *exit_ptr.add(0);
+            let final_address = (*exit_ptr).current_block;
             let exit_info = if final_address == block.guest_address {
                 block.last_exit_info
             } else {
@@ -6396,9 +9528,20 @@ impl JitRuntime {
                     .unwrap_or(block.last_exit_info)
             };
 
-            // x0 carries the exit code for every native exit arm.
-            map_exit_reason(result, state, result, exit_info)
+            // x0 carries the exit code for every native exit arm; the optional
+            // dynamic payload (indirect target / target pointer) is written by
+            // the compiled block into exec_slot[2].
+            map_exit_reason(result, state, result, exit_info, (*exit_ptr).payload)
         };
+        // A budget/epoch guard stops BEFORE the block body runs.  Re-dispatch
+        // exactly that block; never re-run the chain's already-executed
+        // prefix.
+        if matches!(
+            reason,
+            JitExitReason::LinkBudget { .. } | JitExitReason::CodeEpoch { .. }
+        ) {
+            state.rip = chain.current_block;
+        }
         // Self-modifying code, exit check: the block just executed may have
         // written another block's code page (or its own).  Invalidate before
         // the dispatcher looks the next block up, so the stale block can
@@ -6410,7 +9553,8 @@ impl JitRuntime {
     /// Attach the flat view to the live image's canonical store.
     ///
     /// O(1): an `Arc` identity check.  Both views then address the same
-    /// 4 GiB mapping, so no page copy is needed before or after execution.
+    /// direct-window mapping, so no page copy is needed before or after
+    /// execution.
     pub(crate) fn attach_guest_memory(&mut self, memory: &MemoryImage) {
         self.flat_memory.attach_store(memory.canonical_store());
     }
@@ -6588,12 +9732,112 @@ impl JitRuntime {
 /// it carries the guest return RIP; the dormant jump-family arms use it
 /// as a best-effort carrier — a re-enabled JIT must either populate it or
 /// have the dispatcher re-derive the target from `state`).
+/// Map an x86 condition to the equivalent ARM64 `b.cond` encoding for the
+/// flags produced by `CMP` (SUBS) or `TEST` (ANDS).  `None` means the
+/// condition needs the parity flag and must use the generic path.
+fn arm_condition_for(condition: ConditionCode) -> Option<u32> {
+    Some(match condition {
+        ConditionCode::Equal => 0x0,         // EQ
+        ConditionCode::NotEqual => 0x1,      // NE
+        ConditionCode::NotBelow => 0x2,      // CS/HS (CF = 0)
+        ConditionCode::Below => 0x3,         // CC/LO (CF = 1)
+        ConditionCode::NotSign => 0x5,       // PL
+        ConditionCode::Sign => 0x4,          // MI
+        ConditionCode::NotOverflow => 0x7,   // VC
+        ConditionCode::Overflow => 0x6,      // VS
+        ConditionCode::Above => 0x8,         // HI
+        ConditionCode::NotAbove => 0x9,      // LS
+        ConditionCode::GreaterEqual => 0x10, // GE
+        ConditionCode::Less => 0x11,         // LT
+        ConditionCode::Greater => 0x12,      // GT
+        ConditionCode::LessEqual => 0x13,    // LE
+        ConditionCode::Parity | ConditionCode::NotParity => return None,
+    })
+}
+
+/// True when the first flag-related instruction in `block` reads flags (so a
+/// predecessor must materialise them into `CpuState`).  A block that writes
+/// flags first (CMP/TEST) does not need them on entry.
+fn block_reads_flags_before_write(block: &crate::jit_ssa::OptimizedBlock) -> bool {
+    for insn in &block.instructions {
+        match insn {
+            IrInstruction::Compare { .. } | IrInstruction::Test { .. } => return false,
+            IrInstruction::JumpIf { .. }
+            | IrInstruction::Setcc { .. }
+            | IrInstruction::SetccMemory { .. }
+            | IrInstruction::Cmov { .. }
+            | IrInstruction::AdcImm { .. }
+            | IrInstruction::AdcOperand { .. }
+            | IrInstruction::SbbImm { .. }
+            | IrInstruction::SbbOperand { .. }
+            | IrInstruction::PushFlags { .. }
+            | IrInstruction::Lahf => return true,
+            _ => {}
+        }
+    }
+    // No flag writer in this block: the incoming flags are still guest-visible
+    // at its exit, so a predecessor must have materialised them.
+    true
+}
+
+fn edge_reads_flags(
+    target: u64,
+    blocks: &[crate::jit_ssa::OptimizedBlock],
+    by_address: &std::collections::HashMap<u64, usize>,
+) -> bool {
+    match by_address.get(&target) {
+        Some(index) => block_reads_flags_before_write(&blocks[*index]),
+        None => true,
+    }
+}
+
+/// Return the index of a trailing CMP/TEST that feeds a terminating `Jcc`
+/// with only spill bookkeeping after it.
+fn find_native_compare(block: &crate::jit_ssa::OptimizedBlock) -> Option<usize> {
+    let condition = match &block.terminator {
+        crate::jit_ssa::OptimizedTerminator::JumpIf { condition, .. } => *condition,
+        _ => return None,
+    };
+    // Parity needs PF, which ARM NZCV does not carry: keep the helper path.
+    arm_condition_for(condition)?;
+    let mut candidate = None;
+    for (index, insn) in block.instructions.iter().enumerate() {
+        match insn {
+            IrInstruction::Compare { width: 8, .. } | IrInstruction::Test { width: 8, .. } => {
+                candidate = Some(index);
+            }
+            IrInstruction::SpillLoad { .. } | IrInstruction::SpillStore { .. } => {}
+            _ => candidate = None,
+        }
+    }
+    candidate.filter(|index| {
+        block.instructions[index + 1..].iter().all(|insn| {
+            matches!(
+                insn,
+                IrInstruction::SpillLoad { .. } | IrInstruction::SpillStore { .. }
+            )
+        })
+    })
+}
+
 fn map_exit_reason(
     exit_reason: u64,
     state: &CpuState,
     result: u64,
     block_exit_info: Option<BlockExitInfo>,
+    payload: u64,
 ) -> JitExitReason {
+    // Indirect call sites need the static return address (never written by the
+    // compiled block); the dynamic callee target arrives in `payload`.
+    let call_return_address = match block_exit_info {
+        Some(BlockExitInfo::CallIndirect { return_address }) => return_address,
+        Some(BlockExitInfo::Call { return_address, .. }) => return_address,
+        _ => 0,
+    };
+    let direct_call_target = match block_exit_info {
+        Some(BlockExitInfo::Call { target, .. }) => target,
+        _ => payload,
+    };
     match exit_reason {
         EXIT_NORMAL => JitExitReason::Normal { new_rip: state.rip },
         EXIT_THUNK => JitExitReason::ThunkDispatch {
@@ -6619,7 +9863,39 @@ fn map_exit_reason(
         EXIT_INDIRECT_CALL => JitExitReason::IndirectCall {
             target: result,
             return_address: state.rip,
+            target_is_pointer: false,
         },
+        EXIT_INDIRECT_JUMP_REG => JitExitReason::IndirectJump {
+            target: payload,
+            target_is_pointer: false,
+        },
+        EXIT_INDIRECT_CALL_REG => JitExitReason::IndirectCall {
+            target: payload,
+            return_address: call_return_address,
+            target_is_pointer: false,
+        },
+        EXIT_INDIRECT_JUMP_MEM => JitExitReason::IndirectJump {
+            target: payload,
+            target_is_pointer: true,
+        },
+        EXIT_INDIRECT_CALL_MEM => JitExitReason::IndirectCall {
+            target: payload,
+            return_address: call_return_address,
+            target_is_pointer: true,
+        },
+        EXIT_CALL_DIRECT => JitExitReason::DirectCall {
+            target: direct_call_target,
+            return_address: call_return_address,
+        },
+        EXIT_CALL_PUSHED => JitExitReason::DirectCallPushed {
+            target: direct_call_target,
+            return_address: call_return_address,
+        },
+        EXIT_RET_RESOLVED => JitExitReason::ReturnResolved { target: payload },
+        EXIT_LINK_BUDGET => JitExitReason::LinkBudget { rip: state.rip },
+        EXIT_CODE_EPOCH => JitExitReason::CodeEpoch { rip: state.rip },
+        EXIT_COND_TAKEN => JitExitReason::ConditionalTaken { rip: state.rip },
+        EXIT_COND_NOT_TAKEN => JitExitReason::ConditionalNotTaken { rip: state.rip },
         EXIT_RET => JitExitReason::Return { return_rip: result },
         EXIT_MEM_ACCESS => JitExitReason::MemoryAccess {
             address: result,
@@ -7024,21 +10300,25 @@ impl JitCompiler {
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
         self.used_interpreter_helper = false;
-        let link_target = Arc::new(AtomicU64::new(0));
-        self.link_slot = Some(Arc::clone(&link_target));
+        self.relocations.clear();
+        let link_slots = LinkSlots::new();
+        self.link_slots = Some(link_slots.clone());
 
         // Optimized prologue: same as default but with better register planning
         self.emit_prologue(arch);
         self.emit_current_block_tag(guest_address);
         self.emit_load_guest_registers(arch);
+        self.emit_chain_guard(ir.len() as u64, arch);
         self.emit_safepoint_check(arch);
+        self.emit_block_accounting(ir.len() as u64);
 
         // Constant folding pass: pre-compute known constants
         let folded_ir = Self::constant_fold(ir);
 
         // Compile optimized IR
-        for insn in &folded_ir {
-            self.compile_instruction(insn, arch, fast_thunk_addrs)?;
+        let last = folded_ir.len().saturating_sub(1);
+        for (index, insn) in folded_ir.iter().enumerate() {
+            self.compile_instruction(insn, arch, fast_thunk_addrs, index == last)?;
         }
 
         self.emit_store_guest_registers(arch);
@@ -7065,7 +10345,7 @@ impl JitCompiler {
         let source_hash = compute_ir_hash(ir, guest_address);
         let last_exit_info = block_exit_info(ir);
         let worker_safe = block_is_worker_safe(&folded_ir, self.used_interpreter_helper);
-        self.link_slot = None;
+        self.link_slots = None;
 
         Ok(JitCompiledBlock {
             entry_addr: code_ptr as usize,
@@ -7077,7 +10357,11 @@ impl JitCompiler {
             last_exit_info,
             compile_tier: CompilationTier::Tier1,
             ends_in_control_flow: block_ends_in_control_flow(ir),
-            link_target,
+            link_target: link_slots.jump,
+            taken_link: link_slots.taken,
+            fallthrough_link: link_slots.fallthrough,
+            call_link: link_slots.call,
+            return_entry_link: link_slots.return_entry,
             worker_safe,
         })
     }
@@ -7097,25 +10381,32 @@ impl JitCompiler {
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
         self.used_interpreter_helper = false;
-        let link_target = Arc::new(AtomicU64::new(0));
-        self.link_slot = Some(Arc::clone(&link_target));
+        self.relocations.clear();
+        let link_slots = LinkSlots::new();
+        self.link_slots = Some(link_slots.clone());
 
         self.emit_prologue(arch);
         self.emit_current_block_tag(guest_address);
         self.emit_load_guest_registers(arch);
+        self.emit_chain_guard(ir.len() as u64, arch);
         self.emit_safepoint_check(arch);
+        self.emit_block_accounting(ir.len() as u64);
 
-        // Apply aggressive optimizations.  Loop unrolling is intentionally
-        // NOT applied: the current pass removes the block's flag-setting
-        // back-edge and can change guest-visible flags/counter values for
-        // loop bodies that read them.  Tier2 therefore shares Tier1's sound
-        // constant-folding pass; the two required real optimizations are
-        // block linking and direct resolved-thunk calls (see `chain_blocks`
-        // and the Call emission arm).
-        let optimized_ir = Self::constant_fold(ir);
+        // Whole-block SSA: GVN, SCCP, DCE, LICM and exact-address load/store
+        // forwarding.  Unsupported constructs reject the block as a unit and
+        // it is recompiled at Tier-0, so a partially-optimised block can never
+        // be executed.
+        let optimized_ir = match crate::jit_ssa::optimize_block_ir(ir, arch) {
+            Ok(optimized) => optimized,
+            Err(_) => {
+                return self.compile_block(ir, guest_address, arch, fast_thunk_addrs);
+            }
+        };
 
-        for insn in &optimized_ir {
-            self.compile_instruction(insn, arch, fast_thunk_addrs)?;
+        self.emit_spill_slots_init(arch);
+        let last = optimized_ir.len().saturating_sub(1);
+        for (index, insn) in optimized_ir.iter().enumerate() {
+            self.compile_instruction(insn, arch, fast_thunk_addrs, index == last)?;
         }
 
         self.emit_store_guest_registers(arch);
@@ -7139,7 +10430,7 @@ impl JitCompiler {
         let source_hash = compute_ir_hash(ir, guest_address);
         let last_exit_info = block_exit_info(&optimized_ir);
         let worker_safe = block_is_worker_safe(&optimized_ir, self.used_interpreter_helper);
-        self.link_slot = None;
+        self.link_slots = None;
 
         Ok(JitCompiledBlock {
             entry_addr: code_ptr as usize,
@@ -7151,9 +10442,431 @@ impl JitCompiler {
             last_exit_info,
             compile_tier: CompilationTier::Tier2,
             ends_in_control_flow: block_ends_in_control_flow(ir),
-            link_target,
+            link_target: link_slots.jump,
+            taken_link: link_slots.taken,
+            fallthrough_link: link_slots.fallthrough,
+            call_link: link_slots.call,
+            return_entry_link: link_slots.return_entry,
             worker_safe,
         })
+    }
+
+    /// Compile a whole hot function at Tier-2.
+    ///
+    /// The entry block is the first element.  The SSA front end builds one
+    /// function-wide IR, runs the optimiser, and this emitter lays every block
+    /// out in one native code object: guest registers are loaded once at the
+    /// entry, internal branches are native `b`/`b.cond` instructions, and only
+    /// function exits store `CpuState`.  Unsupported constructs fall back to
+    /// the entry block at Tier-0.
+    pub fn compile_function_tier2(
+        &mut self,
+        blocks: &[crate::jit_ssa::FunctionBlock],
+        arch: GuestArch,
+    ) -> AppResult<JitCompiledBlock> {
+        if blocks.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                "JIT Tier2: no function blocks",
+            ));
+        }
+        let optimized = match crate::jit_ssa::optimize_function(blocks, arch) {
+            Ok(optimized) => optimized,
+            Err(_) => {
+                let entry = &blocks[0];
+                return self.compile_block(&entry.instructions, entry.guest_address, arch, None);
+            }
+        };
+
+        self.emitter = Emitter::new();
+        self.used_interpreter_helper = false;
+        self.relocations.clear();
+        self.fault_cbnz_patches.clear();
+        self.safepoint_cbnz_patch = None;
+        self.link_slots = None;
+
+        let mut labels = vec![0usize; optimized.blocks.len()];
+        let mut by_address = std::collections::HashMap::new();
+        for (index, block) in optimized.blocks.iter().enumerate() {
+            by_address.insert(block.guest_address, index);
+        }
+        let entry_address = optimized.blocks[0].guest_address;
+        let original_count: usize = optimized.original_instructions;
+
+        self.emit_prologue(arch);
+        self.emit_current_block_tag(entry_address);
+        self.emit_load_guest_registers(arch);
+        self.emit_spill_slots_init(arch);
+        self.emit_chain_guard(original_count as u64, arch);
+        self.emit_safepoint_check(arch);
+        self.emit_block_accounting(original_count as u64);
+
+        let mut jump_patches: Vec<(usize, usize)> = Vec::new();
+        let mut conditional_patches: Vec<(usize, usize)> = Vec::new();
+        let mut extra_safepoints: Vec<usize> = Vec::new();
+
+        for (index, block) in optimized.blocks.iter().enumerate() {
+            labels[index] = self.emitter.len();
+            self.emit_set_state_rip(block.guest_address);
+            if index != 0 {
+                let flag_addr = &JIT_SAFEPOINT_REQUESTED as *const AtomicBool as u64;
+                self.emit_reloc_imm64(regmap::X26, flag_addr, AotRelocKind::SafepointFlag);
+                self.emitter.ldr8(regmap::X26, regmap::X26, 0);
+                let pos = self.emitter.len();
+                self.emitter.cbnz(regmap::X26, 0);
+                extra_safepoints.push(pos);
+            }
+            let native_compare_index = find_native_compare(block);
+            let mut native_compare: Option<IrInstruction> = None;
+            for (insn_index, insn) in block.instructions.iter().enumerate() {
+                if Some(insn_index) == native_compare_index && self.emit_native_compare(insn) {
+                    native_compare = Some(insn.clone());
+                } else {
+                    self.compile_instruction(insn, arch, None, false)?;
+                }
+            }
+            match &block.terminator {
+                crate::jit_ssa::OptimizedTerminator::Jump { target, copies } => {
+                    for insn in copies {
+                        self.compile_instruction(insn, arch, None, false)?;
+                    }
+                    if let Some(target_index) = by_address.get(target).copied() {
+                        let pos = self.emitter.len();
+                        self.emitter.b(0);
+                        jump_patches.push((pos, target_index));
+                    } else {
+                        self.emit_set_state_rip(*target);
+                        self.emit_store_guest_registers(arch);
+                        self.emitter.movz(regmap::X0, EXIT_JUMP as u16, 0);
+                        self.emit_epilogue();
+                    }
+                }
+                crate::jit_ssa::OptimizedTerminator::JumpIf {
+                    condition,
+                    target,
+                    fallthrough,
+                    taken_copies,
+                    fallthrough_copies,
+                } => {
+                    let native_condition = native_compare
+                        .is_some()
+                        .then(|| arm_condition_for(*condition))
+                        .flatten();
+                    let taken_pos = if let Some(condition) = native_condition {
+                        let pos = self.emitter.len();
+                        self.emitter.bcond(condition, 0);
+                        pos
+                    } else {
+                        self.emit_materialize_flags();
+                        self.emit_x86_flag_loads_scratch();
+                        self.emit_x86_condition_branch_scratch(*condition)
+                    };
+                    if native_condition.is_some()
+                        && edge_reads_flags(*fallthrough, &optimized.blocks, &by_address)
+                        && let Some(compare) = native_compare.as_ref()
+                    {
+                        self.compile_instruction(compare, arch, None, false)?;
+                    }
+                    for insn in fallthrough_copies {
+                        self.compile_instruction(insn, arch, None, false)?;
+                    }
+                    if let Some(fallthrough_index) = by_address.get(fallthrough).copied() {
+                        let pos = self.emitter.len();
+                        self.emitter.b(0);
+                        jump_patches.push((pos, fallthrough_index));
+                    } else {
+                        self.emit_set_state_rip(*fallthrough);
+                        self.emit_store_guest_registers(arch);
+                        self.emitter.movz(regmap::X0, EXIT_JUMP as u16, 0);
+                        self.emit_epilogue();
+                    }
+                    let taken_label = self.emitter.len();
+                    conditional_patches.push((taken_pos, taken_label));
+                    if native_condition.is_some()
+                        && edge_reads_flags(*target, &optimized.blocks, &by_address)
+                        && let Some(compare) = native_compare.as_ref()
+                    {
+                        self.compile_instruction(compare, arch, None, false)?;
+                    }
+                    for insn in taken_copies {
+                        self.compile_instruction(insn, arch, None, false)?;
+                    }
+                    if let Some(target_index) = by_address.get(target).copied() {
+                        let pos = self.emitter.len();
+                        self.emitter.b(0);
+                        jump_patches.push((pos, target_index));
+                    } else {
+                        self.emit_set_state_rip(*target);
+                        self.emit_store_guest_registers(arch);
+                        self.emitter.movz(regmap::X0, EXIT_JUMP as u16, 0);
+                        self.emit_epilogue();
+                    }
+                }
+                crate::jit_ssa::OptimizedTerminator::Return { .. } => {
+                    self.emit_store_guest_registers(arch);
+                    self.emitter.movz(regmap::X0, EXIT_RET as u16, 0);
+                    self.emit_epilogue();
+                }
+                crate::jit_ssa::OptimizedTerminator::Exit => {
+                    self.emit_store_guest_registers(arch);
+                    self.emitter.movz(regmap::X0, EXIT_NORMAL as u16, 0);
+                    self.emit_epilogue();
+                }
+            }
+        }
+
+        // Defensive normal exit (a function with no explicit terminator).
+        self.emit_store_guest_registers(arch);
+        self.emitter.movz(regmap::X0, EXIT_NORMAL as u16, 0);
+        self.emit_epilogue();
+
+        // Shared safepoint stub.
+        let mut safepoints = std::mem::take(&mut extra_safepoints);
+        if let Some(pos) = self.safepoint_cbnz_patch.take() {
+            safepoints.push(pos);
+        }
+        if !safepoints.is_empty() {
+            let stub = self.emitter.len();
+            self.emit_store_guest_registers(arch);
+            self.emitter.movz(regmap::X0, EXIT_JUMP as u16, 0);
+            self.emit_epilogue();
+            for pos in safepoints {
+                self.patch_cbnz_any(pos, stub);
+            }
+        }
+        self.finish_fault_stub(arch);
+
+        for (pos, target) in jump_patches {
+            self.patch_b_any(pos, labels[target]);
+        }
+        for (pos, target) in conditional_patches {
+            self.patch_bcond_any(pos, target);
+        }
+        let code_size = self.emitter.len();
+        let code_ptr = self.memory_manager.allocate_code_space(code_size);
+        if code_ptr.is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcJitCodeAllocFailed,
+                "JIT Tier2 function: failed to allocate executable memory",
+            ));
+        }
+        self.install_code(code_ptr, code_size)?;
+
+        let mut source = Vec::new();
+        for block in blocks {
+            source.extend(block.instructions.iter().cloned());
+        }
+        let source_hash = compute_ir_hash(&source, entry_address);
+        let link_slots = LinkSlots::new();
+        Ok(JitCompiledBlock {
+            entry_addr: code_ptr as usize,
+            entry_atomic: AtomicPtr::new(code_ptr),
+            code_size,
+            guest_address: entry_address,
+            instruction_count: original_count,
+            source_hash,
+            last_exit_info: None,
+            compile_tier: CompilationTier::Tier2,
+            ends_in_control_flow: true,
+            link_target: link_slots.jump,
+            taken_link: link_slots.taken,
+            fallthrough_link: link_slots.fallthrough,
+            call_link: link_slots.call,
+            return_entry_link: link_slots.return_entry,
+            worker_safe: false,
+        })
+    }
+
+    /// Emit a native x86 CMP/TEST for a 64-bit register/immediate comparison.
+    /// Returns false when the form is not covered and the caller must use the
+    /// generic (helper-backed) emission.
+    fn emit_native_compare(&mut self, insn: &IrInstruction) -> bool {
+        use crate::cpu::CompareOperand;
+        let (lhs, rhs, width, is_test) = match insn {
+            IrInstruction::Compare { lhs, rhs, width } => (lhs, rhs, *width, false),
+            IrInstruction::Test { lhs, rhs, width } => (lhs, rhs, *width, true),
+            _ => return false,
+        };
+        if width != 8 {
+            return false;
+        }
+        let resolve =
+            |emitter: &mut Emitter, operand: &CompareOperand, scratch: u32| -> Option<u32> {
+                match operand {
+                    CompareOperand::Register(reg) => Some(regmap::guest_to_arm(reg.index())),
+                    CompareOperand::ImmediateU64(value) => {
+                        emitter.mov_imm64(scratch, *value);
+                        Some(scratch)
+                    }
+                    _ => None,
+                }
+            };
+        let Some(lhs_reg) = resolve(&mut self.emitter, lhs, regmap::X21) else {
+            return false;
+        };
+        let Some(rhs_reg) = resolve(&mut self.emitter, rhs, regmap::X22) else {
+            return false;
+        };
+        if is_test {
+            self.emitter.ands_reg(31, lhs_reg, rhs_reg);
+        } else {
+            self.emitter.subs_reg(31, lhs_reg, rhs_reg);
+        }
+        true
+    }
+
+    fn patch_b_any(&mut self, position: usize, target: usize) {
+        let offset = (target as i32 - position as i32) / 4;
+        let insn = 0x1400_0000u32 | ((offset as u32) & 0x03ff_ffff);
+        self.emitter.code[position..position + 4].copy_from_slice(&insn.to_le_bytes());
+    }
+
+    fn patch_bcond_any(&mut self, position: usize, target: usize) {
+        let offset = (target as i32 - position as i32) / 4;
+        let condition = self.emitter.code[position] & 0x0f;
+        let insn = 0x5400_0000u32 | (((offset as u32) & 0x7ffff) << 5) | u32::from(condition);
+        self.emitter.code[position..position + 4].copy_from_slice(&insn.to_le_bytes());
+    }
+
+    fn patch_cbnz_any(&mut self, position: usize, target: usize) {
+        let offset = (target as i32 - position as i32) / 4;
+        let register = self.emitter.code[position] & 0x1f;
+        let insn = 0xb500_0000u32 | (((offset as u32) & 0x7ffff) << 5) | u32::from(register);
+        self.emitter.code[position..position + 4].copy_from_slice(&insn.to_le_bytes());
+    }
+
+    /// Load the six x86 flag bytes into non-guest scratch registers.  Unlike
+    /// `emit_x86_flag_loads`, this keeps x4-x20 (the live guest register file)
+    /// intact so a whole-function internal branch needs no per-block reload.
+    fn emit_x86_flag_loads_scratch(&mut self) {
+        let base = std::mem::offset_of!(CpuState, flags) as u32;
+        let cf = base + std::mem::offset_of!(crate::cpu::Flags, cf) as u32;
+        let pf = base + std::mem::offset_of!(crate::cpu::Flags, pf) as u32;
+        let zf = base + std::mem::offset_of!(crate::cpu::Flags, zf) as u32;
+        let sf = base + std::mem::offset_of!(crate::cpu::Flags, sf) as u32;
+        let of = base + std::mem::offset_of!(crate::cpu::Flags, of) as u32;
+        self.emitter.ldr8(21, regmap::X0, cf);
+        self.emitter.ldr8(22, regmap::X0, pf);
+        self.emitter.ldr8(24, regmap::X0, zf);
+        self.emitter.ldr8(25, regmap::X0, sf);
+        self.emitter.ldr8(27, regmap::X0, of);
+    }
+
+    /// Scratch-only counterpart of `emit_x86_condition_branch`.
+    fn emit_x86_condition_branch_scratch(&mut self, condition: ConditionCode) -> usize {
+        const EQ: u32 = 0;
+        const NE: u32 = 1;
+        // cf=x21, pf=x22, zf=x24, sf=x25, of=x27, temps x26/x28.
+        match condition {
+            ConditionCode::Equal => {
+                self.emitter.subs_imm(31, 24, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotEqual => {
+                self.emitter.subs_imm(31, 24, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+            ConditionCode::Overflow => {
+                self.emitter.subs_imm(31, 27, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotOverflow => {
+                self.emitter.subs_imm(31, 27, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+            ConditionCode::Below => {
+                self.emitter.subs_imm(31, 21, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotBelow => {
+                self.emitter.subs_imm(31, 21, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+            ConditionCode::Above => {
+                self.emitter.movz(28, 1, 0);
+                self.emitter.eor_reg(26, 21, 28);
+                self.emitter.eor_reg(28, 24, 28);
+                self.emitter.and_reg(26, 26, 28);
+                self.emitter.subs_imm(31, 26, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotAbove => {
+                self.emitter.orr_reg(26, 21, 24);
+                self.emitter.subs_imm(31, 26, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::Sign => {
+                self.emitter.subs_imm(31, 25, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotSign => {
+                self.emitter.subs_imm(31, 25, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+            ConditionCode::Less => {
+                self.emitter.subs_reg(31, 25, 27);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::GreaterEqual => {
+                self.emitter.subs_reg(31, 25, 27);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+            ConditionCode::LessEqual => {
+                self.emitter.eor_reg(26, 25, 27);
+                self.emitter.orr_reg(26, 24, 26);
+                self.emitter.subs_imm(31, 26, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::Greater => {
+                self.emitter.eor_reg(26, 25, 27);
+                self.emitter.movz(28, 1, 0);
+                self.emitter.eor_reg(26, 26, 28);
+                self.emitter.eor_reg(28, 24, 28);
+                self.emitter.and_reg(26, 26, 28);
+                self.emitter.subs_imm(31, 26, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::Parity => {
+                self.emitter.subs_imm(31, 22, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(NE, 0);
+                pos
+            }
+            ConditionCode::NotParity => {
+                self.emitter.subs_imm(31, 22, 0);
+                let pos = self.emitter.len();
+                self.emitter.bcond(EQ, 0);
+                pos
+            }
+        }
     }
 
     /// Constant folding: forward dataflow pass that tracks known register values
@@ -9735,6 +13448,7 @@ fn status_signal_description(_status: &std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpu::GUEST_FLAT_SIZE;
 
     #[test]
     fn jit_memory_manager_rejects_null_and_zero_size_finalize() {
@@ -9771,10 +13485,15 @@ mod tests {
     fn jit_exec_probe_matrix_macos_aarch64() {
         let matrix = probe_jit_execution();
         eprintln!("[jit] executable-memory probe matrix: {matrix:#?}");
-        assert_eq!(
-            matrix.mprotect_rx,
-            JitExecProbeOutcome::Executed(42),
-            "mmap RW -> mprotect RX must execute the ARM64 stub: {}",
+        // macOS may deny the RX transition with ENOENT depending on the
+        // process's W^X state; the selected mechanism below must still be the
+        // MAP_JIT W^X path that does execute.
+        assert!(
+            matches!(
+                matrix.mprotect_rx,
+                JitExecProbeOutcome::Executed(42) | JitExecProbeOutcome::MprotectFailed(2)
+            ),
+            "mmap RW -> mprotect RX must execute or fail with a real ENOENT: {}",
             matrix.mprotect_rx
         );
         assert_eq!(
@@ -11271,8 +14990,8 @@ mod tests {
         assert_eq!(runtime.flat_memory.materialised_page_count(), 16);
         assert_eq!(
             runtime.flat_memory.total_page_count(),
-            1_048_576,
-            "the flat region is still the full 4 GiB"
+            (runtime.flat_memory.size() / 4096) as u64,
+            "the flat region is the whole direct window"
         );
         assert!(
             telemetry.pages_materialised < runtime.flat_memory.total_page_count() / 1000,
@@ -11309,7 +15028,7 @@ mod tests {
         assert!(
             !runtime
                 .flat_memory
-                .is_page_materialised(4 * 1024 * 1024 * 1024)
+                .is_page_materialised(GUEST_FLAT_SIZE as u64)
         );
         let debug = format!("{memory:?}");
         assert!(debug.contains("GuestMemoryStore"));
@@ -11320,7 +15039,7 @@ mod tests {
     fn invalid_flat_view_rejects_reads_syncs_and_materialisation() {
         let memory = MemoryImage::default();
         let store = Arc::new(GuestMemoryStore::invalid_for_test());
-        let bitmap_words = (4 * 1024 * 1024 * 1024_usize).div_ceil(4096 * 64);
+        let bitmap_words = GUEST_FLAT_SIZE.div_ceil(4096 * 64);
         let flat = FlatGuestMemory {
             store,
             materialised: (0..bitmap_words)
@@ -11370,7 +15089,7 @@ mod tests {
         assert_eq!(empty.pages_materialised, 0);
         let outside = runtime
             .flat_memory
-            .materialise_pages(&memory, &[4 * 1024 * 1024 * 1024]);
+            .materialise_pages(&memory, &[GUEST_FLAT_SIZE as u64]);
         assert_eq!(outside.pages_materialised, 0);
         assert_eq!(outside.sync_operations, 0);
     }
@@ -11925,7 +15644,7 @@ mod production_safety_tests {
         assert_eq!(
             runtime.flat_memory.base(),
             memory.canonical_store().flat_base(),
-            "both views must share the same 4 GiB mapping"
+            "both views must share the same direct-window mapping"
         );
         assert_eq!(memory.canonical_store().materialisation_count(), 1);
 
@@ -12019,6 +15738,7 @@ mod production_safety_tests {
 #[cfg(test)]
 mod coverage_adversarial_tests {
     use super::*;
+    use crate::cpu::{GUEST_FLAT_ALIGN, GUEST_FLAT_MIN_SIZE, GUEST_FLAT_SIZE};
     use std::sync::atomic::Ordering;
 
     fn probe_matrix(selected: JitExecMechanism) -> JitExecProbeMatrix {
@@ -12914,12 +16634,13 @@ mod coverage_adversarial_tests {
     #[test]
     fn jit_jump_missing_link_slot_pins_exit_encoding() {
         let mut compiler = JitCompiler::new();
-        compiler.link_slot = None;
+        compiler.link_slots = None;
         compiler
             .compile_instruction(
                 &IrInstruction::Jump { target: 0x2000 },
                 GuestArch::X64,
                 None,
+                true,
             )
             .expect("jump emission");
         let code = &compiler.emitter.code;
@@ -13462,27 +17183,23 @@ mod coverage_adversarial_tests {
             flat_base: view.flat_base(),
             memory: view,
             mechanism: runtime.compiler.memory_manager.mechanism(),
+            epoch: 0,
         };
         let mut state = CpuState::new(GuestArch::X86);
         state.set(Register::Rcx, 3);
         let mut taken = Vec::new();
         for _ in 0..4 {
-            let mut exit_slot = [u64::MAX, program.flat_base];
+            let mut chain = ChainState::new(program.flat_base, 0x1000, LINK_BUDGET);
             let outcome = unsafe {
-                execute_slice_block(
-                    &program,
-                    &program.blocks[&0x1000],
-                    &mut state,
-                    &mut exit_slot,
-                )
+                execute_slice_block(&program, &program.blocks[&0x1000], &mut state, &mut chain)
             };
-            match outcome.reason {
-                JitExitReason::ConditionalBranch {
-                    taken: branch_taken,
-                    ..
-                } => taken.push(branch_taken),
+            let branch_taken = match outcome.reason {
+                JitExitReason::ConditionalBranch { taken, .. } => taken,
+                JitExitReason::ConditionalTaken { .. } => true,
+                JitExitReason::ConditionalNotTaken { .. } => false,
                 other => panic!("expected conditional branch, got {other:?}"),
-            }
+            };
+            taken.push(branch_taken);
         }
         assert_eq!(taken, vec![true, true, false, true]);
         assert_eq!(state.get(Register::Rcx), 0xFFFF_FFFF);
@@ -13599,10 +17316,10 @@ mod coverage_adversarial_tests {
             }
         );
         assert_eq!(
-            view.load(0x1_0000_0000, 8)
+            view.load(view.flat_size(), 8)
                 .expect_err("range beyond the flat window must fault"),
             GuestMemoryFault {
-                address: 0x1_0000_0000,
+                address: view.flat_size(),
                 write: false,
                 read_len: 8,
             }
@@ -13616,6 +17333,298 @@ mod coverage_adversarial_tests {
                 read_len: 8,
             }
         );
+    }
+
+    #[test]
+    fn invalid_small_flat_view_bitmap_is_grown_on_attach() {
+        let mut flat = FlatGuestMemory {
+            store: Arc::new(GuestMemoryStore::invalid_for_test()),
+            materialised: vec![AtomicU64::new(0)].into_boxed_slice(),
+        };
+        assert_eq!(flat.materialised.len(), 1);
+        assert_eq!(flat.is_page_materialised(0), false);
+        let memory = MemoryImage::default();
+        flat.attach_store(memory.canonical_store());
+        let required_words = flat.size().div_ceil(4096 * 64);
+        assert_eq!(flat.materialised.len(), required_words);
+        assert_eq!(
+            required_words >= GUEST_FLAT_MIN_SIZE.div_ceil(4096 * 64),
+            true,
+            "the attached bitmap must cover at least the 128 GiB minimum"
+        );
+        assert_eq!(flat.is_page_materialised(0), false);
+    }
+
+    #[test]
+    fn guest_slice_memory_above_four_gib_is_direct_and_window_end_faults_exactly() {
+        let address = 0x2_0000_0000_u64;
+        let mut memory = MemoryImage::default();
+        let window_size = memory.canonical_store().flat_size() as u64;
+        let last_window_page = window_size - 0x1000;
+        let window_end = window_size;
+        memory.map_bytes(address, &[0u8; 4096]);
+        memory.map_bytes(last_window_page, &[0u8; 4096]);
+        let view = GuestSliceMemory::new(&memory, BTreeSet::from([address]));
+        assert_eq!(view.flat_size(), window_size);
+        assert_eq!(view.flat_size() / 4096, window_size / 4096);
+        assert_eq!(
+            view.flat_base() % GUEST_FLAT_ALIGN as u64,
+            0,
+            "the JIT base must be aligned for direct guest addressing"
+        );
+
+        assert_eq!(view.load(address, 8).expect("direct load"), 0);
+        assert_eq!(
+            view.store(address, &0x1122_3344_5566_7788_u64.to_le_bytes())
+                .expect("direct store"),
+            true,
+            "a store to a >4 GiB code page must report the SMC write"
+        );
+        assert_eq!(
+            view.load(address, 8).expect("direct reload"),
+            0x1122_3344_5566_7788
+        );
+        assert_eq!(memory.read_u64(address).unwrap(), 0x1122_3344_5566_7788);
+        assert_eq!(
+            view.load(last_window_page, 8)
+                .expect("the last window page is direct"),
+            0
+        );
+        assert_eq!(view.take_code_writes(), vec![(address, 8)]);
+
+        let fault = view
+            .load(window_end, 8)
+            .expect_err("an address at the window end must fault");
+        assert_eq!(
+            fault,
+            GuestMemoryFault {
+                address: window_end,
+                write: false,
+                read_len: 8,
+            }
+        );
+        let store_fault = view
+            .store(window_end, &[0x11, 0x22])
+            .expect_err("an address beyond the window must fault");
+        assert_eq!((store_fault.address, store_fault.write), (window_end, true));
+        assert_eq!(memory.canonical_store().materialisation_count(), 2);
+        assert_eq!(memory.canonical_store().high_page_count(), 0);
+    }
+
+    #[test]
+    fn jit_loop_with_heap_above_four_gib_executes_without_fault_or_overflow() {
+        let mut runtime = capable_runtime();
+        let heap = 0x2_0000_0000_u64;
+        let site = 0x2_0000_1000_u64;
+        let operand = crate::cpu::MemoryOperand {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0,
+            rip_relative: false,
+            rip_base: 0,
+            segment: None,
+            address_size_32: false,
+            absolute_address: Some(heap),
+        };
+        let ir = vec![
+            IrInstruction::LoadMemory {
+                dst: Register::Rax,
+                address: operand,
+                width: 8,
+            },
+            IrInstruction::AddImm {
+                dst: Register::Rax,
+                value: 1,
+                width: 8,
+            },
+            IrInstruction::StoreMemory {
+                src: Register::Rax,
+                address: operand,
+                width: 8,
+            },
+            IrInstruction::SubImm {
+                dst: Register::Rcx,
+                value: 1,
+                width: 8,
+            },
+            IrInstruction::Compare {
+                lhs: crate::cpu::CompareOperand::Register(Register::Rcx),
+                rhs: crate::cpu::CompareOperand::ImmediateU64(0),
+                width: 8,
+            },
+            IrInstruction::JumpIf {
+                condition: ConditionCode::NotEqual,
+                target: site,
+                fallthrough: site + 0x100,
+            },
+        ];
+        let block = runtime
+            .get_or_compile_slice_block(&ir, site, GuestArch::X64)
+            .expect("compile >4 GiB slice loop")
+            .clone();
+        assert_eq!(block.worker_safe, true);
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(heap, &[0u8; 4096]);
+        let view = Arc::new(GuestSliceMemory::new(
+            &memory,
+            BTreeSet::from([site & !0xfff]),
+        ));
+        let program = GuestSliceProgram {
+            blocks: HashMap::from([(site, block)]),
+            flat_base: view.flat_base(),
+            memory: view,
+            mechanism: runtime.compiler.memory_manager.mechanism(),
+            epoch: 0,
+        };
+        let _guard = WorkerSliceGuard::install(&program.memory);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, 3);
+        let mut branches = Vec::new();
+        for _ in 0..4 {
+            let mut chain = ChainState::new(program.flat_base, site, LINK_BUDGET);
+            let outcome = unsafe {
+                execute_slice_block(&program, &program.blocks[&site], &mut state, &mut chain)
+            };
+            let taken = match outcome.reason {
+                JitExitReason::ConditionalBranch { taken, .. } => taken,
+                JitExitReason::ConditionalTaken { .. } => true,
+                JitExitReason::ConditionalNotTaken { .. } => false,
+                other => panic!("expected conditional branch, got {other:?}"),
+            };
+            branches.push(taken);
+            if !taken {
+                break;
+            }
+        }
+        assert_eq!(branches, vec![true, true, false]);
+        assert_eq!(state.get(Register::Rcx), 0);
+        assert_eq!(
+            memory.read_u64(heap).unwrap(),
+            3,
+            "each dispatched loop iteration must increment the >4 GiB heap word"
+        );
+        assert_eq!(memory.canonical_store().materialisation_count(), 1);
+    }
+
+    #[test]
+    fn jit_memory_helpers_above_four_gib_and_high_frame_fallback_are_exact() {
+        let mut runtime = capable_runtime();
+        let flat_address = 0x2_0000_0000_u64;
+        let upper_flat_address = 0x10_0000_0000_u64;
+        let high_address = 0x1800_0000_0000_u64;
+        let site = 0x2_0000_5000_u64;
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(flat_address, &[0u8; 4096]);
+        memory.write_u64(flat_address, 0x0102_0304_0506_0708);
+        memory.map_bytes(upper_flat_address, &[0u8; 4096]);
+        memory.write_u64(upper_flat_address, 0x2122_2324_2526_2728);
+        memory.map_bytes(high_address, &[0u8; 4096]);
+        memory.write_u64(high_address, 0x1112_1314_1516_1718);
+        runtime.attach_guest_memory(&memory);
+
+        let flat_operand = crate::cpu::MemoryOperand {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0,
+            rip_relative: false,
+            rip_base: 0,
+            segment: None,
+            address_size_32: false,
+            absolute_address: Some(flat_address),
+        };
+        let upper_flat_operand = crate::cpu::MemoryOperand {
+            absolute_address: Some(upper_flat_address),
+            ..flat_operand
+        };
+        let high_operand = crate::cpu::MemoryOperand {
+            absolute_address: Some(high_address),
+            ..flat_operand
+        };
+        runtime
+            .get_or_compile(
+                &[IrInstruction::LoadMemory {
+                    dst: Register::Rax,
+                    address: flat_operand,
+                    width: 8,
+                }],
+                site,
+                GuestArch::X64,
+                None,
+            )
+            .expect("compile >4 GiB load");
+        let mut state = CpuState::new(GuestArch::X64);
+        let reason = execute_cached(&mut runtime, site, &mut state, &mut memory);
+        assert_eq!(reason, JitExitReason::Normal { new_rip: state.rip });
+        assert_eq!(state.get(Register::Rax), 0x0102_0304_0506_0708);
+
+        runtime
+            .get_or_compile(
+                &[IrInstruction::LoadMemory {
+                    dst: Register::Rax,
+                    address: upper_flat_operand,
+                    width: 8,
+                }],
+                site + 0x200,
+                GuestArch::X64,
+                None,
+            )
+            .expect("compile 64 GiB load");
+        let reason = execute_cached(&mut runtime, site + 0x200, &mut state, &mut memory);
+        assert_eq!(reason, JitExitReason::Normal { new_rip: state.rip });
+        assert_eq!(
+            state.get(Register::Rax),
+            0x2122_2324_2526_2728,
+            "a 64 GiB address must be served directly by the window"
+        );
+
+        runtime
+            .get_or_compile(
+                &[IrInstruction::LoadMemory {
+                    dst: Register::Rax,
+                    address: high_operand,
+                    width: 8,
+                }],
+                site + 0x100,
+                GuestArch::X64,
+                None,
+            )
+            .expect("compile high-frame load");
+        let reason = execute_cached(&mut runtime, site + 0x100, &mut state, &mut memory);
+        assert_eq!(reason, JitExitReason::Normal { new_rip: state.rip });
+        assert_eq!(
+            state.get(Register::Rax),
+            0x1112_1314_1516_1718,
+            "addresses beyond the window must keep using MemoryImage frames"
+        );
+        assert_eq!(memory.canonical_store().materialisation_count(), 3);
+        assert_eq!(memory.canonical_store().high_page_count(), 1);
+        assert_eq!(
+            memory.canonical_store().resident_flat_page_count(),
+            2,
+            "the high-address frame must not consume flat residency"
+        );
+    }
+
+    #[test]
+    fn sigbus_fallback_above_four_gib_uses_the_direct_window() {
+        let mut memory = MemoryImage::default();
+        let page = 0x2_0000_0000_u64;
+        memory.map_bytes(page, &[0x5A; 4096]);
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        runtime.attach_guest_memory(&memory);
+        let base = runtime.flat_memory.base() as *mut u8;
+        let size = runtime.flat_memory.size();
+        let before = SIGBUS_PAGE_FOUND.load(Ordering::Relaxed);
+        service_faulting_page(&runtime, &memory, page, base, size);
+        assert_eq!(SIGBUS_PAGE_FOUND.load(Ordering::Relaxed), before + 1);
+        assert_eq!(runtime.flat_memory.is_page_materialised(page), true);
+        // SAFETY: the >4 GiB page is inside the canonical flat mapping.
+        let byte = unsafe { std::ptr::read_volatile(base.add(page as usize)) };
+        assert_eq!(byte, 0x5A);
+        assert_eq!(memory.read_u8(page).unwrap(), 0x5A);
+        assert_eq!(memory.canonical_store().materialisation_count(), 1);
     }
 
     #[test]
@@ -13642,7 +17651,7 @@ mod coverage_adversarial_tests {
     #[test]
     fn execute_slice_block_stale_null_entry_falls_back_to_safepoint() {
         let mut runtime = capable_runtime();
-        let mut block = runtime
+        let block = runtime
             .get_or_compile_slice_block(&[IrInstruction::Nop], 0x7000, GuestArch::X64)
             .expect("compile slice block")
             .clone();
@@ -13658,18 +17667,14 @@ mod coverage_adversarial_tests {
             flat_base: view.flat_base(),
             memory: view,
             mechanism: runtime.compiler.memory_manager.mechanism(),
+            epoch: 0,
         };
         let mut state = CpuState::new(GuestArch::X64);
-        let mut exit_slot = [u64::MAX, program.flat_base];
+        let mut chain = ChainState::new(program.flat_base, 0x7000, LINK_BUDGET);
         assert_eq!(program.block(0x7000).is_some(), true);
         assert_eq!(program.block(0x7001).is_none(), true);
         let outcome = unsafe {
-            execute_slice_block(
-                &program,
-                &program.blocks[&0x7000],
-                &mut state,
-                &mut exit_slot,
-            )
+            execute_slice_block(&program, &program.blocks[&0x7000], &mut state, &mut chain)
         };
         assert_eq!(outcome.reason, JitExitReason::Safepoint);
         assert_eq!(outcome.final_block, 0x7000);
@@ -13695,9 +17700,36 @@ mod coverage_adversarial_tests {
     }
 
     #[test]
-    fn worker_safe_classification_rejects_host_barriers_and_helper_fallback() {
+    fn worker_safe_classification_accepts_native_control_transfer_rejects_mid_block_exits() {
+        // An interpreter-helper fallback still needs a live `MemoryImage`, so
+        // it can never run on a production worker.
         assert_eq!(block_is_worker_safe(&[IrInstruction::Nop], true), false);
+        // Mid-block-exit instructions re-run the whole block on the
+        // interpreter, so they must stay host barriers.
         assert_eq!(block_is_worker_safe(&[IrInstruction::Cpuid], false), false);
+        assert_eq!(block_is_worker_safe(&[IrInstruction::Xgetbv], false), false);
+        assert_eq!(
+            block_is_worker_safe(
+                &[IrInstruction::Fxsave {
+                    address: crate::cpu::MemoryOperand {
+                        base: None,
+                        index: None,
+                        scale: 1,
+                        displacement: 0,
+                        rip_relative: false,
+                        rip_base: 0,
+                        segment: None,
+                        address_size_32: false,
+                        absolute_address: None,
+                    }
+                }],
+                false
+            ),
+            false
+        );
+        // Guest call / ret / indirect control transfer now lowers to a native
+        // worker exit (target published in the exit cell), so the block is
+        // worker-safe even though the target block may take the owner path.
         assert_eq!(
             block_is_worker_safe(
                 &[IrInstruction::Call {
@@ -13706,7 +17738,7 @@ mod coverage_adversarial_tests {
                 }],
                 false,
             ),
-            false
+            true
         );
         assert_eq!(
             block_is_worker_safe(
@@ -13716,11 +17748,15 @@ mod coverage_adversarial_tests {
                 }],
                 false,
             ),
-            false
+            true
+        );
+        assert_eq!(
+            block_is_worker_safe(&[IrInstruction::JumpRegister { src: Register::Rax }], false),
+            true
         );
         assert_eq!(
             block_is_worker_safe(&[IrInstruction::Return { stack_adjust: 0 }], false),
-            false
+            true
         );
         assert_eq!(
             block_is_worker_safe(
@@ -13746,5 +17782,1131 @@ mod coverage_adversarial_tests {
             ),
             true
         );
+    }
+    // ── Production worker control flow (return predictor / inline caches) ──
+
+    fn worker_program(
+        runtime: &mut JitRuntime,
+        memory: &MemoryImage,
+        arch: GuestArch,
+        blocks: &[(u64, Vec<IrInstruction>)],
+    ) -> GuestSliceProgram {
+        for (address, ir) in blocks {
+            runtime
+                .get_or_compile_slice_block(ir, *address, arch)
+                .expect("compile worker block");
+        }
+        runtime.build_slice_program(memory)
+    }
+
+    fn worker_memory(stack: u64) -> MemoryImage {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(stack & !0xfff, &vec![0_u8; 0x1000]);
+        memory
+    }
+
+    #[test]
+    fn indirect_inline_cache_polymorphic_boundary_and_megamorphic_counts_are_exact() {
+        let site = 0x1_000_u64;
+        let mut cache = IndirectInlineCache::default();
+        assert_eq!(cache.lookup(site, 0xA), None);
+        cache.insert(site, 0xA, 0xAA);
+        assert_eq!(cache.lookup(site, 0xA), Some(0xAA));
+        assert_eq!(cache.lookup(site, 0xB), None);
+        cache.insert(site, 0xB, 0xBB);
+        assert_eq!(cache.lookup(site, 0xA), Some(0xAA));
+        assert_eq!(cache.lookup(site, 0xB), Some(0xBB));
+        assert_eq!(
+            (
+                cache.hits(),
+                cache.misses(),
+                cache.megamorphic_sites(),
+                cache.megamorphic_hits(),
+                cache.is_megamorphic(site),
+            ),
+            (3, 2, 0, 0, false),
+            "a 2-way code path must stay polymorphic (monomorphic first)"
+        );
+
+        assert_eq!(cache.lookup(site, 0xC), None);
+        cache.insert(site, 0xC, 0xCC);
+        assert_eq!(cache.lookup(site, 0xD), None);
+        cache.insert(site, 0xD, 0xDD);
+        for (target, entry) in [(0xA, 0xAA), (0xB, 0xBB), (0xC, 0xCC), (0xD, 0xDD)] {
+            assert_eq!(cache.lookup(site, target), Some(entry));
+        }
+        assert_eq!(
+            (
+                cache.hits(),
+                cache.misses(),
+                cache.megamorphic_sites(),
+                cache.megamorphic_hits(),
+            ),
+            (7, 4, 0, 0),
+            "four distinct targets are exactly the 4-way polymorphic limit"
+        );
+
+        assert_eq!(cache.lookup(site, 0xE), None);
+        cache.insert(site, 0xE, 0xEE);
+        assert_eq!(
+            (cache.megamorphic_sites(), cache.is_megamorphic(site)),
+            (1, true),
+            "a fifth distinct target must promote the site to megamorphic"
+        );
+        for (target, entry) in [
+            (0xA, 0xAA),
+            (0xB, 0xBB),
+            (0xC, 0xCC),
+            (0xD, 0xDD),
+            (0xE, 0xEE),
+        ] {
+            assert_eq!(cache.lookup(site, target), Some(entry));
+        }
+        assert_eq!(cache.lookup(site, 0xF), None);
+        assert_eq!(
+            (
+                cache.hits(),
+                cache.misses(),
+                cache.megamorphic_sites(),
+                cache.megamorphic_hits(),
+            ),
+            (7, 6, 1, 5),
+            "megamorphic lookups must be counted separately from hits/misses"
+        );
+    }
+
+    #[test]
+    fn return_predictor_misprediction_edge_boundary_is_exact() {
+        let mut predictor = ReturnPredictor::new(4);
+        assert_eq!(predictor.on_return(0x10), false);
+        assert_eq!(
+            (
+                predictor.hits(),
+                predictor.misses(),
+                predictor.mispredictions()
+            ),
+            (0, 1, 0),
+            "a return without a call is a miss, not a misprediction"
+        );
+        predictor.on_call(0x10);
+        assert_eq!(predictor.on_return(0x10), true);
+        predictor.on_call(0x20);
+        predictor.on_call(0x30);
+        assert_eq!(predictor.on_return(0x30), true);
+        assert_eq!(predictor.on_return(0x99), false);
+        assert_eq!(
+            (
+                predictor.hits(),
+                predictor.misses(),
+                predictor.mispredictions()
+            ),
+            (2, 2, 1),
+            "the real guest return address must be authoritative"
+        );
+        assert_eq!(predictor.on_return(0x77), false);
+        assert_eq!(
+            (
+                predictor.hits(),
+                predictor.misses(),
+                predictor.mispredictions()
+            ),
+            (2, 3, 1)
+        );
+
+        // A non-local return resynchronises to the real frame when possible.
+        predictor.reset();
+        predictor.on_call(0x1);
+        predictor.on_call(0x2);
+        predictor.on_call(0x3);
+        assert_eq!(predictor.on_return(0x2), false);
+        assert_eq!(
+            (
+                predictor.hits(),
+                predictor.misses(),
+                predictor.mispredictions()
+            ),
+            (0, 1, 1)
+        );
+        assert_eq!(
+            predictor.on_return(0x2),
+            true,
+            "the predictor must resynchronise after a misprediction"
+        );
+        assert_eq!(
+            (
+                predictor.hits(),
+                predictor.misses(),
+                predictor.mispredictions()
+            ),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn worker_recursion_uses_native_call_ret_chain_and_exact_predictor_counters() {
+        let arch = GuestArch::X64;
+        let stack = 0x11_000_u64;
+        let mut memory = worker_memory(stack);
+        memory.write_u64(stack + 0x800, 0xDEAD);
+        let mut runtime = JitRuntime::new(arch);
+        let blocks = vec![
+            (
+                0x1000,
+                vec![IrInstruction::Call {
+                    target: 0x2000,
+                    return_address: 0x1010,
+                }],
+            ),
+            (0x1010, vec![IrInstruction::Return { stack_adjust: 0 }]),
+            (
+                0x2000,
+                vec![
+                    IrInstruction::SubImm {
+                        dst: Register::Rcx,
+                        value: 1,
+                        width: 8,
+                    },
+                    IrInstruction::Compare {
+                        lhs: crate::cpu::CompareOperand::Register(Register::Rcx),
+                        rhs: crate::cpu::CompareOperand::ImmediateU64(0),
+                        width: 8,
+                    },
+                    IrInstruction::JumpIf {
+                        condition: ConditionCode::NotEqual,
+                        target: 0x2010,
+                        fallthrough: 0x2020,
+                    },
+                ],
+            ),
+            (
+                0x2010,
+                vec![IrInstruction::Call {
+                    target: 0x2000,
+                    return_address: 0x2018,
+                }],
+            ),
+            (0x2018, vec![IrInstruction::Return { stack_adjust: 0 }]),
+            (0x2020, vec![IrInstruction::Return { stack_adjust: 0 }]),
+        ];
+        let program = worker_program(&mut runtime, &memory, arch, &blocks);
+        let mut state = CpuState::new(arch);
+        state.rip = 0x1000;
+        state.set(Register::Rsp, stack + 0x800);
+        state.set(Register::Rcx, 3);
+        let mut thread = SliceThreadState::default();
+        let shutdown = AtomicBool::new(false);
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 64, &shutdown) };
+        assert_eq!(
+            report.stop,
+            SliceStop::HostBarrier { rip: 0xDEAD },
+            "the balanced recursion must unwind to the caller's sentinel"
+        );
+        assert_eq!(state.get(Register::Rcx), 0);
+        assert_eq!(report.blocks_executed, 10);
+        assert_eq!(
+            (
+                report.metrics.return_predictions,
+                report.metrics.return_hits,
+                report.metrics.return_misses,
+                report.metrics.return_mispredictions,
+                report.metrics.native_chains,
+            ),
+            (4, 3, 1, 0, 9),
+            "three calls and four returns must be predicted exactly"
+        );
+        assert_eq!(report.metrics.blocks_executed, 10);
+        assert_eq!(
+            report.metrics.dispatcher_exits, 1,
+            "the balanced recursion is one native chain"
+        );
+        assert_eq!(report.metrics.instructions_executed, 16);
+    }
+
+    #[test]
+    fn worker_mispredicted_return_follows_the_real_guest_address() {
+        let arch = GuestArch::X64;
+        let stack = 0x12_000_u64;
+        let top = stack + 0x800;
+        let memory = worker_memory(stack);
+        let mut runtime = JitRuntime::new(arch);
+        let address = crate::cpu::MemoryOperand {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0,
+            rip_relative: false,
+            rip_base: 0,
+            segment: None,
+            address_size_32: false,
+            absolute_address: Some(top - 8),
+        };
+        let blocks = vec![
+            (
+                0x1000,
+                vec![IrInstruction::Call {
+                    target: 0x2000,
+                    return_address: 0x1010,
+                }],
+            ),
+            (
+                0x2000,
+                vec![
+                    IrInstruction::StoreMemory {
+                        src: Register::Rcx,
+                        address,
+                        width: 8,
+                    },
+                    IrInstruction::Return { stack_adjust: 0 },
+                ],
+            ),
+            (0x2020, vec![IrInstruction::Jump { target: 0x2020 }]),
+        ];
+        let program = worker_program(&mut runtime, &memory, arch, &blocks);
+        let mut state = CpuState::new(arch);
+        state.rip = 0x1000;
+        state.set(Register::Rsp, top);
+        state.set(Register::Rcx, 0x2020);
+        let mut thread = SliceThreadState::default();
+        let shutdown = AtomicBool::new(false);
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 4, &shutdown) };
+        assert_eq!(
+            report.stop,
+            SliceStop::Budget,
+            "execution must continue at the real return address, not the prediction"
+        );
+        assert_eq!(state.rip, 0x2020);
+        assert_eq!(
+            (
+                report.metrics.return_hits,
+                report.metrics.return_misses,
+                report.metrics.return_mispredictions,
+            ),
+            (0, 1, 1),
+            "the overwritten return address must be a counted misprediction"
+        );
+        assert_eq!(report.metrics.native_chains, 2);
+    }
+
+    #[test]
+    fn worker_indirect_calls_use_monomorphic_polymorphic_and_megamorphic_caches() {
+        let arch = GuestArch::X64;
+        let stack = 0x13_000_u64;
+        let memory = worker_memory(stack);
+        let mut runtime = JitRuntime::new(arch);
+        let mut blocks = vec![(
+            0x1000,
+            vec![IrInstruction::CallRegister {
+                src: Register::Rax,
+                return_address: 0x1010,
+            }],
+        )];
+        for target in [0x2000_u64, 0x3000, 0x4000, 0x5000, 0x6000] {
+            blocks.push((target, vec![IrInstruction::Return { stack_adjust: 0 }]));
+        }
+        let program = worker_program(&mut runtime, &memory, arch, &blocks);
+        let mut state = CpuState::new(arch);
+        state.set(Register::Rsp, stack + 0x800);
+        let mut thread = SliceThreadState::default();
+        let shutdown = AtomicBool::new(false);
+        let sequence = [
+            0x2000, 0x3000, 0x2000, 0x4000, 0x5000, 0x2000, 0x3000, 0x4000, 0x5000,
+        ];
+        for target in sequence {
+            state.rip = 0x1000;
+            state.set(Register::Rsp, stack + 0x800);
+            state.set(Register::Rax, target);
+            // SAFETY: program/state are live for the call; budget 1 executes
+            // only the indirect call block.
+            let report = unsafe { run_slice(&program, &mut state, &mut thread, 1, &shutdown) };
+            assert_eq!(report.stop, SliceStop::Budget);
+            assert_eq!(state.rip, target);
+            assert_eq!(report.metrics.indirect_megamorphic_sites, 0);
+        }
+        assert_eq!(
+            (
+                thread.metrics.indirect_ic_hits,
+                thread.metrics.indirect_ic_misses,
+                thread.metrics.indirect_megamorphic_sites,
+                thread.metrics.indirect_megamorphic_hits,
+            ),
+            (5, 4, 0, 0),
+            "four distinct call targets stay inside the 4-way polymorphic cache"
+        );
+        state.rip = 0x1000;
+        state.set(Register::Rsp, stack + 0x800);
+        state.set(Register::Rax, 0x6000);
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 1, &shutdown) };
+        assert_eq!(report.metrics.indirect_megamorphic_sites, 1);
+        assert_eq!(report.metrics.indirect_ic_misses, 1);
+        for target in [0x2000_u64, 0x3000, 0x4000, 0x5000, 0x6000] {
+            state.rip = 0x1000;
+            state.set(Register::Rsp, stack + 0x800);
+            state.set(Register::Rax, target);
+            let report = unsafe { run_slice(&program, &mut state, &mut thread, 1, &shutdown) };
+            assert_eq!(report.metrics.indirect_megamorphic_hits, 1);
+        }
+        assert_eq!(thread.metrics.indirect_megamorphic_hits, 5);
+        assert_eq!(thread.metrics.indirect_ic_hits, 5);
+        state.rip = 0x1000;
+        state.set(Register::Rsp, stack + 0x800);
+        state.set(Register::Rax, 0x2000);
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 1, &shutdown) };
+        assert_eq!(
+            (
+                report.metrics.indirect_ic_hits,
+                report.metrics.indirect_megamorphic_hits,
+                thread.metrics.indirect_megamorphic_sites,
+            ),
+            (0, 1, 1),
+            "a megamorphic hit must not be reported as an ordinary hit"
+        );
+    }
+
+    #[test]
+    fn worker_chained_code_safepoint_and_smc_stop_before_the_next_block() {
+        let arch = GuestArch::X64;
+        let stack = 0x14_000_u64;
+        let mut memory = worker_memory(stack);
+        memory.map_bytes(0x5000, &vec![0_u8; 0x1000]);
+        let mut runtime = JitRuntime::new(arch);
+        runtime.code_pages.insert(0x5000);
+        let call_blocks = vec![
+            (
+                0x1000,
+                vec![IrInstruction::Call {
+                    target: 0x2000,
+                    return_address: 0x1010,
+                }],
+            ),
+            (0x2000, vec![IrInstruction::Return { stack_adjust: 0 }]),
+            (0x1010, vec![IrInstruction::Jump { target: 0x1010 }]),
+        ];
+        let call_program = worker_program(&mut runtime, &memory, arch, &call_blocks);
+        let mut state = CpuState::new(arch);
+        state.rip = 0x1000;
+        state.set(Register::Rsp, stack + 0x800);
+        let mut thread = SliceThreadState::default();
+        let shutdown = AtomicBool::new(false);
+        let report = unsafe { run_slice(&call_program, &mut state, &mut thread, 1, &shutdown) };
+        assert_eq!(report.stop, SliceStop::Budget);
+        assert_eq!(state.rip, 0x2000);
+        crate::jit::JIT_SAFEPOINT_REQUESTED.store(true, Ordering::Release);
+        let report = unsafe { run_slice(&call_program, &mut state, &mut thread, 8, &shutdown) };
+        crate::jit::JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        assert_eq!(
+            report.stop,
+            SliceStop::Safepoint,
+            "a chained callee must poll the safepoint at its block entry"
+        );
+        assert_eq!(state.rip, 0x2000);
+        assert_eq!(
+            report.blocks_executed, 0,
+            "the callee's entry safepoint poll must stop before its body runs"
+        );
+
+        let write = crate::cpu::MemoryOperand {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0,
+            rip_relative: false,
+            rip_base: 0,
+            segment: None,
+            address_size_32: false,
+            absolute_address: Some(0x5010),
+        };
+        let smc_blocks = vec![
+            (0x5000, vec![IrInstruction::Jump { target: 0x5010 }]),
+            (
+                0x5010,
+                vec![
+                    IrInstruction::StoreMemory {
+                        src: Register::Rcx,
+                        address: write,
+                        width: 8,
+                    },
+                    IrInstruction::Jump { target: 0x5020 },
+                ],
+            ),
+            (
+                0x5020,
+                vec![IrInstruction::AddImm {
+                    dst: Register::Rdx,
+                    value: 1,
+                    width: 8,
+                }],
+            ),
+        ];
+        let smc_program = worker_program(&mut runtime, &memory, arch, &smc_blocks);
+        let mut state = CpuState::new(arch);
+        state.rip = 0x5000;
+        state.set(Register::Rcx, 0x1122_3344_5566_7788);
+        let mut thread = SliceThreadState::default();
+        let report = unsafe { run_slice(&smc_program, &mut state, &mut thread, 8, &shutdown) };
+        assert_eq!(report.stop, SliceStop::CodeWrite);
+        assert_eq!(report.blocks_executed, 2);
+        assert_eq!(report.code_writes, vec![(0x5010, 8)]);
+        assert_eq!(
+            state.get(Register::Rdx),
+            0,
+            "the block after a chained code write must not execute"
+        );
+        assert_eq!(state.rip, 0x5020);
+    }
+
+    // ── Native linking / in-block branches / persistent AOT cache ──────────
+
+    fn worker_runtime(arch: GuestArch) -> JitRuntime {
+        assert!(
+            jit_execution_available(),
+            "this test requires a working executable-memory mechanism"
+        );
+        let mut runtime = JitRuntime::new(arch);
+        runtime.set_aot_cache_dir(None);
+        runtime
+    }
+
+    fn unlink_program(program: &GuestSliceProgram) {
+        for block in program.blocks.values() {
+            block.link_target.store(0, Ordering::Release);
+            block.taken_link.store(0, Ordering::Release);
+            block.fallthrough_link.store(0, Ordering::Release);
+            block.call_link.store(0, Ordering::Release);
+            block.return_entry_link.store(0, Ordering::Release);
+        }
+    }
+
+    fn loop_blocks(site: u64, exit: u64) -> Vec<(u64, Vec<IrInstruction>)> {
+        vec![
+            (
+                site,
+                vec![
+                    IrInstruction::SubImm {
+                        dst: Register::Rcx,
+                        value: 1,
+                        width: 4,
+                    },
+                    IrInstruction::Compare {
+                        lhs: crate::cpu::CompareOperand::Register(Register::Rcx),
+                        rhs: crate::cpu::CompareOperand::ImmediateU64(0),
+                        width: 4,
+                    },
+                    IrInstruction::JumpIf {
+                        condition: ConditionCode::NotEqual,
+                        target: site,
+                        fallthrough: exit,
+                    },
+                ],
+            ),
+            (exit, vec![IrInstruction::Nop]),
+        ]
+    }
+
+    #[test]
+    fn jit_worker_linked_loop_and_call_return_match_unlinked_exactly() {
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        let mut runtime = worker_runtime(GuestArch::X64);
+        let memory = worker_memory(0x7000);
+        runtime.attach_guest_memory(&memory);
+        let mut blocks = loop_blocks(0x1000, 0x1010);
+        blocks.push((
+            0x2000,
+            vec![IrInstruction::Call {
+                target: 0x2100,
+                return_address: 0x2010,
+            }],
+        ));
+        blocks.push((0x2010, vec![IrInstruction::Jump { target: 0x9000 }]));
+        blocks.push((0x2100, vec![IrInstruction::Return { stack_adjust: 0 }]));
+        let program = worker_program(&mut runtime, &memory, GuestArch::X64, &blocks);
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+
+        let run_loop = |program: &GuestSliceProgram, budget: u64| {
+            let mut state = CpuState::new(GuestArch::X64);
+            state.rip = 0x1000;
+            state.set(Register::Rcx, 100);
+            let mut thread = SliceThreadState::default();
+            let report = unsafe { run_slice(program, &mut state, &mut thread, budget, &shutdown) };
+            (report, state.get(Register::Rcx))
+        };
+        let (linked_report, linked_rcx) = run_loop(&program, 8);
+        unlink_program(&program);
+        let (unlinked_report, unlinked_rcx) = run_loop(&program, 8);
+        assert_eq!(
+            (linked_report.blocks_executed, linked_rcx),
+            (8, 100 - 8),
+            "linked loop must execute exactly the slice budget"
+        );
+        assert_eq!(
+            (unlinked_report.blocks_executed, unlinked_rcx),
+            (8, 100 - 8),
+            "unlinked execution must reach the identical guest state"
+        );
+        assert_eq!(linked_report.metrics.native_chains, 7);
+        assert_eq!(unlinked_report.metrics.native_chains, 0);
+        assert_eq!(linked_report.metrics.instructions_executed, 24);
+        assert_eq!(unlinked_report.metrics.instructions_executed, 24);
+        assert_eq!(linked_report.stop, SliceStop::Budget);
+        assert_eq!(unlinked_report.stop, SliceStop::Budget);
+
+        let run_call = |program: &GuestSliceProgram| {
+            let mut state = CpuState::new(GuestArch::X64);
+            state.rip = 0x2000;
+            state.set(Register::Rsp, 0x7800);
+            let mut thread = SliceThreadState::default();
+            let report = unsafe { run_slice(program, &mut state, &mut thread, 4, &shutdown) };
+            (
+                report.blocks_executed,
+                report.stop,
+                state.get(Register::Rsp),
+            )
+        };
+        // Re-publish links for the call/ret measurement.
+        runtime.build_slice_program(&memory);
+        let linked_call = run_call(&program);
+        unlink_program(&program);
+        let unlinked_call = run_call(&program);
+        assert_eq!(
+            linked_call,
+            (3, SliceStop::HostBarrier { rip: 0x9000 }, 0x7800)
+        );
+        assert_eq!(
+            unlinked_call,
+            (3, SliceStop::HostBarrier { rip: 0x9000 }, 0x7800)
+        );
+        // Call + return must be linked; the final uncompiled jump is not.
+        assert_eq!(
+            unsafe {
+                let mut state = CpuState::new(GuestArch::X64);
+                state.rip = 0x2000;
+                state.set(Register::Rsp, 0x7800);
+                let mut thread = SliceThreadState::default();
+                runtime.build_slice_program(&memory);
+                run_slice(&program, &mut state, &mut thread, 4, &shutdown)
+                    .metrics
+                    .native_chains
+            },
+            2
+        );
+    }
+
+    #[test]
+    fn jit_worker_safepoint_stop_is_observed_within_the_link_budget() {
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        let mut runtime = worker_runtime(GuestArch::X64);
+        let memory = worker_memory(0x7000);
+        runtime.attach_guest_memory(&memory);
+        let program = worker_program(
+            &mut runtime,
+            &memory,
+            GuestArch::X64,
+            &loop_blocks(0x1100, 0x1110),
+        );
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        JIT_SAFEPOINT_REQUESTED.store(true, Ordering::Release);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.rip = 0x1100;
+        state.set(Register::Rcx, 10);
+        let mut thread = SliceThreadState::default();
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 8, &shutdown) };
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        assert_eq!(report.stop, SliceStop::Safepoint);
+        assert_eq!(report.blocks_executed, 0);
+        assert_eq!(state.rip, 0x1100);
+        assert_eq!(state.get(Register::Rcx), 10);
+
+        // A running chain must observe a safepoint set by another host thread
+        // before the slice budget is exhausted, and never exceed LINK_BUDGET
+        // block entries between dispatch boundaries.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setter = std::sync::Arc::clone(&flag);
+        let watcher = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            setter.store(true, Ordering::Release);
+            JIT_SAFEPOINT_REQUESTED.store(true, Ordering::Release);
+        });
+        let mut state = CpuState::new(GuestArch::X64);
+        state.rip = 0x1100;
+        state.set(Register::Rcx, 100_000_000);
+        let mut thread = SliceThreadState::default();
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 50_000_000, &shutdown) };
+        watcher.join().expect("safepoint setter");
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        assert_eq!(flag.load(Ordering::Acquire), true);
+        assert_eq!(report.stop, SliceStop::Safepoint);
+        assert_eq!(report.blocks_executed > 0, true);
+        assert_eq!(report.blocks_executed <= 50_000_000, true);
+    }
+
+    #[test]
+    fn jit_worker_smc_write_invalidates_native_links_exactly() {
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        let mut runtime = worker_runtime(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x3000, &[0_u8; 0x1000]);
+        runtime.attach_guest_memory(&memory);
+        let operand = crate::cpu::MemoryOperand {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0,
+            rip_relative: false,
+            rip_base: 0,
+            segment: None,
+            address_size_32: false,
+            absolute_address: Some(0x3000),
+        };
+        let blocks = vec![(
+            0x3000,
+            vec![
+                IrInstruction::StoreImmediate {
+                    address: operand,
+                    value: 0x90,
+                    width: 1,
+                },
+                IrInstruction::Jump { target: 0x3000 },
+            ],
+        )];
+        let program = worker_program(&mut runtime, &memory, GuestArch::X64, &blocks);
+        let link = Arc::clone(&program.blocks[&0x3000].link_target);
+        assert_eq!(link.load(Ordering::Acquire) != 0, true);
+        let epoch_before = JIT_CODE_EPOCH.load(Ordering::Acquire);
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.rip = 0x3000;
+        let mut thread = SliceThreadState::default();
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 4, &shutdown) };
+        assert_eq!(report.stop, SliceStop::CodeWrite);
+        assert_eq!(report.blocks_executed, 1);
+        assert_eq!(report.code_writes, vec![(0x3000, 1)]);
+        assert_eq!(state.rip, 0x3000);
+        assert_eq!(JIT_CODE_EPOCH.load(Ordering::Acquire) > epoch_before, true);
+
+        let pages = BTreeSet::from([0x3000]);
+        let affected = runtime.invalidate_blocks_on_pages(&pages);
+        assert_eq!(affected, Vec::<u64>::new());
+        assert_eq!(link.load(Ordering::Acquire), 0);
+        assert_eq!(runtime.slice_block(0x3000).is_none(), true);
+        assert_eq!(runtime.slice_epoch, 1);
+
+        // Recompilation after invalidation must use the new guest code.
+        let replacement = vec![(
+            0x3000,
+            vec![IrInstruction::AddImm {
+                dst: Register::Rcx,
+                value: 7,
+                width: 8,
+            }],
+        )];
+        let program = worker_program(&mut runtime, &memory, GuestArch::X64, &replacement);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.rip = 0x3000;
+        let mut thread = SliceThreadState::default();
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 1, &shutdown) };
+        assert_eq!(report.blocks_executed, 1);
+        assert_eq!(state.get(Register::Rcx), 7);
+    }
+
+    #[test]
+    fn jit_worker_host_call_barrier_pushes_return_exactly_once() {
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        let mut runtime = worker_runtime(GuestArch::X64);
+        let memory = worker_memory(0x7000);
+        runtime.attach_guest_memory(&memory);
+        let blocks = vec![(
+            0x4000,
+            vec![IrInstruction::Call {
+                target: 0x9000,
+                return_address: 0x4010,
+            }],
+        )];
+        let program = worker_program(&mut runtime, &memory, GuestArch::X64, &blocks);
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.rip = 0x4000;
+        state.set(Register::Rsp, 0x7800);
+        let mut thread = SliceThreadState::default();
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 4, &shutdown) };
+        assert_eq!(report.stop, SliceStop::HostBarrier { rip: 0x9000 });
+        assert_eq!(report.blocks_executed, 1);
+        assert_eq!(state.get(Register::Rsp), 0x77f8);
+        assert_eq!(memory.read_u64(0x77f8).expect("mapped stack"), 0x4010);
+        assert_eq!(
+            thread.return_predictor.hits() + thread.return_predictor.misses(),
+            0
+        );
+    }
+
+    #[test]
+    fn jit_worker_conditional_flags_equivalence_all_conditions_is_exact() {
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        let mut runtime = worker_runtime(GuestArch::X64);
+        let memory = worker_memory(0x7000);
+        runtime.attach_guest_memory(&memory);
+        let conditions = [
+            ConditionCode::Equal,
+            ConditionCode::NotEqual,
+            ConditionCode::Overflow,
+            ConditionCode::NotOverflow,
+            ConditionCode::Below,
+            ConditionCode::NotBelow,
+            ConditionCode::Above,
+            ConditionCode::NotAbove,
+            ConditionCode::Sign,
+            ConditionCode::NotSign,
+            ConditionCode::Less,
+            ConditionCode::GreaterEqual,
+            ConditionCode::LessEqual,
+            ConditionCode::Greater,
+            ConditionCode::Parity,
+            ConditionCode::NotParity,
+        ];
+        let mut blocks = Vec::new();
+        let mut addresses = Vec::new();
+        for (index, condition) in conditions.iter().enumerate() {
+            let address = 0x5000 + (index as u64) * 0x20;
+            addresses.push(address);
+            blocks.push((
+                address,
+                vec![IrInstruction::JumpIf {
+                    condition: *condition,
+                    target: 0x9000,
+                    fallthrough: 0x9008,
+                }],
+            ));
+        }
+        let program = worker_program(&mut runtime, &memory, GuestArch::X64, &blocks);
+        let mut checks = 0_u64;
+        for (index, condition) in conditions.iter().enumerate() {
+            for bits in 0..32_u8 {
+                let mut state = CpuState::new(GuestArch::X64);
+                state.flags = crate::cpu::Flags {
+                    cf: bits & 1 != 0,
+                    pf: bits & 2 != 0,
+                    zf: bits & 4 != 0,
+                    sf: bits & 8 != 0,
+                    of: bits & 16 != 0,
+                    af: false,
+                };
+                let mut chain = ChainState::new(program.flat_base, addresses[index], LINK_BUDGET);
+                let outcome = unsafe {
+                    execute_slice_block(
+                        &program,
+                        &program.blocks[&addresses[index]],
+                        &mut state,
+                        &mut chain,
+                    )
+                };
+                let actual = match outcome.reason {
+                    JitExitReason::ConditionalTaken { .. } => true,
+                    JitExitReason::ConditionalNotTaken { .. } => false,
+                    other => panic!("expected native conditional exit, got {other:?}"),
+                };
+                assert_eq!(
+                    actual,
+                    crate::cpu::evaluate_condition(*condition, &state.flags),
+                    "condition {condition:?} with flags {bits:#07b}"
+                );
+                checks += 1;
+            }
+        }
+        assert_eq!(checks, 16 * 32);
+    }
+
+    #[test]
+    fn jit_worker_lazy_flags_materialize_before_native_jcc_exactly() {
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        let mut runtime = worker_runtime(GuestArch::X64);
+        let memory = worker_memory(0x7000);
+        runtime.attach_guest_memory(&memory);
+        let cases = [
+            (ConditionCode::Equal, true, true),
+            (ConditionCode::Overflow, true, true),
+            (ConditionCode::Sign, true, true),
+        ];
+        let mut blocks = Vec::new();
+        for (index, _) in cases.iter().enumerate() {
+            blocks.push((
+                0x5300 + (index as u64) * 0x20,
+                vec![IrInstruction::JumpIf {
+                    condition: cases[index].0,
+                    target: 0x9000,
+                    fallthrough: 0x9008,
+                }],
+            ));
+        }
+        let program = worker_program(&mut runtime, &memory, GuestArch::X64, &blocks);
+        let materialised_before = crate::cpu::lazy_flag_telemetry().materialised;
+        let mut stats = crate::cpu::LazyFlagStats::default();
+        for (index, (condition, _, _)) in cases.iter().enumerate() {
+            let address = 0x5300 + (index as u64) * 0x20;
+            let mut state = CpuState::new(GuestArch::X64);
+            match index {
+                0 => state.defer_sub_flags(5, 5, 0, 32, &mut stats),
+                1 => state.defer_add_flags(i64::MAX as u64, 1, i64::MIN as u64, 64, &mut stats),
+                _ => state.defer_sub_flags(1, 2, u64::MAX, 64, &mut stats),
+            }
+            assert_eq!(state.pending_flags.is_some(), true);
+            let mut chain = ChainState::new(program.flat_base, address, LINK_BUDGET);
+            let outcome = unsafe {
+                execute_slice_block(&program, &program.blocks[&address], &mut state, &mut chain)
+            };
+            assert_eq!(state.pending_flags.is_none(), true);
+            assert_eq!(
+                outcome.reason,
+                JitExitReason::ConditionalTaken { rip: address },
+                "lazy flags must be materialised before the native branch"
+            );
+            assert_eq!(
+                cases[index].1,
+                crate::cpu::evaluate_condition(*condition, &state.flags)
+            );
+        }
+        assert_eq!(
+            crate::cpu::lazy_flag_telemetry().materialised,
+            materialised_before + 3
+        );
+    }
+
+    fn decode_fixed_mov_imm64(bytes: &[u8]) -> u64 {
+        let mut value = 0_u64;
+        for index in 0..4 {
+            let word = u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
+            let hw = (word >> 21) & 3;
+            let imm = ((word >> 5) & 0xffff) as u64;
+            value |= imm << (hw * 16);
+        }
+        value
+    }
+
+    fn aot_probe_ir() -> Vec<IrInstruction> {
+        vec![IrInstruction::AddImm {
+            dst: Register::Rcx,
+            value: 1,
+            width: 8,
+        }]
+    }
+
+    fn run_aot_probe(runtime: &mut JitRuntime, memory: &MemoryImage) -> (u64, u64) {
+        let ir = aot_probe_ir();
+        runtime
+            .get_or_compile_slice_block(&ir, 0x6000, GuestArch::X64)
+            .expect("compile or load AOT probe");
+        let program = runtime.build_slice_program(memory);
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.rip = 0x6000;
+        state.set(Register::Rcx, 41);
+        let mut thread = SliceThreadState::default();
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 4, &shutdown) };
+        (report.blocks_executed, state.get(Register::Rcx))
+    }
+
+    #[test]
+    fn jit_worker_aot_cache_round_trip_across_process_boundaries_loads_exact_code() {
+        if let Ok(directory) = std::env::var("CASA1_AOT_CHILD_DIR") {
+            let mut runtime = JitRuntime::new(GuestArch::X64);
+            runtime.set_aot_cache_dir(Some(std::path::PathBuf::from(directory)));
+            let memory = worker_memory(0x7000);
+            runtime.attach_guest_memory(&memory);
+            assert_eq!(run_aot_probe(&mut runtime, &memory), (1, 42));
+            return;
+        }
+        let directory = tempfile::tempdir().expect("tempdir");
+        let executable = std::env::current_exe().expect("test executable");
+        let name = format!(
+            "{}::jit_worker_aot_cache_round_trip_across_process_boundaries_loads_exact_code",
+            module_path!()
+        )
+        .replace("casa1::", "");
+        let status = std::process::Command::new(executable)
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env("CASA1_AOT_CHILD_DIR", directory.path())
+            .status()
+            .expect("spawn AOT child process");
+        assert_eq!(status.success(), true);
+
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        runtime.set_aot_cache_dir(Some(directory.path().to_path_buf()));
+        let memory = worker_memory(0x7000);
+        runtime.attach_guest_memory(&memory);
+        assert_eq!(run_aot_probe(&mut runtime, &memory), (1, 42));
+        assert_eq!(runtime.aot_metrics(), (1, 0, 0));
+    }
+
+    #[test]
+    fn jit_worker_aot_corrupt_and_wrong_version_cache_are_rejected_with_counters() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let ir = aot_probe_ir();
+        let source_hash = compute_ir_hash(&ir, 0x6100);
+        let mut writer = JitRuntime::new(GuestArch::X64);
+        writer.set_aot_cache_dir(Some(directory.path().to_path_buf()));
+        writer
+            .get_or_compile_slice_block(&ir, 0x6100, GuestArch::X64)
+            .expect("initial compile");
+        let path = writer.aot_path(source_hash, 0x6100).expect("cache path");
+        assert_eq!(path.is_file(), true);
+
+        std::fs::write(&path, b"corrupt").expect("corrupt cache write");
+        let mut corrupt = JitRuntime::new(GuestArch::X64);
+        corrupt.set_aot_cache_dir(Some(directory.path().to_path_buf()));
+        corrupt
+            .get_or_compile_slice_block(&ir, 0x6100, GuestArch::X64)
+            .expect("fallback compile after corruption");
+        assert_eq!(corrupt.aot_metrics(), (0, 0, 1));
+
+        let bytes = std::fs::read(&path).expect("rewritten cache");
+        let mut record = AotRecord::decode(&bytes).expect("valid rewritten record");
+        record.translator = record.translator.wrapping_add(1);
+        std::fs::write(&path, record.encode()).expect("wrong-version cache write");
+        let mut wrong = JitRuntime::new(GuestArch::X64);
+        wrong.set_aot_cache_dir(Some(directory.path().to_path_buf()));
+        wrong
+            .get_or_compile_slice_block(&ir, 0x6100, GuestArch::X64)
+            .expect("fallback compile after version mismatch");
+        assert_eq!(wrong.aot_metrics(), (0, 0, 1));
+    }
+
+    #[test]
+    fn jit_worker_aot_relocations_rebind_link_slots_exactly() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut writer = JitRuntime::new(GuestArch::X64);
+        writer.set_aot_cache_dir(Some(directory.path().to_path_buf()));
+        let memory = worker_memory(0x7000);
+        writer.attach_guest_memory(&memory);
+        let ir = vec![IrInstruction::Jump { target: 0x6210 }];
+        let source_hash = compute_ir_hash(&ir, 0x6200);
+        writer
+            .get_or_compile_slice_block(&ir, 0x6200, GuestArch::X64)
+            .expect("compile jump");
+        writer
+            .get_or_compile_slice_block(
+                &[IrInstruction::Jump { target: 0x9000 }],
+                0x6210,
+                GuestArch::X64,
+            )
+            .expect("compile target");
+        let path = writer.aot_path(source_hash, 0x6200).expect("cache path");
+        let bytes = std::fs::read(&path).expect("cache record");
+        let record = AotRecord::decode(&bytes).expect("decode cache record");
+        let relocation = record
+            .relocations
+            .iter()
+            .find(|relocation| relocation.kind == AotRelocKind::JumpLink)
+            .expect("jump link relocation");
+        let offset = relocation.offset as usize;
+        let on_disk = decode_fixed_mov_imm64(&record.code[offset..offset + 16]);
+        assert_eq!(on_disk != 0, true);
+
+        let mut reader = JitRuntime::new(GuestArch::X64);
+        reader.set_aot_cache_dir(Some(directory.path().to_path_buf()));
+        reader.attach_guest_memory(&memory);
+        let _ = reader
+            .get_or_compile_slice_block(
+                &[IrInstruction::Jump { target: 0x9000 }],
+                0x6210,
+                GuestArch::X64,
+            )
+            .expect("load target jump");
+        let loaded = reader
+            .get_or_compile_slice_block(&ir, 0x6200, GuestArch::X64)
+            .expect("load jump")
+            .clone();
+        // Both jump blocks came from the persistent cache.
+        assert_eq!(reader.aot_metrics(), (2, 0, 0));
+        // SAFETY: the loaded entry is finalized executable code; reading its
+        // bytes is side-effect free.
+        let loaded_code =
+            unsafe { std::slice::from_raw_parts(loaded.entry() as *const u8, loaded.code_size) };
+        let relocated = decode_fixed_mov_imm64(&loaded_code[offset..offset + 16]);
+        assert_eq!(relocated, Arc::as_ptr(&loaded.link_target) as u64);
+        assert_eq!(relocated != on_disk, true);
+        let mut in_reloc = vec![false; loaded.code_size];
+        for relocation in &record.relocations {
+            let start = relocation.offset as usize;
+            for byte in &mut in_reloc[start..start + 16] {
+                *byte = true;
+            }
+        }
+        for (index, (a, b)) in record.code.iter().zip(loaded_code.iter()).enumerate() {
+            if !in_reloc[index] {
+                assert_eq!(a, b, "non-relocated byte {index:#x} changed");
+            }
+        }
+        for relocation in &record.relocations {
+            let start = relocation.offset as usize;
+            let original_rd =
+                u32::from_le_bytes(record.code[start..start + 4].try_into().unwrap()) & 0x1f;
+            let relocated_rd =
+                u32::from_le_bytes(loaded_code[start..start + 4].try_into().unwrap()) & 0x1f;
+            assert_eq!(
+                original_rd, relocated_rd,
+                "relocation must preserve its destination register"
+            );
+            let value = decode_fixed_mov_imm64(&loaded_code[start..start + 16]);
+            let expected = match relocation.kind {
+                AotRelocKind::SafepointFlag => &JIT_SAFEPOINT_REQUESTED as *const _ as u64,
+                AotRelocKind::CodeEpoch => &JIT_CODE_EPOCH as *const _ as u64,
+                AotRelocKind::JumpLink => Arc::as_ptr(&loaded.link_target) as u64,
+                other => panic!("unexpected relocation {other:?}"),
+            };
+            assert_eq!(value, expected, "relocation {relocation:?}");
+        }
+
+        let program = reader.build_slice_program(&memory);
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.rip = 0x6200;
+        let mut thread = SliceThreadState::default();
+        let report = unsafe { run_slice(&program, &mut state, &mut thread, 8, &shutdown) };
+        assert_eq!(report.blocks_executed, 2);
+        assert_eq!(report.metrics.native_chains, 1);
+        assert_eq!(report.stop, SliceStop::HostBarrier { rip: 0x9000 });
+    }
+
+    #[test]
+    fn jit_worker_concurrent_in_flight_linked_blocks_are_exact() {
+        JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+        let mut runtime = worker_runtime(GuestArch::X64);
+        let memory = worker_memory(0x7000);
+        runtime.attach_guest_memory(&memory);
+        let program = std::sync::Arc::new(worker_program(
+            &mut runtime,
+            &memory,
+            GuestArch::X64,
+            &loop_blocks(0x1200, 0x1210),
+        ));
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let entry = program.blocks[&0x1200].entry() as u64;
+        let slot = Arc::clone(&program.blocks[&0x1200].taken_link);
+        let results = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let program = std::sync::Arc::clone(&program);
+                let results = &results;
+                let shutdown = &shutdown;
+                scope.spawn(move || {
+                    let mut state = CpuState::new(GuestArch::X64);
+                    state.rip = 0x1200;
+                    state.set(Register::Rcx, 100);
+                    let mut thread = SliceThreadState::default();
+                    let report =
+                        unsafe { run_slice(&program, &mut state, &mut thread, 50, shutdown) };
+                    results
+                        .lock()
+                        .expect("results lock")
+                        .push((report.blocks_executed, state.get(Register::Rcx)));
+                });
+            }
+            let slot = &slot;
+            scope.spawn(move || {
+                for index in 0..2_000_u64 {
+                    slot.store(if index % 2 == 0 { 0 } else { entry }, Ordering::Release);
+                }
+            });
+        });
+        let mut results = results.into_inner().expect("results");
+        results.sort_unstable();
+        assert_eq!(results, vec![(50, 50), (50, 50), (50, 50), (50, 50)]);
     }
 }

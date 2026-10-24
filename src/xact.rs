@@ -2067,14 +2067,18 @@ pub(crate) fn pitch_to_ratio(cents: i16) -> f32 {
 /// Deterministic xorshift used for weighted variation selection.  Real XACT
 /// uses a random draw as well; determinism only makes tests reproducible.
 fn next_random_u32() -> u32 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-    let mut value = STATE.load(Ordering::Relaxed);
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-    STATE.store(value, Ordering::Relaxed);
-    (value >> 32) as u32
+    use std::cell::Cell;
+    thread_local! {
+        static STATE: Cell<u64> = const { Cell::new(0x9E37_79B9_7F4A_7C15) };
+    }
+    STATE.with(|state| {
+        let mut value = state.get();
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        state.set(value);
+        (value >> 32) as u32
+    })
 }
 
 // ---------------------------------------------------------------------------

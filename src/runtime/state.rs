@@ -1194,6 +1194,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) keyboard_replay_device: Option<String>,
     pub(crate) keyboard_replay_injected: bool,
     pub(crate) host_thunks: U64Map<HostThunk>,
+    /// Directly-patched guest IAT slots and their re-resolution state.
+    pub(crate) iat_patches: crate::runtime::IatPatchTable,
     /// Maps guest thunk addresses → fast-thunk indices for JIT direct calls.
     pub(crate) thunk_to_fast_index: U64Map<usize>,
     pub(crate) guest_objects: BTreeMap<u64, GuestObjectMeta>,
@@ -1310,6 +1312,12 @@ pub(crate) struct PeHostRuntime {
     pub(crate) console_input_handles: BTreeSet<u32>,
     pub(crate) console_output_handles: BTreeSet<u32>,
     pub(crate) debugger_present: bool,
+    /// The live anti-cheat surface of this runtime: the debugger-attach state
+    /// machine, the one monotonic clock every timing API reads in a live run,
+    /// and the attestation provider registry.  Every Win32 and Nt* arm that
+    /// answers an anti-debug / timing / attestation question reads THIS state,
+    /// so the two API families can never disagree.
+    pub(crate) anticheat: crate::runtime::dispatch::ntdll::GuestAnticheatState,
     pub(crate) process_affinity_mask: u64,
     pub(crate) thread_affinity_masks: BTreeMap<u32, u64>,
     pub(crate) std_handle_overrides: BTreeMap<u32, u64>,
@@ -2293,6 +2301,7 @@ impl PeHostRuntime {
             keyboard_replay_device,
             keyboard_replay_injected: false,
             host_thunks: U64Map::default(),
+            iat_patches: crate::runtime::IatPatchTable::default(),
             thunk_to_fast_index: U64Map::default(),
             guest_objects: BTreeMap::new(),
             shell_link_interfaces: BTreeMap::new(),
@@ -2387,6 +2396,7 @@ impl PeHostRuntime {
             console_input_handles: BTreeSet::new(),
             console_output_handles: BTreeSet::new(),
             debugger_present: false,
+            anticheat: crate::runtime::dispatch::ntdll::GuestAnticheatState::new(guest_pid),
             process_affinity_mask: 0xFF,
             thread_affinity_masks: BTreeMap::new(),
             std_handle_overrides: BTreeMap::new(),

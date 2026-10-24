@@ -15,6 +15,7 @@
 //! Everything is self-contained: no guest execution, no global mutable state.
 
 pub mod exec;
+pub mod introspection;
 pub mod io;
 pub mod object;
 

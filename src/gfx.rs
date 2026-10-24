@@ -4442,6 +4442,7 @@ impl GraphicsBackend {
             ));
         }
         resource.bytes[offset..end].copy_from_slice(bytes);
+        self.record_update_path(ResourceUpdatePath::HostVisibleInPlace);
         Ok(())
     }
 
@@ -4483,6 +4484,12 @@ impl GraphicsBackend {
         bytes: Vec<u8>,
     ) -> AppResult<ResourceUpdatePath> {
         let record = self.resource_mut(resource)?;
+        if record.storage_mode == MetalStorageMode::Memoryless {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "memoryless resource cannot be updated from the CPU",
+            ));
+        }
         if bytes.len() > record.bytes.len() {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
@@ -4519,6 +4526,12 @@ impl GraphicsBackend {
     ) -> AppResult<ResourceUpdatePath> {
         let path = {
             let record = self.resource(resource)?;
+            if record.storage_mode == MetalStorageMode::Memoryless {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "memoryless resource cannot be updated from the CPU",
+                ));
+            }
             if record.storage_mode == MetalStorageMode::Shared {
                 ResourceUpdatePath::HostVisibleInPlace
             } else {
@@ -4540,6 +4553,12 @@ impl GraphicsBackend {
     ) -> AppResult<ResourceUpdatePath> {
         let path = {
             let record = self.resource(resource)?;
+            if record.storage_mode == MetalStorageMode::Memoryless {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "memoryless resource cannot be updated from the CPU",
+                ));
+            }
             if record.storage_mode == MetalStorageMode::Shared {
                 ResourceUpdatePath::HostVisibleInPlace
             } else {
@@ -4684,6 +4703,12 @@ impl GraphicsBackend {
         bytes: &[u8],
     ) -> AppResult<()> {
         let resource = self.resource_mut(resource)?;
+        if resource.storage_mode == MetalStorageMode::Memoryless {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "memoryless resource cannot be written from the CPU",
+            ));
+        }
         let end = offset.checked_add(bytes.len()).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcD3dInvalidState,
@@ -4825,6 +4850,36 @@ impl GraphicsBackend {
                     render_target: false,
                     depth_stencil: false,
                     cpu_write_frequent: true,
+                }
+            )
+        {
+            return MetalStorageMode::Shared;
+        }
+
+        // On unified memory every non-memoryless default-heap resource is
+        // hosted in shared storage: the CPU backing *is* the host-visible
+        // backing, so no separate device-private shadow is required. Discrete
+        // GPUs genuinely need private storage, and those updates stay counted
+        // as staged uploads. Memoryless attachments cannot be CPU-written and
+        // are refused explicitly by `update_resource_region`.
+        if self.capabilities.unified_memory && desc.heap == HeapType::Default {
+            return MetalStorageMode::Shared;
+        }
+
+        // Constant/vertex/index buffers are rewritten every frame. On unified
+        // memory a bounded dynamic buffer is host-visible, so Map/Unmap and
+        // UpdateSubresource write straight into the shared backing instead of
+        // creating a staging upload. Static buffers above the bound and
+        // device-private resources keep the staged path.
+        if self.capabilities.unified_memory
+            && desc.heap == HeapType::Default
+            && desc.subresources == 1
+            && desc.size <= 256 * 1024
+            && matches!(
+                desc.usage_hint,
+                ResourceUsageHint::Buffer {
+                    role: BufferRole::Constant | BufferRole::Vertex | BufferRole::Index,
+                    ..
                 }
             )
         {
@@ -6380,16 +6435,182 @@ mod tests {
         }));
         assert_eq!(poisoned.is_err(), true);
 
+        let storage = backend
+            .resource_storage_mode(resource)
+            .expect("storage mode");
         let path = backend
             .overwrite_resource_host_visible(resource, &[0x5A; 64])
             .expect("a poisoned stats lock must not drop the resource update");
-        assert_eq!(path, ResourceUpdatePath::StagedUpload);
+        if storage == MetalStorageMode::Shared {
+            assert_eq!(path, ResourceUpdatePath::HostVisibleInPlace);
+        } else {
+            assert_eq!(path, ResourceUpdatePath::StagedUpload);
+        }
         assert_eq!(
             backend.resource_bytes(resource).expect("resource bytes"),
             &[0x5A; 64]
         );
         let stats = backend.translation_stats();
-        assert_eq!(stats.staged_copies, 1);
-        assert_eq!(stats.zero_copy_updates, 0);
+        if storage == MetalStorageMode::Shared {
+            assert_eq!(stats.zero_copy_updates, 1);
+            assert_eq!(stats.staged_copies, 0);
+        } else {
+            assert_eq!(stats.staged_copies, 1);
+            assert_eq!(stats.zero_copy_updates, 0);
+        }
+    }
+
+    #[test]
+    fn gfx_shared_dynamic_buffer_update_fallback_counts_are_exact() {
+        let mut backend = GraphicsBackend::new();
+        let buffer = backend
+            .create_resource(ResourceDesc {
+                name: "gfx-dynamic-constant-buffer".to_string(),
+                format: DxgiFormat::Unknown,
+                heap: HeapType::Default,
+                size: 256,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Buffer {
+                    role: BufferRole::Constant,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("dynamic buffer");
+        let storage = backend.resource_storage_mode(buffer).expect("storage mode");
+        if backend.capabilities().unified_memory {
+            assert_eq!(storage, MetalStorageMode::Shared);
+            let path = backend
+                .update_resource_region(buffer, 0, &[0x11; 8])
+                .expect("shared dynamic update");
+            assert_eq!(path, ResourceUpdatePath::HostVisibleInPlace);
+            let path = backend
+                .overwrite_resource_host_visible(buffer, &[0x22; 16])
+                .expect("shared dynamic overwrite");
+            assert_eq!(path, ResourceUpdatePath::HostVisibleInPlace);
+            let stats = backend.translation_stats();
+            assert_eq!(stats.zero_copy_updates, 2);
+            assert_eq!(stats.staged_copies, 0);
+            assert_eq!(
+                backend.resource_bytes(buffer).expect("bytes")[..16],
+                [0x22u8; 16]
+            );
+        } else {
+            // A discrete GPU has no host-visible default-heap buffer: the
+            // update must be counted as a staged upload, never as zero-copy.
+            assert_eq!(storage, MetalStorageMode::Private);
+            let path = backend
+                .update_resource_region(buffer, 0, &[0x11; 8])
+                .expect("private dynamic update");
+            assert_eq!(path, ResourceUpdatePath::StagedUpload);
+            let stats = backend.translation_stats();
+            assert_eq!(stats.zero_copy_updates, 0);
+            assert_eq!(stats.staged_copies, 1);
+        }
+
+        let texture = backend
+            .create_resource(ResourceDesc {
+                name: "gfx-private-texture".to_string(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                heap: HeapType::Default,
+                size: 1024,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Texture {
+                    sampled: true,
+                    render_target: true,
+                    depth_stencil: false,
+                    cpu_write_frequent: false,
+                },
+            })
+            .expect("private texture");
+        if backend.capabilities().unified_memory {
+            // No CPU shadow: the texture's bytes are the shared host-visible
+            // backing, so the update is in place and counts as zero-copy.
+            assert_eq!(
+                backend.resource_storage_mode(texture).expect("storage"),
+                MetalStorageMode::Shared
+            );
+            let before = backend.translation_stats();
+            let path = backend
+                .update_resource_region(texture, 4, &[0x33; 4])
+                .expect("shared texture update");
+            assert_eq!(path, ResourceUpdatePath::HostVisibleInPlace);
+            let stats = backend.translation_stats();
+            assert_eq!(stats.zero_copy_updates, before.zero_copy_updates + 1);
+            assert_eq!(stats.staged_copies, before.staged_copies);
+        }
+    }
+    #[test]
+    fn memoryless_resource_cpu_update_is_refused_exactly() {
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Pro"));
+        let resource = backend
+            .create_resource(ResourceDesc {
+                name: "memoryless-depth".to_string(),
+                format: DxgiFormat::D24UnormS8Uint,
+                heap: HeapType::Default,
+                size: 4096,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::DepthStencil,
+            })
+            .expect("memoryless depth resource");
+        assert_eq!(
+            backend
+                .resource_storage_mode(resource)
+                .expect("storage mode"),
+            MetalStorageMode::Memoryless
+        );
+        let error = backend
+            .update_resource_region(resource, 0, &[1u8; 4])
+            .expect_err("memoryless CPU update must be refused");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "memoryless resource cannot be updated from the CPU"
+        );
+        let error = backend
+            .overwrite_resource_host_visible(resource, &[1u8; 4])
+            .expect_err("memoryless host-visible update must be refused");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "memoryless resource cannot be updated from the CPU"
+        );
+        assert_eq!(backend.translation_stats().staged_copies, 0);
+        assert_eq!(backend.translation_stats().zero_copy_updates, 0);
+    }
+
+    #[test]
+    fn default_heap_resource_has_no_device_private_shadow_fallback_on_unified_memory() {
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Pro"));
+        let resource = backend
+            .create_resource(ResourceDesc {
+                name: "unified-texture".to_string(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                heap: HeapType::Default,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Texture {
+                    sampled: true,
+                    render_target: true,
+                    depth_stencil: false,
+                    cpu_write_frequent: false,
+                },
+            })
+            .expect("unified texture");
+        assert_eq!(
+            backend.resource_storage_mode(resource).expect("storage"),
+            MetalStorageMode::Shared
+        );
+        let path = backend
+            .update_resource_region(resource, 0, &[0x5A; 8])
+            .expect("unified update");
+        assert_eq!(path, ResourceUpdatePath::HostVisibleInPlace);
+        assert_eq!(backend.translation_stats().staged_copies, 0);
+        assert_eq!(backend.translation_stats().zero_copy_updates, 1);
     }
 }

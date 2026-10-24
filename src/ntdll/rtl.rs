@@ -346,4 +346,72 @@ mod tests {
             crate::error::ntstatus_to_dos_error(0xC000_0008)
         );
     }
+
+    #[test]
+    fn compare_and_equal_implement_the_nt_contract() {
+        let mut vm = VirtualMemory::new(0x7fff_0000_0000);
+        let mut memory = memory_with(&mut vm);
+        let a_buf = mapped(
+            &mut memory,
+            &"Alpha"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .chain([0u8, 0])
+                .collect::<Vec<_>>(),
+        );
+        let b_buf = 0x4100_0000;
+        mapped_at(
+            &mut memory,
+            b_buf,
+            &"alpha"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .chain([0u8, 0])
+                .collect::<Vec<_>>(),
+        );
+        let c_buf = 0x4200_0000;
+        mapped_at(
+            &mut memory,
+            c_buf,
+            &"Beta"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .chain([0u8, 0])
+                .collect::<Vec<_>>(),
+        );
+        // The Rtl* comparison entry points take UNICODE_STRING headers.
+        let a = 0x4300_0000;
+        let b = 0x4300_0010;
+        let c = 0x4300_0020;
+        for (header, buffer, text) in [(a, a_buf, "Alpha"), (b, b_buf, "alpha"), (c, c_buf, "Beta")]
+        {
+            mapped_at(&mut memory, header, &[0_u8; 16]);
+            rtl_init_unicode_string(&mut memory, header, buffer, GuestArch::X64).expect("init");
+            assert_eq!(
+                read_unicode_string(&memory, header, GuestArch::X64).as_deref(),
+                Ok(text)
+            );
+        }
+        // Case-sensitive: "Alpha" < "alpha" ('A' < 'a').
+        assert_eq!(
+            rtl_compare_unicode_string(&memory, a, b, false, GuestArch::X64),
+            Ok(-1)
+        );
+        assert_eq!(
+            rtl_compare_unicode_string(&memory, a, b, true, GuestArch::X64),
+            Ok(0)
+        );
+        assert_eq!(
+            rtl_compare_unicode_string(&memory, a, c, false, GuestArch::X64),
+            Ok(-1)
+        );
+        assert_eq!(
+            rtl_equal_unicode_string(&memory, a, b, false, GuestArch::X64),
+            Ok(false)
+        );
+        assert_eq!(
+            rtl_equal_unicode_string(&memory, a, b, true, GuestArch::X64),
+            Ok(true)
+        );
+    }
 }

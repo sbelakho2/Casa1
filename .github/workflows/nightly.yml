@@ -18,6 +18,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run all integration tests
+        env:
+          RUST_TEST_THREADS: "1"
         run: cargo test --tests
 
   all-features-test:

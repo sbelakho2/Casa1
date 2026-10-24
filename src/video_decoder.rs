@@ -35,16 +35,26 @@ use std::sync::{Arc, Mutex};
 pub struct ZeroCopyStats {
     pub iosurface_frames: u64,
     pub cpu_copies_avoided: u64,
+    /// Frames copied from an IOSurface/Metal texture straight into canonical
+    /// guest pages (the MF/DXGI surface hand-off).
+    pub guest_surface_frames: u64,
+    /// Guest-surface hand-offs that fell back to a host staging buffer because
+    /// the destination region was unaligned for a no-copy Metal buffer.
+    pub staging_fallbacks: u64,
 }
 
 static IOSURFACE_FRAMES: AtomicU64 = AtomicU64::new(0);
 static CPU_COPIES_AVOIDED: AtomicU64 = AtomicU64::new(0);
+static GUEST_SURFACE_FRAMES: AtomicU64 = AtomicU64::new(0);
+static GUEST_STAGING_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the process-wide zero-copy counters.
 pub fn zero_copy_stats() -> ZeroCopyStats {
     ZeroCopyStats {
         iosurface_frames: IOSURFACE_FRAMES.load(Ordering::Relaxed),
         cpu_copies_avoided: CPU_COPIES_AVOIDED.load(Ordering::Relaxed),
+        guest_surface_frames: GUEST_SURFACE_FRAMES.load(Ordering::Relaxed),
+        staging_fallbacks: GUEST_STAGING_FALLBACKS.load(Ordering::Relaxed),
     }
 }
 
@@ -52,6 +62,8 @@ pub fn zero_copy_stats() -> ZeroCopyStats {
 pub fn reset_zero_copy_stats() {
     IOSURFACE_FRAMES.store(0, Ordering::Relaxed);
     CPU_COPIES_AVOIDED.store(0, Ordering::Relaxed);
+    GUEST_SURFACE_FRAMES.store(0, Ordering::Relaxed);
+    GUEST_STAGING_FALLBACKS.store(0, Ordering::Relaxed);
 }
 
 /// Record one IOSurface-backed decoded/created frame.
@@ -62,6 +74,17 @@ pub(crate) fn record_iosurface_frame() {
 /// Record one full-frame CPU copy avoided on the way to the GPU.
 pub(crate) fn record_cpu_copy_avoided() {
     CPU_COPIES_AVOIDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one frame handed to canonical guest pages through the Metal path.
+pub(crate) fn record_guest_surface_frame() {
+    GUEST_SURFACE_FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one guest-surface hand-off that needed a host staging buffer.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn record_guest_staging_fallback() {
+    GUEST_STAGING_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Availability of the CoreVideo → Metal zero-copy path.
@@ -426,6 +449,243 @@ impl Drop for VideoFrame {
             }
         }
     }
+}
+
+/// Layout of a decoded frame copied into a guest-visible surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestSurfaceLayout {
+    pub width: u32,
+    pub height: u32,
+    /// Total bytes written (`width * height * 4` for BGRA, the NV12
+    /// luma+interleaved-chroma size for two-plane frames).
+    pub bytes: usize,
+    /// True for two-plane NV12 output, false for BGRA8 output.
+    pub nv12: bool,
+    /// True when the Metal blit wrote directly into canonical guest pages.
+    pub guest_backed: bool,
+    /// 1 when an unaligned destination forced the counted staging fallback.
+    pub staging_fallbacks: u64,
+}
+
+/// Copy a decoded IOSurface frame into canonical guest pages as the
+/// guest-visible MF/DXGI surface.
+///
+/// Both planes are blitted by the GPU from the IOSurface-backed Metal texture
+/// into a no-copy Metal buffer over `window[offset..]`; there is no CPU pixel
+/// conversion and no intermediate RGB frame. When the destination is not
+/// host-page aligned for a no-copy buffer the copy falls back to one shared
+/// Metal buffer followed by a byte copy into the same guest pages, and the
+/// fallback is counted. A frame without an IOSurface texture, a zero-sized
+/// frame, or a destination outside the window is rejected without writing.
+#[cfg(target_os = "macos")]
+pub fn copy_frame_to_guest_surface(
+    frame: &VideoFrame,
+    window: &crate::metal_backend::GuestMemoryWindow,
+    offset: usize,
+) -> AppResult<GuestSurfaceLayout> {
+    use metal::foreign_types::ForeignTypeRef;
+
+    if frame.width == 0 || frame.height == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            "guest surface copy: zero-sized frame",
+        ));
+    }
+    let texture_pointer = frame.metal_texture.ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcMediaInvalid,
+            "guest surface copy: frame has no IOSurface texture",
+        )
+    })?;
+    let texture = unsafe { metal::TextureRef::from_ptr(texture_pointer as *mut metal::MTLTexture) };
+    let device = crate::metal_backend::MetalDevice::system_default()?;
+
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let nv12 = frame.has_uv_plane();
+    let luma_bytes = width.checked_mul(height).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcMediaInvalid,
+            "guest surface copy: dimensions overflow",
+        )
+    })?;
+    let total = if nv12 {
+        luma_bytes.checked_add(luma_bytes / 2).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "guest surface copy: NV12 size overflow",
+            )
+        })?
+    } else {
+        luma_bytes.checked_mul(4).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "guest surface copy: BGRA size overflow",
+            )
+        })?
+    };
+
+    let span = window.resolve_aligned(offset, total).map_err(|error| {
+        AppError::new(
+            ReasonCode::RcMediaInvalid,
+            format!("guest surface copy refused: {}", error.reason()),
+        )
+    })?;
+    let buffer = device
+        .create_buffer_over_aligned_guest_span(&span)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                format!("guest surface copy refused: {}", error.reason()),
+            )
+        })?;
+
+    let pipeline = guest_surface_pipeline(device.metal_device(), nv12)?;
+    let queue = device.create_command_queue();
+    let command_buffer = queue.new_command_buffer();
+    {
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+        if nv12 {
+            let uv_pointer = frame.uv_texture_ptr().ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    "guest surface copy: NV12 frame is missing its chroma plane",
+                )
+            })?;
+            let uv_texture =
+                unsafe { metal::TextureRef::from_ptr(uv_pointer as *mut metal::MTLTexture) };
+            encoder.set_texture(0, Some(texture));
+            encoder.set_texture(1, Some(uv_texture));
+        } else {
+            encoder.set_texture(0, Some(texture));
+        }
+        encoder.set_buffer(0, Some(&buffer), 0);
+        // The kernel writes at this byte offset inside the page-aligned
+        // no-copy buffer, so an unaligned guest destination is still written
+        // directly by the GPU (no staging buffer and no byte copy).
+        let base = span.leading as u32;
+        encoder.set_bytes(
+            1,
+            std::mem::size_of::<u32>() as u64,
+            &base as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.dispatch_threads(
+            metal::MTLSize::new(frame.width as u64, frame.height as u64, 1),
+            metal::MTLSize::new(8, 8, 1),
+        );
+        encoder.end_encoding();
+    }
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    record_guest_surface_frame();
+    Ok(GuestSurfaceLayout {
+        width: frame.width,
+        height: frame.height,
+        bytes: total,
+        nv12,
+        guest_backed: true,
+        staging_fallbacks: 0,
+    })
+}
+
+/// Build the compute pipeline that copies a decoded frame (BGRA or NV12)
+/// directly into a guest buffer at an arbitrary byte offset.
+#[cfg(target_os = "macos")]
+fn guest_surface_pipeline(
+    device: &metal::DeviceRef,
+    nv12: bool,
+) -> AppResult<metal::ComputePipelineState> {
+    const SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline uchar quantize(float value) {
+    return uchar(floor(clamp(value, 0.0, 1.0) * 255.0 + 0.5));
+}
+
+kernel void copy_bgra_to_guest(texture2d<float, access::read> source [[texture(0)]],
+                               device uchar* destination [[buffer(0)]],
+                               constant uint& base [[buffer(1)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= source.get_width() || gid.y >= source.get_height()) {
+        return;
+    }
+    uchar4 pixel = uchar4(quantize(source.read(gid).r),
+                          quantize(source.read(gid).g),
+                          quantize(source.read(gid).b),
+                          quantize(source.read(gid).a));
+    uint offset = base + (gid.y * uint(source.get_width()) + gid.x) * 4u;
+    // The frame texture is BGRA8Unorm (Metal swizzles it to RGBA on read), so
+    // the guest receives the DXGI byte order B, G, R, A.
+    destination[offset + 0u] = pixel.z;
+    destination[offset + 1u] = pixel.y;
+    destination[offset + 2u] = pixel.x;
+    destination[offset + 3u] = pixel.w;
+}
+
+kernel void copy_nv12_to_guest(texture2d<float, access::read> luma [[texture(0)]],
+                               texture2d<float, access::read> chroma [[texture(1)]],
+                               device uchar* destination [[buffer(0)]],
+                               constant uint& base [[buffer(1)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= luma.get_width() || gid.y >= luma.get_height()) {
+        return;
+    }
+    uint width = uint(luma.get_width());
+    destination[base + gid.y * width + gid.x] = quantize(luma.read(gid).r);
+    if ((gid.x % 2u) == 0u && (gid.y % 2u) == 0u) {
+        float2 uv = chroma.read(uint2(gid.x / 2u, gid.y / 2u)).rg;
+        uint chroma_base = base + width * uint(luma.get_height());
+        uint offset = chroma_base + (gid.y / 2u) * width + (gid.x / 2u) * 2u;
+        destination[offset + 0u] = quantize(uv.x);
+        destination[offset + 1u] = quantize(uv.y);
+    }
+}
+"#;
+    let function_name = if nv12 {
+        "copy_nv12_to_guest"
+    } else {
+        "copy_bgra_to_guest"
+    };
+    let options = metal::CompileOptions::new();
+    let library = device
+        .new_library_with_source(SHADER, &options)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                format!("guest surface copy: shader compilation failed: {error}"),
+            )
+        })?;
+    let function = library.get_function(function_name, None).map_err(|error| {
+        AppError::new(
+            ReasonCode::RcMediaInvalid,
+            format!("guest surface copy: kernel lookup failed: {error}"),
+        )
+    })?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                format!("guest surface copy: pipeline creation failed: {error}"),
+            )
+        })
+}
+
+/// Guest-surface copy is only available where IOSurface-backed Metal textures
+/// exist (macOS). Other hosts report the unsupported path instead of silently
+/// converting pixels on the CPU.
+#[cfg(not(target_os = "macos"))]
+pub fn copy_frame_to_guest_surface(
+    _frame: &VideoFrame,
+    _window: &crate::metal_backend::GuestMemoryWindow,
+    _offset: usize,
+) -> AppResult<GuestSurfaceLayout> {
+    Err(AppError::new(
+        ReasonCode::RcMediaInvalid,
+        "guest surface copy requires macOS IOSurface-backed frames",
+    ))
 }
 
 /// Video decoder configuration.
@@ -4547,5 +4807,166 @@ mod tests {
         } else {
             Some(samples)
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Guest-visible MF/DXGI surface hand-off (no CPU RGB conversion)
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn video_decoder_guest_surface_nv12_boundary_roundtrip_matches_planes_exactly() {
+        if !probe_zero_copy_status().is_available() {
+            eprintln!(
+                "skipping guest-surface NV12 test: {}",
+                probe_zero_copy_status().reason()
+            );
+            return;
+        }
+        let (width, height) = (16u32, 8u32);
+        let (y_len, uv_len) = (
+            (width * height) as usize,
+            ((width / 2) * (height / 2) * 2) as usize,
+        );
+        let y_plane: Vec<u8> = (0..y_len).map(|index| (index * 7) as u8).collect();
+        let uv_plane: Vec<u8> = (0..uv_len).map(|index| (index * 11 + 3) as u8).collect();
+        let frame = create_corevideo_nv12_frame(
+            width,
+            height,
+            &y_plane,
+            &uv_plane,
+            0,
+            33_333,
+            ColorSpace::Rec709,
+        )
+        .expect("NV12 frame");
+        let region = crate::metal_backend::GuestSharedRegion::new(
+            4 * crate::metal_backend::host_page_size(),
+        )
+        .expect("guest region");
+        let window = region.window();
+        let offset = crate::metal_backend::host_page_size();
+        let before = zero_copy_stats();
+        let layout =
+            copy_frame_to_guest_surface(&frame, &window, offset).expect("guest surface copy");
+        let after = zero_copy_stats();
+
+        assert_eq!(
+            layout,
+            GuestSurfaceLayout {
+                width,
+                height,
+                bytes: y_len + uv_len,
+                nv12: true,
+                guest_backed: true,
+                staging_fallbacks: 0,
+            }
+        );
+        assert_eq!(after.guest_surface_frames, before.guest_surface_frames + 1);
+        assert_eq!(after.staging_fallbacks, before.staging_fallbacks);
+        // The guest layout is exactly the decoded NV12 planes: no RGB
+        // conversion and no row padding was introduced.
+        assert_eq!(&region.as_slice()[offset..offset + y_len], &y_plane);
+        assert_eq!(
+            &region.as_slice()[offset + y_len..offset + y_len + uv_len],
+            &uv_plane
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn video_decoder_guest_surface_bgra_roundtrip_and_unaligned_fallback_are_exact() {
+        if !probe_zero_copy_status().is_available() {
+            eprintln!(
+                "skipping guest-surface BGRA test: {}",
+                probe_zero_copy_status().reason()
+            );
+            return;
+        }
+        let (width, height) = (8u32, 4u32);
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for index in 0..(width * height) {
+            rgba.push((index * 3) as u8);
+            rgba.push((index * 5 + 1) as u8);
+            rgba.push((index * 7 + 2) as u8);
+            rgba.push(0xFF);
+        }
+        let frame =
+            create_corevideo_frame_from_rgba(width, height, &rgba, 0, 33_333, ColorSpace::Rec709)
+                .expect("BGRA frame");
+        let region = crate::metal_backend::GuestSharedRegion::new(
+            4 * crate::metal_backend::host_page_size(),
+        )
+        .expect("guest region");
+        let window = region.window();
+        let page = crate::metal_backend::host_page_size();
+        let layout = copy_frame_to_guest_surface(&frame, &window, page).expect("aligned copy");
+        assert_eq!(layout.nv12, false);
+        assert_eq!(layout.guest_backed, true);
+        assert_eq!(layout.bytes, (width * height * 4) as usize);
+        let expected: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+            .collect();
+        let end = page + expected.len();
+        assert_eq!(&region.as_slice()[page..end], expected.as_slice());
+
+        let before = zero_copy_stats();
+        let unaligned = copy_frame_to_guest_surface(&frame, &window, 1).expect("unaligned copy");
+        let after = zero_copy_stats();
+        // An unaligned destination is widened to the enclosing host page and
+        // written by the GPU at the byte offset, so it is still zero-copy.
+        assert_eq!(unaligned.guest_backed, true);
+        assert_eq!(unaligned.staging_fallbacks, 0);
+        assert_eq!(after.staging_fallbacks, before.staging_fallbacks);
+        let end = 1 + expected.len();
+        assert_eq!(&region.as_slice()[1..end], expected.as_slice());
+
+        let error = copy_frame_to_guest_surface(&frame, &window, region.len())
+            .expect_err("out-of-window destination must be rejected");
+        assert_eq!(error.code, ReasonCode::RcMediaInvalid);
+        assert_eq!(
+            error.message,
+            "guest surface copy refused: guest region outside the canonical window"
+        );
+    }
+
+    #[test]
+    fn video_decoder_guest_surface_rejects_cpu_only_frame_without_conversion() {
+        let frame = VideoFrame {
+            width: 2,
+            height: 2,
+            data: vec![0u8; 16],
+            pts: 0,
+            duration: 0,
+            texture_id: None,
+            metal_texture: None,
+            color_space: ColorSpace::Rec709,
+        };
+        let region =
+            crate::metal_backend::GuestSharedRegion::new(crate::metal_backend::host_page_size())
+                .expect("guest region");
+        let error = copy_frame_to_guest_surface(&frame, &region.window(), 0)
+            .expect_err("a CPU-only frame must not be converted");
+        assert_eq!(error.code, ReasonCode::RcMediaInvalid);
+        assert_eq!(
+            error.message,
+            "guest surface copy: frame has no IOSurface texture"
+        );
+
+        let empty = VideoFrame {
+            width: 0,
+            height: 0,
+            data: Vec::new(),
+            pts: 0,
+            duration: 0,
+            texture_id: None,
+            metal_texture: None,
+            color_space: ColorSpace::Rec709,
+        };
+        let error = copy_frame_to_guest_surface(&empty, &region.window(), 0)
+            .expect_err("a zero-sized frame must be rejected");
+        assert_eq!(error.code, ReasonCode::RcMediaInvalid);
+        assert_eq!(error.message, "guest surface copy: zero-sized frame");
     }
 }
