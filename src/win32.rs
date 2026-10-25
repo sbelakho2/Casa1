@@ -1143,6 +1143,11 @@ impl CompletionPortWaitState {
         inner.queue.push_back(packet);
         inner.counters.packets_posted += 1;
         self.wake_eligible_waiter(&mut inner);
+        drop(inner);
+        // The cooperative pump is not registered as a port waiter (it probes
+        // readiness without blocking on the port condvar), so publish the
+        // scheduler wake explicitly for a queued packet.
+        crate::runtime::scheduler::notify_pump_wake();
         Ok(())
     }
 
@@ -1156,12 +1161,16 @@ impl CompletionPortWaitState {
         if previous == concurrent_threads {
             return;
         }
-        if !inner.queue.is_empty() && inner.waiters > 0 {
-            let limit = self.effective_limit(&inner);
-            if inner.active_threads.len() < limit {
-                inner.counters.waiter_wakeups += 1;
-                self.wake.notify_all();
-            }
+        let packet_available = !inner.closed
+            && !inner.queue.is_empty()
+            && inner.active_threads.len() < self.effective_limit(&inner);
+        if packet_available && inner.waiters > 0 {
+            inner.counters.waiter_wakeups += 1;
+            self.wake.notify_all();
+        }
+        drop(inner);
+        if packet_available {
+            crate::runtime::scheduler::notify_pump_wake();
         }
     }
 
@@ -1175,9 +1184,18 @@ impl CompletionPortWaitState {
     /// Explicit active-slot release for an associated thread.
     pub fn release_active_as(&self, thread: CompletionPortThreadKey) {
         let mut inner = self.lock();
-        if inner.active_threads.remove(&thread) {
+        let released = inner.active_threads.remove(&thread);
+        if released {
             inner.counters.threads_released += 1;
             self.wake_eligible_waiter(&mut inner);
+        }
+        let packet_available = released
+            && !inner.closed
+            && !inner.queue.is_empty()
+            && inner.active_threads.len() < self.effective_limit(&inner);
+        drop(inner);
+        if packet_available {
+            crate::runtime::scheduler::notify_pump_wake();
         }
     }
 
@@ -1202,6 +1220,10 @@ impl CompletionPortWaitState {
             inner.counters.waiter_wakeups += inner.waiters as u64;
         }
         self.wake.notify_all();
+        drop(inner);
+        // A cooperative waiter must observe the close (ERROR_ABANDONED_WAIT_0)
+        // even though it never blocks on the port condvar.
+        crate::runtime::scheduler::notify_pump_wake();
     }
 
     /// Non-consuming readiness probe for a cooperative scheduler: `true` when
@@ -6504,6 +6526,13 @@ impl Win32Subsystem {
         Ok(self.thread_state(thread_id)?.priority)
     }
 
+    /// Current Windows thread-priority value for a guest thread id.
+    pub fn thread_priority_by_id(&self, thread_id: u32) -> i32 {
+        self.thread_state(thread_id)
+            .map(|state| state.priority)
+            .unwrap_or(0)
+    }
+
     /// The subsystem's current suspend count for `thread_id` (0 = running).
     ///
     /// THE single source of truth for suspension: `suspend_thread` /
@@ -9002,6 +9031,33 @@ mod tests {
         win32.close_handle(with_sync).expect("close with-sync");
         win32.close_handle(created).expect("close created");
         win32.close_handle(no_sync_mutex).expect("close mutex");
+    }
+
+    #[test]
+    fn thread_priority_by_id_unknown_thread_race_is_zero() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "thr-prio", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let handle = win32.create_thread(
+            ThreadPlan {
+                exit_code: None,
+                priority: 0,
+                signaled: false,
+            },
+            false,
+        );
+        let thread_id = win32.thread_id_for_handle(handle).expect("thread id");
+        assert_eq!(
+            win32.thread_priority_by_id(thread_id),
+            0,
+            "a fresh thread starts at priority 0"
+        );
+        assert_eq!(
+            win32.thread_priority_by_id(thread_id.wrapping_add(1)),
+            0,
+            "an unknown guest thread id must report priority 0, not panic"
+        );
     }
 
     #[test]

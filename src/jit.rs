@@ -8642,36 +8642,65 @@ impl JitRuntime {
                 }
             };
 
-            let block = match tier {
-                CompilationTier::Tier0 => {
-                    self.tier0_compiles += 1;
-                    self.compiler.compile_block(
-                        ir,
-                        guest_address,
-                        arch,
-                        resolved_thunks.as_ref(),
-                    )?
+            // Persistent AOT first: a validated record bound to this exact
+            // IR + address + translator/CPU generation avoids recompilation.
+            // Only unlinked Tier-0 records are installed here; hot-path tier
+            // promotion still recompiles from IR.
+            let mut aot_block = None;
+            if matches!(tier, CompilationTier::Tier0) && self.aot_cache_dir.is_some() {
+                let source_hash = compute_ir_hash(ir, guest_address);
+                match self.load_aot_slice_block(ir, guest_address, source_hash, arch) {
+                    Ok(Some(block)) => {
+                        self.aot_hits += 1;
+                        aot_block = Some(block);
+                    }
+                    Ok(None) => self.aot_misses += 1,
+                    Err(error) => {
+                        self.aot_rejected += 1;
+                        eprintln!("[jit] AOT cache rejected for {guest_address:#x}: {error}");
+                        if let Some(path) = self.aot_path(source_hash, guest_address) {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
                 }
-                CompilationTier::Tier1 => {
-                    self.tier1_compiles += 1;
-                    self.compiler.compile_tier1(
-                        ir,
-                        guest_address,
-                        arch,
-                        resolved_thunks.as_ref(),
-                    )?
-                }
-                CompilationTier::Tier2 => {
-                    self.tier2_compiles += 1;
-                    self.compiler.compile_tier2(
-                        ir,
-                        guest_address,
-                        arch,
-                        resolved_thunks.as_ref(),
-                    )?
+            }
+            let loaded_aot = aot_block.is_some();
+            let block = if let Some(block) = aot_block {
+                block
+            } else {
+                match tier {
+                    CompilationTier::Tier0 => {
+                        self.tier0_compiles += 1;
+                        self.compiler.compile_block(
+                            ir,
+                            guest_address,
+                            arch,
+                            resolved_thunks.as_ref(),
+                        )?
+                    }
+                    CompilationTier::Tier1 => {
+                        self.tier1_compiles += 1;
+                        self.compiler.compile_tier1(
+                            ir,
+                            guest_address,
+                            arch,
+                            resolved_thunks.as_ref(),
+                        )?
+                    }
+                    CompilationTier::Tier2 => {
+                        self.tier2_compiles += 1;
+                        self.compiler.compile_tier2(
+                            ir,
+                            guest_address,
+                            arch,
+                            resolved_thunks.as_ref(),
+                        )?
+                    }
                 }
             };
-            self.blocks_compiled += 1;
+            if !loaded_aot {
+                self.blocks_compiled += 1;
+            }
 
             // Track which 4K guest pages this compiled block occupies,
             // for self-modifying code detection.
@@ -18908,5 +18937,28 @@ mod coverage_adversarial_tests {
         let mut results = results.into_inner().expect("results");
         results.sort_unstable();
         assert_eq!(results, vec![(50, 50), (50, 50), (50, 50), (50, 50)]);
+    }
+
+    #[test]
+    fn hot_path_loads_persisted_aot_record_without_recompiling() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let ir = vec![
+            IrInstruction::Nop,
+            IrInstruction::Return { stack_adjust: 0 },
+        ];
+        let mut writer = JitRuntime::new(GuestArch::X64);
+        writer.set_aot_cache_dir(Some(directory.path().to_path_buf()));
+        writer
+            .get_or_compile_slice_block(&ir, 0x9100, GuestArch::X64)
+            .expect("persist worker block");
+
+        let mut reader = JitRuntime::new(GuestArch::X64);
+        reader.set_aot_cache_dir(Some(directory.path().to_path_buf()));
+        reader
+            .get_or_compile_at_tier(&ir, 0x9100, GuestArch::X64, CompilationTier::Tier0, None)
+            .expect("hot path load");
+        assert_eq!(reader.aot_metrics().0, 1, "one persistent hit");
+        assert_eq!(reader.blocks_compiled, 0, "an AOT hit does not recompile");
+        assert_eq!(reader.tier0_compiles, 0);
     }
 }

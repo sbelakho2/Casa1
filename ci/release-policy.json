@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "kind": "casa1-release-policy",
+  "protected_branches": {
+    "main": {
+      "required_status_checks": [
+        "CI Gate"
+      ],
+      "strict": true,
+      "enforce_admins": true,
+      "allow_force_pushes": false,
+      "allow_deletions": false,
+      "required_approving_review_count": 1,
+      "dismiss_stale_reviews": true
+    }
+  },
+  "workflows": {
+    ".github/workflows/ci.yml": {
+      "aggregate_job": "ci-gate",
+      "aggregate_name": "CI Gate",
+      "required_jobs": [
+        "fmt",
+        "check",
+        "clippy",
+        "clippy-all-features",
+        "test",
+        "api-gate",
+        "integration-tests",
+        "docs",
+        "fuzz-build",
+        "fuzz-smoke",
+        "warning-count",
+        "policy-check",
+        "ci-gate"
+      ]
+    },
+    ".github/workflows/release.yml": {
+      "aggregate_job": "release-gate",
+      "aggregate_name": "Release Gate",
+      "required_jobs": [
+        "check-compile",
+        "check-format",
+        "check-clippy",
+        "check-tests",
+        "check-no-insecure-tls",
+        "check-dependency-audit",
+        "check-licenses",
+        "check-reproducible",
+        "signed-build",
+        "steam-e2e",
+        "release-smoke-tests",
+        "audit-release-entitlements",
+        "check-release-gate",
+        "release-gate"
+      ]
+    }
+  },
+  "contract": {
+    "ci_workflow": ".github/workflows/ci.yml",
+    "release_workflow": ".github/workflows/release.yml",
+    "nightly_workflow": ".github/workflows/nightly.yml",
+    "api_gate_job": "api-gate",
+    "api_gate_name_terms": [
+      "Completeness",
+      "Regression"
+    ],
+    "api_gate_commands": [
+      "--gate completeness",
+      "ci/check_api_regression.sh"
+    ],
+    "release_completeness_job": "check-release-gate",
+    "release_completeness_commands": [
+      "--gate completeness"
+    ],
+    "manifest_write_command": "ci/evidence_manifest.py --write ci/test-manifest.json",
+    "manifest_verify_command": "ci/evidence_manifest.py",
+    "manifest_path": "ci/test-manifest.json",
+    "manifest_artifact_prefix": "test-manifest-",
+    "manifest_fold_argument": "--test-manifest",
+    "api_gate_forbidden_commands": [
+      "api-report --gate none"
+    ],
+    "ubsan_script": "ci/run_nightly_ubsan_if_supported.sh",
+    "ubsan_required_tokens": [
+      "-Zsanitizer=undefined",
+      "-Zbuild-std",
+      "ci/meta-tests.txt",
+      "--skip",
+      "--lib --bins --tests"
+    ],
+    "manual_settings_required_terms": [
+      "force push",
+      "deletions",
+      "CI Gate",
+      "enforce",
+      "review"
+    ],
+    "forbid_feature_tokens": [
+      "metal"
+    ],
+    "forbid_command_patterns": [
+      "git push --force",
+      "git push -f",
+      "git push --force-with-lease",
+      "git push --delete",
+      "git branch -D",
+      "git reset --hard",
+      "--no-verify"
+    ]
+  },
+  "manual_github_settings": [
+    "Repository Settings > General: disable 'Allow force pushes' and 'Allow deletions' for main.",
+    "Branches > main protection: require the status check 'CI Gate' (strict/up-to-date), enforce for administrators, require at least 1 approving review, and dismiss stale reviews.",
+    "Branches > main protection: do not allow force pushes, do not allow deletions, and do not bypass the required checks for administrators.",
+    "Tags: protect v* release tags from update/deletion (GitHub tag protection rules; not expressible in this repository).",
+    "Environments: protect the self-hosted release environment with required reviewers; the release workflow is workflow_dispatch-only.",
+    "Actions > General: require approval for first-time contributors and keep the default GITHUB_TOKEN read-only.",
+    "Verify after applying: `gh api repos/:owner/:repo/branches/main/protection` shows required_status_checks.contexts == ['CI Gate'], enforce_admins.enabled == true, allow_force_pushes.enabled == false, allow_deletions.enabled == false."
+  ]
+}

@@ -1452,14 +1452,15 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "mscoree.dll",
         "CLRCreateInstance",
         None,
-        SemanticFidelity::SyntheticEnvironment,
+        SemanticFidelity::Exact,
         SubsystemCapability::Partial,
-        "Models a Windows machine with no .NET Framework CLR installed for the \
-         Framework hosting contract: CLRCreateInstance answers \
-         COR_E_CLRNOTAVAILABLE.  Separately, managed images carrying a CLI header \
-         execute on the host-installed CoreCLR (dotnet 8) through the real managed \
-         execution path, so the CLR capability is partial: .NET (Core) images run, \
-         .NET Framework-only images do not.",
+        "Exposes the CoreCLR runtimes really installed on the host: the meta host, \
+         ICLRRuntimeInfo and a real ICLRRuntimeHost whose \
+         ExecuteInDefaultAppDomain runs managed static methods natively on ARM64 \
+         CoreCLR.  Managed (.NET Core) images also execute through the managed \
+         image path.  The legacy .NET Framework activation contract \
+         (CorBindToRuntime*) remains absent, so .NET Framework-only images do not \
+         run; the capability is partial, never synthetic.",
     ),
     semantic_override(
         "mscoree.dll",
@@ -1492,19 +1493,21 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "mscorwks.dll",
         "CorBindToRuntime",
         None,
-        SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "No CLR workhorse runtime exists in the modeled environment: activation \
-         answers COR_E_CLRNOTAVAILABLE.",
+        SemanticFidelity::Exact,
+        SubsystemCapability::Partial,
+        "Binds an explicitly requested installed CoreCLR version to the real \
+         ICLRRuntimeHost (managed delegates and applications execute natively on \
+         ARM64 CoreCLR); the absent .NET Framework CLR keeps versionless and \
+         Framework-version requests at COR_E_CLRNOTAVAILABLE.",
     ),
     semantic_override(
         "mscorwks.dll",
         "CorBindToRuntimeEx",
         None,
-        SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "No CLR workhorse runtime exists in the modeled environment: activation \
-         answers COR_E_CLRNOTAVAILABLE.",
+        SemanticFidelity::Exact,
+        SubsystemCapability::Partial,
+        "Binds an explicitly requested installed CoreCLR version to the real \
+         ICLRRuntimeHost; Framework versions remain genuinely absent.",
     ),
     // ── Media Foundation: MF exists, service providers do not ──────────────
     semantic_override(

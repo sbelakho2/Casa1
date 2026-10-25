@@ -232,8 +232,7 @@ impl PeHostRuntime {
             // ── mscorwks: the CLR-absent answers ──
             HostThunk::ClrCreateManagedInstance
             | HostThunk::CorBindToRuntime
-            | HostThunk::CorBindToRuntimeEx
-            | HostThunk::GetClrRuntimeHost => {
+            | HostThunk::CorBindToRuntimeEx => {
                 let out_index = if matches!(thunk, HostThunk::ClrCreateManagedInstance) {
                     2
                 } else {

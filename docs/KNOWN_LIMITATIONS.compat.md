@@ -6,7 +6,7 @@
 
 Every tracked export whose dispatch is not exact or whose backing subsystem is not fully available, per the semantic axes of the API database (level = dispatch quality; fidelity = how close the guest-visible behavior is to the documented operation; capability = whether the Windows subsystem the operation belongs to exists in the modeled environment).
 
-**Counts**: 37 entries deviate from exact/full — fidelity Exact 3, Restricted 16, SyntheticEnvironment 18, capability Full 1, Partial 22, Absent 14.
+**Counts**: 37 entries deviate from exact/full — fidelity Exact 6, Restricted 16, SyntheticEnvironment 15, capability Full 1, Partial 27, Absent 9.
 
 
 ### actxprxy.dll
@@ -72,15 +72,15 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### mscoree.dll
 
-- `CLRCreateInstance` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — Models a Windows machine with no .NET CLR installed: activation answers COR_E_CLRNOTAVAILABLE.  Export dispatch is callable; the CLR capability is absent (see KNOWN_LIMITATIONS: .NET applications do not run).
-- `CorBindToRuntime` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — Models a Windows machine with no .NET CLR installed: activation answers COR_E_CLRNOTAVAILABLE.
-- `CorBindToRuntimeEx` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — Models a Windows machine with no .NET CLR installed: activation answers COR_E_CLRNOTAVAILABLE.
+- `CLRCreateInstance` — level `Implemented`, fidelity `Exact`, capability `Partial` — Exposes the CoreCLR runtimes really installed on the host: the meta host, ICLRRuntimeInfo and a real ICLRRuntimeHost whose ExecuteInDefaultAppDomain runs managed static methods natively on ARM64 CoreCLR.  Managed (.NET Core) images also execute through the managed image path.  The legacy .NET Framework activation contract (CorBindToRuntime*) remains absent, so .NET Framework-only images do not run; the capability is partial, never synthetic.
+- `CorBindToRuntime` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — Models a Windows machine with no .NET CLR installed: activation answers COR_E_CLRNOTAVAILABLE.
+- `CorBindToRuntimeEx` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — Models a Windows machine with no .NET CLR installed: activation answers COR_E_CLRNOTAVAILABLE.
 - `GetCORSystemDirectory` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — Models a Windows machine with no .NET CLR installed: the directory query fails as it would without a runtime directory.
 
 ### mscorwks.dll
 
-- `CorBindToRuntime` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No CLR workhorse runtime exists in the modeled environment: activation answers COR_E_CLRNOTAVAILABLE.
-- `CorBindToRuntimeEx` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No CLR workhorse runtime exists in the modeled environment: activation answers COR_E_CLRNOTAVAILABLE.
+- `CorBindToRuntime` — level `Implemented`, fidelity `Exact`, capability `Partial` — Binds an explicitly requested installed CoreCLR version to the real ICLRRuntimeHost (managed delegates and applications execute natively on ARM64 CoreCLR); the absent .NET Framework CLR keeps versionless and Framework-version requests at COR_E_CLRNOTAVAILABLE.
+- `CorBindToRuntimeEx` — level `Implemented`, fidelity `Exact`, capability `Partial` — Binds an explicitly requested installed CoreCLR version to the real ICLRRuntimeHost; Framework versions remain genuinely absent.
 
 ### msftedit.dll
 

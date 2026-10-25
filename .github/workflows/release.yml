@@ -455,10 +455,21 @@ jobs:
           run-id: ${{ steps.api-report-ci.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: e2e-evidence
-      # Bind the downloaded report+provenance into release-evidence.json (both
-      # the outer file and its embedded peer copy, which the gate requires
-      # byte-identical) before the release gate runs.
-      - name: Fold api-report provenance into the release evidence
+      # The compiled-test manifest is uploaded by the same ci.yml run's test
+      # job. It proves every declared conformance/differential evidence id was
+      # actually compiled (and runnable), and its canonical hash is folded into
+      # the release evidence below.
+      - name: Download compiled test/evidence manifest from CI
+        uses: actions/download-artifact@v4
+        with:
+          name: test-manifest-${{ github.sha }}
+          run-id: ${{ steps.api-report-ci.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: e2e-evidence
+      # Bind the downloaded report+provenance and compiled-test manifest into
+      # release-evidence.json (both the outer file and its embedded peer copy,
+      # which the gate requires byte-identical) before the release gate runs.
+      - name: Fold api-report provenance and test manifest into the release evidence
         run: |
           set -euo pipefail
           python3 ci/fold_api_report_provenance.py \
@@ -466,6 +477,7 @@ jobs:
             --peer e2e-evidence/steam-e2e-evidence/release-evidence.json \
             --report e2e-evidence/api-completeness.json \
             --provenance e2e-evidence/api-completeness.json.provenance.json \
+            --test-manifest e2e-evidence/test-manifest.json \
             --ci-run-id "${{ steps.api-report-ci.outputs.run_id }}" \
             --ci-run-url "${{ steps.api-report-ci.outputs.run_url }}"
       # The release-smoke job's JIT self-test verdict must reach the
@@ -536,49 +548,37 @@ jobs:
       - check-release-gate
     if: always()
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify protected-main/release policy
+        run: python3 ci/check_release_policy.py --root .
       - name: Evaluate release gate results
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          RESULTS=""
-          FAIL=0
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
 
-          for job in check-compile check-format check-clippy check-tests \
-                     check-no-insecure-tls check-dependency-audit \
-                     check-licenses check-reproducible signed-build steam-e2e \
-                     release-smoke-tests audit-release-entitlements \
-                     check-release-gate; do
-            STATUS=""
-            case "$job" in
-              check-compile)           STATUS="${{ needs.check-compile.result }}" ;;
-              check-format)            STATUS="${{ needs.check-format.result }}" ;;
-              check-clippy)            STATUS="${{ needs.check-clippy.result }}" ;;
-              check-tests)             STATUS="${{ needs.check-tests.result }}" ;;
-              check-no-insecure-tls)   STATUS="${{ needs.check-no-insecure-tls.result }}" ;;
-              check-dependency-audit)  STATUS="${{ needs.check-dependency-audit.result }}" ;;
-              check-licenses)          STATUS="${{ needs.check-licenses.result }}" ;;
-              check-reproducible)      STATUS="${{ needs.check-reproducible.result }}" ;;
-              signed-build)            STATUS="${{ needs.signed-build.result }}" ;;
-              steam-e2e)               STATUS="${{ needs.steam-e2e.result }}" ;;
-              release-smoke-tests)     STATUS="${{ needs.release-smoke-tests.result }}" ;;
-              audit-release-entitlements) STATUS="${{ needs.audit-release-entitlements.result }}" ;;
-              check-release-gate)      STATUS="${{ needs.check-release-gate.result }}" ;;
-            esac
-
-            if [ "$STATUS" = "success" ]; then
-              RESULTS="$RESULTS\n✅ $job: PASSED"
-            else
-              RESULTS="$RESULTS\n❌ $job: FAILED ($STATUS)"
-              FAIL=1
-            fi
-          done
-
-          echo -e "$RESULTS"
-          echo ""
-
-          if [ "$FAIL" -eq 1 ]; then
-            echo "::error::Release gate FAILED — evidence is missing or a check did not pass"
-            echo "::error::The gate fails closed: Steam E2E evidence for this exact SHA,"
-            echo "::error::the signed JIT self-test, and the evidence checks are all required."
-            exit 1
-          else
-            echo "🎉 All release gate checks PASSED"
-          fi
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          if not needs:
+              print("::error::Release gate has no dependencies; refusing to pass")
+              sys.exit(1)
+          failed = []
+          for job in sorted(needs):
+              result = (needs.get(job) or {}).get("result", "missing")
+              if result == "success":
+                  print(f"PASSED {job}")
+              else:
+                  print(f"FAILED {job} ({result})")
+                  failed.append(job)
+          print("")
+          if failed:
+              print("::error::Release gate FAILED — evidence is missing or a check did not pass")
+              print("::error::The gate fails closed: Steam E2E evidence for this exact SHA,")
+              print("::error::the signed JIT self-test, and the evidence checks are all required.")
+              sys.exit(1)
+          print(f"All {len(needs)} release gate checks PASSED")
+          PY

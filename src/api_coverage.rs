@@ -276,83 +276,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     evidence("kernel32.dll", "HeapAlloc", "windows-oracle:heap"),
     evidence("kernel32.dll", "HeapFree", "windows-oracle:heap"),
     evidence("kernel32.dll", "HeapSize", "windows-oracle:heap"),
-    // The d3d12 enum categories are covered by the Windows reference's
-    // d3d12_* differential vectors.
-    evidence(
-        "d3d12.dll",
-        "D3D12CreateDevice",
-        "windows-oracle:d3d12_device",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12DeviceCreateCommandQueue",
-        "windows-oracle:d3d12_command_queue",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12DeviceCreateCommandAllocator",
-        "windows-oracle:d3d12_command_allocator",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12DeviceCreateCommandList",
-        "windows-oracle:d3d12_command_list",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12DeviceCheckFeatureSupport",
-        "windows-oracle:d3d12_feature_support",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12DeviceCreateDescriptorHeap",
-        "windows-oracle:d3d12_descriptor_heap",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12DeviceCreateRenderTargetView",
-        "windows-oracle:d3d12_render_target_view",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12DeviceCreateFence",
-        "windows-oracle:d3d12_fence",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12CommandQueueExecuteCommandLists",
-        "windows-oracle:d3d12_command_queue",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12CommandQueueSignal",
-        "windows-oracle:d3d12_fence",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12DescriptorHeapGetCpuHandleForHeapStart",
-        "windows-oracle:d3d12_descriptor_heap",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12GraphicsCommandListResourceBarrier",
-        "windows-oracle:d3d12_resource_barrier",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12GraphicsCommandListClearRenderTargetView",
-        "windows-oracle:d3d12_render_target_view",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12GraphicsCommandListDrawInstanced",
-        "windows-oracle:d3d12_draw",
-    ),
-    evidence(
-        "d3d12.dll",
-        "D3D12GraphicsCommandListClose",
-        "windows-oracle:d3d12_command_list",
-    ),
     // == evidence-ui-mm ==
     //
     // UI + multimedia families (user32/gdi32/shell32/comctl32/winmm).  The
@@ -4486,6 +4409,46 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     conformance_evidence!(
         "ntdll.dll",
         "NtQueryObject",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtAttestationChallenge",
+        "attestation_guest_thunks_reject_forgery_replay_and_no_provider"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtAttestationEnrollProvider",
+        "attestation_provider_enrollment_is_persisted_revocable_and_exact"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtAttestationQuote",
+        "attestation_guest_thunks_reject_forgery_replay_and_no_provider"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtAttestationRevokeProvider",
+        "attestation_provider_enrollment_is_persisted_revocable_and_exact"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtAttestationVerify",
+        "attestation_guest_thunks_reject_forgery_replay_and_no_provider"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtOpenDirectoryObject",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtQueryDirectoryObject",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtQueryVolumeInformationFile",
         "section50_win32_nt_consistency"
     ),
     conformance_evidence!(
@@ -9857,6 +9820,81 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "d3d8thk.dll",
         "D3DKMTCreateAllocation",
         "casa1-conformance:evidence_d3d8thk_esent_wsp_wininet_dinput_surfaces",
+    ),
+    conformance(
+        "d3d12.dll",
+        "D3D12CreateDevice",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    conformance(
+        "d3d8thk.dll",
+        "D3DKMTEscape",
+        "casa1-conformance:escape_dispatch_fails_closed_and_new_imports_resolve",
+    ),
+    conformance(
+        "d3d8thk.dll",
+        "D3DKMTMapGpuVirtualAddress",
+        "casa1-conformance:gpu_va_vidmm_paging_dispatch_pins_contracts_on_x86_and_x64",
+    ),
+    conformance(
+        "d3d8thk.dll",
+        "D3DKMTPagingFence",
+        "casa1-conformance:gpu_va_vidmm_paging_dispatch_pins_contracts_on_x86_and_x64",
+    ),
+    conformance(
+        "d3d8thk.dll",
+        "D3DKMTQueryVideoMemoryInfo",
+        "casa1-conformance:gpu_va_vidmm_paging_dispatch_pins_contracts_on_x86_and_x64",
+    ),
+    conformance(
+        "d3d8thk.dll",
+        "D3DKMTSubmitCommand",
+        "casa1-conformance:submit_command_dispatch_requires_residency_and_pins_outputs",
+    ),
+    conformance(
+        "d3d8thk.dll",
+        "D3DKMTUnmapGpuVirtualAddress",
+        "casa1-conformance:gpu_va_vidmm_paging_dispatch_pins_contracts_on_x86_and_x64",
+    ),
+    conformance(
+        "gdi32.dll",
+        "D3DKMTEscape",
+        "casa1-conformance:escape_dispatch_fails_closed_and_new_imports_resolve",
+    ),
+    conformance(
+        "gdi32.dll",
+        "D3DKMTMapGpuVirtualAddress",
+        "casa1-conformance:gpu_va_vidmm_paging_dispatch_pins_contracts_on_x86_and_x64",
+    ),
+    conformance(
+        "gdi32.dll",
+        "D3DKMTPagingFence",
+        "casa1-conformance:gpu_va_vidmm_paging_dispatch_pins_contracts_on_x86_and_x64",
+    ),
+    conformance(
+        "gdi32.dll",
+        "D3DKMTQueryVideoMemoryInfo",
+        "casa1-conformance:gpu_va_vidmm_paging_dispatch_pins_contracts_on_x86_and_x64",
+    ),
+    conformance(
+        "gdi32.dll",
+        "D3DKMTSubmitCommand",
+        "casa1-conformance:submit_command_dispatch_requires_residency_and_pins_outputs",
+    ),
+    conformance(
+        "gdi32.dll",
+        "D3DKMTUnmapGpuVirtualAddress",
+        "casa1-conformance:gpu_va_vidmm_paging_dispatch_pins_contracts_on_x86_and_x64",
+    ),
+    conformance(
+        "dml.dll",
+        "DMLCreateDevice",
+        "casa1-conformance:d3d12_dml_dll_imports_resolve_and_reject_unsupported_registry_export",
+    ),
+    conformance(
+        "dml.dll",
+        "DMLCreateDevice1",
+        "casa1-conformance:d3d12_dml_create_device1_feature_level_and_device1_query_interface",
     ),
     conformance(
         "d3d8thk.dll",

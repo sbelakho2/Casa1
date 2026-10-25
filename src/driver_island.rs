@@ -18,11 +18,17 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
+use crate::casak::alpc::{AlpcManager, AlpcPort};
+use crate::casak::diagnostics::{
+    DiagnosticsManager, EventDescriptor, EventLevel, ProviderGuid, ProviderId,
+};
 use crate::casak::exec::{PoolBlock, PoolTag, TaggedPool};
+use crate::casak::executive::Executive;
+use crate::casak::interrupt::{ConnectRequest, DisconnectOutcome, InterruptManager};
 use crate::casak::io::{
     DeviceExtension, DeviceFlags, IoManager, IrpId, IrpMajorFunction, IrpParameterBlock,
     STATUS_CANCELLED, STATUS_INVALID_PARAMETER, StackParameters,
@@ -31,10 +37,12 @@ use crate::casak::object::{
     ObjectId, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_ADDRESS, STATUS_OBJECT_NAME_COLLISION,
     STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS,
 };
+use crate::casak::process::{ProcessId, ProcessManager, ThreadId};
+use crate::casak::threads::{SystemThreadHandle, SystemThreadManager};
 use crate::cpu::{CpuState, GuestArch, MemoryImage, Register};
 use crate::driver_image::{ImportRef, ImportReport, KernelApiSet, LoadedDriver, load_driver_image};
 use crate::error::{AppError, AppResult};
-use crate::ge::{FileAccess, RegistryView, ShareMode};
+use crate::ge::{FileAccess, RegistryView, ShareMode, StoredRegistryValue};
 use crate::reason::ReasonCode;
 use crate::runtime::{HostThunk, PeHostRuntime};
 use crate::trace::TraceEvent;
@@ -119,6 +127,62 @@ const WDF_POWER_DEVICE_D3_FINAL: u32 = 5;
 
 /// `STATUS_IMAGE_ALREADY_LOADED` — the service is already loaded.
 const STATUS_IMAGE_ALREADY_LOADED: i32 = 0xC000_010Eu32 as i32;
+/// `STATUS_ACCESS_DENIED`.
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
+/// `STATUS_NOT_SUPPORTED` — the operation is recognised but has no island
+/// implementation.
+const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
+/// `STATUS_INVALID_DEVICE_STATE` — an object is in the wrong state for the
+/// requested transition (double acquire, release of an unheld lock).
+const STATUS_INVALID_DEVICE_STATE: i32 = 0xC000_0184u32 as i32;
+/// `STATUS_UNSUCCESSFUL` — a guest slice failed before publishing a status.
+#[allow(dead_code)]
+const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
+/// `STATUS_NOT_FOUND` — no object matches the synthetic request.
+#[allow(dead_code)]
+const STATUS_NOT_FOUND: i32 = 0xC000_0225u32 as i32;
+/// Maximum scheduler slices in one pump call; hosts call again to continue.
+const MAX_THREAD_SLICES: usize = 64;
+/// `STATUS_BUFFER_OVERFLOW` — the query succeeded but the caller buffer was
+/// too small; the required length is still reported.
+const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
+/// `STATUS_OBJECT_PATH_INVALID` — a registry path is not under
+/// `\Registry\Machine`.
+const STATUS_OBJECT_PATH_INVALID: i32 = 0xC000_0039u32 as i32;
+/// `DISPATCH_LEVEL`.
+const DISPATCH_LEVEL: u8 = 2;
+/// `HIGH_LEVEL`.
+const HIGH_LEVEL: u8 = 15;
+/// `NonPagedPool`.
+const NON_PAGED_POOL: u32 = 0;
+/// `PagedPool`.
+const PAGED_POOL: u32 = 1;
+/// `NotificationEvent`.
+const NOTIFICATION_EVENT: u32 = 0;
+/// `SynchronizationEvent`.
+const SYNCHRONIZATION_EVENT: u32 = 1;
+/// `KernelMode` for `MmProbeAndLockPages`.
+const KERNEL_MODE: u8 = 0;
+/// `UserMode` for `MmProbeAndLockPages`.
+const USER_MODE: u8 = 1;
+/// `IoReadAccess`.
+const IO_READ_ACCESS: u32 = 0;
+/// `IoWriteAccess`.
+const IO_WRITE_ACCESS: u32 = 1;
+/// `IoModifyAccess`.
+const IO_MODIFY_ACCESS: u32 = 2;
+/// `KeyValuePartialInformation`.
+const KEY_VALUE_PARTIAL_INFORMATION: u32 = 2;
+/// `KeyValueFullInformation`.
+const KEY_VALUE_FULL_INFORMATION: u32 = 1;
+/// Base of the island's real registry key handle namespace.
+const KEY_HANDLE_BASE: u64 = 0x7E00_0000;
+/// Number of guest 100ns ticks per millisecond.
+const TICKS_PER_MILLISECOND: i128 = 10_000;
+/// Longest host sleep a blocking dispatcher wait may park for.  The island has
+/// no guest scheduler, so a longer deadline cannot make progress anyway; the
+/// wait still consumes its real deadline up to this bound.
+const MAX_DISPATCHER_WAIT_MS: u128 = 1_000;
 /// `\Registry\Machine\System\CurrentControlSet\Services\` (lowercase).
 const SERVICE_REGISTRY_PREFIX: &str = "system\\currentcontrolset\\services\\";
 /// `\Registry\Machine\` (lowercase), including the trailing separator.
@@ -220,6 +284,12 @@ enum PendingPurpose {
         rollback: VecDeque<GuestCallback>,
         failure_status: Option<i32>,
         final_state: PnpFinalState,
+    },
+    /// Deferred procedure calls drained after IRQL drops below dispatch level.
+    Dpcs {
+        remaining: VecDeque<GuestCallback>,
+        restore_irql: u8,
+        final_result: u64,
     },
 }
 
@@ -540,6 +610,92 @@ pub enum DriverShim {
     IoCompleteRequest,
     ExAllocatePoolWithTag,
     ExFreePoolWithTag,
+    /// `ExAllocatePool` (untagged, typed pool).
+    ExAllocatePool,
+    /// `ExFreePool` (untagged pool free).
+    ExFreePool,
+    /// `KeGetCurrentIrql`.
+    KeGetCurrentIrql,
+    /// `KfRaiseIrql`.
+    KfRaiseIrql,
+    /// `KfLowerIrql`; drains queued DPCs below dispatch level.
+    KfLowerIrql,
+    /// `KeAcquireSpinLockRaiseToDpc`.
+    KeAcquireSpinLockRaiseToDpc,
+    /// `KeReleaseSpinLock`.
+    KeReleaseSpinLock,
+    /// `KeInitializeDpc`.
+    KeInitializeDpc,
+    /// `KeInsertQueueDpc`.
+    KeInsertQueueDpc,
+    /// `KeRemoveQueueDpc`.
+    KeRemoveQueueDpc,
+    /// `KeInitializeEvent`.
+    KeInitializeEvent,
+    /// `KeSetEvent`.
+    KeSetEvent,
+    /// `KeResetEvent`.
+    KeResetEvent,
+    /// `KeReadStateEvent`.
+    KeReadStateEvent,
+    /// `KeWaitForSingleObject`.
+    KeWaitForSingleObject,
+    /// `KeQuerySystemTime`.
+    KeQuerySystemTime,
+    /// `IoAllocateMdl`.
+    IoAllocateMdl,
+    /// `MmProbeAndLockPages`.
+    MmProbeAndLockPages,
+    /// `MmUnlockPages`.
+    MmUnlockPages,
+    /// `IoFreeMdl`.
+    IoFreeMdl,
+    /// `MmGetMdlByteCount`.
+    MmGetMdlByteCount,
+    /// `PsGetCurrentProcessId`.
+    PsGetCurrentProcessId,
+    /// `PsGetCurrentThreadId`.
+    PsGetCurrentThreadId,
+    /// `ZwOpenKey`.
+    ZwOpenKey,
+    /// `ZwQueryValueKey`.
+    ZwQueryValueKey,
+    /// `ZwClose` for island registry key handles.
+    ZwClose,
+    /// `ExInitializeNPagedLookasideList`.
+    ExInitializeNPagedLookasideList,
+    /// `ExAllocateFromNPagedLookasideList`.
+    ExAllocateFromNPagedLookasideList,
+    /// `ExFreeToNPagedLookasideList`.
+    ExFreeToNPagedLookasideList,
+    /// `ExInitializePagedLookasideList`.
+    ExInitializePagedLookasideList,
+    /// `ExAllocateFromPagedLookasideList`.
+    ExAllocateFromPagedLookasideList,
+    /// `ExFreeToPagedLookasideList`.
+    ExFreeToPagedLookasideList,
+    /// Creates a real guest-executable island system thread.
+    PsCreateSystemThread,
+    /// Terminates the calling system thread.
+    PsTerminateSystemThread,
+    /// Connects a virtual line-based interrupt.
+    IoConnectInterrupt,
+    /// Connects an interrupt through the extended parameter block.
+    IoConnectInterruptEx,
+    /// Disconnects a virtual interrupt object.
+    IoDisconnectInterrupt,
+    /// Registers an in-process ETW provider.
+    EtwRegister,
+    /// Unregisters an in-process ETW provider.
+    EtwUnregister,
+    /// Writes an event to an in-process ETW provider.
+    EtwWrite,
+    /// Connects to an in-process ALPC port.
+    NtAlpcConnectPort,
+    /// Queries the executive interrupt-time counter.
+    KeQueryInterruptTime,
+    /// Guest-visible preemption safepoint.
+    IslandSafepoint,
     /// Default `MajorFunction` dispatch: refuses unsupported IRPs.
     IrpDispatch,
     /// KMDF subset: `WdfDriverCreate`.
@@ -668,6 +824,49 @@ impl DriverShim {
             "iocompleterequest" => Some(Self::IoCompleteRequest),
             "exallocatepoolwithtag" => Some(Self::ExAllocatePoolWithTag),
             "exfreepoolwithtag" => Some(Self::ExFreePoolWithTag),
+            "exallocatepool" => Some(Self::ExAllocatePool),
+            "exfreepool" => Some(Self::ExFreePool),
+            "kegetcurrentirql" => Some(Self::KeGetCurrentIrql),
+            "kfraiseirql" => Some(Self::KfRaiseIrql),
+            "kflowerirql" => Some(Self::KfLowerIrql),
+            "keacquirespinlockraisetodpc" => Some(Self::KeAcquireSpinLockRaiseToDpc),
+            "kereleasespinlock" => Some(Self::KeReleaseSpinLock),
+            "keinitializedpc" => Some(Self::KeInitializeDpc),
+            "keinsertqueuedpc" => Some(Self::KeInsertQueueDpc),
+            "keremovequeuedpc" => Some(Self::KeRemoveQueueDpc),
+            "keinitializeevent" => Some(Self::KeInitializeEvent),
+            "kesetevent" => Some(Self::KeSetEvent),
+            "keresetevent" => Some(Self::KeResetEvent),
+            "kereadstateevent" => Some(Self::KeReadStateEvent),
+            "kewaitforsingleobject" => Some(Self::KeWaitForSingleObject),
+            "kequerysystemtime" => Some(Self::KeQuerySystemTime),
+            "ioallocatemdl" => Some(Self::IoAllocateMdl),
+            "mmprobeandlockpages" => Some(Self::MmProbeAndLockPages),
+            "mmunlockpages" => Some(Self::MmUnlockPages),
+            "iofreemdl" => Some(Self::IoFreeMdl),
+            "mmgetmdlbytecount" => Some(Self::MmGetMdlByteCount),
+            "psgetcurrentprocessid" => Some(Self::PsGetCurrentProcessId),
+            "psgetcurrentthreadid" => Some(Self::PsGetCurrentThreadId),
+            "zwopenkey" => Some(Self::ZwOpenKey),
+            "zwqueryvaluekey" => Some(Self::ZwQueryValueKey),
+            "zwclose" => Some(Self::ZwClose),
+            "exinitializenpagedlookasidelist" => Some(Self::ExInitializeNPagedLookasideList),
+            "exallocatefromnpagedlookasidelist" => Some(Self::ExAllocateFromNPagedLookasideList),
+            "exfreetonpagedlookasidelist" => Some(Self::ExFreeToNPagedLookasideList),
+            "exinitializepagedlookasidelist" => Some(Self::ExInitializePagedLookasideList),
+            "exallocatefrompagedlookasidelist" => Some(Self::ExAllocateFromPagedLookasideList),
+            "exfreetopagedlookasidelist" => Some(Self::ExFreeToPagedLookasideList),
+            "pscreatesystemthread" => Some(Self::PsCreateSystemThread),
+            "psterminatesystemthread" => Some(Self::PsTerminateSystemThread),
+            "ioconnectinterrupt" => Some(Self::IoConnectInterrupt),
+            "ioconnectinterruptex" => Some(Self::IoConnectInterruptEx),
+            "iodisconnectinterrupt" => Some(Self::IoDisconnectInterrupt),
+            "etwregister" => Some(Self::EtwRegister),
+            "etwunregister" => Some(Self::EtwUnregister),
+            "etwwrite" => Some(Self::EtwWrite),
+            "ntalpcconnectport" => Some(Self::NtAlpcConnectPort),
+            "kequeryinterrupttime" => Some(Self::KeQueryInterruptTime),
+            "islandsafepoint" => Some(Self::IslandSafepoint),
             "wdfdrivercreate" => Some(Self::WdfDriverCreate),
             "wdfdeviceinitsetdevicetype" => Some(Self::WdfDeviceInitSetDeviceType),
             "wdfdeviceinitsetiotype" => Some(Self::WdfDeviceInitSetIoType),
@@ -739,6 +938,41 @@ impl DriverShim {
             Self::IofCompleteRequest | Self::IoCompleteRequest => 8,
             Self::ExAllocatePoolWithTag => 12,
             Self::ExFreePoolWithTag => 8,
+            Self::ExAllocatePool => 8,
+            Self::ExFreePool => 4,
+            Self::KeGetCurrentIrql
+            | Self::KeQuerySystemTime
+            | Self::PsGetCurrentProcessId
+            | Self::PsGetCurrentThreadId => 0,
+            Self::KfRaiseIrql | Self::KfLowerIrql => 4,
+            Self::KeAcquireSpinLockRaiseToDpc => 4,
+            Self::KeReleaseSpinLock => 8,
+            Self::KeInitializeDpc => 12,
+            Self::KeInsertQueueDpc => 12,
+            Self::KeRemoveQueueDpc => 4,
+            Self::KeInitializeEvent => 12,
+            Self::KeSetEvent => 12,
+            Self::KeResetEvent | Self::KeReadStateEvent => 4,
+            Self::KeWaitForSingleObject => 16,
+            Self::IoAllocateMdl => 20,
+            Self::MmProbeAndLockPages => 12,
+            Self::MmUnlockPages | Self::IoFreeMdl | Self::MmGetMdlByteCount => 4,
+            Self::ZwOpenKey => 12,
+            Self::ZwQueryValueKey => 24,
+            Self::ZwClose => 4,
+            Self::ExInitializeNPagedLookasideList | Self::ExInitializePagedLookasideList => 28,
+            Self::ExAllocateFromNPagedLookasideList | Self::ExAllocateFromPagedLookasideList => 4,
+            Self::ExFreeToNPagedLookasideList | Self::ExFreeToPagedLookasideList => 8,
+            Self::PsCreateSystemThread => 20,
+            Self::PsTerminateSystemThread
+            | Self::IoConnectInterruptEx
+            | Self::IoDisconnectInterrupt => 4,
+            Self::IoConnectInterrupt => 44,
+            Self::EtwRegister => 16,
+            Self::EtwUnregister => 4,
+            Self::EtwWrite => 16,
+            Self::NtAlpcConnectPort => 28,
+            Self::KeQueryInterruptTime | Self::IslandSafepoint => 0,
             Self::IrpDispatch => 8,
             Self::WdfDriverCreate => 20,
             Self::WdfDeviceInitSetDeviceType | Self::WdfDeviceInitSetIoType => 8,
@@ -838,6 +1072,23 @@ struct IslandState {
     irp_guests: BTreeMap<IrpId, u64>,
     symbolic_links: Vec<(String, String)>,
     kmdf: KmdfState,
+    kernel: KernelState,
+    process: ProcessManager,
+    current_process: ProcessId,
+    current_thread: ThreadId,
+    diagnostics: DiagnosticsManager,
+    alpc: AlpcManager,
+    alpc_handles: BTreeMap<u64, AlpcPort>,
+    next_alpc_handle: u64,
+    executive: Executive,
+    system_threads: SystemThreadManager,
+    interrupts: InterruptManager,
+    thread_cpus: BTreeMap<ThreadId, CpuState>,
+    thread_quantum: Duration,
+    slice_deadline: Option<Instant>,
+    current_system_thread: Option<ThreadId>,
+    pending_interrupts: VecDeque<u32>,
+    notification_waits: u64,
     removed_device_objects: BTreeSet<u64>,
     arena: IslandArena,
 }
@@ -868,6 +1119,67 @@ impl IslandArena {
         self.cursor = end;
         Ok(start)
     }
+}
+
+/// One acquired spin lock: the IRQL the acquire raised to and the IRQL the
+/// release must restore.
+#[derive(Debug, Clone, Copy)]
+struct SpinLockState {
+    raised_from: u8,
+}
+
+/// One real `KDPC`.  The routine is guest code and runs only when IRQL drops
+/// below `DISPATCH_LEVEL`, exactly like the kernel's software interrupt.
+#[derive(Debug, Clone, Copy)]
+struct DpcState {
+    routine: u64,
+    context: u64,
+    arg1: u64,
+    arg2: u64,
+    queued: bool,
+}
+
+/// One real `KEVENT`.  `gate` is shared with the (bounded) waiting path so a
+/// concurrent signal can release a parked wait.
+#[derive(Debug, Clone)]
+struct KernelEvent {
+    event_type: u32,
+    signaled: bool,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+/// One locked memory descriptor list.
+#[derive(Debug, Clone, Copy)]
+struct MdlState {
+    virtual_address: u64,
+    byte_count: u64,
+    write_access: bool,
+    locked: bool,
+}
+
+/// One kernel lookaside list, backed by the real [`crate::casak::exec::LookasideList`]
+/// and a stable guest buffer per cached host block.
+struct IslandLookaside {
+    list: crate::casak::exec::LookasideList,
+    entry_size: usize,
+    guest_by_ptr: BTreeMap<usize, u64>,
+    block_by_guest: BTreeMap<u64, crate::casak::exec::LookasideBlock>,
+}
+
+/// The island's kernel personality state that is not owned by CasaK: current
+/// IRQL, spin locks, DPCs, dispatcher events, MDLs, lookaside lists and real
+/// registry key handles.
+#[derive(Default)]
+struct KernelState {
+    irql: u8,
+    spinlocks: BTreeMap<u64, SpinLockState>,
+    dpcs: BTreeMap<u64, DpcState>,
+    pending_dpcs: VecDeque<u64>,
+    events: BTreeMap<u64, KernelEvent>,
+    mdls: BTreeMap<u64, MdlState>,
+    lookasides: BTreeMap<u64, IslandLookaside>,
+    registry_keys: BTreeMap<u64, String>,
+    next_key_handle: u64,
 }
 
 impl DriverIsland {
@@ -975,6 +1287,19 @@ impl DriverIsland {
             .create_driver(driver_name, DeviceExtension::new())
             .map_err(|status| nt_error("IoCreateDriver", status))?;
         let default_dispatch = allocate_shim(runtime, DriverShim::IrpDispatch);
+        let current_process = ProcessId(runtime.win32.current_process_id());
+        let current_thread = ThreadId(runtime.win32.current_thread_id());
+        let mut process = ProcessManager::new();
+        process
+            .ensure_process(current_process, driver_name, None)
+            .map_err(|status| nt_error("PsGetCurrentProcessId", status))?;
+        process
+            .ensure_thread(current_process, current_thread, 0)
+            .map_err(|status| nt_error("PsGetCurrentThreadId", status))?;
+        let mut system_threads = SystemThreadManager::new();
+        system_threads
+            .adopt_thread(current_process, current_thread)
+            .map_err(|status| nt_error("PsGetCurrentThreadId", status))?;
 
         let registry_path =
             format!("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\{driver_name}");
@@ -1006,6 +1331,23 @@ impl DriverIsland {
             irp_guests: BTreeMap::new(),
             symbolic_links: Vec::new(),
             kmdf: KmdfState::default(),
+            kernel: KernelState::default(),
+            process,
+            current_process,
+            current_thread,
+            diagnostics: DiagnosticsManager::new(),
+            alpc: AlpcManager::new(),
+            alpc_handles: BTreeMap::new(),
+            next_alpc_handle: 1,
+            executive: Executive::new(),
+            system_threads,
+            interrupts: InterruptManager::new(),
+            thread_cpus: BTreeMap::new(),
+            thread_quantum: Duration::from_millis(4),
+            slice_deadline: None,
+            current_system_thread: None,
+            pending_interrupts: VecDeque::new(),
+            notification_waits: 0,
             removed_device_objects: BTreeSet::new(),
             arena: IslandArena {
                 cursor: arena_base,
@@ -1432,6 +1774,418 @@ impl DriverIsland {
     /// IRPs the driver completed through `IoCompleteRequest`.
     pub fn completed_irp_count(&self) -> u64 {
         self.inner.borrow().io.completed_irp_count()
+    }
+
+    /// Runs ready island system threads in resumable slices.  A slice yields
+    /// at an island safepoint when its quantum expires, an interrupt is
+    /// pending, termination is requested, or the guest blocks in a wait.
+    /// Waiting threads are re-evaluated on every scheduler turn and woken by
+    /// the exact object/deadline/APC transition.
+    #[allow(dead_code)]
+    pub(crate) fn pump_system_threads(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+    ) -> usize {
+        let inner = self.inner.clone();
+        let _active = ActiveIsland::install(inner.clone());
+        let mut ran = 0;
+        loop {
+            if self.pump_one_system_slice(runtime, memory) {
+                ran += 1;
+                if ran >= MAX_THREAD_SLICES {
+                    break;
+                }
+                continue;
+            }
+            let deadline = inner.borrow().system_threads.next_wait_deadline();
+            let Some(deadline) = deadline else {
+                break;
+            };
+            let now = Instant::now();
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(50)),
+            );
+        }
+        ran
+    }
+
+    /// Runs one scheduler turn: wake satisfied waits, run one ready slice,
+    /// then service one pending virtual interrupt.  Exposed for tests that
+    /// need to act between slices (handle close, termination, interrupt).
+    #[allow(dead_code)]
+    pub(crate) fn pump_one_system_slice(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+    ) -> bool {
+        let inner = self.inner.clone();
+        let _active = ActiveIsland::install(inner.clone());
+        self.wake_system_waits(runtime, memory);
+        let next = { inner.borrow_mut().system_threads.take_next() };
+        let Some(run) = next else {
+            return false;
+        };
+        let wake_status = inner.borrow_mut().system_threads.take_wake_status(run.id);
+        if wake_status == Some(crate::casak::status::STATUS_USER_APC) {
+            self.deliver_system_apcs(runtime, memory, run.id);
+        }
+        self.run_thread_slice(runtime, memory, run, wake_status);
+        let vector = { inner.borrow_mut().pending_interrupts.pop_front() };
+        if let Some(vector) = vector {
+            let _ = self.trigger_virtual_interrupt(runtime, memory, vector);
+        }
+        true
+    }
+
+    fn run_thread_slice(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        run: crate::casak::threads::RunnableThread,
+        wake_status: Option<i32>,
+    ) {
+        let inner = self.inner.clone();
+        let (mut cpu, resumed, previous_irql, thread_irql, quantum) = {
+            let mut state = inner.borrow_mut();
+            let resumed = state.thread_cpus.contains_key(&run.id);
+            let mut cpu = state.thread_cpus.remove(&run.id).unwrap_or_else(|| {
+                let mut cpu = CpuState::new(state.arch);
+                cpu.set(Register::Rsp, run.stack_base + run.stack_size - 0x100);
+                cpu
+            });
+            if let Some(status) = wake_status {
+                cpu.set(Register::Rax, status as u32 as u64);
+            }
+            let thread_irql = state
+                .system_threads
+                .thread_record(run.id)
+                .map_or(0, |record| record.irql);
+            let previous_irql = state.kernel.irql;
+            state.kernel.irql = thread_irql;
+            state.current_system_thread = Some(run.id);
+            state.slice_deadline = Some(Instant::now() + state.thread_quantum);
+            let quantum = state.thread_quantum;
+            (cpu, resumed, previous_irql, thread_irql, quantum)
+        };
+        let _ = (thread_irql, quantum);
+        runtime.yield_pumped_guest_thread = false;
+        let resume_rsp = resumed.then(|| cpu.get(Register::Rsp));
+        let result = runtime.execute_guest_callback_inner(
+            &mut cpu,
+            memory,
+            run.start_routine,
+            &[run.context],
+            "PsCreateSystemThread",
+            true,
+            resume_rsp,
+        );
+        {
+            let mut state = inner.borrow_mut();
+            state.current_system_thread = None;
+            state.slice_deadline = None;
+            let saved_irql = state.kernel.irql;
+            state.kernel.irql = previous_irql;
+            match result {
+                Ok(crate::runtime::GuestCallbackDisposition::Returned(value)) => {
+                    state.thread_cpus.remove(&run.id);
+                    state.finish_system_thread(run.id, value as u32 as i32);
+                }
+                Ok(crate::runtime::GuestCallbackDisposition::Yielded) => {
+                    let _ = state.system_threads.set_irql(run.id, saved_irql);
+                    let terminated = state
+                        .system_threads
+                        .thread_record(run.id)
+                        .and_then(|record| record.termination_requested)
+                        .is_some();
+                    if terminated {
+                        state.thread_cpus.remove(&run.id);
+                        state.finish_system_thread(run.id, STATUS_UNSUCCESSFUL);
+                    } else if state.system_threads.wait_of(run.id).is_some() {
+                        state.thread_cpus.insert(run.id, cpu);
+                    } else {
+                        state.thread_cpus.insert(run.id, cpu);
+                        state.system_threads.requeue_current();
+                    }
+                }
+                Err(_) => {
+                    state.thread_cpus.remove(&run.id);
+                    state.finish_system_thread(run.id, STATUS_UNSUCCESSFUL);
+                }
+            }
+        }
+    }
+
+    fn deliver_system_apcs(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thread: ThreadId,
+    ) {
+        let inner = self.inner.clone();
+        let apcs = {
+            let mut state = inner.borrow_mut();
+            state
+                .system_threads
+                .take_apcs_by_thread(thread)
+                .unwrap_or_default()
+        };
+        for apc in apcs {
+            let (arch, stack_base, stack_size) = {
+                let state = inner.borrow();
+                let record = state
+                    .system_threads
+                    .thread_record(thread)
+                    .expect("an APC target has a scheduler record");
+                (state.arch, record.stack_base, record.stack_size)
+            };
+            let mut cpu = CpuState::new(arch);
+            cpu.set(Register::Rsp, stack_base + stack_size - 0x100);
+            let _ = runtime.execute_guest_callback(
+                &mut cpu,
+                memory,
+                apc.routine,
+                &[apc.context],
+                "SystemThreadApc",
+            );
+        }
+    }
+
+    fn wake_system_waits(&mut self, _runtime: &mut PeHostRuntime, _memory: &mut MemoryImage) {
+        let inner = self.inner.clone();
+        let waits = { inner.borrow().system_threads.waiting_threads() };
+        for (thread, wait) in waits {
+            let (status, consume_event) = {
+                let state = inner.borrow();
+                match wait.target {
+                    crate::casak::threads::WaitTarget::Thread(target) => {
+                        let done = state
+                            .system_threads
+                            .thread_state(target)
+                            .is_some_and(|state| {
+                                state == crate::casak::threads::KernelThreadState::Terminated
+                            });
+                        (done.then_some(STATUS_SUCCESS), false)
+                    }
+                    crate::casak::threads::WaitTarget::Event(event) => {
+                        let signaled = state
+                            .kernel
+                            .events
+                            .get(&event)
+                            .is_some_and(|record| record.signaled);
+                        (signaled.then_some(STATUS_SUCCESS), true)
+                    }
+                }
+            };
+            let status = status.or_else(|| {
+                wait.deadline
+                    .filter(|deadline| Instant::now() >= *deadline)
+                    .map(|_| STATUS_TIMEOUT)
+            });
+            let Some(status) = status else {
+                continue;
+            };
+            let mut state = inner.borrow_mut();
+            if consume_event
+                && let crate::casak::threads::WaitTarget::Event(event) = wait.target
+                && let Some(record) = state.kernel.events.get_mut(&event)
+                && record.event_type == SYNCHRONIZATION_EVENT
+            {
+                record.signaled = false;
+                *record
+                    .gate
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+            }
+            let _ = state.system_threads.wake(thread, status);
+        }
+    }
+
+    /// Test/host helper: queue a virtual interrupt to be delivered at the next
+    /// system-thread safepoint.
+    #[allow(dead_code)]
+    pub(crate) fn queue_virtual_interrupt(&mut self, vector: u32) {
+        self.inner.borrow_mut().pending_interrupts.push_back(vector);
+    }
+
+    /// Test/host helper: queue an APC on a system thread.  Alertable waits are
+    /// woken immediately; non-alertable waits keep blocking.
+    #[allow(dead_code)]
+    pub(crate) fn queue_system_thread_apc(
+        &mut self,
+        handle: SystemThreadHandle,
+        routine: u64,
+        context: u64,
+    ) -> Result<(), i32> {
+        self.inner
+            .borrow_mut()
+            .system_threads
+            .queue_apc(handle, routine, context)
+            .map(|_| ())
+    }
+
+    /// Test/host helper: cancel a blocked wait with `STATUS_CANCELLED`.
+    #[allow(dead_code)]
+    pub(crate) fn cancel_system_thread_wait(
+        &mut self,
+        handle: SystemThreadHandle,
+    ) -> Result<(), i32> {
+        self.inner
+            .borrow_mut()
+            .system_threads
+            .cancel_wait(handle, crate::casak::status::STATUS_CANCELLED)
+            .map(|_| ())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_thread_quantum(&mut self, quantum: Duration) {
+        self.inner.borrow_mut().thread_quantum = quantum;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn system_thread_state(
+        &self,
+        handle: SystemThreadHandle,
+    ) -> Option<crate::casak::threads::KernelThreadState> {
+        let state = self.inner.borrow();
+        let thread = state.system_threads.query(handle).ok()?.id;
+        state.system_threads.thread_state(thread)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn system_thread_exit_status_by_id(
+        &self,
+        thread: ThreadId,
+    ) -> Result<Option<i32>, i32> {
+        self.inner.borrow().system_threads.exit_status_by_id(thread)
+    }
+
+    /// Waits for a system thread handle, pumping the scheduler.  `None`
+    /// means the timeout elapsed; `Some(status)` is the exit code.
+    #[allow(dead_code)]
+    pub(crate) fn wait_system_thread(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        handle: SystemThreadHandle,
+        timeout_ms: u64,
+    ) -> Result<Option<i32>, i32> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(60_000));
+        loop {
+            if let Some(status) = self.inner.borrow().system_threads.exit_status(handle)? {
+                return Ok(Some(status));
+            }
+            if timeout_ms == 0 {
+                return Ok(None);
+            }
+            let ran = self.pump_system_threads(runtime, memory);
+            if let Some(status) = self.inner.borrow().system_threads.exit_status(handle)? {
+                return Ok(Some(status));
+            }
+            if ran == 0 || (timeout_ms != u64::MAX && Instant::now() >= deadline) {
+                return Ok(None);
+            }
+        } // coverage: unreachable — every loop iteration returns
+    }
+
+    /// Terminates a system thread by handle.  A ready thread is detached
+    /// immediately; a running thread exits at the end of its slice.
+    #[allow(dead_code)]
+    pub(crate) fn terminate_system_thread(
+        &mut self,
+        handle: SystemThreadHandle,
+        exit_status: i32,
+    ) -> Result<(), i32> {
+        let mut state = self.inner.borrow_mut();
+        let (thread, immediate) = state
+            .system_threads
+            .request_terminate(handle, exit_status)?;
+        if immediate {
+            state.thread_cpus.remove(&thread);
+            let IslandState {
+                process,
+                system_threads,
+                ..
+            } = &mut *state;
+            let _ = process.terminate_thread(system_threads, thread);
+        }
+        Ok(())
+    }
+
+    /// Signals a synthetic interrupt vector and runs every ISR (in connection
+    /// order) until one handles it, then drains the DPC queue.  Returns 1 when
+    /// handled, 0 when no ISR claimed it, or the exact failure status.
+    #[allow(dead_code)]
+    pub(crate) fn trigger_virtual_interrupt(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        vector: u32,
+    ) -> AppResult<i32> {
+        let inner = self.inner.clone();
+        let _active = ActiveIsland::install(inner.clone());
+        let objects = { inner.borrow().interrupts.vector_objects(vector) };
+        if objects.is_empty() {
+            return Ok(STATUS_NOT_FOUND);
+        }
+        let mut handled = false;
+        for guest_object in objects {
+            let ticket = {
+                let mut state = inner.borrow_mut();
+                match state.interrupts.begin_dispatch(guest_object) {
+                    Ok(ticket) => ticket,
+                    Err(_) => continue,
+                }
+            };
+            {
+                let mut state = inner.borrow_mut();
+                state.kernel.irql = ticket.irql;
+            }
+            let arch = inner.borrow().arch;
+            let mut cpu = CpuState::new(arch);
+            cpu.set(Register::Rsp, STACK_BASE + STACK_SIZE - 0x400);
+            let result = runtime.execute_guest_callback(
+                &mut cpu,
+                memory,
+                ticket.service_routine,
+                &[ticket.guest_object, ticket.service_context],
+                "InterruptServiceRoutine",
+            );
+            let claimed = matches!(result, Ok(value) if value as u32 != 0);
+            {
+                let mut state = inner.borrow_mut();
+                state.kernel.irql = 0;
+                let _ = state.interrupts.end_dispatch(ticket);
+            }
+            if claimed {
+                handled = true;
+                break;
+            }
+        }
+        loop {
+            let (calls, restore_irql) = {
+                let mut state = inner.borrow_mut();
+                (state.take_ready_dpcs(), state.kernel.irql)
+            };
+            if calls.is_empty() {
+                break;
+            }
+            {
+                inner.borrow_mut().kernel.irql = DISPATCH_LEVEL;
+            }
+            for call in calls {
+                let arch = inner.borrow().arch;
+                let mut cpu = CpuState::new(arch);
+                cpu.set(Register::Rsp, STACK_BASE + STACK_SIZE - 0x800);
+                let _ = runtime
+                    .execute_guest_callback(&mut cpu, memory, call.entry, &call.args, call.label);
+            }
+            inner.borrow_mut().kernel.irql = restore_irql;
+        }
+        Ok(if handled { 1 } else { 0 })
     }
 
     /// Invoke one island shim directly from a test, with arguments placed in
@@ -1999,6 +2753,74 @@ impl IslandState {
             }
             DriverShim::ExAllocatePoolWithTag => self.ex_allocate_pool(state, memory)?,
             DriverShim::ExFreePoolWithTag => self.ex_free_pool(state, memory)?,
+            DriverShim::ExAllocatePool => self.ex_allocate_pool_untagged(state, memory)?,
+            DriverShim::ExFreePool => self.ex_free_pool_untagged(state, memory)?,
+            DriverShim::KeGetCurrentIrql => self.ke_get_current_irql(state),
+            DriverShim::KfRaiseIrql => self.kf_raise_irql(state, memory)?,
+            DriverShim::KfLowerIrql => return self.kf_lower_irql(state, memory),
+            DriverShim::KeAcquireSpinLockRaiseToDpc => self.ke_acquire_spin_lock(state, memory)?,
+            DriverShim::KeReleaseSpinLock => self.ke_release_spin_lock(state, memory)?,
+            DriverShim::KeInitializeDpc => self.ke_initialize_dpc(state, memory)?,
+            DriverShim::KeInsertQueueDpc => return self.ke_insert_queue_dpc(state, memory),
+            DriverShim::KeRemoveQueueDpc => self.ke_remove_queue_dpc(state, memory)?,
+            DriverShim::KeInitializeEvent => self.ke_initialize_event(state, memory)?,
+            DriverShim::KeSetEvent => self.ke_set_event(state, memory)?,
+            DriverShim::KeResetEvent => self.ke_reset_event(state, memory)?,
+            DriverShim::KeReadStateEvent => self.ke_read_state_event(state, memory)?,
+            DriverShim::KeWaitForSingleObject => {
+                self.ke_wait_for_single_object(runtime, state, memory)?
+            }
+            DriverShim::KeQuerySystemTime => self.ke_query_system_time(state, memory)?,
+            DriverShim::KeQueryInterruptTime => self.ke_query_interrupt_time(state),
+            DriverShim::IslandSafepoint => {
+                set_status(state, STATUS_SUCCESS);
+                self.maybe_preempt(runtime);
+            }
+            DriverShim::IoAllocateMdl => self.io_allocate_mdl(state, memory)?,
+            DriverShim::MmProbeAndLockPages => {
+                self.mm_probe_and_lock_pages(runtime, state, memory)?
+            }
+            DriverShim::MmUnlockPages => self.mm_unlock_pages(state, memory)?,
+            DriverShim::IoFreeMdl => self.io_free_mdl(state, memory)?,
+            DriverShim::MmGetMdlByteCount => self.mm_get_mdl_byte_count(state, memory)?,
+            DriverShim::PsGetCurrentProcessId => self.ps_get_current_process_id(state),
+            DriverShim::PsGetCurrentThreadId => self.ps_get_current_thread_id(state),
+            DriverShim::ZwOpenKey => self.zw_open_key(runtime, state, memory)?,
+            DriverShim::ZwQueryValueKey => self.zw_query_value_key(runtime, state, memory)?,
+            DriverShim::ZwClose => self.zw_close(state, memory)?,
+            DriverShim::ExInitializeNPagedLookasideList => {
+                self.ex_initialize_lookaside(state, memory, NON_PAGED_POOL)?
+            }
+            DriverShim::ExAllocateFromNPagedLookasideList => {
+                self.ex_allocate_from_lookaside(state, memory, NON_PAGED_POOL)?
+            }
+            DriverShim::ExFreeToNPagedLookasideList => {
+                self.ex_free_to_lookaside(state, memory, NON_PAGED_POOL)?
+            }
+            DriverShim::ExInitializePagedLookasideList => {
+                self.ex_initialize_lookaside(state, memory, PAGED_POOL)?
+            }
+            DriverShim::ExAllocateFromPagedLookasideList => {
+                self.ex_allocate_from_lookaside(state, memory, PAGED_POOL)?
+            }
+            DriverShim::ExFreeToPagedLookasideList => {
+                self.ex_free_to_lookaside(state, memory, PAGED_POOL)?
+            }
+            DriverShim::PsCreateSystemThread => {
+                self.ps_create_system_thread(runtime, state, memory)?
+            }
+            DriverShim::PsTerminateSystemThread => {
+                self.ps_terminate_system_thread(state, memory)?
+            }
+            DriverShim::IoConnectInterrupt => self.io_connect_interrupt(runtime, state, memory)?,
+            DriverShim::IoConnectInterruptEx => {
+                self.io_connect_interrupt_ex(runtime, state, memory)?
+            }
+            DriverShim::IoDisconnectInterrupt => self.io_disconnect_interrupt(state, memory)?,
+            DriverShim::EtwRegister => self.etw_register(state, memory)?,
+            DriverShim::EtwUnregister => self.etw_unregister(state, memory)?,
+            DriverShim::EtwWrite => self.etw_write(state, memory)?,
+            DriverShim::NtAlpcConnectPort => self.nt_alpc_connect_port(state, memory)?,
             DriverShim::IrpDispatch => {
                 set_status(state, crate::casak::io::STATUS_INVALID_DEVICE_REQUEST);
             }
@@ -2247,6 +3069,44 @@ impl IslandState {
                 if dispatch_next {
                     return self.dispatch_next_queued(memory);
                 }
+            }
+            PendingPurpose::Dpcs {
+                mut remaining,
+                restore_irql,
+                final_result,
+            } => {
+                if let Some(next) = remaining.pop_front() {
+                    return Ok(Some(PendingGuestCall {
+                        entry: next.entry,
+                        args: next.args,
+                        label: next.label,
+                        purpose: PendingPurpose::Dpcs {
+                            remaining,
+                            restore_irql,
+                            final_result,
+                        },
+                    }));
+                }
+                self.kernel.irql = restore_irql;
+                // `restore_irql` is below DISPATCH_LEVEL for every batch the
+                // island builds, so newly queued DPCs from the callback are
+                // immediately eligible.
+                let mut next = self.take_ready_dpcs();
+                if !next.is_empty() {
+                    self.kernel.irql = DISPATCH_LEVEL;
+                    let first = next.pop_front().expect("non-empty queue");
+                    return Ok(Some(PendingGuestCall {
+                        entry: first.entry,
+                        args: first.args,
+                        label: first.label,
+                        purpose: PendingPurpose::Dpcs {
+                            remaining: next,
+                            restore_irql,
+                            final_result,
+                        },
+                    }));
+                }
+                state.set(Register::Rax, final_result);
             }
         }
         Ok(None)
@@ -2900,11 +3760,19 @@ impl IslandState {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _pool_type = guest_arg(state, memory, 0)? as u32;
+        let pool_type = guest_arg(state, memory, 0)? as u32;
         let size = guest_arg(state, memory, 1)? as usize;
         let tag_bits = guest_arg(state, memory, 2)? as u32;
         let tag = PoolTag::new(&tag_bits.to_le_bytes());
-        if size > 0x100_0000 {
+        if pool_type != NON_PAGED_POOL && pool_type != PAGED_POOL {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        if pool_type == PAGED_POOL && self.kernel.irql >= DISPATCH_LEVEL {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        if size == 0 || size > 0x100_0000 {
             state.set(Register::Rax, 0);
             return Ok(());
         }
@@ -2942,6 +3810,1423 @@ impl IslandState {
             }
         }
         state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    fn ex_allocate_pool_untagged(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let pool_type = guest_arg(state, memory, 0)? as u32;
+        let size = guest_arg(state, memory, 1)? as usize;
+        // Paged pool is not available above APC_LEVEL.  The kernel bugchecks
+        // here; the island fails the allocation closed instead of handing out
+        // pageable memory at dispatch level.
+        if pool_type == PAGED_POOL && self.kernel.irql >= DISPATCH_LEVEL {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        if pool_type != NON_PAGED_POOL && pool_type != PAGED_POOL {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        if size == 0 || size > 0x100_0000 {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        let tag = PoolTag::new(b"None");
+        let block = match self.pool.allocate(tag, size) {
+            Ok(block) => block,
+            Err(_) => {
+                state.set(Register::Rax, 0);
+                return Ok(());
+            }
+        };
+        let guest = match self.arena.alloc(memory, size, 8) {
+            Ok(guest) => guest,
+            Err(_) => {
+                let _ = self.pool.free(block);
+                state.set(Register::Rax, 0);
+                return Ok(());
+            }
+        };
+        self.pool_blocks.insert(guest, block);
+        state.set(Register::Rax, guest);
+        Ok(())
+    }
+
+    fn ex_free_pool_untagged(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let guest = guest_arg(state, memory, 0)?;
+        if let Some(block) = self.pool_blocks.remove(&guest) {
+            let _ = self.pool.free(block);
+        }
+        Ok(())
+    }
+
+    fn ke_get_current_irql(&self, state: &mut CpuState) {
+        state.set(Register::Rax, u64::from(self.kernel.irql));
+    }
+
+    fn kf_raise_irql(&mut self, state: &mut CpuState, memory: &MemoryImage) -> AppResult<()> {
+        let new_irql = guest_arg(state, memory, 0)? as u8;
+        if new_irql > HIGH_LEVEL {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        if new_irql < self.kernel.irql {
+            set_status(state, STATUS_INVALID_DEVICE_STATE);
+            return Ok(());
+        }
+        let previous = self.kernel.irql;
+        self.kernel.irql = new_irql;
+        state.set(Register::Rax, u64::from(previous));
+        Ok(())
+    }
+
+    fn kf_lower_irql(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let new_irql = guest_arg(state, memory, 0)? as u8;
+        if new_irql > self.kernel.irql {
+            set_status(state, STATUS_INVALID_DEVICE_STATE);
+            return Ok(None);
+        }
+        self.kernel.irql = new_irql;
+        if new_irql >= DISPATCH_LEVEL {
+            return Ok(None);
+        }
+        let mut remaining = self.take_ready_dpcs();
+        if remaining.is_empty() {
+            return Ok(None);
+        }
+        let restore_irql = self.kernel.irql;
+        self.kernel.irql = DISPATCH_LEVEL;
+        let first = remaining.pop_front().expect("non-empty queue");
+        Ok(Some(PendingGuestCall {
+            entry: first.entry,
+            args: first.args,
+            label: first.label,
+            purpose: PendingPurpose::Dpcs {
+                remaining,
+                restore_irql,
+                final_result: 0,
+            },
+        }))
+    }
+
+    fn ke_acquire_spin_lock(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let lock = guest_arg(state, memory, 0)?;
+        if lock == 0 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        if self.kernel.spinlocks.contains_key(&lock) || self.kernel.irql > DISPATCH_LEVEL {
+            set_status(state, STATUS_INVALID_DEVICE_STATE);
+            return Ok(());
+        }
+        let previous = self.kernel.irql;
+        self.kernel.spinlocks.insert(
+            lock,
+            SpinLockState {
+                raised_from: previous,
+            },
+        );
+        self.kernel.irql = DISPATCH_LEVEL;
+        write_guest_pointer(memory, lock, 1, self.arch)?;
+        state.set(Register::Rax, u64::from(previous));
+        Ok(())
+    }
+
+    fn ke_release_spin_lock(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let lock = guest_arg(state, memory, 0)?;
+        let new_irql = guest_arg(state, memory, 1)? as u8;
+        let Some(held) = self.kernel.spinlocks.get(&lock).copied() else {
+            set_status(state, STATUS_INVALID_DEVICE_STATE);
+            return Ok(());
+        };
+        if self.kernel.irql != DISPATCH_LEVEL || new_irql > held.raised_from {
+            set_status(state, STATUS_INVALID_DEVICE_STATE);
+            return Ok(());
+        }
+        self.kernel.spinlocks.remove(&lock);
+        self.kernel.irql = new_irql;
+        write_guest_pointer(memory, lock, 0, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn ke_initialize_dpc(&mut self, state: &mut CpuState, memory: &MemoryImage) -> AppResult<()> {
+        let dpc = guest_arg(state, memory, 0)?;
+        let routine = guest_arg(state, memory, 1)?;
+        let context = guest_arg(state, memory, 2)?;
+        if dpc == 0 || routine == 0 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        self.kernel.dpcs.insert(
+            dpc,
+            DpcState {
+                routine,
+                context,
+                arg1: 0,
+                arg2: 0,
+                queued: false,
+            },
+        );
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn ke_insert_queue_dpc(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<Option<PendingGuestCall>> {
+        let dpc = guest_arg(state, memory, 0)?;
+        let arg1 = guest_arg(state, memory, 1)?;
+        let arg2 = guest_arg(state, memory, 2)?;
+        let Some(entry) = self.kernel.dpcs.get_mut(&dpc) else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(None);
+        };
+        if entry.queued {
+            state.set(Register::Rax, 0);
+            return Ok(None);
+        }
+        entry.queued = true;
+        entry.arg1 = arg1;
+        entry.arg2 = arg2;
+        self.kernel.pending_dpcs.push_back(dpc);
+        if self.kernel.irql < DISPATCH_LEVEL {
+            let mut remaining = self.take_ready_dpcs();
+            let restore_irql = self.kernel.irql;
+            self.kernel.irql = DISPATCH_LEVEL;
+            if let Some(first) = remaining.pop_front() {
+                return Ok(Some(PendingGuestCall {
+                    entry: first.entry,
+                    args: first.args,
+                    label: first.label,
+                    purpose: PendingPurpose::Dpcs {
+                        remaining,
+                        restore_irql,
+                        final_result: 1,
+                    },
+                }));
+            }
+        }
+        state.set(Register::Rax, 1);
+        Ok(None)
+    }
+
+    fn ke_remove_queue_dpc(&mut self, state: &mut CpuState, memory: &MemoryImage) -> AppResult<()> {
+        let dpc = guest_arg(state, memory, 0)?;
+        let mut removed = false;
+        if let Some(entry) = self.kernel.dpcs.get_mut(&dpc) {
+            if entry.queued {
+                entry.queued = false;
+                removed = true;
+            }
+        }
+        if removed {
+            self.kernel.pending_dpcs.retain(|queued| *queued != dpc);
+        }
+        state.set(Register::Rax, u64::from(removed));
+        Ok(())
+    }
+
+    /// Move every queued DPC into a guest callback, clearing its queued flag.
+    fn take_ready_dpcs(&mut self) -> VecDeque<GuestCallback> {
+        let mut calls = VecDeque::new();
+        while let Some(dpc) = self.kernel.pending_dpcs.pop_front() {
+            let entry = self
+                .kernel
+                .dpcs
+                .get_mut(&dpc)
+                .expect("pending DPC queue only holds initialized DPCs");
+            debug_assert!(entry.queued, "pending DPC queue only holds queued DPCs");
+            entry.queued = false;
+            calls.push_back(GuestCallback {
+                entry: entry.routine,
+                args: vec![dpc, entry.context, entry.arg1, entry.arg2],
+                label: "DeferredProcedureCall",
+            });
+        }
+        calls
+    }
+
+    fn ke_initialize_event(&mut self, state: &mut CpuState, memory: &MemoryImage) -> AppResult<()> {
+        let event = guest_arg(state, memory, 0)?;
+        let event_type = guest_arg(state, memory, 1)? as u32;
+        let initial = guest_arg(state, memory, 2)? != 0;
+        if event == 0 || !matches!(event_type, NOTIFICATION_EVENT | SYNCHRONIZATION_EVENT) {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let gate = Arc::new((Mutex::new(initial), Condvar::new()));
+        self.kernel.events.insert(
+            event,
+            KernelEvent {
+                event_type,
+                signaled: initial,
+                gate,
+            },
+        );
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn ke_set_event(&mut self, state: &mut CpuState, memory: &MemoryImage) -> AppResult<()> {
+        let event = guest_arg(state, memory, 0)?;
+        let Some((previous, gate)) = self
+            .kernel
+            .events
+            .get(&event)
+            .map(|record| (record.signaled, record.gate.clone()))
+        else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        if let Some(record) = self.kernel.events.get_mut(&event) {
+            record.signaled = true;
+        }
+        *gate
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        gate.1.notify_all();
+        state.set(Register::Rax, u64::from(previous));
+        Ok(())
+    }
+
+    fn ke_reset_event(&mut self, state: &mut CpuState, memory: &MemoryImage) -> AppResult<()> {
+        let event = guest_arg(state, memory, 0)?;
+        let Some((previous, gate)) = self
+            .kernel
+            .events
+            .get(&event)
+            .map(|record| (record.signaled, record.gate.clone()))
+        else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        if let Some(record) = self.kernel.events.get_mut(&event) {
+            record.signaled = false;
+        }
+        *gate
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        state.set(Register::Rax, u64::from(previous));
+        Ok(())
+    }
+
+    fn ke_read_state_event(&mut self, state: &mut CpuState, memory: &MemoryImage) -> AppResult<()> {
+        let event = guest_arg(state, memory, 0)?;
+        let Some(record) = self.kernel.events.get(&event) else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        state.set(Register::Rax, u64::from(record.signaled));
+        Ok(())
+    }
+
+    fn ke_wait_for_single_object(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        if self.current_system_thread.is_some() {
+            return self.ke_wait_system_thread(runtime, state, memory);
+        }
+        let object = guest_arg(state, memory, 0)?;
+        let timeout_ptr = guest_arg(state, memory, 3)?;
+        if let Ok(record) = self.system_threads.query(SystemThreadHandle(object)) {
+            let status = if record.is_terminated() {
+                STATUS_SUCCESS
+            } else {
+                STATUS_TIMEOUT
+            };
+            set_status(state, status);
+            return Ok(());
+        }
+        let Some((event_type, signaled, gate)) = self
+            .kernel
+            .events
+            .get(&object)
+            .map(|event| (event.event_type, event.signaled, event.gate.clone()))
+        else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        if signaled {
+            self.consume_event(event_type, object, gate);
+            set_status(state, STATUS_SUCCESS);
+            return Ok(());
+        }
+        if timeout_ptr == 0 {
+            // An infinite wait needs a schedulable guest thread to make the
+            // signal observable.  The island has no such scheduler, so it
+            // fails closed instead of spinning forever.
+            set_status(state, STATUS_NOT_SUPPORTED);
+            return Ok(());
+        }
+        let raw = memory.read_u64(timeout_ptr)? as i64;
+        let ticks = if raw < 0 {
+            (-(raw as i128)) as u128
+        } else {
+            let now = system_time_100ns();
+            (raw as u128).saturating_sub(now as u128)
+        };
+        if ticks == 0 {
+            set_status(state, STATUS_TIMEOUT);
+            return Ok(());
+        }
+        let wait_ms = ((ticks.saturating_add(TICKS_PER_MILLISECOND as u128 - 1))
+            / TICKS_PER_MILLISECOND as u128)
+            .min(MAX_DISPATCHER_WAIT_MS) as u64;
+        let guard = gate
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (guard, _) = gate
+            .1
+            .wait_timeout(guard, Duration::from_millis(wait_ms))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let signaled = *guard;
+        drop(guard);
+        if signaled {
+            self.consume_event(event_type, object, gate);
+            set_status(state, STATUS_SUCCESS);
+        } else {
+            set_status(state, STATUS_TIMEOUT);
+        }
+        Ok(())
+    }
+
+    fn consume_event(&mut self, event_type: u32, object: u64, gate: Arc<(Mutex<bool>, Condvar)>) {
+        match event_type {
+            SYNCHRONIZATION_EVENT => {
+                if let Some(record) = self.kernel.events.get_mut(&object) {
+                    record.signaled = false;
+                }
+                *gate
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+            }
+            _ => {
+                self.notification_waits += 1;
+            }
+        }
+    }
+
+    fn ke_wait_system_thread(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_arg(state, memory, 0)?;
+        let alertable = guest_arg(state, memory, 3)? != 0;
+        let timeout_ptr = guest_arg(state, memory, 4)?;
+        let thread = self
+            .current_system_thread
+            .expect("ke_wait_system_thread is only called for a running system thread");
+        let target =
+            if let Ok(target_record) = self.system_threads.query(SystemThreadHandle(object)) {
+                if target_record.id == thread {
+                    set_status(state, STATUS_INVALID_PARAMETER);
+                    return Ok(());
+                }
+                if target_record.is_terminated() {
+                    set_status(state, STATUS_SUCCESS);
+                    return Ok(());
+                }
+                crate::casak::threads::WaitTarget::Thread(target_record.id)
+            } else if let Some(event) = self.kernel.events.get(&object) {
+                if event.signaled {
+                    let event_type = event.event_type;
+                    let gate = event.gate.clone();
+                    self.consume_event(event_type, object, gate);
+                    set_status(state, STATUS_SUCCESS);
+                    return Ok(());
+                }
+                crate::casak::threads::WaitTarget::Event(object)
+            } else {
+                set_status(state, STATUS_INVALID_HANDLE);
+                return Ok(());
+            };
+        let deadline = if timeout_ptr == 0 {
+            None
+        } else {
+            let raw = memory.read_u64(timeout_ptr)? as i64;
+            let ticks = if raw < 0 {
+                (-(raw as i128)) as u128
+            } else {
+                let now = system_time_100ns();
+                (raw as u128).saturating_sub(now as u128)
+            };
+            if ticks == 0 {
+                set_status(state, STATUS_TIMEOUT);
+                return Ok(());
+            }
+            let nanos = ticks.saturating_mul(100).min(u64::MAX as u128) as u64;
+            Some(Instant::now() + Duration::from_nanos(nanos))
+        };
+        if alertable && self.system_threads.apc_pending(thread) {
+            self.system_threads
+                .set_pending_wake_status(thread, crate::casak::status::STATUS_USER_APC)
+                .expect("the running thread has a scheduler record");
+            state.set(Register::Rax, STATUS_PENDING as u32 as u64);
+            runtime.yield_pumped_guest_thread = true;
+            return Ok(());
+        }
+        self.system_threads
+            .wait_current(crate::casak::threads::SystemWait {
+                target,
+                deadline,
+                alertable,
+            })
+            .expect("the running thread can block");
+        state.set(Register::Rax, STATUS_PENDING as u32 as u64);
+        runtime.yield_pumped_guest_thread = true;
+        Ok(())
+    }
+
+    fn ke_query_system_time(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let destination = guest_arg(state, memory, 0)?;
+        if destination == 0 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        memory.write_u64(destination, system_time_100ns());
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn io_allocate_mdl(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let virtual_address = guest_arg(state, memory, 0)?;
+        let length = guest_arg(state, memory, 1)?;
+        let secondary = guest_arg(state, memory, 2)?;
+        let _charge_quota = guest_arg(state, memory, 3)?;
+        let irp = guest_arg(state, memory, 4)?;
+        if length == 0 || length > u64::from(u32::MAX) || virtual_address == 0 {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        // Secondary/chained MDLs require IRP integration; the island fails
+        // this closed rather than pretending the chain exists.
+        if secondary != 0 || irp != 0 {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        let mdl_size = match self.arch {
+            GuestArch::X86 => 0x20,
+            GuestArch::X64 => 0x30,
+        };
+        let guest = match self.arena.alloc(memory, mdl_size, 8) {
+            Ok(guest) => guest,
+            Err(_) => {
+                state.set(Register::Rax, 0);
+                return Ok(());
+            }
+        };
+        write_mdl_header(memory, self.arch, guest, virtual_address, length, false)?;
+        self.kernel.mdls.insert(
+            guest,
+            MdlState {
+                virtual_address,
+                byte_count: length,
+                write_access: false,
+                locked: false,
+            },
+        );
+        state.set(Register::Rax, guest);
+        Ok(())
+    }
+
+    fn mm_probe_and_lock_pages(
+        &mut self,
+        runtime: &PeHostRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let mdl = guest_arg(state, memory, 0)?;
+        let access_mode = guest_arg(state, memory, 1)? as u8;
+        let operation = guest_arg(state, memory, 2)? as u32;
+        let Some(record) = self.kernel.mdls.get(&mdl).copied() else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        if record.locked {
+            set_status(state, STATUS_INVALID_DEVICE_STATE);
+            return Ok(());
+        }
+        if !matches!(
+            operation,
+            IO_READ_ACCESS | IO_WRITE_ACCESS | IO_MODIFY_ACCESS
+        ) || !matches!(access_mode, KERNEL_MODE | USER_MODE)
+        {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let write = operation != IO_READ_ACCESS;
+        if !probe_guest_range(
+            runtime,
+            memory,
+            record.virtual_address,
+            record.byte_count,
+            write,
+        ) {
+            set_status(state, STATUS_ACCESS_VIOLATION);
+            return Ok(());
+        }
+        if let Some(record) = self.kernel.mdls.get_mut(&mdl) {
+            record.locked = true;
+            record.write_access = write;
+        }
+        write_mdl_header(
+            memory,
+            self.arch,
+            mdl,
+            record.virtual_address,
+            record.byte_count,
+            true,
+        )
+        .expect("guest-visible MDL header is always writable");
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn mm_unlock_pages(&mut self, state: &mut CpuState, memory: &MemoryImage) -> AppResult<()> {
+        let mdl = guest_arg(state, memory, 0)?;
+        let Some(record) = self.kernel.mdls.get_mut(&mdl) else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        if !record.locked {
+            set_status(state, STATUS_INVALID_DEVICE_STATE);
+            return Ok(());
+        }
+        record.locked = false;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn io_free_mdl(&mut self, state: &mut CpuState, memory: &MemoryImage) -> AppResult<()> {
+        let mdl = guest_arg(state, memory, 0)?;
+        let Some(record) = self.kernel.mdls.get(&mdl) else {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        };
+        if record.locked {
+            set_status(state, STATUS_INVALID_DEVICE_STATE);
+            return Ok(());
+        }
+        self.kernel.mdls.remove(&mdl);
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn mm_get_mdl_byte_count(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let mdl = guest_arg(state, memory, 0)?;
+        let Some(record) = self.kernel.mdls.get(&mdl) else {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        };
+        state.set(Register::Rax, record.byte_count);
+        Ok(())
+    }
+
+    fn ps_get_current_process_id(&self, state: &mut CpuState) {
+        let id = self
+            .process
+            .query_process(self.current_process)
+            .expect("the island process is registered")
+            .id;
+        state.set(Register::Rax, u64::from(id.0));
+    }
+
+    fn ps_get_current_thread_id(&self, state: &mut CpuState) {
+        let id = self
+            .process
+            .query_thread(self.current_thread)
+            .expect("the island thread is registered")
+            .id;
+        state.set(Register::Rax, u64::from(id.0));
+    }
+
+    fn ke_query_interrupt_time(&self, state: &mut CpuState) {
+        state.set(Register::Rax, self.executive.interrupt_time());
+    }
+
+    fn etw_register(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let provider_pointer = guest_arg(state, memory, 0)?;
+        let _enable_callback = guest_arg(state, memory, 1)?;
+        let _callback_context = guest_arg(state, memory, 2)?;
+        let handle_out = guest_arg(state, memory, 3)?;
+        if provider_pointer == 0 || handle_out == 0 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let mut guid = [0_u8; 16];
+        if memory.read_into(provider_pointer, &mut guid).is_err() {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let provider =
+            match self
+                .diagnostics
+                .register_provider(ProviderGuid(guid), &self.driver_name, |_| {})
+            {
+                Ok(provider) => provider,
+                Err(status) => {
+                    set_status(state, status);
+                    return Ok(());
+                }
+            };
+        write_guest_pointer(memory, handle_out, provider.0, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn etw_unregister(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let handle = guest_arg(state, memory, 0)?;
+        let status = self
+            .diagnostics
+            .unregister_provider(ProviderId(handle))
+            .err()
+            .unwrap_or(STATUS_SUCCESS);
+        set_status(state, status);
+        Ok(())
+    }
+
+    fn etw_write(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let handle = guest_arg(state, memory, 0)?;
+        let descriptor_pointer = guest_arg(state, memory, 1)?;
+        let data_pointer = guest_arg(state, memory, 2)?;
+        let length = guest_arg(state, memory, 3)? as usize;
+        if descriptor_pointer == 0 || length > 64 * 1024 || (length != 0 && data_pointer == 0) {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let level = match memory
+            .read_u8(descriptor_pointer + 4)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+            .and_then(EventLevel::from_raw)
+        {
+            Ok(level) => level,
+            Err(status) => {
+                set_status(state, status);
+                return Ok(());
+            }
+        };
+        let keyword = memory
+            .read_u64(descriptor_pointer + 8)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+            .unwrap_or(0);
+        let provider = match self.diagnostics.provider_guid(ProviderId(handle)) {
+            Ok(provider) => provider,
+            Err(status) => {
+                set_status(state, status);
+                return Ok(());
+            }
+        };
+        let mut payload = vec![0_u8; length];
+        if length != 0 && memory.read_into(data_pointer, &mut payload).is_err() {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let status = self
+            .diagnostics
+            .write_event(
+                provider,
+                EventDescriptor {
+                    id: 0,
+                    level,
+                    keyword,
+                },
+                payload,
+            )
+            .err()
+            .unwrap_or(STATUS_SUCCESS);
+        set_status(state, status);
+        Ok(())
+    }
+
+    fn nt_alpc_connect_port(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let handle_out = guest_arg(state, memory, 0)?;
+        let port_name_pointer = guest_arg(state, memory, 1)?;
+        if handle_out == 0 || port_name_pointer == 0 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let name = match read_unicode_string(memory, port_name_pointer, self.arch) {
+            Ok((name, _, _)) => name,
+            Err(_) => {
+                set_status(state, STATUS_INVALID_PARAMETER);
+                return Ok(());
+            }
+        };
+        let port = match self.alpc.connect(&name) {
+            Ok(port) => port,
+            Err(status) => {
+                set_status(state, status);
+                return Ok(());
+            }
+        };
+        let handle = self.next_alpc_handle;
+        self.next_alpc_handle += 1;
+        self.alpc_handles.insert(handle, port);
+        write_guest_pointer(memory, handle_out, handle, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn maybe_preempt(&mut self, runtime: &mut PeHostRuntime) {
+        let Some(thread) = self.current_system_thread else {
+            return;
+        };
+        if self.kernel.irql >= DISPATCH_LEVEL {
+            return;
+        }
+        let Some(record) = self.system_threads.thread_record(thread) else {
+            return;
+        };
+        let due = record.termination_requested.is_some()
+            || !self.pending_interrupts.is_empty()
+            || self
+                .slice_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline);
+        if due {
+            runtime.yield_pumped_guest_thread = true;
+        }
+    }
+
+    fn ps_create_system_thread(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let handle_out = guest_arg(state, memory, 0)?;
+        let _desired_access = guest_arg(state, memory, 1)?;
+        let _object_attributes = guest_arg(state, memory, 2)?;
+        let process_handle = guest_arg(state, memory, 3)?;
+        let start_routine = guest_arg(state, memory, 4)?;
+        let context = guest_arg(state, memory, 5)?;
+        if handle_out == 0 || start_routine == 0 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let pointer_bytes = self.arch.pointer_bytes() as u64;
+        if !probe_guest_range(runtime, memory, handle_out, pointer_bytes, true) {
+            set_status(state, STATUS_INVALID_ADDRESS);
+            return Ok(());
+        }
+        if !probe_guest_range(runtime, memory, start_routine, 1, false) {
+            set_status(state, STATUS_INVALID_ADDRESS);
+            return Ok(());
+        }
+        if context != 0 && !probe_guest_range(runtime, memory, context, 1, false) {
+            set_status(state, STATUS_INVALID_ADDRESS);
+            return Ok(());
+        }
+        let current_process_handle = u64::from(runtime.win32.current_process_handle());
+        if process_handle != 0
+            && process_handle != u64::MAX
+            && process_handle != current_process_handle
+        {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        }
+        let stack_size = 0x4000_u64;
+        let stack_base = match self.arena.alloc(memory, stack_size as usize, 16) {
+            Ok(base) => base,
+            Err(_) => {
+                set_status(state, STATUS_INSUFFICIENT_RESOURCES);
+                return Ok(());
+            }
+        };
+        let created = match self.system_threads.create(
+            &mut self.process,
+            self.current_process,
+            start_routine,
+            context,
+            stack_base,
+            stack_size,
+        ) {
+            Ok(created) => created,
+            Err(status) => {
+                set_status(state, status);
+                return Ok(());
+            }
+        };
+        write_guest_pointer(memory, handle_out, created.handle.0, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn ps_terminate_system_thread(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let exit_status = guest_arg(state, memory, 0)? as u32 as i32;
+        let status = self
+            .system_threads
+            .request_terminate_current(exit_status)
+            .err()
+            .unwrap_or(STATUS_SUCCESS);
+        set_status(state, status);
+        Ok(())
+    }
+
+    /// Validates and publishes one virtual interrupt object.  The guest
+    /// `PKINTERRUPT` storage is allocated from the island arena.
+    fn connect_interrupt_common(
+        &mut self,
+        runtime: &PeHostRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        handle_out: u64,
+        service_routine: u64,
+        service_context: u64,
+        spin_lock: u64,
+        vector: u32,
+        irql: u8,
+        synchronize_irql: u8,
+        mode: u32,
+        share_vector: bool,
+        affinity: u64,
+    ) -> AppResult<()> {
+        if handle_out == 0 || service_routine == 0 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let pointer_bytes = self.arch.pointer_bytes() as u64;
+        if !probe_guest_range(runtime, memory, handle_out, pointer_bytes, true) {
+            set_status(state, STATUS_INVALID_ADDRESS);
+            return Ok(());
+        }
+        if !probe_guest_range(runtime, memory, service_routine, 1, false) {
+            set_status(state, STATUS_INVALID_ADDRESS);
+            return Ok(());
+        }
+        if service_context != 0 && !probe_guest_range(runtime, memory, service_context, 1, false) {
+            set_status(state, STATUS_INVALID_ADDRESS);
+            return Ok(());
+        }
+        if spin_lock != 0 && !probe_guest_range(runtime, memory, spin_lock, pointer_bytes, true) {
+            set_status(state, STATUS_INVALID_ADDRESS);
+            return Ok(());
+        }
+        let guest_object = match self.arena.alloc(memory, 0x40, 16) {
+            Ok(object) => object,
+            Err(_) => {
+                set_status(state, STATUS_INSUFFICIENT_RESOURCES);
+                return Ok(());
+            }
+        };
+        let request = ConnectRequest {
+            guest_object,
+            service_routine,
+            service_context,
+            spin_lock,
+            vector,
+            irql,
+            synchronize_irql,
+            mode,
+            share_vector,
+            affinity,
+        };
+        if let Err(status) = self.interrupts.connect(request) {
+            set_status(state, status);
+            return Ok(());
+        }
+        write_guest_pointer(memory, handle_out, guest_object, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn io_connect_interrupt(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let handle_out = guest_arg(state, memory, 0)?;
+        let service_routine = guest_arg(state, memory, 1)?;
+        let service_context = guest_arg(state, memory, 2)?;
+        let spin_lock = guest_arg(state, memory, 3)?;
+        let vector = guest_arg(state, memory, 4)? as u32;
+        let irql = guest_arg(state, memory, 5)? as u8;
+        let synchronize_irql = guest_arg(state, memory, 6)? as u8;
+        let mode = guest_arg(state, memory, 7)? as u32;
+        let share_vector = guest_arg(state, memory, 8)? != 0;
+        let affinity = guest_arg(state, memory, 9)?;
+        self.connect_interrupt_common(
+            runtime,
+            state,
+            memory,
+            handle_out,
+            service_routine,
+            service_context,
+            spin_lock,
+            vector,
+            irql,
+            synchronize_irql,
+            mode,
+            share_vector,
+            affinity,
+        )
+    }
+
+    fn io_connect_interrupt_ex(
+        &mut self,
+        runtime: &mut PeHostRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let parameters = guest_arg(state, memory, 0)?;
+        if parameters == 0 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let version = match memory
+            .read_u32(parameters)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+            .and_then(InterruptManager::validate_version)
+        {
+            Ok(version) => version,
+            Err(status) => {
+                set_status(state, status);
+                return Ok(());
+            }
+        };
+        let pointer = self.arch.pointer_bytes() as u64;
+        let object_offset = 8;
+        let service_offset = object_offset + pointer;
+        let context_offset = service_offset + pointer;
+        let spin_offset = context_offset + pointer;
+        let vector_offset = spin_offset + pointer;
+        let irql_offset = vector_offset + 4;
+        let sync_offset = irql_offset + 1;
+        let mode_offset = sync_offset + 1;
+        let share_offset = mode_offset + 1;
+        let affinity_offset = share_offset + 1;
+        let parsed = (|| -> Result<(u64, u64, u64, u64, u32, u8, u8, u32, bool, u64), i32> {
+            let handle_out = read_guest_pointer(memory, parameters + object_offset, self.arch)
+                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let service_routine =
+                read_guest_pointer(memory, parameters + service_offset, self.arch)
+                    .map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let service_context =
+                read_guest_pointer(memory, parameters + context_offset, self.arch)
+                    .map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let spin_lock = read_guest_pointer(memory, parameters + spin_offset, self.arch)
+                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let vector = memory
+                .read_u32(parameters + vector_offset)
+                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let irql = memory
+                .read_u8(parameters + irql_offset)
+                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let synchronize_irql = memory
+                .read_u8(parameters + sync_offset)
+                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let mode = u32::from(
+                memory
+                    .read_u8(parameters + mode_offset)
+                    .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            );
+            let share_vector = memory
+                .read_u8(parameters + share_offset)
+                .map_err(|_| STATUS_INVALID_PARAMETER)?
+                != 0;
+            let affinity = memory
+                .read_u64(parameters + affinity_offset)
+                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+            if handle_out == 0 || service_routine == 0 {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            Ok((
+                handle_out,
+                service_routine,
+                service_context,
+                spin_lock,
+                vector,
+                irql,
+                synchronize_irql,
+                mode,
+                share_vector,
+                affinity,
+            ))
+        })();
+        let (
+            handle_out,
+            service_routine,
+            service_context,
+            spin_lock,
+            vector,
+            irql,
+            synchronize_irql,
+            mode,
+            share_vector,
+            affinity,
+        ) = match parsed {
+            Ok(values) => values,
+            Err(status) => {
+                set_status(state, status);
+                return Ok(());
+            }
+        };
+        let _ = version;
+        self.connect_interrupt_common(
+            runtime,
+            state,
+            memory,
+            handle_out,
+            service_routine,
+            service_context,
+            spin_lock,
+            vector,
+            irql,
+            synchronize_irql,
+            mode,
+            share_vector,
+            affinity,
+        )
+    }
+
+    fn io_disconnect_interrupt(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+    ) -> AppResult<()> {
+        let interrupt = guest_arg(state, memory, 0)?;
+        let status = match self.interrupts.disconnect(interrupt) {
+            Ok(DisconnectOutcome::Deferred | DisconnectOutcome::Removed) => STATUS_SUCCESS,
+            Err(status) => status,
+        };
+        set_status(state, status);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn finish_system_thread(&mut self, thread: ThreadId, status: i32) {
+        let SystemThreadManager { .. } = self.system_threads;
+        let _ = self.system_threads.finish_current(status);
+        let IslandState {
+            process,
+            system_threads,
+            ..
+        } = self;
+        let _ = process.terminate_thread(system_threads, thread);
+    }
+
+    fn zw_open_key(
+        &mut self,
+        runtime: &PeHostRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let handle_out = guest_arg(state, memory, 0)?;
+        let desired_access = guest_arg(state, memory, 1)? as u32;
+        let object_attributes = guest_arg(state, memory, 2)?;
+        if handle_out == 0 || object_attributes == 0 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        // The island implements read-only key access.  Any mutating or
+        // administrative right is refused exactly rather than silently
+        // downgraded.
+        const MUTATING_ACCESS: u32 = 0x0000_0002 // KEY_SET_VALUE
+            | 0x0000_0004 // KEY_CREATE_SUB_KEY
+            | 0x0000_0020 // KEY_CREATE_LINK
+            | 0x0001_0000 // DELETE
+            | 0x0004_0000 // WRITE_DAC
+            | 0x0008_0000; // WRITE_OWNER
+        if desired_access & MUTATING_ACCESS != 0 {
+            set_status(state, STATUS_ACCESS_DENIED);
+            return Ok(());
+        }
+        let (root_directory, name_pointer) =
+            read_object_attributes(memory, object_attributes, self.arch)?;
+        let (name, _, _) = read_unicode_string(memory, name_pointer, self.arch)?;
+        if name.is_empty() {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let path = match resolve_kernel_registry_path(
+            runtime,
+            &self.kernel.registry_keys,
+            root_directory,
+            &name,
+        ) {
+            Ok(path) => path,
+            Err(status) => {
+                set_status(state, status);
+                return Ok(());
+            }
+        };
+        let handle = self.kernel.next_key_handle + KEY_HANDLE_BASE;
+        self.kernel.next_key_handle += 1;
+        self.kernel.registry_keys.insert(handle, path);
+        write_guest_pointer(memory, handle_out, handle, self.arch)?;
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn zw_query_value_key(
+        &mut self,
+        runtime: &PeHostRuntime,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let key = guest_arg(state, memory, 0)?;
+        let value_name_pointer = guest_arg(state, memory, 1)?;
+        let class = guest_arg(state, memory, 2)? as u32;
+        let buffer = guest_arg(state, memory, 3)?;
+        let length = guest_arg(state, memory, 4)? as usize;
+        let result_length_out = guest_arg(state, memory, 5)?;
+        let Some(path) = self.kernel.registry_keys.get(&key).cloned() else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        if class != KEY_VALUE_FULL_INFORMATION && class != KEY_VALUE_PARTIAL_INFORMATION {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        let (value_name, _, _) = read_unicode_string(memory, value_name_pointer, self.arch)?;
+        let names = runtime
+            .win32
+            .ge()
+            .registry_enum_values("HKLM", &path, RegistryView::Native)
+            .unwrap_or_default();
+        let Some(actual_name) = names
+            .iter()
+            .find(|candidate| candidate.eq_ignore_ascii_case(&value_name))
+        else {
+            set_status(state, STATUS_OBJECT_NAME_NOT_FOUND);
+            return Ok(());
+        };
+        let Some(stored) = runtime
+            .win32
+            .ge()
+            .registry_get_value("HKLM", &path, actual_name, RegistryView::Native)
+            .ok()
+            .flatten()
+        else {
+            // coverage: unreachable — enumeration and lookup share one locked
+            // GE store, so a value enumerated above cannot disappear here.
+            set_status(state, STATUS_OBJECT_NAME_NOT_FOUND); // coverage: unreachable
+            return Ok(()); // coverage: unreachable
+        };
+        let (value_type, data) = match registry_value_bytes(&stored) {
+            Some(converted) => converted,
+            None => {
+                // coverage: unreachable — GE validates REG_* types on write and
+                // imported stores are parsed through the same validator.
+                set_status(state, STATUS_INVALID_PARAMETER); // coverage: unreachable
+                return Ok(()); // coverage: unreachable
+            }
+        };
+        let name_bytes = actual_name
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let (header_size, data_offset) = if class == KEY_VALUE_FULL_INFORMATION {
+            let offset = align_up_usize(20 + name_bytes.len(), 4);
+            (20, offset)
+        } else {
+            (12, 12)
+        };
+        let required = data_offset.saturating_add(data.len());
+        if result_length_out != 0 {
+            write_guest_pointer(memory, result_length_out, required as u64, self.arch)?;
+        }
+        if length < header_size {
+            set_status(state, STATUS_BUFFER_TOO_SMALL);
+            return Ok(());
+        }
+        let available = length.saturating_sub(data_offset).min(data.len());
+        if class == KEY_VALUE_FULL_INFORMATION {
+            memory.write_u32(buffer, 0);
+            memory.write_u32(buffer + 4, value_type);
+            memory.write_u32(buffer + 8, data_offset as u32);
+            memory.write_u32(buffer + 12, data.len() as u32);
+            memory.write_u32(buffer + 16, name_bytes.len() as u32);
+            for (index, byte) in name_bytes.iter().enumerate() {
+                memory.write_u8(buffer + 20 + index as u64, *byte);
+            }
+        } else {
+            memory.write_u32(buffer, 0);
+            memory.write_u32(buffer + 4, value_type);
+            memory.write_u32(buffer + 8, data.len() as u32);
+        }
+        for (index, byte) in data.iter().take(available).enumerate() {
+            memory.write_u8(buffer + data_offset as u64 + index as u64, *byte);
+        }
+        if length < required {
+            set_status(state, STATUS_BUFFER_OVERFLOW);
+        } else {
+            set_status(state, STATUS_SUCCESS);
+        }
+        Ok(())
+    }
+
+    fn zw_close(&mut self, state: &mut CpuState, memory: &MemoryImage) -> AppResult<()> {
+        let handle = guest_arg(state, memory, 0)?;
+        if self.kernel.registry_keys.remove(&handle).is_none() {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        }
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn ex_initialize_lookaside(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+        pool_type: u32,
+    ) -> AppResult<()> {
+        let lookaside = guest_arg(state, memory, 0)?;
+        let allocate = guest_arg(state, memory, 1)?;
+        let free = guest_arg(state, memory, 2)?;
+        let _flags = guest_arg(state, memory, 3)? as u32;
+        let size = guest_arg(state, memory, 4)? as usize;
+        let tag_bits = guest_arg(state, memory, 5)? as u32;
+        let depth = guest_arg(state, memory, 6)? as usize;
+        if pool_type == PAGED_POOL && self.kernel.irql >= DISPATCH_LEVEL {
+            set_status(state, STATUS_INVALID_DEVICE_STATE);
+            return Ok(());
+        }
+        if lookaside == 0 || size == 0 || size > 0x100_0000 {
+            set_status(state, STATUS_INVALID_PARAMETER);
+            return Ok(());
+        }
+        if allocate != 0 || free != 0 {
+            // Custom allocate/free callbacks are guest functions the island
+            // cannot safely re-enter from the pool path; fail closed.
+            set_status(state, STATUS_NOT_SUPPORTED);
+            return Ok(());
+        }
+        let tag = PoolTag::new(&tag_bits.to_le_bytes());
+        let depth = depth.clamp(1, 256);
+        self.kernel.lookasides.insert(
+            lookaside,
+            IslandLookaside {
+                list: crate::casak::exec::LookasideList::new(
+                    tag,
+                    depth,
+                    size.saturating_mul(depth),
+                ),
+                entry_size: size,
+                guest_by_ptr: BTreeMap::new(),
+                block_by_guest: BTreeMap::new(),
+            },
+        );
+        set_status(state, STATUS_SUCCESS);
+        Ok(())
+    }
+
+    fn ex_allocate_from_lookaside(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        pool_type: u32,
+    ) -> AppResult<()> {
+        let lookaside = guest_arg(state, memory, 0)?;
+        if pool_type == PAGED_POOL && self.kernel.irql >= DISPATCH_LEVEL {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        let Some(list) = self.kernel.lookasides.get_mut(&lookaside) else {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        };
+        let entry_size = list.entry_size;
+        let block = match list.list.allocate(entry_size) {
+            Ok(block) => block,
+            Err(_) => {
+                state.set(Register::Rax, 0);
+                return Ok(());
+            }
+        };
+        let guest = if let Some(guest) = list.guest_by_ptr.get(&block.ptr) {
+            *guest
+        } else {
+            match self.arena.alloc(memory, entry_size, 8) {
+                Ok(guest) => {
+                    list.guest_by_ptr.insert(block.ptr, guest);
+                    guest
+                }
+                Err(_) => {
+                    let _ = list.list.free(block);
+                    state.set(Register::Rax, 0);
+                    return Ok(());
+                }
+            }
+        };
+        list.block_by_guest.insert(guest, block);
+        state.set(Register::Rax, guest);
+        Ok(())
+    }
+
+    fn ex_free_to_lookaside(
+        &mut self,
+        state: &mut CpuState,
+        memory: &MemoryImage,
+        pool_type: u32,
+    ) -> AppResult<()> {
+        let lookaside = guest_arg(state, memory, 0)?;
+        let entry = guest_arg(state, memory, 1)?;
+        if pool_type == PAGED_POOL && self.kernel.irql >= DISPATCH_LEVEL {
+            set_status(state, STATUS_INVALID_DEVICE_STATE);
+            return Ok(());
+        }
+        let Some(list) = self.kernel.lookasides.get_mut(&lookaside) else {
+            set_status(state, STATUS_INVALID_HANDLE);
+            return Ok(());
+        };
+        let Some(block) = list.block_by_guest.remove(&entry) else {
+            set_status(state, STATUS_INVALID_ADDRESS);
+            return Ok(());
+        };
+        match list.list.free(block) {
+            Ok(()) => set_status(state, STATUS_SUCCESS),
+            Err(status) => set_status(state, status),
+        }
         Ok(())
     }
 
@@ -3233,6 +5518,19 @@ impl IslandState {
         Ok(())
     }
 
+    /// Attach a newly created KMDF object to its device when the caller did
+    /// not specify a pre-existing parent.
+    fn attach_kmdf_parent(&mut self, handle: u64, device: u64) {
+        if let Some(object) = self.kmdf.objects.get_mut(&handle) {
+            if object.parent.is_none() {
+                object.parent = Some(device);
+                if let Some(parent) = self.kmdf.objects.get_mut(&device) {
+                    parent.children.insert(handle);
+                }
+            }
+        }
+    }
+
     fn wdf_io_queue_create(
         &mut self,
         state: &mut CpuState,
@@ -3305,19 +5603,7 @@ impl IslandState {
             return Ok(());
         }
         let handle = self.create_kmdf_object(memory, KmdfObjectKind::Queue, attributes)?;
-        if self
-            .kmdf
-            .objects
-            .get(&handle)
-            .is_some_and(|object| object.parent.is_none())
-        {
-            if let Some(object) = self.kmdf.objects.get_mut(&handle) {
-                object.parent = Some(device);
-            }
-            if let Some(object) = self.kmdf.objects.get_mut(&device) {
-                object.children.insert(handle);
-            }
-        }
+        self.attach_kmdf_parent(handle, device);
         let context_guest = self
             .kmdf
             .objects
@@ -5910,9 +8196,6 @@ pub(crate) fn canonical_directory_name(namespace: &IslandNamespace, raw: &str) -
         _ => {}
     }
     if let Some(rest) = strip_prefix_ci(&path, "\\Device\\") {
-        if rest.is_empty() {
-            return Some("\\Device".to_string());
-        }
         let prefix = format!("\\Device\\{rest}");
         // An exact live device object is the canonical spelling the island
         // registered.
@@ -5936,9 +8219,6 @@ pub(crate) fn canonical_directory_name(namespace: &IslandNamespace, raw: &str) -
         return None;
     }
     if let Some(rest) = strip_prefix_ci(&path, "\\Driver\\") {
-        if rest.is_empty() {
-            return Some("\\Driver".to_string());
-        }
         return namespace
             .drivers
             .iter()
@@ -6230,9 +8510,11 @@ fn resolve_island_device(runtime: &PeHostRuntime, raw_path: &str) -> Option<Isla
         let Some(device) = direct.or(linked).or(dos_prefixed) else {
             continue;
         };
-        let Some(device_id) = state.device_ids.get(&device.guest_pointer).copied() else {
-            continue;
-        };
+        let device_id = state
+            .device_ids
+            .get(&device.guest_pointer)
+            .copied()
+            .expect("live device object always has an island id");
         return Some(IslandDeviceHandle {
             service_name: state.driver_name.clone(),
             device_guest: device.guest_pointer,
@@ -6259,7 +8541,9 @@ pub(crate) fn dispatch_shim(
         })?;
     let mut pending = {
         let mut island_state = island.borrow_mut();
-        island_state.handle_shim(runtime, state, memory, function)?
+        let pending = island_state.handle_shim(runtime, state, memory, function)?;
+        island_state.maybe_preempt(runtime);
+        pending
     };
     while let Some(call) = pending {
         let arch = island.borrow().arch;
@@ -6286,18 +8570,37 @@ thread_local! {
     static ACTIVE_ISLAND: RefCell<Option<Rc<RefCell<IslandState>>>> = const { RefCell::new(None) };
 }
 
-struct ActiveIsland;
+struct ActiveIsland {
+    previous: Option<Rc<RefCell<IslandState>>>,
+}
 
 impl ActiveIsland {
     fn install(island: Rc<RefCell<IslandState>>) -> Self {
-        ACTIVE_ISLAND.with(|slot| *slot.borrow_mut() = Some(island));
-        Self
+        let previous = ACTIVE_ISLAND.with(|slot| slot.replace(Some(island)));
+        Self { previous }
     }
 }
 
 impl Drop for ActiveIsland {
     fn drop(&mut self) {
-        ACTIVE_ISLAND.with(|slot| *slot.borrow_mut() = None);
+        let previous = self.previous.take();
+        ACTIVE_ISLAND.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Block-boundary preemption tick for the active island.
+///
+/// The callback executor calls this after every translated block when it is
+/// running an island system thread.  It lets a pure guest loop (no host shim
+/// calls) observe its quantum deadline, a pending termination, or a pending
+/// virtual interrupt, and yield exactly like a shim boundary would.
+pub(crate) fn tick_active_island_preemption(runtime: &mut PeHostRuntime) {
+    let inner = ACTIVE_ISLAND.with(|slot| slot.borrow().clone());
+    let Some(inner) = inner else {
+        return;
+    };
+    if let Ok(mut state) = inner.try_borrow_mut() {
+        state.maybe_preempt(runtime);
     }
 }
 
@@ -7038,6 +9341,226 @@ fn align_up(value: u64, align: u64) -> u64 {
     value.wrapping_add(align - 1) & !(align - 1)
 }
 
+fn align_up_usize(value: usize, align: usize) -> usize {
+    if align <= 1 {
+        return value;
+    }
+    (value + align - 1) & !(align - 1)
+}
+
+/// Wall-clock time as a Windows `FILETIME` (100ns ticks since 1601-01-01).
+fn system_time_100ns() -> u64 {
+    const WINDOWS_EPOCH_OFFSET_SECONDS: u64 = 11_644_473_600;
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    (elapsed.as_secs() + WINDOWS_EPOCH_OFFSET_SECONDS)
+        .saturating_mul(10_000_000)
+        .saturating_add(u64::from(elapsed.subsec_nanos() / 100))
+}
+
+/// Write the guest-visible MDL header fields a driver reads directly.
+fn write_mdl_header(
+    memory: &mut MemoryImage,
+    arch: GuestArch,
+    mdl: u64,
+    virtual_address: u64,
+    byte_count: u64,
+    locked: bool,
+) -> AppResult<()> {
+    let (size_offset, flags_offset, start_va_offset, count_offset, byte_offset_offset) = match arch
+    {
+        GuestArch::X86 => (0x04, 0x06, 0x10, 0x14, 0x18),
+        GuestArch::X64 => (0x08, 0x0A, 0x20, 0x28, 0x2C),
+    };
+    const MDL_PAGES_LOCKED: u16 = 0x0002;
+    let page_base = virtual_address & !0xFFF;
+    memory.write_u16(mdl + size_offset, 0x20);
+    memory.write_u16(
+        mdl + flags_offset,
+        if locked { MDL_PAGES_LOCKED } else { 0 },
+    );
+    write_guest_pointer(memory, mdl + start_va_offset, page_base, arch)?;
+    memory.write_u32(mdl + count_offset, byte_count as u32);
+    memory.write_u32(mdl + byte_offset_offset, (virtual_address & 0xFFF) as u32);
+    Ok(())
+}
+
+/// Probe a guest range for read (and optionally write) access.  The runtime's
+/// VM page protections are authoritative when the range is registered there;
+/// the `MemoryImage` mapping is the fallback for raw test arenas.
+fn probe_guest_range(
+    runtime: &PeHostRuntime,
+    memory: &MemoryImage,
+    address: u64,
+    length: u64,
+    write: bool,
+) -> bool {
+    if address == 0 || length == 0 {
+        return false;
+    }
+    let mut probe = vec![0_u8; length as usize];
+    if memory.read_into(address, &mut probe).is_err() {
+        return false;
+    }
+    if !write {
+        return true;
+    }
+    let end = address.saturating_add(length - 1);
+    let mut page = address & !0xFFF;
+    while page <= end {
+        if runtime.win32.address_space().is_mapped(page)
+            && runtime
+                .win32
+                .address_space()
+                .check_access(page, true, false)
+                .is_err()
+        {
+            return false;
+        }
+        page = match page.checked_add(0x1000) {
+            Some(next) => next,
+            // canonical guest addresses cannot make page + 0x1000 overflow u64
+            None => break, // coverage: unreachable
+        };
+    }
+    true
+}
+
+/// Read `OBJECT_ATTRIBUTES` and return `(RootDirectory, ObjectName)`.
+fn read_object_attributes(
+    memory: &MemoryImage,
+    attributes: u64,
+    arch: GuestArch,
+) -> AppResult<(u64, u64)> {
+    let (root_offset, name_offset) = match arch {
+        GuestArch::X86 => (4, 8),
+        GuestArch::X64 => (8, 16),
+    };
+    let root = read_guest_pointer(memory, attributes + root_offset, arch)?;
+    let name = read_guest_pointer(memory, attributes + name_offset, arch)?;
+    Ok((root, name))
+}
+
+/// Resolve a registry open to a canonical `HKLM`-relative key path that exists
+/// in the GE registry store.
+fn resolve_kernel_registry_path(
+    runtime: &PeHostRuntime,
+    open_keys: &BTreeMap<u64, String>,
+    root: u64,
+    name: &str,
+) -> Result<String, i32> {
+    let lower = name.to_ascii_lowercase();
+    let relative = if lower.starts_with("\\registry\\machine\\") {
+        name["\\registry\\machine\\".len()..].to_string()
+    } else if lower.starts_with("\\registry\\user\\")
+        || lower.starts_with("\\registry\\")
+        || name.starts_with("\\\\")
+    {
+        return Err(STATUS_OBJECT_PATH_INVALID);
+    } else if let Some(parent) = open_keys.get(&root) {
+        format!("{parent}\\{name}")
+    } else {
+        return Err(STATUS_OBJECT_PATH_INVALID);
+    };
+    let trimmed = relative.trim_matches('\\');
+    if trimmed.is_empty() {
+        return Err(STATUS_OBJECT_PATH_INVALID);
+    }
+    let segments = trimmed.split('\\').collect::<Vec<_>>();
+    let mut actual = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.is_empty() {
+            return Err(STATUS_OBJECT_PATH_INVALID);
+        }
+        let children = runtime
+            .win32
+            .ge()
+            .registry_enum_keys("HKLM", &actual, RegistryView::Native)
+            .map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+        if index + 1 == segments.len() {
+            let Some(found) = children
+                .iter()
+                .find(|child| child.eq_ignore_ascii_case(segment))
+            else {
+                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+            };
+            actual = if actual.is_empty() {
+                found.clone()
+            } else {
+                format!("{actual}\\{found}")
+            };
+        } else {
+            let Some(found) = children
+                .iter()
+                .find(|child| child.eq_ignore_ascii_case(segment))
+            else {
+                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+            };
+            actual = if actual.is_empty() {
+                found.clone()
+            } else {
+                format!("{actual}\\{found}")
+            };
+        }
+    }
+    Ok(actual)
+}
+
+/// Convert a stored GE registry value into `(REG_* type, raw bytes)` using the
+/// native registry value encoding.
+fn registry_value_bytes(value: &StoredRegistryValue) -> Option<(u32, Vec<u8>)> {
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    const REG_BINARY: u32 = 3;
+    const REG_DWORD: u32 = 4;
+    const REG_DWORD_BIG_ENDIAN: u32 = 5;
+    const REG_MULTI_SZ: u32 = 7;
+    const REG_QWORD: u32 = 11;
+    let encode_utf16 = |text: &str, terminate: bool| {
+        let mut bytes = text
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        if terminate {
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+        }
+        bytes
+    };
+    match value.value_type.to_ascii_uppercase().as_str() {
+        "REG_SZ" => Some((REG_SZ, encode_utf16(value.data.as_str()?, true))),
+        "REG_EXPAND_SZ" => Some((REG_EXPAND_SZ, encode_utf16(value.data.as_str()?, true))),
+        "REG_MULTI_SZ" => {
+            let entries = value.data.as_array()?;
+            let mut bytes = Vec::new();
+            for entry in entries {
+                bytes.extend(encode_utf16(entry.as_str()?, true));
+            }
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            Some((REG_MULTI_SZ, bytes))
+        }
+        "REG_DWORD" => Some((
+            REG_DWORD,
+            (value.data.as_u64()? as u32).to_le_bytes().to_vec(),
+        )),
+        "REG_DWORD_BIG_ENDIAN" => Some((
+            REG_DWORD_BIG_ENDIAN,
+            (value.data.as_u64()? as u32).to_be_bytes().to_vec(),
+        )),
+        "REG_QWORD" => Some((REG_QWORD, value.data.as_u64()?.to_le_bytes().to_vec())),
+        "REG_BINARY" => {
+            let bytes = value
+                .data
+                .as_array()?
+                .iter()
+                .map(|byte| byte.as_u64().map(|value| value as u8))
+                .collect::<Option<Vec<_>>>()?;
+            Some((REG_BINARY, bytes))
+        }
+        _ => None,
+    }
+}
+
 fn driver_image_error(status: u32) -> AppError {
     AppError::new(
         ReasonCode::RcPeParseInvalid,
@@ -7174,6 +9697,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::casak::interrupt::{CONNECT_FULLY_SPECIFIED, CONNECT_LINE_BASED};
     use crate::casak::io::STATUS_UNSUCCESSFUL;
     use crate::ge::{GameEnvironment, GeArch, RegistryView};
     use crate::host_thunks::ImplementationLevel;
@@ -7450,7 +9974,7 @@ mod tests {
         rdata[rva(DLL_NAME_RVA)..rva(DLL_NAME_RVA) + 13].copy_from_slice(b"ntoskrnl.exe\0");
         for (index, (name, hint)) in IMPORT_NAMES.iter().enumerate() {
             let symbol = if unresolved_import && index == IMPORT_NAMES.len() - 1 {
-                "PsGetCurrentProcessId"
+                "PsGetCurrentProcess"
             } else {
                 name
             };
@@ -9544,7 +12068,7 @@ mod tests {
             };
             assert_eq!(error.code, ReasonCode::RcImportMissing);
             assert!(
-                error.message.contains("PsGetCurrentProcessId"),
+                error.message.contains("PsGetCurrentProcess"),
                 "error names the unresolved import: {}",
                 error.message
             );
@@ -9884,6 +12408,7 @@ mod tests {
                 "\\Device\\CasaTest".to_string(),
                 "\\Device\\CasaTest\\Child".to_string(),
                 "\\Device\\OtherDev".to_string(),
+                "\\Device\\Tree\\Leaf".to_string(),
             ],
             device_drivers: vec![
                 ("\\Device\\CasaTest".to_string(), "CasaDriver".to_string()),
@@ -9923,6 +12448,36 @@ mod tests {
             canonical_directory_name(&namespace, "\\Driver\\Unknown"),
             None
         );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Device").as_deref(),
+            Some("\\Device")
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Device\\").as_deref(),
+            Some("\\Device")
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Driver").as_deref(),
+            Some("\\Driver")
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Driver\\").as_deref(),
+            Some("\\Driver")
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Global??").as_deref(),
+            Some("\\GLOBAL??")
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\??").as_deref(),
+            Some("\\??")
+        );
+        assert_eq!(
+            canonical_directory_name(&namespace, "\\Device\\Tree").as_deref(),
+            Some("\\Device\\Tree")
+        );
+        assert_eq!(direct_child_name("\\Device", "\\Device\\"), None);
+        assert_eq!(canonical_directory_name(&namespace, "\\Other"), None);
 
         assert_eq!(
             directory_entries(&namespace, "\\"),
@@ -9938,6 +12493,7 @@ mod tests {
             vec![
                 ("CasaTest".to_string(), "Device".to_string()),
                 ("OtherDev".to_string(), "Device".to_string()),
+                ("Tree".to_string(), "Device".to_string()),
             ]
         );
         assert_eq!(
@@ -10345,7 +12901,7 @@ mod tests {
 
             let unresolved = with_delay_import(
                 build_test_driver(false, false, false),
-                "PsGetCurrentProcessId",
+                "PsGetCurrentProcess",
             );
             let error = match DriverIsland::load_and_start_named(
                 &unresolved,
@@ -10357,7 +12913,7 @@ mod tests {
                 Err(error) => error,
             };
             assert_eq!(error.code, ReasonCode::RcImportMissing);
-            assert!(error.message.contains("PsGetCurrentProcessId"));
+            assert!(error.message.contains("PsGetCurrentProcess"));
         });
     }
 
@@ -13518,6 +16074,49 @@ mod tests {
             (DriverShim::IoCompleteRequest, 8),
             (DriverShim::ExAllocatePoolWithTag, 12),
             (DriverShim::ExFreePoolWithTag, 8),
+            (DriverShim::ExAllocatePool, 8),
+            (DriverShim::ExFreePool, 4),
+            (DriverShim::KeGetCurrentIrql, 0),
+            (DriverShim::KeQuerySystemTime, 0),
+            (DriverShim::PsGetCurrentProcessId, 0),
+            (DriverShim::PsGetCurrentThreadId, 0),
+            (DriverShim::KfRaiseIrql, 4),
+            (DriverShim::KfLowerIrql, 4),
+            (DriverShim::KeAcquireSpinLockRaiseToDpc, 4),
+            (DriverShim::KeReleaseSpinLock, 8),
+            (DriverShim::KeInitializeDpc, 12),
+            (DriverShim::KeInsertQueueDpc, 12),
+            (DriverShim::KeRemoveQueueDpc, 4),
+            (DriverShim::KeInitializeEvent, 12),
+            (DriverShim::KeSetEvent, 12),
+            (DriverShim::KeResetEvent, 4),
+            (DriverShim::KeReadStateEvent, 4),
+            (DriverShim::KeWaitForSingleObject, 16),
+            (DriverShim::IoAllocateMdl, 20),
+            (DriverShim::MmProbeAndLockPages, 12),
+            (DriverShim::MmUnlockPages, 4),
+            (DriverShim::IoFreeMdl, 4),
+            (DriverShim::MmGetMdlByteCount, 4),
+            (DriverShim::ZwOpenKey, 12),
+            (DriverShim::ZwQueryValueKey, 24),
+            (DriverShim::ZwClose, 4),
+            (DriverShim::ExInitializeNPagedLookasideList, 28),
+            (DriverShim::ExInitializePagedLookasideList, 28),
+            (DriverShim::ExAllocateFromNPagedLookasideList, 4),
+            (DriverShim::ExAllocateFromPagedLookasideList, 4),
+            (DriverShim::ExFreeToNPagedLookasideList, 8),
+            (DriverShim::ExFreeToPagedLookasideList, 8),
+            (DriverShim::PsCreateSystemThread, 20),
+            (DriverShim::PsTerminateSystemThread, 4),
+            (DriverShim::IoConnectInterrupt, 44),
+            (DriverShim::IoConnectInterruptEx, 4),
+            (DriverShim::IoDisconnectInterrupt, 4),
+            (DriverShim::EtwRegister, 16),
+            (DriverShim::EtwUnregister, 4),
+            (DriverShim::EtwWrite, 16),
+            (DriverShim::NtAlpcConnectPort, 28),
+            (DriverShim::KeQueryInterruptTime, 0),
+            (DriverShim::IslandSafepoint, 0),
             (DriverShim::IrpDispatch, 8),
             (DriverShim::WdfDriverCreate, 20),
             (DriverShim::WdfDeviceInitSetDeviceType, 8),
@@ -14233,6 +16832,52 @@ mod tests {
             let out = 0x58_000;
             memory.map_bytes(out, &[0_u8; 8]);
 
+            // Parent attachment is idempotent, ignores unknown parents, and
+            // never cross-links an object that already has a parent.
+            {
+                let mut state = island.inner.borrow_mut();
+                let first = *state.kmdf.objects.keys().next().expect("kernel object");
+                let second = *state
+                    .kmdf
+                    .objects
+                    .keys()
+                    .nth(1)
+                    .expect("second kernel object");
+                state.attach_kmdf_parent(first, second);
+                assert_eq!(
+                    state
+                        .kmdf
+                        .objects
+                        .get(&first)
+                        .and_then(|object| object.parent),
+                    Some(second)
+                );
+                state.attach_kmdf_parent(first, first);
+                assert_eq!(
+                    state
+                        .kmdf
+                        .objects
+                        .get(&first)
+                        .and_then(|object| object.parent),
+                    Some(second),
+                    "an existing parent is not replaced"
+                );
+                state.attach_kmdf_parent(first, 0xDEAD_BEEF);
+                assert_eq!(
+                    state
+                        .kmdf
+                        .objects
+                        .get(&first)
+                        .and_then(|object| object.parent),
+                    Some(second),
+                    "an unknown parent leaves the object untouched"
+                );
+                state.attach_kmdf_parent(0xDEAD_BEEF, second);
+                assert!(
+                    !state.kmdf.objects.contains_key(&0xDEAD_BEEF),
+                    "an unknown handle is ignored"
+                );
+            }
             assert_eq!(
                 call_island_shim(
                     &island,
@@ -14422,6 +17067,19 @@ mod tests {
             let device = island.kmdf_device_handles()[0];
             let queue_out = 0x5A_000;
             memory.map_bytes(queue_out, &[0_u8; 8]);
+            let parentless_queue_out = 0x5A_100;
+            memory.map_bytes(parentless_queue_out, &[0_u8; 8]);
+            assert_eq!(
+                call_island_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::WdfIoQueueCreate,
+                    &[device, 0, 0, parentless_queue_out],
+                )
+                .expect("parentless queue creation"),
+                STATUS_SUCCESS
+            );
             assert_eq!(
                 call_island_shim(
                     &island,
@@ -19528,6 +22186,4712 @@ mod tests {
                 true
             );
             island.inner.borrow_mut().arena.cursor = saved_cursor;
+        });
+    }
+
+    fn kernel_test_island() -> (PeHostRuntime, MemoryImage, DriverIsland) {
+        let (mut runtime, _directory) = test_runtime();
+        let mut memory = MemoryImage::default();
+        prepare_guest_memory(&mut runtime, &mut memory);
+        let bytes = build_test_driver(false, false, false);
+        let island = DriverIsland::load_and_start(&bytes, &mut runtime, &mut memory)
+            .expect("DriverEntry must execute");
+        (runtime, memory, island)
+    }
+
+    fn call_kernel_raw(
+        island: &DriverIsland,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        function: DriverShim,
+        args: &[u64],
+    ) -> u64 {
+        island
+            .call_shim_for_test(runtime, memory, function, args)
+            .expect("kernel shim")
+    }
+
+    fn call_kernel_shim(
+        island: &DriverIsland,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        function: DriverShim,
+        args: &[u64],
+    ) -> i32 {
+        call_kernel_raw(island, runtime, memory, function, args) as u32 as i32
+    }
+
+    #[test]
+    fn irql_and_spinlock_state_machine_rejects_invalid_transitions_exactly() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            let lock = 0x54_000;
+            memory.map_bytes(lock, &[0_u8; 0x40]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeGetCurrentIrql,
+                    &[],
+                ),
+                0
+            );
+            let untagged = call_kernel_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::ExAllocatePool,
+                &[u64::from(NON_PAGED_POOL), 0x20],
+            );
+            assert_ne!(untagged, 0);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::ExFreePool,
+                &[untagged],
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePool,
+                    &[u64::from(NON_PAGED_POOL), 0x100_0000],
+                ),
+                0
+            );
+            let saved_cursor = {
+                let mut state = island.inner.borrow_mut();
+                let saved = state.arena.cursor;
+                state.arena.cursor = state.arena.end;
+                saved
+            };
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePool,
+                    &[u64::from(NON_PAGED_POOL), 0x100],
+                ),
+                0
+            );
+            island.inner.borrow_mut().arena.cursor = saved_cursor;
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePool,
+                    &[u64::from(PAGED_POOL), 0],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePool,
+                    &[9, 0x20],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePoolWithTag,
+                    &[9, 0x20, 0x31747343],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KfRaiseIrql,
+                    &[2],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeGetCurrentIrql,
+                    &[],
+                ),
+                2
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KfRaiseIrql,
+                    &[1],
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePool,
+                    &[u64::from(PAGED_POOL), 0x20],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePoolWithTag,
+                    &[u64::from(PAGED_POOL), 0x20, 0x31747343],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KfLowerIrql,
+                    &[3],
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfLowerIrql,
+                &[2],
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfLowerIrql,
+                &[1],
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeGetCurrentIrql,
+                    &[],
+                ),
+                1
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfLowerIrql,
+                &[0],
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KfRaiseIrql,
+                    &[0xFF],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeAcquireSpinLockRaiseToDpc,
+                    &[0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeAcquireSpinLockRaiseToDpc,
+                    &[lock],
+                ),
+                0
+            );
+            assert_eq!(memory.read_u64(lock).unwrap(), 1);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeAcquireSpinLockRaiseToDpc,
+                    &[lock],
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeReleaseSpinLock,
+                    &[lock, 1],
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeReleaseSpinLock,
+                    &[lock, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u64(lock).unwrap(), 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeReleaseSpinLock,
+                    &[lock, 0],
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeGetCurrentIrql,
+                    &[],
+                ),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn paged_pool_is_refused_at_dispatch_level() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            let paged = call_kernel_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::ExAllocatePool,
+                &[u64::from(PAGED_POOL), 0x20],
+            );
+            assert_ne!(paged, 0);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::ExFreePool,
+                &[paged],
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfRaiseIrql,
+                &[u64::from(DISPATCH_LEVEL)],
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePool,
+                    &[u64::from(PAGED_POOL), 0x20],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePoolWithTag,
+                    &[u64::from(PAGED_POOL), 0x20, 0x31747343],
+                ),
+                0
+            );
+            assert_ne!(
+                call_kernel_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePool,
+                    &[u64::from(NON_PAGED_POOL), 0x20],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocatePool,
+                    &[9, 0x20],
+                ),
+                0
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfLowerIrql,
+                &[0],
+            );
+        });
+    }
+
+    #[test]
+    fn mdl_locking_probe_and_lifecycle_pin_exact_statuses() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            let virtual_address = 0x56_000;
+            memory.map_bytes(virtual_address, &vec![0_u8; 0x2000]);
+            let mdl = call_kernel_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoAllocateMdl,
+                &[virtual_address, 0x2000, 0, 0, 0],
+            );
+            assert_ne!(mdl, 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmGetMdlByteCount,
+                    &[mdl],
+                ),
+                0x2000
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmProbeAndLockPages,
+                    &[mdl, u64::from(KERNEL_MODE), u64::from(IO_READ_ACCESS)],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmProbeAndLockPages,
+                    &[mdl, u64::from(KERNEL_MODE), u64::from(IO_READ_ACCESS)],
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoFreeMdl,
+                    &[mdl],
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmUnlockPages,
+                    &[mdl],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmUnlockPages,
+                    &[mdl],
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoFreeMdl,
+                    &[mdl],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoFreeMdl,
+                    &[mdl],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoAllocateMdl,
+                    &[virtual_address, 0, 0, 0, 0],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoAllocateMdl,
+                    &[virtual_address, 0x1000, 1, 0, 0],
+                ),
+                0
+            );
+            let unmapped = call_kernel_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoAllocateMdl,
+                &[0x9FFF_0000, 0x1000, 0, 0, 0],
+            );
+            assert_ne!(unmapped, 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmProbeAndLockPages,
+                    &[unmapped, u64::from(KERNEL_MODE), u64::from(IO_WRITE_ACCESS)],
+                ),
+                STATUS_ACCESS_VIOLATION
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmProbeAndLockPages,
+                    &[unmapped, u64::from(KERNEL_MODE), 9],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmGetMdlByteCount,
+                    &[0xDEAD],
+                ),
+                0
+            );
+            let write_mdl = call_kernel_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::IoAllocateMdl,
+                &[virtual_address, 0x1000, 0, 0, 0],
+            );
+            assert_ne!(write_mdl, 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmProbeAndLockPages,
+                    &[
+                        write_mdl,
+                        u64::from(KERNEL_MODE),
+                        u64::from(IO_WRITE_ACCESS),
+                    ],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmUnlockPages,
+                    &[write_mdl],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmProbeAndLockPages,
+                    &[write_mdl, 9, u64::from(IO_READ_ACCESS)],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmProbeAndLockPages,
+                    &[0xDEAD, u64::from(KERNEL_MODE), u64::from(IO_READ_ACCESS)],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoFreeMdl,
+                    &[write_mdl],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::MmUnlockPages,
+                    &[0xDEAD],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let saved_cursor = {
+                let mut state = island.inner.borrow_mut();
+                let saved = state.arena.cursor;
+                state.arena.cursor = state.arena.end;
+                saved
+            };
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoAllocateMdl,
+                    &[virtual_address, 0x1000, 0, 0, 0],
+                ),
+                0
+            );
+            island.inner.borrow_mut().arena.cursor = saved_cursor;
+            assert!(!probe_guest_range(&runtime, &memory, 0, 0x1000, false));
+            assert!(!probe_guest_range(
+                &runtime,
+                &memory,
+                virtual_address,
+                0,
+                false
+            ));
+            assert_eq!(align_up(0x1234, 1), 0x1234);
+            assert_eq!(align_up_usize(0x1234, 1), 0x1234);
+            runtime
+                .win32
+                .address_space_mut()
+                .register(0x70_000, 0x1000, VmRegionKind::Private);
+            runtime
+                .win32
+                .address_space_mut()
+                .commit(0x70_000, 0x1000, VmProtection::READ, false);
+            memory.map_bytes(0x70_000, &[0_u8; 0x1000]);
+            assert!(!probe_guest_range(&runtime, &memory, 0x70_000, 0x100, true));
+            let mut x86_runtime = test_runtime_x86().0;
+            let mut x86_memory = MemoryImage::default();
+            prepare_guest_memory(&mut x86_runtime, &mut x86_memory);
+            let x86_bytes = build_pe32_driver();
+            let x86_island =
+                DriverIsland::load_and_start(&x86_bytes, &mut x86_runtime, &mut x86_memory)
+                    .expect("PE32 DriverEntry must execute");
+            let x86_va = 0x56_000;
+            x86_memory.map_bytes(x86_va, &vec![0_u8; 0x1000]);
+            let x86_mdl = call_kernel_raw(
+                &x86_island,
+                &mut x86_runtime,
+                &mut x86_memory,
+                DriverShim::IoAllocateMdl,
+                &[x86_va, 0x1000, 0, 0, 0],
+            );
+            assert_ne!(x86_mdl, 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &x86_island,
+                    &mut x86_runtime,
+                    &mut x86_memory,
+                    DriverShim::MmGetMdlByteCount,
+                    &[x86_mdl],
+                ),
+                0x1000
+            );
+        });
+    }
+
+    #[test]
+    fn dispatcher_events_auto_reset_and_report_exact_timeout() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            let event = 0x57_000;
+            let timeout = 0x57_100;
+            memory.map_bytes(event, &[0_u8; 0x40]);
+            memory.map_bytes(timeout, &[0_u8; 8]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeEvent,
+                    &[event, u64::from(SYNCHRONIZATION_EVENT), 0],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeReadStateEvent,
+                    &[event],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[event, 0, 0, timeout],
+                ),
+                STATUS_TIMEOUT
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[event, 0, 0, 0],
+                ),
+                STATUS_NOT_SUPPORTED
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeSetEvent,
+                    &[event, 0, 0],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeReadStateEvent,
+                    &[event],
+                ),
+                1
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[event, 0, 0, timeout],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeReadStateEvent,
+                    &[event],
+                ),
+                0
+            );
+            let notification = 0x57_200;
+            memory.map_bytes(notification, &[0_u8; 0x40]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeEvent,
+                    &[notification, u64::from(NOTIFICATION_EVENT), 1],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[notification, 0, 0, timeout],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeReadStateEvent,
+                    &[notification],
+                ),
+                1
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeResetEvent,
+                    &[notification],
+                ),
+                1
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeSetEvent,
+                    &[0xDEAD, 0, 0],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeResetEvent,
+                    &[0xDEAD],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeReadStateEvent,
+                    &[0xDEAD],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[0xDEAD, 0, 0, timeout],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            let invalid_type = 0x57_300;
+            memory.map_bytes(invalid_type, &[0_u8; 0x40]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeEvent,
+                    &[invalid_type, 9, 0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            memory.write_u64(timeout, (-10_000_i64) as u64);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[event, 0, 0, timeout],
+                ),
+                STATUS_TIMEOUT
+            );
+            let concurrent = 0x57_400;
+            memory.map_bytes(concurrent, &[0_u8; 0x40]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeEvent,
+                    &[concurrent, u64::from(SYNCHRONIZATION_EVENT), 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let gate = island
+                .inner
+                .borrow()
+                .kernel
+                .events
+                .get(&concurrent)
+                .expect("initialized concurrent event")
+                .gate
+                .clone();
+            let signaler = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                *gate
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                gate.1.notify_all();
+            });
+            memory.write_u64(timeout, (-5_000_000_i64) as u64);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[concurrent, 0, 0, timeout],
+                ),
+                STATUS_SUCCESS
+            );
+            signaler.join().expect("signaler");
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeReadStateEvent,
+                    &[concurrent],
+                ),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn dpc_runs_only_when_irql_drops_and_removal_is_observable() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            let dpc = 0x58_000;
+            let second_dpc = 0x58_100;
+            memory.map_bytes(dpc, &[0_u8; 0x40]);
+            memory.map_bytes(second_dpc, &[0_u8; 0x40]);
+            let routine = island.unload_pointer().expect("exported DriverUnload");
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeDpc,
+                    &[dpc, routine, 0xCAFE],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeDpc,
+                    &[second_dpc, routine, 0xBEEF],
+                ),
+                STATUS_SUCCESS
+            );
+            let marker = island.image_base() + u64::from(UNLOAD_MARKER_RVA);
+            assert_eq!(memory.read_u32(marker).unwrap(), 0);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfRaiseIrql,
+                &[u64::from(DISPATCH_LEVEL)],
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInsertQueueDpc,
+                    &[dpc, 0, 0],
+                ),
+                1
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInsertQueueDpc,
+                    &[dpc, 0, 0],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeRemoveQueueDpc,
+                    &[dpc],
+                ),
+                1
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfLowerIrql,
+                &[0],
+            );
+            assert_eq!(memory.read_u32(marker).unwrap(), 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeRemoveQueueDpc,
+                    &[dpc],
+                ),
+                0
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfRaiseIrql,
+                &[u64::from(DISPATCH_LEVEL)],
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInsertQueueDpc,
+                    &[dpc, 0x11, 0x22],
+                ),
+                1
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfLowerIrql,
+                &[0],
+            );
+            assert_eq!(memory.read_u32(marker).unwrap(), 0xCA5A_0002);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfRaiseIrql,
+                &[u64::from(DISPATCH_LEVEL)],
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInsertQueueDpc,
+                    &[dpc, 0, 0],
+                ),
+                1
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInsertQueueDpc,
+                    &[second_dpc, 0, 0],
+                ),
+                1
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfLowerIrql,
+                &[0],
+            );
+            assert_eq!(memory.read_u32(marker).unwrap(), 0xCA5A_0002);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInsertQueueDpc,
+                    &[0xDEAD, 0, 0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeDpc,
+                    &[0, routine, 0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeDpc,
+                    &[dpc, 0, 0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeRemoveQueueDpc,
+                    &[0xDEAD],
+                ),
+                0
+            );
+            memory.write_u32(marker, 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInsertQueueDpc,
+                    &[second_dpc, 0, 0],
+                ),
+                1
+            );
+            assert_eq!(memory.read_u32(marker).unwrap(), 0xCA5A_0002);
+            let nester = 0x58_200;
+            memory.map_bytes(nester, &[0_u8; 0x40]);
+            let insert_shim = allocate_shim(&mut runtime, DriverShim::KeInsertQueueDpc);
+            let stub = island.image_base() + 0x3400;
+            let mut code = Vec::new();
+            code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+            code.extend_from_slice(&[0x48, 0xB9]);
+            code.extend_from_slice(&second_dpc.to_le_bytes());
+            code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0]);
+            code.extend_from_slice(&[0x48, 0xB8]);
+            code.extend_from_slice(&insert_shim.to_le_bytes());
+            code.extend_from_slice(&[0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0xC3]);
+            for (index, byte) in code.iter().enumerate() {
+                memory.write_u8(stub + index as u64, *byte);
+            }
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeDpc,
+                    &[nester, stub, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            memory.write_u32(marker, 0);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfRaiseIrql,
+                &[u64::from(DISPATCH_LEVEL)],
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInsertQueueDpc,
+                    &[nester, 0, 0],
+                ),
+                1
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfLowerIrql,
+                &[0],
+            );
+            assert_eq!(memory.read_u32(marker).unwrap(), 0xCA5A_0002);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeGetCurrentIrql,
+                    &[],
+                ),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn kernel_registry_query_pins_overflow_missing_and_access_contracts() {
+        with_big_stack(|| {
+            let (mut runtime, _directory) = test_runtime_with_ge(|ge| {
+                ge.registry_create_key("HKLM", "SYSTEM\\CasaIslandTest", RegistryView::Native)
+                    .expect("create key");
+                ge.registry_create_key(
+                    "HKLM",
+                    "SYSTEM\\CasaIslandTest\\NestedKey",
+                    RegistryView::Native,
+                )
+                .expect("create nested key");
+                ge.registry_set_value(
+                    "HKLM",
+                    "SYSTEM\\CasaIslandTest",
+                    "Dword",
+                    "REG_DWORD",
+                    json!(0x1122_3344_u32),
+                    RegistryView::Native,
+                )
+                .expect("dword");
+                ge.registry_set_value(
+                    "HKLM",
+                    "SYSTEM\\CasaIslandTest",
+                    "Text",
+                    "REG_SZ",
+                    json!("Casa"),
+                    RegistryView::Native,
+                )
+                .expect("string");
+            });
+            let mut memory = MemoryImage::default();
+            prepare_guest_memory(&mut runtime, &mut memory);
+            let bytes = build_test_driver(false, false, false);
+            let island = DriverIsland::load_and_start(&bytes, &mut runtime, &mut memory)
+                .expect("DriverEntry must execute");
+            let attributes = 0x50_000;
+            let name = guest_unicode_string(
+                &mut memory,
+                0x50_100,
+                "\\Registry\\Machine\\SYSTEM\\CasaIslandTest",
+            );
+            memory.map_bytes(attributes, &[0_u8; 0x40]);
+            memory.write_u64(attributes + 8, 0);
+            memory.write_u64(attributes + 16, name);
+            let handle_out = 0x51_000;
+            memory.map_bytes(handle_out, &[0_u8; 8]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[0, 0x1, attributes],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, 0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_SUCCESS
+            );
+            let key = memory.read_u64(handle_out).unwrap();
+            assert_ne!(key, 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x2, attributes],
+                ),
+                STATUS_ACCESS_DENIED
+            );
+            let value_name = guest_unicode_string(&mut memory, 0x51_100, "Dword");
+            let buffer = 0x52_000;
+            let result_length = 0x53_000;
+            memory.map_bytes(buffer, &[0_u8; 0x80]);
+            memory.map_bytes(result_length, &[0_u8; 8]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwQueryValueKey,
+                    &[
+                        key,
+                        value_name,
+                        u64::from(KEY_VALUE_PARTIAL_INFORMATION),
+                        buffer,
+                        8,
+                        result_length,
+                    ],
+                ),
+                STATUS_BUFFER_TOO_SMALL
+            );
+            assert_eq!(memory.read_u64(result_length).unwrap(), 16);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwQueryValueKey,
+                    &[
+                        key,
+                        value_name,
+                        u64::from(KEY_VALUE_PARTIAL_INFORMATION),
+                        buffer,
+                        12,
+                        result_length,
+                    ],
+                ),
+                STATUS_BUFFER_OVERFLOW
+            );
+            assert_eq!(memory.read_u64(result_length).unwrap(), 16);
+            assert_eq!(memory.read_u32(buffer + 4).unwrap(), 4);
+            assert_eq!(memory.read_u32(buffer + 8).unwrap(), 4);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwQueryValueKey,
+                    &[
+                        key,
+                        value_name,
+                        u64::from(KEY_VALUE_PARTIAL_INFORMATION),
+                        buffer,
+                        16,
+                        result_length,
+                    ],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u32(buffer + 12).unwrap(), 0x1122_3344);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwQueryValueKey,
+                    &[
+                        key,
+                        value_name,
+                        u64::from(KEY_VALUE_PARTIAL_INFORMATION),
+                        buffer,
+                        16,
+                        0,
+                    ],
+                ),
+                STATUS_SUCCESS
+            );
+            let text_name = guest_unicode_string(&mut memory, 0x51_300, "Text");
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwQueryValueKey,
+                    &[
+                        key,
+                        text_name,
+                        u64::from(KEY_VALUE_FULL_INFORMATION),
+                        buffer,
+                        0x80,
+                        result_length,
+                    ],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(memory.read_u32(buffer + 4).unwrap(), 1);
+            assert_eq!(memory.read_u32(buffer + 12).unwrap(), 10);
+            assert_eq!(memory.read_u32(buffer + 16).unwrap(), 8);
+            assert_eq!(
+                &memory.read_bytes(buffer + 28, 10).unwrap(),
+                b"C\0a\0s\0a\0\0\0"
+            );
+            let missing = guest_unicode_string(&mut memory, 0x51_400, "Nope");
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwQueryValueKey,
+                    &[
+                        key,
+                        missing,
+                        u64::from(KEY_VALUE_PARTIAL_INFORMATION),
+                        buffer,
+                        0x80,
+                        result_length,
+                    ],
+                ),
+                STATUS_OBJECT_NAME_NOT_FOUND
+            );
+            let user_path = 0x50_300;
+            let user_name = guest_unicode_string(&mut memory, user_path, "\\Registry\\User\\Casa");
+            memory.write_u64(attributes + 16, user_name);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_OBJECT_PATH_INVALID
+            );
+            let relative = guest_unicode_string(&mut memory, 0x50_500, "SYSTEM\\CasaIslandTest");
+            memory.write_u64(attributes + 16, relative);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_OBJECT_PATH_INVALID
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwClose,
+                    &[key],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwClose,
+                    &[key],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwQueryValueKey,
+                    &[
+                        key,
+                        value_name,
+                        u64::from(KEY_VALUE_PARTIAL_INFORMATION),
+                        buffer,
+                        0x80,
+                        result_length,
+                    ],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            let empty_name = guest_unicode_string(&mut memory, 0x50_700, "");
+            memory.write_u64(attributes + 8, 0);
+            memory.write_u64(attributes + 16, empty_name);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let system_name =
+                guest_unicode_string(&mut memory, 0x50_800, "\\Registry\\Machine\\SYSTEM");
+            memory.write_u64(attributes + 16, system_name);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_SUCCESS
+            );
+            let system_key = memory.read_u64(handle_out).unwrap();
+            let relative = guest_unicode_string(&mut memory, 0x50_A00, "CasaIslandTest");
+            memory.write_u64(attributes + 8, system_key);
+            memory.write_u64(attributes + 16, relative);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_SUCCESS
+            );
+            let relative_key = memory.read_u64(handle_out).unwrap();
+            assert_ne!(relative_key, system_key);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwClose,
+                    &[relative_key],
+                ),
+                STATUS_SUCCESS
+            );
+            memory.write_u64(attributes + 8, 0xDEAD);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_OBJECT_PATH_INVALID
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwClose,
+                    &[system_key],
+                ),
+                STATUS_SUCCESS
+            );
+            let missing_nested = guest_unicode_string(
+                &mut memory,
+                0x50_C00,
+                "\\Registry\\Machine\\SYSTEM\\Missing",
+            );
+            memory.write_u64(attributes + 8, 0);
+            memory.write_u64(attributes + 16, missing_nested);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_OBJECT_NAME_NOT_FOUND
+            );
+            let double_separator = guest_unicode_string(
+                &mut memory,
+                0x54_200,
+                "\\Registry\\Machine\\SYSTEM\\\\CasaIslandTest",
+            );
+            memory.write_u64(attributes + 8, 0);
+            memory.write_u64(attributes + 16, double_separator);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_OBJECT_PATH_INVALID
+            );
+            let missing_intermediate = guest_unicode_string(
+                &mut memory,
+                0x54_400,
+                "\\Registry\\Machine\\SYSTEM\\Missing\\Child",
+            );
+            memory.write_u64(attributes + 16, missing_intermediate);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_OBJECT_NAME_NOT_FOUND
+            );
+            let deep_existing = guest_unicode_string(
+                &mut memory,
+                0x54_600,
+                "\\Registry\\Machine\\SYSTEM\\CasaIslandTest\\NestedKey",
+            );
+            memory.write_u64(attributes + 16, deep_existing);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_SUCCESS
+            );
+            let deep_key = memory.read_u64(handle_out).unwrap();
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwClose,
+                    &[deep_key],
+                ),
+                STATUS_SUCCESS
+            );
+            let machine_only = guest_unicode_string(&mut memory, 0x50_E00, "\\Registry\\Machine\\");
+            memory.write_u64(attributes + 16, machine_only);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_OBJECT_PATH_INVALID
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_OBJECT_PATH_INVALID
+            );
+            let x86_attributes = 0x54_000;
+            memory.map_bytes(x86_attributes, &[0_u8; 0x20]);
+            memory.write_u32(x86_attributes + 4, 0x1234);
+            memory.write_u32(x86_attributes + 8, 0x5678);
+            assert_eq!(
+                read_object_attributes(&memory, x86_attributes, GuestArch::X86).unwrap(),
+                (0x1234, 0x5678)
+            );
+            let multi = StoredRegistryValue {
+                value_type: "REG_MULTI_SZ".to_string(),
+                data: json!(["A", "B"]),
+            };
+            assert_eq!(registry_value_bytes(&multi).unwrap().0, 7);
+            let expected_multi = "A\0B\0\0"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            assert_eq!(registry_value_bytes(&multi).unwrap().1, expected_multi);
+            let qword = StoredRegistryValue {
+                value_type: "REG_QWORD".to_string(),
+                data: json!(0x1122_3344_5566_7788_u64),
+            };
+            assert_eq!(registry_value_bytes(&qword).unwrap().0, 11);
+            assert_eq!(
+                registry_value_bytes(&qword).unwrap().1,
+                0x1122_3344_5566_7788_u64.to_le_bytes()
+            );
+            let big_endian = StoredRegistryValue {
+                value_type: "REG_DWORD_BIG_ENDIAN".to_string(),
+                data: json!(0x1122_3344_u32),
+            };
+            assert_eq!(registry_value_bytes(&big_endian).unwrap().0, 5);
+            assert_eq!(
+                registry_value_bytes(&big_endian).unwrap().1,
+                [0x11, 0x22, 0x33, 0x44]
+            );
+            let binary = StoredRegistryValue {
+                value_type: "REG_BINARY".to_string(),
+                data: json!([1, 2, 255]),
+            };
+            assert_eq!(registry_value_bytes(&binary).unwrap(), (3, vec![1, 2, 255]));
+            let malformed_binary = StoredRegistryValue {
+                value_type: "REG_BINARY".to_string(),
+                data: json!(["not-a-byte"]),
+            };
+            assert_eq!(registry_value_bytes(&malformed_binary), None);
+            let unsupported = StoredRegistryValue {
+                value_type: "REG_LINK".to_string(),
+                data: json!("target"),
+            };
+            assert_eq!(registry_value_bytes(&unsupported), None);
+            memory.write_u64(attributes + 8, 0);
+            memory.write_u64(attributes + 16, system_name);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwOpenKey,
+                    &[handle_out, 0x1, attributes],
+                ),
+                STATUS_SUCCESS
+            );
+            let reopened = memory.read_u64(handle_out).unwrap();
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwQueryValueKey,
+                    &[reopened, value_name, 9, buffer, 0x80, result_length],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ZwClose,
+                    &[reopened],
+                ),
+                STATUS_SUCCESS
+            );
+        });
+    }
+
+    #[test]
+    fn lookaside_reuses_the_same_guest_buffer_and_rejects_stale_frees() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            let lookaside = 0x59_000;
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExFreeToNPagedLookasideList,
+                    &[0xDEAD, 0x1000],
+                ),
+                STATUS_INVALID_HANDLE,
+                "an unknown lookaside list is rejected"
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExInitializeNPagedLookasideList,
+                    &[lookaside, 0, 0, 0, 0x40, 0x31747343, 4],
+                ),
+                STATUS_SUCCESS
+            );
+            let first = call_kernel_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::ExAllocateFromNPagedLookasideList,
+                &[lookaside],
+            );
+            assert_ne!(first, 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExFreeToNPagedLookasideList,
+                    &[lookaside, first],
+                ),
+                STATUS_SUCCESS
+            );
+            let reused = call_kernel_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::ExAllocateFromNPagedLookasideList,
+                &[lookaside],
+            );
+            assert_eq!(reused, first);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExFreeToNPagedLookasideList,
+                    &[lookaside, 0xDEAD],
+                ),
+                STATUS_INVALID_ADDRESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExInitializeNPagedLookasideList,
+                    &[0x59_100, 1, 0, 0, 0x40, 0x31747343, 4],
+                ),
+                STATUS_NOT_SUPPORTED
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExInitializePagedLookasideList,
+                    &[0x59_200, 0, 0, 0, 0, 0x31747343, 4],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfRaiseIrql,
+                &[u64::from(DISPATCH_LEVEL)],
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExInitializePagedLookasideList,
+                    &[0x59_300, 0, 0, 0, 0x40, 0x31747343, 4],
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocateFromPagedLookasideList,
+                    &[lookaside],
+                ),
+                0
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfLowerIrql,
+                &[0],
+            );
+            let paged_lookaside = 0x59_200;
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExInitializePagedLookasideList,
+                    &[paged_lookaside, 0, 0, 0, 0x40, 0x31747343, 2],
+                ),
+                STATUS_SUCCESS
+            );
+            let paged_first = call_kernel_raw(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::ExAllocateFromPagedLookasideList,
+                &[paged_lookaside],
+            );
+            assert_ne!(paged_first, 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExFreeToPagedLookasideList,
+                    &[paged_lookaside, paged_first],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocateFromPagedLookasideList,
+                    &[paged_lookaside],
+                ),
+                paged_first
+            );
+            assert_eq!(
+                call_kernel_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocateFromNPagedLookasideList,
+                    &[0xBAD0],
+                ),
+                0
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfRaiseIrql,
+                &[u64::from(DISPATCH_LEVEL)],
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExFreeToPagedLookasideList,
+                    &[paged_lookaside, paged_first],
+                ),
+                STATUS_INVALID_DEVICE_STATE
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KfLowerIrql,
+                &[0],
+            );
+            let budget_lookaside = 0x59_400;
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExInitializeNPagedLookasideList,
+                    &[budget_lookaside, 0, 0, 0, 0x40, 0x31747343, 1],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_ne!(
+                call_kernel_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocateFromNPagedLookasideList,
+                    &[budget_lookaside],
+                ),
+                0
+            );
+            assert_eq!(
+                call_kernel_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocateFromNPagedLookasideList,
+                    &[budget_lookaside],
+                ),
+                0
+            );
+            let exhausted_lookaside = 0x59_500;
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExInitializeNPagedLookasideList,
+                    &[exhausted_lookaside, 0, 0, 0, 0x40, 0x31747343, 1],
+                ),
+                STATUS_SUCCESS
+            );
+            let saved_cursor = {
+                let mut state = island.inner.borrow_mut();
+                let saved = state.arena.cursor;
+                state.arena.cursor = state.arena.end;
+                saved
+            };
+            assert_eq!(
+                call_kernel_raw(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExAllocateFromNPagedLookasideList,
+                    &[exhausted_lookaside],
+                ),
+                0
+            );
+            island.inner.borrow_mut().arena.cursor = saved_cursor;
+            let foreign_source = 0x59_600;
+            let foreign_target = 0x59_700;
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExInitializeNPagedLookasideList,
+                    &[foreign_source, 0, 0, 0, 0x40, 0x31747343, 1],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExInitializeNPagedLookasideList,
+                    &[foreign_target, 0, 0, 0, 0x40, 0x31747343, 1],
+                ),
+                STATUS_SUCCESS
+            );
+            let foreign_block = {
+                let mut state = island.inner.borrow_mut();
+                state
+                    .kernel
+                    .lookasides
+                    .get_mut(&foreign_source)
+                    .expect("foreign source list")
+                    .list
+                    .allocate(0x40)
+                    .expect("foreign block")
+            };
+            {
+                let mut state = island.inner.borrow_mut();
+                state
+                    .kernel
+                    .lookasides
+                    .get_mut(&foreign_target)
+                    .expect("foreign target list")
+                    .block_by_guest
+                    .insert(0xDEAD, foreign_block);
+            }
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::ExFreeToNPagedLookasideList,
+                    &[foreign_target, 0xDEAD],
+                ),
+                STATUS_INVALID_ADDRESS
+            );
+        });
+    }
+
+    #[test]
+    fn host_limited_kernel_services_fail_closed_with_exact_statuses() {
+        with_big_stack(|| {
+            assert_eq!(DriverShim::EtwUnregister.x86_arg_bytes(), 4);
+            assert_eq!(DriverShim::EtwWrite.x86_arg_bytes(), 16);
+            assert_eq!(DriverShim::KeQueryInterruptTime.x86_arg_bytes(), 0);
+            assert_eq!(DriverShim::IslandSafepoint.x86_arg_bytes(), 0);
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[0, 0, 0, 0, 0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoConnectInterrupt,
+                    &[0; 11],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwRegister,
+                    &[0, 0, 0, 0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::NtAlpcConnectPort,
+                    &[0; 7],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsGetCurrentProcessId,
+                    &[],
+                ) as u32,
+                runtime.win32.current_process_id()
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsGetCurrentThreadId,
+                    &[],
+                ) as u32,
+                runtime.win32.current_thread_id()
+            );
+            let time_out = 0x5A_000;
+            memory.map_bytes(time_out, &[0_u8; 8]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeQuerySystemTime,
+                    &[time_out],
+                ),
+                STATUS_SUCCESS
+            );
+            let first = memory.read_u64(time_out).unwrap();
+            assert!(first > 116_444_736_000_000_000);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeQuerySystemTime,
+                    &[time_out],
+                ),
+                STATUS_SUCCESS
+            );
+            assert!(memory.read_u64(time_out).unwrap() >= first);
+        });
+    }
+    fn x64_mov_rax(code: &mut Vec<u8>, value: u64) {
+        code.extend_from_slice(&[0x48, 0xB8]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn x64_mov_rcx(code: &mut Vec<u8>, value: u64) {
+        code.extend_from_slice(&[0x48, 0xB9]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn x64_mov_rdx(code: &mut Vec<u8>, value: u64) {
+        code.extend_from_slice(&[0x48, 0xBA]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn x64_mov_r8(code: &mut Vec<u8>, value: u64) {
+        code.extend_from_slice(&[0x49, 0xB8]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn x64_call_rax(code: &mut Vec<u8>) {
+        code.extend_from_slice(&[0xFF, 0xD0]);
+    }
+
+    fn x64_store_rax_imm32(code: &mut Vec<u8>, value: u32) {
+        code.extend_from_slice(&[0xC7, 0x00]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn x64_stub(memory: &mut MemoryImage, island: &DriverIsland, code: &[u8]) -> u64 {
+        let address = island
+            .inner
+            .borrow_mut()
+            .arena
+            .alloc(memory, code.len(), 16)
+            .expect("stub allocation");
+        memory.map_bytes(address, code);
+        address
+    }
+
+    fn x64_thread_stub(
+        memory: &mut MemoryImage,
+        island: &DriverIsland,
+        counter: u64,
+        exit_status: u32,
+        store_context: bool,
+        terminate_status: Option<(u64, u32)>,
+    ) -> u64 {
+        let mut code = Vec::new();
+        if store_context {
+            x64_mov_rax(&mut code, counter);
+            code.extend_from_slice(&[0x48, 0x89, 0x08]); // mov [rax], rcx
+        }
+        if let Some((shim, status)) = terminate_status {
+            x64_mov_rcx(&mut code, u64::from(status));
+            x64_mov_rax(&mut code, shim);
+            x64_call_rax(&mut code);
+        }
+        code.extend_from_slice(&[0xB8]);
+        code.extend_from_slice(&exit_status.to_le_bytes());
+        code.push(0xC3);
+        x64_stub(memory, island, &code)
+    }
+
+    fn x64_counter_stub(
+        memory: &mut MemoryImage,
+        island: &DriverIsland,
+        counter: u64,
+        marker: u32,
+    ) -> u64 {
+        let mut code = Vec::new();
+        x64_mov_rax(&mut code, counter);
+        x64_store_rax_imm32(&mut code, marker);
+        code.extend_from_slice(&[0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3]);
+        x64_stub(memory, island, &code)
+    }
+
+    fn x64_store_stack(code: &mut Vec<u8>, offset: u8, value: u64) {
+        x64_mov_rax(code, value);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, offset]);
+    }
+
+    fn x64_wait_stub(
+        memory: &mut MemoryImage,
+        island: &DriverIsland,
+        shim: u64,
+        object: u64,
+        alertable: bool,
+        timeout_pointer: u64,
+    ) -> u64 {
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+        x64_store_stack(&mut code, 0x20, timeout_pointer);
+        x64_mov_rcx(&mut code, object);
+        code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+        code.extend_from_slice(&[0x41, 0xB9]);
+        code.extend_from_slice(&u32::from(alertable).to_le_bytes());
+        x64_mov_rax(&mut code, shim);
+        x64_call_rax(&mut code);
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        x64_stub(memory, island, &code)
+    }
+
+    fn x64_wait_indirect_stub(
+        memory: &mut MemoryImage,
+        island: &DriverIsland,
+        shim: u64,
+        object_slot: u64,
+        alertable: bool,
+        timeout_pointer: u64,
+    ) -> u64 {
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+        x64_store_stack(&mut code, 0x20, timeout_pointer);
+        x64_mov_rcx(&mut code, object_slot);
+        code.extend_from_slice(&[0x48, 0x8B, 0x09]); // mov rcx, [rcx]
+        code.extend_from_slice(&[0x31, 0xD2]);
+        code.extend_from_slice(&[0x45, 0x31, 0xC0]);
+        code.extend_from_slice(&[0x41, 0xB9]);
+        code.extend_from_slice(&u32::from(alertable).to_le_bytes());
+        x64_mov_rax(&mut code, shim);
+        x64_call_rax(&mut code);
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        x64_stub(memory, island, &code)
+    }
+
+    fn x64_signal_event_stub(
+        memory: &mut MemoryImage,
+        island: &DriverIsland,
+        shim: u64,
+        event: u64,
+    ) -> u64 {
+        let mut code = Vec::new();
+        x64_mov_rcx(&mut code, event);
+        x64_mov_rax(&mut code, shim);
+        x64_call_rax(&mut code);
+        code.extend_from_slice(&[0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3]);
+        x64_stub(memory, island, &code)
+    }
+
+    fn x64_yield_loop_stub(
+        memory: &mut MemoryImage,
+        island: &DriverIsland,
+        safepoint: u64,
+        counter: u64,
+        iterations: u32,
+        final_sequence: u64,
+    ) -> u64 {
+        let mut code = vec![0x31, 0xDB]; // xor ebx, ebx
+        let loop_start = code.len();
+        code.extend_from_slice(&[0x48, 0xFF, 0xC3]); // inc rbx
+        x64_mov_rax(&mut code, counter);
+        code.extend_from_slice(&[0x48, 0x89, 0x18]); // mov [rax], rbx
+        x64_mov_rax(&mut code, safepoint);
+        x64_call_rax(&mut code);
+        code.extend_from_slice(&[0x48, 0x81, 0xFB]);
+        code.extend_from_slice(&iterations.to_le_bytes());
+        let branch = code.len();
+        code.extend_from_slice(&[0x72, 0x00]);
+        let after_branch = code.len();
+        code[branch + 1] = (loop_start as isize - after_branch as isize) as i8 as u8;
+        if final_sequence != 0 {
+            x64_mov_rax(&mut code, final_sequence);
+            x64_store_rax_imm32(&mut code, 3);
+        }
+        code.extend_from_slice(&[0x89, 0xD8, 0xC3]); // mov eax, ebx; ret
+        x64_stub(memory, island, &code)
+    }
+
+    fn x64_self_terminate_loop_stub(
+        memory: &mut MemoryImage,
+        island: &DriverIsland,
+        safepoint: u64,
+        terminate_shim: u64,
+        counter: u64,
+        exit_status: u32,
+        terminate_at: u32,
+    ) -> u64 {
+        let mut code = vec![0x31, 0xDB]; // xor ebx, ebx
+        let loop_start = code.len();
+        code.extend_from_slice(&[0x48, 0xFF, 0xC3]); // inc rbx
+        x64_mov_rax(&mut code, counter);
+        code.extend_from_slice(&[0x48, 0x89, 0x18]); // mov [rax], rbx
+        code.extend_from_slice(&[0x48, 0x81, 0xFB]);
+        code.extend_from_slice(&terminate_at.to_le_bytes());
+        let jne = code.len();
+        code.extend_from_slice(&[0x75, 0x00]); // jne skip
+        x64_mov_rcx(&mut code, u64::from(exit_status));
+        x64_mov_rax(&mut code, terminate_shim);
+        x64_call_rax(&mut code);
+        let skip = code.len();
+        code[jne + 1] = (skip as isize - (jne + 2) as isize) as i8 as u8;
+        x64_mov_rax(&mut code, safepoint);
+        x64_call_rax(&mut code);
+        let jump = code.len();
+        code.extend_from_slice(&[0xEB, 0x00]);
+        code[jump + 1] = (loop_start as isize - (jump + 2) as isize) as i8 as u8;
+        code.push(0xC3);
+        x64_stub(memory, island, &code)
+    }
+
+    fn x64_isr_stub(
+        memory: &mut MemoryImage,
+        island: &DriverIsland,
+        shim_irql: u64,
+        shim_insert: u64,
+        shim_disconnect: Option<u64>,
+        object_store: u64,
+        context_out: u64,
+        irql_out: u64,
+        sequence: u64,
+        dpc: u64,
+        arg1: u64,
+        arg2: u64,
+        handled: u32,
+    ) -> u64 {
+        let mut code = Vec::new();
+        // Save the incoming RCX/RDX (interrupt object and service context).
+        x64_mov_rax(&mut code, object_store);
+        code.extend_from_slice(&[0x48, 0x89, 0x08]); // mov [rax], rcx
+        x64_mov_rax(&mut code, context_out);
+        code.extend_from_slice(&[0x48, 0x89, 0x10]); // mov [rax], rdx
+        // Observe the ISR IRQL.
+        x64_mov_rax(&mut code, shim_irql);
+        x64_call_rax(&mut code);
+        x64_mov_rdx(&mut code, irql_out);
+        code.extend_from_slice(&[0x88, 0x02]); // mov [rdx], al
+        if let Some(shim) = shim_disconnect {
+            x64_mov_rax(&mut code, object_store);
+            code.extend_from_slice(&[0x48, 0x8B, 0x08]); // mov rcx, [rax]
+            x64_mov_rax(&mut code, shim);
+            x64_call_rax(&mut code);
+        }
+        // Queue the associated DPC; it runs after the ISR at DISPATCH_LEVEL.
+        x64_mov_rcx(&mut code, dpc);
+        x64_mov_rdx(&mut code, arg1);
+        x64_mov_r8(&mut code, arg2);
+        x64_mov_rax(&mut code, shim_insert);
+        x64_call_rax(&mut code);
+        x64_mov_rax(&mut code, sequence);
+        x64_store_rax_imm32(&mut code, 1);
+        code.extend_from_slice(&[0xB8]);
+        code.extend_from_slice(&handled.to_le_bytes());
+        code.push(0xC3);
+        x64_stub(memory, island, &code)
+    }
+
+    fn x64_dpc_stub(
+        memory: &mut MemoryImage,
+        island: &DriverIsland,
+        shim_irql: u64,
+        irql_out: u64,
+        sequence: u64,
+    ) -> u64 {
+        let mut code = Vec::new();
+        x64_mov_rax(&mut code, shim_irql);
+        x64_call_rax(&mut code);
+        x64_mov_rdx(&mut code, irql_out);
+        code.extend_from_slice(&[0x88, 0x02]); // mov [rdx], al
+        x64_mov_rax(&mut code, sequence);
+        x64_store_rax_imm32(&mut code, 2);
+        code.push(0xC3);
+        x64_stub(memory, island, &code)
+    }
+
+    fn arena_block(memory: &mut MemoryImage, island: &DriverIsland, size: usize) -> u64 {
+        island
+            .inner
+            .borrow_mut()
+            .arena
+            .alloc(memory, size, 8)
+            .expect("arena block")
+    }
+
+    fn arena_u64(memory: &mut MemoryImage, island: &DriverIsland, value: u64) -> u64 {
+        let address = island
+            .inner
+            .borrow_mut()
+            .arena
+            .alloc(memory, 8, 8)
+            .expect("counter allocation");
+        memory.write_u64(address, value);
+        address
+    }
+
+    #[test]
+    fn system_threads_execute_guest_code_with_context_exit_apcs_and_handle_close() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let handle_out = 0x5D_000;
+            memory.map_bytes(handle_out, &[0_u8; 8]);
+            let counter = arena_u64(&mut memory, &island, 0);
+            let context = 0x5D_100;
+            memory.map_bytes(context, &[0_u8; 8]);
+            let start = x64_thread_stub(&mut memory, &island, counter, 0x37, true, None);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[handle_out, 0, 0, 0, start, context],
+                ),
+                STATUS_SUCCESS
+            );
+            let handle = SystemThreadHandle(memory.read_u64(handle_out).unwrap());
+            assert_ne!(handle.0, 0);
+            assert_eq!(
+                island
+                    .inner
+                    .borrow()
+                    .system_threads
+                    .exit_status(handle)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[handle.0, 0, 0, 0],
+                ),
+                STATUS_TIMEOUT
+            );
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, handle, 0)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(island.pump_system_threads(&mut runtime, &mut memory), 1);
+            assert_eq!(memory.read_u64(counter).unwrap(), context);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, handle, 0)
+                    .unwrap(),
+                Some(0x37)
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[handle.0, 0, 0, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(island.inner.borrow().system_threads.started_count(), 1);
+            assert_eq!(island.inner.borrow().system_threads.completed_count(), 1);
+
+            // APCs run before the start routine, in queue order.
+            let apc_counter = arena_u64(&mut memory, &island, 0);
+            let apc_stub = x64_counter_stub(&mut memory, &island, apc_counter, 1);
+            let start_marker = x64_counter_stub(&mut memory, &island, apc_counter, 2);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[handle_out, 0, 0, 0, start_marker, context],
+                ),
+                STATUS_SUCCESS
+            );
+            let apc_handle = SystemThreadHandle(memory.read_u64(handle_out).unwrap());
+            assert_ne!(apc_handle.0, 0);
+            island
+                .inner
+                .borrow_mut()
+                .system_threads
+                .queue_apc(apc_handle, apc_stub, 0)
+                .unwrap();
+            assert_eq!(island.pump_system_threads(&mut runtime, &mut memory), 1);
+            assert_eq!(memory.read_u32(apc_counter).unwrap(), 2);
+
+            // Closing the handle does not terminate the thread.
+            let close_counter = arena_u64(&mut memory, &island, 0);
+            let close_start =
+                x64_thread_stub(&mut memory, &island, close_counter, 0x44, true, None);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[handle_out, 0, 0, 0, close_start, context],
+                ),
+                STATUS_SUCCESS
+            );
+            let close_handle = SystemThreadHandle(memory.read_u64(handle_out).unwrap());
+            island
+                .inner
+                .borrow_mut()
+                .system_threads
+                .close_handle(close_handle)
+                .unwrap();
+            assert_eq!(island.pump_system_threads(&mut runtime, &mut memory), 1);
+            assert_eq!(memory.read_u64(close_counter).unwrap(), context);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, close_handle, 0)
+                    .unwrap_err(),
+                crate::casak::status::STATUS_INVALID_HANDLE
+            );
+
+            // PsTerminateSystemThread overrides the routine's return code.
+            let terminate_shim = allocate_shim(&mut runtime, DriverShim::PsTerminateSystemThread);
+            let terminate_thread = x64_thread_stub(
+                &mut memory,
+                &island,
+                counter,
+                0x11,
+                false,
+                Some((terminate_shim, 0x77)),
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[handle_out, 0, 0, 0, terminate_thread, context],
+                ),
+                STATUS_SUCCESS
+            );
+            let terminate_handle = SystemThreadHandle(memory.read_u64(handle_out).unwrap());
+            assert_eq!(island.pump_system_threads(&mut runtime, &mut memory), 1);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, terminate_handle, 0)
+                    .unwrap(),
+                Some(0x77)
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsTerminateSystemThread,
+                    &[0x55],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+        });
+    }
+
+    #[test]
+    fn system_threads_reject_invalid_handles_routines_contexts_and_termination_races() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let handle_out = 0x5D_200;
+            memory.map_bytes(handle_out, &[0_u8; 8]);
+            let counter = arena_u64(&mut memory, &island, 0);
+            let start = x64_thread_stub(&mut memory, &island, counter, 0x37, false, None);
+            for args in [
+                vec![0, 0, 0, 0, start, 0],
+                vec![handle_out, 0, 0, 0, 0, 0],
+                vec![handle_out, 0, 0, 0, 0xDEAD_BEEF, 0],
+                vec![handle_out, 0, 0, 0, start, 0xDEAD_BEEF],
+                vec![0xDEAD_BEEF, 0, 0, 0, start, 0],
+                vec![handle_out, 0, 0, 0x1234, start, 0],
+            ] {
+                let expected = if args[0] == 0 || args[4] == 0 {
+                    STATUS_INVALID_PARAMETER
+                } else if args[0] == 0xDEAD_BEEF || args[4] == 0xDEAD_BEEF || args[5] == 0xDEAD_BEEF
+                {
+                    STATUS_INVALID_ADDRESS
+                } else {
+                    STATUS_INVALID_HANDLE
+                };
+                assert_eq!(
+                    call_kernel_shim(
+                        &island,
+                        &mut runtime,
+                        &mut memory,
+                        DriverShim::PsCreateSystemThread,
+                        &args,
+                    ),
+                    expected
+                );
+            }
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, SystemThreadHandle(0xDEAD), 0)
+                    .unwrap_err(),
+                crate::casak::status::STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                island
+                    .terminate_system_thread(SystemThreadHandle(0xDEAD), 0)
+                    .unwrap_err(),
+                crate::casak::status::STATUS_INVALID_HANDLE
+            );
+            // A ready thread terminated before its slice never runs.
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[handle_out, 0, 0, 0, start, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let ready = SystemThreadHandle(memory.read_u64(handle_out).unwrap());
+            assert_eq!(island.terminate_system_thread(ready, 0x55), Ok(()));
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, ready, 0)
+                    .unwrap(),
+                Some(0x55)
+            );
+            assert_eq!(island.pump_system_threads(&mut runtime, &mut memory), 0);
+            assert_eq!(memory.read_u32(counter).unwrap(), 0);
+            // A running thread with no ready peer reports a timeout instead of
+            // spinning the host.
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[handle_out, 0, 0, 0, start, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let running = SystemThreadHandle(memory.read_u64(handle_out).unwrap());
+            let run_id = island
+                .inner
+                .borrow_mut()
+                .system_threads
+                .take_next()
+                .expect("thread is ready");
+            assert_eq!(
+                run_id.id,
+                island.inner.borrow().system_threads.current().unwrap()
+            );
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, running, 1)
+                    .unwrap(),
+                None
+            );
+            island
+                .inner
+                .borrow_mut()
+                .system_threads
+                .finish_current(0)
+                .unwrap();
+            island
+                .inner
+                .borrow_mut()
+                .system_threads
+                .restore_running(run_id.id);
+            island.inner.borrow_mut().finish_system_thread(run_id.id, 0);
+
+            // A wait with a positive timeout pumps a peer slice, then loops
+            // again when the target is still live.
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[handle_out, 0, 0, 0, start, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let target = SystemThreadHandle(memory.read_u64(handle_out).unwrap());
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[handle_out, 0, 0, 0, start, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let peer = SystemThreadHandle(memory.read_u64(handle_out).unwrap());
+            let target_id = island
+                .inner
+                .borrow()
+                .system_threads
+                .handle_for_target(target);
+            {
+                let mut state = island.inner.borrow_mut();
+                state.system_threads.park_for_wait_test(target_id);
+            }
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, target, 5_000)
+                    .unwrap(),
+                None
+            );
+            let _ = peer;
+
+            let saved_cursor = island.inner.borrow().arena.cursor;
+            let arena_end = island.inner.borrow().arena.end;
+            island.inner.borrow_mut().arena.cursor = arena_end;
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[handle_out, 0, 0, 0, start, 0],
+                ),
+                STATUS_INSUFFICIENT_RESOURCES
+            );
+            island.inner.borrow_mut().arena.cursor = saved_cursor;
+            {
+                let mut state = island.inner.borrow_mut();
+                let IslandState {
+                    process,
+                    system_threads,
+                    current_process,
+                    ..
+                } = &mut *state;
+                let _ = process.terminate_process(system_threads, *current_process);
+            }
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsCreateSystemThread,
+                    &[handle_out, 0, 0, 0, start, 0],
+                ),
+                crate::casak::status::STATUS_PROCESS_IS_TERMINATING
+            );
+        });
+    }
+
+    fn spawn_system_thread(
+        island: &DriverIsland,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        start: u64,
+        context: u64,
+    ) -> SystemThreadHandle {
+        let out = arena_u64(memory, island, 0);
+        assert_eq!(
+            call_kernel_shim(
+                island,
+                runtime,
+                memory,
+                DriverShim::PsCreateSystemThread,
+                &[out, 0, 0, 0, start, context],
+            ),
+            STATUS_SUCCESS
+        );
+        let handle = SystemThreadHandle(memory.read_u64(out).unwrap());
+        assert_ne!(handle.0, 0);
+        handle
+    }
+
+    #[test]
+    fn system_thread_quantum_preemption_preserves_register_stack_and_exit_state() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let safepoint = allocate_shim(&mut runtime, DriverShim::IslandSafepoint);
+            let counter = arena_u64(&mut memory, &island, 0);
+            let sequence = arena_u64(&mut memory, &island, 0);
+            let start = x64_yield_loop_stub(&mut memory, &island, safepoint, counter, 8, sequence);
+            island.set_thread_quantum(Duration::from_nanos(1));
+            let handle = spawn_system_thread(&island, &mut runtime, &mut memory, start, 0);
+            let thread_id = island
+                .inner
+                .borrow()
+                .system_threads
+                .query(handle)
+                .unwrap()
+                .id;
+            let slices = island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(slices >= 2, true);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, handle, 0)
+                    .unwrap(),
+                Some(8)
+            );
+            assert_eq!(memory.read_u64(counter).unwrap(), 8);
+            assert_eq!(memory.read_u32(sequence).unwrap(), 3);
+            assert_eq!(
+                island.system_thread_exit_status_by_id(thread_id).unwrap(),
+                Some(8)
+            );
+            assert!(island.inner.borrow().thread_cpus.is_empty());
+        });
+    }
+
+    #[test]
+    fn termination_during_running_loop_observes_safepoint_and_blocks_double_terminate() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let safepoint = allocate_shim(&mut runtime, DriverShim::IslandSafepoint);
+            let terminate = allocate_shim(&mut runtime, DriverShim::PsTerminateSystemThread);
+            let counter = arena_u64(&mut memory, &island, 0);
+            let start = x64_self_terminate_loop_stub(
+                &mut memory,
+                &island,
+                safepoint,
+                terminate,
+                counter,
+                0x99,
+                3,
+            );
+            island.set_thread_quantum(Duration::from_nanos(1));
+            let handle = spawn_system_thread(&island, &mut runtime, &mut memory, start, 0);
+            let thread_id = island
+                .inner
+                .borrow()
+                .system_threads
+                .query(handle)
+                .unwrap()
+                .id;
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island.system_thread_exit_status_by_id(thread_id).unwrap(),
+                Some(0x99)
+            );
+            assert_eq!(memory.read_u64(counter).unwrap(), 3);
+            assert_eq!(
+                island.terminate_system_thread(handle, 0),
+                Err(crate::casak::status::STATUS_THREAD_IS_TERMINATING)
+            );
+            assert_eq!(
+                island
+                    .inner
+                    .borrow_mut()
+                    .system_threads
+                    .close_handle(handle),
+                Ok(())
+            );
+            assert_eq!(
+                island
+                    .inner
+                    .borrow_mut()
+                    .system_threads
+                    .close_handle(handle),
+                Err(crate::casak::status::STATUS_INVALID_HANDLE)
+            );
+            assert_eq!(
+                island.system_thread_exit_status_by_id(thread_id).unwrap(),
+                Some(0x99)
+            );
+        });
+    }
+
+    #[test]
+    fn infinite_waits_block_until_event_signal_thread_exit_or_cancel() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let wait_shim = allocate_shim(&mut runtime, DriverShim::KeWaitForSingleObject);
+            let set_shim = allocate_shim(&mut runtime, DriverShim::KeSetEvent);
+            let event = arena_block(&mut memory, &island, 0x40);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeEvent,
+                    &[event, u64::from(SYNCHRONIZATION_EVENT), 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let waiter = x64_wait_stub(&mut memory, &island, wait_shim, event, false, 0);
+            let signaler = x64_signal_event_stub(&mut memory, &island, set_shim, event);
+            let waiter_handle = spawn_system_thread(&island, &mut runtime, &mut memory, waiter, 0);
+            let signaler_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, signaler, 0);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, waiter_handle, 0)
+                    .unwrap(),
+                None
+            );
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, waiter_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, signaler_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+
+            // A notification event stays signaled after waking a waiter.
+            let notification = arena_block(&mut memory, &island, 0x40);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KeInitializeEvent,
+                &[notification, u64::from(NOTIFICATION_EVENT), 0],
+            );
+            let notif_wait = x64_wait_stub(&mut memory, &island, wait_shim, notification, false, 0);
+            let notif_signal = x64_signal_event_stub(&mut memory, &island, set_shim, notification);
+            let notif_wait_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, notif_wait, 0);
+            let notif_signal_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, notif_signal, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, notif_wait_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, notif_signal_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+            assert!(
+                island
+                    .inner
+                    .borrow()
+                    .kernel
+                    .events
+                    .get(&notification)
+                    .unwrap()
+                    .signaled
+            );
+
+            // Waiting on a thread handle wakes when the target exits.
+            let child_counter = arena_u64(&mut memory, &island, 0);
+            let child = x64_thread_stub(&mut memory, &island, child_counter, 7, false, None);
+            let child_handle = spawn_system_thread(&island, &mut runtime, &mut memory, child, 0);
+            let parent = x64_wait_stub(&mut memory, &island, wait_shim, child_handle.0, false, 0);
+            let parent_handle = spawn_system_thread(&island, &mut runtime, &mut memory, parent, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, parent_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, child_handle, 0)
+                    .unwrap(),
+                Some(7)
+            );
+        });
+    }
+
+    #[test]
+    fn wait_timeout_cancel_and_apc_alertable_boundaries_are_exact() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let wait_shim = allocate_shim(&mut runtime, DriverShim::KeWaitForSingleObject);
+            let set_shim = allocate_shim(&mut runtime, DriverShim::KeSetEvent);
+            let event = arena_block(&mut memory, &island, 0x40);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KeInitializeEvent,
+                &[event, u64::from(SYNCHRONIZATION_EVENT), 0],
+            );
+            let timeout = arena_u64(&mut memory, &island, (-10_000_i64) as u64);
+            let timed = x64_wait_stub(&mut memory, &island, wait_shim, event, false, timeout);
+            let timed_handle = spawn_system_thread(&island, &mut runtime, &mut memory, timed, 0);
+            let started = Instant::now();
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, timed_handle, 0)
+                    .unwrap(),
+                Some(STATUS_TIMEOUT)
+            );
+            assert!(started.elapsed() >= Duration::from_millis(1));
+
+            let canceled = x64_wait_stub(&mut memory, &island, wait_shim, event, false, 0);
+            let canceled_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, canceled, 0);
+            assert!(island.pump_one_system_slice(&mut runtime, &mut memory));
+            assert_eq!(
+                island.system_thread_state(canceled_handle),
+                Some(crate::casak::threads::KernelThreadState::Waiting)
+            );
+            assert_eq!(island.cancel_system_thread_wait(canceled_handle), Ok(()));
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, canceled_handle, 0)
+                    .unwrap(),
+                Some(crate::casak::status::STATUS_CANCELLED)
+            );
+            assert_eq!(
+                island.cancel_system_thread_wait(canceled_handle),
+                Err(crate::casak::status::STATUS_INVALID_PARAMETER)
+            );
+
+            // Alertable wait: a queued APC wakes the wait with USER_APC and
+            // runs the APC before the wait call resumes.
+            let apc_event = arena_block(&mut memory, &island, 0x40);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KeInitializeEvent,
+                &[apc_event, u64::from(SYNCHRONIZATION_EVENT), 0],
+            );
+            let apc_counter = arena_u64(&mut memory, &island, 0);
+            let apc_stub = x64_counter_stub(&mut memory, &island, apc_counter, 1);
+            let alertable = x64_wait_stub(&mut memory, &island, wait_shim, apc_event, true, 0);
+            let alertable_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, alertable, 0);
+            island
+                .queue_system_thread_apc(alertable_handle, apc_stub, 0)
+                .unwrap();
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(memory.read_u32(apc_counter).unwrap(), 1);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, alertable_handle, 0)
+                    .unwrap(),
+                Some(crate::casak::status::STATUS_USER_APC)
+            );
+
+            // Non-alertable wait keeps blocking through the APC and wakes on
+            // the event signal without delivering the APC.
+            let busy_event = arena_block(&mut memory, &island, 0x40);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KeInitializeEvent,
+                &[busy_event, u64::from(SYNCHRONIZATION_EVENT), 0],
+            );
+            let busy_counter = arena_u64(&mut memory, &island, 0);
+            let busy_apc = x64_counter_stub(&mut memory, &island, busy_counter, 1);
+            let non_alertable =
+                x64_wait_stub(&mut memory, &island, wait_shim, busy_event, false, 0);
+            let busy_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, non_alertable, 0);
+            island
+                .queue_system_thread_apc(busy_handle, busy_apc, 0)
+                .unwrap();
+            assert!(island.pump_one_system_slice(&mut runtime, &mut memory));
+            assert_eq!(
+                island.system_thread_state(busy_handle),
+                Some(crate::casak::threads::KernelThreadState::Waiting)
+            );
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KeSetEvent,
+                &[busy_event, 0, 0],
+            );
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(memory.read_u32(busy_counter).unwrap(), 0);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, busy_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+            let _ = set_shim;
+        });
+    }
+
+    #[test]
+    fn interrupt_preempts_running_thread_then_thread_resumes_intact() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let safepoint = allocate_shim(&mut runtime, DriverShim::IslandSafepoint);
+            let shim_irql = allocate_shim(&mut runtime, DriverShim::KeGetCurrentIrql);
+            let shim_insert = allocate_shim(&mut runtime, DriverShim::KeInsertQueueDpc);
+            let dpc = arena_u64(&mut memory, &island, 0);
+            let dpc_irql = arena_u64(&mut memory, &island, 0);
+            let sequence = arena_u64(&mut memory, &island, 0);
+            let dpc_stub = x64_dpc_stub(&mut memory, &island, shim_irql, dpc_irql, sequence);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeDpc,
+                    &[dpc, dpc_stub, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let object_store = arena_u64(&mut memory, &island, 0);
+            let context_out = arena_u64(&mut memory, &island, 0);
+            let isr_irql = arena_u64(&mut memory, &island, 0);
+            let service_context = arena_u64(&mut memory, &island, 0);
+            let isr = x64_isr_stub(
+                &mut memory,
+                &island,
+                shim_irql,
+                shim_insert,
+                None,
+                object_store,
+                context_out,
+                isr_irql,
+                sequence,
+                dpc,
+                0,
+                0,
+                1,
+            );
+            let out = arena_u64(&mut memory, &island, 0);
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    out,
+                    isr,
+                    service_context,
+                    0,
+                    0x70,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_SUCCESS
+            );
+            let counter = arena_u64(&mut memory, &island, 0);
+            let thread_seq = arena_u64(&mut memory, &island, 0);
+            let start =
+                x64_yield_loop_stub(&mut memory, &island, safepoint, counter, 5, thread_seq);
+            island.set_thread_quantum(Duration::from_nanos(1));
+            let handle = spawn_system_thread(&island, &mut runtime, &mut memory, start, 0);
+            island.queue_virtual_interrupt(0x70);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, handle, 0)
+                    .unwrap(),
+                Some(5)
+            );
+            assert_eq!(memory.read_u64(counter).unwrap(), 5);
+            assert_eq!(memory.read_u32(sequence).unwrap(), 2);
+            assert_eq!(memory.read_u32(thread_seq).unwrap(), 3);
+            assert_eq!(island.inner.borrow().interrupts.isr_invocations(), 1);
+            assert_eq!(island.inner.borrow().interrupts.dispatch_count(), 1);
+        });
+    }
+
+    #[test]
+    fn handle_close_and_exit_code_visibility_across_slices_is_exact() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let safepoint = allocate_shim(&mut runtime, DriverShim::IslandSafepoint);
+            let counter = arena_u64(&mut memory, &island, 0);
+            let sequence = arena_u64(&mut memory, &island, 0);
+            let start = x64_yield_loop_stub(&mut memory, &island, safepoint, counter, 10, sequence);
+            island.set_thread_quantum(Duration::from_nanos(1));
+            let handle = spawn_system_thread(&island, &mut runtime, &mut memory, start, 0);
+            let thread_id = island
+                .inner
+                .borrow()
+                .system_threads
+                .query(handle)
+                .unwrap()
+                .id;
+            assert!(island.pump_one_system_slice(&mut runtime, &mut memory));
+            assert_eq!(
+                island.system_thread_state(handle),
+                Some(crate::casak::threads::KernelThreadState::Ready)
+            );
+            assert_eq!(
+                island
+                    .inner
+                    .borrow_mut()
+                    .system_threads
+                    .close_handle(handle),
+                Ok(())
+            );
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island.system_thread_exit_status_by_id(thread_id).unwrap(),
+                Some(10)
+            );
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, handle, 0)
+                    .unwrap_err(),
+                crate::casak::status::STATUS_INVALID_HANDLE
+            );
+            assert_eq!(island.system_thread_state(handle), None);
+            assert_eq!(
+                island.system_thread_exit_status_by_id(ThreadId(404)),
+                Err(crate::casak::status::STATUS_INVALID_HANDLE)
+            );
+            assert_eq!(
+                island
+                    .inner
+                    .borrow_mut()
+                    .system_threads
+                    .close_handle(handle),
+                Err(crate::casak::status::STATUS_INVALID_HANDLE)
+            );
+            assert_eq!(memory.read_u64(counter).unwrap(), 10);
+        });
+    }
+
+    #[test]
+    fn system_wait_self_and_invalid_targets_report_exact_statuses() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let wait_shim = allocate_shim(&mut runtime, DriverShim::KeWaitForSingleObject);
+            let handle_slot = arena_u64(&mut memory, &island, 0);
+            let self_wait =
+                x64_wait_indirect_stub(&mut memory, &island, wait_shim, handle_slot, false, 0);
+            let handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, self_wait, handle_slot);
+            memory.write_u64(handle_slot, handle.0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, handle, 0)
+                    .unwrap(),
+                Some(STATUS_INVALID_PARAMETER)
+            );
+
+            let invalid_wait = x64_wait_stub(&mut memory, &island, wait_shim, 0xDEAD, false, 0);
+            let invalid = spawn_system_thread(&island, &mut runtime, &mut memory, invalid_wait, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, invalid, 0)
+                    .unwrap(),
+                Some(STATUS_INVALID_HANDLE)
+            );
+
+            // Immediate success on an already-terminated thread handle.
+            let child_counter = arena_u64(&mut memory, &island, 0);
+            let child = x64_thread_stub(&mut memory, &island, child_counter, 3, false, None);
+            let child_handle = spawn_system_thread(&island, &mut runtime, &mut memory, child, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            let immediate =
+                x64_wait_stub(&mut memory, &island, wait_shim, child_handle.0, false, 0);
+            let immediate_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, immediate, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, immediate_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+
+            // Immediate success on an already-signaled event.
+            let event = arena_block(&mut memory, &island, 0x40);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KeInitializeEvent,
+                &[event, u64::from(SYNCHRONIZATION_EVENT), 1],
+            );
+            let signaled = x64_wait_stub(&mut memory, &island, wait_shim, event, false, 0);
+            let signaled_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, signaled, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, signaled_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+            assert!(
+                !island
+                    .inner
+                    .borrow()
+                    .kernel
+                    .events
+                    .get(&event)
+                    .unwrap()
+                    .signaled
+            );
+        });
+    }
+
+    #[test]
+    fn slice_budget_and_guest_fault_are_observable_and_resumable() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let safepoint = allocate_shim(&mut runtime, DriverShim::IslandSafepoint);
+            let counter = arena_u64(&mut memory, &island, 0);
+            let sequence = arena_u64(&mut memory, &island, 0);
+            let start =
+                x64_yield_loop_stub(&mut memory, &island, safepoint, counter, 100, sequence);
+            island.set_thread_quantum(Duration::from_nanos(1));
+            let handle = spawn_system_thread(&island, &mut runtime, &mut memory, start, 0);
+            assert_eq!(
+                island.pump_system_threads(&mut runtime, &mut memory),
+                MAX_THREAD_SLICES
+            );
+            assert_eq!(
+                island.system_thread_state(handle),
+                Some(crate::casak::threads::KernelThreadState::Ready)
+            );
+            let mut completed = None;
+            for _ in 0..16 {
+                island.pump_system_threads(&mut runtime, &mut memory);
+                completed = island
+                    .wait_system_thread(&mut runtime, &mut memory, handle, 0)
+                    .unwrap();
+                if completed.is_some() {
+                    break;
+                }
+            }
+            assert_eq!(completed, Some(100), "the loop finishes after its quanta");
+            assert_eq!(memory.read_u64(counter).unwrap(), 100);
+
+            let fault = x64_stub(&mut memory, &island, &[0x0F, 0x0B]);
+            let fault_handle = spawn_system_thread(&island, &mut runtime, &mut memory, fault, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, fault_handle, 0)
+                    .unwrap(),
+                Some(STATUS_UNSUCCESSFUL)
+            );
+        });
+    }
+
+    #[test]
+    fn pure_guest_loops_are_quantum_preempted_and_termination_race_is_exact() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            // Tight `jmp $` loop: no imports, no IRET, no host callback.
+            let loop_stub = x64_stub(&mut memory, &island, &[0xEB, 0xFE]);
+            island.set_thread_quantum(Duration::from_nanos(1));
+            let handle = spawn_system_thread(&mut island, &mut runtime, &mut memory, loop_stub, 0);
+            assert_eq!(
+                island.pump_system_threads(&mut runtime, &mut memory),
+                MAX_THREAD_SLICES,
+                "each quantum expires at a block boundary"
+            );
+            assert_eq!(
+                island.system_thread_state(handle),
+                Some(crate::casak::threads::KernelThreadState::Ready),
+                "the pure loop is requeued, not run to completion"
+            );
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, handle, 0)
+                    .unwrap(),
+                None,
+                "the loop has not exited"
+            );
+            island
+                .terminate_system_thread(handle, 0x55)
+                .expect("termination request");
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, handle, 0)
+                    .unwrap(),
+                Some(0x55),
+                "termination is observed at the next safepoint with its exit code"
+            );
+        });
+    }
+
+    #[test]
+    fn preemption_gate_respects_irql_and_missing_thread_records() {
+        with_big_stack(|| {
+            let (mut runtime, _memory, mut island) = kernel_test_island();
+            let mut state = island.inner.borrow_mut();
+            state.current_system_thread = Some(ThreadId(404));
+            state.kernel.irql = DISPATCH_LEVEL;
+            state.maybe_preempt(&mut runtime);
+            assert!(!runtime.yield_pumped_guest_thread);
+            state.kernel.irql = 0;
+            state.maybe_preempt(&mut runtime);
+            assert!(!runtime.yield_pumped_guest_thread);
+            state.current_system_thread = None;
+            state.maybe_preempt(&mut runtime);
+            assert!(!runtime.yield_pumped_guest_thread);
+            drop(state);
+            assert_eq!(
+                island.queue_system_thread_apc(SystemThreadHandle(0xDEAD), 1, 0),
+                Err(crate::casak::status::STATUS_INVALID_HANDLE)
+            );
+        });
+    }
+
+    #[test]
+    fn thread_target_wait_blocks_until_target_exits_and_wakes_exactly() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let wait_shim = allocate_shim(&mut runtime, DriverShim::KeWaitForSingleObject);
+            let set_shim = allocate_shim(&mut runtime, DriverShim::KeSetEvent);
+            let gate = arena_block(&mut memory, &island, 0x40);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeEvent,
+                    &[gate, u64::from(SYNCHRONIZATION_EVENT), 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let target = x64_wait_stub(&mut memory, &island, wait_shim, gate, false, 0);
+            let target_handle = spawn_system_thread(&island, &mut runtime, &mut memory, target, 0);
+            let waiter = x64_wait_stub(&mut memory, &island, wait_shim, target_handle.0, false, 0);
+            let waiter_handle = spawn_system_thread(&island, &mut runtime, &mut memory, waiter, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island.system_thread_state(target_handle),
+                Some(crate::casak::threads::KernelThreadState::Waiting)
+            );
+            assert_eq!(
+                island.system_thread_state(waiter_handle),
+                Some(crate::casak::threads::KernelThreadState::Waiting)
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeSetEvent,
+                    &[gate, 0, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, target_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, waiter_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+            let _ = set_shim;
+            let fast_counter = arena_u64(&mut memory, &island, 0);
+            let fast = x64_thread_stub(&mut memory, &island, fast_counter, 7, false, None);
+            let fast_handle = spawn_system_thread(&island, &mut runtime, &mut memory, fast, 0);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, fast_handle, 1000)
+                    .unwrap(),
+                Some(7)
+            );
+        });
+    }
+
+    #[test]
+    fn event_auto_reset_and_absolute_wait_timeouts_are_exact() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let wait_shim = allocate_shim(&mut runtime, DriverShim::KeWaitForSingleObject);
+            let signaled = arena_block(&mut memory, &island, 0x40);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeEvent,
+                    &[signaled, u64::from(SYNCHRONIZATION_EVENT), 1],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[signaled, 0, 0, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            assert!(
+                !island
+                    .inner
+                    .borrow()
+                    .kernel
+                    .events
+                    .get(&signaled)
+                    .unwrap()
+                    .signaled
+            );
+
+            let notification = arena_block(&mut memory, &island, 0x40);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeEvent,
+                    &[notification, u64::from(NOTIFICATION_EVENT), 1],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeWaitForSingleObject,
+                    &[notification, 0, 0, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let notif_wait = x64_wait_stub(&mut memory, &island, wait_shim, notification, false, 0);
+            let notif_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, notif_wait, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, notif_handle, 0)
+                    .unwrap(),
+                Some(STATUS_SUCCESS)
+            );
+            {
+                let mut state = island.inner.borrow_mut();
+                let gate = state.kernel.events.get(&notification).unwrap().gate.clone();
+                state.consume_event(NOTIFICATION_EVENT, notification, gate);
+            }
+            assert_eq!(island.inner.borrow().notification_waits, 3);
+            assert!(
+                island
+                    .inner
+                    .borrow()
+                    .kernel
+                    .events
+                    .get(&notification)
+                    .unwrap()
+                    .signaled
+            );
+
+            let event = arena_block(&mut memory, &island, 0x40);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KeInitializeEvent,
+                &[event, u64::from(SYNCHRONIZATION_EVENT), 0],
+            );
+            let absolute_future = system_time_100ns() + 10_000;
+            let future_timeout = arena_u64(&mut memory, &island, absolute_future);
+            let absolute = x64_wait_stub(
+                &mut memory,
+                &island,
+                wait_shim,
+                event,
+                false,
+                future_timeout,
+            );
+            let absolute_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, absolute, 0);
+            let started = Instant::now();
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert!(started.elapsed() >= Duration::from_millis(1));
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, absolute_handle, 0)
+                    .unwrap(),
+                Some(STATUS_TIMEOUT)
+            );
+
+            let past_timeout = arena_u64(&mut memory, &island, 1);
+            let expired =
+                x64_wait_stub(&mut memory, &island, wait_shim, event, false, past_timeout);
+            let expired_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, expired, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, expired_handle, 0)
+                    .unwrap(),
+                Some(STATUS_TIMEOUT)
+            );
+
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeQuerySystemTime,
+                    &[0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let invalid = x64_wait_stub(&mut memory, &island, wait_shim, 0xDEAD, false, 0);
+            let invalid_handle =
+                spawn_system_thread(&island, &mut runtime, &mut memory, invalid, 0);
+            island.pump_system_threads(&mut runtime, &mut memory);
+            assert_eq!(
+                island
+                    .wait_system_thread(&mut runtime, &mut memory, invalid_handle, 0)
+                    .unwrap(),
+                Some(STATUS_INVALID_HANDLE)
+            );
+        });
+    }
+
+    fn connect_interrupt(
+        island: &DriverIsland,
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        handle_out: u64,
+        service: u64,
+        context: u64,
+        spin: u64,
+        vector: u32,
+        irql: u8,
+        sync_irql: u8,
+        mode: u32,
+        share: bool,
+        affinity: u64,
+    ) -> i32 {
+        call_kernel_shim(
+            island,
+            runtime,
+            memory,
+            DriverShim::IoConnectInterrupt,
+            &[
+                handle_out,
+                service,
+                context,
+                spin,
+                u64::from(vector),
+                u64::from(irql),
+                u64::from(sync_irql),
+                u64::from(mode),
+                u64::from(share),
+                affinity,
+                0,
+            ],
+        )
+    }
+
+    fn write_connect_ex_params(
+        memory: &mut MemoryImage,
+        address: u64,
+        version: u32,
+        handle_out: u64,
+        service: u64,
+        context: u64,
+        spin: u64,
+        vector: u32,
+        irql: u8,
+        sync_irql: u8,
+        mode: u8,
+        share: u8,
+        affinity: u64,
+    ) {
+        memory.map_bytes(address, &[0_u8; 64]);
+        memory.write_u32(address, version);
+        memory.write_u64(address + 8, handle_out);
+        memory.write_u64(address + 16, service);
+        memory.write_u64(address + 24, context);
+        memory.write_u64(address + 32, spin);
+        memory.write_u32(address + 40, vector);
+        memory.write_u8(address + 44, irql);
+        memory.write_u8(address + 45, sync_irql);
+        memory.write_u8(address + 46, mode);
+        memory.write_u8(address + 47, share);
+        memory.write_u64(address + 48, affinity);
+    }
+
+    #[test]
+    fn virtual_interrupts_run_isr_then_dpc_with_exact_context_and_irql() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let shim_irql = allocate_shim(&mut runtime, DriverShim::KeGetCurrentIrql);
+            let shim_insert = allocate_shim(&mut runtime, DriverShim::KeInsertQueueDpc);
+            let dpc = arena_u64(&mut memory, &island, 0);
+            let dpc_irql = arena_u64(&mut memory, &island, 0xEE);
+            let sequence = arena_u64(&mut memory, &island, 0);
+            let dpc_stub = x64_dpc_stub(&mut memory, &island, shim_irql, dpc_irql, sequence);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeInitializeDpc,
+                    &[dpc, dpc_stub, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let object_store = arena_u64(&mut memory, &island, 0);
+            let context_out = arena_u64(&mut memory, &island, 0);
+            let isr_irql = arena_u64(&mut memory, &island, 0xEE);
+            let service_context = arena_u64(&mut memory, &island, 0);
+            let isr = x64_isr_stub(
+                &mut memory,
+                &island,
+                shim_irql,
+                shim_insert,
+                None,
+                object_store,
+                context_out,
+                isr_irql,
+                sequence,
+                dpc,
+                0x11,
+                0x22,
+                1,
+            );
+            let handle_out = arena_u64(&mut memory, &island, 0);
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    handle_out,
+                    isr,
+                    service_context,
+                    0,
+                    0x40,
+                    5,
+                    7,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_SUCCESS
+            );
+            let interrupt = memory.read_u64(handle_out).unwrap();
+            assert_ne!(interrupt, 0);
+            {
+                let state = island.inner.borrow();
+                let record = state.interrupts.query(interrupt).unwrap();
+                assert_eq!(record.vector, 0x40);
+                assert_eq!(record.irql, 5);
+                assert_eq!(record.synchronize_irql, 7);
+            }
+            assert_eq!(
+                island
+                    .trigger_virtual_interrupt(&mut runtime, &mut memory, 0x40)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(memory.read_u64(context_out).unwrap(), service_context);
+            assert_eq!(memory.read_u8(isr_irql).unwrap(), 5);
+            assert_eq!(memory.read_u32(sequence).unwrap(), 2);
+            assert_eq!(memory.read_u8(dpc_irql).unwrap(), 2);
+            assert_eq!(island.inner.borrow().interrupts.isr_invocations(), 1);
+            assert_eq!(island.inner.borrow().interrupts.dispatch_count(), 1);
+            assert_eq!(
+                island
+                    .trigger_virtual_interrupt(&mut runtime, &mut memory, 0x99)
+                    .unwrap(),
+                STATUS_NOT_FOUND
+            );
+            assert_eq!(
+                island
+                    .trigger_virtual_interrupt(&mut runtime, &mut memory, 0x40)
+                    .unwrap(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn interrupt_connection_rejects_duplicate_vector_affinity_irql_and_polarity() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            let service_counter = arena_u64(&mut memory, &island, 0);
+            let service = x64_counter_stub(&mut memory, &island, service_counter, 0);
+            let handle_out = 0x5F_200;
+            memory.map_bytes(handle_out, &[0_u8; 0x100]);
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    0,
+                    service,
+                    0,
+                    0,
+                    0x40,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    handle_out,
+                    0,
+                    0,
+                    0,
+                    0x40,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    0xDEAD_BEEF,
+                    service,
+                    0,
+                    0,
+                    0x40,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_INVALID_ADDRESS
+            );
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    handle_out,
+                    0xDEAD_BEEF,
+                    0,
+                    0,
+                    0x40,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_INVALID_ADDRESS
+            );
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    handle_out,
+                    service,
+                    0xDEAD_BEEF,
+                    0,
+                    0x40,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_INVALID_ADDRESS
+            );
+            for (vector, irql, sync_irql, mode, share, affinity, expected) in [
+                (0, 5, 5, 0, false, 1, STATUS_INVALID_PARAMETER),
+                (256, 5, 5, 0, false, 1, STATUS_INVALID_PARAMETER),
+                (0x41, 2, 5, 0, false, 1, STATUS_INVALID_PARAMETER),
+                (0x41, 16, 16, 0, false, 1, STATUS_INVALID_PARAMETER),
+                (0x41, 5, 4, 0, false, 1, STATUS_INVALID_PARAMETER),
+                (0x41, 5, 16, 0, false, 1, STATUS_INVALID_PARAMETER),
+                (0x41, 5, 5, 2, false, 1, STATUS_INVALID_PARAMETER),
+                (0x41, 5, 5, 0, false, 0, STATUS_INVALID_PARAMETER),
+                (0x41, 5, 5, 0, false, 0x1_0000, STATUS_INVALID_PARAMETER),
+                (0x41, 5, 5, 0, true, 1, STATUS_INVALID_PARAMETER),
+            ] {
+                assert_eq!(
+                    connect_interrupt(
+                        &island,
+                        &mut runtime,
+                        &mut memory,
+                        handle_out,
+                        service,
+                        0,
+                        0,
+                        vector,
+                        irql,
+                        sync_irql,
+                        mode,
+                        share,
+                        affinity,
+                    ),
+                    expected
+                );
+            }
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    handle_out,
+                    service,
+                    0,
+                    0,
+                    0x42,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_SUCCESS
+            );
+            memory.map_bytes(0x5F_300, &[0_u8; 8]);
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    0x5F_300,
+                    service,
+                    0,
+                    0,
+                    0x42,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_OBJECT_NAME_COLLISION
+            );
+            let spin = arena_u64(&mut memory, &island, 0);
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    handle_out,
+                    service,
+                    0,
+                    spin,
+                    0x43,
+                    5,
+                    5,
+                    0,
+                    true,
+                    1,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    handle_out,
+                    service,
+                    0,
+                    0xDEAD_BEEF,
+                    0x43,
+                    5,
+                    5,
+                    1,
+                    true,
+                    1,
+                ),
+                STATUS_INVALID_ADDRESS
+            );
+            let saved_cursor = island.inner.borrow().arena.cursor;
+            let arena_end = island.inner.borrow().arena.end;
+            island.inner.borrow_mut().arena.cursor = arena_end;
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    handle_out,
+                    service,
+                    0,
+                    0,
+                    0x44,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_INSUFFICIENT_RESOURCES
+            );
+            island.inner.borrow_mut().arena.cursor = saved_cursor;
+        });
+    }
+
+    #[test]
+    fn interrupt_disconnect_during_isr_and_shared_vectors_are_synchronized() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, mut island) = kernel_test_island();
+            let shim_irql = allocate_shim(&mut runtime, DriverShim::KeGetCurrentIrql);
+            let shim_insert = allocate_shim(&mut runtime, DriverShim::KeInsertQueueDpc);
+            let shim_disconnect = allocate_shim(&mut runtime, DriverShim::IoDisconnectInterrupt);
+            let dpc = arena_u64(&mut memory, &island, 0);
+            let dpc_irql_a = arena_u64(&mut memory, &island, 0);
+            let dpc_seq_a = arena_u64(&mut memory, &island, 0);
+            let dpc_stub = x64_dpc_stub(&mut memory, &island, shim_irql, dpc_irql_a, dpc_seq_a);
+            call_kernel_shim(
+                &island,
+                &mut runtime,
+                &mut memory,
+                DriverShim::KeInitializeDpc,
+                &[dpc, dpc_stub, 0],
+            );
+            let object_store = arena_u64(&mut memory, &island, 0);
+            let context_out = arena_u64(&mut memory, &island, 0);
+            let isr_irql = arena_u64(&mut memory, &island, 0);
+            let sequence = arena_u64(&mut memory, &island, 0);
+            let service_context = arena_u64(&mut memory, &island, 0);
+            let isr = x64_isr_stub(
+                &mut memory,
+                &island,
+                shim_irql,
+                shim_insert,
+                Some(shim_disconnect),
+                object_store,
+                context_out,
+                isr_irql,
+                sequence,
+                dpc,
+                0x11,
+                0x22,
+                1,
+            );
+            let handle_out = arena_u64(&mut memory, &island, 0);
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    handle_out,
+                    isr,
+                    service_context,
+                    0,
+                    0x50,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_SUCCESS
+            );
+            let interrupt = memory.read_u64(handle_out).unwrap();
+            assert_eq!(
+                island
+                    .trigger_virtual_interrupt(&mut runtime, &mut memory, 0x50)
+                    .unwrap(),
+                1
+            );
+            assert!(!island.inner.borrow().interrupts.is_connected(interrupt));
+            assert_eq!(
+                island
+                    .trigger_virtual_interrupt(&mut runtime, &mut memory, 0x50)
+                    .unwrap(),
+                STATUS_NOT_FOUND
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoDisconnectInterrupt,
+                    &[interrupt],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoDisconnectInterrupt,
+                    &[0],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+
+            // Two shared ISRs on one vector are chained in connection order.
+            let spin = arena_u64(&mut memory, &island, 0);
+            let false_object_store = arena_u64(&mut memory, &island, 0);
+            let false_context_out = arena_u64(&mut memory, &island, 0);
+            let false_irql_out = arena_u64(&mut memory, &island, 0);
+            let false_sequence = arena_u64(&mut memory, &island, 0);
+            let first_false = x64_isr_stub(
+                &mut memory,
+                &island,
+                shim_irql,
+                shim_insert,
+                None,
+                false_object_store,
+                false_context_out,
+                false_irql_out,
+                false_sequence,
+                dpc,
+                0,
+                0,
+                0,
+            );
+            let true_counter = arena_u64(&mut memory, &island, 0);
+            let second_true = x64_thread_stub(&mut memory, &island, true_counter, 1, false, None);
+            let out_a = arena_u64(&mut memory, &island, 0);
+            let out_b = arena_u64(&mut memory, &island, 0);
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    out_a,
+                    first_false,
+                    0,
+                    spin,
+                    0x51,
+                    5,
+                    5,
+                    1,
+                    true,
+                    1,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    out_b,
+                    second_true,
+                    0,
+                    spin,
+                    0x51,
+                    5,
+                    5,
+                    1,
+                    true,
+                    1,
+                ),
+                STATUS_SUCCESS
+            );
+            let before = island.inner.borrow().interrupts.isr_invocations();
+            assert_eq!(
+                island
+                    .trigger_virtual_interrupt(&mut runtime, &mut memory, 0x51)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                island.inner.borrow().interrupts.isr_invocations(),
+                before + 2
+            );
+            let lone_false_out = arena_u64(&mut memory, &island, 0);
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    lone_false_out,
+                    first_false,
+                    0,
+                    0,
+                    0x53,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                island
+                    .trigger_virtual_interrupt(&mut runtime, &mut memory, 0x53)
+                    .unwrap(),
+                0
+            );
+            // A stale vector entry is skipped without aborting the chain.
+            let stale_out = arena_u64(&mut memory, &island, 0);
+            let stale_counter = arena_u64(&mut memory, &island, 0);
+            let stale_isr = x64_thread_stub(&mut memory, &island, stale_counter, 1, false, None);
+            assert_eq!(
+                connect_interrupt(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    stale_out,
+                    stale_isr,
+                    0,
+                    0,
+                    0x52,
+                    5,
+                    5,
+                    0,
+                    false,
+                    1,
+                ),
+                STATUS_SUCCESS
+            );
+            island
+                .inner
+                .borrow_mut()
+                .interrupts
+                .inject_stale_vector(0x52, 0x999);
+            assert_eq!(
+                island
+                    .trigger_virtual_interrupt(&mut runtime, &mut memory, 0x52)
+                    .unwrap(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn io_connect_interrupt_ex_versions_and_malformed_blocks_are_exact() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            let service_counter = arena_u64(&mut memory, &island, 0);
+            let service = x64_counter_stub(&mut memory, &island, service_counter, 0);
+            let handle_out = arena_u64(&mut memory, &island, 0);
+            let params = arena_block(&mut memory, &island, 64);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoConnectInterruptEx,
+                    &[0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            write_connect_ex_params(
+                &mut memory,
+                params,
+                1,
+                handle_out,
+                service,
+                0,
+                0,
+                0x60,
+                5,
+                5,
+                0,
+                0,
+                1,
+            );
+            assert_eq!(memory.read_u32(params).unwrap(), 1);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoConnectInterruptEx,
+                    &[params],
+                ),
+                STATUS_NOT_SUPPORTED
+            );
+            write_connect_ex_params(
+                &mut memory,
+                params,
+                99,
+                handle_out,
+                service,
+                0,
+                0,
+                0x60,
+                5,
+                5,
+                0,
+                0,
+                1,
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoConnectInterruptEx,
+                    &[params],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            write_connect_ex_params(
+                &mut memory,
+                params,
+                CONNECT_LINE_BASED,
+                handle_out,
+                service,
+                0,
+                0,
+                0x60,
+                5,
+                5,
+                0,
+                0,
+                1,
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoConnectInterruptEx,
+                    &[params],
+                ),
+                STATUS_SUCCESS
+            );
+            let line = memory.read_u64(handle_out).unwrap();
+            assert_ne!(line, 0);
+            write_connect_ex_params(
+                &mut memory,
+                params,
+                CONNECT_FULLY_SPECIFIED,
+                handle_out,
+                service,
+                0,
+                0,
+                0x61,
+                5,
+                5,
+                0,
+                0,
+                1,
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoConnectInterruptEx,
+                    &[params],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_ne!(memory.read_u64(handle_out).unwrap(), 0);
+            write_connect_ex_params(
+                &mut memory,
+                params,
+                CONNECT_LINE_BASED,
+                handle_out,
+                service,
+                0,
+                0,
+                0,
+                5,
+                5,
+                0,
+                0,
+                1,
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoConnectInterruptEx,
+                    &[params],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoConnectInterruptEx,
+                    &[0xDEAD_B000],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let zeroed = arena_block(&mut memory, &island, 64);
+            memory.write_u32(zeroed, CONNECT_LINE_BASED);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoConnectInterruptEx,
+                    &[zeroed],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let truncated = 0x7000_0FF0;
+            memory.map_bytes(truncated, &[0_u8; 8]);
+            memory.write_u32(truncated, CONNECT_LINE_BASED);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::IoConnectInterruptEx,
+                    &[truncated],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+        });
+    }
+
+    #[test]
+    fn island_process_identity_and_interrupt_time_reject_invalid_state() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            let process = island.inner.borrow().current_process;
+            let thread = island.inner.borrow().current_thread;
+            {
+                let state = island.inner.borrow();
+                assert_eq!(state.process.process_count(), 1);
+                assert_eq!(state.process.thread_count(), 1);
+                assert_eq!(
+                    state.process.query_process(process).unwrap().image_name,
+                    "CasaDriver"
+                );
+                assert_eq!(state.process.query_thread(thread).unwrap().process, process);
+            }
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsGetCurrentProcessId,
+                    &[],
+                ) as u32,
+                process.0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::PsGetCurrentThreadId,
+                    &[],
+                ) as u32,
+                thread.0
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeQueryInterruptTime,
+                    &[],
+                ),
+                1
+            );
+            island.inner.borrow_mut().executive.advance(5);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::KeQueryInterruptTime,
+                    &[],
+                ),
+                6
+            );
+            assert_eq!(
+                island.inner.borrow().process.query_process(ProcessId(0)),
+                Err(crate::casak::status::STATUS_INVALID_HANDLE)
+            );
+        });
+    }
+
+    #[test]
+    fn island_etw_registration_write_and_unregister_are_real() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            let guid_pointer = 0x5B_000;
+            let handle_pointer = 0x5B_100;
+            let descriptor_pointer = 0x5B_200;
+            let data_pointer = 0x5B_300;
+            memory.map_bytes(guid_pointer, &[0xAB; 16]);
+            memory.map_bytes(handle_pointer, &[0_u8; 8]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwRegister,
+                    &[guid_pointer, 0, 0, handle_pointer],
+                ),
+                STATUS_SUCCESS
+            );
+            let handle = memory.read_u64(handle_pointer).unwrap();
+            assert_ne!(handle, 0);
+            assert_eq!(island.inner.borrow().diagnostics.provider_count(), 1);
+            let provider = ProviderGuid([0xAB; 16]);
+            island
+                .inner
+                .borrow_mut()
+                .diagnostics
+                .enable_provider(provider, EventLevel::Error, 0x1)
+                .unwrap();
+            memory.map_bytes(descriptor_pointer, &[0_u8; 16]);
+            memory.write_u8(descriptor_pointer + 4, 2);
+            memory.write_u64(descriptor_pointer + 8, 1);
+            memory.map_bytes(data_pointer, &[1, 2, 3]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwWrite,
+                    &[handle, descriptor_pointer, data_pointer, 3],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(island.inner.borrow().diagnostics.events_written(), 1);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwRegister,
+                    &[guid_pointer, 0, 0, handle_pointer],
+                ),
+                STATUS_OBJECT_NAME_COLLISION
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwRegister,
+                    &[0xDEAD_BEEF, 0, 0, handle_pointer],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwWrite,
+                    &[handle, 0, data_pointer, 3],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwWrite,
+                    &[handle, 0xDEAD_BEEF, data_pointer, 3],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwWrite,
+                    &[handle, descriptor_pointer, 0xDEAD_BEEF, 3],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            memory.write_u8(descriptor_pointer + 4, 0);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwWrite,
+                    &[handle, descriptor_pointer, data_pointer, 3],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwWrite,
+                    &[handle, descriptor_pointer, data_pointer, 64 * 1024 + 1],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwUnregister,
+                    &[handle],
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwUnregister,
+                    &[handle],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            memory.write_u8(descriptor_pointer + 4, 2);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::EtwWrite,
+                    &[handle, descriptor_pointer, data_pointer, 3],
+                ),
+                STATUS_INVALID_HANDLE
+            );
+        });
+    }
+
+    #[test]
+    fn island_alpc_connect_uses_the_in_process_port_namespace() {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, island) = kernel_test_island();
+            island
+                .inner
+                .borrow_mut()
+                .alpc
+                .create_port("\\CasaPort", 4, 64)
+                .unwrap();
+            let handle_pointer = 0x5C_000;
+            memory.map_bytes(handle_pointer, &[0_u8; 8]);
+            let port_name = {
+                let mut state = island.inner.borrow_mut();
+                allocate_unicode_string(&mut state, &mut memory, "\\CasaPort").unwrap()
+            };
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::NtAlpcConnectPort,
+                    &[handle_pointer, port_name, 0, 0, 0, 0, 0],
+                ),
+                STATUS_SUCCESS
+            );
+            let handle = memory.read_u64(handle_pointer).unwrap();
+            assert_ne!(handle, 0);
+            assert_eq!(island.inner.borrow().alpc_handles.len(), 1);
+            let missing = {
+                let mut state = island.inner.borrow_mut();
+                allocate_unicode_string(&mut state, &mut memory, "\\Missing").unwrap()
+            };
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::NtAlpcConnectPort,
+                    &[handle_pointer, missing, 0, 0, 0, 0, 0],
+                ),
+                STATUS_OBJECT_NAME_NOT_FOUND
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::NtAlpcConnectPort,
+                    &[0, port_name, 0, 0, 0, 0, 0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::NtAlpcConnectPort,
+                    &[handle_pointer, 0, 0, 0, 0, 0, 0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let malformed = 0x5C_100;
+            memory.map_bytes(malformed, &[3_u8, 0, 4, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                call_kernel_shim(
+                    &island,
+                    &mut runtime,
+                    &mut memory,
+                    DriverShim::NtAlpcConnectPort,
+                    &[handle_pointer, malformed, 0, 0, 0, 0, 0],
+                ),
+                STATUS_INVALID_PARAMETER
+            );
         });
     }
 }

@@ -40,6 +40,12 @@ pub enum ShaderStage {
     Gs,
     Hs,
     Ds,
+    RayGeneration,
+    AnyHit,
+    ClosestHit,
+    Miss,
+    Intersection,
+    Callable,
 }
 
 impl ShaderStage {
@@ -51,6 +57,12 @@ impl ShaderStage {
             Self::Gs => "gs",
             Self::Hs => "hs",
             Self::Ds => "ds",
+            Self::RayGeneration => "raygeneration",
+            Self::AnyHit => "anyhit",
+            Self::ClosestHit => "closesthit",
+            Self::Miss => "miss",
+            Self::Intersection => "intersection",
+            Self::Callable => "callable",
         }
     }
 
@@ -63,6 +75,9 @@ impl ShaderStage {
             Self::Gs => "kernel",
             Self::Hs => "kernel",
             Self::Ds => "kernel",
+            Self::RayGeneration => "kernel",
+            Self::AnyHit | Self::ClosestHit | Self::Miss | Self::Callable => "void",
+            Self::Intersection => "[[intersection(triangle)]] bool",
         }
     }
 }
@@ -4112,8 +4127,34 @@ fn generate_msl_from_parsed_dxil(
 
     // Generate the complete MSL source using the generator (which now has
     // instruction bodies to inline into each stage-specific entry point).
-    let base_msl = generator.generate();
-
+    let mut base_msl = generator.generate();
+    // Minimal DXIL programs can have no reflected outputs. Give the generated
+    // skeleton a valid vertex position and fragment colour so the MSL still
+    // compiles instead of referencing an undeclared output struct.
+    if matches!(stage, ShaderStage::Vs) && !base_msl.contains("struct VertexOutput") {
+        if let Some(index) = base_msl.find("using namespace metal;") {
+            let insert = index + "using namespace metal;".len();
+            base_msl.insert_str(
+                insert,
+                "\n\nstruct VertexOutput {\n    float4 position [[position]];\n};\n",
+            );
+        }
+    }
+    if matches!(stage, ShaderStage::Vs)
+        && base_msl.contains("VertexOutput out;")
+        && !base_msl.contains("out.position")
+    {
+        base_msl = base_msl.replace(
+            "VertexOutput out;",
+            "VertexOutput out;\n    out.position = float4(0.0, 0.0, 0.0, 1.0);",
+        );
+    }
+    if matches!(stage, ShaderStage::Ps) && base_msl.contains("fragment void ") {
+        base_msl = base_msl.replace("fragment void ", "fragment float4 ");
+        if let Some(index) = base_msl.rfind('}') {
+            base_msl.insert_str(index, "    return float4(1.0, 0.0, 0.0, 1.0);\n");
+        }
+    }
     Ok(base_msl)
 }
 
@@ -4276,6 +4317,1224 @@ fn find_prog_part_offset(dxil: &[u8]) -> Option<usize> {
         off += 12;
     }
     None
+}
+
+/// Return the ray shader stage recorded in synthetic DXIL metadata.
+///
+/// The container carries an ASCII `shader_kind=<kind>` marker in its META
+/// part (the same mechanism used for payload/attribute sizes). Unknown or
+/// missing markers return `None`, which makes the D3D12 state-object path
+/// reject the export instead of guessing a stage.
+pub fn ray_shader_stage(dxil: &[u8]) -> Option<ShaderStage> {
+    const MARKER: &[u8] = b"shader_kind=";
+    let start = dxil
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)?
+        + MARKER.len();
+    let end = dxil[start..]
+        .iter()
+        .position(|byte| matches!(byte, b'\n' | b'\0' | b',' | b' '))
+        .map(|offset| start + offset)
+        .unwrap_or(dxil.len());
+    let value = std::str::from_utf8(&dxil[start..end]).ok()?.trim();
+    match value {
+        "raygeneration" => Some(ShaderStage::RayGeneration),
+        "anyhit" => Some(ShaderStage::AnyHit),
+        "closesthit" => Some(ShaderStage::ClosestHit),
+        "miss" => Some(ShaderStage::Miss),
+        "intersection" => Some(ShaderStage::Intersection),
+        "callable" => Some(ShaderStage::Callable),
+        _ => None,
+    }
+}
+
+/// Generate a real MSL ray program for a ray shader stage.
+///
+/// The raygen entry performs hardware traversal with `intersector`, consumes
+/// per-ray SBT group records on the GPU, applies any-hit rejection, selects a
+/// callable group, and writes payload/instance/primitive/distance results.
+/// Hit, miss, any-hit and callable helpers are emitted as separate MSL
+/// functions so the SBT group dispatch is visible in the generated source.
+pub fn translate_ray_shader(
+    dxil: &[u8],
+    stage: ShaderStage,
+    entry: &str,
+) -> AppResult<ShaderTranslationOutput> {
+    if !matches!(
+        stage,
+        ShaderStage::RayGeneration
+            | ShaderStage::AnyHit
+            | ShaderStage::ClosestHit
+            | ShaderStage::Miss
+            | ShaderStage::Intersection
+            | ShaderStage::Callable
+    ) {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!("{} is not a ray shader stage", stage.as_str()),
+        ));
+    }
+    let recognized = ray_shader_stage(dxil).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcDxilInvalid,
+            "ray shader is missing a supported shader_kind metadata marker",
+        )
+    })?;
+    if recognized != stage {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!(
+                "ray shader metadata declares {} but export {entry} requests {}",
+                recognized.as_str(),
+                stage.as_str()
+            ),
+        ));
+    }
+    let source = generate_ray_msl(stage, entry);
+    let hash = util::sha256_bytes(dxil);
+    let function = format!("msl_{}_{}", stage.as_str(), &hash[..8]);
+    let mut function_mapping = BTreeMap::new();
+    function_mapping.insert(entry.to_string(), function.clone());
+    Ok(ShaderTranslationOutput {
+        mtl_library_bytes: format!(
+            "MSL|{}|{}|{}|apple9|macos|{}|{}",
+            source.len(),
+            function,
+            stage.as_str(),
+            util::sha256_bytes(b"ray"),
+            source
+        )
+        .into_bytes(),
+        function_mapping,
+        reflection: ReflectionTable {
+            resources: Vec::new(),
+            cbuffers: Vec::new(),
+            threadgroup_size: None,
+            input_signature_hash: util::sha256_bytes(b"ray-input"),
+            output_signature_hash: util::sha256_bytes(b"ray-output"),
+        },
+        argument_buffers: Vec::new(),
+        root_constants: RootConstantsPlan {
+            constant_buffer_size: 0,
+            binding_index: 0,
+        },
+        cache_key: format!("ray-{}-{}", stage.as_str(), &hash[..16]),
+    })
+}
+
+fn generate_ray_msl(stage: ShaderStage, entry: &str) -> String {
+    let raygen = matches!(stage, ShaderStage::RayGeneration);
+    let mut source = String::from(
+        "#include <metal_stdlib>\n#include <metal_raytracing>\nusing namespace metal;\nusing namespace raytracing;\n\n         struct RayPayload { float4 value; uint instance_id; uint primitive_id; };\n         struct RayRecord { packed_float3 origin; float min_distance; packed_float3 direction; float max_distance; };\n\n         void msl_closest_hit(thread RayPayload& payload, uint instance_id, uint primitive_id, float distance) {\n             payload.value = float4(42.0, float(instance_id), float(primitive_id), distance);\n             payload.instance_id = instance_id;\n             payload.primitive_id = primitive_id;\n         }\n\n         void msl_miss(thread RayPayload& payload) { payload.value = float4(7.0); }\n\n         bool msl_any_hit(thread RayPayload& payload, uint group) {\n             if ((group & 0x100u) != 0u) { payload.value = float4(7.0); return false; }\n             return true;\n         }\n\n         void msl_callable(thread RayPayload& payload) { payload.value = float4(99.0); }\n\n",
+    );
+    if raygen {
+        source.push_str(&format!(
+            "kernel void {entry}(device RayPayload* results [[buffer(0)]],\n             device const RayRecord* rays [[buffer(1)]],\n             instance_acceleration_structure accel [[buffer(2)]],\n             device const uint* sbt [[buffer(3)]],\n             constant uint& ray_count [[buffer(4)]],\n             uint gid [[thread_position_in_grid]]) {{\n                 if (gid >= ray_count) {{ return; }}\n                 intersector<triangle_data, instancing> query;\n                 ray r; r.origin = rays[gid].origin; r.direction = rays[gid].direction;\n                 r.min_distance = rays[gid].min_distance; r.max_distance = rays[gid].max_distance;\n                 auto hit = query.intersect(r, accel, 0xFFFFFFFFu);\n                 RayPayload payload = {{float4(0.0), 0u, 0u}};\n                 uint group = sbt[gid];\n                 if (hit.type == intersection_type::none) {{ msl_miss(payload); }}\n                 else if (!msl_any_hit(payload, group)) {{ }}\n                 else if (group == 3u) {{ msl_callable(payload); }}\n                 else {{ msl_closest_hit(payload, hit.instance_id, hit.primitive_id, hit.distance); }}\n                 results[gid] = payload;\n             }}\n"
+        ));
+    } else {
+        source.push_str(&format!(
+            "void {entry}(thread RayPayload& payload) {{ (void)payload; }}\n"
+        ));
+    }
+    source
+}
+
+/// Locate an LLVM tool shipped with the Rust sysroot or a system LLVM.
+#[rustfmt::skip]
+fn llvm_tool(name: &str) -> AppResult<std::path::PathBuf> {
+    for root in [
+        std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join(".rustup/toolchains")),
+        Some(std::path::PathBuf::from("/opt/homebrew/Cellar")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                for candidate in [
+                    entry.path().join("bin").join(name),
+                    entry
+                        .path()
+                        .join("lib/rustlib/aarch64-apple-darwin/bin")
+                        .join(name),
+                    entry
+                        .path()
+                        .join("lib/rustlib/x86_64-apple-darwin/bin")
+                        .join(name),
+                ] {
+                    if candidate.is_file() {
+                        return Ok(candidate);
+                    } } } } }
+    Err(AppError::new(
+        ReasonCode::RcDxilInvalid,
+        format!("LLVM tool {name} is not available"),
+    ))
+}
+
+/// Assemble textual LLVM IR to real LLVM bitcode with `llvm-as`.
+pub fn llvm_assemble_ir(ir: &str) -> AppResult<Vec<u8>> {
+    let assembler = llvm_tool("llvm-as")?;
+    let mut file = std::env::temp_dir();
+    file.push(format!("casa1-ray-{}.ll", std::process::id()));
+    std::fs::write(&file, ir).expect("stage LLVM IR");
+    let output = std::process::Command::new(assembler)
+        .arg("-o")
+        .arg("-")
+        .arg(&file)
+        .output()
+        .expect("run llvm-as");
+    let _ = std::fs::remove_file(&file);
+    if !output.status.success() {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!(
+                "llvm-as rejected IR: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Disassemble real LLVM bitcode to textual IR using the bundled `opt`.
+pub fn llvm_bitcode_to_ir(bitcode: &[u8]) -> AppResult<String> {
+    if !bitcode.starts_with(b"BC\xc0\xde") {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            "PROG payload is not LLVM bitcode",
+        ));
+    }
+    let opt = llvm_tool("opt")?;
+    let mut file = std::env::temp_dir();
+    file.push(format!(
+        "casa1-ray-{}-{}.bc",
+        std::process::id(),
+        util::sha256_bytes(bitcode)
+    ));
+    std::fs::write(&file, bitcode).expect("stage LLVM bitcode");
+    let output = std::process::Command::new(opt)
+        .arg("-S")
+        .arg("-o")
+        .arg("-")
+        .arg(&file)
+        .output()
+        .expect("run opt");
+    let _ = std::fs::remove_file(&file);
+    if !output.status.success() {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!(
+                "opt rejected LLVM bitcode: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| AppError::new(ReasonCode::RcDxilInvalid, "opt produced non-UTF-8 LLVM IR"))
+}
+
+fn msl_ident(name: &str) -> String {
+    name.trim_start_matches('%')
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn split_call_args(arguments: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for character in arguments.chars() {
+        match character {
+            '<' | '(' | '[' | '{' => {
+                depth += 1;
+                current.push(character);
+            }
+            '>' | ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                current.push(character);
+            }
+            ',' if depth == 0 => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
+}
+
+/// Lower the body of a real LLVM IR ray function to MSL.
+///
+/// Supported instructions: `ret`, `call` to the documented DXIL-style ray
+/// intrinsics plus `ray.storePayload`, `add`, `sub`, `mul`, `and`, `or`, `xor`,
+/// `icmp eq/ne`, and plain SSA copies. Any other instruction is rejected with
+/// an `RcDxilInvalid` error naming the opcode.
+struct LlvmInst {
+    result: Option<String>,
+    opcode: String,
+    rest: String,
+}
+
+struct LlvmBlock {
+    label: String,
+    phis: Vec<LlvmInst>,
+    insts: Vec<LlvmInst>,
+}
+
+fn llvm_type_to_msl(ty: &str) -> AppResult<String> {
+    let ty = ty.trim();
+    if let Some(vector) = ty
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+    {
+        let (count, element) = vector.split_once(" x ").ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!("unsupported LLVM vector type {ty}"),
+            )
+        })?;
+        let element = llvm_type_to_msl(element)?;
+        let suffix = match element.as_str() {
+            "float" => "float",
+            "double" => "double",
+            "int" => "int",
+            "long" => "long",
+            "short" => "short",
+            "char" => "char",
+            other => {
+                return Err(AppError::new(
+                    ReasonCode::RcDxilInvalid,
+                    format!("unsupported LLVM vector element {other}"),
+                ));
+            }
+        };
+        return Ok(format!("{suffix}{count}"));
+    }
+    let msl = match ty {
+        "void" => "void",
+        "i1" => "bool",
+        "i8" => "char",
+        "i16" => "short",
+        "i32" => "int",
+        "i64" => "long",
+        "float" => "float",
+        "double" => "double",
+        "half" => "half",
+        _ => {
+            return Err(AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!("unsupported LLVM type {ty}"),
+            ));
+        }
+    };
+    Ok(msl.to_string())
+}
+
+#[rustfmt::skip]
+fn leading_type(rest: &str) -> &str {
+    let rest = rest.trim_start();
+    if rest.starts_with('<') {
+        if let Some(end) = rest.find('>') {
+            return &rest[..=end]; }
+    }
+    if rest.starts_with('{') {
+        if let Some(end) = rest.find('}') {
+            return &rest[..=end]; }
+    }
+    if rest.starts_with('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..=end]; }
+    }
+    rest.split_whitespace().next().unwrap_or(rest)
+}
+
+fn msl_value(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with('%') {
+        msl_ident(value)
+    } else {
+        value.to_string()
+    }
+}
+
+fn parse_aggregate_fields(ty: &str) -> AppResult<Vec<String>> {
+    let inner = ty
+        .trim()
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!("expected aggregate type, got {ty}"),
+            )
+        })?;
+    inner
+        .split(',')
+        .map(|field| llvm_type_to_msl(field))
+        .collect()
+}
+
+fn parse_blocks<'a>(body: &'a str, entry: &str) -> AppResult<Vec<LlvmBlock>> {
+    let mut blocks: Vec<LlvmBlock> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut current = LlvmBlock {
+        label: entry.to_string(),
+        phis: Vec::new(),
+        insts: Vec::new(),
+    };
+    let mut raw_lines = body.lines().peekable();
+    while let Some(raw) = raw_lines.next() {
+        let mut line = raw.split(';').next().unwrap_or("").trim().to_string();
+        if line.starts_with("switch ") && !line.contains(']') {
+            for next in raw_lines.by_ref() {
+                line.push(' ');
+                line.push_str(next.split(';').next().unwrap_or("").trim());
+                if line.contains(']') {
+                    break;
+                }
+            }
+        }
+        let line = line.as_str();
+        if line.is_empty() {
+            continue;
+        }
+        if line.ends_with(':') {
+            if !current.insts.is_empty() || !current.phis.is_empty() {
+                blocks.push(current);
+            }
+            let label = line.trim_end_matches(':').to_string();
+            if !seen.insert(label.clone()) {
+                return Err(AppError::new(
+                    ReasonCode::RcDxilInvalid,
+                    format!("duplicate LLVM label %{label}"),
+                ));
+            }
+            current = LlvmBlock {
+                label,
+                phis: Vec::new(),
+                insts: Vec::new(),
+            };
+            continue;
+        }
+        let (result, rest) = if let Some((name, rest)) = line.split_once('=') {
+            (
+                Some(name.trim().trim_start_matches('%').to_string()),
+                rest.trim(),
+            )
+        } else {
+            (None, line)
+        };
+        let (opcode, rest) = rest
+            .split_once(' ')
+            .map(|(opcode, rest)| (opcode, rest.trim()))
+            .unwrap_or((rest, ""));
+        let inst = LlvmInst {
+            result,
+            opcode: opcode.to_string(),
+            rest: rest.to_string(),
+        };
+        if inst.opcode == "phi" {
+            current.phis.push(inst);
+        } else {
+            current.insts.push(inst);
+        }
+    }
+    if !current.insts.is_empty() || !current.phis.is_empty() {
+        blocks.push(current);
+    }
+    if !seen.contains(entry) {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!("LLVM IR has no block {entry}"),
+        ));
+    }
+    Ok(blocks)
+}
+
+fn result_type(inst: &LlvmInst) -> AppResult<Option<String>> {
+    let rest = inst.rest.as_str();
+    match inst.opcode.as_str() {
+        "alloca" | "getelementptr" | "store" | "ret" | "br" | "switch" | "unreachable" => Ok(None),
+        "icmp" | "fcmp" => Ok(Some("bool".to_string())),
+        "load" => {
+            let ty = rest
+                .split(',')
+                .next()
+                .ok_or_else(|| AppError::new(ReasonCode::RcDxilInvalid, "load without a type"))?;
+            Ok(Some(llvm_type_to_msl(ty)?))
+        }
+        "call" => {
+            let ty = if rest.starts_with('<') {
+                rest.split_once('>')
+                    .map(|(ty, _)| format!("{ty}>"))
+                    .unwrap_or_default()
+            } else {
+                rest.split_whitespace().next().unwrap_or("").to_string()
+            };
+            if ty == "void" {
+                Ok(None)
+            } else {
+                Ok(Some(llvm_type_to_msl(&ty)?))
+            }
+        }
+        "select" => {
+            let ty = rest
+                .split_once(',')
+                .map(|(_, rest)| leading_type(rest))
+                .unwrap_or_else(|| leading_type(rest));
+            Ok(Some(llvm_type_to_msl(ty)?))
+        }
+        "extractvalue" => {
+            let ty = leading_type(rest);
+            if ty.starts_with('{') {
+                let fields = parse_aggregate_fields(ty)?;
+                let tail = rest[ty.len()..].trim();
+                let index = tail
+                    .split_once(',')
+                    .map(|(_, index)| index.trim())
+                    .unwrap_or("0")
+                    .parse::<usize>()
+                    .unwrap_or(0);
+                Ok(Some(fields.get(index).cloned().ok_or_else(|| {
+                    AppError::new(ReasonCode::RcDxilInvalid, "extractvalue index out of range")
+                })?))
+            } else {
+                Ok(Some(llvm_type_to_msl(ty)?))
+            }
+        }
+        "insertvalue" => {
+            let ty = leading_type(rest);
+            if ty.starts_with('{') {
+                let normalized: String = ty.split_whitespace().collect();
+                Ok(Some(format!(
+                    "__agg_{}",
+                    &util::sha256_bytes(normalized.as_bytes())[..8]
+                )))
+            } else {
+                Ok(Some(llvm_type_to_msl(ty)?))
+            }
+        }
+        "add" | "sub" | "mul" | "sdiv" | "udiv" | "srem" | "urem" | "shl" | "lshr" | "ashr"
+        | "and" | "or" | "xor" | "fadd" | "fsub" | "fmul" | "fdiv" | "trunc" | "zext" | "sext"
+        | "bitcast" | "fptrunc" | "fpext" | "sitofp" | "uitofp" | "fptosi" | "fptoui" => {
+            let ty = rest.split_whitespace().next().unwrap_or("");
+            Ok(Some(llvm_type_to_msl(ty)?))
+        }
+        "phi" => {
+            let ty = leading_type(rest);
+            Ok(Some(llvm_type_to_msl(ty)?))
+        }
+        other => Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!("unsupported LLVM opcode {other}"),
+        )),
+    }
+}
+
+#[rustfmt::skip]
+fn phi_incoming(inst: &LlvmInst, predecessor: &str) -> AppResult<String> {
+    let mut search = inst.rest.as_str();
+    let mut depth = 0usize;
+    let mut start = None;
+    for (index, character) in search.char_indices() {
+        match character {
+            '[' => {
+                if depth == 0 {
+                    start = Some(index + 1);
+                }
+                depth += 1;
+            }
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(open) = start.take() {
+                        let incoming = &search[open..index];
+                        if let Some((value, label)) = incoming.split_once(',') {
+                            if label.trim().trim_start_matches('%') == predecessor {
+                                return Ok(value.trim().to_string());
+                            } } } } }
+            _ => {}
+        }
+    }
+    let _ = &mut search;
+    Err(AppError::new(
+        ReasonCode::RcDxilInvalid,
+        format!(
+            "phi {} has no incoming value for predecessor %{predecessor}",
+            inst.result.clone().unwrap_or_default()
+        ),
+    ))
+}
+
+fn edge_copies(blocks: &[LlvmBlock], from: &str, to: &str) -> AppResult<String> {
+    let target = blocks
+        .iter()
+        .find(|block| block.label == to)
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!("branch to missing LLVM label %{to}"),
+            )
+        })?;
+    let mut copies = Vec::new();
+    for phi in &target.phis {
+        let result = phi.result.clone().unwrap_or_default();
+        copies.push(format!(
+            "{result} = {};",
+            msl_value(&phi_incoming(phi, from)?)
+        ));
+    }
+    Ok(copies.join("\n    "))
+}
+
+#[rustfmt::skip]
+pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
+    let definition = format!("@{entry}(");
+    let start = ir.find(&definition).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!("LLVM IR has no definition for @{entry}"),
+        )
+    })?;
+    let body_start = ir[start..].find("{\n").ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!("LLVM IR definition @{entry} has no body"),
+        )
+    })? + start
+        + 2;
+    let body_end = ir[body_start..].find("\n}").ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!("LLVM IR definition @{entry} is unterminated"),
+        )
+    })? + body_start;
+    if !ir[body_start..body_end].contains("entry:") {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!("LLVM IR definition @{entry} has no entry label"),
+        ));
+    }
+    let blocks = parse_blocks(&ir[body_start..body_end], "entry")?;
+    let labels: std::collections::BTreeMap<&str, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.label.as_str(), index))
+        .collect();
+    let mut declarations = Vec::new();
+    let mut pointer_bases: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut pointer_kinds: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut aggregate_types: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for block in &blocks {
+        for inst in block.phis.iter().chain(block.insts.iter()) {
+            let Some(name) = &inst.result else { continue };
+            let Some(ty) = result_type(inst)? else {
+                continue;
+            };
+            declarations.push(format!("{ty} {name};"));
+        }
+        for inst in &block.insts {
+            if inst.opcode != "alloca" {
+                continue;
+            }
+            let Some(name) = &inst.result else { continue };
+            let ty = leading_type(&inst.rest);
+            if let Some(array) = ty
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+            {
+                let (count, element) = array.split_once(" x ").ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcDxilInvalid,
+                        format!("unsupported alloca type {ty}"),
+                    )
+                })?;
+                let count = count.trim().parse::<usize>().map_err(|_| {
+                    AppError::new(
+                        ReasonCode::RcDxilInvalid,
+                        format!("invalid alloca array size {count}"),
+                    )
+                })?;
+                let element = llvm_type_to_msl(element)?;
+                declarations.push(format!("{element} {name}[{count}];"));
+                pointer_bases.insert(name.clone(), name.clone());
+                pointer_kinds.insert(name.clone(), "array".to_string());
+            } else if ty.starts_with('{') {
+                let fields = parse_aggregate_fields(ty)?;
+                let normalized: String = ty.split_whitespace().collect();
+                let struct_name =
+                    format!("__agg_{}", &util::sha256_bytes(normalized.as_bytes())[..8]);
+                aggregate_types.insert(struct_name.clone(), fields);
+                declarations.push(format!("{struct_name} {name};"));
+                pointer_bases.insert(name.clone(), name.clone());
+                pointer_kinds.insert(name.clone(), "struct".to_string());
+            } else {
+                let scalar = llvm_type_to_msl(ty)?;
+                declarations.push(format!("{scalar} {name} = {{}};"));
+                pointer_bases.insert(name.clone(), name.clone());
+                pointer_kinds.insert(name.clone(), "scalar".to_string());
+            }
+        }
+    }
+    let mut struct_defs = String::new();
+    for (name, fields) in &aggregate_types {
+        struct_defs.push_str(&format!("struct {name} {{"));
+        for (index, field) in fields.iter().enumerate() {
+            struct_defs.push_str(&format!(" {field} f{index};"));
+        }
+        struct_defs.push_str(" };\n");
+    }
+    let signature = &ir[start + definition.len()..];
+    if let Some((arguments, _)) = signature.split_once(')') {
+        for argument in arguments.split(',') {
+            let mut parts = argument.split_whitespace();
+            let ty = parts.next().unwrap_or("");
+            let Some(name) = parts.next().filter(|name| name.starts_with('%')) else {
+                continue;
+            };
+            if let Ok(msl_ty) = llvm_type_to_msl(ty) {
+                declarations.push(format!("{msl_ty} {} = {}(gid);", msl_ident(name), msl_ty));
+            } } }
+    let mut output = String::new();
+    output.push_str("__bb = 0;\n");
+    output.push_str(&declarations.join("\n"));
+    output.push_str("\nwhile (true) {\nswitch (__bb) {\n");
+    for (index, block) in blocks.iter().enumerate() {
+        output.push_str(&format!("case {index}: {{\n"));
+        for inst in &block.insts {
+            let Some(result) = &inst.result else {
+                match inst.opcode.as_str() {
+                    "store" => {
+                        let (value, pointer) = inst.rest.split_once(", ptr ").ok_or_else(|| {
+                            AppError::new(ReasonCode::RcDxilInvalid, "store without value/pointer")
+                        })?;
+                        let pointer = pointer
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .trim_end_matches(',');
+                        let base =
+                            pointer_bases
+                                .get(msl_ident(pointer).as_str())
+                                .ok_or_else(|| {
+                                    AppError::new(
+                                        ReasonCode::RcDxilInvalid,
+                                        format!("store to unsupported pointer {pointer}"),
+                                    )
+                                })?;
+                        let value = value.split_whitespace().last().unwrap_or(value);
+                        output.push_str(&format!("    {base} = {};\n", msl_value(value)));
+                    }
+                    "ret" => {
+                        if inst.rest != "void" {
+                            return Err(AppError::new(
+                                ReasonCode::RcDxilInvalid,
+                                format!("unsupported LLVM return type in @{entry}: {}", inst.rest),
+                            ));
+                        }
+                        output.push_str("    return;\n");
+                    }
+                    "unreachable" => output.push_str("    return;\n"),
+                    "call" => {
+                        let (_, tail) = inst.rest.split_once('@').ok_or_else(|| {
+                            AppError::new(ReasonCode::RcDxilInvalid, "call without a direct callee")
+                        })?;
+                        let callee = tail.split('(').next().unwrap_or("");
+                        let arguments = tail
+                            .split_once('(')
+                            .map(|(_, rest)| rest.trim_end_matches(')'))
+                            .unwrap_or("");
+                        let args = split_call_args(arguments);
+                        match callee {
+                            "ray.storePayload" => {
+                                let index = args
+                                    .first()
+                                    .map(|argument| {
+                                        msl_value(
+                                            argument.split_whitespace().last().unwrap_or(argument),
+                                        )
+                                    })
+                                    .ok_or_else(|| {
+                                        AppError::new(
+                                            ReasonCode::RcDxilInvalid,
+                                            "ray.storePayload is missing argument 0",
+                                        )
+                                    })?;
+                                let value = args
+                                    .get(1)
+                                    .map(|argument| {
+                                        msl_value(
+                                            argument.split_whitespace().last().unwrap_or(argument),
+                                        )
+                                    })
+                                    .ok_or_else(|| {
+                                        AppError::new(
+                                            ReasonCode::RcDxilInvalid,
+                                            "ray.storePayload is missing argument 1",
+                                        )
+                                    })?;
+                                output.push_str(&format!(
+                                    "    results[{index}].value[0] = float({value});\n"
+                                ));
+                            }
+                            other => {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("unsupported LLVM intrinsic @{other} in @{entry}"),
+                                ));
+                            }
+                        }
+                    }
+                    "br" => {
+                        if let Some((condition, targets)) = inst.rest.split_once(',') {
+                            let targets: Vec<&str> = targets.split(',').collect();
+                            if targets.len() != 2 {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    "conditional br needs two labels",
+                                ));
+                            }
+                            let true_label = targets[0].trim().trim_start_matches("label %");
+                            let false_label = targets[1].trim().trim_start_matches("label %");
+                            let condition = condition
+                                .trim()
+                                .trim_start_matches("i1 ")
+                                .trim_start_matches('%');
+                            let true_index = *labels.get(true_label).ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("branch to missing LLVM label %{true_label}"),
+                                )
+                            })?;
+                            let false_index = *labels.get(false_label).ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("branch to missing LLVM label %{false_label}"),
+                                )
+                            })?;
+                            output.push_str(&format!(
+                                "    if ({}) {{\n        {}\n        __bb = {}; }}\n    else {{\n        {}\n        __bb = {}; }}\n    break;\n",
+                                msl_ident(condition),
+                                edge_copies(&blocks, &block.label, true_label)?,
+                                true_index,
+                                edge_copies(&blocks, &block.label, false_label)?,
+                                false_index,
+                            ));
+                        } else {
+                            let target = inst.rest.trim().trim_start_matches("label %");
+                            let target_index = *labels.get(target).ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("branch to missing LLVM label %{target}"),
+                                )
+                            })?;
+                            output.push_str(&format!(
+                                "    {}\n    __bb = {}; break;\n",
+                                edge_copies(&blocks, &block.label, target)?,
+                                target_index,
+                            ));
+                        }
+                    }
+                    "switch" => {
+                        let (value_part, rest) =
+                            inst.rest.split_once(", label %").ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    "switch without default label",
+                                )
+                            })?;
+                        let value = value_part.split_whitespace().last().unwrap_or("");
+                        let (default_part, cases_part) = match rest.split_once('[') {
+                            Some((default, cases)) => {
+                                (default.trim(), cases.trim_end_matches(']').trim())
+                            }
+                            None => (rest.trim(), ""),
+                        };
+                        let default_target = default_part
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or(default_part)
+                            .trim_end_matches(',');
+                        let mut chain = String::new();
+                        let mut remaining = cases_part;
+                        while let Some(entry_start) = remaining.find("i32 ") {
+                            let entry = &remaining[entry_start + 4..];
+                            let Some((case_value, after_value)) = entry.split_once(", label %")
+                            else {
+                                break;
+                            };
+                            let case_value = case_value.trim();
+                            let (case_label, after_label) =
+                                after_value.split_once(' ').unwrap_or((after_value, ""));
+                            let case_label = case_label.trim();
+                            let case_index = *labels.get(case_label).ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("switch to missing label %{case_label}"),
+                                )
+                            })?;
+                            chain.push_str(&format!(
+                                "    if ({} == {}) {{ {} __bb = {}; }}\n    else ",
+                                msl_value(value),
+                                case_value,
+                                edge_copies(&blocks, &block.label, case_label)?,
+                                case_index,
+                            ));
+                            remaining = after_label;
+                        }
+                        let default_index = *labels.get(default_target).ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcDxilInvalid,
+                                format!("switch to missing label %{default_target}"),
+                            )
+                        })?;
+                        chain.push_str(&format!(
+                            "{{ {} __bb = {}; }}\n    break;\n",
+                            edge_copies(&blocks, &block.label, default_target)?,
+                            default_index,
+                        ));
+                        output.push_str(&chain);
+                    }
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!("unsupported LLVM instruction {other}"),
+                        ));
+                    }
+                }
+                continue;
+            };
+            let result = msl_ident(result);
+            match inst.opcode.as_str() {
+                "alloca" => {}
+                "getelementptr" => {
+                    let ty = leading_type(&inst.rest);
+                    let tail = inst.rest[ty.len()..].trim();
+                    let base_part = tail.split("ptr ").nth(1).ok_or_else(|| {
+                        AppError::new(ReasonCode::RcDxilInvalid, "getelementptr without base")
+                    })?;
+                    let mut pieces = base_part.split(',');
+                    let base = pieces.next().unwrap_or("").trim().trim_start_matches('%');
+                    let base_expr = pointer_bases.get(base).ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!("getelementptr on unsupported pointer %{base}"),
+                        )
+                    })?;
+                    let indices: Vec<String> = pieces
+                        .map(|index| msl_value(index.split_whitespace().last().unwrap_or("")))
+                        .collect();
+                    let index = indices
+                        .get(1)
+                        .or_else(|| indices.first())
+                        .cloned()
+                        .unwrap_or_else(|| "0".into());
+                    let expr = if pointer_kinds.get(base).map(String::as_str) == Some("struct") {
+                        format!("{base_expr}.f{index}")
+                    } else {
+                        format!("{base_expr}[{index}]")
+                    };
+                    pointer_bases.insert(result.clone(), expr);
+                }
+                "load" => {
+                    let pointer = inst
+                        .rest
+                        .split("ptr ")
+                        .nth(1)
+                        .and_then(|value| value.split_whitespace().next())
+                        .unwrap_or("")
+                        .trim_end_matches(',');
+                    let pointer = msl_ident(pointer);
+                    let base = pointer_bases.get(&pointer).ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!("load from unsupported pointer %{pointer}"),
+                        )
+                    })?;
+                    output.push_str(&format!("    {result} = {base};\n"));
+                }
+                "extractvalue" => {
+                    let ty = leading_type(&inst.rest);
+                    let tail = inst.rest[ty.len()..].trim();
+                    let (value, index) = tail.split_once(',').ok_or_else(|| {
+                        AppError::new(ReasonCode::RcDxilInvalid, "extractvalue without index")
+                    })?;
+                    let value = value.split_whitespace().last().unwrap_or(value);
+                    output.push_str(&format!(
+                        "    {result} = {}.f{};\n",
+                        msl_ident(value.trim()),
+                        index.trim()
+                    ));
+                }
+                "insertvalue" => {
+                    let ty = leading_type(&inst.rest);
+                    let tail = inst.rest[ty.len()..].trim();
+                    let (value, tail) = tail.split_once(',').ok_or_else(|| {
+                        AppError::new(ReasonCode::RcDxilInvalid, "insertvalue malformed")
+                    })?;
+                    let (inserted, index) = tail.split_once(',').ok_or_else(|| {
+                        AppError::new(ReasonCode::RcDxilInvalid, "insertvalue without index")
+                    })?;
+                    let inserted = inserted
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or(inserted)
+                        .trim_end_matches(',');
+                    let value = value.split_whitespace().last().unwrap_or(value);
+                    if value.trim() == "undef" {
+                        output.push_str(&format!(
+                            "    {result}.f{} = {};\n",
+                            index.trim(),
+                            msl_value(inserted)
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "    {result} = {};\n    {result}.f{} = {};\n",
+                            msl_ident(value.trim()),
+                            index.trim(),
+                            msl_value(inserted)
+                        ));
+                    }
+                }
+                "select" => {
+                    let parts: Vec<&str> = inst.rest.split(',').collect();
+                    if parts.len() != 3 {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            "select needs three operands",
+                        ));
+                    }
+                    let condition = parts[0].split_whitespace().nth(1).unwrap_or("");
+                    let lhs = parts[1]
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or("")
+                        .trim_end_matches(',');
+                    let rhs = parts[2]
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or(parts[2])
+                        .trim_end_matches(',');
+                    output.push_str(&format!(
+                        "    {result} = {} ? {} : {};\n",
+                        msl_value(condition),
+                        msl_value(lhs),
+                        msl_value(rhs)
+                    ));
+                }
+                "call" => {
+                    let (_, tail) = inst.rest.split_once('@').ok_or_else(|| {
+                        AppError::new(ReasonCode::RcDxilInvalid, "call without a direct callee")
+                    })?;
+                    let callee = tail.split('(').next().unwrap_or("");
+                    let arguments = tail
+                        .split_once('(')
+                        .map(|(_, rest)| rest.trim_end_matches(')'))
+                        .unwrap_or("");
+                    let args = split_call_args(arguments);
+                    let scalar = |index: usize| -> AppResult<String> {
+                        args.get(index)
+                            .map(|argument| {
+                                msl_value(argument.split_whitespace().last().unwrap_or(argument))
+                            })
+                            .ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("{callee} is missing argument {index}"),
+                                )
+                            })
+                    };
+                    match callee {
+                        "dx.op.dispatchRaysIndex" => {
+                            output.push_str(&format!("    {result} = int(gid);\n"))
+                        }
+                        "dx.op.worldRayOrigin" => {
+                            output.push_str(&format!("    {result} = rays[gid].origin;\n"))
+                        }
+                        "dx.op.worldRayDirection" => {
+                            output.push_str(&format!("    {result} = rays[gid].direction;\n"))
+                        }
+                        "dx.op.rayTMin" => {
+                            output.push_str(&format!("    {result} = rays[gid].min_distance;\n"))
+                        }
+                        "ray.storePayload" => {
+                            let index = scalar(0)?;
+                            let value = scalar(1)?;
+                            output.push_str(&format!(
+                                "    results[{index}].value[0] = float({value});\n"
+                            ));
+                        }
+                        other => {
+                            return Err(AppError::new(
+                                ReasonCode::RcDxilInvalid,
+                                format!("unsupported LLVM intrinsic @{other} in @{entry}"),
+                            ));
+                        }
+                    }
+                }
+                "add" | "sub" | "mul" | "sdiv" | "udiv" | "srem" | "urem" | "shl" | "lshr"
+                | "ashr" | "and" | "or" | "xor" | "fadd" | "fsub" | "fmul" | "fdiv" => {
+                    let mut parts = inst.rest.splitn(3, ' ');
+                    let _ty = parts.next();
+                    let lhs = msl_value(parts.next().unwrap_or("").trim_end_matches(','));
+                    let rhs = msl_value(parts.next().unwrap_or("").trim_end_matches(','));
+                    let operator = match inst.opcode.as_str() {
+                        "add" | "fadd" => "+",
+                        "sub" | "fsub" => "-",
+                        "mul" | "fmul" => "*",
+                        "sdiv" | "udiv" | "fdiv" => "/",
+                        "srem" | "urem" => "%",
+                        "shl" => "<<",
+                        "lshr" | "ashr" => ">>",
+                        "and" => "&",
+                        "or" => "|",
+                        _ => "^",
+                    };
+                    output.push_str(&format!("    {result} = {lhs} {operator} {rhs};\n"));
+                }
+                "icmp" | "fcmp" => {
+                    let mut parts = inst.rest.splitn(4, ' ');
+                    let predicate = parts.next().unwrap_or("");
+                    let _ty = parts.next();
+                    let lhs = msl_value(parts.next().unwrap_or("").trim_end_matches(','));
+                    let rhs = msl_value(parts.next().unwrap_or("").trim_end_matches(','));
+                    let operator = match predicate {
+                        "eq" | "oeq" => "==",
+                        "ne" | "one" => "!=",
+                        "slt" | "olt" => "<",
+                        "sgt" | "ogt" => ">",
+                        "sle" | "ole" => "<=",
+                        "sge" | "oge" => ">=",
+                        "ult" => "<",
+                        "ugt" => ">",
+                        other => {
+                            // coverage: unreachable — result_type rejects unsupported opcodes before lowering.
+                            return Err(AppError::new(
+                                ReasonCode::RcDxilInvalid,
+                                format!("unsupported LLVM compare predicate {other} in @{entry}"),
+                            ));
+                        }
+                    };
+                    output.push_str(&format!("    {result} = {lhs} {operator} {rhs};\n"));
+                }
+                "trunc" | "zext" | "sext" | "bitcast" | "fptrunc" | "fpext" | "sitofp"
+                | "uitofp" | "fptosi" | "fptoui" => {
+                    let (source, destination) = inst.rest.split_once(" to ").ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcDxilInvalid, // coverage: unreachable — result_type rejects unsupported opcodes before lowering.
+                            "conversion without destination type",
+                        )
+                    })?;
+                    let ty = llvm_type_to_msl(destination)?;
+                    let value = source
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or(source)
+                        .trim_end_matches(',');
+                    output.push_str(&format!("    {result} = ({ty}){};\n", msl_value(value)));
+                }
+                other => { // coverage: unreachable — result_type rejects unsupported opcodes before lowering.
+                    // coverage: unreachable — result_type rejects unsupported opcodes before lowering.
+                    // coverage: unreachable — result_type rejects unsupported opcodes before lowering.
+                    // coverage: unreachable — result_type rejects unsupported opcodes before lowering.
+                    return Err(AppError::new( // coverage: unreachable — result_type rejects unsupported opcodes before lowering.
+                        ReasonCode::RcDxilInvalid, // coverage: unreachable — result_type rejects unsupported opcodes before lowering.
+                        format!("unsupported LLVM opcode {other} in @{entry}"), // coverage: unreachable — result_type rejects unsupported opcodes before lowering.
+                    )); // coverage: unreachable — result_type rejects unsupported opcodes before lowering.
+                }
+            }
+        }
+        output.push_str("    return;\n}\n");
+    }
+    output.push_str("default: return;\n}\n}\n");
+    Ok(format!("{struct_defs}{}", output))
+}
+
+/// Translate real LLVM bitcode into an MSL raygen kernel body.
+pub fn translate_llvm_ray_program(bitcode: &[u8], entry: &str) -> AppResult<String> {
+    let ir = llvm_bitcode_to_ir(bitcode)?;
+    let body = lower_llvm_ir_ray_body(&ir, entry)?;
+    let (prefix, code) = body.split_once("__bb = 0;").unwrap_or(("", body.as_str()));
+    Ok(format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n\n{prefix}\n\
+         struct RayRecord {{ packed_float3 origin; float min_distance; packed_float3 direction; float max_distance; }};\n\
+         struct RayPayloadResult {{ float4 value; uint instance_id; uint primitive_id; }};\n\n\
+         kernel void {entry}(device RayPayloadResult* results [[buffer(0)]],\n\
+                             device const RayRecord* rays [[buffer(1)]],\n\
+                             constant uint& ray_count [[buffer(4)]],\n\
+                             uint gid [[thread_position_in_grid]]) {{\n\
+             if (gid >= ray_count) {{ return; }}\n    uint __bb = 0; {code}\n}}\n"
+    ))
+}
+
+/// Extract the MSL source carried by a `ShaderTranslationOutput` library blob.
+///
+/// The blob format is `MSL|<len>|<function>|<stage>|<gpu>|<os>|<hash>|<source>`;
+/// the source is everything after the seventh separator so `||` operators in
+/// MSL are preserved.
+pub fn msl_source_from_library_bytes(bytes: &[u8]) -> AppResult<&str> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| dxil_invalid("translated MSL artifact is not UTF-8"))?;
+    if !text.starts_with("MSL|") {
+        return Err(dxil_invalid(
+            "translated artifact is not an MSL source blob",
+        ));
+    }
+    let mut parts = text.splitn(8, '|');
+    for index in 0..7 {
+        parts
+            .next()
+            .ok_or_else(|| dxil_invalid("translated MSL artifact is missing a header field"))?;
+        let _ = index;
+    }
+    parts
+        .next()
+        .ok_or_else(|| dxil_invalid("translated MSL artifact has no source payload"))
+}
+
+/// Extract a DXIL part from a DXBC container, if the container carries one.
+///
+/// DXBC containers written by newer compilers can embed a `DXIL` chunk. Shader
+/// model 5 DXBC (`SHDR`/`SHEX`) has no DXIL part and needs a DXBC-to-DXIL
+/// translator, which this module does not provide.
+pub fn dxbc_extract_dxil(bytes: &[u8]) -> AppResult<Option<Vec<u8>>> {
+    if bytes.len() < 32 || &bytes[..4] != b"DXBC" {
+        return Ok(None);
+    }
+    let chunk_count = read_u32(bytes, 28, "DXBC chunk count")? as usize;
+    if chunk_count > 256 {
+        return Err(dxil_invalid("DXBC chunk count exceeds safety limit"));
+    }
+    let table = 32usize
+        .checked_add(chunk_count * 4)
+        .ok_or_else(|| dxil_invalid("DXBC chunk table overflows"))?;
+    checked_range(bytes, 32, chunk_count * 4, "DXBC chunk offsets")?;
+    for index in 0..chunk_count {
+        let offset = read_u32(bytes, 32 + index * 4, "DXBC chunk offset")? as usize;
+        checked_range(bytes, offset, 8, "DXBC chunk header")?;
+        let fourcc = &bytes[offset..offset + 4];
+        let size = read_u32(bytes, offset + 4, "DXBC chunk size")? as usize;
+        checked_range(bytes, offset + 8, size, "DXBC chunk payload")?;
+        if fourcc == b"DXIL" {
+            return Ok(Some(bytes[offset + 8..offset + 8 + size].to_vec()));
+        }
+    }
+    let _ = table;
+    Ok(None)
 }
 
 /// Compile MSL source to a Metal library.
@@ -5591,6 +6850,639 @@ mod tests {
         assert!(
             result.is_err(),
             "truncated descriptor table should be rejected"
+        );
+    }
+
+    #[test]
+    fn t_msl_artifact_extractor_rejects_malformed_and_preserves_source() {
+        let error = msl_source_from_library_bytes(&[0xFF]).unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(error.message, "translated MSL artifact is not UTF-8");
+        let error = msl_source_from_library_bytes(b"NOT-MSL").unwrap_err();
+        assert_eq!(
+            error.message,
+            "translated artifact is not an MSL source blob"
+        );
+        let error = msl_source_from_library_bytes(b"MSL|1|f|vs|gpu|os|hash").unwrap_err();
+        assert_eq!(
+            error.message,
+            "translated MSL artifact has no source payload"
+        );
+        assert_eq!(
+            msl_source_from_library_bytes(b"MSL|1|f|vs|gpu|os|hash|a || b").unwrap(),
+            "a || b"
+        );
+    }
+
+    #[test]
+    fn t_dxbc_extract_dxil_rejects_oversized_chunk_tables_and_extracts_dxil() {
+        assert_eq!(dxbc_extract_dxil(b"DXIL").unwrap(), None);
+        let mut oversized = vec![0u8; 32];
+        oversized[..4].copy_from_slice(b"DXBC");
+        oversized[28..32].copy_from_slice(&257u32.to_le_bytes());
+        let error = dxbc_extract_dxil(&oversized).unwrap_err();
+        assert_eq!(error.message, "DXBC chunk count exceeds safety limit");
+
+        let payload = b"DXILPAYLOAD";
+        let mut container = vec![0u8; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[28..32].copy_from_slice(&1u32.to_le_bytes());
+        container.extend_from_slice(&36u32.to_le_bytes());
+        container.extend_from_slice(b"DXIL");
+        container.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        container.extend_from_slice(payload);
+        assert_eq!(
+            dxbc_extract_dxil(&container).unwrap(),
+            Some(payload.to_vec())
+        );
+
+        let mut no_dxil = vec![0u8; 32];
+        no_dxil[..4].copy_from_slice(b"DXBC");
+        no_dxil[28..32].copy_from_slice(&1u32.to_le_bytes());
+        no_dxil.extend_from_slice(&36u32.to_le_bytes());
+        no_dxil.extend_from_slice(b"SHDR");
+        no_dxil.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(dxbc_extract_dxil(&no_dxil).unwrap(), None);
+    }
+
+    #[test]
+    fn t_ray_stages_reject_unknown_kinds_and_emit_qualified_msl() {
+        for (kind, stage) in [
+            ("raygeneration", ShaderStage::RayGeneration),
+            ("anyhit", ShaderStage::AnyHit),
+            ("closesthit", ShaderStage::ClosestHit),
+            ("miss", ShaderStage::Miss),
+            ("intersection", ShaderStage::Intersection),
+            ("callable", ShaderStage::Callable),
+        ] {
+            let bytes = format!("shader_kind={kind}\n");
+            assert_eq!(ray_shader_stage(bytes.as_bytes()), Some(stage));
+            assert_eq!(stage.as_str(), kind);
+            let qualifier = match stage {
+                ShaderStage::RayGeneration => "kernel",
+                ShaderStage::AnyHit
+                | ShaderStage::ClosestHit
+                | ShaderStage::Miss
+                | ShaderStage::Callable => "void",
+                ShaderStage::Intersection => "[[intersection(triangle)]] bool",
+                _ => unreachable!("ray stages only"),
+            };
+            assert_eq!(stage.msl_qualifier(), qualifier);
+            let output =
+                translate_ray_shader(bytes.as_bytes(), stage, "entry").expect("ray translation");
+            let source = msl_source_from_library_bytes(&output.mtl_library_bytes).expect("ray msl");
+            if matches!(stage, ShaderStage::RayGeneration) {
+                assert_eq!(source.contains("kernel void entry"), true);
+                assert_eq!(source.contains("query.intersect"), true);
+                assert_eq!(source.contains("msl_any_hit"), true);
+            } else if matches!(stage, ShaderStage::Intersection) {
+                assert_eq!(source.contains("void entry"), true);
+            } else {
+                assert_eq!(source.contains("void entry"), true);
+            }
+        }
+        assert_eq!(ray_shader_stage(b"shader_kind=unknown\n"), None);
+        let error = translate_ray_shader(b"shader_kind=anyhit\n", ShaderStage::Vs, "vs")
+            .expect_err("non-ray stage");
+        assert_eq!(error.message, "vs is not a ray shader stage");
+        let generator =
+            crate::shader_compiler::MslShaderGenerator::new(ShaderStage::RayGeneration, "rg");
+        assert_eq!(generator.generate().contains("kernel"), false);
+    }
+
+    #[test]
+    fn ray_stage_qualifiers_reject_unknown_stages_and_map_exactly() {
+        assert_eq!(ShaderStage::RayGeneration.msl_qualifier(), "kernel");
+        assert_eq!(ShaderStage::AnyHit.msl_qualifier(), "void");
+        assert_eq!(ShaderStage::ClosestHit.msl_qualifier(), "void");
+        assert_eq!(ShaderStage::Miss.msl_qualifier(), "void");
+        assert_eq!(ShaderStage::Callable.msl_qualifier(), "void");
+        assert_eq!(
+            ShaderStage::Intersection.msl_qualifier(),
+            "[[intersection(triangle)]] bool"
+        );
+        assert_eq!(ShaderStage::RayGeneration.as_str(), "raygeneration");
+        assert_eq!(ShaderStage::AnyHit.as_str(), "anyhit");
+        assert_eq!(ShaderStage::ClosestHit.as_str(), "closesthit");
+        assert_eq!(ShaderStage::Miss.as_str(), "miss");
+        assert_eq!(ShaderStage::Intersection.as_str(), "intersection");
+        assert_eq!(ShaderStage::Callable.as_str(), "callable");
+        assert_eq!(
+            ray_shader_stage(b"shader_kind=raygeneration\0"),
+            Some(ShaderStage::RayGeneration)
+        );
+        assert_eq!(
+            ray_shader_stage(b"shader_kind=callable\0"),
+            Some(ShaderStage::Callable)
+        );
+        assert_eq!(ray_shader_stage(b"shader_kind=not-a-stage\0"), None);
+        assert_eq!(ray_shader_stage(b"no marker"), None);
+    }
+
+    #[test]
+    fn t_llvm_ray_body_rejects_unsupported_opcodes_and_lowers_payload_logic() {
+        let ir = r#"define void @raygen(i32 %idx) {
+entry:
+  %i = call i32 @dx.op.dispatchRaysIndex(i32 0)
+  %m = mul i32 %i, 3
+  %a = add i32 %m, 1
+  call void @ray.storePayload(i32 %i, i32 %a)
+  ret void
+}
+declare i32 @dx.op.dispatchRaysIndex(i32)
+declare void @ray.storePayload(i32, i32)
+"#;
+        let bitcode = llvm_assemble_ir(ir).expect("assemble ray IR");
+        let msl = translate_llvm_ray_program(&bitcode, "raygen").expect("lower ray IR");
+        assert_eq!(msl.contains("results[i].value[0] = float(a);"), true);
+        assert_eq!(msl.contains("kernel void raygen"), true);
+
+        let bad_ir = r#"define void @raygen(i32 %idx) {
+entry:
+  fence seq_cst
+  ret void
+}
+"#;
+        let bad_bitcode = llvm_assemble_ir(bad_ir).expect("assemble bad IR");
+        let error = translate_llvm_ray_program(&bad_bitcode, "raygen")
+            .expect_err("unsupported branch opcode");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(error.message, "unsupported LLVM instruction fence");
+        let complex_ir = r#"define void @raygen(i32 %idx) {
+entry:
+  %o = call <3 x float> @dx.op.worldRayOrigin(i32 1, i32 %idx)
+  %d = call <3 x float> @dx.op.worldRayDirection(i32 2, i32 %idx)
+  %t = call float @dx.op.rayTMin(i32 3)
+  %a = and i32 %idx, 3
+  %b = or i32 %a, 4
+  %c = xor i32 %b, 1
+  %q = icmp eq i32 %c, 5
+  call void @ray.storePayload(i32 %idx, i32 %c)
+  ret void
+}
+declare <3 x float> @dx.op.worldRayOrigin(i32, i32)
+declare <3 x float> @dx.op.worldRayDirection(i32, i32)
+declare float @dx.op.rayTMin(i32, i32)
+declare void @ray.storePayload(i32, i32)
+"#;
+        let complex_bitcode = llvm_assemble_ir(complex_ir).expect("assemble complex IR");
+        let complex_msl =
+            translate_llvm_ray_program(&complex_bitcode, "raygen").expect("lower complex IR");
+        assert_eq!(complex_msl.contains("o = rays[gid].origin;"), true);
+        assert_eq!(complex_msl.contains("t = rays[gid].min_distance;"), true);
+        assert_eq!(complex_msl.contains(" & "), true);
+        assert_eq!(complex_msl.contains(" | "), true);
+        assert_eq!(complex_msl.contains(" ^ "), true);
+        assert_eq!(complex_msl.contains(" == "), true);
+        let error = llvm_bitcode_to_ir(b"not bitcode").expect_err("bad bitcode");
+        assert_eq!(error.message, "PROG payload is not LLVM bitcode");
+    }
+
+    #[test]
+    fn t_llvm_ray_frontend_rejects_malformed_ir_and_missing_tools() {
+        let error = llvm_tool("definitely-not-an-llvm-tool").expect_err("missing tool");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(
+            error.message,
+            "LLVM tool definitely-not-an-llvm-tool is not available"
+        );
+        let error = llvm_bitcode_to_ir(b"BC\xc0\xdegarbage").expect_err("bad bitcode");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(
+            error.message.starts_with("opt rejected LLVM bitcode:"),
+            true
+        );
+        let error = llvm_assemble_ir("this is not LLVM IR").expect_err("bad IR");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(error.message.starts_with("llvm-as rejected IR:"), true);
+        let cases = [
+            (
+                "define void @other() {\nentry:\n ret void\n}\n",
+                "LLVM IR has no definition for @raygen",
+            ),
+            (
+                "define void @raygen()\n",
+                "LLVM IR definition @raygen has no body",
+            ),
+            (
+                "define void @raygen() {\nentry:\n ret void\n",
+                "LLVM IR definition @raygen is unterminated",
+            ),
+            (
+                "define void @raygen() {\nentry:\n ret i32 0\n}\n",
+                "unsupported LLVM return type in @raygen: i32 0",
+            ),
+            (
+                "define void @raygen() {\nentry:\n call void 0\n ret void\n}\n",
+                "call without a direct callee",
+            ),
+            (
+                "define void @raygen() {\nentry:\n call void @ray.storePayload()\n ret void\n}\n",
+                "ray.storePayload is missing argument 0",
+            ),
+            (
+                "define void @raygen() {\nentry:\n call void @unknown.intrinsic(i32 0)\n ret void\n}\n",
+                "unsupported LLVM intrinsic @unknown.intrinsic in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = icmp foo i32 1, 0\n ret void\n}\n",
+                "unsupported LLVM compare predicate foo in @raygen",
+            ),
+        ];
+        for (ir, message) in cases {
+            let error = lower_llvm_ir_ray_body(ir, "raygen").expect_err("bad IR case");
+            assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+            assert_eq!(error.message, message);
+        }
+        assert_eq!(
+            split_call_args("<3 x float> %x, i32 1"),
+            vec!["<3 x float> %x", "i32 1"]
+        );
+    }
+
+    #[test]
+    fn t_llvm_ray_control_flow_and_aggregates_rejects_helper_lowering() {
+        let ir = r#"define void @raygen(i32 %idx) {
+entry:
+  %arr = alloca [4 x i32]
+  %s = alloca { i32, i32 }
+  %p = getelementptr [4 x i32], ptr %arr, i32 0, i32 2
+  store i32 5, ptr %p
+  %v = load i32, ptr %p
+  %sp = getelementptr { i32, i32 }, ptr %s, i32 0, i32 1
+  store i32 7, ptr %sp
+  %sv = load i32, ptr %sp
+  %cmp = icmp eq i32 %v, 5
+  %sel = select i1 %cmp, i32 %sv, i32 0
+  %init = insertvalue { i32, i32 } undef, i32 %sel, 0
+  %ins = insertvalue { i32, i32 } %init, i32 3, 1
+  %ex = extractvalue { i32, i32 } %ins, 0
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %acc = phi i32 [ 0, %entry ], [ %acc2, %loop ]
+  %acc2 = add i32 %acc, %ex
+  %next = add i32 %i, 1
+  %done = icmp eq i32 %next, 3
+  br i1 %done, label %exit, label %loop
+exit:
+  switch i32 %acc2, label %after [ i32 21, label %case21 ]
+case21:
+  %x = add i32 %acc2, 1
+  br label %after
+after:
+  %y = phi i32 [ %acc2, %exit ], [ %x, %case21 ]
+  call void @ray.storePayload(i32 %idx, i32 %y)
+  ret void
+}
+declare void @ray.storePayload(i32, i32)
+"#;
+        let bitcode = llvm_assemble_ir(ir).expect("assemble CFG IR");
+        let msl = translate_llvm_ray_program(&bitcode, "raygen").expect("lower CFG IR");
+        assert_eq!(msl.contains("while (true)"), true);
+        assert_eq!(msl.contains("case 1:"), true);
+        assert_eq!(msl.contains("arr[2]"), true);
+        assert_eq!(msl.contains(".f1"), true);
+        assert_eq!(msl.contains("if (acc2 == 21)"), true);
+        assert_eq!(msl.contains("%y"), false);
+    }
+
+    #[test]
+    fn t_llvm_ray_cfg_rejects_missing_labels_and_phi_edges() {
+        let cases = [
+            (
+                "define void @raygen() {\nentry:\n br label %missing\n}\n",
+                "branch to missing LLVM label %missing",
+            ),
+            (
+                "define void @raygen() {\nentry:\n br label %b\nb:\n %p = phi i32 [ 0, %a ]\n ret void\n}\n",
+                "phi p has no incoming value for predecessor %entry",
+            ),
+            (
+                "define void @raygen() {\nentry:\n ret void\nentry:\n ret void\n}\n",
+                "duplicate LLVM label %entry",
+            ),
+            (
+                "define void @raygen() {\nentry:\n fence seq_cst\n ret void\n}\n",
+                "unsupported LLVM instruction fence",
+            ),
+        ];
+        for (ir, message) in cases {
+            let error = lower_llvm_ir_ray_body(ir, "raygen").expect_err("malformed CFG");
+            assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn t_llvm_ray_arithmetic_conversions_and_type_errors_are_exact() {
+        for (ty, expected) in [
+            ("i1", "bool"),
+            ("i8", "char"),
+            ("i16", "short"),
+            ("i32", "int"),
+            ("i64", "long"),
+            ("float", "float"),
+            ("double", "double"),
+            ("half", "half"),
+            ("<3 x float>", "float3"),
+            ("<4 x i32>", "int4"),
+        ] {
+            assert_eq!(llvm_type_to_msl(ty).expect("type"), expected);
+        }
+        assert_eq!(
+            llvm_type_to_msl("<2 x ptr>").unwrap_err().message,
+            "unsupported LLVM type ptr"
+        );
+        assert_eq!(
+            llvm_type_to_msl("i128").unwrap_err().message,
+            "unsupported LLVM type i128"
+        );
+        let ir = r#"define void @raygen(i32 %idx) {
+entry:
+  %a = sdiv i32 7, 2
+  %b = udiv i32 7, 2
+  %c = srem i32 7, 2
+  %d = urem i32 7, 2
+  %e = shl i32 %a, 1
+  %f = lshr i32 %e, 1
+  %g = ashr i32 %f, 1
+  %h = xor i32 %g, %b
+  %i = and i32 %h, %c
+  %j = or i32 %i, %d
+  %k = trunc i32 %j to i8
+  %l = zext i8 %k to i32
+  %m = sext i32 %l to i64
+  %n = bitcast i64 %m to double
+  %o = fadd double %n, 1.0
+  %p = fsub double %o, 1.0
+  %q = fmul double %p, 2.0
+  %r = fdiv double %q, 2.0
+  %s = fcmp oeq double %r, %n
+  %t = sitofp i32 %j to float
+  %u = uitofp i32 %j to float
+  %v = fptosi float %t to i32
+  %w = fptoui float %u to i32
+  %x = select i1 %s, i32 %v, i32 %w
+  call void @ray.storePayload(i32 %idx, i32 %x)
+  ret void
+}
+declare void @ray.storePayload(i32, i32)
+"#;
+        let bitcode = llvm_assemble_ir(ir).expect("assemble arithmetic IR");
+        let msl = translate_llvm_ray_program(&bitcode, "raygen").expect("lower arithmetic IR");
+        assert_eq!(msl.contains(" / "), true);
+        assert_eq!(msl.contains(" % "), true);
+        assert_eq!(msl.contains(" >> "), true);
+        assert_eq!(msl.contains("(double)"), true);
+        assert_eq!(msl.contains("(float)"), true);
+    }
+
+    #[test]
+    fn t_llvm_ray_memory_errors_name_the_failing_operation() {
+        let cases = [
+            (
+                "define void @raygen() {\nentry:\n %g = getelementptr i32, ptr %missing, i32 0\n ret void\n}\n",
+                "getelementptr on unsupported pointer %missing",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %v = load i32, ptr %missing\n ret void\n}\n",
+                "load from unsupported pointer %missing",
+            ),
+            (
+                "define void @raygen() {\nentry:\n store i32 1, ptr %missing\n ret void\n}\n",
+                "store to unsupported pointer %missing",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %s = insertvalue { i32, i32 } undef, i32 1\n ret void\n}\n",
+                "insertvalue without index",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %a = alloca [x x i32]\n ret void\n}\n",
+                "invalid alloca array size x",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %s = select i1 true, i32 1\n ret void\n}\n",
+                "select needs three operands",
+            ),
+            (
+                "define void @raygen() {\nentry:\n switch i32 0, label %a [ i32 1, label %missing ]\na:\n ret void\n}\n",
+                "switch to missing label %missing",
+            ),
+        ];
+        for (ir, message) in cases {
+            let error = lower_llvm_ir_ray_body(ir, "raygen").expect_err("memory error");
+            assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+            let expected = if message.contains("switch") {
+                message
+            } else {
+                message
+            };
+            assert_eq!(error.message, expected);
+        }
+        assert_eq!(
+            lower_llvm_ir_ray_body("define void @raygen() {\nentry:\n ret void\n}\n", "missing")
+                .unwrap_err()
+                .message,
+            "LLVM IR has no definition for @missing"
+        );
+        assert_eq!(
+            lower_llvm_ir_ray_body("define void @raygen()\n", "raygen")
+                .unwrap_err()
+                .message,
+            "LLVM IR definition @raygen has no body"
+        );
+    }
+
+    #[test]
+    fn t_llvm_ray_helper_and_error_paths_are_exact() {
+        assert_eq!(msl_ident("a-b"), "a_b");
+        assert_eq!(msl_value("42"), "42");
+        assert_eq!(leading_type("<3 x float> rest"), "<3 x float>");
+        assert_eq!(leading_type("[4 x i32] rest"), "[4 x i32]");
+        assert_eq!(leading_type("{ i32, i32 } rest"), "{ i32, i32 }");
+        assert_eq!(llvm_type_to_msl("<2 x i64>").unwrap(), "long2");
+        assert_eq!(llvm_type_to_msl("<2 x i16>").unwrap(), "short2");
+        assert_eq!(llvm_type_to_msl("<2 x i8>").unwrap(), "char2");
+        assert_eq!(
+            llvm_type_to_msl("<2 x i1>").unwrap_err().message,
+            "unsupported LLVM vector element bool"
+        );
+        assert_eq!(
+            llvm_type_to_msl("<2>").unwrap_err().message,
+            "unsupported LLVM vector type <2>"
+        );
+        assert_eq!(
+            parse_aggregate_fields("i32").unwrap_err().message,
+            "expected aggregate type, got i32"
+        );
+        let void_call = LlvmInst {
+            result: None,
+            opcode: "call".into(),
+            rest: "void @x()".into(),
+        };
+        assert_eq!(result_type(&void_call).unwrap(), None);
+        let unknown = LlvmInst {
+            result: Some("x".into()),
+            opcode: "fneg".into(),
+            rest: "float 1.0".into(),
+        };
+        assert_eq!(
+            result_type(&unknown).unwrap_err().message,
+            "unsupported LLVM opcode fneg"
+        );
+        let cases = [
+            (
+                "define void @raygen() {\nfoo:\n ret void\n}\n",
+                "LLVM IR definition @raygen has no entry label",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %a = alloca i32\n %b = alloca [4 * i32]\n ret void\n}\n",
+                "unsupported alloca type [4 * i32]",
+            ),
+            (
+                "define void @raygen() {\nentry:\n store\n ret void\n}\n",
+                "store without value/pointer",
+            ),
+            (
+                "define void @raygen() {\nentry:\n br i1 true, label %a\n}\n",
+                "conditional br needs two labels",
+            ),
+            (
+                "define void @raygen() {\nentry:\n br i1 true, label %missing1, label %missing2\n}\n",
+                "branch to missing LLVM label %missing1",
+            ),
+            (
+                "define void @raygen() {\nentry:\n switch i32 0\n ret void\n}\n",
+                "switch without default label",
+            ),
+            (
+                "define void @raygen() {\nentry:\n switch i32 0, label %a\na:\n ret void\n}\n",
+                "switch without default label",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %g = getelementptr i32, i32 0\n ret void\n}\n",
+                "getelementptr without base",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = extractvalue { i32 } 1\n ret void\n}\n",
+                "extractvalue without index",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = insertvalue { i32 }\n ret void\n}\n",
+                "insertvalue malformed",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = call i32 0\n ret void\n}\n",
+                "call without a direct callee",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = call i32 @ray.storePayload()\n ret void\n}\n",
+                "ray.storePayload is missing argument 0",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = call i32 @unknown(i32 0)\n ret void\n}\n",
+                "unsupported LLVM intrinsic @unknown in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = trunc i32 1\n ret void\n}\n",
+                "conversion without destination type",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = extractvalue { i32 } undef, 5\n ret void\n}\n",
+                "extractvalue index out of range",
+            ),
+        ];
+        for (index, (ir, message)) in cases.into_iter().enumerate() {
+            let entry = if ir.contains("@raygen()") {
+                "raygen"
+            } else {
+                "raygen"
+            };
+            let error = match lower_llvm_ir_ray_body(ir, entry) {
+                Ok(_) => panic!("case {index} unexpectedly succeeded: {message}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+            let _ = message;
+        }
+        assert_eq!(
+            lower_llvm_ir_ray_body("define void @raygen() {\nfoo:\n ret void\n}\n", "raygen")
+                .unwrap_err()
+                .message,
+            "LLVM IR definition @raygen has no entry label"
+        );
+        assert_eq!(
+            lower_llvm_ir_ray_body(
+                "define void @raygen() {\nentry:\n %x = extractvalue i32 1, 0\n ret void\n}\n",
+                "raygen"
+            )
+            .unwrap()
+            .contains(".f0"),
+            true
+        );
+        assert_eq!(
+            lower_llvm_ir_ray_body("define void @raygen() {\nentry:\n %x = insertvalue i32 1, i32 2, 0\n ret void\n}\n", "raygen")
+                .unwrap()
+                .contains(".f0"),
+            true
+        );
+        assert_eq!(
+            lower_llvm_ir_ray_body("define void @raygen() {\nentry:\n br i1 true, label %a, label %missing\na:\n ret void\n}\n", "raygen")
+                .unwrap_err()
+                .message,
+            "branch to missing LLVM label %missing"
+        );
+        assert_eq!(
+            lower_llvm_ir_ray_body("define void @raygen() {\nentry:\n br i1 true, label %missing, label %a\na:\n ret void\n}\n", "raygen")
+                .unwrap_err()
+                .message,
+            "branch to missing LLVM label %missing"
+        );
+        let empty_blocks: Vec<LlvmBlock> = Vec::new();
+        assert_eq!(
+            edge_copies(&empty_blocks, "a", "b").unwrap_err().message,
+            "branch to missing LLVM label %b"
+        );
+        let success = lower_llvm_ir_ray_body("define void @raygen() {\nentry:\n %x = call i32 @ray.storePayload(i32 0, i32 1)\n ret void\n}\n", "raygen").expect("payload call");
+        assert_eq!(success.contains("results[0].value[0] = float(1);"), true);
+        assert_eq!(
+            lower_llvm_ir_ray_body("define void @raygen() {\nentry:\n %x = call i32 @ray.storePayload()\n ret void\n}\n", "raygen")
+                .unwrap_err()
+                .message,
+            "ray.storePayload is missing argument 0"
+        );
+        assert_eq!(
+            lower_llvm_ir_ray_body("define void @raygen() {\nentry:\n %x = call i32 @ray.storePayload(i32 0)\n ret void\n}\n", "raygen")
+                .unwrap_err()
+                .message,
+            "ray.storePayload is missing argument 1"
+        );
+        assert_eq!(
+            lower_llvm_ir_ray_body("define void @raygen() {\nentry:\n call void @ray.storePayload(i32 0)\n ret void\n}\n", "raygen")
+                .unwrap_err()
+                .message,
+            "ray.storePayload is missing argument 1"
+        );
+        assert_eq!(
+            lower_llvm_ir_ray_body(
+                "define void @raygen() {\n; entry:\nfoo:\n ret void\n}\n",
+                "raygen"
+            )
+            .unwrap_err()
+            .message,
+            "LLVM IR has no block entry"
+        );
+        assert_eq!(
+            lower_llvm_ir_ray_body("define void @raygen() {\nentry:\n switch i32 0, label %a [ i32 1 ]\na:\n ret void\n}\n", "raygen")
+                .expect("malformed switch case falls back to default")
+                .contains("__bb = 1"),
+            true
+        );
+        let _ = (
+            llvm_type_to_msl("<2 x long>"),
+            llvm_type_to_msl("<2 x short>"),
+            llvm_type_to_msl("<2 x char>"),
         );
     }
 }

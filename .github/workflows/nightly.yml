@@ -30,9 +30,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install FFmpeg system dependencies (all-features build needs them)
-        run: brew install ffmpeg
-      - name: Test with all features
-        run: cargo test --all-features
+        run: |
+          set -euo pipefail
+          brew install ffmpeg
+          # ffmpeg-next discovers the system libraries through pkg-config.
+          # Homebrew does not put its lib/pkgconfig on the default search path
+          # for every runner image, so make it explicit for this step and for
+          # every later step (this is the same environment the stable
+          # clippy-all-features job uses).
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+          pkg-config --modversion libavcodec
+      - name: Test with all features (cargo-invoking meta tests skipped)
+        run: |
+          set -euo pipefail
+          SKIPS=()
+          while IFS= read -r name; do
+            [[ -z "$name" ]] && continue
+            SKIPS+=(--skip "$name")
+          done < ci/meta-tests.txt
+          if ((${#SKIPS[@]})); then
+            cargo test --all-features -- "${SKIPS[@]}"
+          else
+            cargo test --all-features --
+          fi
 
   no-default-features:
     name: No Default Features
@@ -95,8 +116,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
-      - name: Run nightly lib/bins tests
-        run: cargo +nightly test --lib --bins
+      - name: Run nightly lib/bins tests (cargo-invoking meta tests skipped)
+        run: |
+          set -euo pipefail
+          SKIPS=()
+          while IFS= read -r name; do
+            [[ -z "$name" ]] && continue
+            SKIPS+=(--skip "$name")
+          done < ci/meta-tests.txt
+          if ((${#SKIPS[@]})); then
+            cargo +nightly test --lib --bins -- "${SKIPS[@]}"
+          else
+            cargo +nightly test --lib --bins --
+          fi
       - name: Test nightly UBSAN if supported
         run: bash ci/run_nightly_ubsan_if_supported.sh
 

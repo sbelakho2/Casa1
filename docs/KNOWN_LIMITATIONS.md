@@ -156,20 +156,26 @@ imports reach implemented vs. canned/unsupported semantics:
 cargo run --bin macwin -- import-coverage
 ```
 
-### .NET Framework is Not Supported
+### Legacy .NET Framework Activation is Not Supported
 
-**Limitation**: Guest applications that require the .NET Framework (CLR) will
-not run. Casa1 does not include a .NET runtime.
+**Limitation**: Managed images targeting .NET (Core) run natively on the
+host-installed ARM64 CoreCLR. Guest applications that specifically require the
+legacy .NET Framework activation contract (`CorBindToRuntime*`) still fail with
+`COR_E_CLRNOTAVAILABLE`, because no Framework CLR (`Microsoft.NET\Framework*`)
+is installed.
 
-**Reason**: .NET requires a full Common Language Runtime with JIT compilation,
-garbage collection, and a large class library. This is beyond the scope of
-Casa1's Win32 compatibility layer.
+**Reason**: Casa1 hosts CoreCLR rather than shipping a Windows .NET Framework
+runtime. The CLR metadata COM surface (`ICLRMetaHost`, `ICLRRuntimeInfo`,
+`ICLRRuntimeHost`, `IEnumUnknown`) exposes exactly the runtimes discovered under
+`shared/Microsoft.NETCore.App`; `ICLRRuntimeHost::ExecuteInDefaultAppDomain`
+executes managed static methods natively through `coreclr_create_delegate`.
 
-**Modeled behavior**: `mscoree.dll`/`mscorwks.dll` export dispatch is callable
-and honest — activation answers `COR_E_CLRNOTAVAILABLE`, directory queries fail
-as they would on a Windows machine with no CLR installed — but the ledger
-records the CLR capability as **absent** (fidelity `synthetic-environment`).
-Six callable exports must never be read as ".NET support".
+**Modeled behavior**: `CLRCreateInstance` returns the real meta host;
+`GetCLRRuntimeHost` returns a real host object; managed execution reports the
+CLR's own status for missing assemblies, types and methods. Framework-only
+activation and `GetCORSystemDirectory` still report absence. The ledger records
+the CLR capability as **partial** with `exact` fidelity for the CoreCLR surface,
+never `synthetic-environment`.
 
 
 ## Security

@@ -40,6 +40,20 @@ def default_base() -> str:
 
 def changed_rs_files(base: str | None = None) -> list[pathlib.Path]:
     base = base or default_base()
+    # Fail closed: an unresolvable base must never silently select no tests.
+    verified = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", base],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if verified.returncode != 0:
+        print(
+            f"::error::affected-test base {base!r} cannot be resolved; "
+            "fetch the base history or pass --base <commit>",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     tracked = set(_git("diff", "--name-only", base))
     tracked |= set(_git("diff", "--name-only", "HEAD"))
     untracked = set(_git("ls-files", "--others", "--exclude-standard"))

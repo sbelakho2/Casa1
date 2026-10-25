@@ -4462,10 +4462,31 @@ impl GraphicsBackend {
         Ok(())
     }
 
+    /// Borrow a pipeline state descriptor.
+    pub fn pipeline_state_desc(&self, pipeline: PipelineStateId) -> AppResult<&PipelineStateDesc> {
+        self.pipeline_states
+            .get(&pipeline)
+            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown pipeline state"))
+    }
+
+    /// Borrow a resource's descriptor.
+    pub fn resource_desc(&self, resource: ResourceId) -> AppResult<&ResourceDesc> {
+        Ok(&self.resource(resource)?.desc)
+    }
+
     /// Borrow a resource's host-visible bytes without cloning, for zero-copy
     /// consumers such as an IOSurface present channel.
     pub fn resource_bytes(&self, resource: ResourceId) -> AppResult<&[u8]> {
         Ok(self.resource(resource)?.bytes.as_slice())
+    }
+
+    /// Read one descriptor slot for native command-list state tracking.
+    pub fn descriptor_at_view(
+        &self,
+        heap: DescriptorHeapId,
+        index: usize,
+    ) -> AppResult<ViewDescriptor> {
+        self.descriptor_at(heap, index)
     }
 
     /// Overwrite a resource from bytes whose storage is already owned by the

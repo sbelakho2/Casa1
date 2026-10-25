@@ -735,6 +735,7 @@ const CREATE_SUSPENDED: u32 = 0x0000_0004;
 const STARTF_USESHOWWINDOW: u32 = 0x0001;
 const STARTF_USESTDHANDLES: u32 = 0x0100;
 const E_INVALIDARG: u64 = 0x8007_0057;
+const E_NOTIMPL: u64 = 0x8000_4001;
 /// CLASS_E_CLASSNOTAVAILABLE — returned when CoCreateInstance cannot find a
 /// registered class factory for the requested CLSID.
 const CLASS_E_CLASSNOTAVAILABLE: u64 = 0x8004_0154;
@@ -812,6 +813,14 @@ const PE_RUNTIME_BUDGET_ENV: &str = "CASA1_PE_RUNTIME_BUDGET";
 /// (message dispatch / window procs) still terminates.
 pub static RUN_DEADLINE_EXPIRED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Publish the run-deadline cancellation and wake a cooperative pump blocked
+/// on a guest wait/timer deadline.  The watchdog thread uses this exact path
+/// so cancellation is not delayed until the next guest event.
+pub(crate) fn expire_run_deadline() {
+    RUN_DEADLINE_EXPIRED.store(true, std::sync::atomic::Ordering::Release);
+    crate::runtime::scheduler::notify_pump_wake();
+}
 /// Optional wall-clock run deadline in seconds (e.g. `CASA1_PE_RUNTIME_DEADLINE_SECS=600`).
 /// Steam's main loop is wait-bound and never exits on its own; the deadline
 /// ends the run with exit code -2 (the timeout convention) so diagnostic
@@ -2381,6 +2390,40 @@ pub enum HostThunk {
     D3D12ObjectSetName,
     D3D12ObjectGetPrivateData,
     D3D12ObjectSetPrivateData,
+    // -- D3D12 state objects / work graphs (Device5/7 + CommandList10) --
+    D3D12Device5CreateStateObject,
+    D3D12Device7AddToStateObject,
+    D3d12ChildObjectGetDevice,
+    D3D12GraphicsCommandList10SetProgram,
+    D3D12GraphicsCommandList10DispatchGraph,
+    // -- DirectML (dml.dll + IDML* COM surface) --
+    DmlObjectQueryInterface,
+    DmlObjectGetPrivateData,
+    DmlObjectSetPrivateData,
+    DmlObjectSetPrivateDataInterface,
+    DmlObjectSetName,
+    DmlObjectGetDevice,
+    DmlDeviceCheckFeatureSupport,
+    DmlDeviceCreateOperator,
+    DmlDeviceCompileOperator,
+    DmlDeviceCreateOperatorInitializer,
+    DmlDeviceCreateCommandRecorder,
+    DmlDeviceCreateBindingTable,
+    DmlDeviceEvict,
+    DmlDeviceMakeResident,
+    DmlDeviceGetDeviceRemovedReason,
+    DmlDeviceGetParentDevice,
+    DmlDevice1CompileGraph,
+    DmlDispatchableGetBindingProperties,
+    DmlOperatorInitializerReset,
+    DmlCommandRecorderRecordDispatch,
+    DmlBindingTableBindInputs,
+    DmlBindingTableBindOutputs,
+    DmlBindingTableBindTemporaryResource,
+    DmlBindingTableBindPersistentResource,
+    DmlBindingTableReset,
+    DMLCreateDevice,
+    DMLCreateDevice1,
     D3D12CommandQueueGetTimestampFrequency,
     D3D12CommandQueueGetClockCalibration,
     // -- D3D9 Device gap-fill methods (Phase 3.3) --
@@ -5264,6 +5307,19 @@ pub enum HostThunk {
     ClrRuntimeInfoLoadLibrary,
     ClrRuntimeInfoGetProcAddress,
     ClrRuntimeInfoGetInterface,
+    // ── ICLRRuntimeHost methods ──────────────────────────────────────────
+    ClrRuntimeHostQueryInterface,
+    ClrRuntimeHostAddRef,
+    ClrRuntimeHostRelease,
+    ClrRuntimeHostStart,
+    ClrRuntimeHostStop,
+    ClrRuntimeHostSetHostControl,
+    ClrRuntimeHostGetClrControl,
+    ClrRuntimeHostUnloadAppDomain,
+    ClrRuntimeHostExecuteInAppDomain,
+    ClrRuntimeHostGetCurrentAppDomainId,
+    ClrRuntimeHostExecuteApplication,
+    ClrRuntimeHostExecuteInDefaultAppDomain,
     ClrEnumUnknownQueryInterface,
     ClrEnumUnknownAddRef,
     ClrEnumUnknownRelease,
@@ -5599,7 +5655,13 @@ pub enum HostThunk {
     D3DKMTDestroySynchronizationObject,
     D3DKMTEnumAdapters,
     D3DKMTEnumOutputs,
+    D3DKMTEscape,
     D3DKMTEvict,
+    D3DKMTMapGpuVirtualAddress,
+    D3DKMTPagingFence,
+    D3DKMTQueryVideoMemoryInfo,
+    D3DKMTSubmitCommand,
+    D3DKMTUnmapGpuVirtualAddress,
     D3DKMTGetDisplayModeList,
     D3DKMTGetDisplayModeList2,
     D3DKMTGetGammaRamp,
@@ -7010,7 +7072,7 @@ pub fn execute_with_options(
         std::thread::spawn(move || {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             std::thread::sleep(remaining);
-            RUN_DEADLINE_EXPIRED.store(true, std::sync::atomic::Ordering::Release);
+            expire_run_deadline();
         });
     }
     let mut state = CpuState::new(guest_arch);
@@ -7048,6 +7110,14 @@ pub fn execute_with_options(
         mapped.selected_base,
     )?;
     state.rip = mapped.selected_base + image.address_of_entry_point as u64;
+    match runtime.precompile_image(&memory, state.rip) {
+        Ok(Some(report)) => crate::live::live_trace(&format!(
+            "[aot] precompiled {}/{} reachable blocks (skipped {}, out-of-range {})",
+            report.compiled, report.blocks, report.skipped, report.out_of_range
+        )),
+        Ok(None) => {}
+        Err(error) => crate::live::live_trace(&format!("[aot] precompile failed: {error}")),
+    }
     // NtCreateThreadEx on a native child passes the FIRST thread's start
     // routine/parameter: the child's first thread genuinely begins at that
     // address, not at the image entry point.  The address is a guest VA in
@@ -11637,6 +11707,49 @@ pub(crate) fn jit_construction_selected(
 }
 
 impl PeHostRuntime {
+    /// Precompile the whole mapped image at `entry` when enabled.
+    pub(crate) fn precompile_image(
+        &mut self,
+        memory: &MemoryImage,
+        entry: u64,
+    ) -> AppResult<Option<crate::precompile::PrecompileReport>> {
+        if !self.aot_precompile || self.mapped_image_size == 0 {
+            return Ok(None);
+        }
+        let image_end = self
+            .mapped_image_base
+            .saturating_add(self.mapped_image_size);
+        self.precompile_code_range(memory, entry, image_end, 20_000)
+    }
+
+    /// Discover and precompile every control-flow-reachable block of the
+    /// mapped image before guest entry, persisting each translation in the
+    /// AOT cache.  Returns `None` when the JIT is disabled.
+    pub(crate) fn precompile_code_range(
+        &mut self,
+        memory: &MemoryImage,
+        start: u64,
+        end: u64,
+        max_blocks: usize,
+    ) -> AppResult<Option<crate::precompile::PrecompileReport>> {
+        let arch = self.guest_arch;
+        let Some(jit) = self.jit_runtime.as_mut() else {
+            return Ok(None);
+        };
+        let report = crate::precompile::precompile_blocks(
+            memory,
+            arch,
+            start,
+            end,
+            max_blocks,
+            |ir, address| {
+                jit.get_or_compile_slice_block(ir, address, arch)
+                    .map(|_| ())
+            },
+        )?;
+        Ok(Some(report))
+    }
+
     /// Attach a generic runtime-event observer.  The runtime works perfectly
     /// with no observer attached — this is purely opt-in workload wiring.
     pub fn add_observer(&mut self, observer: Box<dyn crate::runtime_events::RuntimeObserver>) {
@@ -14849,6 +14962,96 @@ impl PeHostRuntime {
             HostThunk::D3D12ObjectSetPrivateData => {
                 self.dispatch_d3d12_object_set_private_data(state, memory)?
             }
+            HostThunk::D3D12Device5CreateStateObject => {
+                self.dispatch_d3d12_device5_create_state_object(memory, state)?
+            }
+            HostThunk::D3D12Device7AddToStateObject => {
+                self.dispatch_d3d12_device7_add_to_state_object(memory, state)?
+            }
+            HostThunk::D3d12ChildObjectGetDevice => {
+                self.dispatch_d3d12_child_object_get_device(memory, state)?
+            }
+            HostThunk::D3D12GraphicsCommandList10SetProgram => {
+                self.dispatch_d3d12_graphics_command_list10_set_program(memory, state)?
+            }
+            HostThunk::D3D12GraphicsCommandList10DispatchGraph => {
+                self.dispatch_d3d12_graphics_command_list10_dispatch_graph(memory, state)?
+            }
+            HostThunk::DmlObjectQueryInterface => {
+                self.dispatch_dml_object_query_interface(memory, state)?
+            }
+            HostThunk::DmlObjectGetPrivateData => {
+                self.dispatch_dml_object_get_private_data(memory, state)?
+            }
+            HostThunk::DmlObjectSetPrivateData => {
+                self.dispatch_dml_object_set_private_data(memory, state)?
+            }
+            HostThunk::DmlObjectSetPrivateDataInterface => {
+                self.dispatch_dml_object_set_private_data_interface(memory, state)?
+            }
+            HostThunk::DmlObjectSetName => self.dispatch_dml_object_set_name(memory, state)?,
+            HostThunk::DmlObjectGetDevice => self.dispatch_dml_object_get_device(memory, state)?,
+            HostThunk::DmlDeviceCheckFeatureSupport => {
+                self.dispatch_dml_device_check_feature_support(memory, state)?
+            }
+            HostThunk::DmlDeviceCreateOperator => {
+                self.dispatch_dml_device_create_operator(memory, state)?
+            }
+            HostThunk::DmlDeviceCompileOperator => {
+                self.dispatch_dml_device_compile_operator(memory, state)?
+            }
+            HostThunk::DmlDeviceCreateOperatorInitializer => {
+                self.dispatch_dml_device_create_operator_initializer(memory, state)?
+            }
+            HostThunk::DmlDeviceCreateCommandRecorder => {
+                self.dispatch_dml_device_create_command_recorder(memory, state)?
+            }
+            HostThunk::DmlDeviceCreateBindingTable => {
+                self.dispatch_dml_device_create_binding_table(memory, state)?
+            }
+            HostThunk::DmlDeviceEvict | HostThunk::DmlDeviceMakeResident => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::DmlDeviceGetDeviceRemovedReason => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::DmlDeviceGetParentDevice => {
+                self.dispatch_dml_device_get_parent_device(memory, state)?
+            }
+            HostThunk::DmlDevice1CompileGraph => {
+                state.set(Register::Rax, E_NOTIMPL);
+                self.last_error = 0;
+            }
+            HostThunk::DmlDispatchableGetBindingProperties => {
+                self.dispatch_dml_dispatchable_get_binding_properties(memory, state)?
+            }
+            HostThunk::DmlOperatorInitializerReset => {
+                self.dispatch_dml_operator_initializer_reset(memory, state)?
+            }
+            HostThunk::DmlCommandRecorderRecordDispatch => {
+                self.dispatch_dml_command_recorder_record_dispatch(state)?
+            }
+            HostThunk::DmlBindingTableBindInputs => {
+                self.dispatch_dml_binding_table_bind_inputs(memory, state)?
+            }
+            HostThunk::DmlBindingTableBindOutputs => {
+                self.dispatch_dml_binding_table_bind_outputs(memory, state)?
+            }
+            HostThunk::DmlBindingTableBindTemporaryResource
+            | HostThunk::DmlBindingTableBindPersistentResource => {
+                // Temporary/persistent resources are part of the binding
+                // table's resource footprint; record and validate them like
+                // inputs so RecordDispatch can fail closed on unsupported
+                // buffer bindings.
+                self.dispatch_dml_binding_table_bind_aux(memory, state)?
+            }
+            HostThunk::DmlBindingTableReset => {
+                self.dispatch_dml_binding_table_reset(memory, state)?
+            }
+            HostThunk::DMLCreateDevice => self.dispatch_dml_create_device(memory, state)?,
+            HostThunk::DMLCreateDevice1 => self.dispatch_dml_create_device1(memory, state)?,
             HostThunk::D3D12CommandQueueWait => {
                 self.dispatch_d3d12_command_queue_wait(state)?;
             }
@@ -29697,6 +29900,19 @@ impl PeHostRuntime {
             | HostThunk::ClrRuntimeInfoLoadLibrary
             | HostThunk::ClrRuntimeInfoGetProcAddress
             | HostThunk::ClrRuntimeInfoGetInterface
+            | HostThunk::GetClrRuntimeHost
+            | HostThunk::ClrRuntimeHostQueryInterface
+            | HostThunk::ClrRuntimeHostAddRef
+            | HostThunk::ClrRuntimeHostRelease
+            | HostThunk::ClrRuntimeHostStart
+            | HostThunk::ClrRuntimeHostStop
+            | HostThunk::ClrRuntimeHostSetHostControl
+            | HostThunk::ClrRuntimeHostGetClrControl
+            | HostThunk::ClrRuntimeHostUnloadAppDomain
+            | HostThunk::ClrRuntimeHostExecuteInAppDomain
+            | HostThunk::ClrRuntimeHostGetCurrentAppDomainId
+            | HostThunk::ClrRuntimeHostExecuteApplication
+            | HostThunk::ClrRuntimeHostExecuteInDefaultAppDomain
             | HostThunk::ClrEnumUnknownQueryInterface
             | HostThunk::ClrEnumUnknownAddRef
             | HostThunk::ClrEnumUnknownRelease
@@ -29757,7 +29973,7 @@ impl PeHostRuntime {
             ref thunk @ (HostThunk::BasicClassAddRef | HostThunk::BasicClassGetIDsOfNames | HostThunk::BasicClassInvoke | HostThunk::BasicClassQueryInterface | HostThunk::BasicClassRelease | HostThunk::BasicDispatchInvoke | HostThunk::DllCall | HostThunk::DllFunc | HostThunk::DllMain | HostThunk::DllProc) => {
                 self.dispatch_msvbvm(thunk, state, memory)?;
             }
-            ref thunk @ (HostThunk::D3DKMTAcquireKeyedMutex | HostThunk::D3DKMTAcquireKeyedMutex2 | HostThunk::D3DKMTCloseAdapter | HostThunk::D3DKMTCreateAllocation | HostThunk::D3DKMTCreateContext | HostThunk::D3DKMTCreateDevice | HostThunk::D3DKMTCreateSwapChain | HostThunk::D3DKMTCreateSynchronizationObject | HostThunk::D3DKMTDestroyAllocation | HostThunk::D3DKMTDestroyContext | HostThunk::D3DKMTDestroyDevice | HostThunk::D3DKMTDestroySwapchain | HostThunk::D3DKMTDestroySynchronizationObject | HostThunk::D3DKMTEnumAdapters | HostThunk::D3DKMTEnumOutputs | HostThunk::D3DKMTEvict | HostThunk::D3DKMTGetDisplayModeList | HostThunk::D3DKMTGetDisplayModeList2 | HostThunk::D3DKMTGetGammaRamp | HostThunk::D3DKMTMakeResident | HostThunk::D3DKMTOpenAdapterFromDeviceName | HostThunk::D3DKMTOpenAdapterFromGdiDisplayName | HostThunk::D3DKMTOpenAdapterFromHdc | HostThunk::D3DKMTOpenAdapterFromLuid | HostThunk::D3DKMTOpenDevice | HostThunk::D3DKMTOpenKeyedMutex | HostThunk::D3DKMTOpenKeyedMutex2 | HostThunk::D3DKMTOpenResource | HostThunk::D3DKMTOpenResource2 | HostThunk::D3DKMTPnPStart | HostThunk::D3DKMTPnPStop | HostThunk::D3DKMTPowerComponent | HostThunk::D3DKMTPresent | HostThunk::D3DKMTQueryAdapterInfo | HostThunk::D3DKMTQueryAllocationResidency | HostThunk::D3DKMTQueryStatistics | HostThunk::D3DKMTQuerySwapChainInfo | HostThunk::D3DKMTReleaseKeyedMutex | HostThunk::D3DKMTReleaseKeyedMutex2 | HostThunk::D3DKMTRender | HostThunk::D3DKMTSetAllocationPriority | HostThunk::D3DKMTSetCursor | HostThunk::D3DKMTSetCursorPosition | HostThunk::D3DKMTSetDisplayPrivateDriverFormat | HostThunk::D3DKMTSetGammaRamp | HostThunk::D3DKMTSignalSynchronizationObject | HostThunk::D3DKMTSignalSynchronizationObject2 | HostThunk::D3DKMTWaitForSynchronizationObject | HostThunk::D3DKMTWaitForSynchronizationObject2) => {
+            ref thunk @ (HostThunk::D3DKMTAcquireKeyedMutex | HostThunk::D3DKMTAcquireKeyedMutex2 | HostThunk::D3DKMTCloseAdapter | HostThunk::D3DKMTCreateAllocation | HostThunk::D3DKMTCreateContext | HostThunk::D3DKMTCreateDevice | HostThunk::D3DKMTCreateSwapChain | HostThunk::D3DKMTCreateSynchronizationObject | HostThunk::D3DKMTDestroyAllocation | HostThunk::D3DKMTDestroyContext | HostThunk::D3DKMTDestroyDevice | HostThunk::D3DKMTDestroySwapchain | HostThunk::D3DKMTDestroySynchronizationObject | HostThunk::D3DKMTEnumAdapters | HostThunk::D3DKMTEnumOutputs | HostThunk::D3DKMTEscape | HostThunk::D3DKMTEvict | HostThunk::D3DKMTMapGpuVirtualAddress | HostThunk::D3DKMTPagingFence | HostThunk::D3DKMTQueryVideoMemoryInfo | HostThunk::D3DKMTSubmitCommand | HostThunk::D3DKMTUnmapGpuVirtualAddress | HostThunk::D3DKMTGetDisplayModeList | HostThunk::D3DKMTGetDisplayModeList2 | HostThunk::D3DKMTGetGammaRamp | HostThunk::D3DKMTMakeResident | HostThunk::D3DKMTOpenAdapterFromDeviceName | HostThunk::D3DKMTOpenAdapterFromGdiDisplayName | HostThunk::D3DKMTOpenAdapterFromHdc | HostThunk::D3DKMTOpenAdapterFromLuid | HostThunk::D3DKMTOpenDevice | HostThunk::D3DKMTOpenKeyedMutex | HostThunk::D3DKMTOpenKeyedMutex2 | HostThunk::D3DKMTOpenResource | HostThunk::D3DKMTOpenResource2 | HostThunk::D3DKMTPnPStart | HostThunk::D3DKMTPnPStop | HostThunk::D3DKMTPowerComponent | HostThunk::D3DKMTPresent | HostThunk::D3DKMTQueryAdapterInfo | HostThunk::D3DKMTQueryAllocationResidency | HostThunk::D3DKMTQueryStatistics | HostThunk::D3DKMTQuerySwapChainInfo | HostThunk::D3DKMTReleaseKeyedMutex | HostThunk::D3DKMTReleaseKeyedMutex2 | HostThunk::D3DKMTRender | HostThunk::D3DKMTSetAllocationPriority | HostThunk::D3DKMTSetCursor | HostThunk::D3DKMTSetCursorPosition | HostThunk::D3DKMTSetDisplayPrivateDriverFormat | HostThunk::D3DKMTSetGammaRamp | HostThunk::D3DKMTSignalSynchronizationObject | HostThunk::D3DKMTSignalSynchronizationObject2 | HostThunk::D3DKMTWaitForSynchronizationObject | HostThunk::D3DKMTWaitForSynchronizationObject2) => {
                 self.dispatch_d3d8thk(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::JetAttachDatabase | HostThunk::JetBeginTransaction | HostThunk::JetCloseDatabase | HostThunk::JetCloseTable | HostThunk::JetCommitTransaction | HostThunk::JetCreateDatabase | HostThunk::JetDetachDatabase | HostThunk::JetGetTableColumnInfo | HostThunk::JetInit | HostThunk::JetOpenDatabase | HostThunk::JetOpenTable | HostThunk::JetRollback | HostThunk::JetTerm) => {
@@ -29790,7 +30006,7 @@ impl PeHostRuntime {
             ref thunk @ (HostThunk::ImageListGetIcon | HostThunk::ImageListGetIconSize | HostThunk::ImageListSetIconSize | HostThunk::PropertySheetW | HostThunk::CmFreeDeviceIdList | HostThunk::CmGetDevNodeStatus | HostThunk::CmGetDeviceIdListW | HostThunk::CmGetDeviceIdListSizeW | HostThunk::CmLocateDevNodeW | HostThunk::PowerGetActiveScheme | HostThunk::PowerReadACValue | HostThunk::PowerReadDCValue | HostThunk::PowerSetActiveScheme | HostThunk::WimApplyImage | HostThunk::WimCloseHandle | HostThunk::WimCreateFile | HostThunk::WimLoadImage | HostThunk::WimUnmountImageHandle | HostThunk::RoActivateInstance | HostThunk::RoGetActivationFactory | HostThunk::RoInitialize | HostThunk::RoUninitialize | HostThunk::CreateXmlReader | HostThunk::CreateXmlReaderInputWithEncoding | HostThunk::CreateXmlWriter | HostThunk::CreateXmlWriterOutputWithEncoding | HostThunk::CoInternetIsFeatureEnabled | HostThunk::CoInternetSetFeatureEnabled | HostThunk::ObtainUserAgentString | HostThunk::UrlDownloadToCacheFileW | HostThunk::UrlDownloadToFileW | HostThunk::WinHttpCrackUrl | HostThunk::WinHttpCreateUrl | HostThunk::WinHttpDetectAutoProxyConfigUrl | HostThunk::WinHttpTimeFromSystemTime | HostThunk::WinHttpTimeToSystemTime | HostThunk::SpCreateObjectFromKey | HostThunk::SpCreateObjectFromToken | HostThunk::SpEnumTokens | HostThunk::SpGetCategoryFromId | HostThunk::SpGetDescription | HostThunk::RasDial | HostThunk::RasEnumConnections | HostThunk::RasGetConnectionStatus | HostThunk::RasGetErrorString | HostThunk::RasHangUp | HostThunk::RasSetEntryProperties | HostThunk::WmiClose | HostThunk::WmiConnect | HostThunk::WmiInitialize | HostThunk::WmiQuery | HostThunk::UiaGetPatternProvider | HostThunk::UiaGetRuntimeId | HostThunk::UiaGetUpdatedCache | HostThunk::UiaLookupId | HostThunk::UiaNavigate | HostThunk::UiaRaiseAutomationEvent | HostThunk::UiaRaiseAutomationPropertyChangedEvent | HostThunk::AccessibleObjectFromEvent | HostThunk::AccessibleObjectFromPoint | HostThunk::AccessibleObjectFromWindow | HostThunk::GetAccessibleObjectFromWindow | HostThunk::GetOleaccVersionInfo | HostThunk::WindowFromAccessibleObject | HostThunk::DhcpCApiCleanup | HostThunk::DhcpCApiInitialize | HostThunk::DhcpReleaseParams | HostThunk::DhcpRenewParams | HostThunk::DhcpRequestParams | HostThunk::DnsFlushResolverCache | HostThunk::DnsQueryConfig | HostThunk::DnsQueryW | HostThunk::DnsRecordListFree | HostThunk::DiInstallDevice | HostThunk::DiInstallDriverW | HostThunk::DiUninstallDevice | HostThunk::UpdateDriverForPlugAndPlayDevicesW | HostThunk::WtsEnumerateSessionsW | HostThunk::WtsFreeMemory | HostThunk::WtsQuerySessionInformationW | HostThunk::WtsQueryUserToken | HostThunk::CreateVssBackupComponents | HostThunk::VssFreeComponent | HostThunk::VssFreeSnapshotProperties | HostThunk::VssFreeWriterMetadata | HostThunk::CreateTextServices | HostThunk::ITextDocument | HostThunk::RichEdit10AnsiWndClass | HostThunk::ShutdownTextServices | HostThunk::DirectSoundCaptureCreate8 | HostThunk::DirectSoundCaptureEnumerateW | HostThunk::DirectSoundCreate8 | HostThunk::DirectSoundEnumerateW) => {
                 self.dispatch_system_sweep(thunk, state, memory)?;
             }
-            ref thunk @ (HostThunk::AtlModuleAddTermFunc | HostThunk::AtlModuleLoadTypeLib | HostThunk::AtlModuleRegisterServer | HostThunk::AtlModuleRegisterTypeLib | HostThunk::AtlModuleUnregisterServer | HostThunk::AtlModuleUnregisterTypeLib | HostThunk::AtlModuleUpdateRegistryFromResource | HostThunk::WicCreateAvifDecoder | HostThunk::WicCreateAvifEncoder | HostThunk::WicCreateHeifDecoder | HostThunk::WicCreateHeifEncoder | HostThunk::WicCreateWebpDecoder | HostThunk::WicCreateWebpEncoder | HostThunk::DllInstall | HostThunk::OverlayCreateHook | HostThunk::OverlayHookWindow | HostThunk::OverlayPresent | HostThunk::OverlayReset | HostThunk::OverlayUnhookWindow | HostThunk::CndInit | HostThunk::MtxDestroy | HostThunk::MtxInit | HostThunk::MtxLock | HostThunk::MtxUnlock | HostThunk::SteamBGetSteamId | HostThunk::SteamBIsSubscribedApp | HostThunk::SteamBLoggedOn | HostThunk::SteamNotifyOfLogin | HostThunk::SteamNotifyOfLogoff | HostThunk::CCSpecificHandler | HostThunk::CurrentException | HostThunk::CurrentExceptionContext | HostThunk::ProcessingThrow | HostThunk::Chkstk | HostThunk::CertSrvBackupEnd | HostThunk::CertSrvBackupPrepare | HostThunk::CertSrvRestoreEnd | HostThunk::CertSrvRestorePrepare | HostThunk::D3dx10CompileFromFile | HostThunk::D3dx10CreateTextureFromFileW | HostThunk::D3dx10GetImageInfoFromFile | HostThunk::D3dx10SaveTextureToMemory | HostThunk::GameuxShfolderpath | HostThunk::GameExplorerInitialize | HostThunk::GameExplorerSetUserAccess | HostThunk::GameExplorerVerifyAccess | HostThunk::ClrCreateManagedInstance | HostThunk::GetClrRuntimeHost | HostThunk::CreateHtmlPropertyPage | HostThunk::IeFrameFactoryConstructor | HostThunk::ShowHtmlDialogEx | HostThunk::IhtmlDocument2 | HostThunk::DsBind | HostThunk::DsBindWithCred | HostThunk::DsMakeSpnW | HostThunk::DsUnbind | HostThunk::AdsBuildEnumerator | HostThunk::AdsGetObject | HostThunk::AdsOpenObject | HostThunk::CertSrvAdminGetCa | HostThunk::CertSrvAdminGetCert | HostThunk::CertSrvAdminSetCa | HostThunk::D3d10CreateDevice1 | HostThunk::D3d10CreateDeviceAndSwapChain1 | HostThunk::Dhcpv6ReleaseParams | HostThunk::Dhcpv6RenewParams | HostThunk::Dhcpv6RequestParams | HostThunk::GetdfDIJoystick | HostThunk::FwpsFilter | HostThunk::FwpsOpenToken | HostThunk::FwpsQueryTokenInformation | HostThunk::IeGetFrameComponent | HostThunk::IeGetWriteableHlink | HostThunk::IeHlink | HostThunk::LoadPerfCounterTextStringsW | HostThunk::SetServiceAsTrusted | HostThunk::UnloadPerfCounterTextStringsW | HostThunk::MsiFormatRecordW | HostThunk::MsiGetLastErrorRecord | HostThunk::MsiProcessMessage | HostThunk::ApplyPatchToFileExW | HostThunk::ApplyPatchToFileW | HostThunk::GetPatchFileSignature | HostThunk::PrintUiEntry | HostThunk::PrintUiToDevice | HostThunk::PrintUiToFile | HostThunk::SamCloseHandle | HostThunk::SamConnect | HostThunk::SamOpenDomain | HostThunk::ScGenerateRelativeName | HostThunk::ScRemoveAllPrivileges | HostThunk::ScSetSecurityDescriptor | HostThunk::RnrCancelQuery | HostThunk::RnrInitialize | HostThunk::RnrQuery | HostThunk::WinStationCloseServer | HostThunk::WinStationEnumerate | HostThunk::WinStationOpenServer | HostThunk::CreateFx) => {
+            ref thunk @ (HostThunk::AtlModuleAddTermFunc | HostThunk::AtlModuleLoadTypeLib | HostThunk::AtlModuleRegisterServer | HostThunk::AtlModuleRegisterTypeLib | HostThunk::AtlModuleUnregisterServer | HostThunk::AtlModuleUnregisterTypeLib | HostThunk::AtlModuleUpdateRegistryFromResource | HostThunk::WicCreateAvifDecoder | HostThunk::WicCreateAvifEncoder | HostThunk::WicCreateHeifDecoder | HostThunk::WicCreateHeifEncoder | HostThunk::WicCreateWebpDecoder | HostThunk::WicCreateWebpEncoder | HostThunk::DllInstall | HostThunk::OverlayCreateHook | HostThunk::OverlayHookWindow | HostThunk::OverlayPresent | HostThunk::OverlayReset | HostThunk::OverlayUnhookWindow | HostThunk::CndInit | HostThunk::MtxDestroy | HostThunk::MtxInit | HostThunk::MtxLock | HostThunk::MtxUnlock | HostThunk::SteamBGetSteamId | HostThunk::SteamBIsSubscribedApp | HostThunk::SteamBLoggedOn | HostThunk::SteamNotifyOfLogin | HostThunk::SteamNotifyOfLogoff | HostThunk::CCSpecificHandler | HostThunk::CurrentException | HostThunk::CurrentExceptionContext | HostThunk::ProcessingThrow | HostThunk::Chkstk | HostThunk::CertSrvBackupEnd | HostThunk::CertSrvBackupPrepare | HostThunk::CertSrvRestoreEnd | HostThunk::CertSrvRestorePrepare | HostThunk::D3dx10CompileFromFile | HostThunk::D3dx10CreateTextureFromFileW | HostThunk::D3dx10GetImageInfoFromFile | HostThunk::D3dx10SaveTextureToMemory | HostThunk::GameuxShfolderpath | HostThunk::GameExplorerInitialize | HostThunk::GameExplorerSetUserAccess | HostThunk::GameExplorerVerifyAccess | HostThunk::ClrCreateManagedInstance | HostThunk::CreateHtmlPropertyPage | HostThunk::IeFrameFactoryConstructor | HostThunk::ShowHtmlDialogEx | HostThunk::IhtmlDocument2 | HostThunk::DsBind | HostThunk::DsBindWithCred | HostThunk::DsMakeSpnW | HostThunk::DsUnbind | HostThunk::AdsBuildEnumerator | HostThunk::AdsGetObject | HostThunk::AdsOpenObject | HostThunk::CertSrvAdminGetCa | HostThunk::CertSrvAdminGetCert | HostThunk::CertSrvAdminSetCa | HostThunk::D3d10CreateDevice1 | HostThunk::D3d10CreateDeviceAndSwapChain1 | HostThunk::Dhcpv6ReleaseParams | HostThunk::Dhcpv6RenewParams | HostThunk::Dhcpv6RequestParams | HostThunk::GetdfDIJoystick | HostThunk::FwpsFilter | HostThunk::FwpsOpenToken | HostThunk::FwpsQueryTokenInformation | HostThunk::IeGetFrameComponent | HostThunk::IeGetWriteableHlink | HostThunk::IeHlink | HostThunk::LoadPerfCounterTextStringsW | HostThunk::SetServiceAsTrusted | HostThunk::UnloadPerfCounterTextStringsW | HostThunk::MsiFormatRecordW | HostThunk::MsiGetLastErrorRecord | HostThunk::MsiProcessMessage | HostThunk::ApplyPatchToFileExW | HostThunk::ApplyPatchToFileW | HostThunk::GetPatchFileSignature | HostThunk::PrintUiEntry | HostThunk::PrintUiToDevice | HostThunk::PrintUiToFile | HostThunk::SamCloseHandle | HostThunk::SamConnect | HostThunk::SamOpenDomain | HostThunk::ScGenerateRelativeName | HostThunk::ScRemoveAllPrivileges | HostThunk::ScSetSecurityDescriptor | HostThunk::RnrCancelQuery | HostThunk::RnrInitialize | HostThunk::RnrQuery | HostThunk::WinStationCloseServer | HostThunk::WinStationEnumerate | HostThunk::WinStationOpenServer | HostThunk::CreateFx) => {
                 self.dispatch_long_tail(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::CredSspGetClientCredential | HostThunk::CredSspGetServerCredential | HostThunk::KerbLogon | HostThunk::KerbRetrieveTicket | HostThunk::NetGetAnyDcName | HostThunk::NetGetDcName | HostThunk::NetWkstaSetInfo | HostThunk::X3dAudioInitialize | HostThunk::Xact3CreateEngine | HostThunk::Xact3CreateEngineWithFlags | HostThunk::NtCreateFileMapping | HostThunk::ImfAsyncResult | HostThunk::ImfGetService | HostThunk::BrowserServerEnum | HostThunk::GdipCreateGraphics | HostThunk::ActivateAudioInterfaceAsync | HostThunk::NetServerGetInfo | HostThunk::DsBindToTopology | HostThunk::IPersistFile | HostThunk::IActiveScript | HostThunk::ID3d12Heap | HostThunk::ImfMediaSink) => {
@@ -30663,11 +30879,22 @@ impl PeHostRuntime {
                     GuestObjectKind::D3d11DeviceContext => bytes == [0xf0, 0xa0, 0xbf, 0xc1, 0x33, 0x51, 0xe0, 0x4a, 0xbb, 0xc4, 0xf1, 0x11, 0x43, 0x5b, 0x09, 0xaf],
                     GuestObjectKind::DxgiFactory => bytes == [0xec, 0x71, 0x6b, 0x7b, 0xc7, 0x21, 0x44, 0xae, 0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1e, 0xa3, 0x69],
                     GuestObjectKind::DxgiSwapChain => bytes == [0xa0, 0x36, 0x0d, 0x31, 0xe7, 0xd2, 0x0a, 0x4c, 0xaa, 0x04, 0x6a, 0x9d, 0x23, 0xb8, 0x88, 0x6a],
-                    GuestObjectKind::D3d12Device => bytes == [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7],
+                    GuestObjectKind::D3d12Device => {
+                        bytes == [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7]
+                            || bytes == [0x3b, 0x17, 0x4f, 0x8b, 0xea, 0x2f, 0x80, 0x4b, 0x8f, 0x58, 0x43, 0x07, 0x19, 0x1a, 0xb9, 0x5d]
+                            || bytes == [0x1b, 0x22, 0x0b, 0xc7, 0xe4, 0x40, 0x17, 0x4a, 0x89, 0xaf, 0x02, 0x5a, 0x07, 0x27, 0xa6, 0xdc]
+                            || bytes == [0x53, 0x4b, 0x01, 0x5c, 0xa1, 0x68, 0x9b, 0x4b, 0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9, 0x35, 0x8b]
+                    }
                     GuestObjectKind::D3d12CommandQueue => bytes == [0xa6, 0x70, 0x08, 0x0e, 0x7e, 0x5d, 0x22, 0x4c, 0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
                     GuestObjectKind::D3d12Fence => bytes == [0xcf, 0xdc, 0x53, 0x0a, 0xd8, 0xc4, 0x91, 0x4b, 0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76],
                     GuestObjectKind::D3d12DescriptorHeap => bytes == [0x1d, 0x47, 0xfb, 0x8e, 0x6c, 0x61, 0x49, 0x4f, 0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
-                    GuestObjectKind::D3d12CommandList => bytes == [0x0f, 0x16, 0x0d, 0x5b, 0x1b, 0xac, 0x85, 0x41, 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x57],
+                    GuestObjectKind::D3d12CommandList
+                    | GuestObjectKind::D3d12GraphicsCommandList => {
+                        bytes == [0x0f, 0x16, 0x0d, 0x5b, 0x1b, 0xac, 0x85, 0x41, 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x57]
+                            || bytes == [0x15, 0xc0, 0x13, 0x70, 0x61, 0xd1, 0x63, 0x4b, 0xa0, 0x8c, 0x23, 0x85, 0x52, 0xdd, 0x8a, 0xcc]
+                    }
+                    GuestObjectKind::D3d12StateObject => bytes == [0x43, 0x69, 0x01, 0x47, 0xa8, 0xfc, 0x94, 0x45, 0x93, 0xea, 0xaf, 0x25, 0x8b, 0x55, 0x34, 0x6d],
+                    GuestObjectKind::D3d12CommandSignature => bytes == [0x7c, 0x79, 0x6a, 0xc3, 0x80, 0xec, 0x0a, 0x4f, 0x89, 0x85, 0xa7, 0xb2, 0x47, 0x50, 0x82, 0xd1],
                     _ => false,
                 };
                 if matches {
@@ -32104,7 +32331,7 @@ impl PeHostRuntime {
                         pending_thread.suspended = 1;
                         let _ = self.win32.set_thread_suspend_count(thread_id, 1);
                     }
-                    self.pending_guest_threads.push_back(pending_thread);
+                    self.enqueue_pending_guest_thread(pending_thread);
                 }
                 // Steam run instrumentation (no behavior change): count the
                 // thread creation; the first CreateThread from the initial
@@ -37556,7 +37783,7 @@ impl PeHostRuntime {
                         pending_thread.suspended = 1;
                         let _ = self.win32.set_thread_suspend_count(thread_id, 1);
                     }
-                    self.pending_guest_threads.push_back(pending_thread);
+                    self.enqueue_pending_guest_thread(pending_thread);
                 }
                 state.set(Register::Rax, u64::from(thread_handle));
                 self.last_error = 0;
@@ -37598,7 +37825,7 @@ impl PeHostRuntime {
                         start_address,
                         parameter,
                     )?;
-                    self.pending_guest_threads.push_back(pending_thread);
+                    self.enqueue_pending_guest_thread(pending_thread);
                 }
                 // Steam run instrumentation (no behavior change): count the
                 // thread creation (`_beginthread` is not CreateThread, so it
@@ -58393,7 +58620,7 @@ impl PeHostRuntime {
                     && let Ok(pending_thread) =
                         self.prepare_guest_thread_entry(memory, thread_handle, stack_size, start_address, parameter)
                     {
-                        self.pending_guest_threads.push_back(pending_thread);
+                        self.enqueue_pending_guest_thread(pending_thread);
                     }
                 state.set(Register::Rax, thread_handle as u64);
                 self.last_error = 0;
@@ -58475,7 +58702,7 @@ impl PeHostRuntime {
                     if let Ok(pending) = self.prepare_guest_thread_entry(
                         memory, thread_handle, 0, callback, context,
                     ) {
-                        self.pending_guest_threads.push_back(pending);
+                        self.enqueue_pending_guest_thread(pending);
                     }
                 }
                 state.set(Register::Rax, 1); // success
@@ -58540,7 +58767,7 @@ impl PeHostRuntime {
                         if let Ok(pending) = self.prepare_guest_thread_entry(
                             memory, thread_handle, 0, callback, context,
                         ) {
-                            self.pending_guest_threads.push_back(pending);
+                            self.enqueue_pending_guest_thread(pending);
                         }
                     }
                 }
@@ -58672,12 +58899,14 @@ impl PeHostRuntime {
                     // Initial due-time wait
                     std::thread::sleep(std::time::Duration::from_millis(due_time as u64));
                     sink.lock().unwrap().push_back((callback, parameter));
+                    crate::runtime::scheduler::notify_pump_wake();
 
                     // If period > 0, repeat at the period interval
                     if period > 0 {
                         loop {
                             std::thread::sleep(std::time::Duration::from_millis(period as u64));
                             sink.lock().unwrap().push_back((callback, parameter));
+                            crate::runtime::scheduler::notify_pump_wake();
                         }
                     }
                 });
@@ -58745,6 +58974,7 @@ impl PeHostRuntime {
                         };
                         std::thread::sleep(std::time::Duration::from_millis(poll_ms));
                         sink.lock().unwrap().push_back((callback, context));
+                        crate::runtime::scheduler::notify_pump_wake();
                         if one_shot {
                             break;
                         }
@@ -66371,6 +66601,96 @@ impl PeHostRuntime {
             }
             GuestObjectKind::D3d12Fence => self.destroy_d3d12_fence_object(address)?,
             GuestObjectKind::D3d12Resource => self.destroy_d3d12_resource_object(address)?,
+            GuestObjectKind::D3d12StateObject => {
+                self.guest_objects.remove(&address);
+                self.d3d12_object_names.remove(&address);
+                self.d3d12_private_data.remove(&address);
+                if let Some(handle) = self.d3d12_state_object_handles.remove(&address) {
+                    self.d3d12_runtime.release_state_object(handle)?;
+                }
+                if let Some(device) = self.d3d12_child_object_devices.remove(&address) {
+                    self.release_guest_object(device)?;
+                }
+            }
+            GuestObjectKind::D3d12CommandSignature => {
+                self.guest_objects.remove(&address);
+                self.d3d12_object_names.remove(&address);
+                self.d3d12_private_data.remove(&address);
+                if let Some(handle) = self.d3d12_command_signature_handles.remove(&address) {
+                    self.d3d12_runtime.destroy_command_signature(handle)?;
+                }
+                if let Some(device) = self.d3d12_child_object_devices.remove(&address) {
+                    self.release_guest_object(device)?;
+                }
+            }
+            GuestObjectKind::DmlDevice => {
+                self.guest_objects.remove(&address);
+                self.dml_private_data.remove(&address);
+                self.dml_object_names.remove(&address);
+                let private_interfaces = self.dml_private_interfaces.remove(&address);
+                if let Some(handle) = self.dml_object_handles.remove(&address) {
+                    self.dml_device_objects.remove(&handle);
+                    let parent_device = self
+                        .d3d12_runtime
+                        .directml()
+                        .devices()
+                        .get(&handle)
+                        .map(|record| record.parent_device);
+                    self.d3d12_runtime
+                        .directml_mut()
+                        .destroy_device(handle)
+                        .map_err(|error| error.to_app_error())?;
+                    if let Some(parent_device) = parent_device {
+                        self.release_guest_object(parent_device)?;
+                    }
+                }
+                if let Some(private_interfaces) = private_interfaces {
+                    for interface in private_interfaces.into_values() {
+                        self.release_guest_object(interface)?;
+                    }
+                }
+            }
+            kind @ (GuestObjectKind::DmlOperator
+            | GuestObjectKind::DmlCompiledOperator
+            | GuestObjectKind::DmlOperatorInitializer
+            | GuestObjectKind::DmlCommandRecorder
+            | GuestObjectKind::DmlBindingTable) => {
+                self.guest_objects.remove(&address);
+                self.dml_private_data.remove(&address);
+                self.dml_object_names.remove(&address);
+                let private_interfaces = self.dml_private_interfaces.remove(&address);
+                let handle = self.dml_object_handles.remove(&address);
+                let device_object = self.dml_object_devices.remove(&address);
+                if let Some(handle) = handle {
+                    let directml = self.d3d12_runtime.directml_mut();
+                    match kind {
+                        GuestObjectKind::DmlOperator => directml
+                            .destroy_operator(handle)
+                            .map_err(|e| e.to_app_error())?,
+                        GuestObjectKind::DmlCompiledOperator => directml
+                            .destroy_compiled(handle)
+                            .map_err(|e| e.to_app_error())?,
+                        GuestObjectKind::DmlOperatorInitializer => directml
+                            .destroy_operator_initializer(handle)
+                            .map_err(|e| e.to_app_error())?,
+                        GuestObjectKind::DmlCommandRecorder => directml
+                            .destroy_command_recorder(handle)
+                            .map_err(|e| e.to_app_error())?,
+                        GuestObjectKind::DmlBindingTable => directml
+                            .destroy_binding_table(handle)
+                            .map_err(|e| e.to_app_error())?,
+                        _ => unreachable!("DML child kind arm"),
+                    }
+                }
+                if let Some(device_object) = device_object {
+                    self.release_guest_object(device_object)?;
+                }
+                if let Some(private_interfaces) = private_interfaces {
+                    for interface in private_interfaces.into_values() {
+                        self.release_guest_object(interface)?;
+                    }
+                }
+            }
             GuestObjectKind::D3d11Buffer => self.destroy_d3d11_buffer_object(address)?,
             GuestObjectKind::D3d11Texture2D => self.destroy_d3d11_texture_object(address)?,
             GuestObjectKind::D3d11View => self.destroy_d3d11_view_object(address)?,
@@ -68263,6 +68583,12 @@ impl HostThunk {
             }
             ("d3d12.dll", ImportSymbol::ByName { name, .. }) if name == "D3D12CreateDevice" => {
                 Self::D3D12CreateDevice
+            }
+            ("dml.dll", ImportSymbol::ByName { name, .. }) if name == "DMLCreateDevice" => {
+                Self::DMLCreateDevice
+            }
+            ("dml.dll", ImportSymbol::ByName { name, .. }) if name == "DMLCreateDevice1" => {
+                Self::DMLCreateDevice1
             }
             ("d3d9.dll", ImportSymbol::ByName { name, .. }) if name == "Direct3DCreate9" => {
                 Self::Direct3DCreate9
@@ -77331,6 +77657,36 @@ impl HostThunk {
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTEnumOutputs" => {
                 Self::D3DKMTEnumOutputs
             }
+            ("d3d8thk.dll" | "gdi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTEscape" =>
+            {
+                Self::D3DKMTEscape
+            }
+            ("d3d8thk.dll" | "gdi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTMapGpuVirtualAddress" =>
+            {
+                Self::D3DKMTMapGpuVirtualAddress
+            }
+            ("d3d8thk.dll" | "gdi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTPagingFence" =>
+            {
+                Self::D3DKMTPagingFence
+            }
+            ("d3d8thk.dll" | "gdi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTQueryVideoMemoryInfo" =>
+            {
+                Self::D3DKMTQueryVideoMemoryInfo
+            }
+            ("d3d8thk.dll" | "gdi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTSubmitCommand" =>
+            {
+                Self::D3DKMTSubmitCommand
+            }
+            ("d3d8thk.dll" | "gdi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTUnmapGpuVirtualAddress" =>
+            {
+                Self::D3DKMTUnmapGpuVirtualAddress
+            }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
                 if name == "D3DKMTGetDisplayModeList" =>
             {
@@ -85615,9 +85971,16 @@ mod tests {
                 0,
                 "overlapped ConnectNamedPipe returns FALSE"
             );
+            let parked_thread = runtime
+                .pending_guest_threads
+                .iter()
+                .find(|thread| thread.wait.is_some())
+                .map(|thread| thread.thread_id)
+                .expect("the waiting thread is parked");
             assert_eq!(
-                runtime.last_error, ERROR_IO_PENDING,
-                "overlapped ConnectNamedPipe reports ERROR_IO_PENDING"
+                runtime.guest_thread_last_error(parked_thread, &memory),
+                Some(ERROR_IO_PENDING),
+                "overlapped ConnectNamedPipe reports ERROR_IO_PENDING in the waiting thread"
             );
             let id = read_u32(&memory, overlapped_ptr).expect("overlapped internal");
             assert!(id != 0, "request id must be recorded in Internal");
@@ -111130,7 +111493,7 @@ mod tests {
                     challenge_thunk,
                     &[
                         verifier as u32,
-                        60_000,
+                        600_000,
                         challenge_out as u32,
                         0,
                         challenge_required as u32
@@ -111144,7 +111507,7 @@ mod tests {
                     &mut runtime,
                     &mut memory,
                     challenge_thunk,
-                    &[verifier as u32, 60_000, 0, 48, 0]
+                    &[verifier as u32, 600_000, 0, 48, 0]
                 ),
                 u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()),
                 "a null challenge output is invalid"
@@ -111155,7 +111518,7 @@ mod tests {
                     &mut runtime,
                     &mut memory,
                     challenge_thunk,
-                    &[0, 60_000, challenge_out as u32, 48, 0]
+                    &[0, 600_000, challenge_out as u32, 48, 0]
                 ),
                 u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
             );
@@ -111180,7 +111543,7 @@ mod tests {
                         challenge_thunk,
                         &[
                             verifier as u32,
-                            60_000,
+                            600_000,
                             nonce_out as u32,
                             48,
                             challenge_required as u32
@@ -111337,7 +111700,7 @@ mod tests {
                     no_provider_challenge_thunk,
                     &[
                         no_provider_verifier as u32,
-                        60_000,
+                        600_000,
                         no_provider_challenge_out as u32,
                         48,
                         no_provider_required as u32
@@ -112718,6 +113081,78 @@ mod tests {
     }
 
     #[test]
+    fn whole_module_precompile_compiles_reachable_blocks_and_skips_without_jit() {
+        let (mut runtime, _temp) = test_runtime("aot-precompile");
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &[0x90, 0x90, 0xC3]);
+        runtime.mapped_image_base = 0x1000;
+        runtime.mapped_image_size = 3;
+        assert_eq!(
+            runtime
+                .precompile_code_range(&memory, 0x1000, 0x1003, 8)
+                .expect("precompile without JIT"),
+            None,
+            "a disabled JIT has nothing to precompile"
+        );
+        assert_eq!(
+            runtime
+                .precompile_image(&memory, 0x1000)
+                .expect("image precompile without JIT"),
+            None
+        );
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "casa1-precompile-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut jit = crate::jit::JitRuntime::new(GuestArch::X64);
+        jit.set_aot_cache_dir(Some(cache_dir.clone()));
+        runtime.jit_runtime = Some(jit);
+        let report = runtime
+            .precompile_code_range(&memory, 0x1000, 0x1003, 8)
+            .expect("precompile with JIT")
+            .expect("JIT is installed");
+        assert_eq!(report.blocks, 1);
+        assert_eq!(report.compiled, 1);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            runtime
+                .precompile_image(&memory, 0x1000)
+                .expect("image precompile")
+                .expect("JIT is installed")
+                .compiled,
+            1
+        );
+        runtime.aot_precompile = false;
+        assert_eq!(
+            runtime.precompile_image(&memory, 0x1000).expect("disabled"),
+            None,
+            "the precompile switch is honored"
+        );
+        runtime.aot_precompile = true;
+
+        // A fresh runtime for the same image must reuse the persisted record.
+        let (mut second, _second_temp) = test_runtime("aot-precompile-second");
+        configure_runtime_for_test_arch(&mut second, GuestArch::X64);
+        let mut second_jit = crate::jit::JitRuntime::new(GuestArch::X64);
+        second_jit.set_aot_cache_dir(Some(cache_dir.clone()));
+        second.jit_runtime = Some(second_jit);
+        let report = second
+            .precompile_code_range(&memory, 0x1000, 0x1003, 8)
+            .expect("second precompile")
+            .expect("JIT is installed");
+        assert_eq!(report.compiled, 1);
+        let hits = second.jit_runtime.as_ref().expect("JIT").aot_metrics().0;
+        assert_ne!(hits, 0, "the second runtime loaded the AOT record");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
     fn jit_inlined_api_call_site_matches_dispatch_no_mismatch() {
         let (mut runtime, _temp) = test_runtime("jit-inline-site");
         configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
@@ -112776,6 +113211,4313 @@ mod tests {
         }
         assert_eq!(runtime.last_error, 0x1234);
         assert_eq!(state.get(Register::Rsp), sp_before);
+    }
+
+    #[test]
+    fn d3d12_dml_dll_imports_resolve_and_reject_unsupported_registry_export() {
+        let import = |name: &str| ResolvedImport {
+            requested_module: "dml.dll".to_string(),
+            resolved_module: "dml.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: name.to_string(),
+            },
+            iat_rva: 0,
+            export: ExportSymbol {
+                ordinal: 0,
+                name: Some(name.to_string()),
+                target: ExportTarget::Rva(0),
+            },
+        };
+        assert!(matches!(
+            HostThunk::from_import(&import("DMLCreateDevice")),
+            HostThunk::DMLCreateDevice
+        ));
+        assert!(matches!(
+            HostThunk::from_import(&import("DMLCreateDevice1")),
+            HostThunk::DMLCreateDevice1
+        ));
+        match HostThunk::from_import(&import("DMLCreateOperatorRegistry")) {
+            HostThunk::Unsupported { dll, symbol } => {
+                assert_eq!(dll, "dml.dll");
+                assert_eq!(symbol, "DMLCreateOperatorRegistry");
+            }
+            other => panic!("unexpected DML registry thunk: {other:?}"),
+        }
+    }
+
+    fn create_test_d3d12_device(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        stack: u64,
+        out: u64,
+    ) -> u64 {
+        memory.map_bytes(stack, &vec![0u8; 0x400]);
+        memory.map_bytes(out, &[0u8; 8]);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rsp, stack);
+        state.set(Register::Rcx, 0);
+        state.set(Register::Rdx, 0);
+        state.set(Register::R8, 0);
+        state.set(Register::R9, out);
+        memory.write_u64(stack, 0x1000_0001);
+        let thunk = runtime.alloc_host_thunk(HostThunk::D3D12CreateDevice);
+        runtime
+            .dispatch_import(thunk, &mut state, memory)
+            .expect("dispatch D3D12CreateDevice");
+        assert_eq!(state.get(Register::Rax), 0);
+        memory.read_u64(out).expect("device object")
+    }
+
+    fn create_test_d3d12_command_list(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        stack: u64,
+        device: u64,
+    ) -> u64 {
+        memory.map_bytes(stack, &vec![0u8; 0x600]);
+        let allocator_out = stack + 0x300;
+        let list_out = stack + 0x308;
+        memory.map_bytes(allocator_out, &[0u8; 8]);
+        memory.map_bytes(list_out, &[0u8; 8]);
+        let device_vtable = memory.read_u64(device).expect("device vtable");
+        let create_allocator = memory
+            .read_u64(device_vtable + 9 * 8)
+            .expect("CreateCommandAllocator");
+        let create_list = memory
+            .read_u64(device_vtable + 12 * 8)
+            .expect("CreateCommandList");
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rsp, stack);
+        state.set(Register::Rcx, device);
+        state.set(Register::Rdx, 0);
+        state.set(Register::R8, 0);
+        state.set(Register::R9, allocator_out);
+        memory.write_u64(stack, 0x1000_0002);
+        runtime
+            .dispatch_import(create_allocator, &mut state, memory)
+            .expect("dispatch CreateCommandAllocator");
+        assert_eq!(state.get(Register::Rax), 0);
+        let allocator = memory.read_u64(allocator_out).expect("allocator");
+        state.set(Register::Rsp, stack + 0x40);
+        state.set(Register::Rcx, device);
+        state.set(Register::Rdx, 0);
+        state.set(Register::R8, 0);
+        state.set(Register::R9, allocator);
+        memory.write_u64(stack + 0x40, 0x1000_0003);
+        memory.write_u64(stack + 0x40 + 0x28, 0);
+        memory.write_u64(stack + 0x40 + 0x38, list_out);
+        runtime
+            .dispatch_import(create_list, &mut state, memory)
+            .expect("dispatch CreateCommandList");
+        assert_eq!(state.get(Register::Rax), 0);
+        memory.read_u64(list_out).expect("command list")
+    }
+
+    fn make_ray_dxil_container(kind: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        let descriptors_end = 12u32 + 3 * 12;
+        let prog_off = descriptors_end;
+        let prog_size: u32 = 24 + 4;
+        data.extend_from_slice(b"PROG");
+        data.extend_from_slice(&prog_off.to_le_bytes());
+        data.extend_from_slice(&prog_size.to_le_bytes());
+        let sign_off = prog_off + prog_size;
+        data.extend_from_slice(b"SIGN");
+        data.extend_from_slice(&sign_off.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        let meta_text =
+            format!("shader_kind={kind}\npayloadSizeInBytes=16\nattributeSizeInBytes=8\n");
+        let meta_off = sign_off + 4;
+        data.extend_from_slice(b"META");
+        data.extend_from_slice(&meta_off.to_le_bytes());
+        data.extend_from_slice(&((5 + meta_text.len()) as u32).to_le_bytes());
+        while data.len() < prog_off as usize {
+            data.push(0);
+        }
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&64u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0x4243_C0DEu32.to_be_bytes());
+        data.extend_from_slice(b"SIG1");
+        data.push(4);
+        data.extend_from_slice(b"main");
+        data.extend_from_slice(meta_text.as_bytes());
+        data
+    }
+
+    fn make_test_dxil_container(instruction_count: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        let descriptors_end = 12u32 + 3 * 12;
+        let prog_off = descriptors_end;
+        let prog_size: u32 = 24 + 4;
+        data.extend_from_slice(b"PROG");
+        data.extend_from_slice(&prog_off.to_le_bytes());
+        data.extend_from_slice(&prog_size.to_le_bytes());
+        let sign_off = prog_off + prog_size;
+        data.extend_from_slice(b"SIGN");
+        data.extend_from_slice(&sign_off.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        let meta_off = sign_off + 4;
+        data.extend_from_slice(b"META");
+        data.extend_from_slice(&meta_off.to_le_bytes());
+        data.extend_from_slice(&5u32.to_le_bytes());
+        while data.len() < prog_off as usize {
+            data.push(0);
+        }
+        data.extend_from_slice(&instruction_count.to_le_bytes());
+        data.extend_from_slice(&64u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0x4243_C0DEu32.to_be_bytes());
+        data.extend_from_slice(b"SIG1");
+        data.push(4);
+        data.extend_from_slice(b"main");
+        data
+    }
+
+    fn build_raytracing_state_object_desc(
+        memory: &mut MemoryImage,
+        base: u64,
+        export: &str,
+    ) -> u64 {
+        let desc = base;
+        let subobjects = base + 0x100;
+        let config = base + 0x200;
+        let dxil = base + 0x210;
+        let shader_config = base + 0x250;
+        let pipeline_config = base + 0x258;
+        let export_desc = base + 0x260;
+        let bytecode = base + 0x1000;
+        let export_name = base + 0x1100;
+        write_u32(memory, desc, 3); // D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE
+        write_u32(memory, desc + 4, 4);
+        write_u64(memory, desc + 8, subobjects);
+        write_u32(memory, subobjects, 0); // STATE_OBJECT_CONFIG
+        write_u64(memory, subobjects + 8, config);
+        write_u32(memory, config, 0x4); // ALLOW_STATE_OBJECT_ADDITIONS
+        write_u32(memory, subobjects + 16, 5); // DXIL_LIBRARY
+        write_u64(memory, subobjects + 24, dxil);
+        write_u64(memory, dxil, bytecode);
+        write_u64(memory, dxil + 8, 4);
+        write_u32(memory, dxil + 16, 1);
+        write_u64(memory, dxil + 24, export_desc);
+        for (index, byte) in [0x44u8, 0x58, 0x42, 0x43].iter().enumerate() {
+            memory.write_u8(bytecode + index as u64, *byte);
+        }
+        for (index, unit) in export.encode_utf16().enumerate() {
+            memory.write_u16(export_name + index as u64 * 2, unit);
+        }
+        write_u64(memory, export_desc, export_name);
+        write_u64(memory, export_desc + 8, 0);
+        write_u32(memory, export_desc + 16, 0);
+        write_u32(memory, subobjects + 32, 9); // RAYTRACING_SHADER_CONFIG
+        write_u64(memory, subobjects + 40, shader_config);
+        write_u32(memory, shader_config, 16);
+        write_u32(memory, shader_config + 4, 8);
+        write_u32(memory, subobjects + 48, 10); // RAYTRACING_PIPELINE_CONFIG
+        write_u64(memory, subobjects + 56, pipeline_config);
+        write_u32(memory, pipeline_config, 1);
+        desc
+    }
+
+    #[test]
+    fn d3d12_state_object_com_lifetime_add_and_query_interface() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "d3d12-state-com",
+                GeArch::X64,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            let mut memory = MemoryImage::default();
+            let base = 0x50_0000;
+            memory.map_bytes(base, &vec![0u8; 0x20000]);
+            let device = create_test_d3d12_device(&mut runtime, &mut memory, base, base + 0x20);
+            let device_vtable = memory.read_u64(device).expect("device vtable");
+            let create_state_object = memory
+                .read_u64(device_vtable + 61 * 8)
+                .expect("CreateStateObject thunk");
+            let add_to_state_object = memory
+                .read_u64(device_vtable + 65 * 8)
+                .expect("AddToStateObject thunk");
+            assert_ne!(create_state_object, 0);
+            assert_ne!(add_to_state_object, 0);
+
+            // ID3D12Device5/7 must be reachable through QueryInterface.
+            let device_qi = memory.read_u64(device_vtable).expect("device QI");
+            let iid_device7 = base + 0x8600;
+            memory.map_bytes(iid_device7, &[0u8; 16]);
+            let device7_iid: [u8; 16] = [
+                0x53, 0x4b, 0x01, 0x5c, 0xa1, 0x68, 0x9b, 0x4b, 0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9,
+                0x35, 0x8b,
+            ];
+            for (index, byte) in device7_iid.iter().enumerate() {
+                memory.write_u8(iid_device7 + index as u64, *byte);
+            }
+            let device_qi_out = base + 0x8610;
+            memory.map_bytes(device_qi_out, &[0u8; 8]);
+            let mut state = CpuState::new(GuestArch::X64);
+            state.set(Register::Rsp, base + 0x600);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, iid_device7);
+            state.set(Register::R8, device_qi_out);
+            memory.write_u64(base + 0x600, 0x1000_0009);
+            runtime
+                .dispatch_import(device_qi, &mut state, &mut memory)
+                .expect("device QI Device7");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(
+                memory.read_u64(device_qi_out).expect("device QI ptr"),
+                device
+            );
+            let bad_device_iid = base + 0x8620;
+            memory.map_bytes(bad_device_iid, &[0xDD; 16]);
+            state.set(Register::Rsp, base + 0x640);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, bad_device_iid);
+            state.set(Register::R8, device_qi_out);
+            memory.write_u64(base + 0x640, 0x1000_000a);
+            runtime
+                .dispatch_import(device_qi, &mut state, &mut memory)
+                .expect("device bad QI");
+            assert_eq!(state.get(Register::Rax), E_NOINTERFACE);
+
+            let desc = build_raytracing_state_object_desc(&mut memory, base + 0x1000, "raygen");
+            let iid = base + 0x8800;
+            let out = base + 0x8900;
+            memory.map_bytes(iid, &[0u8; 16]);
+            memory.map_bytes(out, &[0u8; 8]);
+            let iid_bytes: [u8; 16] = [
+                0x43, 0x69, 0x01, 0x47, 0xa8, 0xfc, 0x94, 0x45, 0x93, 0xea, 0xaf, 0x25, 0x8b, 0x55,
+                0x34, 0x6d,
+            ];
+            for (index, byte) in iid_bytes.iter().enumerate() {
+                memory.write_u8(iid + index as u64, *byte);
+            }
+            let mut state = CpuState::new(GuestArch::X64);
+            state.set(Register::Rsp, base + 0x100);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, desc);
+            state.set(Register::R8, iid);
+            state.set(Register::R9, out);
+            memory.write_u64(base + 0x100, 0x1000_0010);
+            runtime
+                .dispatch_import(create_state_object, &mut state, &mut memory)
+                .expect("CreateStateObject");
+            assert_eq!(state.get(Register::Rax), 0);
+            let state_object = memory.read_u64(out).expect("state object");
+            assert_eq!(
+                runtime.guest_object_kind(state_object).expect("kind"),
+                GuestObjectKind::D3d12StateObject
+            );
+            assert_eq!(runtime.d3d12_state_object_handles.len(), 1);
+            assert_eq!(runtime.d3d12_runtime.state_objects().count(), 1);
+
+            let vtable = memory.read_u64(state_object).expect("state object vtable");
+            let query_interface = memory.read_u64(vtable).expect("QueryInterface");
+            let release = memory.read_u64(vtable + 16).expect("Release");
+            let out2 = base + 0x8100;
+            memory.map_bytes(out2, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x140);
+            state.set(Register::Rcx, state_object);
+            state.set(Register::Rdx, iid);
+            state.set(Register::R8, out2);
+            memory.write_u64(base + 0x140, 0x1000_0011);
+            runtime
+                .dispatch_import(query_interface, &mut state, &mut memory)
+                .expect("state object QueryInterface");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(
+                memory.read_u64(out2).expect("queried pointer"),
+                state_object
+            );
+
+            let bad_iid = base + 0x8110;
+            memory.map_bytes(bad_iid, &[0xAA; 16]);
+            state.set(Register::Rsp, base + 0x180);
+            state.set(Register::Rcx, state_object);
+            state.set(Register::Rdx, bad_iid);
+            state.set(Register::R8, out2);
+            memory.write_u64(base + 0x180, 0x1000_0012);
+            runtime
+                .dispatch_import(query_interface, &mut state, &mut memory)
+                .expect("bad QueryInterface");
+            assert_eq!(state.get(Register::Rax), E_NOINTERFACE);
+            assert_eq!(memory.read_u64(out2).expect("failed pointer"), 0);
+
+            // QI added a reference; release it plus the creation reference.
+            state.set(Register::Rsp, base + 0x1c0);
+            state.set(Register::Rcx, state_object);
+            memory.write_u64(base + 0x1c0, 0x1000_0013);
+            runtime
+                .dispatch_import(release, &mut state, &mut memory)
+                .expect("release QI reference");
+            assert_eq!(state.get(Register::Rax), 1);
+            state.set(Register::Rsp, base + 0x200);
+            state.set(Register::Rcx, state_object);
+            memory.write_u64(base + 0x200, 0x1000_0014);
+            runtime
+                .dispatch_import(release, &mut state, &mut memory)
+                .expect("release creation reference");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert!(runtime.d3d12_state_object_handles.is_empty());
+            assert_eq!(runtime.d3d12_runtime.state_objects().count(), 0);
+
+            // Double release of a destroyed COM object is an exact error.
+            state.set(Register::Rsp, base + 0x240);
+            state.set(Register::Rcx, state_object);
+            memory.write_u64(base + 0x240, 0x1000_0015);
+            let error = runtime
+                .dispatch_import(release, &mut state, &mut memory)
+                .expect_err("double release must fail");
+            assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+
+            // Recreate a parent, grow it with AddToStateObject, then release
+            // both COM objects across the addition.
+            let parent_out = base + 0x8200;
+            memory.map_bytes(parent_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x280);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, desc);
+            state.set(Register::R8, iid);
+            state.set(Register::R9, parent_out);
+            memory.write_u64(base + 0x280, 0x1000_0016);
+            runtime
+                .dispatch_import(create_state_object, &mut state, &mut memory)
+                .expect("recreate parent");
+            let parent = memory.read_u64(parent_out).expect("parent");
+            let addition = build_raytracing_state_object_desc(&mut memory, base + 0x9000, "miss");
+            let child_out = base + 0x8208;
+            memory.map_bytes(child_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x2c0);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, addition);
+            state.set(Register::R8, parent);
+            state.set(Register::R9, iid);
+            memory.write_u64(base + 0x2c0, 0x1000_0017);
+            memory.write_u64(base + 0x2c0 + 0x28, child_out);
+            runtime
+                .dispatch_import(add_to_state_object, &mut state, &mut memory)
+                .expect("AddToStateObject");
+            assert_eq!(state.get(Register::Rax), 0);
+            let child = memory.read_u64(child_out).expect("child state object");
+            assert_ne!(child, parent);
+            assert_eq!(runtime.d3d12_state_object_handles.len(), 2);
+            let child_vtable = memory.read_u64(child).expect("child vtable");
+            let child_release = memory.read_u64(child_vtable + 16).expect("child Release");
+            for (slot, object) in [(0x300u64, child), (0x340, parent)] {
+                state.set(Register::Rsp, base + slot);
+                state.set(Register::Rcx, object);
+                memory.write_u64(base + slot, 0x1000_0020 + slot);
+                runtime
+                    .dispatch_import(child_release, &mut state, &mut memory)
+                    .expect("release state object chain");
+                assert_eq!(state.get(Register::Rax), 0);
+            }
+            assert!(runtime.d3d12_state_object_handles.is_empty());
+            assert_eq!(runtime.d3d12_runtime.state_objects().count(), 0);
+
+            // Null creation arguments fail before any object is produced.
+            state.set(Register::Rsp, base + 0x380);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, iid);
+            state.set(Register::R9, out);
+            memory.write_u64(base + 0x380, 0x1000_0030);
+            runtime
+                .dispatch_import(create_state_object, &mut state, &mut memory)
+                .expect("null desc");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+            state.set(Register::Rsp, base + 0x3c0);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, parent);
+            state.set(Register::R9, iid);
+            memory.write_u64(base + 0x3c0, 0x1000_0031);
+            memory.write_u64(base + 0x3c0 + 0x28, child_out);
+            runtime
+                .dispatch_import(add_to_state_object, &mut state, &mut memory)
+                .expect("null addition");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+        });
+    }
+
+    #[test]
+    fn d3d12_command_signature_com_lifetime_and_execute_indirect() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "d3d12-signature-com",
+                GeArch::X64,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            let mut memory = MemoryImage::default();
+            let base = 0x58_0000;
+            memory.map_bytes(base, &vec![0u8; 0x20000]);
+            let device = create_test_d3d12_device(&mut runtime, &mut memory, base, base + 0x20);
+            let list =
+                create_test_d3d12_command_list(&mut runtime, &mut memory, base + 0x1000, device);
+            let device_vtable = memory.read_u64(device).expect("device vtable");
+            let create_signature = memory
+                .read_u64(device_vtable + 10 * 8)
+                .expect("CreateCommandSignature");
+            let signature_desc = base + 0x2000;
+            let argument_desc = base + 0x2040;
+            let signature_out = base + 0x3000;
+            memory.map_bytes(signature_desc, &[0u8; 32]);
+            memory.map_bytes(argument_desc, &[0u8; 16]);
+            memory.map_bytes(signature_out, &[0u8; 8]);
+            write_u32(&mut memory, signature_desc, 16);
+            write_u32(&mut memory, signature_desc + 4, 1);
+            write_u64(&mut memory, signature_desc + 8, argument_desc);
+            write_u32(&mut memory, signature_desc + 16, 0);
+            write_u32(&mut memory, argument_desc, 0); // DRAW
+            let mut state = CpuState::new(GuestArch::X64);
+            state.set(Register::Rsp, base + 0x100);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, signature_desc);
+            state.set(Register::R8, signature_out);
+            memory.write_u64(base + 0x100, 0x1000_0400);
+            runtime
+                .dispatch_import(create_signature, &mut state, &mut memory)
+                .expect("CreateCommandSignature");
+            assert_eq!(state.get(Register::Rax), 0);
+            let signature = memory.read_u64(signature_out).expect("signature object");
+            assert_eq!(
+                runtime
+                    .guest_object_kind(signature)
+                    .expect("signature kind"),
+                GuestObjectKind::D3d12CommandSignature
+            );
+            assert_eq!(runtime.d3d12_command_signature_handles.len(), 1);
+
+            let vtable = memory.read_u64(signature).expect("signature vtable");
+            let query_interface = memory.read_u64(vtable).expect("QI");
+            let release = memory.read_u64(vtable + 16).expect("Release");
+            let iid = base + 0x3100;
+            memory.map_bytes(iid, &[0u8; 16]);
+            let iid_bytes: [u8; 16] = [
+                0x7c, 0x79, 0x6a, 0xc3, 0x80, 0xec, 0x0a, 0x4f, 0x89, 0x85, 0xa7, 0xb2, 0x47, 0x50,
+                0x82, 0xd1,
+            ];
+            for (index, byte) in iid_bytes.iter().enumerate() {
+                memory.write_u8(iid + index as u64, *byte);
+            }
+            let qi_out = base + 0x3110;
+            memory.map_bytes(qi_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x140);
+            state.set(Register::Rcx, signature);
+            state.set(Register::Rdx, iid);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x140, 0x1000_0401);
+            runtime
+                .dispatch_import(query_interface, &mut state, &mut memory)
+                .expect("signature QI");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(
+                memory.read_u64(qi_out).expect("signature QI ptr"),
+                signature
+            );
+            let bad_iid = base + 0x3120;
+            memory.map_bytes(bad_iid, &[0xBB; 16]);
+            state.set(Register::Rsp, base + 0x180);
+            state.set(Register::Rcx, signature);
+            state.set(Register::Rdx, bad_iid);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x180, 0x1000_0402);
+            runtime
+                .dispatch_import(query_interface, &mut state, &mut memory)
+                .expect("signature bad QI");
+            assert_eq!(state.get(Register::Rax), E_NOINTERFACE);
+
+            // Create an argument-buffer resource and write two DRAW records.
+            let resource_desc = base + 0x3200;
+            memory.map_bytes(resource_desc, &[0u8; 48]);
+            write_u32(&mut memory, resource_desc, 28);
+            write_u32(&mut memory, resource_desc + 4, 4); // BUFFER
+            write_u64(&mut memory, resource_desc + 8, 32);
+            write_u32(&mut memory, resource_desc + 16, 1);
+            write_u16(&mut memory, resource_desc + 20, 1);
+            write_u16(&mut memory, resource_desc + 24, 1);
+            write_u32(&mut memory, resource_desc + 28, 1);
+            let create_resource = memory
+                .read_u64(device_vtable + 24 * 8)
+                .expect("CreateCommittedResource");
+            let resource_out = base + 0x3300;
+            memory.map_bytes(resource_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x1c0);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, resource_desc);
+            memory.write_u64(base + 0x1c0, 0x1000_0403);
+            write_u32(&mut memory, base + 0x1c0 + 0x28, 0);
+            memory.write_u64(base + 0x1c0 + 0x30, 0);
+            memory.write_u64(base + 0x1c0 + 0x38, resource_out);
+            runtime
+                .dispatch_import(create_resource, &mut state, &mut memory)
+                .expect("CreateCommittedResource");
+            assert_eq!(state.get(Register::Rax), 0);
+            let resource = memory.read_u64(resource_out).expect("argument resource");
+            let resource_id = runtime
+                .d3d12_resource(resource)
+                .expect("resource record")
+                .resource_id;
+            let mut arguments = Vec::new();
+            for (vertices, instances) in [(3u32, 1u32), (6, 2)] {
+                arguments.extend_from_slice(&vertices.to_le_bytes());
+                arguments.extend_from_slice(&instances.to_le_bytes());
+                arguments.extend_from_slice(&0u32.to_le_bytes());
+                arguments.extend_from_slice(&0u32.to_le_bytes());
+            }
+            runtime
+                .d3d12_runtime
+                .overwrite_resource_bytes(resource_id, &arguments)
+                .expect("write argument buffer");
+
+            let list_vtable = memory.read_u64(list).expect("list vtable");
+            let execute_indirect = memory
+                .read_u64(list_vtable + 47 * 8)
+                .expect("ExecuteIndirect");
+            state.set(Register::Rsp, base + 0x200);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, signature);
+            state.set(Register::R8, 2);
+            state.set(Register::R9, resource);
+            memory.write_u64(base + 0x200, 0x1000_0404);
+            memory.write_u64(base + 0x200 + 0x28, 0);
+            memory.write_u64(base + 0x200 + 0x30, 0);
+            write_u32(&mut memory, base + 0x200 + 0x38, 0);
+            runtime
+                .dispatch_import(execute_indirect, &mut state, &mut memory)
+                .expect("ExecuteIndirect");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+            let command_list_id = runtime
+                .d3d12_command_lists
+                .get(&list)
+                .and_then(|record| record.command_list_id)
+                .expect("command list id");
+            let stream = runtime
+                .d3d12_runtime
+                .close_command_list(command_list_id)
+                .expect("close command list");
+            assert_eq!(stream.commands.len(), 0);
+
+            // ExecuteIndirect handler error matrix.
+            let error_list =
+                create_test_d3d12_command_list(&mut runtime, &mut memory, base + 0x1400, device);
+            let count_resource = base + 0x3500;
+            memory.map_bytes(count_resource, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x2e0);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, resource_desc);
+            memory.write_u64(base + 0x2e0, 0x1000_0408);
+            write_u32(&mut memory, base + 0x2e0 + 0x28, 0);
+            memory.write_u64(base + 0x2e0 + 0x30, 0);
+            memory.write_u64(base + 0x2e0 + 0x38, count_resource);
+            runtime
+                .dispatch_import(create_resource, &mut state, &mut memory)
+                .expect("count resource");
+            assert_eq!(state.get(Register::Rax), 0);
+            let count_guest = memory
+                .read_u64(count_resource)
+                .expect("count resource guest");
+            let count_id = runtime
+                .d3d12_resource(count_guest)
+                .expect("count record")
+                .resource_id;
+            runtime
+                .d3d12_runtime
+                .overwrite_resource_bytes(count_id, &5u32.to_le_bytes())
+                .expect("count bytes");
+            let fake_resource = base + 0x3600;
+            runtime.guest_objects.insert(
+                fake_resource,
+                super::state::GuestObjectMeta {
+                    kind: GuestObjectKind::D3d12Resource,
+                    refcount: 1,
+                },
+            );
+            runtime.d3d12_resources.insert(
+                fake_resource,
+                super::state::GuestD3d12Resource {
+                    device_object: device,
+                    resource_id: 0xFFFF,
+                    format: crate::gfx::DxgiFormat::R8G8B8A8Unorm,
+                    swapchain_backbuffer: false,
+                    width: 4,
+                    height: 4,
+                },
+            );
+            for (sig, args_obj, max_count, args_offset, count_obj, count_offset, expected) in [
+                (0x9999u64, resource, 2u64, 0u64, 0u64, 0u32, E_INVALIDARG),
+                (signature, 0x9999, 2, 0, 0, 0, E_INVALIDARG),
+                (signature, resource, 2, 0, 0x9999, 0, E_INVALIDARG),
+                (signature, resource, 2, 0, count_guest, 0x1000, E_INVALIDARG),
+                (signature, resource, 1, 0, count_guest, 0, E_INVALIDARG),
+                (signature, fake_resource, 1, 0, 0, 0, E_INVALIDARG),
+                (signature, resource, 1, 0, fake_resource, 0, E_INVALIDARG),
+            ] {
+                state.set(Register::Rsp, base + 0x400);
+                state.set(Register::Rcx, error_list);
+                state.set(Register::Rdx, sig);
+                state.set(Register::R8, max_count);
+                state.set(Register::R9, args_obj);
+                memory.write_u64(base + 0x400, 0x1000_0409);
+                memory.write_u64(base + 0x400 + 0x28, args_offset);
+                memory.write_u64(base + 0x400 + 0x30, count_obj);
+                write_u32(&mut memory, base + 0x400 + 0x38, count_offset);
+                runtime
+                    .dispatch_import(execute_indirect, &mut state, &mut memory)
+                    .expect("ExecuteIndirect error path");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            // Unsupported start location maps to E_NOTIMPL.
+            let mut bad_draw = Vec::new();
+            bad_draw.extend_from_slice(&3u32.to_le_bytes());
+            bad_draw.extend_from_slice(&1u32.to_le_bytes());
+            bad_draw.extend_from_slice(&7u32.to_le_bytes());
+            bad_draw.extend_from_slice(&0u32.to_le_bytes());
+            runtime
+                .d3d12_runtime
+                .overwrite_resource_bytes(resource_id, &bad_draw)
+                .expect("bad draw args");
+            state.set(Register::Rsp, base + 0x440);
+            state.set(Register::Rcx, error_list);
+            state.set(Register::Rdx, signature);
+            state.set(Register::R8, 1);
+            state.set(Register::R9, resource);
+            memory.write_u64(base + 0x440, 0x1000_040a);
+            memory.write_u64(base + 0x440 + 0x28, 0);
+            memory.write_u64(base + 0x440 + 0x30, 0);
+            write_u32(&mut memory, base + 0x440 + 0x38, 0);
+            runtime
+                .dispatch_import(execute_indirect, &mut state, &mut memory)
+                .expect("ExecuteIndirect missing native pipeline");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+
+            // QI added one reference; release it and the creation reference.
+            state.set(Register::Rsp, base + 0x240);
+            state.set(Register::Rcx, signature);
+            memory.write_u64(base + 0x240, 0x1000_0405);
+            runtime
+                .dispatch_import(release, &mut state, &mut memory)
+                .expect("signature release QI");
+            assert_eq!(state.get(Register::Rax), 1);
+            state.set(Register::Rsp, base + 0x280);
+            state.set(Register::Rcx, signature);
+            memory.write_u64(base + 0x280, 0x1000_0406);
+            runtime
+                .dispatch_import(release, &mut state, &mut memory)
+                .expect("signature release creation");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert!(runtime.d3d12_command_signature_handles.is_empty());
+            state.set(Register::Rsp, base + 0x2c0);
+            state.set(Register::Rcx, signature);
+            memory.write_u64(base + 0x2c0, 0x1000_0407);
+            let error = runtime
+                .dispatch_import(release, &mut state, &mut memory)
+                .expect_err("signature double release");
+            assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+        });
+    }
+
+    fn build_work_graph_state_object_desc(memory: &mut MemoryImage, base: u64) -> u64 {
+        let desc = base;
+        let subobjects = base + 0x100;
+        let graph = base + 0x200;
+        let program_name = base + 0x1000;
+        let entrypoint = base + 0x1100;
+        let node_name = base + 0x1200;
+        let node = base + 0x1300;
+        write_u32(memory, desc, 4); // D3D12_STATE_OBJECT_TYPE_EXECUTABLE
+        write_u32(memory, desc + 4, 1);
+        write_u64(memory, desc + 8, subobjects);
+        write_u32(memory, subobjects, 13); // D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH
+        write_u64(memory, subobjects + 8, graph);
+        write_u64(memory, graph, program_name);
+        write_u32(memory, graph + 8, 0);
+        write_u32(memory, graph + 12, 1);
+        write_u64(memory, graph + 16, entrypoint);
+        write_u32(memory, graph + 24, 1);
+        write_u64(memory, graph + 32, node);
+        for (index, unit) in "graph".encode_utf16().enumerate() {
+            memory.write_u16(program_name + index as u64 * 2, unit);
+        }
+        for (index, unit) in "node0".encode_utf16().enumerate() {
+            memory.write_u16(node_name + index as u64 * 2, unit);
+        }
+        write_u64(memory, entrypoint, node_name);
+        write_u32(memory, entrypoint + 8, 0);
+        write_u32(memory, node, 0); // D3D12_NODE_TYPE_SHADER
+        write_u64(memory, node + 8, node_name);
+        write_u32(memory, node + 16, 0); // no overrides
+        write_u64(memory, node + 24, 0);
+        desc
+    }
+    #[test]
+    fn d3d12_auto_graphics_pso_rejects_manual_registration_and_draws_match_indirect() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "d3d12-auto-pso",
+                GeArch::X64,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            let mut memory = MemoryImage::default();
+            let base = 0x70_0000;
+            memory.map_bytes(base, &vec![0u8; 0x40000]);
+            let device = create_test_d3d12_device(&mut runtime, &mut memory, base, base + 0x20);
+            let list =
+                create_test_d3d12_command_list(&mut runtime, &mut memory, base + 0x1000, device);
+            let vs = make_test_dxil_container(0);
+            let ps = make_test_dxil_container(0);
+            let vs_ptr = base + 0x8000;
+            let ps_ptr = base + 0x9000;
+            memory.map_bytes(vs_ptr, &vs);
+            memory.map_bytes(ps_ptr, &ps);
+            let desc = base + 0xa000;
+            let out = base + 0xa100;
+            memory.map_bytes(desc, &[0u8; 0x80]);
+            memory.map_bytes(out, &[0u8; 8]);
+            write_u64(&mut memory, desc + 8, vs_ptr);
+            write_u64(&mut memory, desc + 16, vs.len() as u64);
+            write_u64(&mut memory, desc + 24, ps_ptr);
+            write_u64(&mut memory, desc + 32, ps.len() as u64);
+            let mut state = CpuState::new(GuestArch::X64);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, desc);
+            state.set(Register::R9, out);
+            runtime
+                .dispatch_d3d12_create_graphics_pipeline_state(&mut memory, &mut state)
+                .expect("auto PSO");
+            assert_eq!(state.get(Register::Rax), 0);
+            let pso = memory.read_u64(out).expect("pso handle") as crate::gfx::PipelineStateId;
+            assert_ne!(pso, 0);
+            let (vs_msl, ps_msl) = runtime
+                .d3d12_runtime
+                .native_pipeline_artifacts(pso)
+                .expect("translated artifacts");
+            assert_eq!(vs_msl.contains("vs_main"), true);
+            assert_eq!(ps_msl.contains("fs_main"), true);
+            assert_eq!(vs_msl.starts_with("#include <metal_stdlib>"), true);
+            runtime
+                .d3d12_runtime
+                .compile_native_render_pipeline(pso)
+                .expect("idempotent native compile");
+
+            let target = runtime
+                .d3d12_runtime
+                .create_committed_resource(crate::gfx::ResourceDesc {
+                    name: "auto-pso-target".into(),
+                    format: crate::gfx::DxgiFormat::B8G8R8A8Unorm,
+                    heap: crate::gfx::HeapType::Default,
+                    size: 64,
+                    subresources: 1,
+                    initial_state: crate::gfx::ResourceState::Common,
+                    usage_hint: crate::gfx::ResourceUsageHint::Texture {
+                        sampled: false,
+                        render_target: true,
+                        depth_stencil: false,
+                        cpu_write_frequent: true,
+                    },
+                })
+                .expect("target");
+            let vertex = runtime
+                .d3d12_runtime
+                .create_committed_resource(crate::gfx::ResourceDesc {
+                    name: "auto-pso-vertex".into(),
+                    format: crate::gfx::DxgiFormat::Unknown,
+                    heap: crate::gfx::HeapType::Default,
+                    size: 36,
+                    subresources: 1,
+                    initial_state: crate::gfx::ResourceState::Common,
+                    usage_hint: crate::gfx::ResourceUsageHint::Buffer {
+                        role: crate::gfx::BufferRole::Vertex,
+                        cpu_write_frequent: true,
+                    },
+                })
+                .expect("vertex");
+            runtime
+                .d3d12_runtime
+                .write_resource_bytes(vertex, &[0u8; 36])
+                .expect("vertices");
+            let command_list_id = runtime
+                .d3d12_command_lists
+                .get(&list)
+                .and_then(|record| record.command_list_id)
+                .expect("list id");
+            runtime
+                .d3d12_runtime
+                .bind_native_pipeline(command_list_id, pso)
+                .expect("bind auto pipeline");
+            runtime.d3d12_runtime.bind_native_render_target(
+                command_list_id,
+                target,
+                4,
+                4,
+                crate::gfx::DxgiFormat::B8G8R8A8Unorm,
+            );
+            runtime
+                .d3d12_runtime
+                .bind_native_vertex_buffer(command_list_id, vertex, 0);
+            assert_eq!(
+                runtime
+                    .d3d12_runtime
+                    .execute_native_direct_draw(command_list_id, 3, 1)
+                    .expect("direct draw"),
+                true
+            );
+            let direct = runtime
+                .d3d12_runtime
+                .resource_bytes(target)
+                .expect("direct bytes")
+                .to_vec();
+            runtime
+                .d3d12_runtime
+                .write_resource_bytes(target, &[0u8; 64])
+                .expect("clear");
+            let draw_sig = runtime
+                .d3d12_runtime
+                .create_command_signature(crate::d3d12::D3D12CommandSignatureDesc {
+                    byte_stride: 16,
+                    node_mask: 0,
+                    arguments: vec![crate::d3d12::D3D12IndirectArgumentDesc {
+                        ty: crate::d3d12::D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                        root_parameter_index: 0,
+                        dest_offset_in_32bit_values: 0,
+                        num_32bit_values_to_set: 0,
+                    }],
+                })
+                .expect("draw signature");
+            let args = [3u32, 1, 0, 0].map(|value| value.to_le_bytes()).concat();
+            assert_eq!(
+                runtime
+                    .d3d12_runtime
+                    .execute_indirect_gpu(
+                        command_list_id,
+                        draw_sig,
+                        1,
+                        &args,
+                        0,
+                        Some(1),
+                        Some((&[1, 0, 0, 0], 0)),
+                    )
+                    .expect("indirect draw"),
+                1
+            );
+            assert_eq!(
+                runtime
+                    .d3d12_runtime
+                    .resource_bytes(target)
+                    .expect("indirect bytes"),
+                &direct[..]
+            );
+
+            // Mutating the guest bytecode after creation must not affect the
+            // retained translated artifacts.
+            memory.map_bytes(vs_ptr, &[0xAA; 64]);
+            let (vs_after, _) = runtime
+                .d3d12_runtime
+                .native_pipeline_artifacts(pso)
+                .expect("retained artifacts");
+            assert_eq!(vs_after, vs_msl);
+        });
+    }
+
+    #[test]
+    fn d3d12_auto_graphics_pso_rejects_invalid_bytecode() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "d3d12-auto-pso-errors",
+                GeArch::X64,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            let mut memory = MemoryImage::default();
+            let base = 0x71_0000;
+            memory.map_bytes(base, &vec![0u8; 0x20000]);
+            let device = create_test_d3d12_device(&mut runtime, &mut memory, base, base + 0x20);
+            let desc = base + 0x8000;
+            let out = base + 0x8100;
+            memory.map_bytes(desc, &[0u8; 0x80]);
+            memory.map_bytes(out, &[0u8; 8]);
+            let mut state = CpuState::new(GuestArch::X64);
+            let run =
+                |runtime: &mut PeHostRuntime, memory: &mut MemoryImage, state: &mut CpuState| {
+                    state.set(Register::Rcx, device);
+                    state.set(Register::Rdx, desc);
+                    state.set(Register::R9, out);
+                    runtime
+                        .dispatch_d3d12_create_graphics_pipeline_state(memory, state)
+                        .expect("CreateGraphicsPipelineState");
+                    state.get(Register::Rax)
+                };
+            // Missing VS bytecode.
+            write_u64(&mut memory, desc + 8, 0);
+            write_u64(&mut memory, desc + 16, 0);
+            assert_eq!(run(&mut runtime, &mut memory, &mut state), E_INVALIDARG);
+            // Bad container magic.
+            let bad_ptr = base + 0x9000;
+            memory.map_bytes(bad_ptr, b"NOPE");
+            write_u64(&mut memory, desc + 8, bad_ptr);
+            write_u64(&mut memory, desc + 16, 4);
+            assert_eq!(run(&mut runtime, &mut memory, &mut state), E_INVALIDARG);
+            // DXBC shader model 5 has no DXIL chunk.
+            let dxbc_ptr = base + 0x9100;
+            let mut dxbc = vec![0u8; 32];
+            dxbc[..4].copy_from_slice(b"DXBC");
+            memory.map_bytes(dxbc_ptr, &dxbc);
+            write_u64(&mut memory, desc + 8, dxbc_ptr);
+            write_u64(&mut memory, desc + 16, dxbc.len() as u64);
+            assert_eq!(run(&mut runtime, &mut memory, &mut state), E_NOTIMPL);
+            // Corrupt DXIL container.
+            let bad_dxil = b"DXIL"
+                .iter()
+                .copied()
+                .chain([1u8, 0, 0, 0])
+                .chain([0u8; 4])
+                .collect::<Vec<u8>>();
+            let bad_dxil_ptr = base + 0x9200;
+            memory.map_bytes(bad_dxil_ptr, &bad_dxil);
+            write_u64(&mut memory, desc + 8, bad_dxil_ptr);
+            write_u64(&mut memory, desc + 16, bad_dxil.len() as u64);
+            assert_eq!(run(&mut runtime, &mut memory, &mut state), E_INVALIDARG);
+            // Missing PS bytecode with a valid VS.
+            let good = make_test_dxil_container(0);
+            let good_ptr = base + 0x9300;
+            memory.map_bytes(good_ptr, &good);
+            write_u64(&mut memory, desc + 8, good_ptr);
+            write_u64(&mut memory, desc + 16, good.len() as u64);
+            write_u64(&mut memory, desc + 24, 0);
+            write_u64(&mut memory, desc + 32, 0);
+            assert_eq!(run(&mut runtime, &mut memory, &mut state), E_INVALIDARG);
+            // Oversized bytecode is rejected before reading guest memory.
+            write_u64(&mut memory, desc + 8, good_ptr);
+            write_u64(&mut memory, desc + 16, 64 * 1024 * 1024 + 1);
+            assert_eq!(run(&mut runtime, &mut memory, &mut state), E_INVALIDARG);
+            // PS DXBC without a DXIL chunk maps to E_NOTIMPL.
+            write_u64(&mut memory, desc + 8, good_ptr);
+            write_u64(&mut memory, desc + 16, good.len() as u64);
+            write_u64(&mut memory, desc + 24, dxbc_ptr);
+            write_u64(&mut memory, desc + 32, dxbc.len() as u64);
+            assert_eq!(run(&mut runtime, &mut memory, &mut state), E_NOTIMPL);
+            // Compilation failure inside CreateGraphicsPipelineState surfaces
+            // as E_INVALIDARG.
+            write_u64(&mut memory, desc + 24, good_ptr);
+            write_u64(&mut memory, desc + 32, good.len() as u64);
+            crate::metal_backend::set_native_pipeline_creation_fault(true);
+            assert_eq!(run(&mut runtime, &mut memory, &mut state), E_INVALIDARG);
+            crate::metal_backend::set_native_pipeline_creation_fault(false);
+
+            // Compiling a PSO without retained native artifacts is an exact
+            // error, and a Metal compilation fault surfaces as an error.
+            let root = runtime
+                .d3d12_runtime
+                .create_root_signature(crate::d3d12::RootSignatureDesc::default());
+            let orphan = runtime.d3d12_runtime.create_pipeline_state(
+                root,
+                crate::d3d12::PipelineStateDesc {
+                    label: "auto-pso-orphan".into(),
+                    compute: false,
+                    render_target_formats: vec![crate::gfx::DxgiFormat::B8G8R8A8Unorm],
+                    depth_format: None,
+                },
+            );
+            let error = runtime
+                .d3d12_runtime
+                .compile_native_render_pipeline(orphan)
+                .expect_err("orphan native compile");
+            assert_eq!(
+                error.message,
+                "pipeline state has no registered native pipeline"
+            );
+            runtime
+                .d3d12_runtime
+                .register_native_render_pipeline(
+                    orphan,
+                    "vertex void vs_main() {}".to_string(),
+                    "fragment float4 fs_main() { return float4(1.0); }".to_string(),
+                    crate::gfx::DxgiFormat::B8G8R8A8Unorm,
+                )
+                .expect("register fault pipeline");
+            crate::metal_backend::set_native_pipeline_creation_fault(true);
+            let error = runtime
+                .d3d12_runtime
+                .compile_native_render_pipeline(orphan)
+                .expect_err("native compile fault");
+            crate::metal_backend::set_native_pipeline_creation_fault(false);
+            assert_eq!(error.message, "native render pipeline creation fault");
+        });
+    }
+
+    #[test]
+    fn d3d12_native_indirect_shell_rejects_missing_state_and_binds_gpu_resources() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "d3d12-native-shell",
+                GeArch::X64,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            let mut memory = MemoryImage::default();
+            let base = 0x60_0000;
+            memory.map_bytes(base, &vec![0u8; 0x30000]);
+            let device = create_test_d3d12_device(&mut runtime, &mut memory, base, base + 0x20);
+            let list =
+                create_test_d3d12_command_list(&mut runtime, &mut memory, base + 0x1000, device);
+
+            let target = runtime
+                .d3d12_runtime
+                .create_committed_resource(crate::gfx::ResourceDesc {
+                    name: "shell-target".into(),
+                    format: crate::gfx::DxgiFormat::B8G8R8A8Unorm,
+                    heap: crate::gfx::HeapType::Default,
+                    size: 64,
+                    subresources: 1,
+                    initial_state: crate::gfx::ResourceState::Common,
+                    usage_hint: crate::gfx::ResourceUsageHint::Texture {
+                        sampled: false,
+                        render_target: true,
+                        depth_stencil: false,
+                        cpu_write_frequent: true,
+                    },
+                })
+                .expect("target resource");
+            let vertices: [f32; 9] = [-1.0, -1.0, 0.0, 3.0, -1.0, 0.0, -1.0, 3.0, 0.0];
+            let vertex_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    vertices.as_ptr() as *const u8,
+                    std::mem::size_of_val(&vertices),
+                )
+            };
+            let vertex = runtime
+                .d3d12_runtime
+                .create_committed_resource(crate::gfx::ResourceDesc {
+                    name: "shell-vertices".into(),
+                    format: crate::gfx::DxgiFormat::Unknown,
+                    heap: crate::gfx::HeapType::Default,
+                    size: 36,
+                    subresources: 1,
+                    initial_state: crate::gfx::ResourceState::Common,
+                    usage_hint: crate::gfx::ResourceUsageHint::Buffer {
+                        role: crate::gfx::BufferRole::Vertex,
+                        cpu_write_frequent: true,
+                    },
+                })
+                .expect("vertex resource");
+            runtime
+                .d3d12_runtime
+                .write_resource_bytes(vertex, vertex_bytes)
+                .expect("vertices");
+            let index = runtime
+                .d3d12_runtime
+                .create_committed_resource(crate::gfx::ResourceDesc {
+                    name: "shell-indices".into(),
+                    format: crate::gfx::DxgiFormat::Unknown,
+                    heap: crate::gfx::HeapType::Default,
+                    size: 6,
+                    subresources: 1,
+                    initial_state: crate::gfx::ResourceState::Common,
+                    usage_hint: crate::gfx::ResourceUsageHint::Buffer {
+                        role: crate::gfx::BufferRole::Index,
+                        cpu_write_frequent: true,
+                    },
+                })
+                .expect("index resource");
+            runtime
+                .d3d12_runtime
+                .write_resource_bytes(index, &[0u8, 0, 1, 0, 2, 0])
+                .expect("indices");
+
+            let resource_object =
+                |runtime: &mut PeHostRuntime,
+                 memory: &mut MemoryImage,
+                 resource_id: crate::gfx::ResourceId| {
+                    let object = runtime
+                        .alloc_guest_object(memory, GuestObjectKind::D3d12Resource, 0x7000_0000)
+                        .expect("resource object");
+                    runtime.d3d12_resources.insert(
+                        object,
+                        super::state::GuestD3d12Resource {
+                            device_object: device,
+                            resource_id,
+                            format: crate::gfx::DxgiFormat::B8G8R8A8Unorm,
+                            swapchain_backbuffer: false,
+                            width: 4,
+                            height: 4,
+                        },
+                    );
+                    object
+                };
+            let _target_object = resource_object(&mut runtime, &mut memory, target);
+            let vertex_object = resource_object(&mut runtime, &mut memory, vertex);
+            let index_object = resource_object(&mut runtime, &mut memory, index);
+
+            let heap_id = runtime
+                .d3d12_runtime
+                .create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+            runtime
+                .d3d12_runtime
+                .write_descriptor(
+                    heap_id,
+                    0,
+                    crate::gfx::ViewDescriptor::Rtv {
+                        resource: target,
+                        format: crate::gfx::DxgiFormat::B8G8R8A8Unorm,
+                    },
+                )
+                .expect("RTV descriptor");
+            let heap_object = runtime
+                .alloc_guest_object(
+                    &mut memory,
+                    GuestObjectKind::D3d12DescriptorHeap,
+                    0x7000_0100,
+                )
+                .expect("heap object");
+            runtime.d3d12_descriptor_heaps.insert(
+                heap_object,
+                super::state::GuestD3d12DescriptorHeap {
+                    device_object: device,
+                    heap_id,
+                    ty: DescriptorHeapType::Rtv,
+                    cpu_handle_start: 0x7000_1000,
+                    descriptor_count: 1,
+                },
+            );
+            let rtv_handle = 0x7000_1000u64;
+
+            let root = runtime
+                .d3d12_runtime
+                .create_root_signature(crate::d3d12::RootSignatureDesc::default());
+            let pso = runtime.d3d12_runtime.create_pipeline_state(
+                root,
+                crate::d3d12::PipelineStateDesc {
+                    label: "shell-pso".into(),
+                    compute: false,
+                    render_target_formats: vec![crate::gfx::DxgiFormat::B8G8R8A8Unorm],
+                    depth_format: None,
+                },
+            );
+            runtime
+                .d3d12_runtime
+                .register_native_render_pipeline(
+                    pso,
+                    r#"#include <metal_stdlib>
+using namespace metal;
+struct VOut { float4 position [[position]]; };
+vertex VOut vs_main(uint vid [[vertex_id]], device const float* vertices [[buffer(0)]]) {
+    VOut out;
+    uint index = vid * 3u;
+    out.position = float4(vertices[index], vertices[index + 1u], vertices[index + 2u], 1.0);
+    return out;
+}"#
+                    .to_string(),
+                    r#"#include <metal_stdlib>
+using namespace metal;
+fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
+                        .to_string(),
+                    crate::gfx::DxgiFormat::B8G8R8A8Unorm,
+                )
+                .expect("native pipeline");
+
+            let mut state = CpuState::new(GuestArch::X64);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, pso as u64);
+            runtime
+                .dispatch_d3d12_graphics_command_list_set_pipeline_state(&mut memory, &mut state)
+                .expect("SetPipelineState");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            let vertex_view = base + 0x5000;
+            write_u64(&mut memory, vertex_view, vertex_object);
+            write_u64(&mut memory, vertex_view + 8, 0);
+            write_u32(&mut memory, vertex_view + 16, 12);
+            write_u32(&mut memory, vertex_view + 20, 36);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, 1);
+            state.set(Register::R9, vertex_view);
+            runtime
+                .dispatch_d3d12_graphics_command_list_ia_set_vertex_buffers(&mut memory, &mut state)
+                .expect("IASetVertexBuffers");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            let index_view = base + 0x5040;
+            write_u64(&mut memory, index_view, index_object);
+            write_u64(&mut memory, index_view + 8, 0);
+            write_u32(&mut memory, index_view + 16, 6);
+            write_u32(&mut memory, index_view + 20, 57);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, index_view);
+            runtime
+                .dispatch_d3d12_graphics_command_list_ia_set_index_buffer(&mut memory, &mut state)
+                .expect("IASetIndexBuffer");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            let rts = base + 0x5080;
+            write_u64(&mut memory, rts, rtv_handle);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, rts);
+            state.set(Register::R9, 0);
+            state.set(Register::Rsp, base + 0x5100);
+            write_u64(&mut memory, base + 0x5100, 0);
+            runtime
+                .dispatch_d3d12_graphics_command_list_om_set_render_targets(&mut memory, &mut state)
+                .expect("OMSetRenderTargets");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, 3);
+            state.set(Register::R8, 1);
+            state.set(Register::R9, 0);
+            state.set(Register::Rsp, base + 0x5120);
+            write_u64(&mut memory, base + 0x5120, 0);
+            runtime
+                .dispatch_d3d12_graphics_command_list_draw_instanced(&mut memory, &mut state)
+                .expect("DrawInstanced");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(
+                runtime
+                    .d3d12_runtime
+                    .resource_bytes(target)
+                    .expect("target readback")[0..4],
+                [0, 0, 255, 255]
+            );
+
+            // Descriptor/heap shell paths: null rejects, valid succeeds.
+            state.set(Register::Rcx, device);
+            runtime
+                .dispatch_d3d12_create_pipeline_library(&mut state)
+                .expect("CreatePipelineLibrary");
+            assert_eq!(state.get(Register::Rax), 0);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R9, 0);
+            runtime
+                .dispatch_d3d12_create_heap(&mut memory, &mut state)
+                .expect("CreateHeap null");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+            let heap_desc = base + 0x5200;
+            let heap_out = base + 0x5240;
+            memory.map_bytes(heap_desc, &[0u8; 16]);
+            memory.map_bytes(heap_out, &[0u8; 8]);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, heap_desc);
+            state.set(Register::R9, heap_out);
+            runtime
+                .dispatch_d3d12_create_heap(&mut memory, &mut state)
+                .expect("CreateHeap");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            let placed_desc = base + 0x5300;
+            let placed_out = base + 0x5340;
+            memory.map_bytes(placed_desc, &[0u8; 32]);
+            write_u32(&mut memory, placed_desc, 28);
+            write_u32(&mut memory, placed_desc + 4, 3);
+            write_u64(&mut memory, placed_desc + 8, 4);
+            write_u32(&mut memory, placed_desc + 16, 4);
+            memory.map_bytes(placed_out, &[0u8; 8]);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R9, placed_desc);
+            state.set(Register::Rsp, base + 0x5360);
+            write_u64(&mut memory, base + 0x5380, placed_out);
+            runtime
+                .dispatch_d3d12_create_placed_resource(&mut memory, &mut state)
+                .expect("CreatePlacedResource");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            let reserved_desc = base + 0x5400;
+            let reserved_out = base + 0x5440;
+            memory.map_bytes(reserved_desc, &[0u8; 32]);
+            write_u32(&mut memory, reserved_desc, 28);
+            write_u32(&mut memory, reserved_desc + 4, 3);
+            write_u64(&mut memory, reserved_desc + 8, 4);
+            write_u32(&mut memory, reserved_desc + 16, 4);
+            memory.map_bytes(reserved_out, &[0u8; 8]);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R9, reserved_desc);
+            state.set(Register::Rsp, base + 0x5460);
+            write_u64(&mut memory, base + 0x5480, reserved_out);
+            // Missing-pipeline draw keeps the typed fallback.
+            let fallback_list =
+                create_test_d3d12_command_list(&mut runtime, &mut memory, base + 0x6000, device);
+            state.set(Register::Rcx, fallback_list);
+            state.set(Register::Rdx, 3);
+            state.set(Register::R8, 1);
+            state.set(Register::R9, 0);
+            state.set(Register::Rsp, base + 0x6200);
+            write_u64(&mut memory, base + 0x6200, 0);
+            runtime
+                .dispatch_d3d12_graphics_command_list_draw_instanced(&mut memory, &mut state)
+                .expect("fallback DrawInstanced");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // Unknown PSO is rejected before any native binding.
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, 0xDEAD);
+            runtime
+                .dispatch_d3d12_graphics_command_list_set_pipeline_state(&mut memory, &mut state)
+                .expect("SetPipelineState unknown");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+
+            // Non-device and null descriptors for placed/reserved resources.
+            state.set(Register::Rcx, list);
+            let error = runtime
+                .dispatch_d3d12_create_placed_resource(&mut memory, &mut state.clone())
+                .expect_err("placed non-device");
+            assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+            state.set(Register::Rcx, device);
+            state.set(Register::R9, 0);
+            state.set(Register::Rsp, base + 0x6300);
+            write_u64(&mut memory, base + 0x6300, 0);
+            runtime
+                .dispatch_d3d12_create_placed_resource(&mut memory, &mut state)
+                .expect("placed null");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+            state.set(Register::Rcx, list);
+            let error = runtime
+                .dispatch_d3d12_create_reserved_resource(&mut memory, &mut state)
+                .expect_err("reserved non-device");
+            assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+            state.set(Register::Rcx, device);
+            state.set(Register::R9, 0);
+            state.set(Register::Rsp, base + 0x6320);
+            write_u64(&mut memory, base + 0x6320, 0);
+            runtime
+                .dispatch_d3d12_create_reserved_resource(&mut memory, &mut state)
+                .expect("reserved null");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+
+            // Graphics PSO creation writes a usable PSO handle.
+            let pso_desc_ptr = base + 0x6400;
+            let pso_out = base + 0x6440;
+            memory.map_bytes(pso_desc_ptr, &[0u8; 16]);
+            memory.map_bytes(pso_out, &[0u8; 8]);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, pso_desc_ptr);
+            state.set(Register::R9, pso_out);
+            runtime
+                .dispatch_d3d12_create_graphics_pipeline_state(&mut memory, &mut state)
+                .expect("CreateGraphicsPipelineState empty bytecode");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+            assert_eq!(memory.read_u64(pso_out).expect("pso handle"), 0);
+
+            // ExecuteIndirect success through the DISPATCH GPU path.
+            let dispatch_sig = runtime
+                .d3d12_runtime
+                .create_command_signature(crate::d3d12::D3D12CommandSignatureDesc {
+                    byte_stride: 12,
+                    node_mask: 0,
+                    arguments: vec![crate::d3d12::D3D12IndirectArgumentDesc {
+                        ty: crate::d3d12::D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                        root_parameter_index: 0,
+                        dest_offset_in_32bit_values: 0,
+                        num_32bit_values_to_set: 0,
+                    }],
+                })
+                .expect("dispatch signature");
+            let signature_object = runtime
+                .alloc_guest_object(
+                    &mut memory,
+                    GuestObjectKind::D3d12CommandSignature,
+                    0x7000_0200,
+                )
+                .expect("signature object");
+            runtime
+                .d3d12_command_signature_handles
+                .insert(signature_object, dispatch_sig);
+            let args_resource = runtime
+                .d3d12_runtime
+                .create_committed_resource(crate::gfx::ResourceDesc {
+                    name: "shell-indirect-args".into(),
+                    format: crate::gfx::DxgiFormat::Unknown,
+                    heap: crate::gfx::HeapType::Default,
+                    size: 12,
+                    subresources: 1,
+                    initial_state: crate::gfx::ResourceState::Common,
+                    usage_hint: crate::gfx::ResourceUsageHint::Buffer {
+                        role: crate::gfx::BufferRole::Vertex,
+                        cpu_write_frequent: true,
+                    },
+                })
+                .expect("args resource");
+            runtime
+                .d3d12_runtime
+                .write_resource_bytes(
+                    args_resource,
+                    &[2u32, 1, 1].map(|value| value.to_le_bytes()).concat(),
+                )
+                .expect("args bytes");
+            let args_object = resource_object(&mut runtime, &mut memory, args_resource);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, signature_object);
+            state.set(Register::R8, 1);
+            state.set(Register::R9, args_object);
+            state.set(Register::Rsp, base + 0x6500);
+            write_u64(&mut memory, base + 0x6500, 0);
+            write_u64(&mut memory, base + 0x6508, 0);
+            write_u32(&mut memory, base + 0x6510, 0);
+            runtime
+                .dispatch_d3d12_graphics_command_list_execute_indirect(&mut memory, &mut state)
+                .expect("ExecuteIndirect");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // Build-AS registration consumes mapped guest geometry bytes.
+            let build_desc = base + 0x6600;
+            let geom_desc = base + 0x6700;
+            let vb = base + 0x6800;
+            let ib = base + 0x6900;
+            memory.map_bytes(build_desc, &[0u8; 64]);
+            memory.map_bytes(geom_desc, &[0u8; 48]);
+            memory.map_bytes(vb, vertex_bytes);
+            memory.map_bytes(ib, &[0u8, 0, 1, 0, 2, 0]);
+            write_u64(&mut memory, build_desc, 0x1000);
+            write_u32(&mut memory, build_desc + 8, 0);
+            write_u32(&mut memory, build_desc + 12, 0);
+            write_u32(&mut memory, build_desc + 16, 1);
+            write_u64(&mut memory, build_desc + 24, geom_desc);
+            write_u64(&mut memory, build_desc + 40, 0x2000);
+            write_u32(&mut memory, geom_desc, 0);
+            write_u32(&mut memory, geom_desc + 4, 1);
+            write_u64(&mut memory, geom_desc + 8, vb);
+            write_u64(&mut memory, geom_desc + 16, ib);
+            write_u32(&mut memory, geom_desc + 24, 0);
+            write_u32(&mut memory, geom_desc + 28, 3);
+            write_u32(&mut memory, geom_desc + 32, 57);
+            write_u32(&mut memory, geom_desc + 36, 6);
+            write_u32(&mut memory, geom_desc + 40, 12);
+            write_u32(&mut memory, geom_desc + 44, 1);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, build_desc);
+            runtime
+                .dispatch_d3d12_graphics_command_list4_build_raytracing_acceleration_structure(
+                    &mut memory,
+                    &mut state,
+                )
+                .expect("BuildRaytracingAccelerationStructure");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // Non-indexed and alternate index-format builds cover every
+            // geometry-format branch.
+            let non_indexed_desc = base + 0x6e00;
+            let non_indexed_geom = base + 0x6e40;
+            memory.map_bytes(non_indexed_desc, &[0u8; 64]);
+            memory.map_bytes(non_indexed_geom, &[0u8; 48]);
+            write_u64(&mut memory, non_indexed_desc, 0x1200);
+            write_u32(&mut memory, non_indexed_desc + 8, 0);
+            write_u32(&mut memory, non_indexed_desc + 16, 1);
+            write_u64(&mut memory, non_indexed_desc + 24, non_indexed_geom);
+            write_u64(&mut memory, non_indexed_desc + 40, 0x2200);
+            write_u32(&mut memory, non_indexed_geom, 0);
+            write_u32(&mut memory, non_indexed_geom + 4, 1);
+            write_u64(&mut memory, non_indexed_geom + 8, vb);
+            write_u32(&mut memory, non_indexed_geom + 28, 3);
+            write_u32(&mut memory, non_indexed_geom + 36, 6);
+            write_u32(&mut memory, non_indexed_geom + 40, 12);
+            write_u32(&mut memory, non_indexed_geom + 44, 1);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, non_indexed_desc);
+            runtime
+                .dispatch_d3d12_graphics_command_list4_build_raytracing_acceleration_structure(
+                    &mut memory,
+                    &mut state,
+                )
+                .expect("non-indexed build");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            let uint32_desc = base + 0x6f00;
+            let uint32_geom = base + 0x6f40;
+            let uint32_ib = base + 0x6f80;
+            memory.map_bytes(uint32_desc, &[0u8; 64]);
+            memory.map_bytes(uint32_geom, &[0u8; 48]);
+            memory.map_bytes(uint32_ib, &[0u8; 12]);
+            write_u64(&mut memory, uint32_desc, 0x1300);
+            write_u32(&mut memory, uint32_desc + 8, 0);
+            write_u32(&mut memory, uint32_desc + 16, 1);
+            write_u64(&mut memory, uint32_desc + 24, uint32_geom);
+            write_u64(&mut memory, uint32_desc + 40, 0x2300);
+            write_u32(&mut memory, uint32_geom, 0);
+            write_u32(&mut memory, uint32_geom + 4, 1);
+            write_u64(&mut memory, uint32_geom + 8, vb);
+            write_u64(&mut memory, uint32_geom + 16, uint32_ib);
+            write_u32(&mut memory, uint32_geom + 28, 3);
+            write_u32(&mut memory, uint32_geom + 32, 42);
+            write_u32(&mut memory, uint32_geom + 36, 6);
+            write_u32(&mut memory, uint32_geom + 40, 12);
+            write_u32(&mut memory, uint32_geom + 44, 1);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, uint32_desc);
+            runtime
+                .dispatch_d3d12_graphics_command_list4_build_raytracing_acceleration_structure(
+                    &mut memory,
+                    &mut state,
+                )
+                .expect("uint32 index build");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            let unsupported_index_desc = base + 0x7000;
+            let unsupported_index_geom = base + 0x7040;
+            memory.map_bytes(unsupported_index_desc, &[0u8; 64]);
+            memory.map_bytes(unsupported_index_geom, &[0u8; 48]);
+            write_u64(&mut memory, unsupported_index_desc, 0x1400);
+            write_u32(&mut memory, unsupported_index_desc + 8, 0);
+            write_u32(&mut memory, unsupported_index_desc + 16, 1);
+            write_u64(
+                &mut memory,
+                unsupported_index_desc + 24,
+                unsupported_index_geom,
+            );
+            write_u64(&mut memory, unsupported_index_desc + 40, 0x2400);
+            write_u32(&mut memory, unsupported_index_geom, 0);
+            write_u32(&mut memory, unsupported_index_geom + 4, 1);
+            write_u64(&mut memory, unsupported_index_geom + 8, vb);
+            write_u64(&mut memory, unsupported_index_geom + 16, ib);
+            write_u32(&mut memory, unsupported_index_geom + 28, 3);
+            write_u32(&mut memory, unsupported_index_geom + 32, 0);
+            write_u32(&mut memory, unsupported_index_geom + 36, 6);
+            write_u32(&mut memory, unsupported_index_geom + 40, 12);
+            write_u32(&mut memory, unsupported_index_geom + 44, 1);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, unsupported_index_desc);
+            let error = runtime
+                .dispatch_d3d12_graphics_command_list4_build_raytracing_acceleration_structure(
+                    &mut memory,
+                    &mut state,
+                )
+                .expect_err("unsupported index format");
+            assert_eq!(
+                error.message,
+                "geometry 0 index format 0 is not supported for raytracing"
+            );
+
+            // TLAS registration consumes mapped instance descriptors.
+            let tlas_desc = base + 0x7100;
+            let instance_desc = base + 0x7140;
+            memory.map_bytes(tlas_desc, &[0u8; 64]);
+            memory.map_bytes(instance_desc, &[0u8; 64]);
+            write_u64(&mut memory, tlas_desc, 0x3000);
+            write_u32(&mut memory, tlas_desc + 8, 1);
+            write_u32(&mut memory, tlas_desc + 12, 2);
+            write_u32(&mut memory, tlas_desc + 16, 1);
+            write_u64(&mut memory, tlas_desc + 24, instance_desc);
+            write_u64(&mut memory, tlas_desc + 40, 0x4000);
+            write_u32(&mut memory, instance_desc + 48, 0xFF00_0000);
+            write_u64(&mut memory, instance_desc + 56, 0x1000);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, tlas_desc);
+            runtime
+                .dispatch_d3d12_graphics_command_list4_build_raytracing_acceleration_structure(
+                    &mut memory,
+                    &mut state,
+                )
+                .expect("TLAS build");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // DispatchRays registers mapped shader-table bytes before failing
+            // on the missing top-level structure.
+            let rays_desc = base + 0x6a00;
+            let raygen = base + 0x6b00;
+            let hit = base + 0x6c00;
+            memory.map_bytes(rays_desc, &[0u8; 100]);
+            memory.map_bytes(raygen, &[0u8; 40]);
+            memory.map_bytes(hit, &[7u8, 0, 0, 0]);
+            write_u64(&mut memory, rays_desc, raygen);
+            write_u64(&mut memory, rays_desc + 8, 40);
+            write_u64(&mut memory, rays_desc + 40, hit);
+            write_u64(&mut memory, rays_desc + 48, 4);
+            write_u64(&mut memory, rays_desc + 56, 4);
+            write_u32(&mut memory, rays_desc + 88, 1);
+            write_u32(&mut memory, rays_desc + 92, 1);
+            write_u32(&mut memory, rays_desc + 96, 1);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, rays_desc);
+            runtime
+                .dispatch_d3d12_graphics_command_list4_dispatch_rays(&mut memory, &mut state)
+                .expect("DispatchRays");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // Unsupported command-signature argument type maps to E_NOTIMPL.
+            let bad_sig_desc = base + 0x6d00;
+            let bad_arg = base + 0x6d40;
+            let bad_out = base + 0x6d80;
+            memory.map_bytes(bad_sig_desc, &[0u8; 32]);
+            memory.map_bytes(bad_arg, &[0u8; 16]);
+            memory.map_bytes(bad_out, &[0u8; 8]);
+            write_u32(&mut memory, bad_sig_desc, 4);
+            write_u32(&mut memory, bad_sig_desc + 4, 1);
+            write_u64(&mut memory, bad_sig_desc + 8, bad_arg);
+            write_u32(&mut memory, bad_arg, 99);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, bad_sig_desc);
+            state.set(Register::R8, bad_out);
+            runtime
+                .dispatch_d3d12_create_command_signature(&mut memory, &mut state)
+                .expect("CreateCommandSignature unsupported");
+            assert_eq!(state.get(Register::Rax), E_NOTIMPL);
+
+            // Swapchain backbuffer allocation retains guest dimensions.
+            let swapchain_id = runtime
+                .d3d12_runtime
+                .create_swapchain(crate::gfx::SwapchainDesc {
+                    width: 8,
+                    height: 6,
+                    format: crate::gfx::DxgiFormat::B8G8R8A8Unorm,
+                    buffer_count: 2,
+                })
+                .expect("swapchain");
+            let swapchain_object = runtime
+                .alloc_guest_object(&mut memory, GuestObjectKind::DxgiSwapChain, 0x7000_0300)
+                .expect("swapchain object");
+            runtime.d3d12_swapchains.insert(
+                swapchain_object,
+                super::state::GuestD3d12SwapChain {
+                    device_object: device,
+                    swapchain_id,
+                    backbuffer_objects: std::collections::BTreeMap::new(),
+                },
+            );
+            let backbuffer = runtime
+                .ensure_d3d12_backbuffer_object(&mut memory, swapchain_object, 0)
+                .expect("backbuffer object");
+            let backbuffer_resource = runtime
+                .d3d12_resource(backbuffer)
+                .expect("backbuffer resource");
+            assert_eq!(
+                (backbuffer_resource.width, backbuffer_resource.height),
+                (8, 6)
+            );
+        });
+    }
+
+    #[test]
+    fn d3d12_set_program_and_dispatch_graph_validate_real_vtables() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "d3d12-workgraph-com",
+                GeArch::X64,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            let mut memory = MemoryImage::default();
+            let base = 0x60_0000;
+            memory.map_bytes(base, &vec![0u8; 0x20000]);
+            let device = create_test_d3d12_device(&mut runtime, &mut memory, base, base + 0x20);
+            let device_vtable = memory.read_u64(device).expect("device vtable");
+            let create_state_object = memory
+                .read_u64(device_vtable + 61 * 8)
+                .expect("CreateStateObject");
+            let desc = build_work_graph_state_object_desc(&mut memory, base + 0x1000);
+            let iid = base + 0x8800;
+            memory.map_bytes(iid, &[0u8; 16]);
+            let iid_bytes: [u8; 16] = [
+                0x43, 0x69, 0x01, 0x47, 0xa8, 0xfc, 0x94, 0x45, 0x93, 0xea, 0xaf, 0x25, 0x8b, 0x55,
+                0x34, 0x6d,
+            ];
+            for (index, byte) in iid_bytes.iter().enumerate() {
+                memory.write_u8(iid + index as u64, *byte);
+            }
+            let out = base + 0x8900;
+            memory.map_bytes(out, &[0u8; 8]);
+            let mut state = CpuState::new(GuestArch::X64);
+            state.set(Register::Rsp, base + 0x100);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, desc);
+            state.set(Register::R8, iid);
+            state.set(Register::R9, out);
+            memory.write_u64(base + 0x100, 0x1000_0100);
+            runtime
+                .dispatch_import(create_state_object, &mut state, &mut memory)
+                .expect("create work graph state object");
+            assert_eq!(state.get(Register::Rax), 0);
+            let state_object = memory.read_u64(out).expect("state object");
+            let handle = runtime.d3d12_state_object_handles[&state_object];
+            let identifier = runtime
+                .d3d12_runtime
+                .work_graph_program_identifier(handle, "graph")
+                .expect("program identifier");
+
+            let list =
+                create_test_d3d12_command_list(&mut runtime, &mut memory, base + 0x2000, device);
+            let list_vtable = memory.read_u64(list).expect("list vtable");
+            let set_program = memory.read_u64(list_vtable + 73 * 8).expect("SetProgram");
+            let dispatch_graph = memory
+                .read_u64(list_vtable + 74 * 8)
+                .expect("DispatchGraph");
+            assert_ne!(set_program, 0);
+            assert_ne!(dispatch_graph, 0);
+
+            // The COM object must answer QueryInterface for
+            // ID3D12GraphicsCommandList10, and reject unrelated IIDs.
+            let list_qi = memory.read_u64(list_vtable).expect("list QI");
+            let iid_cl10 = base + 0x8700;
+            memory.map_bytes(iid_cl10, &[0u8; 16]);
+            let cl10_iid: [u8; 16] = [
+                0x15, 0xc0, 0x13, 0x70, 0x61, 0xd1, 0x63, 0x4b, 0xa0, 0x8c, 0x23, 0x85, 0x52, 0xdd,
+                0x8a, 0xcc,
+            ];
+            for (index, byte) in cl10_iid.iter().enumerate() {
+                memory.write_u8(iid_cl10 + index as u64, *byte);
+            }
+            let cl_qi_out = base + 0x8710;
+            memory.map_bytes(cl_qi_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x120);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, iid_cl10);
+            state.set(Register::R8, cl_qi_out);
+            memory.write_u64(base + 0x120, 0x1000_0100_1);
+            runtime
+                .dispatch_import(list_qi, &mut state, &mut memory)
+                .expect("CL10 QI");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(memory.read_u64(cl_qi_out).expect("CL10 QI ptr"), list);
+            let bad_cl_iid = base + 0x8720;
+            memory.map_bytes(bad_cl_iid, &[0xCC; 16]);
+            state.set(Register::Rsp, base + 0x130);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, bad_cl_iid);
+            state.set(Register::R8, cl_qi_out);
+            memory.write_u64(base + 0x130, 0x1000_0100_2);
+            runtime
+                .dispatch_import(list_qi, &mut state, &mut memory)
+                .expect("CL10 bad QI");
+            assert_eq!(state.get(Register::Rax), E_NOINTERFACE);
+
+            // DispatchGraph before SetProgram is an exact error.
+            let graph_desc = base + 0x3000;
+            memory.map_bytes(graph_desc, &[0u8; 0x100]);
+            write_u32(&mut memory, graph_desc, 0); // NODE_CPU_INPUT
+            write_u32(&mut memory, graph_desc + 8, 0);
+            write_u32(&mut memory, graph_desc + 12, 1);
+            write_u64(&mut memory, graph_desc + 16, base + 0x3100);
+            write_u64(&mut memory, graph_desc + 24, 8);
+            memory.map_bytes(base + 0x3100, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x140);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, graph_desc);
+            memory.write_u64(base + 0x140, 0x1000_0101);
+            runtime
+                .dispatch_import(dispatch_graph, &mut state, &mut memory)
+                .expect("dispatch before SetProgram");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+
+            // Unknown program identifier is rejected.
+            let set_desc = base + 0x3200;
+            memory.map_bytes(set_desc, &[0u8; 0x80]);
+            write_u32(&mut memory, set_desc, 5); // WORK_GRAPH
+            for index in 0..32u64 {
+                memory.write_u8(set_desc + 8 + index, 0xAB);
+            }
+            state.set(Register::Rsp, base + 0x180);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, set_desc);
+            memory.write_u64(base + 0x180, 0x1000_0102);
+            runtime
+                .dispatch_import(set_program, &mut state, &mut memory)
+                .expect("SetProgram unknown id");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+
+            // Non-work-graph program type fails closed.
+            write_u32(&mut memory, set_desc, 1);
+            state.set(Register::Rsp, base + 0x1c0);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, set_desc);
+            memory.write_u64(base + 0x1c0, 0x1000_0103);
+            runtime
+                .dispatch_import(set_program, &mut state, &mut memory)
+                .expect("SetProgram unsupported type");
+            assert_eq!(state.get(Register::Rax), E_NOTIMPL);
+
+            // Valid SetProgram then DispatchGraph records a compute command.
+            write_u32(&mut memory, set_desc, 5);
+            for (index, byte) in identifier.iter().enumerate() {
+                memory.write_u8(set_desc + 8 + index as u64, *byte);
+            }
+            write_u32(&mut memory, set_desc + 40, 0);
+            write_u64(&mut memory, set_desc + 48, 0);
+            write_u64(&mut memory, set_desc + 56, 0);
+            state.set(Register::Rsp, base + 0x200);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, set_desc);
+            memory.write_u64(base + 0x200, 0x1000_0104);
+            runtime
+                .dispatch_import(set_program, &mut state, &mut memory)
+                .expect("SetProgram valid");
+            assert_eq!(state.get(Register::Rax), 0);
+            state.set(Register::Rsp, base + 0x240);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, graph_desc);
+            memory.write_u64(base + 0x240, 0x1000_0105);
+            runtime
+                .dispatch_import(dispatch_graph, &mut state, &mut memory)
+                .expect("DispatchGraph valid");
+            assert_eq!(state.get(Register::Rax), 0);
+            let command_list_id = runtime
+                .d3d12_command_lists
+                .get(&list)
+                .and_then(|record| record.command_list_id)
+                .expect("command list id");
+            let stream = runtime
+                .d3d12_runtime
+                .close_command_list(command_list_id)
+                .expect("close command list");
+            assert_eq!(stream.commands.len(), 1);
+            assert!(matches!(
+                stream.commands[0],
+                crate::gfx::Command::Dispatch { x: 1, y: 1, z: 1 }
+            ));
+
+            // GPU-record dispatch mode with zero records is a valid no-work
+            // dispatch; the previous E_NOTIMPL gate is gone.
+            let gpu_list =
+                create_test_d3d12_command_list(&mut runtime, &mut memory, base + 0x4000, device);
+            let gpu_vtable = memory.read_u64(gpu_list).expect("gpu list vtable");
+            let gpu_set_program = memory.read_u64(gpu_vtable + 73 * 8).expect("SetProgram");
+            let gpu_dispatch_graph = memory.read_u64(gpu_vtable + 74 * 8).expect("DispatchGraph");
+            state.set(Register::Rsp, base + 0x280);
+            state.set(Register::Rcx, gpu_list);
+            state.set(Register::Rdx, set_desc);
+            memory.write_u64(base + 0x280, 0x1000_0106);
+            runtime
+                .dispatch_import(gpu_set_program, &mut state, &mut memory)
+                .expect("SetProgram for GPU mode test");
+            assert_eq!(state.get(Register::Rax), 0);
+            let gpu_desc = base + 0x3300;
+            memory.map_bytes(gpu_desc, &[0u8; 0x80]);
+            write_u32(&mut memory, gpu_desc, 1); // NODE_GPU_INPUT
+            state.set(Register::Rsp, base + 0x2c0);
+            state.set(Register::Rcx, gpu_list);
+            state.set(Register::Rdx, gpu_desc);
+            memory.write_u64(base + 0x2c0, 0x1000_0107);
+            runtime
+                .dispatch_import(gpu_dispatch_graph, &mut state, &mut memory)
+                .expect("GPU DispatchGraph");
+            assert_eq!(state.get(Register::Rax), 0);
+        });
+    }
+
+    fn build_dml_identity_operator(memory: &mut MemoryImage, base: u64) -> u64 {
+        let tensor = base;
+        let buffer_desc = base + 0x40;
+        let sizes = base + 0x80;
+        let operator = base + 0x200;
+        let payload = base + 0x240;
+        write_u32(memory, tensor, 1); // DML_TENSOR_TYPE_BUFFER
+        write_u64(memory, tensor + 8, buffer_desc);
+        write_u32(memory, buffer_desc, 1); // FLOAT32
+        write_u32(memory, buffer_desc + 4, 0);
+        write_u32(memory, buffer_desc + 8, 4);
+        write_u64(memory, buffer_desc + 16, sizes);
+        write_u64(memory, buffer_desc + 24, 0);
+        write_u64(memory, buffer_desc + 32, 8);
+        write_u32(memory, buffer_desc + 40, 0);
+        for (index, size) in [2u32, 1, 1, 1].iter().enumerate() {
+            write_u32(memory, sizes + index as u64 * 4, *size);
+        }
+        write_u32(memory, operator, 1); // DML_OPERATOR_ELEMENT_WISE_IDENTITY
+        write_u64(memory, operator + 8, payload);
+        write_u64(memory, payload, tensor);
+        write_u64(memory, payload + 8, tensor);
+        operator
+    }
+
+    #[test]
+    fn d3d12_dml_com_surface_create_compile_bind_record_and_execute() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge =
+                GameEnvironment::create_in(temp_dir.path(), "dml-com", GeArch::X64, "win11-23h2")
+                    .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            let mut memory = MemoryImage::default();
+            let base = 0x70_0000;
+            memory.map_bytes(base, &vec![0u8; 0x30000]);
+            let device = create_test_d3d12_device(&mut runtime, &mut memory, base, base + 0x20);
+
+            let iid_device = base + 0x8000;
+            memory.map_bytes(iid_device, &crate::d3d12::directml::IID_IDMLDEVICE.0);
+            let dml_out = base + 0x8010;
+            memory.map_bytes(dml_out, &[0u8; 8]);
+            let mut state = CpuState::new(GuestArch::X64);
+            state.set(Register::Rsp, base + 0x100);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, iid_device);
+            state.set(Register::R9, dml_out);
+            memory.write_u64(base + 0x100, 0x1000_0200);
+            let create_dml = runtime.alloc_host_thunk(HostThunk::DMLCreateDevice);
+            runtime
+                .dispatch_import(create_dml, &mut state, &mut memory)
+                .expect("DMLCreateDevice");
+            assert_eq!(state.get(Register::Rax), 0);
+            let dml_device = memory.read_u64(dml_out).expect("DML device");
+            assert_eq!(
+                runtime.guest_object_kind(dml_device).expect("dml kind"),
+                GuestObjectKind::DmlDevice
+            );
+
+            let dml_vtable = memory.read_u64(dml_device).expect("DML vtable");
+            let query_interface = memory.read_u64(dml_vtable).expect("QI");
+            let create_operator = memory.read_u64(dml_vtable + 8 * 8).expect("CreateOperator");
+            let compile_operator = memory
+                .read_u64(dml_vtable + 9 * 8)
+                .expect("CompileOperator");
+            let create_initializer = memory
+                .read_u64(dml_vtable + 10 * 8)
+                .expect("CreateOperatorInitializer");
+            let create_recorder = memory
+                .read_u64(dml_vtable + 11 * 8)
+                .expect("CreateCommandRecorder");
+            let create_binding_table = memory
+                .read_u64(dml_vtable + 12 * 8)
+                .expect("CreateBindingTable");
+
+            // QueryInterface: DMLCreateDevice returns IDMLDevice, not
+            // IDMLDevice1; the latter must fail with E_NOINTERFACE.
+            let qi_out = base + 0x8030;
+            memory.map_bytes(qi_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x140);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, iid_device);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x140, 0x1000_0201);
+            runtime
+                .dispatch_import(query_interface, &mut state, &mut memory)
+                .expect("DML QI");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(memory.read_u64(qi_out).expect("DML QI pointer"), dml_device);
+
+            let iid_device1 = base + 0x8020;
+            memory.map_bytes(iid_device1, &crate::d3d12::directml::IID_IDMLDEVICE1.0);
+            state.set(Register::Rsp, base + 0x160);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, iid_device1);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x160, 0x1000_0201_1);
+            runtime
+                .dispatch_import(query_interface, &mut state, &mut memory)
+                .expect("DML Device1 QI");
+            assert_eq!(state.get(Register::Rax), E_NOINTERFACE);
+            assert_eq!(memory.read_u64(qi_out).expect("DML Device1 pointer"), 0);
+            let bad_iid = base + 0x8040;
+            memory.map_bytes(bad_iid, &crate::d3d12::directml::IID_IDMLOPERATOR.0);
+            state.set(Register::Rsp, base + 0x180);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, bad_iid);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x180, 0x1000_0202);
+            runtime
+                .dispatch_import(query_interface, &mut state, &mut memory)
+                .expect("DML bad QI");
+            assert_eq!(state.get(Register::Rax), E_NOINTERFACE);
+            assert_eq!(memory.read_u64(qi_out).expect("failed QI"), 0);
+
+            // Null IID is E_POINTER.
+            state.set(Register::Rsp, base + 0x1a0);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x1a0, 0x1000_0202_1);
+            runtime
+                .dispatch_import(query_interface, &mut state, &mut memory)
+                .expect("DML null QI");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_POINTER as u64
+            );
+
+            // Release the QI reference.
+            let dml_release = memory.read_u64(dml_vtable + 16).expect("Release");
+            state.set(Register::Rsp, base + 0x1c0);
+            state.set(Register::Rcx, dml_device);
+            memory.write_u64(base + 0x1c0, 0x1000_0203);
+            runtime
+                .dispatch_import(dml_release, &mut state, &mut memory)
+                .expect("DML release QI");
+
+            // CreateOperator (real descriptor parsing), then CompileOperator.
+            let iid_operator = base + 0x8050;
+            memory.map_bytes(iid_operator, &crate::d3d12::directml::IID_IDMLOPERATOR.0);
+            let operator_out = base + 0x8060;
+            memory.map_bytes(operator_out, &[0u8; 8]);
+            let operator_desc = build_dml_identity_operator(&mut memory, base + 0x1000);
+            state.set(Register::Rsp, base + 0x200);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, operator_desc);
+            state.set(Register::R8, iid_operator);
+            state.set(Register::R9, operator_out);
+            memory.write_u64(base + 0x200, 0x1000_0204);
+            runtime
+                .dispatch_import(create_operator, &mut state, &mut memory)
+                .expect("CreateOperator");
+            assert_eq!(state.get(Register::Rax), 0);
+            let operator = memory.read_u64(operator_out).expect("operator");
+            assert_eq!(
+                runtime.guest_object_kind(operator).expect("operator kind"),
+                GuestObjectKind::DmlOperator
+            );
+
+            // Unsupported operator type must return E_INVALIDARG.
+            let bad_operator = base + 0x1200;
+            write_u32(&mut memory, bad_operator, 9999);
+            write_u64(&mut memory, bad_operator + 8, bad_operator + 0x40);
+            state.set(Register::Rsp, base + 0x240);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, bad_operator);
+            state.set(Register::R8, iid_operator);
+            state.set(Register::R9, operator_out);
+            memory.write_u64(base + 0x240, 0x1000_0205);
+            runtime
+                .dispatch_import(create_operator, &mut state, &mut memory)
+                .expect("unsupported CreateOperator");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_INVALIDARG as u64
+            );
+
+            // Null operator descriptor is E_POINTER.
+            state.set(Register::Rsp, base + 0x280);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, iid_operator);
+            state.set(Register::R9, operator_out);
+            memory.write_u64(base + 0x280, 0x1000_0206);
+            runtime
+                .dispatch_import(create_operator, &mut state, &mut memory)
+                .expect("null CreateOperator");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_POINTER as u64
+            );
+
+            let iid_compiled = base + 0x8070;
+            memory.map_bytes(
+                iid_compiled,
+                &crate::d3d12::directml::IID_IDMLCOMPILEDOPERATOR.0,
+            );
+            let compiled_out = base + 0x8080;
+            memory.map_bytes(compiled_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x2c0);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, operator);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, iid_compiled);
+            memory.write_u64(base + 0x2c0, 0x1000_0207);
+            memory.write_u64(base + 0x2c0 + 0x28, compiled_out);
+            runtime
+                .dispatch_import(compile_operator, &mut state, &mut memory)
+                .expect("CompileOperator");
+            assert_eq!(state.get(Register::Rax), 0);
+            let compiled = memory.read_u64(compiled_out).expect("compiled");
+            assert_eq!(
+                runtime.guest_object_kind(compiled).expect("compiled kind"),
+                GuestObjectKind::DmlCompiledOperator
+            );
+
+            // Compile failure for an object that is not an operator.
+            state.set(Register::Rsp, base + 0x300);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, dml_device);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, iid_compiled);
+            memory.write_u64(base + 0x300, 0x1000_0208);
+            memory.write_u64(base + 0x300 + 0x28, compiled_out);
+            runtime
+                .dispatch_import(compile_operator, &mut state, &mut memory)
+                .expect("invalid CompileOperator");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_INVALIDARG as u64
+            );
+
+            // GetBindingProperties on the compiled operator.
+            let compiled_vtable = memory.read_u64(compiled).expect("compiled vtable");
+            let get_properties = memory
+                .read_u64(compiled_vtable + 8 * 8)
+                .expect("GetBindingProperties");
+            let properties = base + 0x8090;
+            memory.map_bytes(properties, &[0u8; 24]);
+            state.set(Register::Rsp, base + 0x340);
+            state.set(Register::Rcx, compiled);
+            state.set(Register::Rdx, properties);
+            memory.write_u64(base + 0x340, 0x1000_0209);
+            runtime
+                .dispatch_import(get_properties, &mut state, &mut memory)
+                .expect("GetBindingProperties");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(runtime_read_u32(&memory, properties), 2);
+
+            // Initializer creation and reset.
+            let iid_initializer = base + 0x80a0;
+            memory.map_bytes(
+                iid_initializer,
+                &crate::d3d12::directml::IID_IDMLOPERATORINITIALIZER.0,
+            );
+            let initializer_out = base + 0x80b0;
+            memory.map_bytes(initializer_out, &[0u8; 8]);
+            let operator_array = base + 0x80c0;
+            memory.map_bytes(operator_array, &[0u8; 8]);
+            memory.write_u64(operator_array, compiled);
+            state.set(Register::Rsp, base + 0x380);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, operator_array);
+            state.set(Register::R9, iid_initializer);
+            memory.write_u64(base + 0x380, 0x1000_020a);
+            memory.write_u64(base + 0x380 + 0x28, initializer_out);
+            runtime
+                .dispatch_import(create_initializer, &mut state, &mut memory)
+                .expect("CreateOperatorInitializer");
+            assert_eq!(state.get(Register::Rax), 0);
+            let initializer = memory.read_u64(initializer_out).expect("initializer");
+            let initializer_vtable = memory.read_u64(initializer).expect("initializer vtable");
+            let reset = memory
+                .read_u64(initializer_vtable + 9 * 8)
+                .expect("initializer Reset");
+            state.set(Register::Rsp, base + 0x3c0);
+            state.set(Register::Rcx, initializer);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, operator_array);
+            memory.write_u64(base + 0x3c0, 0x1000_020b);
+            runtime
+                .dispatch_import(reset, &mut state, &mut memory)
+                .expect("initializer Reset");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // Command recorder and binding table.
+            let iid_recorder = base + 0x80d0;
+            memory.map_bytes(
+                iid_recorder,
+                &crate::d3d12::directml::IID_IDMLCOMMANDRECORDER.0,
+            );
+            let recorder_out = base + 0x80e0;
+            memory.map_bytes(recorder_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x400);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, iid_recorder);
+            state.set(Register::R8, recorder_out);
+            memory.write_u64(base + 0x400, 0x1000_020c);
+            runtime
+                .dispatch_import(create_recorder, &mut state, &mut memory)
+                .expect("CreateCommandRecorder");
+            assert_eq!(state.get(Register::Rax), 0);
+            let recorder = memory.read_u64(recorder_out).expect("recorder");
+
+            let iid_table = base + 0x80f0;
+            memory.map_bytes(iid_table, &crate::d3d12::directml::IID_IDMLBINDINGTABLE.0);
+            let table_desc = base + 0x9000;
+            memory.map_bytes(table_desc, &[0u8; 32]);
+            write_u64(&mut memory, table_desc, compiled);
+            write_u32(&mut memory, table_desc + 24, 2);
+            let table_out = base + 0x8100;
+            memory.map_bytes(table_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x440);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, table_desc);
+            state.set(Register::R8, iid_table);
+            state.set(Register::R9, table_out);
+            memory.write_u64(base + 0x440, 0x1000_020d);
+            runtime
+                .dispatch_import(create_binding_table, &mut state, &mut memory)
+                .expect("CreateBindingTable");
+            assert_eq!(state.get(Register::Rax), 0);
+            let table = memory.read_u64(table_out).expect("binding table");
+
+            // Null binding-table descriptor is rejected.
+            state.set(Register::Rsp, base + 0x460);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, iid_table);
+            state.set(Register::R9, table_out);
+            memory.write_u64(base + 0x460, 0x1000_020e);
+            runtime
+                .dispatch_import(create_binding_table, &mut state, &mut memory)
+                .expect("null CreateBindingTable");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_INVALIDARG as u64
+            );
+
+            // Create two D3D12 resources to bind.
+            let resource_desc = base + 0x9200;
+            memory.map_bytes(resource_desc, &[0u8; 48]);
+            write_u32(&mut memory, resource_desc, 28); // DXGI_FORMAT_R8G8B8A8_UNORM
+            write_u32(&mut memory, resource_desc + 4, 2); // TEXTURE2D
+            write_u64(&mut memory, resource_desc + 8, 16);
+            write_u32(&mut memory, resource_desc + 16, 1);
+            write_u16(&mut memory, resource_desc + 20, 1);
+            write_u16(&mut memory, resource_desc + 24, 1);
+            write_u32(&mut memory, resource_desc + 28, 1);
+            write_u32(&mut memory, resource_desc + 32, 0);
+            let create_resource = memory
+                .read_u64(memory.read_u64(device).expect("device vtable") + 24 * 8)
+                .expect("CreateCommittedResource");
+            let resource_a_out = base + 0x8110;
+            let resource_b_out = base + 0x8118;
+            memory.map_bytes(resource_a_out, &[0u8; 8]);
+            memory.map_bytes(resource_b_out, &[0u8; 8]);
+            for (slot, out) in [(0x480u64, resource_a_out), (0x4c0, resource_b_out)] {
+                state.set(Register::Rsp, base + slot);
+                state.set(Register::Rcx, device);
+                state.set(Register::Rdx, 0);
+                state.set(Register::R8, 0);
+                state.set(Register::R9, resource_desc);
+                memory.write_u64(base + slot, 0x1000_0210 + slot);
+                write_u32(&mut memory, base + slot + 0x28, 0);
+                memory.write_u64(base + slot + 0x30, 0);
+                memory.write_u64(base + slot + 0x38, out);
+                runtime
+                    .dispatch_import(create_resource, &mut state, &mut memory)
+                    .expect("CreateCommittedResource");
+                assert_eq!(state.get(Register::Rax), 0);
+            }
+            let resource_a = memory.read_u64(resource_a_out).expect("resource A");
+            let resource_b = memory.read_u64(resource_b_out).expect("resource B");
+
+            let buffer_binding_a = base + 0x9300;
+            let buffer_binding_b = base + 0x9320;
+            let bindings_a = base + 0x9400;
+            let bindings_b = base + 0x9420;
+            for (binding, resource) in [
+                (buffer_binding_a, resource_a),
+                (buffer_binding_b, resource_b),
+            ] {
+                write_u64(&mut memory, binding, resource);
+                write_u64(&mut memory, binding + 8, 0);
+                write_u64(&mut memory, binding + 16, 8);
+            }
+            for (desc, binding) in [
+                (bindings_a, buffer_binding_a),
+                (bindings_b, buffer_binding_b),
+            ] {
+                write_u32(&mut memory, desc, 1); // DML_BINDING_TYPE_BUFFER
+                write_u64(&mut memory, desc + 8, binding);
+            }
+            let table_vtable = memory.read_u64(table).expect("table vtable");
+            let bind_inputs = memory.read_u64(table_vtable + 8 * 8).expect("BindInputs");
+            let bind_outputs = memory.read_u64(table_vtable + 9 * 8).expect("BindOutputs");
+            state.set(Register::Rsp, base + 0x500);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, bindings_a);
+            memory.write_u64(base + 0x500, 0x1000_0220);
+            runtime
+                .dispatch_import(bind_inputs, &mut state, &mut memory)
+                .expect("BindInputs");
+            assert_eq!(state.get(Register::Rax), 0);
+            state.set(Register::Rsp, base + 0x540);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, bindings_b);
+            memory.write_u64(base + 0x540, 0x1000_0221);
+            runtime
+                .dispatch_import(bind_outputs, &mut state, &mut memory)
+                .expect("BindOutputs");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // Null binding array with a non-zero count is E_INVALIDARG.
+            state.set(Register::Rsp, base + 0x560);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, 0);
+            memory.write_u64(base + 0x560, 0x1000_0221_1);
+            runtime
+                .dispatch_import(bind_inputs, &mut state, &mut memory)
+                .expect("null BindInputs");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_INVALIDARG as u64
+            );
+
+            // Unsupported BUFFER_ARRAY binding fails closed.
+            let bad_binding = base + 0x9500;
+            write_u32(&mut memory, bad_binding, 2);
+            write_u64(&mut memory, bad_binding + 8, buffer_binding_a);
+            state.set(Register::Rsp, base + 0x580);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, bad_binding);
+            memory.write_u64(base + 0x580, 0x1000_0222);
+            runtime
+                .dispatch_import(bind_inputs, &mut state, &mut memory)
+                .expect("unsupported BindInputs");
+            assert_eq!(state.get(Register::Rax), E_NOTIMPL);
+
+            // RecordDispatch through the real command recorder vtable.
+            let list =
+                create_test_d3d12_command_list(&mut runtime, &mut memory, base + 0x6000, device);
+            let recorder_vtable = memory.read_u64(recorder).expect("recorder vtable");
+            let record_dispatch = memory
+                .read_u64(recorder_vtable + 8 * 8)
+                .expect("RecordDispatch");
+            state.set(Register::Rsp, base + 0x5c0);
+            state.set(Register::Rcx, recorder);
+            state.set(Register::Rdx, list);
+            state.set(Register::R8, compiled);
+            state.set(Register::R9, table);
+            memory.write_u64(base + 0x5c0, 0x1000_0223);
+            runtime
+                .dispatch_import(record_dispatch, &mut state, &mut memory)
+                .expect("RecordDispatch");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(runtime.d3d12_runtime.directml().dispatches().len(), 1);
+
+            // Null binding table is rejected.
+            state.set(Register::Rsp, base + 0x600);
+            state.set(Register::Rcx, recorder);
+            state.set(Register::Rdx, list);
+            state.set(Register::R8, compiled);
+            state.set(Register::R9, 0);
+            memory.write_u64(base + 0x600, 0x1000_0224);
+            runtime
+                .dispatch_import(record_dispatch, &mut state, &mut memory)
+                .expect("null RecordDispatch");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_INVALIDARG as u64
+            );
+
+            // One real Metal elementwise execution through the compiled
+            // operator (identity on two FLOAT32 values).
+            let compiled_handle = runtime.dml_object_handles[&compiled];
+            let input = [1.5f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat();
+            let mut output = [0u8; 8];
+            runtime
+                .d3d12_runtime
+                .directml()
+                .execute_elementwise(compiled_handle, &[&input], &mut output)
+                .expect("real DirectML Metal execution");
+            assert_eq!(output.as_slice(), input.as_slice());
+
+            // Release the whole COM hierarchy; device refcounts must unwind.
+            for object in [table, recorder, initializer, compiled, operator, dml_device] {
+                let vtable = memory.read_u64(object).expect("object vtable");
+                let release = memory.read_u64(vtable + 16).expect("Release");
+                state.set(Register::Rsp, base + 0x640);
+                state.set(Register::Rcx, object);
+                memory.write_u64(base + 0x640, 0x1000_0230);
+                runtime
+                    .dispatch_import(release, &mut state, &mut memory)
+                    .expect("release DML object");
+            }
+            assert!(runtime.dml_object_handles.is_empty());
+        });
+    }
+
+    #[test]
+    fn d3d12_dml_create_device1_feature_level_and_device1_query_interface() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "dml-device1",
+                GeArch::X64,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            let mut memory = MemoryImage::default();
+            let base = 0x70_0000;
+            memory.map_bytes(base, &vec![0u8; 0x20000]);
+            let device = create_test_d3d12_device(&mut runtime, &mut memory, base, base + 0x20);
+            let iid = base + 0x8000;
+            memory.map_bytes(iid, &crate::d3d12::directml::IID_IDMLDEVICE.0);
+            let out = base + 0x8010;
+            memory.map_bytes(out, &[0u8; 8]);
+            let create_dml1 = runtime.alloc_host_thunk(HostThunk::DMLCreateDevice1);
+            let mut state = CpuState::new(GuestArch::X64);
+            state.set(Register::Rsp, base + 0x100);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, 0x2000);
+            state.set(Register::R9, iid);
+            memory.write_u64(base + 0x100, 0x1000_0300);
+            memory.write_u64(base + 0x100 + 0x28, out);
+            runtime
+                .dispatch_import(create_dml1, &mut state, &mut memory)
+                .expect("DMLCreateDevice1 unsupported level");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::DXGI_ERROR_UNSUPPORTED as u64
+            );
+            state.set(Register::Rsp, base + 0x100);
+            state.set(
+                Register::R8,
+                crate::d3d12::directml::DML_FEATURE_LEVEL_1_0 as u64,
+            );
+            state.set(Register::R9, iid);
+            memory.write_u64(base + 0x100 + 0x28, out);
+            runtime
+                .dispatch_import(create_dml1, &mut state, &mut memory)
+                .expect("DMLCreateDevice1");
+            assert_eq!(state.get(Register::Rax), 0);
+            let dml_device = memory.read_u64(out).expect("device1 object");
+            assert!(runtime.dml_device1_objects.contains(&dml_device));
+            let vtable = memory.read_u64(dml_device).expect("device1 vtable");
+            let query_interface = memory.read_u64(vtable).expect("QI");
+            let iid_device1 = base + 0x8020;
+            memory.map_bytes(iid_device1, &crate::d3d12::directml::IID_IDMLDEVICE1.0);
+            let qi_out = base + 0x8030;
+            memory.map_bytes(qi_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0x140);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, iid_device1);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x140, 0x1000_0301);
+            runtime
+                .dispatch_import(query_interface, &mut state, &mut memory)
+                .expect("Device1 QI");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(memory.read_u64(qi_out).expect("Device1 QI ptr"), dml_device);
+        });
+    }
+
+    #[test]
+    fn d3d12_dml_dispatch_error_paths_and_object_methods_are_pinned() {
+        use crate::d3d12::directml;
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "dml-dispatch-errors",
+                GeArch::X64,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            let mut memory = MemoryImage::default();
+            let base = 0x78_0000;
+            memory.map_bytes(base, &vec![0u8; 0x30000]);
+            let device = create_test_d3d12_device(&mut runtime, &mut memory, base, base + 0x20);
+            let list =
+                create_test_d3d12_command_list(&mut runtime, &mut memory, base + 0x1000, device);
+            let mut state = CpuState::new(GuestArch::X64);
+            let create_dml = runtime.alloc_host_thunk(HostThunk::DMLCreateDevice);
+            let iid_device = base + 0x8000;
+            memory.map_bytes(iid_device, &crate::d3d12::directml::IID_IDMLDEVICE.0);
+            let dml_out = base + 0x8010;
+            memory.map_bytes(dml_out, &[0u8; 8]);
+            let bad_parent = 0x1234u64;
+            for (parent, iid_ptr, flags, out_ptr, expected) in [
+                (
+                    bad_parent,
+                    iid_device,
+                    0,
+                    dml_out,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (
+                    device,
+                    0,
+                    0,
+                    dml_out,
+                    crate::d3d12::directml::E_POINTER as u64,
+                ),
+                (device, base + 0x8020, 0, dml_out, E_NOINTERFACE),
+                (
+                    device,
+                    iid_device,
+                    0x8,
+                    dml_out,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (
+                    device,
+                    iid_device,
+                    0,
+                    0,
+                    crate::d3d12::directml::E_POINTER as u64,
+                ),
+            ] {
+                memory.map_bytes(base + 0x8020, &[0xAA; 16]);
+                state.set(Register::Rsp, base + 0x100);
+                state.set(Register::Rcx, parent);
+                state.set(Register::Rdx, flags);
+                state.set(Register::R8, iid_ptr);
+                state.set(Register::R9, out_ptr);
+                memory.write_u64(base + 0x100, 0x1000_0800);
+                runtime
+                    .dispatch_import(create_dml, &mut state, &mut memory)
+                    .expect("DMLCreateDevice error path");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            state.set(Register::Rsp, base + 0x140);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, iid_device);
+            state.set(Register::R9, dml_out);
+            memory.write_u64(base + 0x140, 0x1000_0801);
+            runtime
+                .dispatch_import(create_dml, &mut state, &mut memory)
+                .expect("DMLCreateDevice success");
+            assert_eq!(state.get(Register::Rax), 0);
+            let dml_device = memory.read_u64(dml_out).expect("DML device");
+            let dml_vtable = memory.read_u64(dml_device).expect("DML vtable");
+            let _query_interface = memory.read_u64(dml_vtable).expect("QI");
+            let create_operator = memory.read_u64(dml_vtable + 8 * 8).expect("CreateOperator");
+            let compile_operator = memory
+                .read_u64(dml_vtable + 9 * 8)
+                .expect("CompileOperator");
+            let create_initializer = memory
+                .read_u64(dml_vtable + 10 * 8)
+                .expect("CreateOperatorInitializer");
+            let create_recorder = memory
+                .read_u64(dml_vtable + 11 * 8)
+                .expect("CreateCommandRecorder");
+            let create_binding_table = memory
+                .read_u64(dml_vtable + 12 * 8)
+                .expect("CreateBindingTable");
+            let get_parent_device = memory
+                .read_u64(dml_vtable + 16 * 8)
+                .expect("GetParentDevice");
+            let check_feature = memory
+                .read_u64(dml_vtable + 7 * 8)
+                .expect("CheckFeatureSupport");
+            let iid_operator = base + 0x8100;
+            memory.map_bytes(iid_operator, &crate::d3d12::directml::IID_IDMLOPERATOR.0);
+            let operator_desc = build_dml_identity_operator(&mut memory, base + 0x2000);
+            let operator_out = base + 0x8110;
+            memory.map_bytes(operator_out, &[0u8; 8]);
+            for (device_obj, desc, iid_ptr, out_ptr, expected) in [
+                (
+                    device,
+                    operator_desc,
+                    iid_operator,
+                    0,
+                    crate::d3d12::directml::E_POINTER as u64,
+                ),
+                (
+                    device,
+                    operator_desc,
+                    base + 0x8120,
+                    operator_out,
+                    E_NOINTERFACE,
+                ),
+                (dml_device, operator_desc, iid_operator, operator_out, 0),
+            ] {
+                memory.map_bytes(base + 0x8120, &[0xBB; 16]);
+                state.set(Register::Rsp, base + 0x180);
+                state.set(Register::Rcx, device_obj);
+                state.set(Register::Rdx, desc);
+                state.set(Register::R8, iid_ptr);
+                state.set(Register::R9, out_ptr);
+                memory.write_u64(base + 0x180, 0x1000_0802);
+                runtime
+                    .dispatch_import(create_operator, &mut state, &mut memory)
+                    .expect("CreateOperator");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            let operator = memory.read_u64(operator_out).expect("operator");
+            // QI on every child object kind.
+            let qi_out = base + 0x8130;
+            memory.map_bytes(qi_out, &[0u8; 8]);
+            let child_qi = memory.read_u64(operator).expect("operator vtable");
+            let child_qi_fn = memory.read_u64(child_qi).expect("child QI");
+            for (iid, expected) in [
+                (crate::d3d12::directml::IID_IDMLOPERATOR.0, 0u64),
+                (crate::d3d12::directml::IID_IDMLDEVICECHILD.0, 0u64),
+                (
+                    crate::d3d12::directml::IID_IDMLCOMPILEDOPERATOR.0,
+                    E_NOINTERFACE,
+                ),
+            ] {
+                memory.map_bytes(base + 0x8140, &iid);
+                state.set(Register::Rsp, base + 0x1c0);
+                state.set(Register::Rcx, operator);
+                state.set(Register::Rdx, base + 0x8140);
+                state.set(Register::R8, qi_out);
+                memory.write_u64(base + 0x1c0, 0x1000_0803);
+                runtime
+                    .dispatch_import(child_qi_fn, &mut state, &mut memory)
+                    .expect("operator QI");
+                assert_eq!(state.get(Register::Rax), expected);
+                if expected == 0 {
+                    // Balance each successful QI reference.
+                    let release = memory.read_u64(child_qi + 16).expect("child release");
+                    state.set(Register::Rsp, base + 0x200);
+                    state.set(Register::Rcx, operator);
+                    memory.write_u64(base + 0x200, 0x1000_0804);
+                    runtime
+                        .dispatch_import(release, &mut state, &mut memory)
+                        .expect("release QI reference");
+                }
+            }
+
+            // Private data, names, and GetDevice on the operator.
+            let get_private = memory.read_u64(child_qi + 24).expect("GetPrivateData");
+            let set_private = memory.read_u64(child_qi + 32).expect("SetPrivateData");
+            let set_interface = memory
+                .read_u64(child_qi + 40)
+                .expect("SetPrivateDataInterface");
+            let set_name = memory.read_u64(child_qi + 48).expect("SetName");
+            let get_device = memory.read_u64(child_qi + 56).expect("GetDevice");
+            let guid = base + 0x8200;
+            memory.map_bytes(guid, &[0x11; 16]);
+            let size_ptr = base + 0x8210;
+            let data_ptr = base + 0x8220;
+            memory.map_bytes(size_ptr, &[0u8; 4]);
+            memory.map_bytes(data_ptr, &[0u8; 16]);
+            state.set(Register::Rsp, base + 0x240);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, size_ptr);
+            state.set(Register::R9, 0);
+            memory.write_u64(base + 0x240, 0x1000_0805);
+            runtime
+                .dispatch_import(get_private, &mut state, &mut memory)
+                .expect("GetPrivateData missing");
+            assert_eq!(state.get(Register::Rax), DXGI_ERROR_NOT_FOUND);
+            state.set(Register::Rsp, base + 0x280);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, 4);
+            state.set(Register::R9, data_ptr);
+            memory.write_u64(base + 0x280, 0x1000_0806);
+            runtime
+                .dispatch_import(set_private, &mut state, &mut memory)
+                .expect("SetPrivateData");
+            assert_eq!(state.get(Register::Rax), 0);
+            write_u32(&mut memory, size_ptr, 16);
+            state.set(Register::Rsp, base + 0x2c0);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, size_ptr);
+            state.set(Register::R9, data_ptr);
+            memory.write_u64(base + 0x2c0, 0x1000_0807);
+            runtime
+                .dispatch_import(get_private, &mut state, &mut memory)
+                .expect("GetPrivateData success");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(runtime_read_u32(&memory, size_ptr), 4);
+            write_u32(&mut memory, size_ptr, 2);
+            state.set(Register::Rsp, base + 0x300);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, size_ptr);
+            state.set(Register::R9, data_ptr);
+            memory.write_u64(base + 0x300, 0x1000_0808);
+            runtime
+                .dispatch_import(get_private, &mut state, &mut memory)
+                .expect("GetPrivateData short buffer");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::DXGI_ERROR_MORE_DATA as u64
+            );
+            assert_eq!(runtime_read_u32(&memory, size_ptr), 4);
+            state.set(Register::Rsp, base + 0x340);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, 4);
+            state.set(Register::R9, 0);
+            memory.write_u64(base + 0x340, 0x1000_0809);
+            runtime
+                .dispatch_import(set_private, &mut state, &mut memory)
+                .expect("SetPrivateData null data");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_INVALIDARG as u64
+            );
+            state.set(Register::Rsp, base + 0x380);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, 0);
+            memory.write_u64(base + 0x380, 0x1000_080a);
+            runtime
+                .dispatch_import(set_private, &mut state, &mut memory)
+                .expect("SetPrivateData clear");
+            assert_eq!(state.get(Register::Rax), 0);
+            state.set(Register::Rsp, base + 0x3c0);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, dml_device);
+            memory.write_u64(base + 0x3c0, 0x1000_080b);
+            runtime
+                .dispatch_import(set_interface, &mut state, &mut memory)
+                .expect("SetPrivateDataInterface set");
+            assert_eq!(state.get(Register::Rax), 0);
+            state.set(Register::Rsp, base + 0x400);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, 0);
+            memory.write_u64(base + 0x400, 0x1000_080c);
+            runtime
+                .dispatch_import(set_interface, &mut state, &mut memory)
+                .expect("SetPrivateDataInterface clear");
+            assert_eq!(state.get(Register::Rax), 0);
+            let name_ptr = base + 0x8300;
+            for (index, unit) in "operator".encode_utf16().enumerate() {
+                memory.write_u16(name_ptr + index as u64 * 2, unit);
+            }
+            for name in [name_ptr, 0] {
+                state.set(Register::Rsp, base + 0x440);
+                state.set(Register::Rcx, operator);
+                state.set(Register::Rdx, name);
+                memory.write_u64(base + 0x440, 0x1000_080d);
+                runtime
+                    .dispatch_import(set_name, &mut state, &mut memory)
+                    .expect("SetName");
+                assert_eq!(state.get(Register::Rax), 0);
+            }
+            for (iid, expected) in [
+                (crate::d3d12::directml::IID_IDMLDEVICE.0, 0u64),
+                (crate::d3d12::directml::IID_IDMLDEVICE1.0, E_NOINTERFACE),
+            ] {
+                memory.map_bytes(base + 0x8340, &iid);
+                state.set(Register::Rsp, base + 0x480);
+                state.set(Register::Rcx, operator);
+                state.set(Register::Rdx, base + 0x8340);
+                state.set(Register::R8, qi_out);
+                memory.write_u64(base + 0x480, 0x1000_080e);
+                runtime
+                    .dispatch_import(get_device, &mut state, &mut memory)
+                    .expect("GetDevice");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            state.set(Register::Rsp, base + 0x4c0);
+            state.set(Register::Rcx, 0x9999);
+            state.set(Register::Rdx, base + 0x8340);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x4c0, 0x1000_080f);
+            runtime
+                .dispatch_import(get_device, &mut state, &mut memory)
+                .expect("GetDevice unknown");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_INVALIDARG as u64
+            );
+
+            // GetParentDevice.
+            let device_iid: [u8; 16] = [
+                0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b,
+                0x85, 0xf7,
+            ];
+            for (iid, expected) in [(device_iid, 0u64), ([0xCCu8; 16], E_NOINTERFACE)] {
+                memory.map_bytes(base + 0x8400, &iid);
+                state.set(Register::Rsp, base + 0x500);
+                state.set(Register::Rcx, dml_device);
+                state.set(Register::Rdx, base + 0x8400);
+                state.set(Register::R8, qi_out);
+                memory.write_u64(base + 0x500, 0x1000_0810);
+                runtime
+                    .dispatch_import(get_parent_device, &mut state, &mut memory)
+                    .expect("GetParentDevice");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            state.set(Register::Rsp, base + 0x540);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, base + 0x8400);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x540, 0x1000_0811);
+            runtime
+                .dispatch_import(get_parent_device, &mut state, &mut memory)
+                .expect("GetParentDevice unknown");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_INVALIDARG as u64
+            );
+
+            // CheckFeatureSupport.
+            let query = base + 0x8500;
+            let feature_out = base + 0x8520;
+            memory.map_bytes(query, &[0u8; 32]);
+            memory.map_bytes(feature_out, &[0u8; 32]);
+            for (feature, query_size, data_type, expected) in [
+                (
+                    0u32,
+                    4u32,
+                    crate::d3d12::directml::DML_TENSOR_DATA_TYPE_FLOAT32,
+                    0u64,
+                ),
+                (0, 4, crate::d3d12::directml::DML_TENSOR_DATA_TYPE_UINT32, 0),
+                (0, 2, 0, crate::d3d12::directml::E_INVALIDARG as u64),
+                (2, 4, 0, crate::d3d12::directml::E_INVALIDARG as u64),
+            ] {
+                write_u32(&mut memory, query, data_type);
+                state.set(Register::Rsp, base + 0x580);
+                state.set(Register::Rcx, dml_device);
+                state.set(Register::Rdx, feature as u64);
+                state.set(Register::R8, query_size as u64);
+                state.set(Register::R9, query);
+                memory.write_u64(base + 0x580, 0x1000_0812);
+                write_u32(&mut memory, base + 0x580 + 0x28, 4);
+                memory.write_u64(base + 0x580 + 0x30, feature_out);
+                runtime
+                    .dispatch_import(check_feature, &mut state, &mut memory)
+                    .expect("CheckFeatureSupport");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            write_u32(&mut memory, query, 2);
+            write_u64(&mut memory, query + 8, base + 0x8540);
+            write_u32(&mut memory, base + 0x8540, 0x1000);
+            write_u32(&mut memory, base + 0x8544, 0x2000);
+            state.set(Register::Rsp, base + 0x5c0);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, 16);
+            state.set(Register::R9, query);
+            memory.write_u64(base + 0x5c0, 0x1000_0813);
+            write_u32(&mut memory, base + 0x5c0 + 0x28, 4);
+            memory.write_u64(base + 0x5c0 + 0x30, feature_out);
+            runtime
+                .dispatch_import(check_feature, &mut state, &mut memory)
+                .expect("CheckFeatureSupport levels");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(runtime_read_u32(&memory, feature_out), 0x1000);
+
+            // Compile and create the rest of the object graph.
+            let iid_compiled = base + 0x8600;
+            memory.map_bytes(
+                iid_compiled,
+                &crate::d3d12::directml::IID_IDMLCOMPILEDOPERATOR.0,
+            );
+            let compiled_out = base + 0x8610;
+            memory.map_bytes(compiled_out, &[0u8; 8]);
+            for (device_obj, op, iid_ptr, out_ptr, expected) in [
+                (
+                    device,
+                    0x9999,
+                    iid_compiled,
+                    compiled_out,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (
+                    dml_device,
+                    operator,
+                    base + 0x8620,
+                    compiled_out,
+                    E_NOINTERFACE,
+                ),
+                (
+                    dml_device,
+                    operator,
+                    iid_compiled,
+                    0,
+                    crate::d3d12::directml::E_POINTER as u64,
+                ),
+            ] {
+                memory.map_bytes(base + 0x8620, &[0xDD; 16]);
+                state.set(Register::Rsp, base + 0x600);
+                state.set(Register::Rcx, device_obj);
+                state.set(Register::Rdx, op);
+                state.set(Register::R8, 0);
+                state.set(Register::R9, iid_ptr);
+                memory.write_u64(base + 0x600, 0x1000_0814);
+                memory.write_u64(base + 0x600 + 0x28, out_ptr);
+                runtime
+                    .dispatch_import(compile_operator, &mut state, &mut memory)
+                    .expect("CompileOperator error");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            state.set(Register::Rsp, base + 0x640);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, operator);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, iid_compiled);
+            memory.write_u64(base + 0x640, 0x1000_0815);
+            memory.write_u64(base + 0x640 + 0x28, compiled_out);
+            runtime
+                .dispatch_import(compile_operator, &mut state, &mut memory)
+                .expect("CompileOperator");
+            assert_eq!(state.get(Register::Rax), 0);
+            let compiled = memory.read_u64(compiled_out).expect("compiled");
+            let compiled_vtable = memory.read_u64(compiled).expect("compiled vtable");
+            let compiled_qi = memory.read_u64(compiled_vtable).expect("compiled QI");
+            let get_props = memory
+                .read_u64(compiled_vtable + 8 * 8)
+                .expect("GetBindingProperties");
+            for iid in [
+                crate::d3d12::directml::IID_IDMLCOMPILEDOPERATOR.0,
+                crate::d3d12::directml::IID_IDMLDISPATCHABLE.0,
+                crate::d3d12::directml::IID_IDMLPAGEABLE.0,
+            ] {
+                memory.map_bytes(base + 0x8640, &iid);
+                state.set(Register::Rsp, base + 0x680);
+                state.set(Register::Rcx, compiled);
+                state.set(Register::Rdx, base + 0x8640);
+                state.set(Register::R8, qi_out);
+                memory.write_u64(base + 0x680, 0x1000_0816);
+                runtime
+                    .dispatch_import(compiled_qi, &mut state, &mut memory)
+                    .expect("compiled QI");
+                assert_eq!(state.get(Register::Rax), 0);
+                let release = memory.read_u64(compiled_vtable + 16).expect("release");
+                state.set(Register::Rsp, base + 0x6c0);
+                state.set(Register::Rcx, compiled);
+                memory.write_u64(base + 0x6c0, 0x1000_0817);
+                runtime
+                    .dispatch_import(release, &mut state, &mut memory)
+                    .expect("release compiled QI");
+            }
+            let props = base + 0x8660;
+            memory.map_bytes(props, &[0u8; 24]);
+            state.set(Register::Rsp, base + 0x700);
+            state.set(Register::Rcx, compiled);
+            state.set(Register::Rdx, props);
+            memory.write_u64(base + 0x700, 0x1000_0818);
+            runtime
+                .dispatch_import(get_props, &mut state, &mut memory)
+                .expect("GetBindingProperties");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // Initializer, recorder and binding table errors plus auxiliary binds.
+            let iid_initializer = base + 0x8700;
+            memory.map_bytes(
+                iid_initializer,
+                &crate::d3d12::directml::IID_IDMLOPERATORINITIALIZER.0,
+            );
+            let initializer_out = base + 0x8710;
+            memory.map_bytes(initializer_out, &[0u8; 8]);
+            let operator_array = base + 0x8720;
+            memory.map_bytes(operator_array, &[0u8; 8]);
+            memory.write_u64(operator_array, compiled);
+            for (device_obj, count, ptr, iid_ptr, out_ptr, expected) in [
+                (
+                    device,
+                    1u32,
+                    operator_array,
+                    iid_initializer,
+                    initializer_out,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (
+                    dml_device,
+                    1,
+                    operator_array,
+                    base + 0x8730,
+                    initializer_out,
+                    E_NOINTERFACE,
+                ),
+                (
+                    dml_device,
+                    1,
+                    0,
+                    iid_initializer,
+                    initializer_out,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (
+                    dml_device,
+                    1,
+                    operator_array,
+                    iid_initializer,
+                    0,
+                    crate::d3d12::directml::E_POINTER as u64,
+                ),
+            ] {
+                memory.map_bytes(base + 0x8730, &[0xEE; 16]);
+                state.set(Register::Rsp, base + 0x740);
+                state.set(Register::Rcx, device_obj);
+                state.set(Register::Rdx, count as u64);
+                state.set(Register::R8, ptr);
+                state.set(Register::R9, iid_ptr);
+                memory.write_u64(base + 0x740, 0x1000_0819);
+                memory.write_u64(base + 0x740 + 0x28, out_ptr);
+                runtime
+                    .dispatch_import(create_initializer, &mut state, &mut memory)
+                    .expect("CreateOperatorInitializer error");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            state.set(Register::Rsp, base + 0x780);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, operator_array);
+            state.set(Register::R9, iid_initializer);
+            memory.write_u64(base + 0x780, 0x1000_081a);
+            memory.write_u64(base + 0x780 + 0x28, initializer_out);
+            runtime
+                .dispatch_import(create_initializer, &mut state, &mut memory)
+                .expect("CreateOperatorInitializer");
+            assert_eq!(state.get(Register::Rax), 0);
+            let initializer = memory.read_u64(initializer_out).expect("initializer");
+            let initializer_vtable = memory.read_u64(initializer).expect("initializer vtable");
+            let reset = memory
+                .read_u64(initializer_vtable + 9 * 8)
+                .expect("initializer Reset");
+            let init_props = memory
+                .read_u64(initializer_vtable + 8 * 8)
+                .expect("initializer properties");
+            memory.map_bytes(props, &[0u8; 24]);
+            state.set(Register::Rsp, base + 0x7c0);
+            state.set(Register::Rcx, initializer);
+            state.set(Register::Rdx, props);
+            memory.write_u64(base + 0x7c0, 0x1000_081b);
+            runtime
+                .dispatch_import(init_props, &mut state, &mut memory)
+                .expect("initializer properties");
+            assert_eq!(runtime_read_u32(&memory, props), 0);
+            for (count, ptr, expected) in [
+                (1u32, 0u64, crate::d3d12::directml::E_INVALIDARG as u64),
+                (
+                    1,
+                    base + 0x8750,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+            ] {
+                memory.map_bytes(base + 0x8750, &[0u8; 8]);
+                state.set(Register::Rsp, base + 0x800);
+                state.set(Register::Rcx, initializer);
+                state.set(Register::Rdx, count as u64);
+                state.set(Register::R8, ptr);
+                memory.write_u64(base + 0x800, 0x1000_081c);
+                runtime
+                    .dispatch_import(reset, &mut state, &mut memory)
+                    .expect("initializer Reset error");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            state.set(Register::Rsp, base + 0x840);
+            state.set(Register::Rcx, initializer);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, operator_array);
+            memory.write_u64(base + 0x840, 0x1000_081d);
+            runtime
+                .dispatch_import(reset, &mut state, &mut memory)
+                .expect("initializer Reset");
+            assert_eq!(state.get(Register::Rax), 0);
+            let iid_recorder = base + 0x8800;
+            memory.map_bytes(
+                iid_recorder,
+                &crate::d3d12::directml::IID_IDMLCOMMANDRECORDER.0,
+            );
+            let recorder_out = base + 0x8810;
+            memory.map_bytes(recorder_out, &[0u8; 8]);
+            for (device_obj, iid_ptr, out_ptr, expected) in [
+                (
+                    device,
+                    iid_recorder,
+                    recorder_out,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (dml_device, base + 0x8820, recorder_out, E_NOINTERFACE),
+                (
+                    dml_device,
+                    iid_recorder,
+                    0,
+                    crate::d3d12::directml::E_POINTER as u64,
+                ),
+            ] {
+                memory.map_bytes(base + 0x8820, &[0x11; 16]);
+                state.set(Register::Rsp, base + 0x880);
+                state.set(Register::Rcx, device_obj);
+                state.set(Register::Rdx, iid_ptr);
+                state.set(Register::R8, out_ptr);
+                memory.write_u64(base + 0x880, 0x1000_081e);
+                runtime
+                    .dispatch_import(create_recorder, &mut state, &mut memory)
+                    .expect("CreateCommandRecorder error");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            state.set(Register::Rsp, base + 0x8c0);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, iid_recorder);
+            state.set(Register::R8, recorder_out);
+            memory.write_u64(base + 0x8c0, 0x1000_081f);
+            runtime
+                .dispatch_import(create_recorder, &mut state, &mut memory)
+                .expect("CreateCommandRecorder");
+            let recorder = memory.read_u64(recorder_out).expect("recorder");
+            let recorder_vtable = memory.read_u64(recorder).expect("recorder vtable");
+            let record_dispatch = memory
+                .read_u64(recorder_vtable + 8 * 8)
+                .expect("RecordDispatch");
+            // A same-device initializer is a valid dispatchable (covers the
+            // success arm of the initializer branch).
+            assert!(
+                runtime
+                    .d3d12_runtime
+                    .directml_mut()
+                    .create_binding_table(
+                        runtime.dml_object_handles[&dml_device],
+                        runtime.dml_object_handles[&initializer],
+                        1,
+                    )
+                    .is_ok()
+            );
+            let iid_table = base + 0x8900;
+            memory.map_bytes(iid_table, &crate::d3d12::directml::IID_IDMLBINDINGTABLE.0);
+            let table_desc = base + 0x8a00;
+            memory.map_bytes(table_desc, &[0u8; 32]);
+            let table_out = base + 0x8a20;
+            memory.map_bytes(table_out, &[0u8; 8]);
+            for (device_obj, desc, iid_ptr, out_ptr, expected) in [
+                (
+                    device,
+                    table_desc,
+                    iid_table,
+                    table_out,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (
+                    dml_device,
+                    table_desc,
+                    base + 0x8a30,
+                    table_out,
+                    E_NOINTERFACE,
+                ),
+                (
+                    dml_device,
+                    0,
+                    iid_table,
+                    table_out,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+            ] {
+                memory.map_bytes(base + 0x8a30, &[0x22; 16]);
+                state.set(Register::Rsp, base + 0x900);
+                state.set(Register::Rcx, device_obj);
+                state.set(Register::Rdx, desc);
+                state.set(Register::R8, iid_ptr);
+                state.set(Register::R9, out_ptr);
+                memory.write_u64(base + 0x900, 0x1000_0820);
+                runtime
+                    .dispatch_import(create_binding_table, &mut state, &mut memory)
+                    .expect("CreateBindingTable error");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            write_u64(&mut memory, table_desc, compiled);
+            write_u32(&mut memory, table_desc + 24, 2);
+            state.set(Register::Rsp, base + 0x940);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, table_desc);
+            state.set(Register::R8, iid_table);
+            state.set(Register::R9, table_out);
+            memory.write_u64(base + 0x940, 0x1000_0821);
+            runtime
+                .dispatch_import(create_binding_table, &mut state, &mut memory)
+                .expect("CreateBindingTable");
+            let table = memory.read_u64(table_out).expect("table");
+            let table_vtable = memory.read_u64(table).expect("table vtable");
+            let bind_inputs = memory.read_u64(table_vtable + 8 * 8).expect("BindInputs");
+            let bind_outputs = memory.read_u64(table_vtable + 9 * 8).expect("BindOutputs");
+            let bind_temp = memory
+                .read_u64(table_vtable + 10 * 8)
+                .expect("BindTemporaryResource");
+            let bind_reset = memory.read_u64(table_vtable + 12 * 8).expect("BindReset");
+            let binding = base + 0x8b00;
+            let binding_desc = base + 0x8b20;
+            write_u32(&mut memory, binding_desc, 1);
+            write_u64(&mut memory, binding_desc + 8, binding);
+            write_u64(&mut memory, binding, 0x1234);
+            write_u64(&mut memory, binding + 8, 0);
+            write_u64(&mut memory, binding + 16, 8);
+            for (fn_ptr, count, ptr, expected) in [
+                (
+                    bind_inputs,
+                    1u32,
+                    0u64,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (
+                    bind_inputs,
+                    65_536,
+                    binding_desc,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (
+                    bind_inputs,
+                    1,
+                    base + 0x8b40,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+            ] {
+                write_u32(&mut memory, base + 0x8b40, 9);
+                state.set(Register::Rsp, base + 0x980);
+                state.set(Register::Rcx, table);
+                state.set(Register::Rdx, count as u64);
+                state.set(Register::R8, ptr);
+                memory.write_u64(base + 0x980, 0x1000_0822);
+                runtime
+                    .dispatch_import(fn_ptr, &mut state, &mut memory)
+                    .expect("Bind error");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            // Null binding entry (type NONE) is accepted.
+            write_u32(&mut memory, binding_desc, 0);
+            state.set(Register::Rsp, base + 0x9c0);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, binding_desc);
+            memory.write_u64(base + 0x9c0, 0x1000_0823);
+            runtime
+                .dispatch_import(bind_inputs, &mut state, &mut memory)
+                .expect("Bind NONE");
+            assert_eq!(state.get(Register::Rax), 0);
+            // Temporary/persistent binding validation.
+            write_u32(&mut memory, binding_desc, 0);
+            for (fn_ptr, ptr, expected) in [
+                (bind_temp, binding_desc, 0u64),
+                (bind_temp, 0, crate::d3d12::directml::E_INVALIDARG as u64),
+            ] {
+                state.set(Register::Rsp, base + 0xa00);
+                state.set(Register::Rcx, table);
+                state.set(Register::Rdx, ptr);
+                memory.write_u64(base + 0xa00, 0x1000_0824);
+                runtime
+                    .dispatch_import(fn_ptr, &mut state, &mut memory)
+                    .expect("Bind auxiliary");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            // Reset errors and success.
+            state.set(Register::Rsp, base + 0xa40);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, 0);
+            memory.write_u64(base + 0xa40, 0x1000_0825);
+            runtime
+                .dispatch_import(bind_reset, &mut state, &mut memory)
+                .expect("BindReset error");
+            assert_eq!(
+                state.get(Register::Rax),
+                crate::d3d12::directml::E_INVALIDARG as u64
+            );
+            state.set(Register::Rsp, base + 0xa80);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, table_desc);
+            memory.write_u64(base + 0xa80, 0x1000_0826);
+            runtime
+                .dispatch_import(bind_reset, &mut state, &mut memory)
+                .expect("BindReset");
+            assert_eq!(state.get(Register::Rax), 0);
+            // RecordDispatch errors and initializer dispatch fail-closed.
+            for (rec, list_arg, dispatchable, table_arg, expected) in [
+                (
+                    recorder,
+                    0x9999,
+                    compiled,
+                    table,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (
+                    0x9999,
+                    list,
+                    compiled,
+                    table,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (
+                    recorder,
+                    list,
+                    0x9999,
+                    table,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+                (recorder, list, initializer, table, 0x8000_4001),
+                (
+                    recorder,
+                    list,
+                    compiled,
+                    0x9999,
+                    crate::d3d12::directml::E_INVALIDARG as u64,
+                ),
+            ] {
+                state.set(Register::Rsp, base + 0xac0);
+                state.set(Register::Rcx, rec);
+                state.set(Register::Rdx, list_arg);
+                state.set(Register::R8, dispatchable);
+                state.set(Register::R9, table_arg);
+                memory.write_u64(base + 0xac0, 0x1000_0827);
+                runtime
+                    .dispatch_import(record_dispatch, &mut state, &mut memory)
+                    .expect("RecordDispatch error");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+
+            // QueryInterface for every child interface family.
+            for (object, iids) in [
+                (
+                    operator,
+                    vec![
+                        crate::d3d12::directml::IID_IDMLOPERATOR.0,
+                        crate::d3d12::directml::IID_IDMLDEVICECHILD.0,
+                        crate::d3d12::directml::IID_IDMLOBJECT.0,
+                    ],
+                ),
+                (
+                    compiled,
+                    vec![
+                        crate::d3d12::directml::IID_IDMLCOMPILEDOPERATOR.0,
+                        crate::d3d12::directml::IID_IDMLDISPATCHABLE.0,
+                        crate::d3d12::directml::IID_IDMLPAGEABLE.0,
+                        crate::d3d12::directml::IID_IDMLDEVICECHILD.0,
+                    ],
+                ),
+                (
+                    initializer,
+                    vec![
+                        crate::d3d12::directml::IID_IDMLOPERATORINITIALIZER.0,
+                        crate::d3d12::directml::IID_IDMLDISPATCHABLE.0,
+                        crate::d3d12::directml::IID_IDMLPAGEABLE.0,
+                    ],
+                ),
+                (
+                    recorder,
+                    vec![
+                        crate::d3d12::directml::IID_IDMLCOMMANDRECORDER.0,
+                        crate::d3d12::directml::IID_IDMLDEVICECHILD.0,
+                    ],
+                ),
+                (
+                    table,
+                    vec![
+                        crate::d3d12::directml::IID_IDMLBINDINGTABLE.0,
+                        crate::d3d12::directml::IID_IDMLOBJECT.0,
+                    ],
+                ),
+            ] {
+                let vtable = memory.read_u64(object).expect("object vtable");
+                let qi = memory.read_u64(vtable).expect("QI");
+                let release = memory.read_u64(vtable + 16).expect("Release");
+                for iid in iids {
+                    memory.map_bytes(base + 0x8c00, &iid);
+                    state.set(Register::Rsp, base + 0xb00);
+                    state.set(Register::Rcx, object);
+                    state.set(Register::Rdx, base + 0x8c00);
+                    state.set(Register::R8, qi_out);
+                    memory.write_u64(base + 0xb00, 0x1000_0828);
+                    runtime
+                        .dispatch_import(qi, &mut state, &mut memory)
+                        .expect("child QI");
+                    assert_eq!(state.get(Register::Rax), 0);
+                    state.set(Register::Rsp, base + 0xb40);
+                    state.set(Register::Rcx, object);
+                    memory.write_u64(base + 0xb40, 0x1000_0829);
+                    runtime
+                        .dispatch_import(release, &mut state, &mut memory)
+                        .expect("release child QI");
+                }
+                memory.map_bytes(base + 0x8c00, &[0xFE; 16]);
+                state.set(Register::Rsp, base + 0xb80);
+                state.set(Register::Rcx, object);
+                state.set(Register::Rdx, base + 0x8c00);
+                state.set(Register::R8, qi_out);
+                memory.write_u64(base + 0xb80, 0x1000_082a);
+                runtime
+                    .dispatch_import(qi, &mut state, &mut memory)
+                    .expect("child bad QI");
+                assert_eq!(state.get(Register::Rax), E_NOINTERFACE);
+            }
+            // QI on a non-DML object returns E_NOINTERFACE.
+            state.set(Register::Rsp, base + 0xbc0);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, base + 0x8c00);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0xbc0, 0x1000_082b);
+            runtime
+                .dispatch_import(
+                    memory
+                        .read_u64(memory.read_u64(device).expect("device vtable"))
+                        .expect("device QI"),
+                    &mut state,
+                    &mut memory,
+                )
+                .expect("non-DML QI");
+            assert_eq!(state.get(Register::Rax), E_NOINTERFACE);
+
+            // Malformed GUID pointers hit the E_INVALIDARG guards.
+            for (fn_ptr, arg2, arg3) in [
+                (get_private, 0u64, size_ptr),
+                (set_private, 0u64, 0u64),
+                (set_interface, 0u64, 0u64),
+            ] {
+                state.set(Register::Rsp, base + 0xc00);
+                state.set(Register::Rcx, operator);
+                state.set(Register::Rdx, arg2);
+                state.set(Register::R8, arg3);
+                state.set(Register::R9, 0);
+                memory.write_u64(base + 0xc00, 0x1000_082c);
+                runtime
+                    .dispatch_import(fn_ptr, &mut state, &mut memory)
+                    .expect("malformed GUID");
+                assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+            }
+            // GetPrivateData with no size pointer uses the stored length.
+            state.set(Register::Rsp, base + 0xc40);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, data_ptr);
+            memory.write_u64(base + 0xc40, 0x1000_082d);
+            runtime
+                .dispatch_import(get_private, &mut state, &mut memory)
+                .expect("GetPrivateData no size");
+            assert_eq!(state.get(Register::Rax), DXGI_ERROR_NOT_FOUND);
+            // Feature-level query with too-small query buffer.
+            state.set(Register::Rsp, base + 0xc80);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, 4);
+            state.set(Register::R9, query);
+            memory.write_u64(base + 0xc80, 0x1000_082e);
+            write_u32(&mut memory, base + 0xc80 + 0x28, 4);
+            memory.write_u64(base + 0xc80 + 0x30, feature_out);
+            runtime
+                .dispatch_import(check_feature, &mut state, &mut memory)
+                .expect("feature levels too small");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+
+            // Unknown-device and unknown-object branches.
+            memory.map_bytes(iid_operator, &crate::d3d12::directml::IID_IDMLOPERATOR.0);
+            let unknown_cases: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![
+                (
+                    create_operator,
+                    operator,
+                    operator_desc,
+                    iid_operator,
+                    operator_out,
+                    0,
+                    directml::E_INVALIDARG as u64,
+                ),
+                (
+                    create_recorder,
+                    operator,
+                    iid_recorder,
+                    recorder_out,
+                    0,
+                    0,
+                    directml::E_INVALIDARG as u64,
+                ),
+                (
+                    create_binding_table,
+                    operator,
+                    table_desc,
+                    iid_table,
+                    table_out,
+                    0,
+                    directml::E_INVALIDARG as u64,
+                ),
+                (
+                    create_binding_table,
+                    dml_device,
+                    base + 0x9900,
+                    iid_table,
+                    table_out,
+                    0,
+                    directml::E_INVALIDARG as u64,
+                ),
+                (
+                    get_parent_device,
+                    operator,
+                    base + 0x8400,
+                    qi_out,
+                    0,
+                    0,
+                    directml::E_INVALIDARG as u64,
+                ),
+                (
+                    get_props,
+                    0x9999,
+                    props,
+                    0,
+                    0,
+                    0,
+                    directml::E_INVALIDARG as u64,
+                ),
+                (reset, 0x9999, 0, 0, 0, 0, directml::E_INVALIDARG as u64),
+                (
+                    record_dispatch,
+                    0x9999,
+                    list,
+                    compiled,
+                    table,
+                    0,
+                    directml::E_INVALIDARG as u64,
+                ),
+            ];
+            for (fn_ptr, a, b, c, d, _e, expected) in unknown_cases {
+                state.set(Register::Rsp, base + 0xcc0);
+                state.set(Register::Rcx, a);
+                state.set(Register::Rdx, b);
+                state.set(Register::R8, c);
+                state.set(Register::R9, d);
+                memory.write_u64(base + 0xcc0, 0x1000_082f);
+                memory.write_u64(base + 0xcc0 + 0x28, c);
+                runtime
+                    .dispatch_import(fn_ptr, &mut state, &mut memory)
+                    .expect("unknown object branch");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+
+            // CompileOperator and CreateOperatorInitializer have stack-based
+            // out parameters and are driven with their real ABI.
+            for (device_obj, op, out_ptr, expected) in [
+                (
+                    operator,
+                    operator,
+                    compiled_out,
+                    directml::E_INVALIDARG as u64,
+                ),
+                (
+                    dml_device,
+                    0x9999,
+                    compiled_out,
+                    directml::E_INVALIDARG as u64,
+                ),
+            ] {
+                state.set(Register::Rsp, base + 0xcd0);
+                state.set(Register::Rcx, device_obj);
+                state.set(Register::Rdx, op);
+                state.set(Register::R8, 0);
+                state.set(Register::R9, iid_compiled);
+                memory.write_u64(base + 0xcd0, 0x1000_0833);
+                memory.write_u64(base + 0xcd0 + 0x28, out_ptr);
+                runtime
+                    .dispatch_import(compile_operator, &mut state, &mut memory)
+                    .expect("CompileOperator unknown");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            let unknown_compiled_array = base + 0x8d00;
+            memory.map_bytes(unknown_compiled_array, &[0u8; 8]);
+            memory.write_u64(unknown_compiled_array, 0x9999);
+            for (device_obj, array, out_ptr, expected) in [
+                (
+                    operator,
+                    operator_array,
+                    initializer_out,
+                    directml::E_INVALIDARG as u64,
+                ),
+                (
+                    dml_device,
+                    unknown_compiled_array,
+                    initializer_out,
+                    directml::E_INVALIDARG as u64,
+                ),
+            ] {
+                state.set(Register::Rsp, base + 0xd10);
+                state.set(Register::Rcx, device_obj);
+                state.set(Register::Rdx, 1);
+                state.set(Register::R8, array);
+                state.set(Register::R9, iid_initializer);
+                memory.write_u64(base + 0xd10, 0x1000_0834);
+                memory.write_u64(base + 0xd10 + 0x28, out_ptr);
+                runtime
+                    .dispatch_import(create_initializer, &mut state, &mut memory)
+                    .expect("CreateOperatorInitializer unknown");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+
+            // Binding-table error branches.
+            for (fn_ptr, table_arg, count, ptr, expected) in [
+                (
+                    bind_inputs,
+                    0x9999u64,
+                    1u64,
+                    binding_desc,
+                    directml::E_INVALIDARG as u64,
+                ),
+                (bind_inputs, table, 1, 0, directml::E_INVALIDARG as u64),
+                (bind_inputs, table, 1, base + 0x8c80, 0x8000_4001),
+            ] {
+                write_u32(&mut memory, base + 0x8c80, 2);
+                state.set(Register::Rsp, base + 0xd00);
+                state.set(Register::Rcx, table_arg);
+                state.set(Register::Rdx, count);
+                state.set(Register::R8, ptr);
+                memory.write_u64(base + 0xd00, 0x1000_0830);
+                runtime
+                    .dispatch_import(fn_ptr, &mut state, &mut memory)
+                    .expect("BindInputs error");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            // BUFFER binding with a non-resource pointer is rejected.
+            write_u32(&mut memory, binding_desc, 1);
+            write_u64(&mut memory, binding, 0x1234);
+            state.set(Register::Rsp, base + 0xd40);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, binding_desc);
+            memory.write_u64(base + 0xd40, 0x1000_0831);
+            runtime
+                .dispatch_import(bind_inputs, &mut state, &mut memory)
+                .expect("BindInputs non-resource");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+            // Reset with an unknown table and unknown dispatchable.
+            for (table_arg, desc_ptr, expected) in [
+                (0x9999u64, table_desc, directml::E_INVALIDARG as u64),
+                (table, base + 0x9900, directml::E_INVALIDARG as u64),
+            ] {
+                state.set(Register::Rsp, base + 0xd80);
+                state.set(Register::Rcx, table_arg);
+                state.set(Register::Rdx, desc_ptr);
+                memory.write_u64(base + 0xd80, 0x1000_0832);
+                runtime
+                    .dispatch_import(bind_reset, &mut state, &mut memory)
+                    .expect("BindReset error");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+
+            // Binding descriptor validation: null Desc and zero-size buffer.
+            write_u32(&mut memory, binding_desc, 1);
+            write_u64(&mut memory, binding_desc + 8, 0);
+            state.set(Register::Rsp, base + 0xdc0);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, binding_desc);
+            memory.write_u64(base + 0xdc0, 0x1000_0835);
+            runtime
+                .dispatch_import(bind_inputs, &mut state, &mut memory)
+                .expect("binding null desc");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+            let fake_resource = base + 0x8e00;
+            runtime.guest_objects.insert(
+                fake_resource,
+                super::state::GuestObjectMeta {
+                    kind: GuestObjectKind::D3d12Resource,
+                    refcount: 1,
+                },
+            );
+            runtime.d3d12_resources.insert(
+                fake_resource,
+                super::state::GuestD3d12Resource {
+                    device_object: device,
+                    resource_id: 0xFFFF,
+                    format: crate::gfx::DxgiFormat::R8G8B8A8Unorm,
+                    swapchain_backbuffer: false,
+                    width: 4,
+                    height: 4,
+                },
+            );
+            let fake_binding = base + 0x8e20;
+            write_u64(&mut memory, binding + 8, 0);
+            write_u64(&mut memory, binding + 16, 0);
+            write_u64(&mut memory, binding, fake_resource);
+            write_u64(&mut memory, binding_desc + 8, fake_binding);
+            write_u64(&mut memory, fake_binding, fake_resource);
+            write_u64(&mut memory, fake_binding + 8, 0);
+            write_u64(&mut memory, fake_binding + 16, 0);
+            state.set(Register::Rsp, base + 0xe00);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, binding_desc);
+            memory.write_u64(base + 0xe00, 0x1000_0836);
+            runtime
+                .dispatch_import(bind_inputs, &mut state, &mut memory)
+                .expect("binding zero size");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+
+            // Private data with no size pointer after a successful set.
+            write_u32(&mut memory, data_ptr, 0x1234_5678);
+            state.set(Register::Rsp, base + 0xe40);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, 4);
+            state.set(Register::R9, data_ptr);
+            memory.write_u64(base + 0xe40, 0x1000_0837);
+            runtime
+                .dispatch_import(set_private, &mut state, &mut memory)
+                .expect("SetPrivateData again");
+            state.set(Register::Rsp, base + 0xe80);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, data_ptr);
+            memory.write_u64(base + 0xe80, 0x1000_0838);
+            runtime
+                .dispatch_import(get_private, &mut state, &mut memory)
+                .expect("GetPrivateData no size with data");
+            assert_eq!(state.get(Register::Rax), 0);
+            write_u32(&mut memory, size_ptr, 16);
+            state.set(Register::Rsp, base + 0xea0);
+            state.set(Register::Rcx, operator);
+            state.set(Register::Rdx, guid);
+            state.set(Register::R8, size_ptr);
+            state.set(Register::R9, 0);
+            memory.write_u64(base + 0xea0, 0x1000_0847);
+            runtime
+                .dispatch_import(get_private, &mut state, &mut memory)
+                .expect("GetPrivateData size only");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // DML QueryInterface on a non-DML COM object returns E_NOINTERFACE.
+            memory.map_bytes(base + 0x8c00, &crate::d3d12::directml::IID_IDMLDEVICE.0);
+            state.set(Register::Rsp, base + 0xec0);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, base + 0x8c00);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0xec0, 0x1000_0839);
+            runtime
+                .dispatch_dml_object_query_interface(&mut memory, &mut state)
+                .expect("non-DML DML QI");
+            assert_eq!(state.get(Register::Rax), E_NOINTERFACE);
+
+            // CreateOperator runtime error (valid device, invalid descriptor).
+            let bad_op_desc = base + 0x8f00;
+            write_u32(&mut memory, bad_op_desc, 9999);
+            write_u64(&mut memory, bad_op_desc + 8, bad_op_desc + 0x40);
+            state.set(Register::Rsp, base + 0xf00);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, bad_op_desc);
+            state.set(Register::R8, iid_operator);
+            state.set(Register::R9, operator_out);
+            memory.write_u64(base + 0xf00, 0x1000_083a);
+            runtime
+                .dispatch_import(create_operator, &mut state, &mut memory)
+                .expect("CreateOperator runtime error");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+
+            // Second DML device for cross-device compile/initializer failures.
+            let other_dml_out = base + 0x8f80;
+            memory.map_bytes(other_dml_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0xf40);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, iid_device);
+            state.set(Register::R9, other_dml_out);
+            memory.write_u64(base + 0xf40, 0x1000_083b);
+            runtime
+                .dispatch_import(create_dml, &mut state, &mut memory)
+                .expect("second DML device");
+            let other_dml_device = memory.read_u64(other_dml_out).expect("other DML device");
+            let other_operator_out = base + 0x8f90;
+            memory.map_bytes(other_operator_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0xf80);
+            state.set(Register::Rcx, other_dml_device);
+            state.set(Register::Rdx, operator_desc);
+            state.set(Register::R8, iid_operator);
+            state.set(Register::R9, other_operator_out);
+            memory.write_u64(base + 0xf80, 0x1000_083c);
+            runtime
+                .dispatch_import(create_operator, &mut state, &mut memory)
+                .expect("operator on second device");
+            assert_eq!(state.get(Register::Rax), 0);
+            let other_operator = memory.read_u64(other_operator_out).expect("other operator");
+            let other_compiled_out = base + 0x8fa0;
+            memory.map_bytes(other_compiled_out, &[0u8; 8]);
+            state.set(Register::Rsp, base + 0xfc0);
+            state.set(Register::Rcx, other_dml_device);
+            state.set(Register::Rdx, other_operator);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, iid_compiled);
+            memory.write_u64(base + 0xfc0, 0x1000_083d);
+            memory.write_u64(base + 0xfc0 + 0x28, other_compiled_out);
+            runtime
+                .dispatch_import(compile_operator, &mut state, &mut memory)
+                .expect("compile on second device");
+            let other_compiled = memory.read_u64(other_compiled_out).expect("other compiled");
+            state.set(Register::Rsp, base + 0x1000);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, other_operator);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, iid_compiled);
+            memory.write_u64(base + 0x1000, 0x1000_083e);
+            memory.write_u64(base + 0x1000 + 0x28, compiled_out);
+            runtime
+                .dispatch_import(compile_operator, &mut state, &mut memory)
+                .expect("cross-device compile");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+            let other_compiled_array = base + 0x8fc0;
+            memory.map_bytes(other_compiled_array, &[0u8; 8]);
+            memory.write_u64(other_compiled_array, other_compiled);
+            state.set(Register::Rsp, base + 0x1040);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, other_compiled_array);
+            state.set(Register::R9, iid_initializer);
+            memory.write_u64(base + 0x1040, 0x1000_083f);
+            memory.write_u64(base + 0x1040 + 0x28, initializer_out);
+            runtime
+                .dispatch_import(create_initializer, &mut state, &mut memory)
+                .expect("cross-device initializer");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+
+            // A binding table whose dispatchable differs from the recorded
+            // operator reaches the runtime and fails.
+            let mismatch_table_out = base + 0x8fe0;
+            memory.map_bytes(mismatch_table_out, &[0u8; 8]);
+            write_u64(&mut memory, table_desc, initializer);
+            write_u64(&mut memory, table_desc + 8, initializer);
+            state.set(Register::Rsp, base + 0x1080);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, table_desc);
+            state.set(Register::R8, iid_table);
+            state.set(Register::R9, mismatch_table_out);
+            memory.write_u64(base + 0x1080, 0x1000_0840);
+            runtime
+                .dispatch_import(create_binding_table, &mut state, &mut memory)
+                .expect("mismatch binding table");
+            assert_eq!(state.get(Register::Rax), 0);
+            let mismatch_table = memory.read_u64(mismatch_table_out).expect("mismatch table");
+            state.set(Register::Rsp, base + 0x10c0);
+            state.set(Register::Rcx, recorder);
+            state.set(Register::Rdx, list);
+            state.set(Register::R8, compiled);
+            state.set(Register::R9, mismatch_table);
+            memory.write_u64(base + 0x10c0, 0x1000_0841);
+            runtime
+                .dispatch_import(record_dispatch, &mut state, &mut memory)
+                .expect("RecordDispatch mismatch");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+
+            // Remove runtime records while guest wrappers still exist to
+            // exercise the remaining error branches.
+            let dml_handle = runtime.dml_object_handles[&dml_device];
+            let compiled_handle = runtime.dml_object_handles[&compiled];
+            let initializer_handle = runtime.dml_object_handles[&initializer];
+            let table_handle = runtime.dml_object_handles[&table];
+            runtime
+                .d3d12_runtime
+                .directml_mut()
+                .destroy_compiled(compiled_handle)
+                .unwrap();
+            state.set(Register::Rsp, base + 0x1100);
+            state.set(Register::Rcx, compiled);
+            state.set(Register::Rdx, props);
+            memory.write_u64(base + 0x1100, 0x1000_0842);
+            runtime
+                .dispatch_import(get_props, &mut state, &mut memory)
+                .expect("binding properties runtime error");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+            runtime
+                .d3d12_runtime
+                .directml_mut()
+                .destroy_operator_initializer(initializer_handle)
+                .unwrap();
+            state.set(Register::Rsp, base + 0x1140);
+            state.set(Register::Rcx, initializer);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, operator_array);
+            memory.write_u64(base + 0x1140, 0x1000_0843);
+            runtime
+                .dispatch_import(reset, &mut state, &mut memory)
+                .expect("initializer reset runtime error");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+            runtime
+                .d3d12_runtime
+                .directml_mut()
+                .destroy_binding_table(table_handle)
+                .unwrap();
+            write_u32(&mut memory, binding_desc, 0);
+            state.set(Register::Rsp, base + 0x1180);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, binding_desc);
+            memory.write_u64(base + 0x1180, 0x1000_0844);
+            runtime
+                .dispatch_import(bind_outputs, &mut state, &mut memory)
+                .expect("BindOutputs runtime error");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+            state.set(Register::Rsp, base + 0x11c0);
+            state.set(Register::Rcx, table);
+            state.set(Register::Rdx, table_desc);
+            memory.write_u64(base + 0x11c0, 0x1000_0845);
+            runtime
+                .dispatch_import(bind_reset, &mut state, &mut memory)
+                .expect("BindReset runtime error");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+            runtime
+                .d3d12_runtime
+                .directml_mut()
+                .destroy_device(dml_handle)
+                .unwrap();
+            state.set(Register::Rsp, base + 0x1200);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, base + 0x8400);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x1200, 0x1000_0846);
+            runtime
+                .dispatch_import(get_parent_device, &mut state, &mut memory)
+                .expect("GetParentDevice runtime error");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+            state.set(Register::Rsp, base + 0x1240);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, iid_recorder);
+            state.set(Register::R8, recorder_out);
+            memory.write_u64(base + 0x1240, 0x1000_0848);
+            runtime
+                .dispatch_import(create_recorder, &mut state, &mut memory)
+                .expect("CreateCommandRecorder runtime error");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+            write_u64(&mut memory, table_desc, initializer);
+            write_u64(&mut memory, table_desc + 8, initializer);
+            state.set(Register::Rsp, base + 0x1280);
+            state.set(Register::Rcx, dml_device);
+            state.set(Register::Rdx, table_desc);
+            state.set(Register::R8, iid_table);
+            state.set(Register::R9, table_out);
+            memory.write_u64(base + 0x1280, 0x1000_0849);
+            runtime
+                .dispatch_import(create_binding_table, &mut state, &mut memory)
+                .expect("CreateBindingTable runtime error");
+            assert_eq!(state.get(Register::Rax), directml::E_INVALIDARG as u64);
+        });
+    }
+
+    #[test]
+    fn d3d12_state_object_and_work_graph_dispatch_error_paths_are_pinned() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "d3d12-dispatch-errors",
+                GeArch::X64,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            let mut memory = MemoryImage::default();
+            let base = 0x68_0000;
+            memory.map_bytes(base, &vec![0u8; 0x30000]);
+            let device = create_test_d3d12_device(&mut runtime, &mut memory, base, base + 0x20);
+            let list =
+                create_test_d3d12_command_list(&mut runtime, &mut memory, base + 0x1000, device);
+            let device_vtable = memory.read_u64(device).expect("device vtable");
+            let create_state_object = memory
+                .read_u64(device_vtable + 61 * 8)
+                .expect("CreateStateObject");
+            let add_to_state_object = memory
+                .read_u64(device_vtable + 65 * 8)
+                .expect("AddToStateObject");
+            let iid = base + 0x8000;
+            memory.map_bytes(iid, &[0u8; 16]);
+            let iid_bytes: [u8; 16] = [
+                0x43, 0x69, 0x01, 0x47, 0xa8, 0xfc, 0x94, 0x45, 0x93, 0xea, 0xaf, 0x25, 0x8b, 0x55,
+                0x34, 0x6d,
+            ];
+            for (index, byte) in iid_bytes.iter().enumerate() {
+                memory.write_u8(iid + index as u64, *byte);
+            }
+            let out = base + 0x8010;
+            memory.map_bytes(out, &[0u8; 8]);
+            let mut state = CpuState::new(GuestArch::X64);
+            let desc = build_work_graph_state_object_desc(&mut memory, base + 0x2000);
+            // CreateStateObject errors.
+            for (device_obj, desc_ptr, iid_ptr, out_ptr, expected) in [
+                (list, desc, iid, out, E_INVALIDARG),
+                (device, 0, iid, out, E_INVALIDARG),
+                (device, desc, base + 0x8020, out, E_NOINTERFACE),
+                (device, 0x5000, iid, out, E_INVALIDARG),
+            ] {
+                memory.map_bytes(base + 0x8020, &[0xBB; 16]);
+                state.set(Register::Rsp, base + 0x100);
+                state.set(Register::Rcx, device_obj);
+                state.set(Register::Rdx, desc_ptr);
+                state.set(Register::R8, iid_ptr);
+                state.set(Register::R9, out_ptr);
+                memory.write_u64(base + 0x100, 0x1000_0900);
+                runtime
+                    .dispatch_import(create_state_object, &mut state, &mut memory)
+                    .expect("CreateStateObject error path");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            state.set(Register::Rsp, base + 0x140);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, desc);
+            state.set(Register::R8, iid);
+            state.set(Register::R9, out);
+            memory.write_u64(base + 0x140, 0x1000_0901);
+            runtime
+                .dispatch_import(create_state_object, &mut state, &mut memory)
+                .expect("CreateStateObject");
+            assert_eq!(state.get(Register::Rax), 0);
+            let state_object = memory.read_u64(out).expect("state object");
+            let handle = runtime.d3d12_state_object_handles[&state_object];
+            let identifier = runtime
+                .d3d12_runtime
+                .work_graph_program_identifier(handle, "graph")
+                .expect("identifier");
+
+            // SetPipelineState1 accepts the COM state object and the direct
+            // DXIL reader extracts bytecode from a real state-object desc.
+            let set_pipeline = memory
+                .read_u64(memory.read_u64(list).expect("list vtable") + 64 * 8)
+                .expect("SetPipelineState1");
+            state.set(Register::Rsp, base + 0x1040);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, state_object);
+            memory.write_u64(base + 0x1040, 0x1000_0900_1);
+            runtime
+                .dispatch_import(set_pipeline, &mut state, &mut memory)
+                .expect("SetPipelineState1 COM");
+            assert_eq!(state.get(Register::Rax), 0);
+            let dxil_desc =
+                build_raytracing_state_object_desc(&mut memory, base + 0x11000, "raygen");
+            assert_eq!(
+                runtime.read_dxil_from_state_object(&memory, dxil_desc),
+                vec![0x44, 0x58, 0x42, 0x43]
+            );
+            assert!(
+                runtime
+                    .read_dxil_from_state_object(&memory, desc)
+                    .is_empty()
+            );
+
+            // CreateCommandSignature handler error matrix.
+            let create_signature = memory
+                .read_u64(device_vtable + 10 * 8)
+                .expect("CreateCommandSignature");
+            let signature_desc = base + 0x1050;
+            let signature_out = base + 0x1070;
+            memory.map_bytes(signature_desc, &[0u8; 32]);
+            memory.map_bytes(signature_out, &[0u8; 8]);
+            let error = runtime
+                .dispatch_import(
+                    create_signature,
+                    &mut {
+                        let mut s = CpuState::new(GuestArch::X64);
+                        s.set(Register::Rsp, base + 0x1080);
+                        s.set(Register::Rcx, list);
+                        s.set(Register::Rdx, signature_desc);
+                        s.set(Register::R8, signature_out);
+                        memory.write_u64(base + 0x1080, 0x1000_0901_1);
+                        s
+                    },
+                    &mut memory,
+                )
+                .expect_err("non-device command signature");
+            assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+            for (desc_ptr, expected) in [(0u64, E_INVALIDARG), (signature_desc, E_INVALIDARG)] {
+                write_u32(&mut memory, signature_desc, 16);
+                write_u32(&mut memory, signature_desc + 4, 5000);
+                state.set(Register::Rsp, base + 0x10c0);
+                state.set(Register::Rcx, device);
+                state.set(Register::Rdx, desc_ptr);
+                state.set(Register::R8, signature_out);
+                memory.write_u64(base + 0x10c0, 0x1000_0902_1);
+                runtime
+                    .dispatch_import(create_signature, &mut state, &mut memory)
+                    .expect("signature arg count");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            for (ty, stride, expected) in [(1u32, 20u32, 0u64), (0, 0, E_INVALIDARG)] {
+                write_u32(&mut memory, signature_desc, stride);
+                write_u32(&mut memory, signature_desc + 4, 1);
+                let argument_desc = base + 0x10e0;
+                write_u64(&mut memory, signature_desc + 8, argument_desc);
+                write_u32(&mut memory, argument_desc, ty);
+                state.set(Register::Rsp, base + 0x1100);
+                state.set(Register::Rcx, device);
+                state.set(Register::Rdx, signature_desc);
+                state.set(Register::R8, signature_out);
+                memory.write_u64(base + 0x1100, 0x1000_0903_1);
+                runtime
+                    .dispatch_import(create_signature, &mut state, &mut memory)
+                    .expect("signature type/stride");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            write_u32(&mut memory, signature_desc, 16);
+            write_u32(&mut memory, signature_desc + 4, 1);
+            let argument_desc = base + 0x10e0;
+            write_u64(&mut memory, signature_desc + 8, argument_desc);
+            write_u32(&mut memory, argument_desc, 0);
+            state.set(Register::Rsp, base + 0x1140);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, signature_desc);
+            state.set(Register::R8, signature_out);
+            memory.write_u64(base + 0x1140, 0x1000_0904_1);
+            runtime
+                .dispatch_import(create_signature, &mut state, &mut memory)
+                .expect("signature valid");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // AddToStateObject errors.
+            let addition = build_raytracing_state_object_desc(&mut memory, base + 0x9000, "miss");
+            let child_out = base + 0x8030;
+            memory.map_bytes(child_out, &[0u8; 8]);
+
+            // AddToStateObject runtime rejection (parent did not opt in).
+            let plain_desc =
+                build_raytracing_state_object_desc(&mut memory, base + 0x12000, "plain");
+            // Clear the ALLOW_STATE_OBJECT_ADDITIONS flag in the state config.
+            write_u32(&mut memory, base + 0x12000 + 0x200, 0);
+            state.set(Register::Rsp, base + 0x1180);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, plain_desc);
+            state.set(Register::R8, iid);
+            state.set(Register::R9, out);
+            memory.write_u64(base + 0x1180, 0x1000_0905_1);
+            runtime
+                .dispatch_import(create_state_object, &mut state, &mut memory)
+                .expect("plain state object");
+            let plain = memory.read_u64(out).expect("plain state object ptr");
+            state.set(Register::Rsp, base + 0x11c0);
+            state.set(Register::Rcx, device);
+            state.set(Register::Rdx, addition);
+            state.set(Register::R8, plain);
+            state.set(Register::R9, iid);
+            memory.write_u64(base + 0x11c0, 0x1000_0906_1);
+            memory.write_u64(base + 0x11c0 + 0x28, child_out);
+            runtime
+                .dispatch_import(add_to_state_object, &mut state, &mut memory)
+                .expect("AddToStateObject runtime rejection");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+
+            for (device_obj, addition_ptr, parent, iid_ptr, out_ptr, expected) in [
+                (list, addition, state_object, iid, child_out, E_INVALIDARG),
+                (device, 0, state_object, iid, child_out, E_INVALIDARG),
+                (device, addition, 0x9999, iid, child_out, E_INVALIDARG),
+                (
+                    device,
+                    addition,
+                    state_object,
+                    base + 0x8040,
+                    child_out,
+                    E_NOINTERFACE,
+                ),
+                (device, 0x5000, state_object, iid, child_out, E_INVALIDARG),
+            ] {
+                memory.map_bytes(base + 0x8040, &[0xCC; 16]);
+                state.set(Register::Rsp, base + 0x180);
+                state.set(Register::Rcx, device_obj);
+                state.set(Register::Rdx, addition_ptr);
+                state.set(Register::R8, parent);
+                state.set(Register::R9, iid_ptr);
+                memory.write_u64(base + 0x180, 0x1000_0902);
+                memory.write_u64(base + 0x180 + 0x28, out_ptr);
+                runtime
+                    .dispatch_import(add_to_state_object, &mut state, &mut memory)
+                    .expect("AddToStateObject error path");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+
+            // Child GetDevice through the state-object vtable.
+            let vtable = memory.read_u64(state_object).expect("state vtable");
+            let get_device = memory.read_u64(vtable + 7 * 8).expect("GetDevice");
+            let qi_out = base + 0x8050;
+            memory.map_bytes(qi_out, &[0u8; 8]);
+            memory.map_bytes(base + 0x8060, &[0xDD; 16]);
+            state.set(Register::Rsp, base + 0x1c0);
+            state.set(Register::Rcx, state_object);
+            state.set(Register::Rdx, base + 0x8060);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x1c0, 0x1000_0903);
+            runtime
+                .dispatch_import(get_device, &mut state, &mut memory)
+                .expect("GetDevice bad iid");
+            assert_eq!(state.get(Register::Rax), E_NOINTERFACE);
+            state.set(Register::Rsp, base + 0x200);
+            state.set(Register::Rcx, state_object);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x200, 0x1000_0904);
+            runtime
+                .dispatch_import(get_device, &mut state, &mut memory)
+                .expect("GetDevice null iid");
+            assert_eq!(state.get(Register::Rax), 0);
+            state.set(Register::Rsp, base + 0x240);
+            state.set(Register::Rcx, 0x9999);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, qi_out);
+            memory.write_u64(base + 0x240, 0x1000_0905);
+            runtime
+                .dispatch_import(get_device, &mut state, &mut memory)
+                .expect("GetDevice unknown");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+
+            // SetPipelineState1 fallback for a malformed description.
+            let set_pipeline = memory
+                .read_u64(memory.read_u64(list).expect("list vtable") + 64 * 8)
+                .expect("SetPipelineState1");
+            write_u32(&mut memory, base + 0x5000, 1);
+            state.set(Register::Rsp, base + 0x280);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, base + 0x5000);
+            memory.write_u64(base + 0x280, 0x1000_0906);
+            runtime
+                .dispatch_import(set_pipeline, &mut state, &mut memory)
+                .expect("SetPipelineState1 fallback");
+            assert_eq!(state.get(Register::Rax), 0);
+            state.set(Register::Rsp, base + 0x2c0);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, 0);
+            memory.write_u64(base + 0x2c0, 0x1000_0907);
+            runtime
+                .dispatch_import(set_pipeline, &mut state, &mut memory)
+                .expect("SetPipelineState1 null");
+            assert_eq!(state.get(Register::Rax), 0);
+
+            // SetProgram / DispatchGraph error branches.
+            let list_vtable = memory.read_u64(list).expect("list vtable");
+            let set_program = memory.read_u64(list_vtable + 73 * 8).expect("SetProgram");
+            let dispatch_graph = memory
+                .read_u64(list_vtable + 74 * 8)
+                .expect("DispatchGraph");
+            let set_desc = base + 0x5100;
+            memory.map_bytes(set_desc, &[0u8; 0x80]);
+            for (desc_ptr, expected) in [(0u64, E_INVALIDARG), (set_desc, E_NOTIMPL)] {
+                state.set(Register::Rsp, base + 0x300);
+                state.set(Register::Rcx, list);
+                state.set(Register::Rdx, desc_ptr);
+                memory.write_u64(base + 0x300, 0x1000_0908);
+                runtime
+                    .dispatch_import(set_program, &mut state, &mut memory)
+                    .expect("SetProgram null/type");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+            write_u32(&mut memory, set_desc, 5);
+            for (index, byte) in identifier.iter().enumerate() {
+                memory.write_u8(set_desc + 8 + index as u64, *byte);
+            }
+            write_u32(&mut memory, set_desc + 40, 0x2);
+            state.set(Register::Rsp, base + 0x340);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, set_desc);
+            memory.write_u64(base + 0x340, 0x1000_0909);
+            runtime
+                .dispatch_import(set_program, &mut state, &mut memory)
+                .expect("SetProgram bad flags");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+            write_u32(&mut memory, set_desc + 40, 0);
+            write_u64(&mut memory, set_desc + 48, 4);
+            write_u64(&mut memory, set_desc + 56, 8);
+            state.set(Register::Rsp, base + 0x380);
+            state.set(Register::Rcx, list);
+            state.set(Register::Rdx, set_desc);
+            memory.write_u64(base + 0x380, 0x1000_090a);
+            runtime
+                .dispatch_import(set_program, &mut state, &mut memory)
+                .expect("SetProgram misaligned backing");
+            assert_eq!(state.get(Register::Rax), E_INVALIDARG);
+            write_u64(&mut memory, set_desc + 48, 0);
+            write_u64(&mut memory, set_desc + 56, 0);
+            for (desc_ptr, expected) in [(0u64, E_INVALIDARG), (base + 0x5200, E_INVALIDARG)] {
+                write_u32(&mut memory, base + 0x5200, 99);
+                state.set(Register::Rsp, base + 0x3c0);
+                state.set(Register::Rcx, list);
+                state.set(Register::Rdx, desc_ptr);
+                memory.write_u64(base + 0x3c0, 0x1000_090b);
+                runtime
+                    .dispatch_import(dispatch_graph, &mut state, &mut memory)
+                    .expect("DispatchGraph error");
+                assert_eq!(state.get(Register::Rax), expected);
+            }
+        });
+    }
+    fn runtime_read_u32(memory: &MemoryImage, address: u64) -> u32 {
+        let bytes = memory.read_bytes(address, 4).expect("read u32");
+        u32::from_le_bytes(bytes.try_into().expect("4 bytes"))
     }
 }
 

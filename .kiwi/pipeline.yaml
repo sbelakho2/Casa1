@@ -9,10 +9,14 @@ jobs:
     steps:
       - name: expectations
         run: python3 ci/test_classification.py --check
+      - name: release-policy
+        run: python3 ci/check_release_policy.py --root .
       - name: format
         run: cargo fmt --all -- --check
       - name: build
         run: cargo build --features vulkan,opengl,websocket
+      - name: evidence-manifest
+        run: python3 ci/evidence_manifest.py --write ci/test-manifest.json
       - name: adversarial-affected-coverage
         run: python3 ci/run_tests.py --lib --affected --coverage
       - name: adversarial-affected-integration

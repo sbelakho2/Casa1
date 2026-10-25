@@ -71,6 +71,15 @@ pub(crate) enum GuestObjectKind {
     D3d12GraphicsCommandList,
     D3d12Fence,
     D3d12Resource,
+    D3d12StateObject,
+    D3d12CommandSignature,
+    // ---- DirectML COM objects ----
+    DmlDevice,
+    DmlOperator,
+    DmlCompiledOperator,
+    DmlOperatorInitializer,
+    DmlCommandRecorder,
+    DmlBindingTable,
     D3d11Buffer,
     D3d11Texture2D,
     D3d11View,
@@ -403,6 +412,8 @@ pub(crate) struct GuestD3d12Resource {
     pub(crate) resource_id: D3d12ResourceId,
     pub(crate) format: DxgiFormat,
     pub(crate) swapchain_backbuffer: bool,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 pub(crate) struct GuestD3d11Device {
@@ -1222,6 +1233,26 @@ pub(crate) struct PeHostRuntime {
     pub(crate) d3d12_fullscreen: HashMap<u64, bool>,
     /// Guest D3D12 object -> its private data (SetPrivateData).
     pub(crate) d3d12_private_data: HashMap<u64, Vec<u8>>,
+    /// Guest COM object -> D3D12 state-object handle in D3d12Runtime.
+    pub(crate) d3d12_state_object_handles: BTreeMap<u64, u64>,
+    /// Guest COM object -> D3D12 command-signature handle in D3d12Runtime.
+    pub(crate) d3d12_command_signature_handles: BTreeMap<u64, u64>,
+    /// Guest state-object/signature COM object -> owning guest D3D12 device.
+    pub(crate) d3d12_child_object_devices: BTreeMap<u64, u64>,
+    /// Guest DML COM object -> DmlRuntime handle.
+    pub(crate) dml_object_handles: BTreeMap<u64, u64>,
+    /// Guest DML child object -> owning guest DML device object.
+    pub(crate) dml_object_devices: BTreeMap<u64, u64>,
+    /// DmlRuntime device handle -> guest COM device object.
+    pub(crate) dml_device_objects: BTreeMap<u64, u64>,
+    /// Guest DML device objects that expose IDMLDevice1.
+    pub(crate) dml_device1_objects: std::collections::BTreeSet<u64>,
+    /// Per-object DML private data keyed by IID bytes.
+    pub(crate) dml_private_data: BTreeMap<u64, BTreeMap<[u8; 16], Vec<u8>>>,
+    /// Per-object DML private-data COM interface pointers keyed by IID bytes.
+    pub(crate) dml_private_interfaces: BTreeMap<u64, BTreeMap<[u8; 16], u64>>,
+    /// Per-object DML debug names.
+    pub(crate) dml_object_names: BTreeMap<u64, String>,
     pub(crate) d3d12_command_queues: BTreeMap<u64, GuestD3d12CommandQueue>,
     pub(crate) d3d12_command_allocators: BTreeMap<u64, GuestD3d12CommandAllocator>,
     pub(crate) d3d12_descriptor_heaps: BTreeMap<u64, GuestD3d12DescriptorHeap>,
@@ -1343,6 +1374,9 @@ pub(crate) struct PeHostRuntime {
     pub(crate) signal_handlers: BTreeMap<i32, u64>,
     pub(crate) tls_slots: BTreeMap<u32, u64>,
     pub(crate) fls_slots: BTreeMap<u32, u64>,
+    /// Per-thread last errors for guest threads without a TEB (synthetic
+    /// harness threads); real guest threads store the value in the TEB.
+    pub(crate) fallback_last_errors: BTreeMap<u32, u32>,
     /// DllMain calls queued during LoadLibrary that must be executed after
     /// the current host thunk returns to the main execution loop.
     /// Each entry is (image_base, entry_point_rva, reason).
@@ -1524,6 +1558,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) process_pointer_cookie: u64,
     pub(crate) mapped_image_base: u64,
     pub(crate) mapped_image_size: u64,
+    /// Precompile reachable module blocks before guest entry (default on).
+    pub(crate) aot_precompile: bool,
     pub(crate) teb_base: u64,
     pub(crate) peb_base: u64,
     pub(crate) main_module_name: String,
@@ -2321,6 +2357,16 @@ impl PeHostRuntime {
             d3d12_object_names: HashMap::new(),
             d3d12_fullscreen: HashMap::new(),
             d3d12_private_data: HashMap::new(),
+            d3d12_state_object_handles: BTreeMap::new(),
+            d3d12_command_signature_handles: BTreeMap::new(),
+            d3d12_child_object_devices: BTreeMap::new(),
+            dml_object_handles: BTreeMap::new(),
+            dml_object_devices: BTreeMap::new(),
+            dml_device_objects: BTreeMap::new(),
+            dml_device1_objects: std::collections::BTreeSet::new(),
+            dml_private_data: BTreeMap::new(),
+            dml_private_interfaces: BTreeMap::new(),
+            dml_object_names: BTreeMap::new(),
             d3d12_command_queues: BTreeMap::new(),
             d3d12_command_allocators: BTreeMap::new(),
             d3d12_descriptor_heaps: BTreeMap::new(),
@@ -2417,6 +2463,7 @@ impl PeHostRuntime {
             signal_handlers: BTreeMap::new(),
             tls_slots: BTreeMap::new(),
             fls_slots: BTreeMap::new(),
+            fallback_last_errors: BTreeMap::new(),
             pending_dll_main_calls: VecDeque::new(),
             pending_fiber_fls_callbacks: Vec::new(),
             pending_guest_threads: VecDeque::new(),
@@ -2501,6 +2548,7 @@ impl PeHostRuntime {
             process_pointer_cookie: 0,
             mapped_image_base: 0,
             mapped_image_size: 0,
+            aot_precompile: true,
             teb_base: 0,
             peb_base: 0,
             main_module_name: String::new(),

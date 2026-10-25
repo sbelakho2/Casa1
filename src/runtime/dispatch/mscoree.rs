@@ -10,13 +10,14 @@
 //!   [`crate::clr_meta`]).  Version strings, runtime directories, PE CLI
 //!   metadata and exported dylib symbols are read from the filesystem; no
 //!   version is invented.
-//! * **.NET Framework activation** — `CorBindToRuntime`/`CorBindToRuntimeEx`
-//!   (and the other `CorBindToRuntime*` export family) bind the legacy
-//!   .NET Framework CLR.  This machine genuinely has no Framework CLR
-//!   (`Microsoft.NET\Framework*` does not exist), so those exports keep the
-//!   real Framework-absent failure `COR_E_CLRNOTAVAILABLE`, exactly as a
-//!   Windows machine without the Framework returns.  The CoreCLR runtimes
-//!   advertised by the meta host are not a Framework substitute.
+//! * **CLR activation** — `CorBindToRuntime`/`CorBindToRuntimeEx` bind an
+//!   explicitly requested *installed* CoreCLR version (for example `8.0.31`)
+//!   to the same real `ICLRRuntimeHost` the meta host exposes, including
+//!   `ExecuteInDefaultAppDomain` and `ExecuteApplication`.  The legacy
+//!   .NET Framework CLR (`v4.0.30319`, `Microsoft.NET\Framework*`) is not
+//!   installed, so Framework-version and versionless requests keep the real
+//!   Framework-absent failure `COR_E_CLRNOTAVAILABLE` rather than silently
+//!   binding a different runtime generation.
 //!
 //! Layer contract: every export returns its HRESULT in EAX.
 
@@ -37,6 +38,7 @@ const E_POINTER: u32 = 0x8000_4003;
 const E_FAIL: u32 = 0x8000_4005;
 const E_UNEXPECTED: u32 = 0x8000_FFFF;
 const E_INVALIDARG: u32 = 0x8007_0057;
+const E_NOTIMPL: u32 = 0x8000_4001;
 /// COR_E_CLRNOTAVAILABLE — "the CLR is unavailable" (the error a Windows
 /// machine without .NET Framework returns from Framework activation).
 const COR_E_CLRNOTAVAILABLE: u32 = 0x8013_1013;
@@ -59,6 +61,16 @@ const CLSID_CLR_META_HOST: [u8; 16] = [
 const IID_ICLR_RUNTIME_INFO: [u8; 16] = [
     0xD2, 0xD1, 0x39, 0xBD, 0x2F, 0xBA, 0x6A, 0x48, 0x89, 0xB0, 0xB4, 0xB0, 0xCB, 0x46, 0x68, 0x91,
 ];
+/// `IID_ICLRRuntimeHost` {D5F0A32B-2E4D-4E4B-9B5C-2D8B0B3B6F5F}.
+const IID_ICLR_RUNTIME_HOST: [u8; 16] = [
+    0x2B, 0xA3, 0xF0, 0xD5, 0x4D, 0x2E, 0x4B, 0x4E, 0x9B, 0x5C, 0x2D, 0x8B, 0x0B, 0x3B, 0x6F, 0x5F,
+];
+/// `CLSID_CLRRuntimeHost` {90F1A06E-7712-4762-86B5-7A5EBA6B65E6}.
+const CLSID_CLR_RUNTIME_HOST: [u8; 16] = [
+    0x6E, 0xA0, 0xF1, 0x90, 0x12, 0x77, 0x62, 0x47, 0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B, 0x65, 0xE6,
+];
+/// `COR_E_EXECUTIONENGINE` — a real CLR execution failure.
+const COR_E_EXECUTIONENGINE: u32 = 0x8013_1506;
 /// `IID_IEnumUnknown` {00000100-0000-0000-C000-000000000046}.
 const IID_IENUM_UNKNOWN: [u8; 16] = [
     0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
@@ -168,6 +180,32 @@ impl PeHostRuntime {
         Ok(object)
     }
 
+    fn alloc_clr_runtime_host(
+        &mut self,
+        memory: &mut MemoryImage,
+        runtime: ClrRuntime,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ClrRuntimeHostQueryInterface,
+            HostThunk::ClrRuntimeHostAddRef,
+            HostThunk::ClrRuntimeHostRelease,
+            HostThunk::ClrRuntimeHostStart,
+            HostThunk::ClrRuntimeHostStop,
+            HostThunk::ClrRuntimeHostSetHostControl,
+            HostThunk::ClrRuntimeHostGetClrControl,
+            HostThunk::ClrRuntimeHostUnloadAppDomain,
+            HostThunk::ClrRuntimeHostExecuteInAppDomain,
+            HostThunk::ClrRuntimeHostGetCurrentAppDomainId,
+            HostThunk::ClrRuntimeHostExecuteApplication,
+            HostThunk::ClrRuntimeHostExecuteInDefaultAppDomain,
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_zeroed(memory, 0x20, 16)?;
+        write_u64(memory, object, vtable);
+        clr_objects().insert_runtime_host(self.guest_pid, object, runtime);
+        Ok(object)
+    }
+
     fn alloc_clr_enumerator(
         &mut self,
         memory: &mut MemoryImage,
@@ -212,6 +250,7 @@ impl PeHostRuntime {
                 self.dispatch_get_requested_runtime_info(state, memory)
             }
             HostThunk::LoadLibraryShim => self.dispatch_load_library_shim(state, memory),
+            HostThunk::GetClrRuntimeHost => self.dispatch_get_clr_runtime_host(state, memory),
             HostThunk::ClrMetaHostQueryInterface => {
                 self.dispatch_clr_meta_host_query_interface(state, memory)
             }
@@ -268,6 +307,59 @@ impl PeHostRuntime {
             HostThunk::ClrRuntimeInfoGetInterface => {
                 self.dispatch_clr_runtime_info_get_interface(state, memory)
             }
+            HostThunk::ClrRuntimeHostQueryInterface => {
+                self.dispatch_clr_runtime_host_query_interface(state, memory)
+            }
+            HostThunk::ClrRuntimeHostAddRef => {
+                self.dispatch_clr_runtime_host_add_ref(state, memory)
+            }
+            HostThunk::ClrRuntimeHostRelease => {
+                self.dispatch_clr_runtime_host_release(state, memory)
+            }
+            HostThunk::ClrRuntimeHostStart => self.dispatch_clr_runtime_host_start(state, memory),
+            HostThunk::ClrRuntimeHostStop => {
+                state.set(Register::Rax, u64::from(S_OK));
+                Ok(())
+            }
+            HostThunk::ClrRuntimeHostSetHostControl => {
+                let _object = guest_call_arg(state, memory, 0)?;
+                let _control = guest_call_arg(state, memory, 1)?;
+                state.set(Register::Rax, u64::from(E_NOTIMPL));
+                Ok(())
+            }
+            HostThunk::ClrRuntimeHostGetClrControl => {
+                let _object = guest_call_arg(state, memory, 0)?;
+                let out = guest_call_arg(state, memory, 1)?;
+                if out != 0 {
+                    write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+                }
+                state.set(Register::Rax, u64::from(E_NOINTERFACE));
+                Ok(())
+            }
+            HostThunk::ClrRuntimeHostUnloadAppDomain => {
+                let _object = guest_call_arg(state, memory, 0)?;
+                let _domain = guest_call_arg_u32(state, memory, 1)?;
+                let _wait = guest_call_arg_u32(state, memory, 2)?;
+                state.set(Register::Rax, u64::from(E_NOTIMPL));
+                Ok(())
+            }
+            HostThunk::ClrRuntimeHostExecuteInAppDomain => {
+                let _object = guest_call_arg(state, memory, 0)?;
+                let _domain = guest_call_arg_u32(state, memory, 1)?;
+                let _callback = guest_call_arg(state, memory, 2)?;
+                let _cookie = guest_call_arg(state, memory, 3)?;
+                state.set(Register::Rax, u64::from(E_NOTIMPL));
+                Ok(())
+            }
+            HostThunk::ClrRuntimeHostGetCurrentAppDomainId => {
+                self.dispatch_clr_runtime_host_get_domain_id(state, memory)
+            }
+            HostThunk::ClrRuntimeHostExecuteApplication => {
+                self.dispatch_clr_runtime_host_execute_application(state, memory)
+            }
+            HostThunk::ClrRuntimeHostExecuteInDefaultAppDomain => {
+                self.dispatch_clr_runtime_host_execute_in_default_app_domain(state, memory)
+            }
             HostThunk::ClrEnumUnknownQueryInterface => {
                 self.dispatch_clr_enum_query_interface(state, memory)
             }
@@ -296,6 +388,46 @@ impl PeHostRuntime {
                 format!("unrouted mscoree thunk {thunk:?}"),
             )),
         }
+    }
+
+    /// `GetCLRRuntimeHost(REFIID riid, ICLRRuntimeHost **host)` — hand the
+    /// guest the real host object for the newest installed CoreCLR.
+    fn dispatch_get_clr_runtime_host(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let riid = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        if riid == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let Some(interface_id) = read_guid(memory, riid) else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        if interface_id != IID_ICLR_RUNTIME_HOST && interface_id != IID_IUNKNOWN {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let Some(runtime) = crate::clr_meta::installed_runtimes().into_iter().next() else {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — every test host has a real CoreCLR installed; an empty installation list is not producible in-process
+            return Ok(()); // coverage: unreachable — same empty-installation branch as the line above
+        };
+        if runtime.coreclr_library().is_none() {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — installed_runtimes() filters out directories whose coreclr_library() is None
+            return Ok(()); // coverage: unreachable — same filtered-installation branch as the line above
+        }
+        let host = self.alloc_clr_runtime_host(memory, runtime)?;
+        write_guest_pointer(memory, out, host, self.guest_arch)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
     }
 
     // ── CLRCreateInstance ─────────────────────────────────────────────────
@@ -342,24 +474,75 @@ impl PeHostRuntime {
 
     /// `CorBindToRuntimeEx(pwszVersion, pwszBuildFlavor, startupFlags,
     /// rclsid, riid, ppv)` (and the 4-argument CorBindToRuntime) — the
-    /// .NET Framework CLR is not installed on this host, so there is no CLR
-    /// to bind.  This is the Framework contract, deliberately distinct from
-    /// the CoreCLR runtimes exposed by `CLRCreateInstance`.
+    /// An explicitly requested installed CoreCLR version binds the real
+    /// runtime host.  A Framework version (or a versionless Framework
+    /// request) stays `COR_E_CLRNOTAVAILABLE`: CoreCLR is not a Framework
+    /// substitute.
     pub(crate) fn dispatch_cor_bind_to_runtime(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _version = guest_call_arg(state, memory, 0)?;
+        let version = guest_call_arg(state, memory, 0)?;
         let _flavor = guest_call_arg(state, memory, 1)?;
         let _startup_flags = guest_call_arg(state, memory, 2)?;
-        let _rclsid = guest_call_arg(state, memory, 3)?;
-        let _riid = guest_call_arg(state, memory, 4)?;
+        let rclsid = guest_call_arg(state, memory, 3)?;
+        let riid = guest_call_arg(state, memory, 4)?;
         let out = guest_call_arg(state, memory, 5)?;
-        if out != 0 {
-            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
         }
-        state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        // No version is the legacy Framework "latest runtime" request; this
+        // host has no Framework CLR, so it stays absent rather than silently
+        // binding a different runtime generation.  An explicit CoreCLR
+        // version binds the real installed runtime of that version.
+        if version == 0 {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+            return Ok(());
+        }
+        let requested = read_utf16_string(memory, version)?;
+        if requested.is_empty() {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+            return Ok(());
+        }
+        if rclsid == 0 || riid == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let Some(class_id) = read_guid(memory, rclsid) else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        let Some(interface_id) = read_guid(memory, riid) else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        if class_id != CLSID_CLR_RUNTIME_HOST {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if interface_id != IID_ICLR_RUNTIME_HOST && interface_id != IID_IUNKNOWN {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let Some(requested) = clr_meta::ClrVersion::parse_request(&requested) else {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+            return Ok(());
+        };
+        let installed = clr_meta::installed_runtimes();
+        let Some(runtime) = clr_meta::select_runtime(&requested, &installed) else {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+            return Ok(());
+        };
+        if runtime.coreclr_library().is_none() {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — select_runtime() only returns runtimes from installed_runtimes(), which filters out missing CLR libraries
+            return Ok(()); // coverage: unreachable — same filtered-installation branch as the line above
+        }
+        let host = self.alloc_clr_runtime_host(memory, runtime.clone())?;
+        write_guest_pointer(memory, out, host, self.guest_arch)?;
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
@@ -906,15 +1089,291 @@ impl PeHostRuntime {
             return Ok(());
         }
         write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        // Unknown objects are rejected before touching the caller's GUID
+        // pointers: the object identity is the primary contract.
+        let Some(runtime) = clr_objects().runtime_info(self.guest_pid, object) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
         if rclsid == 0 || riid == 0 {
             state.set(Register::Rax, u64::from(E_POINTER));
             return Ok(());
         }
-        // No hosting interface (ICLRRuntimeHost, ICLRStrongName, ...) is
-        // implemented by this runtime object, so the truthful answer is
-        // E_NOINTERFACE — never a hollow object.
-        clr_objects().with_runtime_info(self.guest_pid, object, E_NOINTERFACE, |_| ());
-        state.set(Register::Rax, u64::from(E_NOINTERFACE));
+        let Some(class_id) = read_guid(memory, rclsid) else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        let Some(interface_id) = read_guid(memory, riid) else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        if interface_id != IID_ICLR_RUNTIME_HOST && interface_id != IID_IUNKNOWN {
+            clr_objects().with_runtime_info(self.guest_pid, object, E_NOINTERFACE, |_| ());
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if class_id != CLSID_CLR_RUNTIME_HOST {
+            clr_objects().with_runtime_info(self.guest_pid, object, E_NOINTERFACE, |_| ());
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let host = self.alloc_clr_runtime_host(memory, runtime)?;
+        write_guest_pointer(memory, out, host, self.guest_arch)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    // ── ICLRRuntimeHost ──────────────────────────────────────────────────
+
+    fn dispatch_clr_runtime_host_query_interface(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        let riid = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        let Some(interface_id) = read_guid(memory, riid) else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        if interface_id != IID_ICLR_RUNTIME_HOST && interface_id != IID_IUNKNOWN {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if clr_objects()
+            .runtime_host_state(self.guest_pid, object)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        clr_objects().add_ref(self.guest_pid, object);
+        write_guest_pointer(memory, out, object, self.guest_arch)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn dispatch_clr_runtime_host_add_ref(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        match clr_objects().add_ref(self.guest_pid, object) {
+            Some(count) => state.set(Register::Rax, u64::from(count)),
+            None => state.set(Register::Rax, 0),
+        }
+        Ok(())
+    }
+
+    fn dispatch_clr_runtime_host_release(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        match clr_objects().release(self.guest_pid, object) {
+            Some(count) => state.set(Register::Rax, u64::from(count)),
+            None => state.set(Register::Rax, 0),
+        }
+        Ok(())
+    }
+
+    fn dispatch_clr_runtime_host_start(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        let Some((runtime, _)) = clr_objects().runtime_host_state(self.guest_pid, object) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if runtime.coreclr_library().is_none() {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — a runtime host is only allocated from installed_runtimes(), which filters out missing CLR libraries
+            return Ok(()); // coverage: unreachable — same filtered-installation branch as the line above
+        }
+        clr_objects().start_runtime_host(self.guest_pid, object);
+        let version = runtime.version_string();
+        self.notify_clr_runtime_loaded(state, memory, &version)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn dispatch_clr_runtime_host_get_domain_id(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let Some((_, started)) = clr_objects().runtime_host_state(self.guest_pid, object) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        write_guest_u32(memory, out, u32::from(started))?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn dispatch_clr_runtime_host_execute_application(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        let application = guest_call_arg(state, memory, 1)?;
+        let manifest_count = guest_call_arg_u32(state, memory, 2)?;
+        let manifest_paths = guest_call_arg(state, memory, 3)?;
+        let activation_count = guest_call_arg_u32(state, memory, 4)?;
+        let activation_data = guest_call_arg(state, memory, 5)?;
+        let result = guest_call_arg(state, memory, 6)?;
+        if result == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_u32(memory, result, 0)?;
+        if application == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if clr_objects()
+            .runtime_host_state(self.guest_pid, object)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        if (manifest_count != 0 && manifest_paths == 0)
+            || (activation_count != 0 && activation_data == 0)
+        {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let guest_application = read_utf16_string(memory, application)?;
+        let host_application = match self.win32.guest_path_to_host_path(&guest_application) {
+            Ok(path) => path,
+            Err(_) => {
+                state.set(Register::Rax, u64::from(HRESULT_FILE_NOT_FOUND));
+                return Ok(());
+            }
+        };
+        let pointer_size = if self.guest_arch == GuestArch::X64 {
+            8
+        } else {
+            4
+        };
+        let mut arguments = Vec::with_capacity(activation_count as usize);
+        for index in 0..activation_count {
+            let slot = activation_data + u64::from(index) * pointer_size;
+            let pointer = read_guest_pointer(memory, slot, self.guest_arch)?;
+            if pointer != 0 {
+                arguments.push(read_utf16_string(memory, pointer)?);
+            }
+        }
+        // Manifest paths name activation manifests; the runtime entry point
+        // receives the activation data as its command line.
+        let _ = (manifest_paths, manifest_count);
+        match crate::clr_host::execute_assembly(&host_application, &arguments) {
+            Ok(code) => {
+                write_guest_u32(memory, result, code as u32)?;
+                clr_objects().start_runtime_host(self.guest_pid, object);
+                state.set(Register::Rax, u64::from(S_OK));
+            }
+            #[rustfmt::skip]
+            Err(crate::clr_host::ClrHostError::NoRuntime) => { // coverage: unreachable — host_for() fails only when no CoreCLR is installed, and tests require one
+                state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — same missing-CoreCLR host-installation arm as the line above
+            } // coverage: unreachable — same missing-CoreCLR host-installation arm as the lines above
+            Err(crate::clr_host::ClrHostError::AssemblyNotFound(_)) => {
+                state.set(Register::Rax, u64::from(HRESULT_FILE_NOT_FOUND));
+            }
+            #[rustfmt::skip]
+            Err(crate::clr_host::ClrHostError::InvalidArgument(_)) => { // coverage: unreachable — read_utf16_string stops at NUL, so activation data never contains the interior NUL CString::new rejects
+                state.set(Register::Rax, u64::from(E_INVALIDARG)); // coverage: unreachable — same NUL-free activation-data arm as the line above
+            } // coverage: unreachable — same NUL-free activation-data arm as the lines above
+            Err(_) => {
+                state.set(Register::Rax, u64::from(COR_E_EXECUTIONENGINE));
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch_clr_runtime_host_execute_in_default_app_domain(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        let assembly = guest_call_arg(state, memory, 1)?;
+        let type_name = guest_call_arg(state, memory, 2)?;
+        let method_name = guest_call_arg(state, memory, 3)?;
+        let argument = guest_call_arg(state, memory, 4)?;
+        let result = guest_call_arg(state, memory, 5)?;
+        if result == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_guest_u32(memory, result, 0)?;
+        if assembly == 0 || type_name == 0 || method_name == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(_) = clr_objects().runtime_host_state(self.guest_pid, object) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let guest_assembly = read_utf16_string(memory, assembly)?;
+        let host_assembly = match self.win32.guest_path_to_host_path(&guest_assembly) {
+            Ok(path) => path,
+            Err(_) => {
+                state.set(Register::Rax, u64::from(HRESULT_FILE_NOT_FOUND));
+                return Ok(());
+            }
+        };
+        let type_name = read_utf16_string(memory, type_name)?;
+        let method_name = read_utf16_string(memory, method_name)?;
+        let argument = if argument == 0 {
+            None
+        } else {
+            Some(read_utf16_string(memory, argument)?)
+        };
+        match crate::clr_host::execute_in_default_app_domain(
+            &host_assembly,
+            &type_name,
+            &method_name,
+            argument.as_deref(),
+        ) {
+            Ok(value) => {
+                write_guest_u32(memory, result, value as u32)?;
+                clr_objects().start_runtime_host(self.guest_pid, object);
+                state.set(Register::Rax, u64::from(S_OK));
+            }
+            #[rustfmt::skip]
+            Err(crate::clr_host::ClrHostError::NoRuntime) => { // coverage: unreachable — host_for() fails only when no CoreCLR is installed, and tests require one
+                state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — same missing-CoreCLR host-installation arm as the line above
+            } // coverage: unreachable — same missing-CoreCLR host-installation arm as the lines above
+            Err(crate::clr_host::ClrHostError::AssemblyNotFound(_)) => {
+                state.set(Register::Rax, u64::from(HRESULT_FILE_NOT_FOUND));
+            }
+            Err(crate::clr_host::ClrHostError::InvalidArgument(_)) => {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+            }
+            Err(error) => {
+                self.last_error = 0;
+                let _ = error;
+                state.set(Register::Rax, u64::from(COR_E_EXECUTIONENGINE));
+            }
+        }
         Ok(())
     }
 
@@ -2091,6 +2550,817 @@ mod tests {
                 u64::from(E_UNEXPECTED),
                 "a destroyed runtime info object cannot be queried"
             );
+        })
+    }
+
+    #[test]
+    fn clr_runtime_host_executes_delegates_and_reports_real_failures() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("clr-runtime-host");
+            // The mscorwks export hands out the same real host object.
+            let export_iid = words(&mut fixture.memory, 0x41_200, 4);
+            let export_out = words(&mut fixture.memory, 0x41_220, 1);
+            write_guid(&mut fixture.memory, export_iid, IID_ICLR_RUNTIME_HOST);
+            assert_eq!(
+                call_thunk(
+                    &mut fixture,
+                    HostThunk::GetClrRuntimeHost,
+                    &[export_iid as u32, export_out as u32]
+                ),
+                0
+            );
+            let export_host = read_ptr_at(&fixture.memory, export_out);
+            assert_ne!(export_host, 0, "GetCLRRuntimeHost returns a real host");
+            assert_eq!(
+                call_thunk(
+                    &mut fixture,
+                    HostThunk::GetClrRuntimeHost,
+                    &[export_iid as u32, 0]
+                ),
+                u64::from(E_POINTER)
+            );
+            write_guid(&mut fixture.memory, export_iid, IID_IENUM_UNKNOWN);
+            assert_eq!(
+                call_thunk(
+                    &mut fixture,
+                    HostThunk::GetClrRuntimeHost,
+                    &[export_iid as u32, export_out as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(read_ptr_at(&fixture.memory, export_out), 0);
+            assert_eq!(call_method(&mut fixture, export_host, 2, &[]), 0);
+
+            // An explicit installed CoreCLR version binds a real host; a
+            // Framework version stays genuinely absent.
+            let legacy_version = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, &real_version())
+                .expect("coreclr version");
+            let legacy_clsid = words(&mut fixture.memory, 0x41_240, 4);
+            let legacy_iid = words(&mut fixture.memory, 0x41_260, 4);
+            write_guid(&mut fixture.memory, legacy_clsid, CLSID_CLR_RUNTIME_HOST);
+            write_guid(&mut fixture.memory, legacy_iid, IID_ICLR_RUNTIME_HOST);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &[
+                        legacy_version as u32,
+                        0,
+                        0,
+                        legacy_clsid as u32,
+                        legacy_iid as u32,
+                        export_out as u32
+                    ]
+                ),
+                0
+            );
+            let bound = read_ptr_at(&fixture.memory, export_out);
+            assert_ne!(bound, 0, "CoreCLR version binds a real host");
+            assert_eq!(call_method(&mut fixture, bound, 2, &[]), 0);
+
+            let framework_version = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "v4.0.30319")
+                .expect("framework version");
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &[
+                        framework_version as u32,
+                        0,
+                        0,
+                        legacy_clsid as u32,
+                        legacy_iid as u32,
+                        export_out as u32
+                    ]
+                ),
+                u64::from(COR_E_CLRNOTAVAILABLE)
+            );
+            assert_eq!(read_ptr_at(&fixture.memory, export_out), 0);
+
+            let meta = create_meta_host(&mut fixture);
+            let (hr, info) = get_runtime(&mut fixture, meta, &real_version());
+            assert_eq!(hr, 0);
+            assert_ne!(info, 0);
+
+            let clsid = words(&mut fixture.memory, 0x41_280, 4);
+            let iid = words(&mut fixture.memory, 0x41_2A0, 4);
+            let host_out = words(&mut fixture.memory, 0x41_2C0, 1);
+            write_guid(&mut fixture.memory, clsid, CLSID_CLR_RUNTIME_HOST);
+            write_guid(&mut fixture.memory, iid, IID_ICLR_RUNTIME_HOST);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    info,
+                    9,
+                    &[clsid as u32, iid as u32, host_out as u32]
+                ),
+                0
+            );
+            let host = read_ptr_at(&fixture.memory, host_out);
+            assert_ne!(host, 0, "ICLRRuntimeHost is a real host object");
+
+            // A riid pointer readable for only four bytes cannot carry a full
+            // GUID: GetCLRRuntimeHost reports E_POINTER instead of reading
+            // past the mapped range.
+            let short_riid = words(&mut fixture.memory, 0x41_600, 1);
+            assert_eq!(
+                call_thunk(
+                    &mut fixture,
+                    HostThunk::GetClrRuntimeHost,
+                    &[short_riid as u32, export_out as u32]
+                ),
+                u64::from(E_POINTER)
+            );
+
+            // CorBindToRuntimeEx validates both GUID pointers and the
+            // interface ID; restore the real IDs between sub-cases.
+            let bind_clsid = words(&mut fixture.memory, 0x41_6C0, 4);
+            let bind_iid = words(&mut fixture.memory, 0x41_6E0, 4);
+            write_guid(&mut fixture.memory, bind_clsid, CLSID_CLR_RUNTIME_HOST);
+            write_guid(&mut fixture.memory, bind_iid, IID_ICLR_RUNTIME_HOST);
+            let short_clsid = words(&mut fixture.memory, 0x41_620, 1);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &[
+                        legacy_version as u32,
+                        0,
+                        0,
+                        short_clsid as u32,
+                        bind_iid as u32,
+                        export_out as u32
+                    ]
+                ),
+                u64::from(E_POINTER)
+            );
+            let short_iid = words(&mut fixture.memory, 0x41_640, 1);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &[
+                        legacy_version as u32,
+                        0,
+                        0,
+                        bind_clsid as u32,
+                        short_iid as u32,
+                        export_out as u32
+                    ]
+                ),
+                u64::from(E_POINTER)
+            );
+            write_guid(&mut fixture.memory, bind_iid, IID_IENUM_UNKNOWN);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &[
+                        legacy_version as u32,
+                        0,
+                        0,
+                        bind_clsid as u32,
+                        bind_iid as u32,
+                        export_out as u32
+                    ]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+
+            // ICLRRuntimeInfo::GetInterface applies the same GUID contract on
+            // a live runtime-info object.
+            let info_short_clsid = words(&mut fixture.memory, 0x41_660, 1);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    info,
+                    9,
+                    &[info_short_clsid as u32, iid as u32, host_out as u32]
+                ),
+                u64::from(E_POINTER)
+            );
+            let info_short_iid = words(&mut fixture.memory, 0x41_680, 1);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    info,
+                    9,
+                    &[clsid as u32, info_short_iid as u32, host_out as u32]
+                ),
+                u64::from(E_POINTER)
+            );
+            let info_bad_clsid = words(&mut fixture.memory, 0x41_6A0, 4);
+            write_guid(&mut fixture.memory, info_bad_clsid, CLSID_CLR_META_HOST);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    info,
+                    9,
+                    &[info_bad_clsid as u32, iid as u32, host_out as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(read_ptr_at(&fixture.memory, host_out), 0);
+
+            // A valid host IID succeeds and hands back the same object with
+            // one extra reference.
+            write_guid(&mut fixture.memory, iid, IID_ICLR_RUNTIME_HOST);
+            assert_eq!(
+                call_method(&mut fixture, host, 0, &[iid as u32, host_out as u32]),
+                0
+            );
+            assert_eq!(read_ptr_at(&fixture.memory, host_out), host);
+            assert_eq!(call_method(&mut fixture, host, 2, &[]), 1);
+
+            // Only the documented host interfaces are exposed.
+            write_guid(&mut fixture.memory, iid, IID_IENUM_UNKNOWN);
+            assert_eq!(
+                call_method(&mut fixture, host, 0, &[iid as u32, host_out as u32]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(read_ptr_at(&fixture.memory, host_out), 0);
+
+            assert_eq!(call_method(&mut fixture, host, 1, &[]), 2);
+            assert_eq!(call_method(&mut fixture, host, 2, &[]), 1);
+            assert_eq!(call_method(&mut fixture, host, 3, &[]), 0, "Start");
+            let domain_out = words(&mut fixture.memory, 0x41_2E0, 1);
+            assert_eq!(call_method(&mut fixture, host, 9, &[domain_out as u32]), 0);
+            assert_eq!(read_u32_at(&fixture.memory, domain_out), 1);
+
+            let result = words(&mut fixture.memory, 0x41_300, 1);
+            assert_eq!(
+                call_method(&mut fixture, host, 11, &[0, 0, 0, 0, result as u32]),
+                u64::from(E_INVALIDARG)
+            );
+
+            let missing = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "C:\\clr\\missing.dll")
+                .expect("missing path");
+            let type_name = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "Casa1.Missing")
+                .expect("type");
+            let method_name = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "Run")
+                .expect("method");
+            let argument = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "arg")
+                .expect("argument");
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    11,
+                    &[
+                        missing as u32,
+                        type_name as u32,
+                        method_name as u32,
+                        argument as u32,
+                        result as u32
+                    ]
+                ),
+                u64::from(HRESULT_FILE_NOT_FOUND)
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 0);
+
+            // A real managed assembly with an absent type is the CLR's own
+            // execution failure, never a fabricated success.
+            let runtime = crate::clr_meta::installed_runtimes()
+                .into_iter()
+                .next()
+                .expect("a real runtime is installed");
+            let source = runtime.directory.join("System.Runtime.dll");
+            fixture
+                .runtime
+                .win32
+                .stage_host_file_w(&source, "C:\\clr\\System.Runtime.dll")
+                .expect("stage managed assembly");
+            let assembly = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "C:\\clr\\System.Runtime.dll")
+                .expect("assembly path");
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    11,
+                    &[
+                        assembly as u32,
+                        type_name as u32,
+                        method_name as u32,
+                        argument as u32,
+                        result as u32
+                    ]
+                ),
+                u64::from(COR_E_EXECUTIONENGINE)
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 0);
+
+            // ExecuteApplication runs a real entry point; libraries and
+            // missing files are refused with exact host statuses.
+            assert_eq!(
+                call_method(&mut fixture, host, 10, &[0, 0, 0, 0, 0, result as u32]),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                call_method(&mut fixture, host, 10, &[assembly as u32, 0, 0, 0, 0, 0]),
+                u64::from(E_POINTER)
+            );
+            let missing_app = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "C:\\clr\\missing.exe")
+                .expect("missing app");
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    10,
+                    &[missing_app as u32, 0, 0, 0, 0, result as u32]
+                ),
+                u64::from(HRESULT_FILE_NOT_FOUND)
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 0);
+            let no_drive_app = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "no-drive-path.dll")
+                .expect("in-guest app path");
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    10,
+                    &[no_drive_app as u32, 0, 0, 0, 0, result as u32]
+                ),
+                u64::from(HRESULT_FILE_NOT_FOUND),
+                "a guest path without a drive cannot be mapped to the host"
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 0);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    10,
+                    &[assembly as u32, 0, 0, 0, 0, result as u32]
+                ),
+                u64::from(COR_E_EXECUTIONENGINE),
+                "a managed library has no entry point"
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 0);
+
+            // Every remaining ICLRRuntimeHost method has a pinned contract.
+            assert_eq!(call_method(&mut fixture, host, 4, &[]), 0, "Stop");
+            assert_eq!(
+                call_method(&mut fixture, host, 5, &[0]),
+                u64::from(E_NOTIMPL),
+                "SetHostControl"
+            );
+            assert_eq!(
+                call_method(&mut fixture, host, 6, &[0]),
+                u64::from(E_NOINTERFACE),
+                "GetCLRControl"
+            );
+            assert_eq!(
+                call_method(&mut fixture, host, 6, &[host_out as u32]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(read_ptr_at(&fixture.memory, host_out), 0);
+            assert_eq!(
+                call_method(&mut fixture, host, 7, &[0, 0]),
+                u64::from(E_NOTIMPL),
+                "UnloadAppDomain"
+            );
+            assert_eq!(
+                call_method(&mut fixture, host, 8, &[0, 0, 0]),
+                u64::from(E_NOTIMPL),
+                "ExecuteInAppDomain"
+            );
+            assert_eq!(
+                call_method(&mut fixture, host, 9, &[0]),
+                u64::from(E_POINTER)
+            );
+
+            // Unknown objects and malformed interface pointers are exact.
+            write_guid(&mut fixture.memory, iid, IID_ICLR_RUNTIME_HOST);
+            assert_eq!(
+                call_method(&mut fixture, host, 0, &[iid as u32, 0]),
+                u64::from(E_POINTER)
+            );
+            assert_eq!(
+                call_method(&mut fixture, host, 0, &[0, host_out as u32]),
+                u64::from(E_POINTER),
+                "a null riid is E_POINTER"
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ClrRuntimeHostQueryInterface,
+                    &[0xDEAD, iid as u32, host_out as u32]
+                ),
+                u64::from(E_UNEXPECTED)
+            );
+            assert_eq!(
+                dispatch_x86(&mut fixture, HostThunk::ClrRuntimeHostAddRef, &[0xDEAD]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86(&mut fixture, HostThunk::ClrRuntimeHostRelease, &[0xDEAD]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86(&mut fixture, HostThunk::ClrRuntimeHostStart, &[0xDEAD]),
+                u64::from(E_UNEXPECTED)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ClrRuntimeHostGetCurrentAppDomainId,
+                    &[0xDEAD, domain_out as u32]
+                ),
+                u64::from(E_UNEXPECTED)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ClrRuntimeHostExecuteApplication,
+                    &[0xDEAD, assembly as u32, 0, 0, 0, 0, result as u32]
+                ),
+                u64::from(E_UNEXPECTED)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ClrRuntimeHostExecuteInDefaultAppDomain,
+                    &[
+                        0xDEAD,
+                        assembly as u32,
+                        type_name as u32,
+                        method_name as u32,
+                        0,
+                        result as u32
+                    ]
+                ),
+                u64::from(E_UNEXPECTED)
+            );
+
+            // ExecuteApplication argument validation and a real entry point.
+            assert_eq!(
+                call_method(&mut fixture, host, 10, &[assembly as u32, 0, 0, 0, 0, 0]),
+                u64::from(E_POINTER)
+            );
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    10,
+                    &[assembly as u32, 1, 0, 0, 0, result as u32]
+                ),
+                u64::from(E_INVALIDARG),
+                "manifest count without paths"
+            );
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    10,
+                    &[assembly as u32, 0, 0, 1, 0, result as u32]
+                ),
+                u64::from(E_INVALIDARG),
+                "activation count without data"
+            );
+
+            let runtime_dir = crate::clr_meta::installed_runtimes()
+                .into_iter()
+                .next()
+                .expect("a real runtime is installed")
+                .directory;
+            let corelib = runtime_dir.join("System.Private.CoreLib.dll");
+            fixture
+                .runtime
+                .win32
+                .stage_host_file_w(&corelib, "C:\\clr\\System.Private.CoreLib.dll")
+                .expect("stage corelib");
+            let corelib_guest = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "C:\\clr\\System.Private.CoreLib.dll")
+                .expect("corelib path");
+            let environment = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "System.Environment")
+                .expect("type");
+            let processor_count = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "get_ProcessorCount")
+                .expect("method");
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    11,
+                    &[
+                        corelib_guest as u32,
+                        environment as u32,
+                        processor_count as u32,
+                        0,
+                        result as u32
+                    ]
+                ),
+                0,
+                "a real managed method executes through ICLRRuntimeHost"
+            );
+            assert_ne!(read_u32_at(&fixture.memory, result), 0);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    11,
+                    &[
+                        corelib_guest as u32,
+                        0,
+                        processor_count as u32,
+                        0,
+                        result as u32
+                    ]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    11,
+                    &[
+                        corelib_guest as u32,
+                        environment as u32,
+                        processor_count as u32,
+                        0,
+                        0
+                    ]
+                ),
+                u64::from(E_POINTER)
+            );
+            let empty_type = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "")
+                .expect("empty type name");
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    11,
+                    &[
+                        corelib_guest as u32,
+                        empty_type as u32,
+                        processor_count as u32,
+                        0,
+                        result as u32
+                    ]
+                ),
+                u64::from(E_INVALIDARG),
+                "an empty type name is refused before CLR execution"
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 0);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    11,
+                    &[
+                        no_drive_app as u32,
+                        environment as u32,
+                        processor_count as u32,
+                        0,
+                        result as u32
+                    ]
+                ),
+                u64::from(HRESULT_FILE_NOT_FOUND),
+                "a guest path without a drive cannot be mapped to the host"
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 0);
+
+            let entry_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/Casa1Entry.dll");
+            fixture
+                .runtime
+                .win32
+                .stage_host_file_w(&entry_fixture, "C:\\clr\\Casa1Entry.dll")
+                .expect("stage managed app");
+            let entry_guest = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "C:\\clr\\Casa1Entry.dll")
+                .expect("entry path");
+            let one = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "one")
+                .expect("arg one");
+            let two = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "two")
+                .expect("arg two");
+            let activation = words(&mut fixture.memory, 0x41_500, 2);
+            write_guest_pointer(&mut fixture.memory, activation, one, GuestArch::X86)
+                .expect("arg pointer");
+            write_guest_pointer(&mut fixture.memory, activation + 4, two, GuestArch::X86)
+                .expect("arg pointer");
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    10,
+                    &[
+                        entry_guest as u32,
+                        0,
+                        0,
+                        2,
+                        activation as u32,
+                        result as u32
+                    ]
+                ),
+                0,
+                "the managed entry point runs with activation data"
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 9);
+
+            // A null activation pointer is skipped rather than dereferenced;
+            // the remaining arguments still reach the entry point.
+            let sparse_activation = words(&mut fixture.memory, 0x41_540, 3);
+            write_guest_pointer(&mut fixture.memory, sparse_activation, one, GuestArch::X86)
+                .expect("arg pointer");
+            write_guest_pointer(
+                &mut fixture.memory,
+                sparse_activation + 8,
+                two,
+                GuestArch::X86,
+            )
+            .expect("arg pointer");
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    10,
+                    &[
+                        entry_guest as u32,
+                        0,
+                        0,
+                        3,
+                        sparse_activation as u32,
+                        result as u32
+                    ]
+                ),
+                0,
+                "a null activation pointer is skipped"
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 9);
+
+            // CorBind: malformed arguments and unparsable/absent versions.
+            let bad_version = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "not-a-version")
+                .expect("bad version");
+            let absent_coreclr = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "9.9.9")
+                .expect("absent version");
+            let empty_version = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "")
+                .expect("empty version");
+            for args in [
+                [legacy_version, 0, 0, legacy_clsid, legacy_iid, 0],
+                [0, 0, 0, legacy_clsid, legacy_iid, export_out],
+                [empty_version, 0, 0, legacy_clsid, legacy_iid, export_out],
+                [legacy_version, 0, 0, 0, legacy_iid, export_out],
+                [legacy_version, 0, 0, legacy_clsid, 0, export_out],
+            ] {
+                assert_ne!(
+                    dispatch_x86(
+                        &mut fixture,
+                        HostThunk::CorBindToRuntimeEx,
+                        &args.map(|value| value as u32)
+                    ),
+                    0
+                );
+            }
+            write_guid(&mut fixture.memory, legacy_clsid, IID_IENUM_UNKNOWN);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &[legacy_version, 0, 0, legacy_clsid, legacy_iid, export_out]
+                        .map(|value| value as u32)
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &[bad_version, 0, 0, export_iid, legacy_iid, export_out]
+                        .map(|value| value as u32)
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            write_guid(&mut fixture.memory, legacy_clsid, CLSID_CLR_RUNTIME_HOST);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &[bad_version, 0, 0, legacy_clsid, legacy_iid, export_out]
+                        .map(|value| value as u32)
+                ),
+                u64::from(COR_E_CLRNOTAVAILABLE)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &[absent_coreclr, 0, 0, legacy_clsid, legacy_iid, export_out]
+                        .map(|value| value as u32)
+                ),
+                u64::from(COR_E_CLRNOTAVAILABLE)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetClrRuntimeHost,
+                    &[export_iid as u32, 0]
+                ),
+                u64::from(E_POINTER)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetClrRuntimeHost,
+                    &[0, export_out as u32]
+                ),
+                u64::from(E_POINTER)
+            );
+        })
+    }
+
+    #[test]
+    fn clr_runtime_host_execute_application_x64_rejects_missing_assembly_with_eight_byte_pointers()
+    {
+        with_big_stack(|| {
+            let (mut runtime, mut memory, _temp) = x64_runtime("clr-runtime-host-x64");
+            let riid = 0x41_000_u64;
+            let host_out = 0x41_020_u64;
+            memory.map_bytes(riid, &IID_ICLR_RUNTIME_HOST);
+            memory.map_bytes(host_out, &[0_u8; 8]);
+            let get_host = runtime.alloc_host_thunk(HostThunk::GetClrRuntimeHost);
+            let mut state = CpuState::new(GuestArch::X64);
+            state.set(Register::Rcx, riid);
+            state.set(Register::Rdx, host_out);
+            runtime
+                .dispatch_import(get_host, &mut state, &mut memory)
+                .expect("dispatch GetClrRuntimeHost");
+            assert_eq!(state.get(Register::Rax), 0);
+            let host = memory.read_u64(host_out).expect("host pointer");
+            assert_ne!(host, 0, "x64 GetCLRRuntimeHost returns a real host");
+
+            let application = runtime
+                .alloc_utf16_string(&mut memory, "C:\\clr\\missing64.dll")
+                .expect("application path");
+            let one = runtime
+                .alloc_utf16_string(&mut memory, "one")
+                .expect("arg one");
+            let two = runtime
+                .alloc_utf16_string(&mut memory, "two")
+                .expect("arg two");
+            let activation = 0x42_000_u64;
+            let mut activation_bytes = [0_u8; 24];
+            activation_bytes[0..8].copy_from_slice(&one.to_le_bytes());
+            activation_bytes[16..24].copy_from_slice(&two.to_le_bytes());
+            memory.map_bytes(activation, &activation_bytes);
+            let stack = 0x58_000_u64;
+            memory.map_bytes(stack, &[0_u8; 0x100]);
+            let result = 0x43_000_u64;
+            memory.map_bytes(result, &[0_u8; 8]);
+            write_u64(&mut memory, stack + 0x28, 3);
+            write_u64(&mut memory, stack + 0x30, activation);
+            write_u64(&mut memory, stack + 0x38, result);
+            let execute = runtime.alloc_host_thunk(HostThunk::ClrRuntimeHostExecuteApplication);
+            let mut state = CpuState::new(GuestArch::X64);
+            state.set(Register::Rsp, stack);
+            state.set(Register::Rcx, host);
+            state.set(Register::Rdx, application);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, 0);
+            runtime
+                .dispatch_import(execute, &mut state, &mut memory)
+                .expect("dispatch ExecuteApplication");
+            assert_eq!(
+                state.get(Register::Rax),
+                u64::from(HRESULT_FILE_NOT_FOUND),
+                "the x64 arm reads three eight-byte activation pointers before refusing a missing assembly"
+            );
+            assert_eq!(memory.read_u32(result).expect("result code"), 0);
         })
     }
 

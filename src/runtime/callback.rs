@@ -402,7 +402,7 @@ impl PeHostRuntime {
                 state,
                 label,
             )?;
-            if self
+            let interrupted = self
                 .execute_ir_with_guest_exception_delivery(
                     &engine,
                     state,
@@ -410,8 +410,14 @@ impl PeHostRuntime {
                     &cached_block.translated.ir,
                     label,
                 )
-                .map_err(|error| annotate_guest_fault(error, memory, state))?
-            {
+                .map_err(|error| annotate_guest_fault(error, memory, state))?;
+            if allow_yield {
+                crate::driver_island::tick_active_island_preemption(self);
+                if self.take_pumped_guest_thread_yield_request() {
+                    return Ok(GuestCallbackDisposition::Yielded);
+                }
+            }
+            if interrupted {
                 continue;
             }
 

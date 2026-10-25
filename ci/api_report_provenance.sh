@@ -13,13 +13,20 @@
 #   3. Writes <report>.provenance.json next to the report with commit SHA,
 #      tree hash, rustc/cargo versions, feature set, UTC timestamp, report
 #      hashes, the exact command, and the determinism verdict.
+#   4. When --test-manifest is supplied, verifies the compiled-test manifest
+#      and records its byte hash + canonical digest in the same sidecar, so
+#      the provenance hash covers the evidence manifest too.
 #
 # Usage:
-#   ci/api_report_provenance.sh <report.json> [--command '<cmd with {out}>']
+#   ci/api_report_provenance.sh <report.json> \
+#     [--command '<cmd with {out}>'] [--test-manifest <manifest.json>]
 #
 # Optional --command must contain the literal {out} placeholder; it is replaced
 # with a temporary output path for each reproducibility run. Default:
 #   cargo run --bin casa1-oracle -- api-report --gate none --out {out}
+#
+# CASA1_TEST_MANIFEST is honoured as an environment fallback for
+# --test-manifest.
 
 set -euo pipefail
 
@@ -28,7 +35,7 @@ CANONICALIZER="$REPO_ROOT/ci/canonical_api_report.py"
 DEFAULT_COMMAND="cargo run --bin casa1-oracle -- api-report --gate none --out {out}"
 
 usage() {
-  echo "usage: ci/api_report_provenance.sh <report.json> [--command '<cmd with {out}>']"
+  echo "usage: ci/api_report_provenance.sh <report.json> [--command '<cmd with {out}>'] [--test-manifest <manifest.json>]"
 }
 fail() { echo "!! $*" >&2; }
 info() { echo ":: $*"; }
@@ -36,12 +43,17 @@ sha256_of() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 REPORT=""
 COMMAND=""
+TEST_MANIFEST="${CASA1_TEST_MANIFEST:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --command)
       [[ $# -ge 2 ]] || { fail "--command requires a value"; usage >&2; exit 2; }
       COMMAND="$2"; shift 2 ;;
     --command=*) COMMAND="${1#--command=}"; shift ;;
+    --test-manifest)
+      [[ $# -ge 2 ]] || { fail "--test-manifest requires a value"; usage >&2; exit 2; }
+      TEST_MANIFEST="$2"; shift 2 ;;
+    --test-manifest=*) TEST_MANIFEST="${1#--test-manifest=}"; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) fail "unknown option: $1"; usage >&2; exit 2 ;;
@@ -165,6 +177,24 @@ fi
 REPORT_SHA="$(sha256_of "$REPORT")"
 SIDECAR="$REPORT.provenance.json"
 
+TEST_MANIFEST_SHA=""
+TEST_MANIFEST_CANONICAL_SHA=""
+if [[ -n "$TEST_MANIFEST" ]]; then
+  [[ -f "$TEST_MANIFEST" ]] || { fail "test manifest not found: $TEST_MANIFEST"; exit 1; }
+  python3 "$REPO_ROOT/ci/evidence_manifest.py" \
+    --verify "$TEST_MANIFEST" --require-head --quiet \
+    || { fail "test manifest failed verification: $TEST_MANIFEST"; exit 1; }
+  TEST_MANIFEST_SHA="$(sha256_of "$TEST_MANIFEST")"
+  TEST_MANIFEST_CANONICAL_SHA="$(python3 "$REPO_ROOT/ci/evidence_manifest.py" \
+    --print-digest "$TEST_MANIFEST" --require-head)" || {
+      fail "cannot compute the canonical test manifest digest: $TEST_MANIFEST"
+      exit 1
+    }
+  info "test manifest: $(basename "$TEST_MANIFEST")"
+  info "  sha256:           $TEST_MANIFEST_SHA"
+  info "  canonical sha256: $TEST_MANIFEST_CANONICAL_SHA"
+fi
+
 export PROV_REPORT="$(basename "$REPORT")"
 export PROV_TIMESTAMP_UTC="$TIMESTAMP_UTC"
 export PROV_COMMIT="$COMMIT"
@@ -179,6 +209,13 @@ export PROV_REPORT_SHA256="$REPORT_SHA"
 export PROV_CANON1_SHA="$CANON1_SHA"
 export PROV_CANON2_SHA="$CANON2_SHA"
 export PROV_CANON_PROVIDED_SHA="$CANON_PROVIDED_SHA"
+PROV_TEST_MANIFEST=""
+if [[ -n "$TEST_MANIFEST" ]]; then
+  PROV_TEST_MANIFEST="$(basename "$TEST_MANIFEST")"
+fi
+export PROV_TEST_MANIFEST
+export PROV_TEST_MANIFEST_SHA="$TEST_MANIFEST_SHA"
+export PROV_TEST_MANIFEST_CANONICAL_SHA="$TEST_MANIFEST_CANONICAL_SHA"
 
 python3 - "$SIDECAR" <<'PY'
 import json
@@ -215,6 +252,12 @@ sidecar = {
         "reproducible": True,
     },
 }
+if os.environ.get("PROV_TEST_MANIFEST"):
+    sidecar["test_manifest"] = os.environ["PROV_TEST_MANIFEST"]
+    sidecar["test_manifest_sha256"] = os.environ["PROV_TEST_MANIFEST_SHA"]
+    sidecar["test_manifest_canonical_sha256"] = os.environ[
+        "PROV_TEST_MANIFEST_CANONICAL_SHA"
+    ]
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(sidecar, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -225,4 +268,8 @@ info "  commit:  $COMMIT"
 info "  tree:    $TREE"
 info "  report sha256:            $REPORT_SHA"
 info "  canonical report sha256:  $CANON_PROVIDED_SHA"
+if [[ -n "$TEST_MANIFEST" ]]; then
+  info "  test manifest sha256:     $TEST_MANIFEST_SHA"
+  info "  test manifest canonical:  $TEST_MANIFEST_CANONICAL_SHA"
+fi
 info "  determinism: reproduced over 2 runs (canonical form, 'generated_at' excluded)"

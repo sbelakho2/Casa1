@@ -21,6 +21,82 @@ use crate::runtime::object_manager::ObjectId;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+/// TEB `LastErrorValue` offset for a guest architecture.
+fn teb_last_error_offset(arch: GuestArch) -> u64 {
+    match arch {
+        GuestArch::X64 => 0x68,
+        GuestArch::X86 => 0x34,
+    }
+}
+
+/// macOS QoS class constants (`sys/qos.h`).
+const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+const QOS_CLASS_USER_INITIATED: u32 = 0x19;
+const QOS_CLASS_DEFAULT: u32 = 0x15;
+const QOS_CLASS_UTILITY: u32 = 0x11;
+const QOS_CLASS_BACKGROUND: u32 = 0x09;
+
+unsafe extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    fn pthread_get_qos_class_np(
+        thread: *mut libc::c_void,
+        qos_class: *mut u32,
+        relative_priority: *mut i32,
+    ) -> i32;
+}
+
+/// Map a Windows `SetThreadPriority` value onto the closest macOS QoS class.
+fn qos_class_for_windows_priority(priority: i32) -> u32 {
+    if priority >= 15 {
+        QOS_CLASS_USER_INTERACTIVE
+    } else if priority >= 2 {
+        QOS_CLASS_USER_INITIATED
+    } else if priority >= 0 {
+        QOS_CLASS_DEFAULT
+    } else if priority >= -2 {
+        QOS_CLASS_UTILITY
+    } else {
+        QOS_CLASS_BACKGROUND
+    }
+}
+
+/// Scoped QoS override for a guest thread slice; dropping restores the
+/// worker thread's previous class.
+struct GuestQosGuard {
+    previous_class: u32,
+    previous_relative: i32,
+}
+
+impl GuestQosGuard {
+    fn apply(priority: i32) -> Self {
+        let mut previous_class = QOS_CLASS_DEFAULT;
+        let mut previous_relative = 0;
+        // SAFETY: pthread_get_qos_class_np writes the two out parameters for
+        // the calling thread; both pointers are valid.
+        unsafe {
+            pthread_get_qos_class_np(
+                libc::pthread_self() as *mut libc::c_void,
+                &raw mut previous_class,
+                &raw mut previous_relative,
+            );
+            pthread_set_qos_class_self_np(qos_class_for_windows_priority(priority), 0);
+        }
+        Self {
+            previous_class,
+            previous_relative,
+        }
+    }
+}
+
+impl Drop for GuestQosGuard {
+    fn drop(&mut self) {
+        // SAFETY: restores the class captured on this same thread.
+        unsafe {
+            pthread_set_qos_class_self_np(self.previous_class, self.previous_relative);
+        }
+    }
+}
+
 /// Scheduler instrumentation.  Process-wide atomics keep the hot paths
 /// lock-free; tests snapshot deltas so concurrently running tests cannot make
 /// an absolute assertion flaky.
@@ -61,8 +137,10 @@ pub(crate) struct SchedulerCounters {
     /// Wait jobs active on native workers right now / high-water mark.
     pub(crate) active_worker_jobs: std::sync::atomic::AtomicU64,
     pub(crate) max_concurrent_worker_jobs: std::sync::atomic::AtomicU64,
-    /// Cooperative fallback idle polls (the only 1 ms poll loop).  Production
-    /// waits must leave this counter untouched.
+    /// Historical cooperative idle-poll counter.  The cooperative pump is now
+    /// event-driven and never increments it; production waits must also leave
+    /// it untouched.  Retained so diagnostics/tests can prove no 1 ms tick
+    /// remains.
     pub(crate) poll_iterations: std::sync::atomic::AtomicU64,
     /// Completion-port slice rechecks (a blocked IOCP wait re-enters the
     /// port's condition variable; never a 1 ms hot-path poll).
@@ -169,6 +247,123 @@ pub(crate) static SCHEDULER_COUNTERS: SchedulerCounters = SchedulerCounters {
     poll_iterations: std::sync::atomic::AtomicU64::new(0),
     port_rechecks: std::sync::atomic::AtomicU64::new(0),
 };
+
+/// Bounded recheck interval for the cooperative idle pump when no finite
+/// guest wait/yield deadline exists.  This is the only fallback tick: a real
+/// state transition notifies [`PumpWake`] and wakes the pump immediately, so
+/// the wait never polls a fixed 1 ms grid.
+const PUMP_IDLE_FALLBACK: Duration = Duration::from_millis(16);
+
+/// Cooperative idle-pump wake signal.
+///
+/// The pump records the current epoch before evaluating readiness and then
+/// blocks on the condition variable with a deadline derived from the earliest
+/// guest deadline.  Every path that can make a cooperative thread runnable
+/// advances the epoch and notifies, so a wake that arrives before the wait
+/// starts is observed by the predicate loop instead of being lost.
+///
+/// The mutex is held only while inspecting/updating the epoch and while
+/// waiting (the condition variable releases it).  It is never held while
+/// executing guest code or while taking the runtime's `&mut self`, so there is
+/// no scheduler lock around guest execution.
+#[derive(Debug)]
+struct PumpWake {
+    state: Mutex<PumpWakeState>,
+    wake: Condvar,
+}
+
+#[derive(Debug)]
+struct PumpWakeState {
+    epoch: u64,
+}
+
+/// Result of one idle-pump wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpWakeOutcome {
+    /// A notification newer than the observed epoch was delivered.
+    Notified { epoch: u64 },
+    /// The wait deadline expired without a newer notification.
+    TimedOut { epoch: u64 },
+}
+
+impl PumpWake {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(PumpWakeState { epoch: 0 }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .epoch
+    }
+
+    /// Publish a wake.  The epoch always advances, even with no waiter, so a
+    /// notification before the pump starts waiting is not lost.
+    fn notify(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.epoch = state.epoch.wrapping_add(1);
+        drop(state);
+        self.wake.notify_all();
+    }
+
+    /// Block until the epoch differs from `observed`, or until `deadline`.
+    /// The predicate (`epoch != observed`) is rechecked under the mutex after
+    /// every wake, which closes the lost-wakeup window.
+    fn wait_until(&self, observed: u64, deadline: Option<Instant>) -> PumpWakeOutcome {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if state.epoch != observed {
+                return PumpWakeOutcome::Notified { epoch: state.epoch };
+            }
+            match deadline {
+                None => {
+                    state = self
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return PumpWakeOutcome::TimedOut { epoch: state.epoch };
+                    }
+                    let (guard, _) = self
+                        .wake
+                        .wait_timeout(state, deadline - now)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state = guard;
+                }
+            }
+        }
+    }
+}
+
+/// Process-wide cooperative pump wake.  Wakes may originate on native
+/// workers, object-manager writers or background timer threads; a spurious
+/// wake from another runtime in the same process only causes a readiness
+/// recheck, never a semantic change.
+static PUMP_WAKE: PumpWake = PumpWake::new();
+
+fn pump_wake() -> &'static PumpWake {
+    &PUMP_WAKE
+}
+
+/// Advance the cooperative idle-pump epoch and wake a blocked pump.  Safe to
+/// call from any host thread; the wake is advisory (the pump always rechecks
+/// its predicates under the runtime's exclusive ownership).
+pub(crate) fn notify_pump_wake() {
+    pump_wake().notify();
+}
 
 /// What a parked guest wait is waiting for.  The scheduler resumes the
 /// thread only when the descriptor becomes satisfiable — object signals,
@@ -277,6 +472,29 @@ pub(crate) struct WaitResume {
     pub(crate) last_error: Option<u32>,
 }
 
+// Test-only hook run after a completion-port readiness probe reports
+// readable, before the pump's consumption pass.  It lets an adversarial test
+// deterministically model a concurrent host consumer draining the packet
+// between readiness and consumption (the real `Stolen` race).
+#[cfg(test)]
+thread_local! {
+    static READABLE_PROBE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_readable_probe_hook(hook: impl FnOnce() + 'static) {
+    READABLE_PROBE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_readable_probe_hook() {
+    let hook = READABLE_PROBE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 impl PeHostRuntime {
     /// Non-consuming satisfiability of a parked thread's wait descriptor.
     /// Read-only (`&self`) so it can run inside the readiness scan.
@@ -352,7 +570,12 @@ impl PeHostRuntime {
             WaitOperation::PipeAvailable { name } => self.win32.named_pipe_server_exists(name),
             WaitOperation::CompletionPort { port, .. }
             | WaitOperation::CompletionPortEx { port, .. } => {
-                self.completion_port_wait_ready(*port, thread.thread_id)
+                let readable = self.completion_port_wait_ready(*port, thread.thread_id);
+                #[cfg(test)]
+                if readable {
+                    run_readable_probe_hook();
+                }
+                readable
             }
         }
     }
@@ -811,9 +1034,31 @@ impl PeHostRuntime {
             .is_some_and(|wait| self.start_production_wait(pending_thread.thread_id, wait));
         if started {
             self.pending_guest_threads.push_back(pending_thread);
+            notify_pump_wake();
             None
         } else {
             Some(pending_thread)
+        }
+    }
+
+    /// Last error recorded for a guest thread: its TEB when it has one, or
+    /// the TEB-less fallback store used by synthetic harness threads.
+    #[cfg(test)]
+    pub(crate) fn guest_thread_last_error(
+        &self,
+        thread_id: u32,
+        memory: &MemoryImage,
+    ) -> Option<u32> {
+        let thread = self
+            .pending_guest_threads
+            .iter()
+            .rev()
+            .find(|thread| thread.thread_id == thread_id);
+        match thread {
+            Some(thread) if thread.teb_base != 0 => memory
+                .read_u32(thread.teb_base + teb_last_error_offset(self.guest_arch))
+                .ok(),
+            _ => self.fallback_last_errors.get(&thread_id).copied(),
         }
     }
 
@@ -853,16 +1098,18 @@ impl PeHostRuntime {
             wait_resume: None,
         });
         self.main_thread_parked = true;
+        notify_pump_wake();
     }
 }
 
 impl PeHostRuntime {
     /// Pump-driven execution mode: the main thread is parked in the wait
     /// queue.  Run runnable guest threads, service timers/APCs, and advance
-    /// the guest clock; the HOST sleeps only when nothing is runnable, and
-    /// only briefly (1 ms) so finite deadlines progress.  Returns the process
-    /// exit code when the run ends (including the run deadline, which is
-    /// harness cancellation — never a fake wait result).
+    /// the guest clock; the HOST blocks only when nothing is runnable, and
+    /// wakes on a scheduler notification or the earliest guest deadline
+    /// (never on a fixed 1 ms tick).  Returns the process exit code when the
+    /// run ends (including the run deadline, which is harness cancellation —
+    /// never a fake wait result).
     pub(crate) fn run_pump_driven(
         &mut self,
         memory: &mut MemoryImage,
@@ -876,6 +1123,13 @@ impl PeHostRuntime {
         let mut scratch_state = CpuState::new(self.guest_arch);
         scratch_state.segment_bases.fs = self.teb_base;
         loop {
+            // Observe the wake epoch BEFORE evaluating readiness.  A
+            // notification that arrives after this read advances the epoch,
+            // so the idle wait below returns immediately instead of blocking
+            // through the event; notifications that arrived before this read
+            // are visible to the readiness checks below.  Together they close
+            // the lost-wakeup window without a fixed polling tick.
+            let wake_epoch = pump_wake().epoch();
             if RUN_DEADLINE_EXPIRED.load(std::sync::atomic::Ordering::Acquire) {
                 crate::live::live_trace(
                     "[pe] run deadline reached in pump-driven mode — ending run with exit -2",
@@ -930,17 +1184,74 @@ impl PeHostRuntime {
                     }
                 } else {
                     // Nothing runnable and at least one cooperative wait:
-                    // the historical 1 ms idle poll (deterministic mode and
-                    // unsupported wait sources).
-                    std::thread::sleep(Duration::from_millis(1));
-                    self.win32.record_sleep_observation(1, 1);
-                    SCHEDULER_COUNTERS
-                        .poll_iterations
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // block until a scheduler notification or the earliest
+                    // guest deadline.  Infinite waits use the bounded
+                    // housekeeping fallback — there is no 1 ms tick.
+                    let deadline = self
+                        .next_cooperative_wake_deadline()
+                        .unwrap_or_else(|| Instant::now() + PUMP_IDLE_FALLBACK);
+                    let wait_started = Instant::now();
+                    let _ = pump_wake().wait_until(wake_epoch, Some(deadline));
+                    let elapsed_ms =
+                        wait_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    // Guest-visible time passed while the host waited; advance
+                    // the guest clock by the observed host interval so finite
+                    // deadlines progress without a polling tick.
+                    if elapsed_ms > 0 {
+                        self.win32.record_sleep_observation(elapsed_ms, elapsed_ms);
+                    }
                 }
             }
         }
         Ok(exit_code)
+    }
+
+    /// Host deadline of the earliest cooperative wake that is still in the
+    /// future: a parked wait's guest timeout, a plain timeslice yield, or the
+    /// next `SetTimer` expiry.  `None` means every pending cooperative wait is
+    /// infinite and no guest timer is armed, so the idle pump uses its bounded
+    /// housekeeping fallback instead.
+    fn next_cooperative_wake_deadline(&self) -> Option<Instant> {
+        let now_tick = self.win32.get_tick_count64();
+        let host_now = Instant::now();
+        let mut earliest: Option<Instant> = None;
+        for thread in &self.pending_guest_threads {
+            if self.production_waits.contains_key(&thread.thread_id) {
+                continue;
+            }
+            let tick = match (&thread.wait, thread.state_machine) {
+                (Some(wait), _) => wait.deadline_ticks,
+                (None, GuestThreadState::Waiting | GuestThreadState::AlertableWaiting) => {
+                    Some(thread.wake_tick)
+                }
+                _ => None,
+            };
+            let Some(tick) = tick else { continue };
+            // An already-due tick would make the idle wait return instantly
+            // forever; the readiness pass owns that transition (suspension and
+            // exit gates included).
+            if tick <= now_tick {
+                continue;
+            }
+            let remaining = Duration::from_millis(tick.saturating_sub(now_tick));
+            let candidate = host_now
+                .checked_add(remaining)
+                .unwrap_or_else(|| host_now + Duration::from_secs(24 * 60 * 60));
+            if earliest.is_none_or(|current| candidate < current) {
+                earliest = Some(candidate);
+            }
+        }
+        // Guest `SetTimer` deadlines are cached by user32 (O(1) query), so the
+        // idle pump includes them without scanning the timer table per block.
+        if let Some(timeout) = self.user32.next_timer_timeout() {
+            let candidate = host_now
+                .checked_add(timeout)
+                .unwrap_or_else(|| host_now + Duration::from_secs(24 * 60 * 60));
+            if earliest.is_none_or(|current| candidate < current) {
+                earliest = Some(candidate);
+            }
+        }
+        earliest
     }
 }
 
@@ -957,6 +1268,23 @@ enum CompletionPortPreconsume {
 }
 
 impl PeHostRuntime {
+    /// Re-park a waiter whose completion packet was stolen between the
+    /// readiness pass and the consumption pass.  No guest code ran; the
+    /// enqueue and wake notification keep an idle pump aware of the
+    /// transition.
+    fn repark_stolen_completion_port_wait(
+        &mut self,
+        mut thread: PendingGuestThread,
+    ) -> PumpOutcome {
+        thread.state_machine = GuestThreadState::Waiting;
+        self.pending_guest_threads.push_back(thread);
+        notify_pump_wake();
+        PumpOutcome {
+            did_work: false,
+            process_exit: None,
+        }
+    }
+
     /// Consume a ready completion-port wait before the pump mutates any state
     /// (see [`CompletionPortPreconsume`]).  Never host-blocks: the packet is
     /// taken with a zero-timeout dequeue.
@@ -1019,6 +1347,14 @@ pub(crate) struct PumpedThreadOutcome {
 }
 
 impl PeHostRuntime {
+    /// Enqueue a guest thread that has just become pending and publish the
+    /// scheduler wake.  Runtime-side thread creation goes through this helper
+    /// so an idle cooperative pump cannot miss a newly created thread.
+    pub(crate) fn enqueue_pending_guest_thread(&mut self, thread: PendingGuestThread) {
+        self.pending_guest_threads.push_back(thread);
+        notify_pump_wake();
+    }
+
     /// Copy the subsystem's suspend count (the single source of truth) into
     /// the scheduler's pending-thread record for `thread_handle`.
     ///
@@ -1036,7 +1372,14 @@ impl PeHostRuntime {
         };
         for thread in &mut self.pending_guest_threads {
             if thread.thread_id == thread_id {
+                let changed = thread.suspended != count;
                 thread.suspended = count;
+                if changed {
+                    // A suspended thread becoming runnable is a progress
+                    // transition: wake an idle pump instead of waiting for a
+                    // fallback tick.
+                    notify_pump_wake();
+                }
                 return;
             }
         }
@@ -1108,16 +1451,23 @@ impl PeHostRuntime {
         // with `complete_wait` so their precedence is exact.
         let preconsumed = self.preconsume_completion_port_wait(&pending_thread, memory)?;
         if matches!(preconsumed, CompletionPortPreconsume::Stolen) {
-            pending_thread.state_machine = GuestThreadState::Waiting;
-            self.pending_guest_threads.push_back(pending_thread);
-            return Ok(PumpOutcome {
-                did_work: false,
-                process_exit: None,
-            });
+            return Ok(self.repark_stolen_completion_port_wait(pending_thread));
         }
 
         let previous_thread_id = self.win32.set_current_thread_id(pending_thread.thread_id);
         let previous_teb_base = self.teb_base;
+        // Windows GetLastError/SetLastError are per-thread: the live value is
+        // cached in `self.last_error` while a guest thread runs and parked in
+        // its TEB (x64 +0x68, x86 +0x34) across a scheduler switch.
+        let previous_last_error = self.last_error;
+        if previous_teb_base != 0 {
+            let _ = memory.write_u32(
+                previous_teb_base + teb_last_error_offset(self.guest_arch),
+                previous_last_error,
+            );
+        }
+        let pumped_teb_base = pending_thread.teb_base;
+        let pumped_thread_id = pending_thread.thread_id;
         let previous_tls_vector_ptr = self.tls_vector_ptr;
         let previous_tls_slots = self.tls_slots.clone();
         let previous_fls_slots = self.fls_slots.clone();
@@ -1141,6 +1491,16 @@ impl PeHostRuntime {
         // → dispatch_import chain.
         let result = {
             self.teb_base = pending_thread.teb_base;
+            self.last_error = if pending_thread.teb_base != 0 {
+                memory
+                    .read_u32(pending_thread.teb_base + teb_last_error_offset(self.guest_arch))
+                    .unwrap_or(0)
+            } else {
+                self.fallback_last_errors
+                    .get(&pumped_thread_id)
+                    .copied()
+                    .unwrap_or(0)
+            };
             self.tls_vector_ptr = pending_thread.tls_vector_ptr;
             self.tls_slots = pending_thread.tls_slots.clone();
             self.fls_slots = pending_thread.fls_slots.clone();
@@ -1428,8 +1788,31 @@ impl PeHostRuntime {
         self.yield_pumped_guest_thread_wake_tick = previous_yield_wake_tick;
         self.pumped_thread_exit_requested = previous_exit_request;
         self.pumped_thread_exit_with_detach = previous_exit_detach;
+        let pumped_last_error = self.last_error;
+        if pumped_teb_base != 0 {
+            let _ = memory.write_u32(
+                pumped_teb_base + teb_last_error_offset(self.guest_arch),
+                pumped_last_error,
+            );
+        } else {
+            self.fallback_last_errors
+                .insert(pumped_thread_id, pumped_last_error);
+        }
+        let same_thread = (pumped_teb_base != 0 && pumped_teb_base == previous_teb_base)
+            || pumped_thread_id == previous_thread_id;
         self.win32.set_current_thread_id(previous_thread_id);
         self.teb_base = previous_teb_base;
+        self.last_error = if same_thread {
+            // The pumped thread is the caller's own logical thread (a nested
+            // pump): its newest last error must survive the restoration.
+            pumped_last_error
+        } else if previous_teb_base != 0 {
+            memory
+                .read_u32(previous_teb_base + teb_last_error_offset(self.guest_arch))
+                .unwrap_or(previous_last_error)
+        } else {
+            previous_last_error
+        };
         self.tls_vector_ptr = previous_tls_vector_ptr;
 
         match result {
@@ -1460,6 +1843,7 @@ impl PeHostRuntime {
                 }
                 if let Some(pending_thread) = outcome.requeue {
                     self.pending_guest_threads.push_back(pending_thread);
+                    notify_pump_wake();
                 }
                 Ok(PumpOutcome {
                     did_work: true,
@@ -1747,6 +2131,10 @@ pub(crate) fn notify_object_waiters(id: ObjectId, closed: bool) {
     if let Some(bus) = WAKE_BUS.get() {
         bus.notify_object(id, closed);
     }
+    // A cooperative waiter is not parked on a `ParkSignal`; the pump must
+    // recheck its readiness predicate even when no production waiter is
+    // subscribed.
+    notify_pump_wake();
 }
 
 /// Scheduler hook: wake a thread parked in an alertable wait (APC queued).
@@ -1754,6 +2142,7 @@ pub(crate) fn notify_thread_apc(thread_id: u32) {
     if let Some(bus) = WAKE_BUS.get() {
         bus.notify_thread(thread_id, WaitWakeReason::Apc);
     }
+    notify_pump_wake();
 }
 
 /// Scheduler hook: wake waits on a terminating thread's kernel object.
@@ -1761,6 +2150,7 @@ pub(crate) fn notify_thread_exit(thread_id: u32) {
     if let Some(bus) = WAKE_BUS.get() {
         bus.notify_thread(thread_id, WaitWakeReason::ThreadExit);
     }
+    notify_pump_wake();
 }
 
 #[derive(Debug)]
@@ -1851,6 +2241,8 @@ pub(crate) enum GuestSliceExit {
 pub(crate) struct GuestSliceRequest {
     pub(crate) thread_id: u32,
     pub(crate) state: CpuState,
+    /// Windows thread priority at submission time.
+    pub(crate) priority: i32,
 }
 
 /// Result of executing one guest thread's slice on a production worker.
@@ -1871,6 +2263,7 @@ pub(crate) struct GuestSliceReport {
 /// job completes, so exactly one host thread owns the guest state at a time.
 struct GuestThreadSlot {
     thread_id: u32,
+    priority: i32,
     state: CpuState,
     control: crate::jit::SliceThreadState,
     /// Park signal of the current production wait, retained with the slot so
@@ -1886,6 +2279,7 @@ impl GuestThreadSlot {
     fn new(thread_id: u32, state: CpuState) -> Self {
         Self {
             thread_id,
+            priority: 0,
             state,
             control: crate::jit::SliceThreadState::default(),
             wait: None,
@@ -1899,6 +2293,7 @@ impl GuestThreadSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GuestSlotSnapshot {
     pub(crate) thread_id: u32,
+    pub(crate) priority: i32,
     pub(crate) rip: u64,
     pub(crate) fs_base: u64,
     pub(crate) slices: u64,
@@ -2038,6 +2433,7 @@ impl ProductionScheduler {
         &self,
         thread_id: u32,
         state: CpuState,
+        priority: i32,
         program: Arc<crate::jit::GuestSliceProgram>,
         budget: u64,
         start: Option<Arc<SliceStartGate>>,
@@ -2054,6 +2450,7 @@ impl ProductionScheduler {
             .remove(&thread_id)
             .unwrap_or_else(|| GuestThreadSlot::new(thread_id, state.clone()));
         slot.state = state;
+        slot.priority = priority;
         shared.slice_queue.push_back(GuestSliceJob {
             job_id,
             slot,
@@ -2144,6 +2541,7 @@ impl ProductionScheduler {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         shared.slots.get(&thread_id).map(|slot| GuestSlotSnapshot {
             thread_id: slot.thread_id,
+            priority: slot.priority,
             rip: slot.state.rip,
             fs_base: slot.state.segment_bases.fs,
             slices: slot.slices,
@@ -2206,6 +2604,7 @@ impl ProductionScheduler {
             let id = self.submit_slice(
                 request.thread_id,
                 request.state,
+                request.priority,
                 Arc::clone(&program),
                 budget,
                 start.as_ref().map(Arc::clone),
@@ -2387,6 +2786,11 @@ fn production_worker(shared: Arc<ProductionShared>, worker_index: usize) {
         }
         SCHEDULER_COUNTERS.active_worker_jobs.fetch_sub(1, Relaxed);
         shared.completion_ready.notify_all();
+        // The runtime owner may be blocked on the cooperative pump wake
+        // signal (mixed cooperative/production waits), not on this pool's
+        // completion condvar; completion insertion is a runnable transition
+        // for it too.
+        notify_pump_wake();
     }
 }
 
@@ -2401,6 +2805,9 @@ fn run_guest_slice_job(
     }
     job.slot.worker_index = Some(worker_index);
     job.slot.slices = job.slot.slices.saturating_add(1);
+    // Apply the guest thread's Windows priority as host QoS for the slice;
+    // the guard restores the worker's previous class when it drops.
+    let _qos = GuestQosGuard::apply(job.slot.priority);
     // SAFETY: the blocks belong to this worker program (compiled and
     // finalized by the runtime owner), the slot is removed from the scheduler
     // map for the duration of the job, and the memory view is installed by
@@ -2761,7 +3168,11 @@ impl PeHostRuntime {
             // A block the slice compiler cannot handle is not an error: the
             // ordinary cooperative owner path executes it below.
             if matches!(self.ensure_slice_block(memory, state.rip), Ok(true)) {
-                requests.push(GuestSliceRequest { thread_id, state });
+                requests.push(GuestSliceRequest {
+                    thread_id,
+                    state,
+                    priority: self.win32.thread_priority_by_id(thread_id),
+                });
             }
         }
         if requests.is_empty() {
@@ -2790,6 +3201,7 @@ impl PeHostRuntime {
             thread.state = report.state;
             thread.state_machine = GuestThreadState::Runnable;
             self.pending_guest_threads.push_back(thread);
+            notify_pump_wake();
         }
         Ok(Some(PumpOutcome {
             did_work: true,
@@ -3015,6 +3427,11 @@ impl PeHostRuntime {
         for completion in completions {
             did_work |= self.apply_production_completion(completion, memory)?;
         }
+        if did_work {
+            // Applying a completion re-queues a runnable guest thread; keep
+            // the pump's wake epoch in step with that transition.
+            notify_pump_wake();
+        }
         Ok(did_work)
     }
 
@@ -3048,6 +3465,7 @@ impl PeHostRuntime {
         }
         let Some(wait) = thread.wait.clone() else {
             self.pending_guest_threads.push_back(thread); // coverage: unreachable
+            notify_pump_wake(); // coverage: unreachable
             return Ok(true); // coverage: unreachable
         };
         let resume = match completion.reason {
@@ -3099,11 +3517,13 @@ impl PeHostRuntime {
                     thread.wait = None;
                 }
                 self.pending_guest_threads.push_back(thread);
+                notify_pump_wake();
             }
             None => {
                 thread.state_machine = GuestThreadState::Waiting;
                 self.pending_guest_threads.push_back(thread);
                 let _ = self.start_production_wait(completion.thread_id, &wait);
+                notify_pump_wake();
                 SCHEDULER_COUNTERS
                     .repark_events
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3351,6 +3771,34 @@ mod tests {
             deadline_ticks: None,
             alertable: false,
             operation: WaitOperation::Objects,
+        }
+    }
+
+    /// Minimal synthetic pending record for scheduler deadline tests.  It has
+    /// no wait descriptor, so its only deadline is `wake_tick`.
+    fn synthetic_pending_thread(
+        thread_id: u32,
+        wake_tick: u64,
+        state_machine: GuestThreadState,
+    ) -> PendingGuestThread {
+        PendingGuestThread {
+            handle: thread_id,
+            thread_id,
+            start_address: ENTRY_POINT,
+            parameter: 0,
+            initial_rsp: CONTINUATION_RSP,
+            started: true,
+            suspended: 0,
+            wake_tick,
+            teb_base: 0,
+            tls_vector_ptr: 0,
+            tls_slots: BTreeMap::new(),
+            fls_slots: BTreeMap::new(),
+            state: CpuState::new(GuestArch::X86),
+            state_machine,
+            exit_code_override: None,
+            wait: None,
+            wait_resume: None,
         }
     }
 
@@ -4606,14 +5054,24 @@ mod tests {
             .io_completion_port_state(port)
             .expect("port state");
         assert_eq!(session.runtime.scheduler_mode(), SchedulerMode::Cooperative);
-        park_main_thread(&mut session, cp_wait(port, None));
+        // A long finite deadline makes the fallback path unusable: the pump
+        // can only complete before it if the real port post publishes a wake.
+        let deadline = session
+            .runtime
+            .win32
+            .get_tick_count64()
+            .saturating_add(2_000);
+        park_main_thread(&mut session, cp_wait(port, Some(deadline)));
         let before = SCHEDULER_COUNTERS.snapshot();
+        let started = Instant::now();
         let poster_state = Arc::clone(&port_state);
         let poster = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(20));
             poster_state
                 .post(test_packet(5, 0x7777, 0x8888))
                 .expect("post");
+            // No manual scheduler notification: CompletionPortWaitState::post
+            // must publish the pump wake itself.
         });
         let mut steps = 0_u64;
         let exit_code = session
@@ -4624,11 +5082,646 @@ mod tests {
         assert_eq!(exit_code, 0);
         assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
         assert_eq!(read_u32_guest(&session, BYTES_PTR), 5);
+        // The only runnable transition was the poster's post after its 20 ms
+        // delay; the idle pump must not resume before it, and must not wait for
+        // the 500 ms guest deadline.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(15),
+            "the idle pump resumed before any wake source fired"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_000),
+            "the idle pump waited for the guest deadline instead of the real port post"
+        );
         let after = SCHEDULER_COUNTERS.snapshot();
         assert!(
-            after.poll_iterations > before.poll_iterations,
-            "cooperative mode keeps the 1 ms idle poll (deterministic fallback)"
+            after.poll_iterations == before.poll_iterations,
+            "the cooperative idle pump is event-driven: no 1 ms poll ticks"
         );
+    }
+
+    #[test]
+    fn pump_idle_wait_blocks_until_notified_and_never_returns_early() {
+        let _guard = test_guard();
+        let wake = Arc::new(PumpWake::new());
+        let observed = wake.epoch();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let wake = Arc::clone(&wake);
+            std::thread::spawn(move || {
+                let outcome = wake.wait_until(observed, None);
+                tx.send(outcome).expect("send idle-wait outcome");
+            })
+        };
+        // No notification has been published: the wait must stay blocked.
+        assert!(
+            matches!(
+                rx.recv_timeout(std::time::Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the idle wait returned before any notification"
+        );
+        wake.notify();
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("idle wait must wake after the notification");
+        assert_eq!(
+            outcome,
+            PumpWakeOutcome::Notified {
+                epoch: observed.wrapping_add(1)
+            }
+        );
+        waiter.join().expect("waiter thread");
+    }
+
+    #[test]
+    fn pump_idle_deadline_timeout_returns_exact_timeout_state_not_early() {
+        let _guard = test_guard();
+        let wake = PumpWake::new();
+        let observed = wake.epoch();
+        let deadline = Instant::now() + std::time::Duration::from_millis(40);
+        let outcome = wake.wait_until(observed, Some(deadline));
+        assert_eq!(outcome, PumpWakeOutcome::TimedOut { epoch: observed });
+        assert!(
+            Instant::now() >= deadline,
+            "the deadline wait returned before its exact timeout"
+        );
+    }
+
+    #[test]
+    fn pump_wake_before_wait_has_no_lost_wakeup_race() {
+        let _guard = test_guard();
+        let wake = PumpWake::new();
+        let observed = wake.epoch();
+        // The notification is published before the wait starts: the epoch
+        // predicate must report it immediately instead of blocking until the
+        // fallback deadline.
+        wake.notify();
+        let notified_epoch = observed.wrapping_add(1);
+        assert_eq!(wake.epoch(), notified_epoch);
+        let outcome = wake.wait_until(
+            observed,
+            Some(Instant::now() + std::time::Duration::from_millis(250)),
+        );
+        assert_eq!(
+            outcome,
+            PumpWakeOutcome::Notified {
+                epoch: notified_epoch
+            }
+        );
+    }
+
+    #[test]
+    fn cooperative_pump_driven_deadline_timeout_wakes_at_deadline_with_exact_state() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_resume_code_probe(&mut session);
+        let (event, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert_eq!(session.runtime.scheduler_mode(), SchedulerMode::Cooperative);
+        let deadline = session.runtime.win32.get_tick_count64().saturating_add(25);
+        let mut wait = object_wait(event);
+        wait.deadline_ticks = Some(deadline);
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let started = Instant::now();
+        park_main_thread(&mut session, wait);
+        let mut steps = 0_u64;
+        let exit_code = session
+            .runtime
+            .run_pump_driven(&mut session.memory, &mut steps, 0)
+            .expect("cooperative pump run");
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            read_u32_guest(&session, RESUME_CODE_PTR),
+            crate::win32::WAIT_TIMEOUT,
+            "the timed-out wait resumes with the exact WAIT_TIMEOUT state"
+        );
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert!(
+            session.runtime.win32.get_tick_count64() >= deadline,
+            "the pump resumed before the guest deadline"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(20),
+            "the idle pump woke before its guest deadline"
+        );
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert!(
+            after.poll_iterations == before.poll_iterations,
+            "a cooperative deadline wake must be event-driven, not a 1 ms poll"
+        );
+    }
+
+    #[test]
+    fn win32_completion_port_post_before_idle_wait_has_no_lost_wakeup_race() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create port");
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+
+        let observed = pump_wake().epoch();
+        port_state
+            .post(test_packet(3, 0x11, 0x22))
+            .expect("post packet");
+        let posted_epoch = pump_wake().epoch();
+        assert_ne!(
+            posted_epoch, observed,
+            "a real port post must publish a pump wake"
+        );
+        let outcome = pump_wake().wait_until(
+            observed,
+            Some(Instant::now() + std::time::Duration::from_millis(250)),
+        );
+        match outcome {
+            PumpWakeOutcome::Notified { epoch } => {
+                assert_ne!(
+                    epoch, observed,
+                    "the post-before-wait notification was lost"
+                )
+            }
+            PumpWakeOutcome::TimedOut { .. } => {
+                panic!("the post-before-wait notification was lost")
+            }
+        }
+
+        let observed = pump_wake().epoch();
+        port_state.close();
+        let closed_epoch = pump_wake().epoch();
+        assert_ne!(
+            closed_epoch, observed,
+            "a port close must publish a pump wake"
+        );
+        let outcome = pump_wake().wait_until(
+            observed,
+            Some(Instant::now() + std::time::Duration::from_millis(250)),
+        );
+        match outcome {
+            PumpWakeOutcome::Notified { epoch } => {
+                assert_ne!(
+                    epoch, observed,
+                    "the close-before-wait notification was lost"
+                )
+            }
+            PumpWakeOutcome::TimedOut { .. } => {
+                panic!("the close-before-wait notification was lost")
+            }
+        }
+    }
+
+    #[test]
+    fn cooperative_set_timer_deadline_timeout_wakes_at_expiry_without_early_wake() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let hwnd = 1;
+        let timer_id = 7;
+        assert!(
+            session.runtime.user32.set_timer(hwnd, timer_id, 60, 0),
+            "SetTimer must arm the guest timer"
+        );
+        let deadline = session
+            .runtime
+            .next_cooperative_wake_deadline()
+            .expect("an armed guest timer is a cooperative wake deadline");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining >= std::time::Duration::from_millis(30),
+            "the idle deadline fired early: {remaining:?}"
+        );
+        assert!(
+            remaining <= std::time::Duration::from_millis(120),
+            "the idle deadline missed the timer expiry: {remaining:?}"
+        );
+        // Wait exactly as the idle pump does, tolerating spurious wakeups.
+        while Instant::now() < deadline {
+            let observed = pump_wake().epoch();
+            let _ = pump_wake().wait_until(observed, Some(deadline));
+        }
+        let expired = session.runtime.user32.poll_timers();
+        assert_eq!(expired, vec![(hwnd, timer_id)]);
+        // Win32 `SetTimer` re-arms a positive interval; the poll consumed the
+        // first expiry and the cache must advance to the re-armed deadline.
+        assert_eq!(session.runtime.user32.timer_count(), 1);
+        assert!(
+            session.runtime.user32.next_timer_timeout().is_some(),
+            "the periodic timer must stay armed after the first expiry"
+        );
+        assert!(session.runtime.user32.kill_timer(hwnd, timer_id));
+        assert_eq!(session.runtime.user32.next_timer_timeout(), None);
+    }
+
+    #[test]
+    fn cooperative_pump_run_deadline_notification_wakes_cancellation_immediately() {
+        let _guard = test_guard();
+        struct ResetRunDeadline;
+        impl Drop for ResetRunDeadline {
+            fn drop(&mut self) {
+                crate::runtime::RUN_DEADLINE_EXPIRED
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _reset = ResetRunDeadline;
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let (event, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        // A far-future guest deadline: only the watchdog notification can end
+        // this wait before two real seconds elapse.
+        let deadline = session
+            .runtime
+            .win32
+            .get_tick_count64()
+            .saturating_add(2_000);
+        let mut wait = object_wait(event);
+        wait.deadline_ticks = Some(deadline);
+        park_main_thread(&mut session, wait);
+        let started = Instant::now();
+        let canceller = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            crate::runtime::expire_run_deadline();
+        });
+        let mut steps = 0_u64;
+        let exit_code = session
+            .runtime
+            .run_pump_driven(&mut session.memory, &mut steps, 0)
+            .expect("cooperative pump run");
+        crate::runtime::RUN_DEADLINE_EXPIRED.store(false, std::sync::atomic::Ordering::Release);
+        canceller.join().expect("canceller");
+        assert_eq!(exit_code, -2);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_000),
+            "run-deadline cancellation must wake the blocked pump immediately"
+        );
+    }
+
+    #[test]
+    fn scheduler_deadline_helper_skips_production_and_due_waits_race() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let (event, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 1 }),
+            "production mode must be selectable with no parked waits"
+        );
+        park_main_thread(&mut session, object_wait(event));
+        assert_eq!(session.runtime.production_waits.len(), 1);
+        let now = session.runtime.win32.get_tick_count64();
+        session
+            .runtime
+            .enqueue_pending_guest_thread(synthetic_pending_thread(
+                0xC1,
+                now.saturating_add(200),
+                GuestThreadState::Waiting,
+            ));
+        session
+            .runtime
+            .enqueue_pending_guest_thread(synthetic_pending_thread(
+                0xC2,
+                now,
+                GuestThreadState::Waiting,
+            ));
+        session
+            .runtime
+            .enqueue_pending_guest_thread(synthetic_pending_thread(
+                0xC3,
+                now.saturating_add(9_000),
+                GuestThreadState::Runnable,
+            ));
+        assert_eq!(session.runtime.pending_guest_threads.len(), 4);
+        let deadline = session
+            .runtime
+            .next_cooperative_wake_deadline()
+            .expect("a future cooperative yield is a deadline");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining >= std::time::Duration::from_millis(100),
+            "a production/due wait shortened the deadline: {remaining:?}"
+        );
+        assert!(
+            remaining <= std::time::Duration::from_millis(400),
+            "the future cooperative yield was missed: {remaining:?}"
+        );
+        assert_eq!(
+            session.runtime.scheduler_mode(),
+            SchedulerMode::Production { workers: 1 }
+        );
+    }
+
+    #[test]
+    fn stolen_completion_port_repark_notification_race_is_exact() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 1)
+            .expect("create port");
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+        port_state
+            .post(test_packet(13, 0x13, 0x31))
+            .expect("post packet");
+        let mut thread = synthetic_pending_thread(0xC1, 0, GuestThreadState::Waiting);
+        thread.wait = Some(cp_wait(port, None));
+        session.runtime.enqueue_pending_guest_thread(thread);
+        // A concurrent host consumer drains the packet after the readiness
+        // probe said readable but before the pump's consumption pass.
+        let hook_state = Arc::clone(&port_state);
+        set_readable_probe_hook(move || {
+            let stolen = hook_state
+                .try_dequeue_as(crate::win32::CompletionPortThreadKey::Guest(0xC1), 1)
+                .expect("hook drains the packet");
+            assert_eq!(stolen.len(), 1);
+        });
+        let observed = pump_wake().epoch();
+        let outcome = session
+            .runtime
+            .pump_pending_guest_thread(&mut session.memory)
+            .expect("pump stolen completion port wait");
+        assert_eq!(outcome.did_work, false);
+        assert_eq!(outcome.process_exit, None);
+        assert_eq!(session.runtime.pending_guest_threads.len(), 1);
+        assert_eq!(
+            session.runtime.pending_guest_threads[0].state_machine,
+            GuestThreadState::Waiting
+        );
+        assert_eq!(port_state.queued_packet_count(), 0, "the packet was stolen");
+        assert_eq!(
+            pump_wake().epoch(),
+            observed.wrapping_add(1),
+            "the stolen repark must publish exactly one wake"
+        );
+    }
+
+    #[test]
+    fn scheduler_suspend_resume_notification_race_is_exact() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let handle = session.runtime.win32.create_thread(
+            crate::win32::ThreadPlan {
+                exit_code: None,
+                priority: 0,
+                signaled: false,
+            },
+            false,
+        );
+        let thread_id = session
+            .runtime
+            .win32
+            .thread_id_for_handle(handle)
+            .expect("thread id");
+        session
+            .runtime
+            .enqueue_pending_guest_thread(synthetic_pending_thread(
+                thread_id,
+                0,
+                GuestThreadState::Waiting,
+            ));
+        session
+            .runtime
+            .win32
+            .set_thread_suspend_count(thread_id, 1)
+            .expect("suspend thread");
+        let observed = pump_wake().epoch();
+        session.runtime.sync_pending_thread_suspend_count(handle);
+        assert_eq!(session.runtime.pending_guest_threads[0].suspended, 1);
+        assert_ne!(
+            pump_wake().epoch(),
+            observed,
+            "a suspend-count change must wake an idle pump"
+        );
+        let observed = pump_wake().epoch();
+        session
+            .runtime
+            .win32
+            .set_thread_suspend_count(thread_id, 0)
+            .expect("resume thread");
+        session.runtime.sync_pending_thread_suspend_count(handle);
+        assert_eq!(session.runtime.pending_guest_threads[0].suspended, 0);
+        assert_ne!(
+            pump_wake().epoch(),
+            observed,
+            "a resume transition must wake an idle pump"
+        );
+        let observed = pump_wake().epoch();
+        session.runtime.sync_pending_thread_suspend_count(handle);
+        assert_eq!(
+            pump_wake().epoch(),
+            observed,
+            "an unchanged suspend count must not publish a wake"
+        );
+    }
+
+    #[test]
+    fn scheduler_teb_last_error_switch_race_restores_exact_value() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let teb_main = 0x62_000_u64;
+        let teb_pumped = 0x64_000_u64;
+        session.map_guest(teb_main, &[0_u8; 0x1000]);
+        session.map_guest(teb_pumped, &[0_u8; 0x1000]);
+        session.runtime.teb_base = teb_main;
+        session.runtime.last_error = 0x1234;
+        let mut thread = synthetic_pending_thread(0xC1, 0, GuestThreadState::Runnable);
+        thread.teb_base = teb_pumped;
+        thread.state.rip = ENTRY_POINT;
+        thread.state.set(Register::Rsp, CONTINUATION_RSP);
+        thread.state.segment_bases.fs = teb_pumped;
+        session.runtime.enqueue_pending_guest_thread(thread);
+        assert!(pump_once(&mut session), "the TEB-bearing thread ran");
+        assert_eq!(read_u32_guest(&session, FLAG_PTR), 1);
+        assert_eq!(
+            read_u32_guest(&session, teb_main + teb_last_error_offset(GuestArch::X86)),
+            0x1234,
+            "the outgoing thread's last error was not parked in its TEB"
+        );
+        assert_eq!(
+            session.runtime.last_error, 0x1234,
+            "the incoming thread's last error was not restored from its TEB"
+        );
+    }
+
+    #[test]
+    fn win32_completion_port_post_and_close_wake_real_waiter_and_pump_race() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 1)
+            .expect("create port");
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+        let waiter_state = Arc::clone(&port_state);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            ready_tx.send(()).expect("waiter ready");
+            waiter_state.wait_dequeue(Some(std::time::Duration::from_secs(2)), 1)
+        });
+        ready_rx.recv().expect("waiter startup");
+        let observed = pump_wake().epoch();
+        port_state
+            .post(test_packet(6, 0x66, 0x6))
+            .expect("post packet");
+        assert_ne!(
+            pump_wake().epoch(),
+            observed,
+            "a post with a blocked port waiter must still wake the pump"
+        );
+        let packets = waiter.join().expect("waiter").expect("packet");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].bytes_transferred, 6);
+
+        let port2 = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 1)
+            .expect("create second port");
+        let port2_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port2)
+            .expect("second port state");
+        let waiter2_state = Arc::clone(&port2_state);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let waiter2 = std::thread::spawn(move || {
+            ready_tx.send(()).expect("waiter ready");
+            waiter2_state.wait_dequeue(None, 1)
+        });
+        ready_rx.recv().expect("waiter startup");
+        let observed = pump_wake().epoch();
+        port2_state.close();
+        assert_ne!(
+            pump_wake().epoch(),
+            observed,
+            "a close with a blocked port waiter must still wake the pump"
+        );
+        let closed = waiter2.join().expect("waiter");
+        assert!(
+            matches!(closed, Err(crate::win32::CompletionPortWaitError::Closed)),
+            "the blocked waiter must observe Closed"
+        );
+    }
+
+    #[test]
+    fn win32_completion_port_release_active_and_set_concurrency_notification_race() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        let port = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 1)
+            .expect("create port");
+        let port_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port)
+            .expect("port state");
+        let thread_a = crate::win32::CompletionPortThreadKey::Guest(0xA1);
+        let thread_b = crate::win32::CompletionPortThreadKey::Guest(0xB2);
+        let thread_c = crate::win32::CompletionPortThreadKey::Guest(0xC3);
+
+        port_state.post(test_packet(1, 0x11, 0x1)).expect("post a");
+        let packet_a = port_state.try_dequeue_as(thread_a, 1).expect("dequeue a");
+        assert_eq!(packet_a.len(), 1);
+        port_state.post(test_packet(2, 0x22, 0x2)).expect("post b");
+        assert_eq!(
+            port_state.readable_for(thread_b),
+            false,
+            "the only concurrency slot is held by thread a"
+        );
+
+        let observed = pump_wake().epoch();
+        port_state.release_active_as(thread_a);
+        assert_ne!(
+            pump_wake().epoch(),
+            observed,
+            "releasing the active slot must wake the pump"
+        );
+        assert_eq!(port_state.readable_for(thread_b), true);
+        let packet_b = port_state.try_dequeue_as(thread_b, 1).expect("dequeue b");
+        assert_eq!(packet_b.len(), 1);
+        assert_eq!(packet_b[0].bytes_transferred, 2);
+
+        port_state.post(test_packet(3, 0x33, 0x3)).expect("post c");
+        let observed = pump_wake().epoch();
+        port_state.set_concurrency(2);
+        assert_ne!(
+            pump_wake().epoch(),
+            observed,
+            "raising concurrency must wake the pump"
+        );
+        assert_eq!(port_state.readable_for(thread_c), true);
+        let packet_c = port_state.try_dequeue_as(thread_c, 1).expect("dequeue c");
+        assert_eq!(packet_c.len(), 1);
+        assert_eq!(packet_c[0].bytes_transferred, 3);
+
+        // A real blocked port waiter exercises the waiters>0 branch in
+        // set_concurrency: the queued packet becomes eligible when the limit
+        // is raised, so both the port condvar and the pump must be woken.
+        let port2 = session
+            .runtime
+            .win32
+            .create_io_completion_port(None, None, 0, 1)
+            .expect("create waiter port");
+        let port2_state = session
+            .runtime
+            .win32
+            .io_completion_port_state(port2)
+            .expect("waiter port state");
+        let thread_d = crate::win32::CompletionPortThreadKey::Guest(0xD4);
+        port2_state.post(test_packet(4, 0x44, 0x4)).expect("post d");
+        let packet_d = port2_state.try_dequeue_as(thread_d, 1).expect("dequeue d");
+        assert_eq!(packet_d.len(), 1);
+        let waiter_state = Arc::clone(&port2_state);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            ready_tx.send(()).expect("waiter ready");
+            waiter_state.wait_dequeue(Some(std::time::Duration::from_secs(2)), 1)
+        });
+        ready_rx.recv().expect("waiter startup");
+        let waiter_deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while port2_state.waiter_count() == 0 {
+            assert!(
+                Instant::now() < waiter_deadline,
+                "the port waiter never registered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        port2_state.post(test_packet(5, 0x55, 0x5)).expect("post e");
+        let observed = pump_wake().epoch();
+        port2_state.set_concurrency(2);
+        assert_ne!(
+            pump_wake().epoch(),
+            observed,
+            "raising concurrency with a blocked waiter must wake the pump"
+        );
+        let packets = waiter.join().expect("waiter").expect("waiter packet");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].bytes_transferred, 5);
     }
 
     #[test]
@@ -5065,6 +6158,7 @@ mod tests {
             .iter()
             .map(|thread| GuestSliceRequest {
                 thread_id: thread.thread_id,
+                priority: 0,
                 state: thread.state.clone(),
             })
             .collect::<Vec<_>>();
@@ -5159,6 +6253,7 @@ mod tests {
             let before = trace_calls(&session, "time", "GetTickCount64");
             let request = GuestSliceRequest {
                 thread_id: 0xB1,
+                priority: 0,
                 state: session.runtime.pending_guest_threads[0].state.clone(),
             };
             let reports = session
@@ -5242,6 +6337,7 @@ mod tests {
         );
         let request = GuestSliceRequest {
             thread_id: 0xC2,
+            priority: 0,
             state: production.runtime.pending_guest_threads[0].state.clone(),
         };
         let reports = production
@@ -5373,6 +6469,7 @@ mod tests {
         );
         let request = GuestSliceRequest {
             thread_id: 0xD11,
+            priority: 0,
             state: production.runtime.pending_guest_threads[0].state.clone(),
         };
         let reports = production
@@ -5460,6 +6557,7 @@ mod tests {
         for round in 1..=3_u64 {
             let request = GuestSliceRequest {
                 thread_id: 0xD12,
+                priority: 0,
                 state: state.clone(),
             };
             let reports = session
@@ -5577,7 +6675,7 @@ mod tests {
             .production_scheduler
             .as_ref()
             .expect("production scheduler");
-        let _job = scheduler.submit_slice(0xD1, state, program, u64::MAX, None);
+        let _job = scheduler.submit_slice(0xD1, state, 0, program, u64::MAX, None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while scheduler.active_job_count() == 0 {
             assert!(std::time::Instant::now() < deadline);
@@ -5696,6 +6794,7 @@ mod tests {
         );
         let request = GuestSliceRequest {
             thread_id: 0x1F1,
+            priority: 0,
             state: session.runtime.pending_guest_threads[0].state.clone(),
         };
         let reports = session
@@ -5817,6 +6916,7 @@ mod tests {
         let reports = scheduler.run_guest_slices(
             vec![GuestSliceRequest {
                 thread_id: 0x5A,
+                priority: 0,
                 state,
             }],
             program,
@@ -5853,6 +6953,7 @@ mod tests {
         let reports = scheduler.run_guest_slices(
             vec![GuestSliceRequest {
                 thread_id: 0x5B,
+                priority: 0,
                 state,
             }],
             program,
@@ -5918,6 +7019,7 @@ mod tests {
         );
         let request = GuestSliceRequest {
             thread_id: 0x6A,
+            priority: 0,
             state: CpuState::new(GuestArch::X86),
         };
         let no_pool = session
@@ -5950,6 +7052,7 @@ mod tests {
         );
         let request = GuestSliceRequest {
             thread_id: 0x77,
+            priority: 0,
             state: session.runtime.pending_guest_threads[0].state.clone(),
         };
         let reports = session
@@ -5995,6 +7098,7 @@ mod tests {
         crate::jit::JIT_SAFEPOINT_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
         let request = GuestSliceRequest {
             thread_id: 0x78,
+            priority: 0,
             state: session.runtime.pending_guest_threads[0].state.clone(),
         };
         let reports = session
@@ -6143,6 +7247,7 @@ mod tests {
         );
         let request = GuestSliceRequest {
             thread_id: 0x7B,
+            priority: 0,
             state: session.runtime.pending_guest_threads[0].state.clone(),
         };
         let reports = session
@@ -6605,6 +7710,132 @@ mod tests {
                 SCHEDULER_COUNTERS.snapshot().guest_thread_switches,
                 before.guest_thread_switches,
                 "the yield must count as one guest-thread switch"
+            );
+        });
+    }
+
+    #[test]
+    fn guest_threads_keep_independent_last_errors_across_switches() {
+        assert_eq!(teb_last_error_offset(GuestArch::X64), 0x68);
+        assert_eq!(teb_last_error_offset(GuestArch::X86), 0x34);
+        with_big_stack(|| {
+            let _guard = test_guard();
+            let (_temp_dir, mut session) = test_session();
+            let thunk = session.alloc_thunk(HostThunk::SetLastError);
+            session.map_guest(SLICE_THUNK_SLOT, &(thunk as u32).to_le_bytes());
+            let code = |value: u32| {
+                let mut bytes = vec![0x68];
+                bytes.extend_from_slice(&value.to_le_bytes());
+                bytes.extend_from_slice(&[0xFF, 0x15]);
+                bytes.extend_from_slice(&(SLICE_THUNK_SLOT as u32).to_le_bytes());
+                bytes.extend_from_slice(&[0x83, 0xC4, 0x04, 0xC3]);
+                bytes
+            };
+            session.map_guest(SLICE_CODE, &code(111));
+            session.map_guest(SLICE_CODE_2, &code(222));
+            let teb_a = 0x62_000_u64;
+            let teb_b = 0x64_000_u64;
+            session.map_guest(teb_a, &[0_u8; 0x1000]);
+            session.map_guest(teb_b, &[0_u8; 0x1000]);
+            for (handle, thread_id, rip, rsp, teb) in [
+                (0x500, 0xC1, SLICE_CODE, SLICE_STACK_A, teb_a),
+                (0x501, 0xC2, SLICE_CODE_2, SLICE_STACK_B, teb_b),
+            ] {
+                let mut state = CpuState::new(GuestArch::X86);
+                state.rip = rip;
+                state.set(Register::Rsp, rsp);
+                state.segment_bases.fs = teb;
+                session
+                    .runtime
+                    .pending_guest_threads
+                    .push_back(PendingGuestThread {
+                        handle,
+                        thread_id,
+                        start_address: rip,
+                        parameter: 0,
+                        initial_rsp: rsp,
+                        started: true,
+                        suspended: 0,
+                        wake_tick: 0,
+                        teb_base: teb,
+                        tls_vector_ptr: 0,
+                        tls_slots: BTreeMap::new(),
+                        fls_slots: BTreeMap::new(),
+                        state,
+                        state_machine: GuestThreadState::Runnable,
+                        exit_code_override: None,
+                        wait: None,
+                        wait_resume: None,
+                    });
+            }
+            assert!(pump_once(&mut session), "thread A ran");
+            assert_eq!(
+                read_u32_guest(&session, teb_a + 0x34),
+                111,
+                "thread A's last error is parked in its own TEB"
+            );
+            assert!(pump_once(&mut session), "thread B ran");
+            assert_eq!(
+                read_u32_guest(&session, teb_b + 0x34),
+                222,
+                "thread B's last error is independent"
+            );
+            assert_eq!(
+                read_u32_guest(&session, teb_a + 0x34),
+                111,
+                "thread A's TEB was not overwritten by B"
+            );
+            assert_eq!(
+                session.runtime.last_error, 0,
+                "the scheduler restores the caller's last error"
+            );
+        });
+    }
+
+    #[test]
+    fn guest_qos_guard_applies_and_restores_the_worker_class() {
+        with_big_stack(|| {
+            let read_class = || {
+                let mut class = 0_u32;
+                let mut relative = 0_i32;
+                // SAFETY: both out pointers are valid for the calling thread.
+                unsafe {
+                    pthread_get_qos_class_np(
+                        libc::pthread_self() as *mut libc::c_void,
+                        &raw mut class,
+                        &raw mut relative,
+                    );
+                }
+                class
+            };
+            assert_eq!(
+                qos_class_for_windows_priority(15),
+                QOS_CLASS_USER_INTERACTIVE
+            );
+            assert_eq!(qos_class_for_windows_priority(2), QOS_CLASS_USER_INITIATED);
+            assert_eq!(qos_class_for_windows_priority(1), QOS_CLASS_DEFAULT);
+            assert_eq!(qos_class_for_windows_priority(0), QOS_CLASS_DEFAULT);
+            assert_eq!(qos_class_for_windows_priority(-1), QOS_CLASS_UTILITY);
+            assert_eq!(qos_class_for_windows_priority(-2), QOS_CLASS_UTILITY);
+            assert_eq!(qos_class_for_windows_priority(-15), QOS_CLASS_BACKGROUND);
+            assert_eq!(
+                qos_class_for_windows_priority(99),
+                QOS_CLASS_USER_INTERACTIVE
+            );
+            assert_eq!(qos_class_for_windows_priority(-99), QOS_CLASS_BACKGROUND);
+            let before = read_class();
+            {
+                let _guard = GuestQosGuard::apply(15);
+                assert_eq!(
+                    read_class(),
+                    QOS_CLASS_USER_INTERACTIVE,
+                    "time-critical work runs at user-interactive QoS"
+                );
+            }
+            assert_eq!(
+                read_class(),
+                before,
+                "dropping the guard restores the worker's class"
             );
         });
     }

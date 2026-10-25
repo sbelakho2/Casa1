@@ -29,8 +29,10 @@ mod support;
 use casa1::cpu::GuestArch;
 use casa1::ge::{GameEnvironment, GeArch};
 use casa1::ntdll::{
-    NtStatus, STATUS_ACCESS_DENIED, STATUS_SUCCESS, STATUS_TIMEOUT, STATUS_WAIT_0,
-    dos_error_to_nt_status, nt_status_to_dos_error,
+    NtStatus, STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH,
+    STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_OBJECT_NAME_INVALID,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_TYPE_MISMATCH, STATUS_SUCCESS, STATUS_TIMEOUT,
+    STATUS_WAIT_0, dos_error_to_nt_status, nt_status_to_dos_error,
 };
 use casa1::pe_runtime::{HostThunk, NtThunkSession};
 use casa1::vm::{VmProtection, VmState};
@@ -1116,6 +1118,146 @@ fn system_time_and_timer_resolution_domains_are_consistent() {
             assert!(
                 ms < 10_000_000,
                 "timeGetTime is a milliseconds-since-start counter"
+            );
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
+}
+
+// ── 14. Directory objects, volume facts, attestation (dispatch failures) ──
+
+fn write_object_attributes(session: &mut NtThunkSession, attrs: u64, name: u64) {
+    let mut bytes = [0_u8; 48];
+    bytes[0..4].copy_from_slice(&48_u32.to_le_bytes());
+    bytes[16..24].copy_from_slice(&name.to_le_bytes());
+    session.map_guest(attrs, &bytes);
+}
+
+fn write_unicode_name(session: &mut NtThunkSession, header: u64, buffer: u64, text: &str) {
+    let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut header_bytes = [0_u8; 16];
+    header_bytes[0..2].copy_from_slice(&(((units.len() - 1) * 2) as u16).to_le_bytes());
+    header_bytes[2..4].copy_from_slice(&((units.len() * 2) as u16).to_le_bytes());
+    header_bytes[8..16].copy_from_slice(&buffer.to_le_bytes());
+    session.map_guest(header, &header_bytes);
+    let mut string_bytes = vec![0_u8; units.len() * 2];
+    for (index, unit) in units.iter().enumerate() {
+        string_bytes[index * 2..index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    session.map_guest(buffer, &string_bytes);
+}
+
+#[test]
+fn directory_objects_reject_missing_paths_and_undersized_query_buffers() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (_tmp, mut session) = setup_session();
+            let open = session.alloc_thunk(HostThunk::NtOpenDirectoryObject);
+            let query = session.alloc_thunk(HostThunk::NtQueryDirectoryObject);
+
+            // No OBJECT_ATTRIBUTES name means no directory to open.
+            let handle_out = 0x30_100_u64;
+            session.map_guest(handle_out, &[0_u8; 8]);
+            assert_eq!(
+                NtStatus::from_raw(session.call(open, &[handle_out, 0, 0]) as u32),
+                casa1::ntdll::STATUS_OBJECT_NAME_INVALID
+            );
+
+            // A missing child of the existing \Device directory is
+            // NAME_NOT_FOUND, never a fabricated handle.
+            let attrs = 0x30_200_u64;
+            let name_header = 0x30_300_u64;
+            let name_buffer = 0x30_400_u64;
+            write_unicode_name(
+                &mut session,
+                name_header,
+                name_buffer,
+                "\\Device\\Casa1MissingDevice",
+            );
+            write_object_attributes(&mut session, attrs, name_header);
+            assert_eq!(
+                NtStatus::from_raw(session.call(open, &[handle_out, 0, attrs]) as u32),
+                STATUS_OBJECT_NAME_NOT_FOUND
+            );
+            assert_eq!(
+                read_u64(&session.read_guest(handle_out, 8), 0),
+                0,
+                "a failed open must not write a handle"
+            );
+
+            // Root enumeration with a too-small buffer reports the exact
+            // required size and does not emit a partial record.
+            write_unicode_name(&mut session, name_header, name_buffer, "\\");
+            assert_eq!(
+                NtStatus::from_raw(session.call(open, &[handle_out, 0, attrs]) as u32),
+                STATUS_SUCCESS
+            );
+            let root = read_u64(&session.read_guest(handle_out, 8), 0);
+            assert_ne!(root, 0);
+            let context = 0x40_000_u64;
+            let required = 0x40_010_u64;
+            session.map_guest(context, &0_u32.to_le_bytes());
+            session.map_guest(required, &0_u32.to_le_bytes());
+            assert_eq!(
+                NtStatus::from_raw(
+                    session.call(query, &[root, 0x50_000, 8, 1, 0, context, required]) as u32
+                ),
+                STATUS_BUFFER_TOO_SMALL
+            );
+            assert!(
+                read_u32(&session.read_guest(required, 4), 0) > 8,
+                "required size must exceed the caller buffer"
+            );
+
+            // An unknown handle is INVALID_HANDLE, before any buffer check.
+            assert_eq!(
+                NtStatus::from_raw(
+                    session.call(query, &[0xDEAD, 0x50_000, 0x100, 0, 1, 0, 0]) as u32
+                ),
+                STATUS_INVALID_HANDLE
+            );
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
+}
+
+#[test]
+fn volume_query_rejects_null_io_status_and_non_file_handles() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (_tmp, mut session) = setup_session();
+            let query = session.alloc_thunk(HostThunk::NtQueryVolumeInformationFile);
+            let io_status = 0x30_000_u64;
+            session.map_guest(io_status, &[0_u8; 16]);
+
+            assert_eq!(
+                NtStatus::from_raw(session.call(query, &[0xDEAD, 0, 0, 0, 1]) as u32),
+                STATUS_INVALID_PARAMETER,
+                "a null IoStatusBlock is rejected before handle lookup"
+            );
+
+            assert_eq!(
+                NtStatus::from_raw(session.call(query, &[0xDEAD, io_status, 0, 0, 1]) as u32),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                read_u32(&session.read_guest(io_status, 4), 0),
+                STATUS_INVALID_HANDLE.raw()
+            );
+
+            // An event handle is a real object of the wrong type.
+            let create_event = session.alloc_thunk(HostThunk::CreateEventW);
+            let event = session.call(create_event, &[0, 0, 0, 0]) as u32;
+            assert_ne!(event, 0);
+            assert_eq!(
+                NtStatus::from_raw(
+                    session.call(query, &[u64::from(event), io_status, 0, 0, 1]) as u32
+                ),
+                STATUS_OBJECT_TYPE_MISMATCH
             );
         })
         .expect("spawn big-stack thread")

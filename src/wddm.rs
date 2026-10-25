@@ -40,6 +40,12 @@ pub const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 /// STATUS_INVALID_DEVICE_STATE (an adapter power/PnP transition is illegal).
 pub const STATUS_INVALID_DEVICE_STATE: u32 = 0xC000_0184;
+/// `STATUS_NOT_FOUND`.
+pub const STATUS_NOT_FOUND: u32 = 0xC000_0225;
+/// GPU virtual addresses are allocated in 4 KiB pages.
+pub const GPU_PAGE_SIZE: u64 = 0x1000;
+/// Base of the GPU virtual address space handed to the guest.
+pub const GPU_VA_BASE: u64 = 0x1_0000_0000;
 /// STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER.
 pub const STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER: u32 = 0xC01E_0002;
 /// STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE.
@@ -426,6 +432,84 @@ pub struct RenderResult {
     pub effective_priority: u32,
 }
 
+/// `D3DKMTMapGpuVirtualAddress` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapGpuVirtualAddressRequest {
+    /// Device that owns the allocation.
+    pub device: DeviceHandle,
+    /// Allocation to map.
+    pub allocation: AllocationHandle,
+    /// Requested start address, or zero to let VidMm choose one.
+    pub virtual_address: u64,
+    /// Mapped range length (a 4 KiB multiple, at most the allocation size).
+    pub size: u64,
+}
+
+/// One live GPU virtual address range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuVirtualAddressInfo {
+    /// Range start.
+    pub virtual_address: u64,
+    /// Range length.
+    pub size: u64,
+    /// Allocation mapped at the range.
+    pub allocation: AllocationHandle,
+}
+
+/// `D3DKMTSubmitCommand` request (VidSch submission).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitCommandRequest {
+    /// Device owning the context and allocations.
+    pub device: DeviceHandle,
+    /// Context the command is submitted on.
+    pub context: ContextHandle,
+    /// Resident allocations referenced by the submission.
+    pub allocations: Vec<AllocationHandle>,
+    /// Fill byte applied by the real Metal blit backing the submission.
+    pub fill_value: u8,
+    /// Optional completion fence.
+    pub fence: Option<(SyncObjectHandle, u64)>,
+}
+
+/// `D3DKMTSubmitCommand` completion state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitCommandResult {
+    /// Context that submitted the command.
+    pub context_id: u64,
+    /// Bytes filled on the GPU.
+    pub bytes_filled: u64,
+    /// Signed fence value (zero without a fence).
+    pub fence_value: u64,
+    /// Effective scheduling priority.
+    pub effective_priority: u32,
+    /// VidSch submission sequence for the context.
+    pub submission_id: u64,
+}
+
+/// Per-segment VidMm budget accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentBudgetInfo {
+    /// Segment identity.
+    pub segment: SegmentId,
+    /// Real segment budget in bytes.
+    pub budget: u64,
+    /// Resident bytes charged to the segment.
+    pub used: u64,
+}
+
+/// `D3DKMTQueryVideoMemoryInfo` snapshot (VidMm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoMemoryInfo {
+    /// Per-segment budgets and usage.
+    pub segments: Vec<SegmentBudgetInfo>,
+    /// Sum of segment budgets.
+    pub budget: u64,
+    /// Sum of resident bytes.
+    pub usage: u64,
+    /// `budget - usage`.
+    pub available: u64,
+}
+
 /// A display mode reported by `D3DKMTGetDisplayModeList`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DisplayModeInfo {
@@ -669,11 +753,20 @@ struct SegmentRecord {
     used: u64,
 }
 
+struct GpuVaMapping {
+    device_object: u64,
+    size: u64,
+    allocation: AllocationHandle,
+}
+
 struct AdapterRecord {
     info: WddmAdapterInfo,
     device: metal::Device,
     segments: Vec<SegmentRecord>,
     device_objects: BTreeSet<u64>,
+    gpu_address_ranges: BTreeMap<u64, GpuVaMapping>,
+    next_gpu_address: u64,
+    paging_fence: u64,
     private_driver_formats: BTreeMap<u32, u32>,
     gamma_ramps: BTreeMap<u32, GammaRamp>,
     cursors: BTreeMap<u32, WddmCursorState>,
@@ -720,6 +813,7 @@ struct ContextRecord {
     context_id: u64,
     submit_count: u64,
     submit_bytes: u64,
+    submission_sequence: u64,
 }
 
 struct KeyedMutexState {
@@ -874,6 +968,9 @@ impl WddmSubsystem {
                         },
                     ],
                     device_objects: BTreeSet::new(),
+                    gpu_address_ranges: BTreeMap::new(),
+                    next_gpu_address: GPU_VA_BASE,
+                    paging_fence: 0,
                     private_driver_formats: BTreeMap::new(),
                     gamma_ramps: BTreeMap::new(),
                     cursors: BTreeMap::new(),
@@ -1657,10 +1754,331 @@ impl WddmSubsystem {
                 let _ = self.backend().destroy_swapchain(record.gfx_swapchain);
             }
         }
-        if let Some(adapter) = state.adapters.get_mut(&object.adapter_id) {
-            adapter.device_objects.remove(&object_id);
-        }
+        let adapter = state
+            .adapters
+            .get_mut(&object.adapter_id)
+            .expect("adapter present for live device");
+        adapter.device_objects.remove(&object_id);
+        adapter
+            .gpu_address_ranges
+            .retain(|_, mapping| mapping.device_object != object_id);
         Ok(())
+    }
+
+    /// `D3DKMTMapGpuVirtualAddress`: map an allocation into the adapter's GPU
+    /// virtual address space.  The range is page-granular, cannot exceed the
+    /// allocation, and cannot overlap a live mapping.
+    pub fn d3dkmt_map_gpu_virtual_address(
+        &self,
+        request: MapGpuVirtualAddressRequest,
+    ) -> WddmResult<u64> {
+        if request.size == 0 || request.size % GPU_PAGE_SIZE != 0 {
+            return failed(
+                STATUS_INVALID_PARAMETER,
+                "GPU virtual address size must be a non-zero 4 KiB multiple",
+            );
+        }
+        if request.virtual_address != 0 && request.virtual_address % GPU_PAGE_SIZE != 0 {
+            return failed(
+                STATUS_INVALID_PARAMETER,
+                "GPU virtual address is not 4 KiB aligned",
+            );
+        }
+        let mut state = self.state();
+        let object_id = require_device(&state, request.device)?;
+        let reference = state.allocations.get(&request.allocation).ok_or_else(|| {
+            WddmError::new(
+                STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE,
+                "unknown GPU virtual address allocation",
+            )
+        })?;
+        if reference.device_object != object_id {
+            return failed(
+                STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE,
+                "GPU virtual address allocation belongs to another device",
+            );
+        }
+        let allocation_id = reference.object;
+        let allocation_size = state
+            .allocation_objects
+            .get(&allocation_id)
+            .expect("allocation object present for live handle")
+            .size;
+        if request.size > allocation_size {
+            return failed(
+                STATUS_INVALID_PARAMETER,
+                "GPU virtual address range exceeds the allocation",
+            );
+        }
+        let adapter_id = state
+            .device_objects
+            .get(&object_id)
+            .expect("device object present for live handle")
+            .adapter_id;
+        let adapter = state
+            .adapters
+            .get_mut(&adapter_id)
+            .expect("adapter present for live device");
+        let start = if request.virtual_address == 0 {
+            let mut start = align_up_u64(adapter.next_gpu_address, GPU_PAGE_SIZE);
+            loop {
+                let end = match start.checked_add(request.size) {
+                    Some(end) => end,
+                    None => {
+                        return failed(
+                            STATUS_INVALID_PARAMETER,
+                            "GPU virtual address space exhausted",
+                        );
+                    }
+                };
+                let overlaps = adapter.gpu_address_ranges.iter().any(|(base, mapping)| {
+                    start < base.saturating_add(mapping.size) && end > *base
+                });
+                if !overlaps {
+                    adapter.next_gpu_address = end;
+                    break start;
+                }
+                start = start.saturating_add(GPU_PAGE_SIZE);
+            }
+        } else {
+            request.virtual_address
+        };
+        let end = start.checked_add(request.size).ok_or_else(|| {
+            WddmError::new(STATUS_INVALID_PARAMETER, "GPU virtual address overflow")
+        })?;
+        if adapter
+            .gpu_address_ranges
+            .iter()
+            .any(|(base, mapping)| start < base.saturating_add(mapping.size) && end > *base)
+        {
+            return failed(
+                STATUS_OBJECT_NAME_COLLISION,
+                "GPU virtual address range overlaps a live mapping",
+            );
+        }
+        adapter.gpu_address_ranges.insert(
+            start,
+            GpuVaMapping {
+                device_object: object_id,
+                size: request.size,
+                allocation: request.allocation,
+            },
+        );
+        Ok(start)
+    }
+
+    /// `D3DKMTUnmapGpuVirtualAddress`: remove a live mapping owned by the
+    /// device.
+    pub fn d3dkmt_unmap_gpu_virtual_address(
+        &self,
+        device: DeviceHandle,
+        virtual_address: u64,
+    ) -> WddmResult<()> {
+        let mut state = self.state();
+        let object_id = require_device(&state, device)?;
+        let adapter_id = state
+            .device_objects
+            .get(&object_id)
+            .expect("device object present for live handle")
+            .adapter_id;
+        let adapter = state
+            .adapters
+            .get_mut(&adapter_id)
+            .expect("adapter present for live device");
+        let Some(mapping) = adapter.gpu_address_ranges.get(&virtual_address) else {
+            return failed(STATUS_NOT_FOUND, "GPU virtual address is not mapped");
+        };
+        if mapping.device_object != object_id {
+            return failed(
+                STATUS_INVALID_PARAMETER,
+                "GPU virtual address belongs to another device",
+            );
+        }
+        adapter.gpu_address_ranges.remove(&virtual_address);
+        Ok(())
+    }
+
+    /// Look up the allocation mapped at a GPU virtual address.
+    pub fn gpu_virtual_address_info(
+        &self,
+        device: DeviceHandle,
+        virtual_address: u64,
+    ) -> WddmResult<GpuVirtualAddressInfo> {
+        let state = self.state();
+        let object_id = require_device(&state, device)?;
+        let adapter_id = state
+            .device_objects
+            .get(&object_id)
+            .expect("device object present for live handle")
+            .adapter_id;
+        let adapter = state
+            .adapters
+            .get(&adapter_id)
+            .expect("adapter present for live device");
+        let Some(mapping) = adapter.gpu_address_ranges.get(&virtual_address) else {
+            return failed(STATUS_NOT_FOUND, "GPU virtual address is not mapped");
+        };
+        if mapping.device_object != object_id {
+            return failed(
+                STATUS_INVALID_PARAMETER,
+                "GPU virtual address belongs to another device",
+            );
+        }
+        Ok(GpuVirtualAddressInfo {
+            virtual_address,
+            size: mapping.size,
+            allocation: mapping.allocation,
+        })
+    }
+
+    /// `D3DKMTQueryVideoMemoryInfo`: VidMm segment budgets and real resident
+    /// usage.
+    pub fn d3dkmt_query_video_memory_info(
+        &self,
+        device: DeviceHandle,
+    ) -> WddmResult<VideoMemoryInfo> {
+        let state = self.state();
+        let object_id = require_device(&state, device)?;
+        let adapter_id = state
+            .device_objects
+            .get(&object_id)
+            .expect("device object present for live handle")
+            .adapter_id;
+        let adapter = state
+            .adapters
+            .get(&adapter_id)
+            .expect("adapter present for live device");
+        let segments = adapter
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(index, segment)| SegmentBudgetInfo {
+                segment: SegmentId(index as u32),
+                budget: segment.budget,
+                used: segment.used,
+            })
+            .collect::<Vec<_>>();
+        let budget = segments.iter().map(|segment| segment.budget).sum();
+        let usage = segments.iter().map(|segment| segment.used).sum();
+        Ok(VideoMemoryInfo {
+            segments,
+            budget,
+            usage,
+            available: budget.saturating_sub(usage),
+        })
+    }
+
+    /// VidMm paging fence for the adapter.  The fence advances on the first
+    /// residency charge and on the final eviction, exactly when the paging
+    /// engine would have to touch the allocation.
+    pub fn d3dkmt_paging_fence(&self, device: DeviceHandle) -> WddmResult<u64> {
+        let state = self.state();
+        let object_id = require_device(&state, device)?;
+        let adapter_id = state
+            .device_objects
+            .get(&object_id)
+            .expect("device object present for live handle")
+            .adapter_id;
+        Ok(state
+            .adapters
+            .get(&adapter_id)
+            .expect("adapter present for live device")
+            .paging_fence)
+    }
+
+    /// `D3DKMTSubmitCommand`: a VidSch submission.  Every referenced
+    /// allocation must already be resident, and the real Metal blit is shared
+    /// with the render path.
+    pub fn d3dkmt_submit_command(
+        &self,
+        request: SubmitCommandRequest,
+    ) -> WddmResult<SubmitCommandResult> {
+        {
+            let state = self.state();
+            let object_id = require_device(&state, request.device)?;
+            let context = state
+                .contexts
+                .get(&request.context)
+                .ok_or_else(|| WddmError::new(STATUS_INVALID_HANDLE, "unknown submit context"))?;
+            if context.device_object != object_id {
+                return failed(
+                    STATUS_INVALID_HANDLE,
+                    "submit context belongs to another device",
+                );
+            }
+            if request.allocations.is_empty() || request.allocations.len() > MAX_KMT_ARRAY {
+                return failed(
+                    STATUS_INVALID_PARAMETER,
+                    "submit allocation array is outside 1..=MAX_KMT_ARRAY",
+                );
+            }
+            for allocation in &request.allocations {
+                let reference = state.allocations.get(allocation).ok_or_else(|| {
+                    WddmError::new(
+                        STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE,
+                        "submit allocation list references an unknown handle",
+                    )
+                })?;
+                if reference.device_object != object_id {
+                    return failed(
+                        STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE,
+                        "submit allocation is not opened on this device",
+                    );
+                }
+                let residency = state
+                    .allocation_objects
+                    .get(&reference.object)
+                    .expect("allocation object present for live handle")
+                    .residency;
+                if residency == 0 {
+                    return failed(
+                        STATUS_GRAPHICS_ALLOCATION_BUSY,
+                        "submit allocation is not resident",
+                    );
+                }
+            }
+        }
+        let rendered = self.d3dkmt_render(RenderRequest {
+            device: request.device,
+            context: request.context,
+            allocations: request.allocations,
+            fill_value: request.fill_value,
+            fence: request.fence,
+        })?;
+        let mut state = self.state();
+        let submission_id = state
+            .contexts
+            .get_mut(&request.context)
+            .map(|context| {
+                context.submission_sequence += 1;
+                context.submission_sequence
+            })
+            .unwrap_or(0);
+        Ok(SubmitCommandResult {
+            context_id: rendered.context_id,
+            bytes_filled: rendered.bytes_filled,
+            fence_value: rendered.fence_value,
+            effective_priority: rendered.effective_priority,
+            submission_id,
+        })
+    }
+
+    /// `D3DKMTEscape`: driver-private escape codes belong to a real host WDDM
+    /// driver.  The synthetic adapter has no private escape surface, so every
+    /// code fails closed instead of fabricating output.
+    pub fn d3dkmt_escape(
+        &self,
+        device: DeviceHandle,
+        escape_code: u32,
+        input: &[u8],
+    ) -> WddmResult<Vec<u8>> {
+        let state = self.state();
+        let _ = require_device(&state, device)?;
+        let _ = (escape_code, input);
+        failed(
+            STATUS_NOT_SUPPORTED,
+            "escape code is not implemented by the host WDDM driver",
+        )
     }
 
     /// `D3DKMTCreateAllocation`.
@@ -1894,22 +2312,28 @@ impl WddmSubsystem {
             return failed(STATUS_ACCESS_DENIED, "residency owner mismatch");
         }
         if first_residency {
-            let segment = state
+            let adapter = state
                 .adapters
                 .get_mut(&adapter_id)
-                .and_then(|adapter| adapter.segments.get_mut(segment_id.0 as usize))
-                .expect("segment validated at allocation creation");
-            let within_budget = segment
-                .used
-                .checked_add(size)
-                .is_some_and(|next| next <= segment.budget);
-            if !within_budget {
-                return failed(
-                    STATUS_GRAPHICS_NO_VIDEO_MEMORY,
-                    "resident bytes exceed the segment budget",
-                );
+                .expect("adapter present for live allocation");
+            {
+                let segment = adapter
+                    .segments
+                    .get_mut(segment_id.0 as usize)
+                    .expect("segment validated at allocation creation");
+                let within_budget = segment
+                    .used
+                    .checked_add(size)
+                    .is_some_and(|next| next <= segment.budget);
+                if !within_budget {
+                    return failed(
+                        STATUS_GRAPHICS_NO_VIDEO_MEMORY,
+                        "resident bytes exceed the segment budget",
+                    );
+                }
+                segment.used += size;
             }
-            segment.used += size;
+            adapter.paging_fence = adapter.paging_fence.saturating_add(1);
         }
         let object = state
             .allocation_objects
@@ -1958,12 +2382,18 @@ impl WddmSubsystem {
             object.residency
         };
         if residency == 0 {
-            let segment = state
+            let adapter = state
                 .adapters
                 .get_mut(&adapter_id)
-                .and_then(|adapter| adapter.segments.get_mut(segment_id.0 as usize))
-                .expect("segment validated at allocation creation");
-            segment.used = segment.used.saturating_sub(size);
+                .expect("adapter present for live allocation");
+            {
+                let segment = adapter
+                    .segments
+                    .get_mut(segment_id.0 as usize)
+                    .expect("segment validated at allocation creation");
+                segment.used = segment.used.saturating_sub(size);
+            }
+            adapter.paging_fence = adapter.paging_fence.saturating_add(1);
         }
         Ok(residency)
     }
@@ -2579,6 +3009,7 @@ impl WddmSubsystem {
                 context_id,
                 submit_count: 0,
                 submit_bytes: 0,
+                submission_sequence: 0,
             },
         );
         state
@@ -3491,15 +3922,28 @@ fn remove_allocation_handle(
         }
     }
     if object.residency > 0 {
-        if let Some(segment) = state
-            .adapters
-            .get_mut(&object.adapter_id)
-            .and_then(|adapter| adapter.segments.get_mut(object.segment.0 as usize))
-        {
-            segment.used = segment.used.saturating_sub(object.size);
+        if let Some(adapter) = state.adapters.get_mut(&object.adapter_id) {
+            if let Some(segment) = adapter.segments.get_mut(object.segment.0 as usize) {
+                segment.used = segment.used.saturating_sub(object.size);
+            }
+            adapter.paging_fence = adapter.paging_fence.saturating_add(1);
         }
     }
+    let adapter = state
+        .adapters
+        .get_mut(&object.adapter_id)
+        .expect("adapter present for live allocation");
+    adapter
+        .gpu_address_ranges
+        .retain(|_, mapping| mapping.allocation != allocation);
     Some(reference)
+}
+
+fn align_up_u64(value: u64, align: u64) -> u64 {
+    if align <= 1 {
+        return value;
+    }
+    value.wrapping_add(align - 1) & !(align - 1)
 }
 
 fn submit_gpu_fill(device: &metal::Device, bytes: u64, fill_value: u8) -> WddmResult<()> {
@@ -6749,4 +7193,453 @@ mod tests {
             STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER
         );
     }
+
+    #[test]
+    fn gpu_virtual_address_boundaries_and_overlaps_are_rejected_exactly() {
+        let subsystem = subsystem();
+        let adapter = open_adapter(&subsystem);
+        let device = create_device(&subsystem, adapter, false);
+        let allocation = create_allocation(&subsystem, device, 0x2000, SEGMENT_LOCAL, 1);
+        let other = create_allocation(&subsystem, device, 0x2000, SEGMENT_LOCAL, 2);
+        let base = 0x4000_0000;
+        assert_eq!(
+            subsystem
+                .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                    device,
+                    allocation,
+                    virtual_address: base,
+                    size: 0x1000,
+                })
+                .unwrap(),
+            base
+        );
+        let overlap = subsystem
+            .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                device,
+                allocation: other,
+                virtual_address: base,
+                size: 0x1000,
+            })
+            .unwrap_err();
+        assert_eq!(overlap.status(), STATUS_OBJECT_NAME_COLLISION);
+        assert_eq!(
+            overlap.detail(),
+            "GPU virtual address range overlaps a live mapping"
+        );
+        let misaligned = subsystem
+            .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                device,
+                allocation,
+                virtual_address: base + 0x800,
+                size: 0x1000,
+            })
+            .unwrap_err();
+        assert_eq!(misaligned.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            misaligned.detail(),
+            "GPU virtual address is not 4 KiB aligned"
+        );
+        let oversized = subsystem
+            .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                device,
+                allocation,
+                virtual_address: 0x4000_2000,
+                size: 0x3000,
+            })
+            .unwrap_err();
+        assert_eq!(oversized.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            oversized.detail(),
+            "GPU virtual address range exceeds the allocation"
+        );
+        let zero_size = subsystem
+            .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                device,
+                allocation,
+                virtual_address: 0,
+                size: 0,
+            })
+            .unwrap_err();
+        assert_eq!(zero_size.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            zero_size.detail(),
+            "GPU virtual address size must be a non-zero 4 KiB multiple"
+        );
+        let foreign = create_device(&subsystem, adapter, false);
+        let auto_first = subsystem
+            .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                device,
+                allocation,
+                virtual_address: 0,
+                size: 0x1000,
+            })
+            .expect("automatic GPU virtual address");
+        assert_eq!(auto_first, GPU_VA_BASE);
+        {
+            let mut state = subsystem.state.lock().unwrap_or_else(|p| p.into_inner());
+            let adapter_id = state
+                .device_objects
+                .values()
+                .next()
+                .expect("device object")
+                .adapter_id;
+            state
+                .adapters
+                .get_mut(&adapter_id)
+                .expect("adapter")
+                .next_gpu_address = GPU_VA_BASE;
+        }
+        let auto_second = subsystem
+            .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                device,
+                allocation,
+                virtual_address: 0,
+                size: 0x1000,
+            })
+            .expect("automatic GPU virtual address after collision");
+        assert_eq!(auto_second, GPU_VA_BASE + GPU_PAGE_SIZE);
+        {
+            let mut state = subsystem.state.lock().unwrap_or_else(|p| p.into_inner());
+            let adapter_id = state
+                .device_objects
+                .values()
+                .next()
+                .expect("device object")
+                .adapter_id;
+            state
+                .adapters
+                .get_mut(&adapter_id)
+                .expect("adapter")
+                .next_gpu_address = 0xFFFF_FFFF_FFFF_F000;
+        }
+        let exhausted = subsystem
+            .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                device,
+                allocation,
+                virtual_address: 0,
+                size: 0x2000,
+            })
+            .unwrap_err();
+        assert_eq!(exhausted.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(exhausted.detail(), "GPU virtual address space exhausted");
+        assert_eq!(align_up_u64(7, 1), 7);
+        let unknown_allocation = subsystem
+            .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                device,
+                allocation: AllocationHandle(0xFFFF_FFFF),
+                virtual_address: 0x4100_0000,
+                size: 0x1000,
+            })
+            .unwrap_err();
+        assert_eq!(
+            unknown_allocation.status(),
+            STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE
+        );
+        let foreign_allocation = create_allocation(&subsystem, foreign, 0x2000, SEGMENT_LOCAL, 1);
+        assert_eq!(
+            subsystem
+                .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                    device,
+                    allocation: foreign_allocation,
+                    virtual_address: 0x4100_0000,
+                    size: 0x1000,
+                })
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE
+        );
+        let overflow = subsystem
+            .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                device,
+                allocation,
+                virtual_address: 0xFFFF_FFFF_FFFF_F000,
+                size: 0x2000,
+            })
+            .unwrap_err();
+        assert_eq!(overflow.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(overflow.detail(), "GPU virtual address overflow");
+        let info = subsystem.gpu_virtual_address_info(device, base).unwrap();
+        assert_eq!(info.allocation, allocation);
+        assert_eq!(info.size, 0x1000);
+        assert_eq!(
+            subsystem
+                .gpu_virtual_address_info(foreign, base)
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_unmap_gpu_virtual_address(foreign, base)
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            subsystem
+                .gpu_virtual_address_info(device, base + 0x1000)
+                .unwrap_err()
+                .status(),
+            STATUS_NOT_FOUND
+        );
+        assert!(
+            subsystem
+                .d3dkmt_unmap_gpu_virtual_address(device, base)
+                .is_ok()
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_unmap_gpu_virtual_address(device, base)
+                .unwrap_err()
+                .status(),
+            STATUS_NOT_FOUND
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                    device,
+                    allocation,
+                    virtual_address: u64::MAX - 0x800,
+                    size: 0x1000,
+                })
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_PARAMETER
+        );
+    }
+
+    #[test]
+    fn submit_command_requires_residency_and_monotonic_fences_exactly() {
+        let subsystem = subsystem();
+        let adapter = open_adapter(&subsystem);
+        let device = create_device(&subsystem, adapter, false);
+        let allocation = create_allocation(&subsystem, device, 0x1000, SEGMENT_LOCAL, 1);
+        let context = create_context(&subsystem, device, 5);
+        let fence = create_sync(&subsystem, device, 0);
+        let submission = || SubmitCommandRequest {
+            device,
+            context,
+            allocations: vec![allocation],
+            fill_value: 0x5A,
+            fence: Some((fence, 1)),
+        };
+        let non_resident = subsystem.d3dkmt_submit_command(submission()).unwrap_err();
+        assert_eq!(non_resident.status(), STATUS_GRAPHICS_ALLOCATION_BUSY);
+        assert_eq!(non_resident.detail(), "submit allocation is not resident");
+        assert_eq!(
+            subsystem
+                .d3dkmt_make_resident(allocation, 7)
+                .expect("charge allocation"),
+            1
+        );
+        let first = subsystem
+            .d3dkmt_submit_command(submission())
+            .expect("first submission");
+        assert_eq!(first.fence_value, 1);
+        assert_eq!(first.submission_id, 1);
+        assert_eq!(first.effective_priority, 5);
+        assert_eq!(first.bytes_filled, TEST_SUBMIT_BYTES);
+        let mut second = submission();
+        second.fence = Some((fence, 2));
+        assert_eq!(
+            subsystem
+                .d3dkmt_submit_command(second)
+                .expect("second submission")
+                .submission_id,
+            2
+        );
+        let stale_fence = subsystem.d3dkmt_submit_command(submission()).unwrap_err();
+        assert_eq!(stale_fence.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(stale_fence.detail(), "render fence value must increase");
+        let foreign_device = create_device(&subsystem, adapter, false);
+        let foreign_allocation =
+            create_allocation(&subsystem, foreign_device, 0x1000, SEGMENT_LOCAL, 1);
+        let mut foreign = submission();
+        foreign.allocations = vec![foreign_allocation];
+        assert_eq!(
+            subsystem
+                .d3dkmt_submit_command(foreign)
+                .unwrap_err()
+                .status(),
+            STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE
+        );
+        let foreign_context = create_context(&subsystem, foreign_device, 5);
+        let foreign_context_error = subsystem
+            .d3dkmt_submit_command(SubmitCommandRequest {
+                device,
+                context: foreign_context,
+                allocations: vec![allocation],
+                fill_value: 0,
+                fence: None,
+            })
+            .unwrap_err();
+        assert_eq!(foreign_context_error.status(), STATUS_INVALID_HANDLE);
+        assert_eq!(
+            foreign_context_error.detail(),
+            "submit context belongs to another device"
+        );
+        let empty = subsystem
+            .d3dkmt_submit_command(SubmitCommandRequest {
+                device,
+                context,
+                allocations: Vec::new(),
+                fill_value: 0,
+                fence: None,
+            })
+            .unwrap_err();
+        assert_eq!(empty.status(), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            empty.detail(),
+            "submit allocation array is outside 1..=MAX_KMT_ARRAY"
+        );
+        let too_many = subsystem
+            .d3dkmt_submit_command(SubmitCommandRequest {
+                device,
+                context,
+                allocations: vec![allocation; MAX_KMT_ARRAY + 1],
+                fill_value: 0,
+                fence: None,
+            })
+            .unwrap_err();
+        assert_eq!(too_many.status(), STATUS_INVALID_PARAMETER);
+        let unknown_allocation = subsystem
+            .d3dkmt_submit_command(SubmitCommandRequest {
+                device,
+                context,
+                allocations: vec![AllocationHandle(0xFFFF_FFFF)],
+                fill_value: 0,
+                fence: None,
+            })
+            .unwrap_err();
+        assert_eq!(
+            unknown_allocation.status(),
+            STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE
+        );
+        assert_eq!(
+            unknown_allocation.detail(),
+            "submit allocation list references an unknown handle"
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_submit_command(SubmitCommandRequest {
+                    device,
+                    context: ContextHandle(0xFFFF_FFFF),
+                    allocations: vec![allocation],
+                    fill_value: 0,
+                    fence: None,
+                })
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_HANDLE
+        );
+    }
+
+    #[test]
+    fn paging_fence_and_video_memory_budget_track_real_residency() {
+        let subsystem = subsystem();
+        let adapter = open_adapter(&subsystem);
+        let device = create_device(&subsystem, adapter, false);
+        let allocation = create_allocation(&subsystem, device, 0x1000, SEGMENT_LOCAL, 1);
+        let before = subsystem
+            .d3dkmt_query_video_memory_info(device)
+            .expect("memory info");
+        assert_eq!(
+            before
+                .segments
+                .iter()
+                .find(|segment| segment.segment == SEGMENT_LOCAL)
+                .expect("local segment")
+                .used,
+            0
+        );
+        let budget = before
+            .segments
+            .iter()
+            .find(|segment| segment.segment == SEGMENT_LOCAL)
+            .expect("local segment")
+            .budget;
+        assert_eq!(subsystem.d3dkmt_paging_fence(device).unwrap(), 0);
+        subsystem.d3dkmt_make_resident(allocation, 7).unwrap();
+        assert_eq!(subsystem.d3dkmt_paging_fence(device).unwrap(), 1);
+        subsystem.d3dkmt_make_resident(allocation, 7).unwrap();
+        assert_eq!(subsystem.d3dkmt_paging_fence(device).unwrap(), 1);
+        let resident = subsystem
+            .d3dkmt_query_video_memory_info(device)
+            .expect("memory info");
+        assert_eq!(resident.usage, 0x1000);
+        assert_eq!(resident.budget, before.budget);
+        assert_eq!(resident.available, resident.budget - resident.usage);
+        assert_eq!(resident.budget, budget + before.segments[1].budget);
+        subsystem.d3dkmt_evict(allocation, 7).unwrap();
+        assert_eq!(subsystem.d3dkmt_paging_fence(device).unwrap(), 1);
+        subsystem.d3dkmt_evict(allocation, 7).unwrap();
+        assert_eq!(subsystem.d3dkmt_paging_fence(device).unwrap(), 2);
+        assert_eq!(
+            subsystem.d3dkmt_evict(allocation, 7).unwrap_err().status(),
+            STATUS_GRAPHICS_ALLOCATION_BUSY
+        );
+        assert_eq!(
+            subsystem.d3dkmt_evict(allocation, 8).unwrap_err().status(),
+            STATUS_ACCESS_DENIED
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_query_video_memory_info(DeviceHandle(0xFFFF_FFFF))
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_HANDLE
+        );
+        let doomed = create_allocation(&subsystem, device, 0x1000, SEGMENT_LOCAL, 3);
+        let doomed_va = 0x5000_0000;
+        subsystem
+            .d3dkmt_map_gpu_virtual_address(MapGpuVirtualAddressRequest {
+                device,
+                allocation: doomed,
+                virtual_address: doomed_va,
+                size: 0x1000,
+            })
+            .expect("map doomed allocation");
+        subsystem.d3dkmt_make_resident(doomed, 7).unwrap();
+        subsystem
+            .d3dkmt_destroy_allocation(doomed)
+            .expect("destroy resident allocation");
+        assert_eq!(
+            subsystem
+                .gpu_virtual_address_info(device, doomed_va)
+                .unwrap_err()
+                .status(),
+            STATUS_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn escape_and_unmapped_queries_fail_closed_with_exact_status() {
+        let subsystem = subsystem();
+        let adapter = open_adapter(&subsystem);
+        let device = create_device(&subsystem, adapter, false);
+        let escape = subsystem
+            .d3dkmt_escape(device, 0x0022_0004, b"probe")
+            .unwrap_err();
+        assert_eq!(escape.status(), STATUS_NOT_SUPPORTED);
+        assert_eq!(
+            escape.detail(),
+            "escape code is not implemented by the host WDDM driver"
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_escape(DeviceHandle(0xFFFF_FFFF), 0, &[])
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_HANDLE
+        );
+        assert_eq!(
+            subsystem
+                .d3dkmt_paging_fence(DeviceHandle(0xFFFF_FFFF))
+                .unwrap_err()
+                .status(),
+            STATUS_INVALID_HANDLE
+        );
+    }
+
+    const TEST_SUBMIT_BYTES: u64 = 0x1000;
 }

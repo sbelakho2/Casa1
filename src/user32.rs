@@ -1418,6 +1418,11 @@ pub struct User32Subsystem {
     /// a non-zero callback is the guest TIMERPROC, delivered through the
     /// WM_TIMER lParam exactly like Windows DispatchMessage semantics.
     timers: BTreeMap<(Hwnd, usize), (std::time::SystemTime, u64, u64)>,
+    /// Cached earliest active `SetTimer` expiry.  Kept incrementally on
+    /// insertion and recomputed only when the earliest entry is removed or
+    /// polled, so the scheduler's next-deadline query is O(1) and never scans
+    /// the timer map on the per-block path.
+    next_timer_expiry: Option<std::time::SystemTime>,
     /// Clipboard open state (OpenClipboard/CloseClipboard tracking).
     clipboard_open: bool,
     /// Window that currently owns the clipboard.
@@ -1646,6 +1651,7 @@ impl User32Subsystem {
             hooks: HashMap::new(),
             next_hook_id: 1,
             timers: BTreeMap::new(),
+            next_timer_expiry: None,
             clipboard_open: false,
             clipboard_owner: None,
             clipboard_data: BTreeMap::new(),
@@ -2248,6 +2254,8 @@ impl User32Subsystem {
         self.scroll_info.retain(|(h, _), _| *h != hwnd);
         self.window_menus.remove(&hwnd);
         self.timers.retain(|(h, _), _| *h != hwnd);
+        // Window destruction can remove the cached earliest timer.
+        self.refresh_next_timer_expiry();
         self.dialog_items.retain(|(h, _), _| *h != hwnd);
         self.touch_state.registered_windows.retain(|h| *h != hwnd);
         self.touch_state.pointer_devices.retain(|h| *h != hwnd);
@@ -2488,7 +2496,13 @@ impl User32Subsystem {
 
     /// KillTimer — destroy a timer.
     pub fn kill_timer(&mut self, hwnd: Hwnd, timer_id: usize) -> bool {
-        self.timers.remove(&(hwnd, timer_id)).is_some()
+        let Some((expiry, _, _)) = self.timers.remove(&(hwnd, timer_id)) else {
+            return false;
+        };
+        if self.next_timer_expiry == Some(expiry) {
+            self.refresh_next_timer_expiry();
+        }
+        true
     }
 
     /// UnregisterClassW — unregister a window class.
@@ -2512,9 +2526,42 @@ impl User32Subsystem {
     ) -> bool {
         let interval = timeout_ms as u64;
         let expiry = std::time::SystemTime::now() + std::time::Duration::from_millis(interval);
-        self.timers
+        let previous = self
+            .timers
             .insert((hwnd, timer_id), (expiry, interval, callback));
+        match self.next_timer_expiry {
+            None => self.next_timer_expiry = Some(expiry),
+            Some(cached) if expiry < cached => self.next_timer_expiry = Some(expiry),
+            // Replacing the earliest timer with a later expiry can move the
+            // cached minimum forward; adding/replacing a non-earliest timer
+            // leaves the cache valid.
+            Some(cached)
+                if previous.is_some_and(|(previous_expiry, _, _)| previous_expiry == cached) =>
+            {
+                self.refresh_next_timer_expiry();
+            }
+            Some(_) => {}
+        }
         true
+    }
+
+    /// Recompute the cached earliest timer expiry by scanning the timer map.
+    /// O(n), and only called from timer mutations (insert/replace/remove/poll),
+    /// never from the scheduler block path.
+    fn refresh_next_timer_expiry(&mut self) {
+        self.next_timer_expiry = self.timers.values().map(|(expiry, _, _)| *expiry).min();
+    }
+
+    /// Remaining host time until the earliest active `SetTimer` expiry.
+    /// O(1); `Some(Duration::ZERO)` means the earliest timer is already due
+    /// (the caller should poll immediately), `None` means no timer exists.
+    pub fn next_timer_timeout(&self) -> Option<std::time::Duration> {
+        let expiry = self.next_timer_expiry?;
+        Some(
+            expiry
+                .duration_since(std::time::SystemTime::now())
+                .unwrap_or(std::time::Duration::ZERO),
+        )
     }
 
     /// Check if any timers have expired (for WM_TIMER generation).
@@ -2539,6 +2586,7 @@ impl User32Subsystem {
                 }
             });
         self.timers.extend(rearmed);
+        self.refresh_next_timer_expiry();
         expired
     }
 
@@ -7076,6 +7124,60 @@ mod tests {
             "should contain our timer (hwnd=1, id=99)"
         );
         assert_eq!(user32.timer_count(), 0, "expired timers should be removed");
+    }
+
+    #[test]
+    fn timer_deadline_cache_recomputes_after_earliest_replace_and_kill_race() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert!(user32.set_timer(1, 1, 200, 0));
+        // A later timer is not the cached earliest: the cache must stay put.
+        assert!(user32.set_timer(1, 3, 800, 0));
+        assert!(user32.set_timer(1, 2, 40, 0));
+        let earliest = user32.next_timer_timeout().expect("three armed timers");
+        assert!(earliest <= std::time::Duration::from_millis(40));
+        // Replacing the earliest timer with a later expiry moves the cache to
+        // the other timer instead of leaving the stale 40 ms entry.
+        assert!(user32.set_timer(1, 2, 400, 0));
+        let replaced = user32.next_timer_timeout().expect("timer 1 remains");
+        assert!(
+            replaced > std::time::Duration::from_millis(100),
+            "stale cached deadline after replacing the earliest timer: {replaced:?}"
+        );
+        // Killing the cached earliest recomputes to timer 2.
+        assert!(user32.kill_timer(1, 1));
+        let remaining = user32.next_timer_timeout().expect("timer 2 remains");
+        assert!(
+            remaining > std::time::Duration::from_millis(250),
+            "stale cached deadline after killing the earliest timer: {remaining:?}"
+        );
+        assert!(user32.kill_timer(1, 2));
+        assert!(user32.kill_timer(1, 3));
+        assert_eq!(user32.next_timer_timeout(), None);
+        assert_eq!(
+            user32.kill_timer(1, 42),
+            false,
+            "killing a missing timer must report false"
+        );
+        // Destroying a window removes its timers and must refresh the cache.
+        user32.register_class_ex_w("timer-cache");
+        let window = user32
+            .create_window_ex_w("timer-cache", "timer", 10, 10, false, false, None, 1)
+            .expect("create timer window");
+        assert!(user32.set_timer(window, 11, 500, 0));
+        assert_ne!(
+            user32.next_timer_timeout(),
+            None,
+            "the window timer must be cached"
+        );
+        assert!(user32.destroy_window(window).expect("destroy timer window"));
+        assert_eq!(
+            user32.next_timer_timeout(),
+            None,
+            "window destruction must refresh the timer cache"
+        );
+        // A due timer reports a zero timeout, not None.
+        assert!(user32.set_timer(1, 9, 0, 0));
+        assert_eq!(user32.next_timer_timeout(), Some(std::time::Duration::ZERO));
     }
 
     // ── MessageQueue QS_* flag tests ────────────────────────────────────────

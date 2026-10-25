@@ -42,7 +42,7 @@ pub const REFERENCE_CWD: &str = "C:\\Windows\\Temp\\casa1-oracle-cwd";
 pub const REFERENCE_BASE_DIR: &str = "C:\\Windows\\Temp\\casa1-oracle";
 
 /// All category names, in corpus generation order.
-pub const ALL_CATEGORIES: [&str; 24] = [
+pub const ALL_CATEGORIES: [&str; 34] = [
     "path_normalize",
     "case_fold",
     "file_sharing",
@@ -56,6 +56,16 @@ pub const ALL_CATEGORIES: [&str; 24] = [
     "d3d12_texture_address_mode",
     "d3d12_filter_reduction",
     "d3d12_filter_translation",
+    "d3d12_device",
+    "d3d12_command_queue",
+    "d3d12_command_allocator",
+    "d3d12_command_list",
+    "d3d12_feature_support",
+    "d3d12_descriptor_heap",
+    "d3d12_render_target_view",
+    "d3d12_fence",
+    "d3d12_resource_barrier",
+    "d3d12_draw",
     "cpu_arithmetic_flags",
     "virtual_memory",
     "time_clock",
@@ -547,6 +557,16 @@ fn generate_category_with_mode(category: &str, exhaustive: bool) -> Vec<Value> {
         "d3d12_texture_address_mode" => d3d12_texture_address_mode_vectors(),
         "d3d12_filter_reduction" => d3d12_filter_reduction_vectors(),
         "d3d12_filter_translation" => d3d12_filter_translation_vectors(),
+        "d3d12_device" => d3d12_device_vectors(),
+        "d3d12_command_queue" => d3d12_command_queue_vectors(),
+        "d3d12_command_allocator" => d3d12_command_allocator_vectors(),
+        "d3d12_command_list" => d3d12_command_list_vectors(),
+        "d3d12_feature_support" => d3d12_feature_support_vectors(),
+        "d3d12_descriptor_heap" => d3d12_descriptor_heap_vectors(),
+        "d3d12_render_target_view" => d3d12_render_target_view_vectors(),
+        "d3d12_fence" => d3d12_fence_vectors(),
+        "d3d12_resource_barrier" => d3d12_resource_barrier_vectors(),
+        "d3d12_draw" => d3d12_draw_vectors(),
         "cpu_arithmetic_flags" => cpu_arithmetic_flags_vectors(exhaustive),
         "virtual_memory" => virtual_memory_vectors(),
         "time_clock" => time_clock_vectors(),
@@ -733,6 +753,49 @@ fn d3d12_filter_translation_vectors() -> Vec<Value> {
         .iter()
         .map(|(filter, _)| json!({ "filter": filter }))
         .collect()
+}
+
+fn d3d12_device_vectors() -> Vec<Value> {
+    vec![
+        json!({ "min_feature_level": 0 }),
+        json!({ "min_feature_level": 1 }),
+    ]
+}
+
+fn d3d12_command_queue_vectors() -> Vec<Value> {
+    vec![json!({ "priority": 0 })]
+}
+
+fn d3d12_command_allocator_vectors() -> Vec<Value> {
+    vec![json!({ "list_type": 0 })]
+}
+
+fn d3d12_command_list_vectors() -> Vec<Value> {
+    vec![json!({ "close": true }), json!({ "close": false })]
+}
+
+fn d3d12_feature_support_vectors() -> Vec<Value> {
+    vec![json!({ "query": "all" })]
+}
+
+fn d3d12_descriptor_heap_vectors() -> Vec<Value> {
+    vec![json!({ "heap_type": "rtv", "count": 4 })]
+}
+
+fn d3d12_render_target_view_vectors() -> Vec<Value> {
+    vec![json!({ "format": "r8g8b8a8_unorm" })]
+}
+
+fn d3d12_fence_vectors() -> Vec<Value> {
+    vec![json!({ "initial": 7 })]
+}
+
+fn d3d12_resource_barrier_vectors() -> Vec<Value> {
+    vec![json!({ "before": "common", "after": "render_target" })]
+}
+
+fn d3d12_draw_vectors() -> Vec<Value> {
+    vec![json!({ "vertices": 3, "instances": 1 })]
 }
 
 /// The arithmetic edge set shared with the JIT flag truth-table tests:
@@ -1006,6 +1069,139 @@ fn heap_vectors() -> Vec<Value> {
     ]
 }
 
+fn runtime_d3d12_device(_input: &Value) -> Value {
+    let runtime = crate::d3d12::D3d12Runtime::new();
+    json!({
+        "device_created": true,
+        "node_count": 1,
+        "info": runtime.device_info(),
+    })
+}
+
+fn runtime_d3d12_command_queue(_input: &Value) -> Value {
+    let mut runtime = crate::d3d12::D3d12Runtime::new();
+    let queue = runtime.create_command_queue();
+    json!({ "queue": queue, "created": true })
+}
+
+fn runtime_d3d12_command_allocator(_input: &Value) -> Value {
+    let mut runtime = crate::d3d12::D3d12Runtime::new();
+    let allocator = runtime.create_command_allocator();
+    json!({ "allocator": allocator, "created": true })
+}
+
+fn runtime_d3d12_command_list(input: &Value) -> Value {
+    let mut runtime = crate::d3d12::D3d12Runtime::new();
+    let allocator = runtime.create_command_allocator();
+    let list = runtime.create_graphics_command_list(allocator, 0, false);
+    let close = input.get("close").and_then(Value::as_bool).unwrap_or(false);
+    if close {
+        let stream = runtime
+            .close_command_list(list)
+            .expect("close command list");
+        json!({ "list": list, "closed": true, "commands": stream.commands.len() })
+    } else {
+        json!({ "list": list, "closed": false })
+    }
+}
+
+fn runtime_d3d12_feature_support(_input: &Value) -> Value {
+    let runtime = crate::d3d12::D3d12Runtime::new();
+    json!({ "features": runtime.device_info().features })
+}
+
+fn runtime_d3d12_descriptor_heap(input: &Value) -> Value {
+    let mut runtime = crate::d3d12::D3d12Runtime::new();
+    let count = input.get("count").and_then(Value::as_u64).unwrap_or(1) as usize;
+    let heap = runtime.create_descriptor_heap(crate::gfx::DescriptorHeapType::Rtv, count);
+    let increment =
+        runtime.get_descriptor_handle_increment_size(crate::gfx::DescriptorHeapType::Rtv);
+    json!({ "heap": heap, "increment": increment, "count": count })
+}
+
+fn runtime_d3d12_render_target_view(_input: &Value) -> Value {
+    let mut runtime = crate::d3d12::D3d12Runtime::new();
+    let resource = runtime
+        .create_committed_resource(crate::gfx::ResourceDesc {
+            name: "oracle-rtv".to_string(),
+            format: crate::gfx::DxgiFormat::R8G8B8A8Unorm,
+            heap: crate::gfx::HeapType::Default,
+            size: 64,
+            subresources: 1,
+            initial_state: crate::gfx::ResourceState::Common,
+            usage_hint: crate::gfx::ResourceUsageHint::Generic,
+        })
+        .expect("resource");
+    let heap = runtime.create_descriptor_heap(crate::gfx::DescriptorHeapType::Rtv, 1);
+    let write = runtime.write_descriptor(
+        heap,
+        0,
+        crate::gfx::ViewDescriptor::Rtv {
+            resource,
+            format: crate::gfx::DxgiFormat::R8G8B8A8Unorm,
+        },
+    );
+    json!({
+        "resource": resource,
+        "heap": heap,
+        "write_ok": write.is_ok(),
+        "descriptors": runtime.descriptor_heap_snapshot(heap).map(|values| values.len()).unwrap_or(0),
+    })
+}
+
+fn runtime_d3d12_fence(input: &Value) -> Value {
+    let mut runtime = crate::d3d12::D3d12Runtime::new();
+    let initial = input.get("initial").and_then(Value::as_u64).unwrap_or(0);
+    let fence = runtime.create_fence(initial);
+    let value = runtime.fence_value(fence).unwrap_or(u64::MAX);
+    json!({ "fence": fence, "value": value })
+}
+
+fn runtime_d3d12_resource_barrier(_input: &Value) -> Value {
+    let mut runtime = crate::d3d12::D3d12Runtime::new();
+    let allocator = runtime.create_command_allocator();
+    let list = runtime.create_graphics_command_list(allocator, 0, false);
+    let resource = runtime
+        .create_committed_resource(crate::gfx::ResourceDesc {
+            name: "oracle-barrier".to_string(),
+            format: crate::gfx::DxgiFormat::R8G8B8A8Unorm,
+            heap: crate::gfx::HeapType::Default,
+            size: 64,
+            subresources: 1,
+            initial_state: crate::gfx::ResourceState::Common,
+            usage_hint: crate::gfx::ResourceUsageHint::Generic,
+        })
+        .expect("resource");
+    let result = runtime.record_resource_barrier(
+        list,
+        &crate::gfx::D3D12ResourceBarrierDesc {
+            barrier_type: crate::gfx::D3D12ResourceBarrierType::Transition,
+            flags: crate::gfx::D3D12ResourceBarrierFlags::None,
+            resource: Some(resource),
+            subresource: 0,
+            state_before: crate::gfx::ResourceState::Common,
+            state_after: crate::gfx::ResourceState::RenderTarget,
+            resource_before: None,
+            resource_after: None,
+        },
+    );
+    json!({ "barrier_ok": result.is_ok() })
+}
+
+fn runtime_d3d12_draw(input: &Value) -> Value {
+    let mut runtime = crate::d3d12::D3d12Runtime::new();
+    let allocator = runtime.create_command_allocator();
+    let list = runtime.create_graphics_command_list(allocator, 0, false);
+    let vertices = input.get("vertices").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let instances = input.get("instances").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let recorded = runtime.record_draw_instanced(list, vertices, instances);
+    let commands = runtime
+        .close_command_list(list)
+        .map(|stream| stream.commands.len())
+        .unwrap_or(0);
+    json!({ "recorded": recorded.is_ok(), "commands": commands })
+}
+
 /// Compute the Casa1 RUNTIME's behavior for a differential vector.  This is
 /// the emulated-Casa1 side of the differential: the reference executable's
 /// captured result is the truth, and this function produces the Casa1
@@ -1097,6 +1293,16 @@ pub fn compute_runtime_result(vector: &Vector) -> VectorResult {
                 "valid": name.is_some(),
             })
         }
+        "d3d12_device" => runtime_d3d12_device(&vector.input),
+        "d3d12_command_queue" => runtime_d3d12_command_queue(&vector.input),
+        "d3d12_command_allocator" => runtime_d3d12_command_allocator(&vector.input),
+        "d3d12_command_list" => runtime_d3d12_command_list(&vector.input),
+        "d3d12_feature_support" => runtime_d3d12_feature_support(&vector.input),
+        "d3d12_descriptor_heap" => runtime_d3d12_descriptor_heap(&vector.input),
+        "d3d12_render_target_view" => runtime_d3d12_render_target_view(&vector.input),
+        "d3d12_fence" => runtime_d3d12_fence(&vector.input),
+        "d3d12_resource_barrier" => runtime_d3d12_resource_barrier(&vector.input),
+        "d3d12_draw" => runtime_d3d12_draw(&vector.input),
         "cpu_arithmetic_flags" => runtime_cpu_arithmetic_flags(&vector.input),
         "virtual_memory" => runtime_virtual_memory(&vector.id, &vector.input),
         "time_clock" => runtime_time_clock(&vector.input),
@@ -1173,10 +1379,17 @@ fn with_oracle_runtime<T>(operation: impl FnOnce(&mut OracleRuntimeContext) -> T
 
 fn create_oracle_runtime() -> OracleRuntimeContext {
     let serial = ORACLE_RUNTIME_SERIAL.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
     let root = std::env::temp_dir().join(format!(
-        "casa1-oracle-runtime-{}-{serial:04}",
+        "casa1-oracle-runtime-{}-{serial:04}-{nanos}",
         std::process::id()
     ));
+    // A reused PID can inherit a stale scratch root from an earlier process;
+    // remove it so create_in starts from an empty directory.
+    let _ = std::fs::remove_dir_all(&root);
     let ge = GameEnvironment::create_in(&root, "oracle", GeArch::X64, "win11-23h2").unwrap_or_else(
         |error| {
             panic!(
@@ -3751,6 +3964,16 @@ mod tests {
             "d3d12_texture_address_mode",
             "d3d12_filter_reduction",
             "d3d12_filter_translation",
+            "d3d12_device",
+            "d3d12_command_queue",
+            "d3d12_command_allocator",
+            "d3d12_command_list",
+            "d3d12_feature_support",
+            "d3d12_descriptor_heap",
+            "d3d12_render_target_view",
+            "d3d12_fence",
+            "d3d12_resource_barrier",
+            "d3d12_draw",
         ] {
             assert!(
                 ALL_CATEGORIES.contains(&category),
@@ -3760,8 +3983,63 @@ mod tests {
             assert!(!vectors.is_empty());
             for vector in &vectors {
                 assert_eq!(vector.category, category);
+                let result = compute_runtime_result(vector);
+                match category {
+                    "d3d12_device" => {
+                        assert_eq!(result.output["device_created"], true);
+                        assert_eq!(result.output["node_count"], 1);
+                    }
+                    "d3d12_command_queue" => {
+                        assert_eq!(result.output["created"], true);
+                        assert_ne!(result.output["queue"].as_u64(), Some(0));
+                    }
+                    "d3d12_command_allocator" => {
+                        assert_eq!(result.output["created"], true);
+                        assert_ne!(result.output["allocator"].as_u64(), Some(0));
+                    }
+                    "d3d12_command_list" => {
+                        let closed = result.output["closed"].as_bool().expect("closed flag");
+                        if closed {
+                            assert_eq!(result.output["commands"], 0);
+                        } else {
+                            assert!(result.output.get("commands").is_none());
+                        }
+                    }
+                    "d3d12_feature_support" => {
+                        assert!(result.output["features"].is_object());
+                    }
+                    "d3d12_descriptor_heap" => {
+                        assert_eq!(result.output["increment"], 16);
+                        assert_eq!(result.output["count"], 4);
+                        assert_ne!(result.output["heap"].as_u64(), Some(0));
+                    }
+                    "d3d12_render_target_view" => {
+                        assert_eq!(result.output["write_ok"], true);
+                        assert_eq!(result.output["descriptors"], 1);
+                    }
+                    "d3d12_fence" => {
+                        assert_eq!(result.output["value"], 7);
+                    }
+                    "d3d12_resource_barrier" => {
+                        assert_eq!(result.output["barrier_ok"], true);
+                    }
+                    "d3d12_draw" => {
+                        assert_eq!(result.output["recorded"], true);
+                        assert_eq!(result.output["commands"], 1);
+                    }
+                    "d3d12_texture_address_mode"
+                    | "d3d12_filter_reduction"
+                    | "d3d12_filter_translation" => {}
+                    other => panic!("missing oracle assertion for {other}"),
+                }
             }
         }
+        let unsupported = compute_runtime_result(&Vector {
+            id: "d3d12_unknown:000".to_string(),
+            category: "d3d12_unknown".to_string(),
+            input: json!({}),
+        });
+        assert_eq!(unsupported.output["runtime_unavailable"], true);
     }
 
     // ── time_clock ──────────────────────────────────────────────────────────

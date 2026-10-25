@@ -30,6 +30,17 @@
 #      api_report_provenance_sha256 is present for inline provenance, the
 #      canonical inline content hash must match too. Nothing is required when
 #      the fields and sidecar are absent, so older evidence keeps working.
+#   7. The compiled-test manifest is REQUIRED: test_manifest is present next to
+#      the evidence, its byte hash matches test_manifest_sha256, its canonical
+#      digest matches test_manifest_canonical_sha256, its commit/tree match
+#      HEAD, every declared conformance/scenario suite binds to a compiled,
+#      runnable test target/function, and every declared windows-oracle
+#      category the oracle advertises is compiled into ALL_CATEGORIES with a
+#      reference executor and is required by the capture workflow. Categories
+#      the oracle does not advertise are reported as explicit warnings by the
+#      verifier rather than silently accepted.
+#      The manifest is produced by ci/evidence_manifest.py in the CI test job
+#      and folded into the evidence by ci/fold_api_report_provenance.py.
 #
 # The Steam E2E artifact content digest is deterministic across machines:
 #   digest = sha256( sha256(commit.txt) + sha256(acceptance.json)
@@ -61,6 +72,12 @@
 #                              // or the full provenance object inline
 #     "api_report_provenance_sha256": "<sha256 of canonical inline provenance>"
 #     "tree": "<git tree hash recorded by the provenance sidecar>"
+#
+# Required compiled-test manifest binding (never optional):
+#
+#     "test_manifest": "test-manifest.json",
+#     "test_manifest_sha256": "<sha256 of test-manifest.json>",
+#     "test_manifest_canonical_sha256": "<manifest_sha256 recorded inside it>"
 #
 # When the evidence does not declare the api-report fields, the gate falls back
 # to <evidence-dir>/api-completeness.json.provenance.json if that file exists.
@@ -458,6 +475,53 @@ print(json.load(sys.stdin).get("determinism", {}).get("reproducible", ""))
   fi
 fi
 
+# ── 7. Compiled test/evidence manifest (required) ────────────────────────────
+TEST_MANIFEST="$(json_field "$EVIDENCE" test_manifest)"
+TEST_MANIFEST_SHA="$(json_field "$EVIDENCE" test_manifest_sha256)"
+TEST_MANIFEST_CANONICAL_SHA="$(json_field "$EVIDENCE" test_manifest_canonical_sha256)"
+if [[ -z "$TEST_MANIFEST" || -z "$TEST_MANIFEST_SHA" || -z "$TEST_MANIFEST_CANONICAL_SHA" ]]; then
+  fail "evidence is missing the compiled test manifest binding"
+  fail "  required: test_manifest, test_manifest_sha256, test_manifest_canonical_sha256"
+  fail "  the CI test job must upload test-manifest-<sha> and the release fold must bind it"
+  FAIL=$((FAIL + 1))
+else
+  MANIFEST_PATH="$EVIDENCE_DIR/$TEST_MANIFEST"
+  if [[ ! -f "$MANIFEST_PATH" ]]; then
+    fail "compiled test manifest not found: $MANIFEST_PATH"
+    FAIL=$((FAIL + 1))
+  else
+    ACTUAL_MANIFEST_SHA="$(sha256_of "$MANIFEST_PATH")"
+    if [[ "$ACTUAL_MANIFEST_SHA" == "$TEST_MANIFEST_SHA" ]]; then
+      info "  ✅ test_manifest_sha256 matches the manifest bytes"
+      PASS=$((PASS + 1))
+    else
+      fail "test manifest hash mismatch: evidence records $TEST_MANIFEST_SHA, $MANIFEST_PATH yields $ACTUAL_MANIFEST_SHA"
+      FAIL=$((FAIL + 1))
+    fi
+
+    ACTUAL_MANIFEST_CANONICAL_SHA="$(python3 "$REPO_ROOT/ci/evidence_manifest.py" \
+      --print-digest "$MANIFEST_PATH" --require-head 2>/dev/null || true)"
+    if [[ -n "$ACTUAL_MANIFEST_CANONICAL_SHA" \
+      && "$ACTUAL_MANIFEST_CANONICAL_SHA" == "$TEST_MANIFEST_CANONICAL_SHA" ]]; then
+      info "  ✅ test_manifest_canonical_sha256 matches the compiled manifest"
+      PASS=$((PASS + 1))
+    else
+      fail "test manifest canonical hash mismatch: evidence records $TEST_MANIFEST_CANONICAL_SHA, recomputation yields ${ACTUAL_MANIFEST_CANONICAL_SHA:-<invalid>}"
+      FAIL=$((FAIL + 1))
+    fi
+
+    if python3 "$REPO_ROOT/ci/evidence_manifest.py" \
+      --verify "$MANIFEST_PATH" --require-head; then
+      info "  ✅ compiled manifest binds every manifest-checkable declared evidence suite/category"
+      PASS=$((PASS + 1))
+    else
+      fail "compiled manifest does not bind every manifest-checkable declared evidence suite/category"
+      fail "  run: python3 ci/evidence_manifest.py --write ci/test-manifest.json"
+      FAIL=$((FAIL + 1))
+    fi
+  fi
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Release Gate Summary ==="
@@ -471,6 +535,8 @@ if [[ $FAIL -gt 0 ]]; then
   echo "To proceed, re-run the Steam E2E workflow for this exact commit and"
   echo "re-test the signed candidate, then regenerate release-evidence.json"
   echo "with hashes of the exact artifacts tested (see docs/RELEASE_PROCESS.md)."
+  echo "The compiled test manifest must come from a successful CI test job for"
+  echo "this exact commit; a stale or unbound manifest blocks the release."
   exit 1
 fi
 

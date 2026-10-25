@@ -6,7 +6,22 @@ use crate::gfx::{
 };
 use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_D3D12_METAL_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+fn alloc_d3d12_metal_handle() -> u64 {
+    NEXT_D3D12_METAL_HANDLE.fetch_add(1, Ordering::Relaxed)
+}
+
+#[path = "d3d12_directml.rs"]
+pub mod directml;
+#[path = "d3d12_state_objects.rs"]
+pub mod state_objects;
+#[path = "d3d12_work_graphs.rs"]
+pub mod work_graphs;
 
 pub use crate::gfx::{
     AdapterId, AdapterInfo, CommandAllocatorId, CommandListId, CommandQueueId,
@@ -17,6 +32,14 @@ pub use crate::gfx::{
     ResourceDesc, ResourceId, ResourceState, ResourceUsageHint, RootSignatureDesc, RootSignatureId,
     SwapchainDesc, SwapchainId, SwapchainState, ViewDescriptor,
 };
+
+use self::directml::DmlRuntime;
+use self::state_objects::{
+    D3d12StateObject, D3d12StateObjectDesc, D3d12StateSubobject,
+    STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS, STATE_OBJECT_TYPE_COLLECTION,
+    STATE_OBJECT_TYPE_EXECUTABLE, STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, StateObjectMemory,
+};
+use self::work_graphs::{D3d12DispatchGraphDesc, D3d12WorkGraph, D3d12WorkGraphMemoryRequirements};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct D3d12FeatureOptions {
@@ -76,6 +99,12 @@ pub struct D3D12RaytracingPipelineState {
     pub payload_size: u32,
     /// Maximum attribute size in bytes.
     pub attribute_size: u32,
+    /// Translated ray-generation MSL, when the state object supplied ray DXIL.
+    #[serde(default)]
+    pub ray_msl: Option<String>,
+    /// Entry point exported for the translated ray-generation shader.
+    #[serde(default)]
+    pub ray_entry: Option<String>,
 }
 
 /// An acceleration structure managed through the D3D12 bridge.
@@ -91,6 +120,10 @@ pub struct D3D12AccelerationStructure {
     pub metal_accel_handle: u64,
     /// Whether the structure has been built.
     pub built: bool,
+    /// Bytes reported by Metal's compacted-size query.
+    pub compacted_size: u64,
+    /// D3D12 build flags the structure was built with.
+    pub build_flags: u32,
 }
 
 /// Description of a raytracing geometry from D3D12 guest memory.
@@ -145,6 +178,78 @@ pub struct D3D12DispatchRaysDesc {
 }
 
 // ---------------------------------------------------------------------------
+// ID3D12CommandSignature / ExecuteIndirect
+// ---------------------------------------------------------------------------
+
+/// D3D12_INDIRECT_ARGUMENT_TYPE values.
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: u32 = 0;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: u32 = 1;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: u32 = 2;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: u32 = 3;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: u32 = 4;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: u32 = 5;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW: u32 = 6;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW: u32 = 7;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: u32 = 8;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS: u32 = 9;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: u32 = 10;
+pub const D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT: u32 = 11;
+
+/// One parsed D3D12_INDIRECT_ARGUMENT_DESC. Only the argument type is needed
+/// for the supported single-argument ExecuteIndirect signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12IndirectArgumentDesc {
+    pub ty: u32,
+    pub root_parameter_index: u32,
+    pub dest_offset_in_32bit_values: u32,
+    pub num_32bit_values_to_set: u32,
+}
+
+/// Parsed D3D12_COMMAND_SIGNATURE_DESC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3D12CommandSignatureDesc {
+    pub byte_stride: u32,
+    pub node_mask: u32,
+    pub arguments: Vec<D3D12IndirectArgumentDesc>,
+}
+
+/// A live command signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3D12CommandSignature {
+    pub handle: u64,
+    pub byte_stride: u32,
+    pub node_mask: u32,
+    pub argument: D3D12IndirectArgumentDesc,
+}
+
+/// Arguments consumed by one indirect DRAW command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12DrawArguments {
+    pub vertex_count_per_instance: u32,
+    pub instance_count: u32,
+    pub start_vertex_location: u32,
+    pub start_instance_location: u32,
+}
+
+/// Arguments consumed by one indirect DISPATCH/DISPATCH_MESH command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12DispatchArguments {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// A Work Graph program bound to a command list by
+/// `ID3D12GraphicsCommandList10::SetProgram`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3d12WorkGraphProgram {
+    pub state_object: u64,
+    pub program_name: String,
+    pub flags: u32,
+    pub backing_memory: Option<(u64, u64)>,
+}
+
+// ---------------------------------------------------------------------------
 // D3d12Runtime
 // ---------------------------------------------------------------------------
 
@@ -192,6 +297,68 @@ impl UploadCompletionHook {
     }
 }
 
+/// Native Metal render pipeline registered for a D3D12 PSO.
+#[derive(Debug, Clone)]
+struct D3d12NativePipeline {
+    vertex_msl: String,
+    fragment_msl: String,
+    pixel_format: DxgiFormat,
+}
+
+/// Native command-list state retained from SetPipelineState / IA / OM calls.
+#[derive(Debug, Clone, Default)]
+struct D3d12NativeCommandState {
+    pipeline: Option<u64>,
+    color_resource: Option<ResourceId>,
+    color_width: u32,
+    color_height: u32,
+    color_format: Option<DxgiFormat>,
+    vertex_resource: Option<ResourceId>,
+    vertex_offset: u64,
+    index_resource: Option<ResourceId>,
+    index_offset: u64,
+    index_format: u32,
+}
+
+/// A real Metal acceleration structure owned by the D3D12 bridge.
+struct D3d12MetalStructure {
+    structure: metal::AccelerationStructure,
+    instance_masks: Vec<u32>,
+}
+
+struct D3d12MetalRayTracingInner {
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    ray_pipeline: crate::metal_backend::MetalRayQueryPipeline,
+    structures: BTreeMap<u64, D3d12MetalStructure>,
+    guest_to_handle: BTreeMap<u64, u64>,
+    last_ray_results: Vec<crate::metal_backend::MetalRayResult>,
+    work_graph: Option<crate::metal_backend::MetalWorkGraphFanout>,
+    last_work_graph_records: Vec<u32>,
+    indirect_interpreter: Option<crate::metal_backend::MetalIndirectInterpreter>,
+    native_render_pipelines: BTreeMap<u64, metal::RenderPipelineState>,
+    ray_shader_programs: BTreeMap<u64, crate::metal_backend::MetalRayShaderProgram>,
+    last_ray_payloads: Vec<crate::metal_backend::MetalRayPayloadResult>,
+    last_indirect_results: Vec<crate::metal_backend::MetalIndirectResult>,
+    last_indirect_effective: u32,
+    last_indirect_native: bool,
+    last_indirect_boundary: Option<String>,
+}
+
+/// Lazily initialised real Metal raytracing state for the D3D12 bridge.
+#[derive(Clone)]
+struct D3d12MetalRayTracing {
+    inner: std::sync::Arc<std::sync::Mutex<D3d12MetalRayTracingInner>>,
+}
+
+#[rustfmt::skip]
+impl std::fmt::Debug for D3d12MetalRayTracing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("D3d12MetalRayTracing")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct D3d12Runtime {
     backend: GraphicsBackend,
@@ -199,10 +366,22 @@ pub struct D3d12Runtime {
     shading_rate: u32,
     /// Map from guest state-object pointer to parsed pipeline state.
     raytracing_pipeline_states: BTreeMap<u64, D3D12RaytracingPipelineState>,
+    /// Live D3D12 state objects keyed by the guest-visible handle.
+    state_objects: BTreeMap<u64, D3d12StateObject>,
+    /// Monotonic allocator for bridge-owned state-object handles.
+    next_state_object_handle: u64,
+    /// State object currently bound to each command list by SetPipelineState1.
+    pipeline_state_objects: BTreeMap<CommandListId, u64>,
+    /// Work-graph program currently bound to each command list by SetProgram.
+    work_graph_programs: BTreeMap<CommandListId, D3d12WorkGraphProgram>,
+    /// Parsed command signatures keyed by the handle returned to the guest.
+    command_signatures: BTreeMap<u64, D3D12CommandSignature>,
+    /// Monotonic allocator for command-signature handles.
+    next_command_signature_handle: u64,
+    /// DirectML device/operator/compile/dispatch registry.
+    directml: DmlRuntime,
     /// Map from GPU virtual address to acceleration structure metadata.
     acceleration_structures: BTreeMap<u64, D3D12AccelerationStructure>,
-    /// Monotonic counter for Metal acceleration structure handles.
-    next_metal_as_handle: u64,
     /// Query heap tracking for begin/end query pairs.
     query_heaps: BTreeMap<u64, QueryHeap>,
     /// Depth bounds min/max (set by OMSetDepthBounds).
@@ -269,6 +448,21 @@ pub struct D3d12Runtime {
     directstorage_completion: UploadCompletionHook,
     /// Resources created by async enqueues that have not completed yet.
     directstorage_pending_resources: Vec<(ResourceId, u64)>,
+    /// Real Metal acceleration structures, ray traversal pipelines and
+    /// dispatch readback, created on first use.
+    metal_raytracing: Option<D3d12MetalRayTracing>,
+    /// Registered CPU bytes for raytracing input buffers keyed by GPU address.
+    raytracing_buffer_bytes: BTreeMap<u64, Vec<u8>>,
+    /// Registered D3D12 instance descriptors keyed by the TLAS destination.
+    raytracing_instance_bytes: BTreeMap<u64, Vec<u8>>,
+    /// Translated native render pipelines keyed by native handle.
+    native_pipelines: BTreeMap<u64, D3d12NativePipeline>,
+    /// Native pipeline bound to each D3D12 pipeline state object.
+    pso_native_pipelines: BTreeMap<PipelineStateId, u64>,
+    /// Native render state per open command list.
+    native_command_states: BTreeMap<CommandListId, D3d12NativeCommandState>,
+    /// Render-target dimensions keyed by resource.
+    native_target_dimensions: BTreeMap<ResourceId, (u32, u32)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -345,8 +539,14 @@ impl Default for D3d12Runtime {
             render_pass_active: false,
             shading_rate: 0,
             raytracing_pipeline_states: BTreeMap::new(),
+            state_objects: BTreeMap::new(),
+            next_state_object_handle: 0x5000,
+            pipeline_state_objects: BTreeMap::new(),
+            work_graph_programs: BTreeMap::new(),
+            command_signatures: BTreeMap::new(),
+            next_command_signature_handle: 1,
+            directml: DmlRuntime::new(),
             acceleration_structures: BTreeMap::new(),
-            next_metal_as_handle: 1,
             query_heaps: BTreeMap::new(),
             depth_bounds_min: 0.0,
             depth_bounds_max: 1.0,
@@ -376,6 +576,13 @@ impl Default for D3d12Runtime {
             directstorage_queue: None,
             directstorage_completion: UploadCompletionHook::default(),
             directstorage_pending_resources: Vec::new(),
+            metal_raytracing: None,
+            raytracing_buffer_bytes: BTreeMap::new(),
+            raytracing_instance_bytes: BTreeMap::new(),
+            native_pipelines: BTreeMap::new(),
+            pso_native_pipelines: BTreeMap::new(),
+            native_command_states: BTreeMap::new(),
+            native_target_dimensions: BTreeMap::new(),
         }
     }
 }
@@ -391,8 +598,14 @@ impl D3d12Runtime {
             render_pass_active: false,
             shading_rate: 0,
             raytracing_pipeline_states: BTreeMap::new(),
+            state_objects: BTreeMap::new(),
+            next_state_object_handle: 0x5000,
+            pipeline_state_objects: BTreeMap::new(),
+            work_graph_programs: BTreeMap::new(),
+            command_signatures: BTreeMap::new(),
+            next_command_signature_handle: 1,
+            directml: DmlRuntime::new(),
             acceleration_structures: BTreeMap::new(),
-            next_metal_as_handle: 1,
             query_heaps: BTreeMap::new(),
             depth_bounds_min: 0.0,
             depth_bounds_max: 1.0,
@@ -422,6 +635,13 @@ impl D3d12Runtime {
             directstorage_queue: None,
             directstorage_completion: UploadCompletionHook::default(),
             directstorage_pending_resources: Vec::new(),
+            metal_raytracing: None,
+            raytracing_buffer_bytes: BTreeMap::new(),
+            raytracing_instance_bytes: BTreeMap::new(),
+            native_pipelines: BTreeMap::new(),
+            pso_native_pipelines: BTreeMap::new(),
+            native_command_states: BTreeMap::new(),
+            native_target_dimensions: BTreeMap::new(),
         }
     }
 
@@ -1449,8 +1669,10 @@ impl D3d12Runtime {
         windows_path: &str,
         desc: crate::metal_backend::DirectStorageUploadDesc,
     ) -> AppResult<ResourceId> {
-        let (mut file, normalized_path) = Self::open_directstorage_file(ge, windows_path)?;
-        let upload = crate::metal_backend::upload_texture_from_file(&mut file, desc)?;
+        let (file, normalized_path) = Self::open_directstorage_file(ge, windows_path)?;
+        let host_path = ge.host_path_for_windows_path(&normalized_path)?;
+        drop(file);
+        let upload = crate::metal_backend::upload_texture_from_path(&host_path, desc)?;
         let stats = upload.stats();
         let format = upload.dxgi_format().ok_or_else(|| {
             AppError::new(
@@ -2586,87 +2808,702 @@ impl D3d12Runtime {
         Ok(())
     }
 
-    /// Build a raytracing acceleration structure.
+    /// Register the CPU bytes for a guest GPU buffer used as raytracing input.
     ///
-    /// `desc` contains the parsed D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC.
-    /// This bridges to `metal_backend::create_acceleration_structure` and stores
-    /// the resulting metadata. For bottom-level AS (BLAS), D3D12 geometry descriptors
-    /// are converted to Metal geometry descriptors. For top-level AS (TLAS), instance
-    /// descriptors are converted to Metal instance descriptors.
+    /// The D3D12 bridge has no global GPU virtual-address map; the dispatch
+    /// layer supplies the bytes it read from guest memory so the Metal build
+    /// consumes the real vertex/index data instead of only descriptor metadata.
+    pub fn register_raytracing_buffer(&mut self, gpu_address: u64, bytes: Vec<u8>) {
+        self.raytracing_buffer_bytes.insert(gpu_address, bytes);
+    }
+
+    /// Register D3D12_RAYTRACING_INSTANCE_DESC records for a top-level build.
+    pub fn register_raytracing_instances(&mut self, dest_address: u64, bytes: Vec<u8>) {
+        self.raytracing_instance_bytes.insert(dest_address, bytes);
+    }
+
+    fn metal_raytracing(&mut self) -> AppResult<D3d12MetalRayTracing> {
+        if let Some(existing) = &self.metal_raytracing {
+            return Ok(existing.clone());
+        }
+        let device = crate::metal_backend::MetalDevice::system_default()?.metal_device_owned();
+        let queue = device.new_command_queue();
+        let ray_pipeline = crate::metal_backend::create_ray_query_pipeline(&device)?;
+        let bridge = D3d12MetalRayTracing {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(D3d12MetalRayTracingInner {
+                device,
+                queue,
+                ray_pipeline,
+                structures: BTreeMap::new(),
+                guest_to_handle: BTreeMap::new(),
+                last_ray_results: Vec::new(),
+                work_graph: None,
+                last_work_graph_records: Vec::new(),
+                indirect_interpreter: None,
+                native_render_pipelines: BTreeMap::new(),
+                ray_shader_programs: BTreeMap::new(),
+                last_ray_payloads: Vec::new(),
+                last_indirect_results: Vec::new(),
+                last_indirect_effective: 0,
+                last_indirect_native: false,
+                last_indirect_boundary: None,
+            })),
+        };
+        self.metal_raytracing = Some(bridge.clone());
+        Ok(bridge)
+    }
+
+    /// Build a raytracing acceleration structure with real Metal objects.
     ///
-    /// The size estimation uses geometry data for accurate allocation:
-    ///   - BLAS: vertex count × vertex stride + index buffer overhead + header
-    ///   - TLAS: instance count × instance descriptor size + header
-    ///
-    /// In a full Metal implementation, `device.acceleration_structure_sizes_with_descriptor()`
-    /// would be called for exact sizing.
+    /// Bottom-level structures consume the registered vertex/index bytes (or a
+    /// zero-filled buffer of the declared size when no bytes were registered);
+    /// top-level structures consume D3D12 instance descriptors, resolve their
+    /// BLAS references and honour instance masks/options. Both paths encode a
+    /// real `buildAccelerationStructure`, query the compacted size and compact
+    /// when D3D12 requested `ALLOW_COMPACTION`.
+#[rustfmt::skip]
     pub fn build_raytracing_acceleration_structure(
         &mut self,
         _list: CommandListId,
         desc: &D3D12BuildAccelerationStructureDesc,
     ) -> AppResult<u64> {
-        let is_tlas = desc.inputs.ty == 1;
-        let gpu_address = desc.dest_address;
+        const BUILD_FLAG_ALLOW_UPDATE: u32 = 0x1;
+        const BUILD_FLAG_ALLOW_COMPACTION: u32 = 0x2;
+        const BUILD_FLAG_PREFER_FAST_TRACE: u32 = 0x4;
+        const BUILD_FLAG_PREFER_FAST_BUILD: u32 = 0x8;
+        const BUILD_FLAG_MINIMIZE_MEMORY: u32 = 0x10;
+        const GEOMETRY_FLAG_OPAQUE: u32 = 0x1;
+        const GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT: u32 = 0x2;
 
-        // Build a Metal acceleration structure descriptor from the D3D12 geometry info.
-        // For bottom-level AS, we convert D3D12 geometry descs to Metal geometry descs.
-        // For top-level AS (instance descs) we create instances; for the bridge we
-        // create a minimal TLAS referencing the BLAS entries.
-        let metal_handle = self.next_metal_as_handle;
-        self.next_metal_as_handle += 1;
+        if desc.dest_address % 256 != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "BuildRaytracingAccelerationStructure DestAccelerationStructureData {:#x} is not 256-byte aligned",
+                    desc.dest_address
+                ),
+            ));
+        }
+        if desc.scratch_address % 256 != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "BuildRaytracingAccelerationStructure ScratchAccelerationStructureData {:#x} is not 256-byte aligned",
+                    desc.scratch_address
+                ),
+            ));
+        }
+        if desc.scratch_address == desc.dest_address {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "BuildRaytracingAccelerationStructure scratch and destination overlap",
+            ));
+        }
+        let valid_flags = BUILD_FLAG_ALLOW_UPDATE
+            | BUILD_FLAG_ALLOW_COMPACTION
+            | BUILD_FLAG_PREFER_FAST_TRACE
+            | BUILD_FLAG_PREFER_FAST_BUILD
+            | BUILD_FLAG_MINIMIZE_MEMORY;
+        if desc.inputs.flags & !valid_flags != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "BuildRaytracingAccelerationStructure flags {:#x} contain undefined bits",
+                    desc.inputs.flags
+                ),
+            ));
+        }
+        let is_tlas = match desc.inputs.ty {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE {other} is not defined"),
+                ));
+            }
+        };
+        if desc.inputs.num_descs == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "BuildRaytracingAccelerationStructure NumDescs must be non-zero",
+            ));
+        }
 
-        // Calculate size based on geometry data with proper alignment.
-        // Metal acceleration structure sizes follow these patterns:
-        //   - BLAS: header (~64 bytes) + geometry data per triangle + scratch space
-        //   - TLAS: header (~64 bytes) + instance descriptors (72 bytes each) + scratch
-        //
-        // These estimates match what Metal's acceleration_structure_sizes_with_descriptor
-        // would return for typical geometries.
-        let size_estimate = if is_tlas {
-            // TLAS: header + instance descriptors with 16-byte alignment
-            64 + desc.inputs.num_descs as u64 * 72
-        } else {
-            // BLAS: header + per-geometry data (vertex data + index data + metadata)
-            64 + desc
-                .inputs
-                .geometries
+        let bridge = self.metal_raytracing()?;
+        let mut inner = bridge
+            .inner
+            .lock()
+            .expect("Metal raytracing bridge lock poisoned");
+
+        let (metal_handle, size, compacted_size) = if is_tlas {
+            let instance_stride = 64u64;
+            let required = (desc.inputs.num_descs as u64) * instance_stride;
+            let mut instance_bytes = self
+                .raytracing_instance_bytes
+                .get(&desc.dest_address)
+                .cloned()
+                .unwrap_or_else(|| vec![0u8; required as usize]);
+            if (instance_bytes.len() as u64) < required {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "TLAS instance descriptor range {required} exceeds the registered {} bytes",
+                        instance_bytes.len()
+                    ),
+                ));
+            }
+            instance_bytes.truncate(required as usize);
+            // Resolve the BLAS list referenced by the D3D12 instance records.
+            let mut referenced: Vec<u64> = Vec::new();
+            for index in 0..desc.inputs.num_descs as usize {
+                let offset = index * instance_stride as usize;
+                let address = u64::from_le_bytes(
+                    instance_bytes[offset + 56..offset + 64]
+                        .try_into()
+                        .expect("8-byte instance tail"),
+                );
+                if address != 0 && !referenced.contains(&address) {
+                    referenced.push(address);
+                }
+            }
+            let mut metal_instances = Vec::with_capacity(desc.inputs.num_descs as usize);
+            let mut instance_masks = Vec::with_capacity(desc.inputs.num_descs as usize);
+            let mut instanced_handles = Vec::new();
+            for address in &referenced {
+                let handle = inner.guest_to_handle.get(address).copied().ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        format!("instance references unknown acceleration structure {address:#x}"),
+                    )
+                })?;
+                instanced_handles.push(handle);
+            }
+            for index in 0..desc.inputs.num_descs as usize {
+                let offset = index * instance_stride as usize;
+                let address = u64::from_le_bytes(
+                    instance_bytes[offset + 56..offset + 64]
+                        .try_into()
+                        .expect("8-byte instance tail"),
+                );
+                if address == 0 {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "top-level acceleration structure instance has a zero AccelerationStructure address",
+                    ));
+                }
+                let structure_index = referenced
+                    .iter()
+                    .position(|candidate| *candidate == address)
+                    .expect("referenced address was resolved");
+                let mut instance = metal::MTLAccelerationStructureInstanceDescriptor::default();
+                for row in 0..3 {
+                    for column in 0..4 {
+                        let source = offset + (row * 4 + column) * 4;
+                        instance.transformation_matrix[column][row] = f32::from_le_bytes(
+                            instance_bytes[source..source + 4]
+                                .try_into()
+                                .expect("4-byte transform element"),
+                        );
+                    }
+                }
+                let identity = [
+                    [1.0f32, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0],
+                ];
+                if instance.transformation_matrix == [[0.0f32; 3]; 4] {
+                    instance.transformation_matrix = identity;
+                }
+                let id_and_mask = u32::from_le_bytes(
+                    instance_bytes[offset + 48..offset + 52]
+                        .try_into()
+                        .expect("4-byte instance id"),
+                );
+                instance.mask = (id_and_mask >> 24) & 0xFF;
+                let contribution_and_flags = u32::from_le_bytes(
+                    instance_bytes[offset + 52..offset + 56]
+                        .try_into()
+                        .expect("4-byte instance flags"),
+                );
+                let instance_flags = (contribution_and_flags >> 24) & 0xFF;
+                let mut options = metal::MTLAccelerationStructureInstanceOptions::None;
+                options.set(
+                    metal::MTLAccelerationStructureInstanceOptions::DisableTriangleCulling,
+                    instance_flags & 0x1 != 0,
+                );
+                options.set(
+                    metal::MTLAccelerationStructureInstanceOptions::TriangleFrontFacingWindingCounterClockwise,
+                    instance_flags & 0x2 != 0,
+                );
+                options.set(
+                    metal::MTLAccelerationStructureInstanceOptions::Opaque,
+                    instance_flags & 0x4 != 0,
+                );
+                options.set(
+                    metal::MTLAccelerationStructureInstanceOptions::NonOpaque,
+                    instance_flags & 0x8 != 0,
+                );
+                instance.options = options;
+                instance.intersection_function_table_offset = 0;
+                instance.acceleration_structure_index = structure_index as u32;
+                instance_masks.push(instance.mask);
+                metal_instances.push(instance);
+            }
+            let instance_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    metal_instances.as_ptr() as *const u8,
+                    std::mem::size_of_val(metal_instances.as_slice()),
+                )
+            };
+            let instance_buffer = inner.device.new_buffer_with_data(
+                instance_bytes.as_ptr() as *const std::ffi::c_void,
+                instance_bytes.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let blas_refs: Vec<&metal::AccelerationStructureRef> = instanced_handles
                 .iter()
-                .map(|g| {
-                    let vertex_data = g.vertex_count as u64 * g.vertex_stride as u64;
-                    let index_data = if g.index_buffer != 0 {
-                        g.index_count as u64 * 4 // max index size
-                    } else {
-                        0
-                    };
-                    // Acceleration structure internal overhead per geometry
-                    let metadata = 128u64;
-                    vertex_data + index_data + metadata
+                .map(|handle| {
+                    inner
+                        .structures
+                        .get(handle)
+                        .expect("validated BLAS handle")
+                        .structure
+                        .as_ref()
                 })
-                .sum::<u64>()
+                .collect();
+            let sizes = crate::metal_backend::instance_acceleration_structure_sizes(
+                &inner.device,
+                &instance_buffer,
+                desc.inputs.num_descs,
+                std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64,
+                metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+                &blas_refs,)?;
+            let mut tlas = crate::metal_backend::create_instance_acceleration_structure(
+                &inner.device,
+                &instance_buffer,
+                desc.inputs.num_descs,
+                std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64,
+                metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+                &blas_refs,)?;
+            let scratch = crate::metal_backend::allocate_acceleration_scratch_buffer(
+                &inner.device,
+                sizes.build_scratch_size.max(sizes.refit_scratch_size),
+            );
+            let command_buffer = inner.queue.new_command_buffer();
+            let encoder =
+                crate::metal_backend::MetalAccelerationStructureEncoder::new(command_buffer)?;
+            crate::metal_backend::build_instance_acceleration_structure(
+                &encoder,
+                &mut tlas,
+                &scratch,
+                0,
+                &instance_buffer,
+                &blas_refs,)?;
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            let compacted =
+                Self::query_compacted_size(&inner.queue, tlas.acceleration_structure.as_ref());
+            let (structure, size) = if desc.inputs.flags & BUILD_FLAG_ALLOW_COMPACTION != 0
+                && compacted > 0
+            {
+                let destination = inner.device.new_acceleration_structure_with_size(compacted);
+                let compact_buffer = inner.queue.new_command_buffer();
+                let encoder =
+                    crate::metal_backend::MetalAccelerationStructureEncoder::new(compact_buffer)?;
+                crate::metal_backend::compact_acceleration_structure(
+                    &encoder,
+                    tlas.acceleration_structure.as_ref(),
+                    destination.as_ref(),
+                );
+                encoder.end_encoding();
+                compact_buffer.commit();
+                compact_buffer.wait_until_completed();
+                (destination, compacted)
+            } else {
+                (tlas.acceleration_structure, tlas.size as u64)
+            };
+            let handle = alloc_d3d12_metal_handle();
+            inner.structures.insert(
+                handle,
+                D3d12MetalStructure {
+                    structure,
+                    instance_masks,
+                },
+            );
+            inner.guest_to_handle.insert(desc.dest_address, handle);
+            (handle, size, compacted)
+        } else {
+            if desc.inputs.geometries.len() != desc.inputs.num_descs as usize {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "BuildRaytracingAccelerationStructure NumDescs {} does not match {} geometry descriptors",
+                        desc.inputs.num_descs,
+                        desc.inputs.geometries.len()
+                    ),
+                ));
+            }
+            if desc.inputs.geometries.len() > 1 {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "bottom-level acceleration structure with multiple geometries must use DescriptorsLayout",
+                ));
+            }
+            let mut metal_geometries = Vec::new();
+            let mut metal_buffers = Vec::new();
+            for (index, geometry) in desc.inputs.geometries.iter().enumerate() {
+                if geometry.flags & !(GEOMETRY_FLAG_OPAQUE | GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT) != 0
+                {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        format!(
+                            "geometry {index} flags {:#x} contain undefined bits",
+                            geometry.flags
+                        ),
+                    ));
+                }
+                match geometry.ty {
+                    0 => {
+                        if geometry.vertex_buffer % 4 != 0 {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!(
+                                    "geometry {index} vertex buffer {:#x} is not 4-byte aligned",
+                                    geometry.vertex_buffer
+                                ),
+                            ));
+                        }
+                        if geometry.vertex_stride == 0 || geometry.vertex_stride % 4 != 0 {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!(
+                                    "geometry {index} vertex stride {} must be a non-zero multiple of 4",
+                                    geometry.vertex_stride
+                                ),
+                            ));
+                        }
+                        let (vertex_format, minimum_stride) =
+                            Self::dxgi_raytracing_vertex_format(geometry.vertex_format, index)?;
+                        if geometry.vertex_stride < minimum_stride {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!(
+                                    "geometry {index} vertex stride {} is smaller than the {} bytes required by the format",
+                                    geometry.vertex_stride, minimum_stride
+                                ),
+                            ));
+                        }
+                        if geometry.vertex_count < 3 {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!(
+                                    "geometry {index} vertex count {} is smaller than 3",
+                                    geometry.vertex_count
+                                ),
+                            ));
+                        }
+                        let indexed = geometry.index_buffer != 0;
+                        let (index_format, index_size) = if indexed {
+                            if geometry.index_buffer % 4 != 0 {
+                                return Err(AppError::new(
+                                    ReasonCode::RcD3dInvalidState,
+                                    format!(
+                                        "geometry {index} index buffer {:#x} is not 4-byte aligned",
+                                        geometry.index_buffer
+                                    ),
+                                ));
+                            }
+                            if geometry.index_count == 0 || geometry.index_count % 3 != 0 {
+                                return Err(AppError::new(
+                                    ReasonCode::RcD3dInvalidState,
+                                    format!(
+                                        "geometry {index} index count {} is not a non-zero multiple of 3",
+                                        geometry.index_count
+                                    ),
+                                ));
+                            }
+                            let (format, size) =
+                                Self::dxgi_raytracing_index_format(geometry.index_format, index)?;
+                            (Some(format), size)
+                        } else {
+                            (None, 0)
+                        };
+                        let vertex_required =
+                            geometry.vertex_count as u64 * geometry.vertex_stride as u64;
+                        let vertex_bytes = self
+                            .raytracing_buffer_bytes
+                            .get(&geometry.vertex_buffer)
+                            .cloned()
+                            .unwrap_or_else(|| vec![0u8; vertex_required as usize]);
+                        if (vertex_bytes.len() as u64) < vertex_required {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!(
+                                    "geometry {index} vertex buffer range {vertex_required} exceeds the registered {} bytes",
+                                    vertex_bytes.len()
+                                ),
+                            ));
+                        }
+                        let vertex_buffer = inner.device.new_buffer_with_data(
+                            vertex_bytes.as_ptr() as *const std::ffi::c_void,
+                            vertex_required,
+                            metal::MTLResourceOptions::StorageModeShared,
+                        );
+                        let (index_buffer, index_required) = if indexed {
+                            let index_required = geometry.index_count as u64 * index_size;
+                            let index_bytes = self
+                                .raytracing_buffer_bytes
+                                .get(&geometry.index_buffer)
+                                .cloned()
+                                .unwrap_or_else(|| vec![0u8; index_required as usize]);
+                            if (index_bytes.len() as u64) < index_required {
+                                return Err(AppError::new(
+                                    ReasonCode::RcD3dInvalidState,
+                                    format!(
+                                        "geometry {index} index buffer range {index_required} exceeds the registered {} bytes",
+                                        index_bytes.len()
+                                    ),
+                                ));
+                            }
+                            let buffer = inner.device.new_buffer_with_data(
+                                index_bytes.as_ptr() as *const std::ffi::c_void,
+                                index_required,
+                                metal::MTLResourceOptions::StorageModeShared,
+                            );
+                            (Some((buffer, index_required)), index_required)
+                        } else {
+                            (None, 0)
+                        };
+                        let _ = index_required;
+                        metal_geometries.push(crate::metal_backend::RayTracingGeometryDescriptor {
+                            kind: crate::metal_backend::RayTracingGeometryKind::Triangles,
+                            vertex_buffer: geometry.vertex_buffer,
+                            vertex_stride: geometry.vertex_stride as u64,
+                            vertex_format,
+                            index_buffer: index_format.map(|_| geometry.index_buffer),
+                            index_format,
+                            primitive_count: if indexed {
+                                geometry.index_count / 3
+                            } else {
+                                geometry.vertex_count / 3
+                            },
+                            triangle_count: if indexed {
+                                geometry.index_count / 3
+                            } else {
+                                geometry.vertex_count / 3
+                            },
+                            opaque: geometry.flags & GEOMETRY_FLAG_OPAQUE != 0,
+                            allow_duplicates: false,
+                        });
+                        metal_buffers.push((vertex_buffer, index_buffer));
+                    }
+                    1 => {
+                        if geometry.vertex_buffer % 4 != 0 {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!(
+                                    "geometry {index} bounding-box buffer {:#x} is not 4-byte aligned",
+                                    geometry.vertex_buffer
+                                ),
+                            ));
+                        }
+                        if geometry.vertex_stride < 24 || geometry.vertex_stride % 4 != 0 {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!(
+                                    "geometry {index} bounding-box stride {} must be at least 24 and a multiple of 4",
+                                    geometry.vertex_stride
+                                ),
+                            ));
+                        }
+                        if geometry.vertex_count == 0 {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!("geometry {index} bounding-box count is zero"),
+                            ));
+                        }
+                        let required = geometry.vertex_count as u64 * geometry.vertex_stride as u64;
+                        let bytes = self
+                            .raytracing_buffer_bytes
+                            .get(&geometry.vertex_buffer)
+                            .cloned()
+                            .unwrap_or_else(|| vec![0u8; required as usize]);
+                        if (bytes.len() as u64) < required {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!(
+                                    "geometry {index} bounding-box range {required} exceeds the registered {} bytes",
+                                    bytes.len()
+                                ),
+                            ));
+                        }
+                        let buffer = inner.device.new_buffer_with_data(
+                            bytes.as_ptr() as *const std::ffi::c_void,
+                            required,
+                            metal::MTLResourceOptions::StorageModeShared,
+                        );
+                        metal_geometries.push(crate::metal_backend::RayTracingGeometryDescriptor {
+                            kind: crate::metal_backend::RayTracingGeometryKind::BoundingBoxes,
+                            vertex_buffer: geometry.vertex_buffer,
+                            vertex_stride: geometry.vertex_stride as u64,
+                            vertex_format: crate::metal_backend::VertexFormat::Float3,
+                            index_buffer: None,
+                            index_format: None,
+                            primitive_count: geometry.vertex_count,
+                            triangle_count: 0,
+                            opaque: geometry.flags & GEOMETRY_FLAG_OPAQUE != 0,
+                            allow_duplicates: false,
+                        });
+                        metal_buffers.push((buffer, None));
+                    }
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!("geometry {index} type {other} is not defined"),
+                        ));
+                    }
+                }
+            }
+            let descriptor = crate::metal_backend::AccelerationStructureDescriptor {
+                geometry_descriptors: metal_geometries,
+                usage: crate::metal_backend::AccelerationStructureUsage::RayTracing,
+            };
+            let buffers: Vec<crate::metal_backend::RayTracingGeometryBuffers<'_>> = metal_buffers
+                .iter()
+                .map(
+                    |(vertex, index)| crate::metal_backend::RayTracingGeometryBuffers {
+                        vertex_buffer: vertex.as_ref(),
+                        vertex_offset: 0,
+                        index_buffer: index.as_ref().map(|(buffer, _)| (buffer.as_ref(), 0)),
+                    },
+                )
+                .collect();
+            let sizes = crate::metal_backend::primitive_acceleration_structure_sizes(
+                &inner.device,
+                &descriptor,
+                &buffers,)?;
+            let mut blas = crate::metal_backend::create_acceleration_structure(
+                &inner.device,
+                &descriptor,
+                &buffers,)?;
+            let scratch = crate::metal_backend::allocate_acceleration_scratch_buffer(
+                &inner.device,
+                sizes.build_scratch_size.max(sizes.refit_scratch_size),
+            );
+            let command_buffer = inner.queue.new_command_buffer();
+            let encoder =
+                crate::metal_backend::MetalAccelerationStructureEncoder::new(command_buffer)?;
+            crate::metal_backend::build_acceleration_structure(
+                &encoder, &mut blas, &scratch, &buffers,)?;
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            let compacted =
+                Self::query_compacted_size(&inner.queue, blas.acceleration_structure.as_ref());
+            let (structure, size) = if desc.inputs.flags & BUILD_FLAG_ALLOW_COMPACTION != 0
+                && compacted > 0
+            {
+                let destination = inner.device.new_acceleration_structure_with_size(compacted);
+                let compact_buffer = inner.queue.new_command_buffer();
+                let encoder =
+                    crate::metal_backend::MetalAccelerationStructureEncoder::new(compact_buffer)?;
+                crate::metal_backend::compact_acceleration_structure(
+                    &encoder,
+                    blas.acceleration_structure.as_ref(),
+                    destination.as_ref(),
+                );
+                encoder.end_encoding();
+                compact_buffer.commit();
+                compact_buffer.wait_until_completed();
+                (destination, compacted)
+            } else {
+                (blas.acceleration_structure, blas.size as u64)
+            };
+            let handle = alloc_d3d12_metal_handle();
+            inner.structures.insert(
+                handle,
+                D3d12MetalStructure {
+                    structure,
+                    instance_masks: vec![0xFFFF_FFFF],
+                },
+            );
+            inner.guest_to_handle.insert(desc.dest_address, handle);
+            (handle, size, compacted)
         };
 
-        // Minimum viable size for any acceleration structure
-        let size_estimate = size_estimate.max(256);
-
         let accel = D3D12AccelerationStructure {
-            gpu_address,
-            size: size_estimate,
+            gpu_address: desc.dest_address,
+            size,
             is_top_level: is_tlas,
             metal_accel_handle: metal_handle,
             built: true,
+            compacted_size,
+            build_flags: desc.inputs.flags,
         };
-
-        self.acceleration_structures.insert(gpu_address, accel);
-
+        self.acceleration_structures
+            .insert(desc.dest_address, accel);
         self.trace(&format!(
-            "BuildAccelerationStructure: addr=0x{gpu_address:x} {} size={} geoms={}",
+            "BuildAccelerationStructure: addr=0x{:x} {} size={} geoms={} compacted={}",
+            desc.dest_address,
             if is_tlas { "TLAS" } else { "BLAS" },
-            size_estimate,
-            desc.inputs.geometries.len(),
+            size,
+            desc.inputs.num_descs,
+            compacted_size,
         ));
+        Ok(desc.dest_address)
+    }
 
-        // Return the GPU virtual address where the structure "resides"
-        Ok(gpu_address)
+    fn query_compacted_size(
+        queue: &metal::CommandQueueRef,
+        acceleration: &metal::AccelerationStructureRef,
+    ) -> u64 {
+        let device = queue.device();
+        let buffer = device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+        let command_buffer = queue.new_command_buffer();
+        let encoder = crate::metal_backend::MetalAccelerationStructureEncoder::new(command_buffer)
+            .expect("compacted-size encoder");
+        crate::metal_backend::write_compacted_acceleration_structure_size(
+            &encoder,
+            acceleration,
+            buffer.as_ref(),
+            0,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        unsafe { *(buffer.contents() as *const u64) }
+    }
+
+    fn dxgi_raytracing_vertex_format(
+        format: u32,
+        index: usize,
+    ) -> AppResult<(crate::metal_backend::VertexFormat, u32)> {
+        match format {
+            6 | 71 | 80 => Ok((crate::metal_backend::VertexFormat::Float3, 12)),
+            17 => Ok((crate::metal_backend::VertexFormat::Float2, 8)),
+            35 => Ok((crate::metal_backend::VertexFormat::Half3, 8)),
+            other => Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("geometry {index} vertex format {other} is not supported for raytracing"),
+            )),
+        }
+    }
+
+    fn dxgi_raytracing_index_format(
+        format: u32,
+        index: usize,
+    ) -> AppResult<(crate::metal_backend::IndexFormat, u64)> {
+        match format {
+            57 => Ok((crate::metal_backend::IndexFormat::UInt16, 2)),
+            42 | 43 => Ok((crate::metal_backend::IndexFormat::UInt32, 4)),
+            other => Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("geometry {index} index format {other} is not supported for raytracing"),
+            )),
+        }
     }
 
     /// Emit post-build info for acceleration structures.
@@ -2694,7 +3531,7 @@ impl D3d12Runtime {
                 D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE => {
                     // Output: UINT64 CompactedSizeInBytes
                     if base_offset + 8 <= output_buffer.len() {
-                        let compacted_size = accel.map(|a| a.size).unwrap_or(0);
+                        let compacted_size = accel.map(|a| a.compacted_size).unwrap_or(0);
                         let bytes = compacted_size.to_le_bytes();
                         let start = base_offset;
                         let end = (base_offset + 8).min(output_buffer.len());
@@ -2816,11 +3653,14 @@ impl D3d12Runtime {
         let (max_recursion_depth, payload_size, attribute_size) =
             Self::parse_raytracing_pipeline_params(&dxil_bytecode);
 
+        let (ray_msl, ray_entry) = Self::translate_ray_pipeline(&dxil_bytecode)?;
         let pso = D3D12RaytracingPipelineState {
             dxil_bytecode,
             max_recursion_depth,
             payload_size,
             attribute_size,
+            ray_msl,
+            ray_entry,
         };
         self.raytracing_pipeline_states
             .insert(state_object_ptr, pso);
@@ -2895,39 +3735,183 @@ impl D3d12Runtime {
         self.raytracing_pipeline_states.get(&state_object_ptr)
     }
 
-    /// Dispatch rays.
+    /// Dispatch rays through a real Metal traversal.
     ///
-    /// `desc` contains the parsed D3D12_DISPATCH_RAYS_DESC with shader table addresses
-    /// and threadgroup dimensions. This bridges to Metal's `MTLRaytracingCommandEncoder`
-    /// via the acceleration structure encoder pipeline.
-    ///
-    /// The dispatch info is stored for consumption by the Metal command buffer encoder
-    /// during command list execution.
+    /// D3D12 record data (ray records and shader-table records) is registered
+    /// by the dispatch layer from guest memory. The traversal runs Metal's
+    /// hardware intersector against the most recently built TLAS and the
+    /// results are readable with [`last_ray_dispatch_results`]. Arbitrary DXIL
+    /// raygen/hit/miss shaders remain a semantic limitation: they need a
+    /// DXIL-to-MSL translator, so this path executes the real traversal and
+    /// SBT group selection, not the guest shader bodies.
+#[rustfmt::skip]
     pub fn dispatch_rays(
         &mut self,
         list: CommandListId,
         desc: &D3D12DispatchRaysDesc,
     ) -> AppResult<()> {
-        // Validate input parameters
         if desc.raygen_shader_start_address == 0 {
             return Ok(());
         }
         if desc.width == 0 || desc.height == 0 || desc.depth == 0 {
             return Ok(());
         }
-
-        // Record the dispatch rays command into the command list.
-        // The shader table GPU virtual addresses are stored as-is; they will
-        // be resolved to Metal buffer bindings during command buffer execution
-        // by the Metal backend, which maps GPU virtual addresses to Metal
-        // buffer objects.
-        //
-        // During real GPU execution, the Metal backend creates a
-        // MetalRayTracingEncoder (backed by a compute command encoder),
-        // binds the acceleration structure at buffer index 0 and the
-        // intersection function table at buffer index 1 via objc msg_send!,
-        // binds the raygen/miss/hit shader table buffers at indices 2/3/4,
-        // and dispatches an 8×8 threadgroup grid covering width×height×depth.
+        let count = (desc.width as u64)
+            .checked_mul(desc.height as u64)
+            .and_then(|value| value.checked_mul(desc.depth as u64))
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "DispatchRays dimensions overflow",
+                )
+            })?;
+        if count > 16 * 1024 * 1024 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("DispatchRays ray count {count} exceeds the 16 MiB per-dispatch limit"),
+            ));
+        }
+        let tlas = self
+            .acceleration_structures
+            .values()
+            .rev()
+            .find(|structure| structure.is_top_level && structure.built)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "DispatchRays requires a built top-level acceleration structure",
+                )
+            })?;
+        let sbt_stride = desc.hit_group_stride.max(4);
+        let shader_records = self
+            .raytracing_buffer_bytes
+            .get(&desc.hit_group_start_address)
+            .map(|bytes| {
+                let records = (bytes.len() as u64 / sbt_stride).max(1) as usize;
+                let mut values = Vec::with_capacity(records);
+                for index in 0..records {
+                    let offset = index * sbt_stride as usize;
+                    values.push(if offset + 4 <= bytes.len() {
+                        u32::from_le_bytes(
+                            bytes[offset..offset + 4]
+                                .try_into()
+                                .expect("4-byte shader record"),
+                        )
+                    } else {
+                        0
+                    });
+                }
+                values
+            })
+            .unwrap_or_else(|| vec![0]);
+        let registered_rays = self
+            .raytracing_buffer_bytes
+            .get(&desc.raygen_shader_start_address);
+        let required_ray_bytes =
+            count * std::mem::size_of::<crate::metal_backend::MetalRay>() as u64;
+        let rays: Vec<crate::metal_backend::MetalRay> = if let Some(bytes) =
+            registered_rays.filter(|bytes| bytes.len() as u64 >= required_ray_bytes)
+        {
+            let mut rays = Vec::with_capacity(count as usize);
+            for index in 0..count as usize {
+                let offset = index * std::mem::size_of::<crate::metal_backend::MetalRay>();
+                let record =
+                    &bytes[offset..offset + std::mem::size_of::<crate::metal_backend::MetalRay>()];
+                let mut ray = crate::metal_backend::MetalRay::default();
+                for (component, slot) in ray.origin.iter_mut().enumerate() {
+                    *slot = f32::from_le_bytes(
+                        record[component * 4..component * 4 + 4]
+                            .try_into()
+                            .expect("ray origin"),
+                    );
+                }
+                ray.min_distance =
+                    f32::from_le_bytes(record[12..16].try_into().expect("ray min distance"));
+                for (component, slot) in ray.direction.iter_mut().enumerate() {
+                    *slot = f32::from_le_bytes(
+                        record[16 + component * 4..20 + component * 4]
+                            .try_into()
+                            .expect("ray direction"),
+                    );
+                }
+                ray.max_distance =
+                    f32::from_le_bytes(record[28..32].try_into().expect("ray max distance"));
+                ray.sbt_offset =
+                    u32::from_le_bytes(record[32..36].try_into().expect("ray SBT offset"));
+                ray.mask = u32::from_le_bytes(record[36..40].try_into().expect("ray mask"));
+                rays.push(ray);
+            }
+            rays
+        } else {
+            (0..count)
+                .map(|index| {
+                    let x = index % desc.width as u64;
+                    let y = (index / desc.width as u64) % desc.height as u64;
+                    let z = index / (desc.width as u64 * desc.height as u64);
+                    crate::metal_backend::MetalRay {
+                        origin: [x as f32 + 0.5, y as f32 + 0.5, -10.0],
+                        min_distance: 0.0,
+                        direction: [0.0, 0.0, 1.0],
+                        max_distance: 1000.0 + z as f32,
+                        sbt_offset: 0,
+                        mask: 0xFFFF_FFFF,
+                    }
+                })
+                .collect()
+        };
+        let bridge = self.metal_raytracing()?;
+        let mut inner = bridge
+            .inner
+            .lock()
+            .expect("Metal raytracing bridge lock poisoned");
+        let table = crate::metal_backend::MetalShaderTable::new(&inner.device, &shader_records, sbt_stride)?;
+        let bound = self
+            .pipeline_state_objects
+            .get(&list)
+            .and_then(|handle| self.raytracing_pipeline_states.get(handle))
+            .cloned();
+        if let Some(pso) = bound
+            && let (Some(source), Some(entry)) = (pso.ray_msl.as_deref(), pso.ray_entry.as_deref())
+        {
+            let key = self
+                .pipeline_state_objects
+                .get(&list)
+                .copied()
+                .unwrap_or(pso.max_recursion_depth as u64);
+            if !inner.ray_shader_programs.contains_key(&key) {
+                let program = crate::metal_backend::create_ray_shader_program(&inner.device, source, entry)?;
+                inner.ray_shader_programs.insert(key, program);
+            }
+            let program = inner
+                .ray_shader_programs
+                .get(&key)
+                .expect("ray shader program cached");
+            let structure = inner
+                .structures
+                .get(&tlas.metal_accel_handle)
+                .expect("bound top-level acceleration structure has a Metal object");
+            let payloads = crate::metal_backend::execute_ray_shader_program(&inner.device, &inner.queue, program, structure.structure.as_ref(), &rays, &table)?;
+            inner.last_ray_payloads = payloads;
+            drop(inner);
+            return self.backend.record_dispatch_rays(
+                list,
+                desc.raygen_shader_start_address,
+                desc.miss_shader_start_address,
+                desc.hit_group_start_address,
+                desc.callable_shader_start_address,
+                desc.width,
+                desc.height,
+                desc.depth,
+            );
+        }
+        let structure = inner
+            .structures
+            .get(&tlas.metal_accel_handle)
+            .expect("bound top-level acceleration structure has a Metal object");
+        let results = crate::metal_backend::trace_rays(&inner.device, &inner.ray_pipeline, structure.structure.as_ref(), &rays, &table, &structure.instance_masks, tlas.is_top_level)?;
+        inner.last_ray_results = results;
+        drop(inner);
         self.backend.record_dispatch_rays(
             list,
             desc.raygen_shader_start_address,
@@ -2938,6 +3922,24 @@ impl D3d12Runtime {
             desc.height,
             desc.depth,
         )
+    }
+
+    /// Payloads produced by the most recent translated guest raygen shader.
+    pub fn last_ray_payloads(&self) -> Vec<crate::metal_backend::MetalRayPayloadResult> {
+        self.metal_raytracing
+            .as_ref()
+            .and_then(|bridge| bridge.inner.lock().ok())
+            .map(|inner| inner.last_ray_payloads.clone())
+            .unwrap_or_default()
+    }
+
+    /// Results read back from the most recent real Metal DispatchRays call.
+    pub fn last_ray_dispatch_results(&self) -> Vec<crate::metal_backend::MetalRayResult> {
+        self.metal_raytracing
+            .as_ref()
+            .and_then(|bridge| bridge.inner.lock().ok())
+            .map(|inner| inner.last_ray_results.clone())
+            .unwrap_or_default()
     }
 
     // ── ID3D12GraphicsCommandList5 methods ─────────────────────────
@@ -3203,6 +4205,1700 @@ impl D3d12Runtime {
     pub fn acceleration_structure(&self, gpu_address: u64) -> Option<&D3D12AccelerationStructure> {
         self.acceleration_structures.get(&gpu_address)
     }
+
+    // -----------------------------------------------------------------
+    // ID3D12Device5/7 state objects
+    // -----------------------------------------------------------------
+
+    /// Create a state object from an already parsed description.
+    pub fn create_state_object(&mut self, desc: D3d12StateObjectDesc) -> AppResult<u64> {
+        let handle = self.next_state_object_handle;
+        self.next_state_object_handle = self.next_state_object_handle.saturating_add(1);
+        let object = self.materialise_state_object(handle, desc)?;
+        self.state_objects.insert(handle, object);
+        Ok(handle)
+    }
+
+    /// Parse and create a state object from guest memory.
+    pub fn create_state_object_from_memory(
+        &mut self,
+        memory: &dyn StateObjectMemory,
+        address: u64,
+    ) -> AppResult<u64> {
+        let desc = state_objects::parse_state_object(memory, address)?;
+        self.create_state_object(desc)
+    }
+
+    /// Create a state object with an explicit handle (used by
+    /// `SetPipelineState1`, which receives the guest state-object pointer).
+    pub fn create_state_object_with_handle(
+        &mut self,
+        handle: u64,
+        desc: D3d12StateObjectDesc,
+    ) -> AppResult<D3d12StateObject> {
+        if self.state_objects.contains_key(&handle) {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("state object {handle:#x} already exists"),
+            ));
+        }
+        let object = self.materialise_state_object(handle, desc)?;
+        self.state_objects.insert(handle, object.clone());
+        Ok(object)
+    }
+
+    pub fn state_object(&self, handle: u64) -> Option<&D3d12StateObject> {
+        self.state_objects.get(&handle)
+    }
+
+    pub fn state_objects(&self) -> impl Iterator<Item = &D3d12StateObject> {
+        self.state_objects.values()
+    }
+
+    /// Release a state object. Matches the COM release path for
+    /// `ID3D12StateObject`.
+    pub fn release_state_object(&mut self, handle: u64) -> AppResult<u32> {
+        let object = self.state_objects.get_mut(&handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("release of unknown state object {handle:#x}"),
+            )
+        })?;
+        if object.ref_count > 0 {
+            object.ref_count -= 1;
+        }
+        let remaining = object.ref_count;
+        if remaining == 0 {
+            self.state_objects.remove(&handle);
+        }
+        Ok(remaining)
+    }
+
+    /// `DestroyStateObject` helper: drop the bridge's reference immediately.
+    pub fn destroy_state_object(&mut self, handle: u64) -> AppResult<()> {
+        if self.state_objects.remove(&handle).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("destroy of unknown state object {handle:#x}"),
+            ));
+        }
+        self.pipeline_state_objects
+            .retain(|_, object| *object != handle);
+        self.work_graph_programs
+            .retain(|_, program| program.state_object != handle);
+        Ok(())
+    }
+
+    /// `ID3D12Device7::AddToStateObject`.
+    pub fn add_to_state_object(
+        &mut self,
+        base: u64,
+        addition: D3d12StateObjectDesc,
+    ) -> AppResult<u64> {
+        let parent = self.state_objects.get(&base).cloned().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("AddToStateObject from unknown state object {base:#x}"),
+            )
+        })?;
+        if parent.is_collection() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "AddToStateObject cannot grow a collection state object",
+            ));
+        }
+        if !parent.allow_additions() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "parent state object did not set D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS",
+            ));
+        }
+        for subobject in &addition.subobjects {
+            if let D3d12StateSubobject::ExistingCollection(collection) = subobject
+                && collection.collection == base
+            {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "AddToStateObject addition references the parent state object; the addition must be self-contained",
+                ));
+            }
+        }
+        if addition.object_type != parent.object_type {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "AddToStateObject addition type {} does not match parent type {}",
+                    addition.object_type, parent.object_type
+                ),
+            ));
+        }
+        let addition_flags = addition
+            .subobjects
+            .iter()
+            .find_map(|subobject| match subobject {
+                D3d12StateSubobject::StateObjectConfig { flags } => Some(*flags),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if addition_flags & STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "addition did not set D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS",
+            ));
+        }
+
+        let handle = self.next_state_object_handle;
+        self.next_state_object_handle = self.next_state_object_handle.saturating_add(1);
+        let added = self.materialise_state_object(handle, addition)?;
+        // Global subobjects must agree with the parent.
+        if let (Some(parent_config), Some(added_config)) =
+            (parent.pipeline_config, added.pipeline_config)
+            && parent_config.0 != added_config.0
+        {
+            self.state_objects.remove(&handle);
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "AddToStateObject raytracing recursion depth {} conflicts with parent {}",
+                    added_config.0, parent_config.0
+                ),
+            ));
+        }
+        if let (Some(parent_shader), Some(added_shader)) =
+            (parent.shader_config, added.shader_config)
+            && parent_shader != added_shader
+        {
+            self.state_objects.remove(&handle);
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "AddToStateObject raytracing shader config conflicts with parent",
+            ));
+        }
+        for name in added.exported_shaders.keys() {
+            if parent.exported_shaders.contains_key(name) {
+                self.state_objects.remove(&handle);
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "AddToStateObject export {name:?} conflicts with the parent state object"
+                    ),
+                ));
+            }
+        }
+
+        let mut merged = added;
+        merged.subobjects = parent
+            .subobjects
+            .iter()
+            .cloned()
+            .chain(merged.subobjects.into_iter())
+            .collect();
+        merged.exported_shaders = parent
+            .exported_shaders
+            .iter()
+            .map(|(name, id)| (name.clone(), *id))
+            .chain(merged.exported_shaders)
+            .collect();
+        merged.pipeline_config = merged.pipeline_config.or(parent.pipeline_config);
+        merged.shader_config = merged.shader_config.or(parent.shader_config);
+        merged.work_graphs.extend(parent.work_graphs);
+        self.state_objects.insert(handle, merged);
+        Ok(handle)
+    }
+
+    fn materialise_state_object(
+        &self,
+        handle: u64,
+        desc: D3d12StateObjectDesc,
+    ) -> AppResult<D3d12StateObject> {
+        let mut exported_shaders = BTreeMap::new();
+        let mut pipeline_config = None;
+        let mut shader_config = None;
+        let mut work_graphs = Vec::new();
+        let mut has_dxil = false;
+        let mut has_existing_collection = false;
+
+        for subobject in &desc.subobjects {
+            match subobject {
+                D3d12StateSubobject::StateObjectConfig { flags } => {
+                    if *flags & !state_objects::STATE_OBJECT_FLAGS_VALID != 0 {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!("D3D12_STATE_OBJECT_FLAGS {flags:#x} contain undefined bits"),
+                        ));
+                    }
+                }
+                D3d12StateSubobject::DxilLibrary(library) => {
+                    has_dxil = true;
+                    if library.exports.is_empty() {
+                        // Without explicit exports we cannot enumerate DXIL
+                        // entry points; the bytecode itself remains available
+                        // to SetPipelineState1/DispatchRays.
+                        continue;
+                    }
+                    for export in &library.exports {
+                        let identifier = shader_identifier(
+                            &library.bytecode,
+                            &export.name,
+                            export.export_to_rename.as_deref(),
+                        );
+                        if exported_shaders
+                            .insert(export.name.clone(), identifier)
+                            .is_some()
+                        {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!(
+                                    "state object export {:?} is defined more than once",
+                                    export.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+                D3d12StateSubobject::ExistingCollection(collection) => {
+                    has_existing_collection = true;
+                    let referenced =
+                        self.state_objects
+                            .get(&collection.collection)
+                            .ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcD3dInvalidState,
+                                    format!(
+                                        "existing collection {:?} is not a live state object",
+                                        collection.collection
+                                    ),
+                                )
+                            })?;
+                    for (name, identifier) in &referenced.exported_shaders {
+                        exported_shaders.entry(name.clone()).or_insert(*identifier);
+                    }
+                    work_graphs.extend(referenced.work_graphs.iter().cloned());
+                }
+                D3d12StateSubobject::RaytracingShaderConfig {
+                    max_payload_size,
+                    max_attribute_size,
+                } => {
+                    if *max_attribute_size > state_objects::RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!(
+                                "raytracing MaxAttributeSizeInBytes {max_attribute_size} exceeds \
+                                 D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES ({})",
+                                state_objects::RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES
+                            ),
+                        ));
+                    }
+                    if !max_attribute_size.is_multiple_of(4) {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!(
+                                "raytracing MaxAttributeSizeInBytes {max_attribute_size} is not a multiple of 4"
+                            ),
+                        ));
+                    }
+                    shader_config = Some((*max_payload_size, *max_attribute_size));
+                }
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth,
+                } => {
+                    if *max_trace_recursion_depth
+                        > state_objects::RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH
+                    {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!(
+                                "raytracing MaxTraceRecursionDepth {max_trace_recursion_depth} exceeds \
+                                 D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH ({})",
+                                state_objects::RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH
+                            ),
+                        ));
+                    }
+                    pipeline_config = Some((*max_trace_recursion_depth, 0));
+                }
+                D3d12StateSubobject::RaytracingPipelineConfig1 {
+                    max_trace_recursion_depth,
+                    flags,
+                } => {
+                    if *max_trace_recursion_depth
+                        > state_objects::RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH
+                    {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!(
+                                "raytracing MaxTraceRecursionDepth {max_trace_recursion_depth} exceeds \
+                                 D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH ({})",
+                                state_objects::RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH
+                            ),
+                        ));
+                    }
+                    if *flags & !state_objects::RAYTRACING_PIPELINE_FLAGS_VALID != 0 {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!(
+                                "D3D12_RAYTRACING_PIPELINE_FLAGS {flags:#x} contain undefined bits"
+                            ),
+                        ));
+                    }
+                    pipeline_config = Some((*max_trace_recursion_depth, *flags));
+                }
+                D3d12StateSubobject::WorkGraph(graph) => {
+                    work_graphs.push(graph.clone());
+                }
+                D3d12StateSubobject::HitGroup(group) => {
+                    let identifier = hit_group_identifier(group, &exported_shaders);
+                    if exported_shaders
+                        .insert(group.name.clone(), identifier)
+                        .is_some()
+                    {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!(
+                                "hit group export {:?} is defined more than once",
+                                group.name
+                            ),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match desc.object_type {
+            STATE_OBJECT_TYPE_RAYTRACING_PIPELINE => {
+                if !has_dxil && !has_existing_collection {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "raytracing pipeline state object has no DXIL library or collection",
+                    ));
+                }
+                if pipeline_config.is_none() {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "raytracing pipeline state object requires D3D12_RAYTRACING_PIPELINE_CONFIG or CONFIG1",
+                    ));
+                }
+                if !work_graphs.is_empty() {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "work-graph subobject requires D3D12_STATE_OBJECT_TYPE_EXECUTABLE",
+                    ));
+                }
+            }
+            STATE_OBJECT_TYPE_EXECUTABLE => {
+                for graph in &work_graphs {
+                    if graph.nodes.is_empty() && graph.entrypoints.is_empty() {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!(
+                                "work graph {:?} has no nodes or entrypoints",
+                                graph.program_name
+                            ),
+                        ));
+                    }
+                }
+            }
+            STATE_OBJECT_TYPE_COLLECTION => {
+                if !work_graphs.is_empty() {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "work-graph subobject requires D3D12_STATE_OBJECT_TYPE_EXECUTABLE",
+                    ));
+                }
+            }
+            other => {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("D3D12_STATE_OBJECT_TYPE {other} is not defined"),
+                ));
+            }
+        }
+
+        Ok(D3d12StateObject {
+            handle,
+            object_type: desc.object_type,
+            subobjects: desc.subobjects,
+            ref_count: 1,
+            exported_shaders,
+            pipeline_config,
+            shader_config,
+            work_graphs,
+        })
+    }
+
+    /// Bind a state object to a command list for `DispatchRays`.
+    #[rustfmt::skip]
+    fn translate_ray_pipeline(dxil: &[u8]) -> AppResult<(Option<String>, Option<String>)> {
+        if !matches!(
+            crate::shader::ray_shader_stage(dxil),
+            Some(crate::shader::ShaderStage::RayGeneration)
+        ) {
+            return Ok((None, None));
+        }
+        let entry = "raygen";
+        if let Some(offset) = dxil.windows(4).position(|window| window == b"BC\xc0\xde")
+            && offset >= 20
+            && dxil.len().saturating_sub(offset) > 16
+        {
+            let declared = u32::from_le_bytes(
+                dxil[offset - 20..offset - 16]
+                    .try_into()
+                    .expect("PROG IR size"),
+            ) as usize;
+            let end = offset
+                .checked_add(declared)
+                .filter(|end| *end <= dxil.len());
+            if let Some(end) = end
+                && declared > 16
+                && dxil.get(offset + 4..offset + 8) != Some(b"SIG1")
+            {
+                let source = crate::shader::translate_llvm_ray_program(&dxil[offset..end], entry)?;
+                return Ok((Some(source), Some(entry.to_string())));
+            } }
+        let output = crate::shader::translate_ray_shader(
+            dxil,
+            crate::shader::ShaderStage::RayGeneration,
+            entry,
+        )
+        .expect("ray-generation translation validated by shader_kind");
+        let source = crate::shader::msl_source_from_library_bytes(&output.mtl_library_bytes)
+            .expect("ray-generation translation emits an MSL artifact");
+        Ok((Some(source.to_string()), Some(entry.to_string())))
+    }
+
+    pub fn set_pipeline_state1_state_object(
+        &mut self,
+        list: CommandListId,
+        state_object_ptr: u64,
+        desc: D3d12StateObjectDesc,
+    ) -> AppResult<()> {
+        let object = if self.state_objects.contains_key(&state_object_ptr) {
+            self.state_objects[&state_object_ptr].clone()
+        } else {
+            self.create_state_object_with_handle(state_object_ptr, desc)?
+        };
+        if object.is_collection() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "SetPipelineState1 cannot bind a collection state object",
+            ));
+        }
+        let dxil = object.first_dxil().unwrap_or(&[]).to_vec();
+        let (ray_msl, ray_entry) = Self::translate_ray_pipeline(&dxil)?;
+        let (max_recursion_depth, payload_size, attribute_size) =
+            if let Some((depth, _flags)) = object.pipeline_config {
+                let (payload, attribute) = object.shader_config.unwrap_or((32, 8));
+                (depth, payload, attribute)
+            } else {
+                Self::parse_raytracing_pipeline_params(&dxil)
+            };
+        self.raytracing_pipeline_states.insert(
+            state_object_ptr,
+            D3D12RaytracingPipelineState {
+                dxil_bytecode: dxil,
+                max_recursion_depth,
+                payload_size,
+                attribute_size,
+                ray_msl: ray_msl.clone(),
+                ray_entry: ray_entry.clone(),
+            },
+        );
+        self.pipeline_state_objects.insert(list, state_object_ptr);
+        Ok(())
+    }
+
+    pub fn bound_state_object(&self, list: CommandListId) -> Option<&D3d12StateObject> {
+        let handle = self.pipeline_state_objects.get(&list)?;
+        self.state_objects.get(handle)
+    }
+
+    /// Return the shader identifier for an exported shader in a state object.
+    pub fn state_object_shader_identifier(
+        &self,
+        handle: u64,
+        export: &str,
+    ) -> Option<[u8; state_objects::SHADER_IDENTIFIER_SIZE_IN_BYTES]> {
+        self.state_objects.get(&handle)?.shader_identifier(export)
+    }
+
+    // -----------------------------------------------------------------
+    // Work-graph execution
+    // -----------------------------------------------------------------
+
+    /// Deterministic 32-byte `D3D12_PROGRAM_IDENTIFIER` for a work graph.
+    pub fn work_graph_program_identifier(
+        &self,
+        state_object: u64,
+        program_name: &str,
+    ) -> Option<[u8; 32]> {
+        let graph = self
+            .select_work_graph(state_object, Some(program_name))
+            .ok()?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"d3d12-work-graph-program");
+        hasher.update(state_object.to_le_bytes());
+        hasher.update(program_name.as_bytes());
+        hasher.update(graph.flags.to_le_bytes());
+        Some(hasher.finalize().into())
+    }
+
+    fn find_work_graph_program(&self, identifier: &[u8; 32]) -> Option<(u64, String)> {
+        for object in self.state_objects.values() {
+            if object.object_type != STATE_OBJECT_TYPE_EXECUTABLE {
+                continue;
+            }
+            for graph in &object.work_graphs {
+                if self
+                    .work_graph_program_identifier(object.handle, &graph.program_name)
+                    .is_some_and(|candidate| &candidate == identifier)
+                {
+                    return Some((object.handle, graph.program_name.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// `ID3D12GraphicsCommandList10::SetProgram` for a work graph.
+    pub fn set_work_graph_program(
+        &mut self,
+        list: CommandListId,
+        identifier: [u8; 32],
+        flags: u32,
+        backing_memory: Option<(u64, u64)>,
+    ) -> AppResult<()> {
+        if flags & !work_graphs::WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("D3D12_WORK_GRAPH_FLAGS {flags:#x} contain undefined bits"),
+            ));
+        }
+        let (state_object, program_name) =
+            self.find_work_graph_program(&identifier).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "SetProgram received an unknown work-graph program identifier",
+                )
+            })?;
+        let graph = self
+            .select_work_graph(state_object, Some(&program_name))?
+            .clone();
+        if let Some((offset, size)) = backing_memory {
+            graph.validate_backing_memory(offset, size)?;
+        }
+        self.work_graph_programs.insert(
+            list,
+            D3d12WorkGraphProgram {
+                state_object,
+                program_name,
+                flags,
+                backing_memory,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn bound_work_graph_program(&self, list: CommandListId) -> Option<&D3d12WorkGraphProgram> {
+        self.work_graph_programs.get(&list)
+    }
+
+    /// `ID3D12GraphicsCommandList10::DispatchGraph` using the program bound by
+    /// `SetProgram`.
+    pub fn dispatch_bound_work_graph(
+        &mut self,
+        list: CommandListId,
+        desc: &D3d12DispatchGraphDesc,
+    ) -> AppResult<u32> {
+        let program = self
+            .work_graph_programs
+            .get(&list)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "DispatchGraph requires a work-graph program bound with SetProgram",
+                )
+            })?;
+        self.dispatch_work_graph(
+            list,
+            program.state_object,
+            Some(&program.program_name),
+            desc,
+            program.backing_memory,
+        )
+    }
+
+    pub fn work_graph_memory_requirements(
+        &self,
+        state_object: u64,
+        program_name: Option<&str>,
+    ) -> AppResult<D3d12WorkGraphMemoryRequirements> {
+        let graph = self.select_work_graph(state_object, program_name)?;
+        Ok(graph.memory_requirements())
+    }
+
+    /// Execute a work graph by linearising its nodes into real Metal compute
+    /// dispatches. GPU-record modes fail closed because the Metal backend does
+    /// not expose a GPU virtual-address mapping for guest buffers.
+    pub fn dispatch_work_graph(
+        &mut self,
+        list: CommandListId,
+        state_object: u64,
+        program_name: Option<&str>,
+        desc: &D3d12DispatchGraphDesc,
+        backing_memory: Option<(u64, u64)>,
+    ) -> AppResult<u32> {
+        let graph = self.select_work_graph(state_object, program_name)?.clone();
+        if let Some((offset, size)) = backing_memory {
+            graph.validate_backing_memory(offset, size)?;
+        }
+        if matches!(
+            desc.mode,
+            work_graphs::DISPATCH_MODE_NODE_GPU_INPUT
+                | work_graphs::DISPATCH_MODE_MULTI_NODE_GPU_INPUT
+        ) {
+            return self.dispatch_work_graph_gpu(desc);
+        }
+        graph.validate_cpu_records(
+            desc.entrypoint_index,
+            desc.record_count,
+            desc.record_stride,
+            desc.records.len(),
+        )?;
+        let plan =
+            graph.dispatch_plan(desc.entrypoint_index, desc.record_count, desc.record_stride)?;
+        for dispatch in &plan {
+            self.backend.record_dispatch(
+                list,
+                dispatch.grid[0],
+                dispatch.grid[1],
+                dispatch.grid[2],
+            )?;
+        }
+        Ok(plan.len() as u32)
+    }
+
+    /// Execute GPU-record work-graph fan-out on the GPU.
+    ///
+    /// The producer kernel materialises record indices and the consumer's
+    /// indirect dispatch grid; the consumer then runs from that GPU-written
+    /// grid. The CPU issues only those two dispatches, never one per record.
+#[rustfmt::skip]
+    fn dispatch_work_graph_gpu(&mut self, desc: &D3d12DispatchGraphDesc) -> AppResult<u32> {
+        if desc.record_count == 0 {
+            return Ok(0);
+        }
+        if desc.record_stride < 8 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "work graph record stride {} is smaller than the 8-byte node/output record",
+                    desc.record_stride
+                ),
+            ));
+        }
+        let required = (desc.record_count as u64)
+            .checked_mul(desc.record_stride)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "work graph record range overflows",
+                )
+            })?;
+        if required > desc.records.len() as u64 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "work graph record range ({required} bytes) exceeds the supplied {} bytes",
+                    desc.records.len()
+                ),
+            ));
+        }
+        let mut records = Vec::with_capacity(desc.record_count as usize);
+        for index in 0..desc.record_count as usize {
+            let offset = index * desc.record_stride as usize;
+            records.push(crate::metal_backend::MetalWorkGraphRecord {
+                node_index: u32::from_le_bytes(
+                    desc.records[offset..offset + 4]
+                        .try_into()
+                        .expect("4-byte node index"),
+                ),
+                output_index: u32::from_le_bytes(
+                    desc.records[offset + 4..offset + 8]
+                        .try_into()
+                        .expect("4-byte output index"),
+                ),
+            });
+        }
+        let bridge = self.metal_raytracing()?;
+        let mut inner = bridge
+            .inner
+            .lock()
+            .expect("Metal raytracing bridge lock poisoned");
+        if inner.work_graph.is_none() {
+            inner.work_graph = Some(crate::metal_backend::MetalWorkGraphFanout::new(
+                &inner.device,)?); }
+        let record_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                records.as_ptr() as *const u8,
+                std::mem::size_of_val(records.as_slice()),
+            )
+        };
+        let buffer = inner.device.new_buffer_with_data(
+            record_bytes.as_ptr() as *const std::ffi::c_void,
+            record_bytes.len() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let fanout_results = inner
+            .work_graph
+            .as_ref()
+            .expect("work-graph fan-out initialised")
+            .execute(
+                &inner.device,
+                &buffer,
+                records.len() as u32,
+                Some(records.len() as u32),
+                None,)?;
+        inner.last_work_graph_records = fanout_results;
+        Ok(desc.record_count)
+    }
+
+    /// Output produced by the most recent GPU work-graph fan-out.
+    pub fn last_work_graph_records(&self) -> Vec<u32> {
+        self.metal_raytracing
+            .as_ref()
+            .and_then(|bridge| bridge.inner.lock().ok())
+            .map(|inner| inner.last_work_graph_records.clone())
+            .unwrap_or_default()
+    }
+
+    fn select_work_graph(
+        &self,
+        state_object: u64,
+        program_name: Option<&str>,
+    ) -> AppResult<&D3d12WorkGraph> {
+        let object = self.state_objects.get(&state_object).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown state object {state_object:#x}"),
+            )
+        })?;
+        if object.object_type != STATE_OBJECT_TYPE_EXECUTABLE {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("state object {state_object:#x} is not D3D12_STATE_OBJECT_TYPE_EXECUTABLE"),
+            ));
+        }
+        match program_name {
+            Some(name) => object
+                .work_graphs
+                .iter()
+                .find(|graph| graph.program_name == name)
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        format!("state object has no work graph named {name:?}"),
+                    )
+                }),
+            None => object.work_graphs.first().ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "state object contains no work graph",
+                )
+            }),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Command signatures / ExecuteIndirect
+    // -----------------------------------------------------------------
+
+    /// `ID3D12Device::CreateCommandSignature`.
+    pub fn create_command_signature(&mut self, desc: D3D12CommandSignatureDesc) -> AppResult<u64> {
+        if desc.byte_stride == 0 || !desc.byte_stride.is_multiple_of(4) {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "invalid command signature: ByteStride {} must be a non-zero multiple of 4",
+                    desc.byte_stride
+                ),
+            ));
+        }
+        if desc.arguments.len() != 1 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "unsupported command signature: {} argument descriptors; only a single \
+                     argument is representable",
+                    desc.arguments.len()
+                ),
+            ));
+        }
+        let argument = desc.arguments[0];
+        let min_size = match argument.ty {
+            D3D12_INDIRECT_ARGUMENT_TYPE_DRAW => 16,
+            D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH | D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH => {
+                12
+            }
+            D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS => 100,
+            D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED => 20,
+            other => {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "unsupported command signature: D3D12_INDIRECT_ARGUMENT_TYPE {other} \
+                         is not representable"
+                    ),
+                ));
+            }
+        };
+        if desc.byte_stride < min_size {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "invalid command signature: ByteStride {} is smaller than the {min_size}-byte \
+                     argument",
+                    desc.byte_stride
+                ),
+            ));
+        }
+        let handle = self.next_command_signature_handle;
+        self.next_command_signature_handle = self.next_command_signature_handle.saturating_add(1);
+        self.command_signatures.insert(
+            handle,
+            D3D12CommandSignature {
+                handle,
+                byte_stride: desc.byte_stride,
+                node_mask: desc.node_mask,
+                argument,
+            },
+        );
+        Ok(handle)
+    }
+
+    pub fn command_signature(&self, handle: u64) -> Option<&D3D12CommandSignature> {
+        self.command_signatures.get(&handle)
+    }
+
+    pub fn destroy_command_signature(&mut self, handle: u64) -> AppResult<()> {
+        self.command_signatures
+            .remove(&handle)
+            .map(|_| ())
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("unknown command signature {handle:#x}"),
+                )
+            })
+    }
+
+    /// Write bytes into a resource from a native command-list test/reader.
+    pub fn write_resource_bytes(&mut self, resource: ResourceId, bytes: &[u8]) -> AppResult<()> {
+        self.backend.write_resource_bytes(resource, 0, bytes)
+    }
+
+    /// Borrow resource bytes for native readback.
+    pub fn resource_bytes(&self, resource: ResourceId) -> AppResult<&[u8]> {
+        self.backend.resource_bytes(resource)
+    }
+
+    /// Register a translated Metal render pipeline for a D3D12 PSO.
+    pub fn register_native_render_pipeline(
+        &mut self,
+        pso: PipelineStateId,
+        vertex_msl: String,
+        fragment_msl: String,
+        pixel_format: DxgiFormat,
+    ) -> AppResult<()> {
+        let handle = alloc_d3d12_metal_handle();
+        self.native_pipelines.insert(
+            handle,
+            D3d12NativePipeline {
+                vertex_msl,
+                fragment_msl,
+                pixel_format,
+            },
+        );
+        self.pso_native_pipelines.insert(pso, handle);
+        Ok(())
+    }
+
+    /// Compile and retain the native Metal pipeline for a PSO immediately.
+    ///
+    /// This makes translation/compilation failures surface at
+    /// `CreateGraphicsPipelineState` rather than at first draw.
+    pub fn compile_native_render_pipeline(&mut self, pso: PipelineStateId) -> AppResult<()> {
+        let handle = self
+            .pso_native_pipelines
+            .get(&pso)
+            .copied()
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "pipeline state has no registered native pipeline",
+                )
+            })?;
+        let descriptor = self.native_pipeline_for(handle).clone();
+        let bridge = self.metal_raytracing()?;
+        let mut inner = bridge
+            .inner
+            .lock()
+            .expect("Metal raytracing bridge lock poisoned");
+        if !inner.native_render_pipelines.contains_key(&handle) {
+            let pixel_format = crate::metal_backend::dxgi_to_metal_format(descriptor.pixel_format);
+            let pipeline = crate::metal_backend::create_native_render_pipeline(
+                &inner.device,
+                &descriptor.vertex_msl,
+                &descriptor.fragment_msl,
+                pixel_format,
+            )?;
+            inner
+                .native_render_pipelines
+                .insert(handle, pipeline.pipeline);
+        }
+        Ok(())
+    }
+
+    /// Translated MSL artifacts retained for a PSO.
+    pub fn native_pipeline_artifacts(&self, pso: PipelineStateId) -> Option<(String, String)> {
+        let handle = self.pso_native_pipelines.get(&pso)?;
+        let pipeline = self.native_pipelines.get(handle)?;
+        Some((pipeline.vertex_msl.clone(), pipeline.fragment_msl.clone()))
+    }
+
+    /// Bind the native pipeline associated with `pso` to a command list.
+    pub fn bind_native_pipeline(
+        &mut self,
+        list: CommandListId,
+        pso: PipelineStateId,
+    ) -> AppResult<()> {
+        let native = self.pso_native_pipelines.get(&pso).copied();
+        let state = self.native_command_states.entry(list).or_default();
+        state.pipeline = native;
+        Ok(())
+    }
+
+    /// Retain the render target for a command list.
+    pub fn bind_native_render_target(
+        &mut self,
+        list: CommandListId,
+        resource: ResourceId,
+        width: u32,
+        height: u32,
+        format: DxgiFormat,
+    ) {
+        self.native_target_dimensions
+            .insert(resource, (width, height));
+        let state = self.native_command_states.entry(list).or_default();
+        state.color_resource = Some(resource);
+        state.color_width = width;
+        state.color_height = height;
+        state.color_format = Some(format);
+    }
+
+    /// Retain the vertex buffer for a command list.
+    pub fn bind_native_vertex_buffer(
+        &mut self,
+        list: CommandListId,
+        resource: ResourceId,
+        offset: u64,
+    ) {
+        let state = self.native_command_states.entry(list).or_default();
+        state.vertex_resource = Some(resource);
+        state.vertex_offset = offset;
+    }
+
+    /// Retain the index buffer for a command list.
+    pub fn bind_native_index_buffer(
+        &mut self,
+        list: CommandListId,
+        resource: ResourceId,
+        offset: u64,
+        format: u32,
+    ) {
+        let state = self.native_command_states.entry(list).or_default();
+        state.index_resource = Some(resource);
+        state.index_offset = offset;
+        state.index_format = format;
+    }
+
+    /// Dimensions retained for a native render target resource.
+    pub fn native_target_dimensions(&self, resource: ResourceId) -> Option<(u32, u32)> {
+        self.native_target_dimensions.get(&resource).copied()
+    }
+
+    fn native_pipeline_for(&self, handle: u64) -> &D3d12NativePipeline {
+        self.native_pipelines
+            .get(&handle)
+            .expect("native render pipeline is registered")
+    }
+
+    /// Execute a direct draw through the retained native pipeline and render
+    /// target. Returns `false` when no native state is bound (the caller keeps
+    /// the typed command recording).
+#[rustfmt::skip]
+    pub fn execute_native_direct_draw(
+        &mut self,
+        list: CommandListId,
+        vertex_count: u32,
+        instance_count: u32,
+    ) -> AppResult<bool> {
+        let Some(state) = self.native_command_states.get(&list).cloned() else {
+            return Ok(false);
+        };
+        let (Some(handle), Some(target), Some(vertex)) =
+            (state.pipeline, state.color_resource, state.vertex_resource)
+        else {
+            return Ok(false);
+        };
+        let descriptor = self.native_pipeline_for(handle).clone();
+        let vertex_bytes = self.backend.resource_bytes(vertex)?.to_vec();
+        let target_bytes = self.backend.resource_bytes(target)?.to_vec();
+        let pixel_format = crate::metal_backend::dxgi_to_metal_format(descriptor.pixel_format);
+        let bridge = self.metal_raytracing()?;
+        let mut inner = bridge
+            .inner
+            .lock()
+            .expect("Metal raytracing bridge lock poisoned");
+        if !inner.native_render_pipelines.contains_key(&handle) {
+            let pipeline = crate::metal_backend::create_native_render_pipeline(
+                &inner.device,
+                &descriptor.vertex_msl,
+                &descriptor.fragment_msl,
+                pixel_format,)?;
+            inner
+                .native_render_pipelines
+                .insert(handle, pipeline.pipeline); }
+        let pipeline = inner
+            .native_render_pipelines
+            .get(&handle)
+            .expect("native render pipeline cached");
+        let vertex_buffer = inner.device.new_buffer_with_data(
+            vertex_bytes.as_ptr() as *const std::ffi::c_void,
+            vertex_bytes.len() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let texture = crate::metal_backend::create_native_render_target(
+            &inner.device,
+            state.color_width,
+            state.color_height,
+            pixel_format,
+            &target_bytes,)?;
+        crate::metal_backend::execute_native_render_pass(
+            &inner.device,
+            &inner.queue,
+            pipeline,
+            texture.as_ref(),
+            vertex_buffer.as_ref(),
+            state.vertex_offset,
+            crate::metal_backend::MetalNativeDraw::Draw {
+                vertex_count: vertex_count as u64,
+                instance_count: instance_count as u64,
+            },
+            None,)?;
+        let rendered = crate::metal_backend::read_native_render_target(
+            texture.as_ref(),
+            state.color_width,
+            state.color_height,
+        );
+        drop(inner);
+        self.backend.write_resource_bytes(target, 0, &rendered)?;
+        Ok(true)
+    }
+
+#[rustfmt::skip]
+    fn execute_native_indirect_draw(
+        &mut self,
+        list: CommandListId,
+        kind: u32,
+        results: &[crate::metal_backend::MetalIndirectResult],
+        effective: u32,
+    ) -> AppResult<u32> {
+        let state = self
+            .native_command_states
+            .get(&list)
+            .cloned()
+            .unwrap_or_default();
+        let Some(handle) = state.pipeline else {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "ExecuteIndirect DRAW requires a native graphics pipeline bound by SetPipelineState",
+            ));
+        };
+        let Some(target) = state.color_resource else {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "ExecuteIndirect DRAW requires a render target bound by OMSetRenderTargets",
+            ));
+        };
+        let Some(vertex_resource) = state.vertex_resource else {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "ExecuteIndirect DRAW requires a vertex buffer bound by IASetVertexBuffers",
+            ));
+        };
+        if kind == 1 && state.index_resource.is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "ExecuteIndirect DRAW_INDEXED requires an index buffer bound by IASetIndexBuffer",
+            ));
+        }
+        let descriptor = self.native_pipeline_for(handle).clone();
+        let vertex_bytes = self.backend.resource_bytes(vertex_resource)?.to_vec();
+        let index_bytes = if kind == 1 {
+            Some(
+                self.backend
+                    .resource_bytes(state.index_resource.expect("validated index resource"))?
+                    .to_vec(),
+            )
+        } else {
+            None
+        };
+        let target_bytes = self.backend.resource_bytes(target)?.to_vec();
+        let pixel_format = crate::metal_backend::dxgi_to_metal_format(
+            state.color_format.unwrap_or(DxgiFormat::B8G8R8A8Unorm),
+        );
+        let bridge = self.metal_raytracing()?;
+        let mut inner = bridge
+            .inner
+            .lock()
+            .expect("Metal raytracing bridge lock poisoned");
+        if !inner.native_render_pipelines.contains_key(&handle) {
+            let pipeline = crate::metal_backend::create_native_render_pipeline(
+                &inner.device,
+                &descriptor.vertex_msl,
+                &descriptor.fragment_msl,
+                pixel_format,)?;
+            inner
+                .native_render_pipelines
+                .insert(handle, pipeline.pipeline); }
+        let pipeline = inner
+            .native_render_pipelines
+            .get(&handle)
+            .expect("native render pipeline cached");
+        let vertex_buffer = inner.device.new_buffer_with_data(
+            vertex_bytes.as_ptr() as *const std::ffi::c_void,
+            vertex_bytes.len() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let index_buffer = index_bytes.as_ref().map(|bytes| {
+            inner.device.new_buffer_with_data(
+                bytes.as_ptr() as *const std::ffi::c_void,
+                bytes.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let command_types = if kind == 1 {
+            metal::MTLIndirectCommandType::DrawIndexed
+        } else {
+            metal::MTLIndirectCommandType::Draw
+        };
+        let icb = crate::metal_backend::MetalIndirectCommandBuffer::new(
+            &inner.device,
+            crate::metal_backend::MetalIndirectCommandBufferDescriptor {
+                command_types,
+                max_command_count: results.len().max(1) as u64,
+                max_kernel_buffer_bind_count: 0,
+            },)?;
+        let mut encoded = 0u64;
+        for result in results.iter().take(effective as usize) {
+            if result.enabled == 0 {
+                continue;
+            }
+            let command = icb.render_command(encoded)?;
+            command.set_render_pipeline_state(pipeline);
+            command.set_vertex_buffer(0, Some(vertex_buffer.as_ref()), state.vertex_offset);
+            if kind == 1 {
+                let index_type = match state.index_format {
+                    57 => metal::MTLIndexType::UInt16,
+                    42 | 43 => metal::MTLIndexType::UInt32,
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!(
+                                "ExecuteIndirect DRAW_INDEXED index format {other} is not supported"
+                            ),
+                        ));
+                    }
+                };
+                command.draw_indexed_primitives(
+                    metal::MTLPrimitiveType::Triangle,
+                    result.x as u64,
+                    index_type,
+                    index_buffer.as_ref().expect("validated index buffer"),
+                    state.index_offset,
+                    result.y as u64,
+                    result.z as u64,
+                    result.w as u64,
+                );
+            } else {
+                command.draw_primitives(
+                    metal::MTLPrimitiveType::Triangle,
+                    result.z as u64,
+                    result.x as u64,
+                    result.y as u64,
+                    result.w as u64,
+                );
+            }
+            encoded += 1;
+        }
+        let texture = crate::metal_backend::create_native_render_target(
+            &inner.device,
+            state.color_width,
+            state.color_height,
+            pixel_format,
+            &target_bytes,)?;
+        crate::metal_backend::execute_native_render_pass(
+            &inner.device,
+            &inner.queue,
+            pipeline,
+            texture.as_ref(),
+            vertex_buffer.as_ref(),
+            state.vertex_offset,
+            crate::metal_backend::MetalNativeDraw::Draw {
+                vertex_count: 0,
+                instance_count: 0,
+            },
+            Some((&icb, encoded)),)?;
+        let rendered = crate::metal_backend::read_native_render_target(
+            texture.as_ref(),
+            state.color_width,
+            state.color_height,
+        );
+        drop(inner);
+        self.backend.write_resource_bytes(target, 0, &rendered)?;
+        Ok(encoded as u32)
+    }
+
+    /// Results decoded by the most recent GPU-side ExecuteIndirect decode.
+    pub fn last_indirect_results(&self) -> Vec<crate::metal_backend::MetalIndirectResult> {
+        self.metal_raytracing
+            .as_ref()
+            .and_then(|bridge| bridge.inner.lock().ok())
+            .map(|inner| inner.last_indirect_results.clone())
+            .unwrap_or_default()
+    }
+
+    /// Effective command count chosen by the GPU count buffer.
+    pub fn last_indirect_effective(&self) -> u32 {
+        self.metal_raytracing
+            .as_ref()
+            .and_then(|bridge| bridge.inner.lock().ok())
+            .map(|inner| inner.last_indirect_effective)
+            .unwrap_or(0)
+    }
+
+    /// Whether the last ExecuteIndirect used the native GPU path.
+    pub fn last_indirect_native(&self) -> bool {
+        self.metal_raytracing
+            .as_ref()
+            .and_then(|bridge| bridge.inner.lock().ok())
+            .map(|inner| inner.last_indirect_native)
+            .unwrap_or(false)
+    }
+
+    /// Exact semantic boundary for the last typed fallback.
+    ///
+    /// Only MESH/RAYS keep the typed fallback; DRAW/DRAW_INDEXED now require a
+    /// native pipeline and return an exact error when it is missing.
+    pub fn last_indirect_boundary(&self) -> Option<String> {
+        self.metal_raytracing
+            .as_ref()
+            .and_then(|bridge| bridge.inner.lock().ok())
+            .and_then(|inner| inner.last_indirect_boundary.clone())
+    }
+
+    /// Execute an indirect command sequence through the real Metal path.
+    ///
+    /// DISPATCH is decoded and count-limited on the GPU. DRAW/DRAW_INDEXED use
+    /// the native pipeline/vertex/index/render-target state retained from
+    /// SetPipelineState, IASetVertexBuffers, IASetIndexBuffer and
+    /// OMSetRenderTargets, and execute through an MTLIndirectCommandBuffer.
+    /// A missing native pipeline is an exact error, never a CPU expansion.
+    /// MESH/RAYS retain the typed fallback reported by
+    /// [`last_indirect_boundary`].
+    #[rustfmt::skip]
+    pub fn execute_indirect_gpu(
+        &mut self,
+        list: CommandListId,
+        signature: u64,
+        max_count: u32,
+        arguments: &[u8],
+        argument_offset: u64,
+        count: Option<u32>,
+        count_bytes: Option<(&[u8], u64)>,
+    ) -> AppResult<u32> {
+        let signature_desc = self
+            .command_signatures
+            .get(&signature)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("ExecuteIndirect with unknown command signature {signature:#x}"),
+                )
+            })?;
+        let cpu_count = count.unwrap_or(max_count);
+        if cpu_count > max_count {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "invalid ExecuteIndirect: Count {cpu_count} exceeds MaxCommandCount {max_count}"
+                ),
+            ));
+        }
+        if argument_offset % 4 != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "invalid ExecuteIndirect: ArgumentBufferOffset {argument_offset} is not 4-byte aligned"
+                ),
+            ));
+        }
+        let offset = argument_offset as usize;
+        let stride = signature_desc.byte_stride as usize;
+        let required = stride
+            .checked_mul(cpu_count as usize)
+            .and_then(|bytes| bytes.checked_add(offset))
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "ExecuteIndirect argument buffer range overflows",
+                )
+            })?;
+        if required > arguments.len() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "ExecuteIndirect argument buffer range {required} exceeds the supplied {} bytes",
+                    arguments.len()
+                ),
+            ));
+        }
+        let kind = match signature_desc.argument.ty {
+            D3D12_INDIRECT_ARGUMENT_TYPE_DRAW => 0u32,
+            D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED => 1u32,
+            D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH => 2u32,
+            D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH
+            | D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS => {
+                let executed = self.execute_indirect(
+                    list,
+                    signature,
+                    max_count,
+                    arguments,
+                    argument_offset,
+                    Some(cpu_count),)?;
+                let bridge = self.metal_raytracing()?;
+                let mut inner = bridge
+                    .inner
+                    .lock()
+                    .expect("Metal raytracing bridge lock poisoned");
+                inner.last_indirect_native = false;
+                inner.last_indirect_effective = executed;
+                inner.last_indirect_boundary = Some(
+                    "DISPATCH_MESH/DISPATCH_RAYS indirect arguments still use typed recording:                      the guest path has no native mesh/ray pipeline"
+                        .to_string(),
+                );
+                return Ok(executed);
+            }
+            other => { // coverage: unreachable — command signature creation only admits the handled argument types
+                return Err(AppError::new( // coverage: unreachable — command signature creation only admits the handled argument types
+                    ReasonCode::RcD3dInvalidState, // coverage: unreachable — command signature creation only admits the handled argument types
+                    format!("unsupported ExecuteIndirect command signature argument type {other}"), // coverage: unreachable — command signature creation only admits the handled argument types
+                )); // coverage: unreachable — command signature creation only admits the handled argument types
+            }
+        };
+
+        let bridge = self.metal_raytracing()?;
+        let mut inner = bridge
+            .inner
+            .lock()
+            .expect("Metal raytracing bridge lock poisoned");
+        if inner.indirect_interpreter.is_none() {
+            inner.indirect_interpreter = Some(crate::metal_backend::MetalIndirectInterpreter::new(
+                &inner.device,)?);
+        }
+        let argument_buffer = inner.device.new_buffer_with_data(
+            arguments.as_ptr() as *const std::ffi::c_void,
+            arguments.len() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let count_buffer = if let Some((bytes, count_offset)) = count_bytes {
+            let start = count_offset as usize;
+            if start + 4 > bytes.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "ExecuteIndirect count buffer range {} exceeds the supplied {} bytes",
+                        start + 4,
+                        bytes.len()
+                    ),
+                ));
+            }
+            Some(inner.device.new_buffer_with_data(
+                bytes[start..].as_ptr() as *const std::ffi::c_void,
+                bytes.len().saturating_sub(start) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            ))
+        } else {
+            None
+        };
+        let effective = {
+            let interpreter = inner
+                .indirect_interpreter
+                .as_ref()
+                .expect("indirect interpreter initialised");
+            let (effective, decoded) = interpreter.execute(
+                &inner.device,
+                &inner.queue,
+                argument_buffer.as_ref(),
+                argument_offset,
+                signature_desc.byte_stride as u64,
+                max_count,
+                kind,
+                count_buffer.as_ref().map(|buffer| buffer.as_ref()),)?;
+            inner.last_indirect_results = decoded;
+            effective
+        };
+        inner.last_indirect_effective = effective;
+        inner.last_indirect_boundary = None;
+        if kind == 0 || kind == 1 {
+            let results = inner.last_indirect_results.clone();
+            drop(inner);
+            let executed = self.execute_native_indirect_draw(list, kind, &results, effective)?;
+            let bridge = self.metal_raytracing()?;
+            let mut inner = bridge
+                .inner
+                .lock()
+                .expect("Metal raytracing bridge lock poisoned");
+            inner.last_indirect_native = true;
+            inner.last_indirect_effective = executed;
+            inner.last_indirect_boundary = None;
+            return Ok(executed);
+        }
+        inner.last_indirect_native = true;
+        Ok(effective)
+    }
+
+    /// Execute an indirect command sequence for a supported signature.
+    ///
+    /// This is the typed-recording fallback used when no native pipeline is
+    /// available (for example MESH/RAYS, or DRAW before a native render
+    /// pipeline is registered). The COM ExecuteIndirect path calls
+    /// [`execute_indirect_gpu`], which consumes count/arguments on the GPU and
+    /// executes draws through a real `MTLIndirectCommandBuffer`. Unsupported
+    /// signatures and arguments fail with an exact error before any command is
+    /// recorded.
+    pub fn execute_indirect(
+        &mut self,
+        list: CommandListId,
+        signature: u64,
+        max_count: u32,
+        arguments: &[u8],
+        argument_offset: u64,
+        count: Option<u32>,
+    ) -> AppResult<u32> {
+        let signature = self
+            .command_signatures
+            .get(&signature)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("ExecuteIndirect with unknown command signature {signature:#x}"),
+                )
+            })?;
+        let count = count.unwrap_or(max_count);
+        if count > max_count {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "invalid ExecuteIndirect: Count {count} exceeds MaxCommandCount {max_count}"
+                ),
+            ));
+        }
+        if argument_offset % 4 != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "invalid ExecuteIndirect: ArgumentBufferOffset {argument_offset} is not 4-byte aligned"
+                ),
+            ));
+        }
+        #[rustfmt::skip]
+        let offset = usize::try_from(argument_offset).map_err(|_| {
+            AppError::new( // coverage: unreachable — u64 offsets always fit usize on 64-bit targets
+                // coverage: unreachable — u64 offsets always fit usize on 64-bit targets
+                ReasonCode::RcD3dInvalidState, // coverage: unreachable — 64-bit target address space
+                "ExecuteIndirect ArgumentBufferOffset does not fit the target address space", // coverage: unreachable — 64-bit target address space
+            )
+        })?; // coverage: unreachable — u64 offsets always fit usize on 64-bit targets
+        let stride = signature.byte_stride as usize;
+        let required = stride
+            .checked_mul(count as usize)
+            .and_then(|bytes| bytes.checked_add(offset))
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "ExecuteIndirect argument buffer range overflows",
+                )
+            })?;
+        if required > arguments.len() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "ExecuteIndirect argument buffer range {required} exceeds the supplied {} bytes",
+                    arguments.len()
+                ),
+            ));
+        }
+
+        let mut executed = 0u32;
+        for index in 0..count as usize {
+            let base = offset + index * stride;
+            match signature.argument.ty {
+                D3D12_INDIRECT_ARGUMENT_TYPE_DRAW => {
+                    let args = D3D12DrawArguments {
+                        vertex_count_per_instance: read_le_u32(arguments, base)?,
+                        instance_count: read_le_u32(arguments, base + 4)?,
+                        start_vertex_location: read_le_u32(arguments, base + 8)?,
+                        start_instance_location: read_le_u32(arguments, base + 12)?,
+                    };
+                    if args.vertex_count_per_instance == 0 || args.instance_count == 0 {
+                        continue;
+                    }
+                    if args.start_vertex_location != 0 || args.start_instance_location != 0 {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            format!(
+                                "unsupported ExecuteIndirect DRAW argument: non-zero start \
+                                 locations ({}, {}) are not representable",
+                                args.start_vertex_location, args.start_instance_location
+                            ),
+                        ));
+                    }
+                    self.backend.record_draw_instanced(
+                        list,
+                        args.vertex_count_per_instance,
+                        args.instance_count,
+                    )?;
+                }
+                D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH => {
+                    let args = D3D12DispatchArguments {
+                        x: read_le_u32(arguments, base)?,
+                        y: read_le_u32(arguments, base + 4)?,
+                        z: read_le_u32(arguments, base + 8)?,
+                    };
+                    if args.x == 0 || args.y == 0 || args.z == 0 {
+                        continue;
+                    }
+                    self.backend.record_dispatch(list, args.x, args.y, args.z)?;
+                }
+                D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH => {
+                    let args = D3D12DispatchArguments {
+                        x: read_le_u32(arguments, base)?,
+                        y: read_le_u32(arguments, base + 4)?,
+                        z: read_le_u32(arguments, base + 8)?,
+                    };
+                    if args.x == 0 || args.y == 0 || args.z == 0 {
+                        continue;
+                    }
+                    self.backend
+                        .record_dispatch_mesh(list, args.x, args.y, args.z)?;
+                }
+                D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS => {
+                    // D3D12_DISPATCH_RAYS_DESC is 100 bytes.
+                    let raygen = read_le_u64(arguments, base)?;
+                    let miss = read_le_u64(arguments, base + 16)?;
+                    let hit = read_le_u64(arguments, base + 40)?;
+                    let callable = read_le_u64(arguments, base + 64)?;
+                    let width = read_le_u32(arguments, base + 88)?;
+                    let height = read_le_u32(arguments, base + 92)?;
+                    let depth = read_le_u32(arguments, base + 96)?;
+                    if raygen == 0 || width == 0 || height == 0 || depth == 0 {
+                        continue;
+                    }
+                    self.backend.record_dispatch_rays(
+                        list, raygen, miss, hit, callable, width, height, depth,
+                    )?;
+                }
+                other => {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        format!(
+                            "unsupported ExecuteIndirect command signature argument type {other}"
+                        ),
+                    ));
+                }
+            }
+            executed += 1;
+        }
+        Ok(executed)
+    }
+
+    pub fn directml(&self) -> &DmlRuntime {
+        &self.directml
+    }
+
+    pub fn directml_mut(&mut self) -> &mut DmlRuntime {
+        &mut self.directml
+    }
+}
+
+fn read_le_u32(bytes: &[u8], offset: usize) -> AppResult<u32> {
+    let raw = bytes.get(offset..offset + 4).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            "indirect argument buffer is truncated",
+        )
+    })?;
+    Ok(u32::from_le_bytes(raw.try_into().expect("4-byte slice")))
+}
+
+fn read_le_u64(bytes: &[u8], offset: usize) -> AppResult<u64> {
+    let raw = bytes.get(offset..offset + 8).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            "indirect argument buffer is truncated",
+        )
+    })?;
+    Ok(u64::from_le_bytes(raw.try_into().expect("8-byte slice")))
+}
+
+fn shader_identifier(
+    bytecode: &[u8],
+    name: &str,
+    rename: Option<&str>,
+) -> [u8; state_objects::SHADER_IDENTIFIER_SIZE_IN_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytecode);
+    hasher.update(name.as_bytes());
+    if let Some(rename) = rename {
+        hasher.update(rename.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn hit_group_identifier(
+    group: &state_objects::D3d12HitGroup,
+    exported: &BTreeMap<String, [u8; state_objects::SHADER_IDENTIFIER_SIZE_IN_BYTES]>,
+) -> [u8; state_objects::SHADER_IDENTIFIER_SIZE_IN_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(group.name.as_bytes());
+    for shader in [
+        group.any_hit.as_deref(),
+        group.closest_hit.as_deref(),
+        group.intersection.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        hasher.update(shader.as_bytes());
+        if let Some(identifier) = exported.get(shader) {
+            hasher.update(identifier);
+        }
+    }
+    hasher.finalize().into()
 }
 
 #[cfg(test)]
@@ -5298,6 +7994,7 @@ mod tests {
             )
             .expect("RTV descriptor");
         let allocator = runtime.create_command_allocator();
+
         let root_signature = runtime.create_root_signature(RootSignatureDesc::default());
         let pipeline = runtime.create_pipeline_state(
             root_signature,
@@ -5605,5 +8302,3143 @@ mod tests {
         assert_eq!(runtime.guest_initial_upload_count(), 1);
         assert_eq!(runtime.staging_bytes(), 0);
         assert_eq!(runtime.directstorage_live_texture_count(), 0);
+    }
+
+    fn rt_desc_with(subobjects: Vec<D3d12StateSubobject>) -> D3d12StateObjectDesc {
+        D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects,
+        }
+    }
+
+    fn dxil(export: &str, bytecode: Vec<u8>) -> D3d12StateSubobject {
+        D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+            bytecode,
+            exports: vec![state_objects::D3d12ExportDesc {
+                name: export.to_string(),
+                export_to_rename: None,
+                flags: 0,
+            }],
+        })
+    }
+
+    fn sig_desc(ty: u32, stride: u32) -> D3D12CommandSignatureDesc {
+        D3D12CommandSignatureDesc {
+            byte_stride: stride,
+            node_mask: 0,
+            arguments: vec![D3D12IndirectArgumentDesc {
+                ty,
+                root_parameter_index: 0,
+                dest_offset_in_32bit_values: 0,
+                num_32bit_values_to_set: 0,
+            }],
+        }
+    }
+
+    fn draw_sig_for_matrix(runtime: &mut D3d12Runtime) -> u64 {
+        runtime
+            .create_command_signature(sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, 16))
+            .expect("draw signature")
+    }
+
+    #[test]
+    fn d3d12_state_objects_work_graphs_and_execute_indirect_error_matrix_are_pinned() {
+        use crate::gfx::Command;
+        let mut runtime = D3d12Runtime::new();
+        let list = runtime.create_graphics_command_list(0, 0, false);
+
+        // create_state_object_with_handle and duplicate handling.
+        let handle = 0x1234u64;
+        let created = runtime
+            .create_state_object_with_handle(
+                handle,
+                rt_desc_with(vec![
+                    D3d12StateSubobject::StateObjectConfig { flags: 0 },
+                    dxil("raygen", vec![1, 2, 3]),
+                    D3d12StateSubobject::RaytracingPipelineConfig {
+                        max_trace_recursion_depth: 1,
+                    },
+                ]),
+            )
+            .expect("explicit handle");
+        assert_eq!(created.handle, handle);
+        let error = runtime
+            .create_state_object_with_handle(
+                handle,
+                rt_desc_with(vec![D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                }]),
+            )
+            .expect_err("duplicate handle");
+        assert_eq!(error.message, "state object 0x1234 already exists");
+        assert!(runtime.bound_state_object(list).is_none());
+        runtime
+            .set_pipeline_state1_state_object(
+                list,
+                handle,
+                D3d12StateObjectDesc {
+                    object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+                    subobjects: vec![],
+                },
+            )
+            .expect("bind existing state object");
+        let bound = runtime
+            .bound_state_object(list)
+            .expect("bound state object");
+        assert_eq!(bound.handle, handle);
+        let error = runtime
+            .set_pipeline_state1_state_object(
+                list,
+                0x5678,
+                D3d12StateObjectDesc {
+                    object_type: STATE_OBJECT_TYPE_COLLECTION,
+                    subobjects: vec![],
+                },
+            )
+            .expect_err("collection binding must fail");
+        assert_eq!(
+            error.message,
+            "SetPipelineState1 cannot bind a collection state object"
+        );
+        runtime.destroy_state_object(handle).expect("destroy");
+        let error = runtime.destroy_state_object(handle).unwrap_err();
+        assert_eq!(error.message, "destroy of unknown state object 0x1234");
+
+        // AddToStateObject validation matrix.
+        let collection = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_COLLECTION,
+                subobjects: vec![D3d12StateSubobject::StateObjectConfig { flags: 0x4 }],
+            })
+            .expect("collection");
+        let error = runtime
+            .add_to_state_object(0x9999, rt_desc_with(vec![]))
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "AddToStateObject from unknown state object 0x9999"
+        );
+        let error = runtime
+            .add_to_state_object(collection, rt_desc_with(vec![]))
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "AddToStateObject cannot grow a collection state object"
+        );
+        let parent = runtime
+            .create_state_object(state_object_desc_with_export(
+                STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+                0x4,
+                "raygen",
+                1,
+            ))
+            .expect("parent");
+        let error = runtime
+            .add_to_state_object(
+                parent,
+                D3d12StateObjectDesc {
+                    object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                    subobjects: vec![D3d12StateSubobject::StateObjectConfig { flags: 0x4 }],
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "AddToStateObject addition type 4 does not match parent type 3"
+        );
+        let mut no_flag =
+            state_object_desc_with_export(STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 0, "miss", 1);
+        no_flag.subobjects.retain(|subobject| {
+            !matches!(subobject, D3d12StateSubobject::StateObjectConfig { .. })
+        });
+        let error = runtime.add_to_state_object(parent, no_flag).unwrap_err();
+        assert_eq!(
+            error.message,
+            "addition did not set D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS"
+        );
+        let mut depth_conflict =
+            state_object_desc_with_export(STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 0x4, "miss", 2);
+        let error = runtime
+            .add_to_state_object(parent, depth_conflict)
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "AddToStateObject raytracing recursion depth 2 conflicts with parent 1"
+        );
+        depth_conflict =
+            state_object_desc_with_export(STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 0x4, "miss", 1);
+        for subobject in &mut depth_conflict.subobjects {
+            if let D3d12StateSubobject::RaytracingShaderConfig {
+                max_attribute_size, ..
+            } = subobject
+            {
+                *max_attribute_size = 12;
+            }
+        }
+        let error = runtime
+            .add_to_state_object(parent, depth_conflict)
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "AddToStateObject raytracing shader config conflicts with parent"
+        );
+        let duplicate =
+            state_object_desc_with_export(STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 0x4, "raygen", 1);
+        let error = runtime.add_to_state_object(parent, duplicate).unwrap_err();
+        assert_eq!(
+            error.message,
+            "AddToStateObject export \"raygen\" conflicts with the parent state object"
+        );
+
+        // Materialise validation branches.
+        let cases: Vec<(D3d12StateObjectDesc, &str)> = vec![
+            (
+                rt_desc_with(vec![
+                    D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                        bytecode: vec![1],
+                        exports: vec![
+                            state_objects::D3d12ExportDesc {
+                                name: "dup".into(),
+                                export_to_rename: None,
+                                flags: 0,
+                            },
+                            state_objects::D3d12ExportDesc {
+                                name: "dup".into(),
+                                export_to_rename: None,
+                                flags: 0,
+                            },
+                        ],
+                    }),
+                    D3d12StateSubobject::RaytracingPipelineConfig {
+                        max_trace_recursion_depth: 1,
+                    },
+                ]),
+                "state object export \"dup\" is defined more than once",
+            ),
+            (
+                rt_desc_with(vec![D3d12StateSubobject::ExistingCollection(
+                    state_objects::D3d12ExistingCollection {
+                        collection: 0x9999,
+                        exports: vec![],
+                    },
+                )]),
+                "existing collection 39321 is not a live state object",
+            ),
+            (
+                rt_desc_with(vec![
+                    dxil("raygen", vec![1]),
+                    D3d12StateSubobject::RaytracingShaderConfig {
+                        max_payload_size: 1,
+                        max_attribute_size: 36,
+                    },
+                    D3d12StateSubobject::RaytracingPipelineConfig {
+                        max_trace_recursion_depth: 1,
+                    },
+                ]),
+                "raytracing MaxAttributeSizeInBytes 36 exceeds D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES (32)",
+            ),
+            (
+                rt_desc_with(vec![
+                    dxil("raygen", vec![1]),
+                    D3d12StateSubobject::RaytracingShaderConfig {
+                        max_payload_size: 1,
+                        max_attribute_size: 2,
+                    },
+                    D3d12StateSubobject::RaytracingPipelineConfig {
+                        max_trace_recursion_depth: 1,
+                    },
+                ]),
+                "raytracing MaxAttributeSizeInBytes 2 is not a multiple of 4",
+            ),
+            (
+                rt_desc_with(vec![
+                    dxil("raygen", vec![1]),
+                    D3d12StateSubobject::RaytracingPipelineConfig {
+                        max_trace_recursion_depth: 32,
+                    },
+                ]),
+                "raytracing MaxTraceRecursionDepth 32 exceeds D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH (31)",
+            ),
+            (
+                rt_desc_with(vec![
+                    dxil("raygen", vec![1]),
+                    D3d12StateSubobject::RaytracingPipelineConfig1 {
+                        max_trace_recursion_depth: 32,
+                        flags: 0,
+                    },
+                ]),
+                "raytracing MaxTraceRecursionDepth 32 exceeds D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH (31)",
+            ),
+            (
+                rt_desc_with(vec![
+                    dxil("raygen", vec![1]),
+                    D3d12StateSubobject::RaytracingPipelineConfig1 {
+                        max_trace_recursion_depth: 1,
+                        flags: 0x1000,
+                    },
+                ]),
+                "D3D12_RAYTRACING_PIPELINE_FLAGS 0x1000 contain undefined bits",
+            ),
+            (
+                rt_desc_with(vec![
+                    dxil("raygen", vec![1]),
+                    D3d12StateSubobject::HitGroup(state_objects::D3d12HitGroup {
+                        name: "raygen".into(),
+                        ty: 0,
+                        any_hit: None,
+                        closest_hit: None,
+                        intersection: None,
+                    }),
+                    D3d12StateSubobject::RaytracingPipelineConfig {
+                        max_trace_recursion_depth: 1,
+                    },
+                ]),
+                "hit group export \"raygen\" is defined more than once",
+            ),
+            (
+                rt_desc_with(vec![D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                }]),
+                "raytracing pipeline state object has no DXIL library or collection",
+            ),
+            (
+                rt_desc_with(vec![dxil("raygen", vec![1])]),
+                "raytracing pipeline state object requires D3D12_RAYTRACING_PIPELINE_CONFIG or CONFIG1",
+            ),
+            (
+                rt_desc_with(vec![
+                    dxil("raygen", vec![1]),
+                    D3d12StateSubobject::WorkGraph(D3d12WorkGraph::default()),
+                    D3d12StateSubobject::RaytracingPipelineConfig {
+                        max_trace_recursion_depth: 1,
+                    },
+                ]),
+                "work-graph subobject requires D3D12_STATE_OBJECT_TYPE_EXECUTABLE",
+            ),
+            (
+                D3d12StateObjectDesc {
+                    object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                    subobjects: vec![D3d12StateSubobject::WorkGraph(D3d12WorkGraph::default())],
+                },
+                "work graph \"\" has no nodes or entrypoints",
+            ),
+            (
+                D3d12StateObjectDesc {
+                    object_type: STATE_OBJECT_TYPE_COLLECTION,
+                    subobjects: vec![D3d12StateSubobject::WorkGraph(D3d12WorkGraph::default())],
+                },
+                "work-graph subobject requires D3D12_STATE_OBJECT_TYPE_EXECUTABLE",
+            ),
+            (
+                D3d12StateObjectDesc {
+                    object_type: STATE_OBJECT_TYPE_COLLECTION,
+                    subobjects: vec![D3d12StateSubobject::StateObjectConfig { flags: 0x8 }],
+                },
+                "D3D12_STATE_OBJECT_FLAGS 0x8 contain undefined bits",
+            ),
+        ];
+        for (desc, message) in cases {
+            let error = runtime.create_state_object(desc).unwrap_err();
+            assert_eq!(error.message, message);
+        }
+
+        // Valid Config1, hit groups, and export renaming exercise the
+        // remaining success arms.
+        let valid_config1 = runtime
+            .create_state_object(rt_desc_with(vec![
+                dxil("raygen", vec![1]),
+                D3d12StateSubobject::RaytracingShaderConfig {
+                    max_payload_size: 16,
+                    max_attribute_size: 8,
+                },
+                D3d12StateSubobject::RaytracingPipelineConfig1 {
+                    max_trace_recursion_depth: 1,
+                    flags: 0x100,
+                },
+                D3d12StateSubobject::HitGroup(state_objects::D3d12HitGroup {
+                    name: "hit".into(),
+                    ty: 0,
+                    any_hit: Some("raygen".into()),
+                    closest_hit: Some("closest".into()),
+                    intersection: None,
+                }),
+                D3d12StateSubobject::NodeMask { mask: 1 },
+            ]))
+            .expect("valid config1 and hit group");
+        assert!(
+            runtime
+                .state_object(valid_config1)
+                .unwrap()
+                .shader_identifier("hit")
+                .is_some()
+        );
+        let renamed = runtime
+            .create_state_object(rt_desc_with(vec![
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: vec![4, 5, 6],
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: "renamed".into(),
+                        export_to_rename: Some("original".into()),
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                },
+            ]))
+            .expect("renamed export");
+        assert!(
+            runtime
+                .state_object(renamed)
+                .unwrap()
+                .shader_identifier("renamed")
+                .is_some()
+        );
+        let error = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: 99,
+                subobjects: vec![],
+            })
+            .unwrap_err();
+        assert_eq!(error.message, "D3D12_STATE_OBJECT_TYPE 99 is not defined");
+        // Executable state object without pipeline config takes the
+        // parse_raytracing_pipeline_params branch on binding.
+        let executable_with_dxil = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![dxil("exe", vec![7, 8])],
+            })
+            .expect("executable dxil");
+        runtime
+            .set_pipeline_state1_state_object(
+                list,
+                executable_with_dxil,
+                D3d12StateObjectDesc {
+                    object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                    subobjects: vec![],
+                },
+            )
+            .expect("bind executable dxil");
+        let overflow_sig = draw_sig_for_matrix(&mut runtime);
+        let error = runtime
+            .execute_indirect(
+                list,
+                overflow_sig,
+                1,
+                &draw_argument_bytes(1, 1),
+                u64::MAX - 3,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect argument buffer range overflows"
+        );
+
+        // ExistingCollection success path.
+        let referenced = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_COLLECTION,
+                subobjects: vec![
+                    D3d12StateSubobject::StateObjectConfig { flags: 0 },
+                    dxil("collection_export", vec![9, 9]),
+                ],
+            })
+            .expect("referenced collection");
+        let with_collection = runtime
+            .create_state_object(rt_desc_with(vec![
+                D3d12StateSubobject::ExistingCollection(state_objects::D3d12ExistingCollection {
+                    collection: referenced,
+                    exports: vec![],
+                }),
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                },
+            ]))
+            .expect("existing collection state object");
+        assert!(
+            runtime
+                .state_object(with_collection)
+                .unwrap()
+                .shader_identifier("collection_export")
+                .is_some()
+        );
+
+        // Work-graph selectors and validation.
+        let graph = D3d12WorkGraph {
+            program_name: "graph".into(),
+            flags: 0,
+            entrypoints: vec![work_graphs::D3d12NodeId::new("node0", 0)],
+            nodes: vec![work_graphs::D3d12WorkGraphNode {
+                shader: "node0".into(),
+                overrides: work_graphs::D3d12NodeOverrides::None,
+            }],
+        };
+        let executable = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::WorkGraph(graph.clone())],
+            })
+            .expect("executable");
+        let identifier = runtime
+            .work_graph_program_identifier(executable, "graph")
+            .expect("identifier");
+        let error = runtime
+            .set_work_graph_program(list, identifier, 0x2, None)
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "D3D12_WORK_GRAPH_FLAGS 0x2 contain undefined bits"
+        );
+        runtime
+            .set_work_graph_program(
+                list,
+                identifier,
+                0,
+                Some((0, graph.memory_requirements().min_size_in_bytes)),
+            )
+            .expect("set program");
+        assert_eq!(
+            runtime
+                .bound_work_graph_program(list)
+                .map(|p| p.program_name.as_str()),
+            Some("graph")
+        );
+        let dispatch = D3d12DispatchGraphDesc {
+            mode: work_graphs::DISPATCH_MODE_NODE_CPU_INPUT,
+            entrypoint_index: 0,
+            record_count: 1,
+            record_stride: 8,
+            records: vec![0; 8],
+        };
+        assert_eq!(
+            runtime.dispatch_bound_work_graph(list, &dispatch).unwrap(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .work_graph_memory_requirements(executable, Some("graph"))
+                .unwrap(),
+            graph.memory_requirements()
+        );
+        let error = runtime
+            .work_graph_memory_requirements(0x9999, None)
+            .unwrap_err();
+        assert_eq!(error.message, "unknown state object 0x9999");
+        let error = runtime
+            .work_graph_memory_requirements(collection, None)
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            format!("state object {collection:#x} is not D3D12_STATE_OBJECT_TYPE_EXECUTABLE")
+        );
+        let error = runtime
+            .work_graph_memory_requirements(referenced, None)
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            format!("state object {referenced:#x} is not D3D12_STATE_OBJECT_TYPE_EXECUTABLE")
+        );
+        let empty_executable = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::StateObjectConfig { flags: 0 }],
+            })
+            .expect("empty executable");
+        let error = runtime
+            .work_graph_memory_requirements(empty_executable, None)
+            .unwrap_err();
+        assert_eq!(error.message, "state object contains no work graph");
+        let error = runtime
+            .dispatch_work_graph(
+                list,
+                executable,
+                Some("graph"),
+                &D3d12DispatchGraphDesc {
+                    entrypoint_index: 0,
+                    record_count: 1,
+                    record_stride: 0,
+                    records: vec![0; 8],
+                    ..dispatch.clone()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.message, "work graph record stride is zero");
+
+        // Command signature error and success matrix.
+        for (desc, message) in [
+            (
+                sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, 0),
+                "invalid command signature: ByteStride 0 must be a non-zero multiple of 4",
+            ),
+            (
+                sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, 2),
+                "invalid command signature: ByteStride 2 must be a non-zero multiple of 4",
+            ),
+            (
+                D3D12CommandSignatureDesc {
+                    byte_stride: 16,
+                    node_mask: 0,
+                    arguments: vec![],
+                },
+                "unsupported command signature: 0 argument descriptors; only a single argument is representable",
+            ),
+            (
+                sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 16),
+                "unsupported command signature: D3D12_INDIRECT_ARGUMENT_TYPE 3 is not representable",
+            ),
+            (
+                sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, 12),
+                "invalid command signature: ByteStride 12 is smaller than the 16-byte argument",
+            ),
+        ] {
+            let error = runtime.create_command_signature(desc).unwrap_err();
+            assert_eq!(error.message, message);
+        }
+        let draw_sig = runtime
+            .create_command_signature(sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, 16))
+            .unwrap();
+        let indexed_sig = runtime
+            .create_command_signature(sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, 20))
+            .unwrap();
+        assert!(runtime.command_signature(indexed_sig).is_some());
+        let dispatch_sig = runtime
+            .create_command_signature(sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, 12))
+            .unwrap();
+        let mesh_sig = runtime
+            .create_command_signature(sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, 12))
+            .unwrap();
+        let rays_sig = runtime
+            .create_command_signature(sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS, 100))
+            .unwrap();
+        assert!(runtime.command_signature(draw_sig).is_some());
+        assert!(runtime.command_signature(0x9999).is_none());
+        assert_eq!(
+            runtime
+                .destroy_command_signature(0x9999)
+                .unwrap_err()
+                .message,
+            "unknown command signature 0x9999"
+        );
+        let temp_sig = runtime
+            .create_command_signature(sig_desc(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, 16))
+            .unwrap();
+        runtime.destroy_command_signature(temp_sig).unwrap();
+
+        // ExecuteIndirect validation and every supported argument type.
+        assert_eq!(
+            runtime
+                .execute_indirect(list, 0x9999, 1, &[0; 16], 0, None)
+                .unwrap_err()
+                .message,
+            "ExecuteIndirect with unknown command signature 0x9999"
+        );
+        let draw_args = draw_argument_bytes(3, 1);
+        assert_eq!(
+            runtime
+                .execute_indirect(list, draw_sig, 1, &draw_args, 0, Some(2))
+                .unwrap_err()
+                .message,
+            "invalid ExecuteIndirect: Count 2 exceeds MaxCommandCount 1"
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, draw_sig, 1, &draw_args, 1, None)
+                .unwrap_err()
+                .message,
+            "invalid ExecuteIndirect: ArgumentBufferOffset 1 is not 4-byte aligned"
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, draw_sig, 2, &draw_args, 0, None)
+                .unwrap_err()
+                .message,
+            "ExecuteIndirect argument buffer range 32 exceeds the supplied 16 bytes"
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, draw_sig, 1, &draw_args, 0, Some(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, draw_sig, 1, &[0u8; 16], 0, None)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, draw_sig, 1, &draw_args, 0, None)
+                .unwrap(),
+            1
+        );
+        let mut nonzero_start = draw_args;
+        nonzero_start[8..12].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(
+            runtime
+                .execute_indirect(list, draw_sig, 1, &nonzero_start, 0, None)
+                .unwrap_err()
+                .message,
+            "unsupported ExecuteIndirect DRAW argument: non-zero start locations (7, 0) are not representable"
+        );
+        let mut dispatch_args = Vec::new();
+        dispatch_args.extend_from_slice(&2u32.to_le_bytes());
+        dispatch_args.extend_from_slice(&3u32.to_le_bytes());
+        dispatch_args.extend_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            runtime
+                .execute_indirect(list, dispatch_sig, 1, &dispatch_args, 0, None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, dispatch_sig, 1, &[0u8; 12], 0, None)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, mesh_sig, 1, &dispatch_args, 0, None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, mesh_sig, 1, &[0u8; 12], 0, None)
+                .unwrap(),
+            0
+        );
+        let mut rays_args = vec![0u8; 100];
+        rays_args[0..8].copy_from_slice(&0x1000u64.to_le_bytes());
+        rays_args[88..92].copy_from_slice(&320u32.to_le_bytes());
+        rays_args[92..96].copy_from_slice(&200u32.to_le_bytes());
+        rays_args[96..100].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            runtime
+                .execute_indirect(list, rays_sig, 1, &rays_args, 0, None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, rays_sig, 1, &[0u8; 100], 0, None)
+                .unwrap(),
+            0
+        );
+        // Unsupported stored signature and truncated argument reads.
+        runtime.command_signatures.insert(
+            0x9001,
+            D3D12CommandSignature {
+                handle: 0x9001,
+                byte_stride: 16,
+                node_mask: 0,
+                argument: D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                },
+            },
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, 0x9001, 1, &[0u8; 16], 0, None)
+                .unwrap_err()
+                .message,
+            "unsupported ExecuteIndirect command signature argument type 3"
+        );
+        runtime.command_signatures.insert(
+            0x9002,
+            D3D12CommandSignature {
+                handle: 0x9002,
+                byte_stride: 4,
+                node_mask: 0,
+                argument: D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                },
+            },
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, 0x9002, 1, &[0u8; 4], 0, None)
+                .unwrap_err()
+                .message,
+            "indirect argument buffer is truncated"
+        );
+        runtime.command_signatures.insert(
+            0x9003,
+            D3D12CommandSignature {
+                handle: 0x9003,
+                byte_stride: 4,
+                node_mask: 0,
+                argument: D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                },
+            },
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect(list, 0x9003, 1, &[0u8; 4], 0, None)
+                .unwrap_err()
+                .message,
+            "indirect argument buffer is truncated"
+        );
+        // Error propagation from the Metal backend is exercised by dispatching
+        // and drawing on a closed command list.
+        let closed = runtime.create_graphics_command_list(0, 0, false);
+        runtime
+            .close_command_list(closed)
+            .expect("close error list");
+        let error = runtime
+            .execute_indirect(closed, draw_sig, 1, &draw_args, 0, None)
+            .unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        let error = runtime
+            .execute_indirect(closed, rays_sig, 1, &rays_args, 0, None)
+            .unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        let error = runtime
+            .dispatch_work_graph(closed, executable, Some("graph"), &dispatch, None)
+            .unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+
+        // The recorded commands include draws, dispatches, mesh dispatches and rays.
+        let stream = runtime.close_command_list(list).expect("close");
+        assert!(stream.commands.iter().any(|command| matches!(
+            command,
+            Command::DrawInstanced {
+                vertices: 3,
+                instances: 1
+            }
+        )));
+        assert!(
+            stream
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Dispatch { x: 2, y: 3, z: 4 }))
+        );
+        assert!(
+            stream
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::DispatchMesh { x: 2, y: 3, z: 4 }))
+        );
+        assert!(stream.commands.iter().any(|command| matches!(
+            command,
+            Command::DispatchRays {
+                width: 320,
+                height: 200,
+                depth: 1,
+                ..
+            }
+        )));
+    }
+
+    fn state_object_desc_with_export(
+        object_type: u32,
+        flags: u32,
+        export: &str,
+        recursion: u32,
+    ) -> D3d12StateObjectDesc {
+        D3d12StateObjectDesc {
+            object_type,
+            subobjects: vec![
+                D3d12StateSubobject::StateObjectConfig { flags },
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: vec![0x44, 0x58, 0x42, 0x43],
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: export.to_string(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::RaytracingShaderConfig {
+                    max_payload_size: 16,
+                    max_attribute_size: 8,
+                },
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: recursion,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn d3d12_state_object_lifetime_and_shader_identifier_are_exact() {
+        let mut runtime = D3d12Runtime::new();
+        let desc =
+            state_object_desc_with_export(STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 0, "raygen", 1);
+        let handle = runtime.create_state_object(desc).expect("state object");
+        let identifier = runtime
+            .state_object_shader_identifier(handle, "raygen")
+            .expect("shader identifier");
+        assert_eq!(identifier.len(), 32);
+        let repeated = runtime
+            .state_object_shader_identifier(handle, "raygen")
+            .expect("stable identifier");
+        assert_eq!(identifier, repeated);
+        assert_ne!(
+            identifier,
+            runtime
+                .state_object_shader_identifier(handle, "missing")
+                .unwrap_or([0; 32])
+        );
+        assert_eq!(runtime.release_state_object(handle).expect("release"), 0);
+        assert!(runtime.state_object(handle).is_none());
+        let error = runtime
+            .release_state_object(handle)
+            .expect_err("double release must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+    }
+
+    #[test]
+    fn d3d12_add_to_state_object_requires_opt_in_and_merges_exports() {
+        let mut runtime = D3d12Runtime::new();
+        let parent = runtime
+            .create_state_object(state_object_desc_with_export(
+                STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+                0,
+                "raygen",
+                1,
+            ))
+            .expect("parent");
+        let addition =
+            state_object_desc_with_export(STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 0x4, "miss", 1);
+        let error = runtime
+            .add_to_state_object(parent, addition)
+            .expect_err("parent without opt-in must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "parent state object did not set D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS"
+        );
+
+        let parent = runtime
+            .create_state_object(state_object_desc_with_export(
+                STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+                0x4,
+                "raygen",
+                1,
+            ))
+            .expect("parent with opt-in");
+        let addition =
+            state_object_desc_with_export(STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 0x4, "miss", 1);
+        let child = runtime
+            .add_to_state_object(parent, addition)
+            .expect("addition");
+        assert!(
+            runtime
+                .state_object(child)
+                .unwrap()
+                .shader_identifier("raygen")
+                .is_some()
+        );
+        assert!(
+            runtime
+                .state_object(child)
+                .unwrap()
+                .shader_identifier("miss")
+                .is_some()
+        );
+        let conflict =
+            state_object_desc_with_export(STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 0x4, "raygen", 1);
+        let error = runtime
+            .add_to_state_object(child, conflict)
+            .expect_err("duplicate export must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "AddToStateObject export \"raygen\" conflicts with the parent state object"
+        );
+    }
+
+    #[test]
+    fn d3d12_state_object_config1_requires_recursion_and_attribute_limits() {
+        let mut runtime = D3d12Runtime::new();
+        let error = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+                subobjects: vec![
+                    D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                        bytecode: vec![1],
+                        exports: vec![],
+                    }),
+                    D3d12StateSubobject::RaytracingShaderConfig {
+                        max_payload_size: 16,
+                        max_attribute_size: 36,
+                    },
+                ],
+            })
+            .expect_err("attribute size above 32 must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "raytracing MaxAttributeSizeInBytes 36 exceeds D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES (32)"
+        );
+        assert_eq!(runtime.state_objects().count(), 0);
+    }
+
+    #[test]
+    fn d3d12_work_graph_dispatch_records_real_compute_commands() {
+        use crate::gfx::Command;
+        let mut runtime = D3d12Runtime::new();
+        let graph = D3d12WorkGraph {
+            program_name: "graph".to_string(),
+            flags: 0,
+            entrypoints: vec![work_graphs::D3d12NodeId::new("entry", 0)],
+            nodes: vec![work_graphs::D3d12WorkGraphNode {
+                shader: "node0".to_string(),
+                overrides: work_graphs::D3d12NodeOverrides::Broadcasting(
+                    work_graphs::D3d12BroadcastingLaunchOverrides {
+                        program_entry: Some(true),
+                        new_name: Some(work_graphs::D3d12NodeId::new("entry", 0)),
+                        dispatch_grid: Some([2, 1, 1]),
+                        ..Default::default()
+                    },
+                ),
+            }],
+        };
+        let requirements = graph.memory_requirements();
+        assert_eq!(requirements.size_granularity_in_bytes, 8);
+        let state_object = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::WorkGraph(graph)],
+            })
+            .expect("executable work graph");
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let dispatch = D3d12DispatchGraphDesc {
+            mode: work_graphs::DISPATCH_MODE_NODE_CPU_INPUT,
+            entrypoint_index: 0,
+            record_count: 4,
+            record_stride: 8,
+            records: vec![0; 32],
+        };
+        let executed = runtime
+            .dispatch_work_graph(
+                list,
+                state_object,
+                Some("graph"),
+                &dispatch,
+                Some((0, requirements.min_size_in_bytes)),
+            )
+            .expect("work graph dispatch");
+        assert_eq!(executed, 1);
+        let stream = runtime.close_command_list(list).expect("close");
+        assert_eq!(stream.commands.len(), 1);
+        assert!(matches!(
+            stream.commands[0],
+            Command::Dispatch { x: 2, y: 1, z: 1 }
+        ));
+
+        let error = runtime
+            .work_graph_memory_requirements(state_object, Some("missing"))
+            .expect_err("unknown program must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "state object has no work graph named \"missing\""
+        );
+    }
+
+    #[test]
+    fn d3d12_work_graph_backing_memory_is_validated() {
+        let mut runtime = D3d12Runtime::new();
+        let graph = D3d12WorkGraph {
+            program_name: "graph".to_string(),
+            flags: 0,
+            entrypoints: vec![work_graphs::D3d12NodeId::new("entry", 0)],
+            nodes: vec![work_graphs::D3d12WorkGraphNode {
+                shader: "node0".to_string(),
+                overrides: work_graphs::D3d12NodeOverrides::None,
+            }],
+        };
+        let requirements = graph.memory_requirements();
+        let state_object = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::WorkGraph(graph)],
+            })
+            .expect("executable work graph");
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let dispatch = D3d12DispatchGraphDesc {
+            mode: work_graphs::DISPATCH_MODE_NODE_CPU_INPUT,
+            entrypoint_index: 0,
+            record_count: 1,
+            record_stride: 8,
+            records: vec![0; 8],
+        };
+        let error = runtime
+            .dispatch_work_graph(list, state_object, None, &dispatch, Some((4, 8)))
+            .expect_err("misaligned backing memory must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "work graph backing memory offset 4 is not aligned to 8 bytes"
+        );
+        let error = runtime
+            .dispatch_work_graph(
+                list,
+                state_object,
+                None,
+                &dispatch,
+                Some((0, requirements.min_size_in_bytes - 1)),
+            )
+            .expect_err("undersized backing memory must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!(
+                "work graph backing memory size {} is smaller than the minimum {}",
+                requirements.min_size_in_bytes - 1,
+                requirements.min_size_in_bytes
+            )
+        );
+    }
+
+    fn draw_argument_bytes(vertices: u32, instances: u32) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&vertices.to_le_bytes());
+        bytes[4..8].copy_from_slice(&instances.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn d3d12_execute_indirect_draw_records_concrete_draws() {
+        use crate::gfx::Command;
+        let mut runtime = D3d12Runtime::new();
+        let signature = runtime
+            .create_command_signature(D3D12CommandSignatureDesc {
+                byte_stride: 16,
+                node_mask: 0,
+                arguments: vec![D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                }],
+            })
+            .expect("draw signature");
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        // Boundary records: zero vertex count and zero instance count must
+        // be skipped without recording or counting a command.
+        let mut arguments = Vec::new();
+        arguments.extend_from_slice(&draw_argument_bytes(0, 5));
+        arguments.extend_from_slice(&draw_argument_bytes(3, 1));
+        arguments.extend_from_slice(&draw_argument_bytes(4, 0));
+        arguments.extend_from_slice(&draw_argument_bytes(6, 2));
+        let executed = runtime
+            .execute_indirect(list, signature, 4, &arguments, 0, None)
+            .expect("execute indirect");
+        assert_eq!(executed, 2);
+        let stream = runtime.close_command_list(list).expect("close");
+        assert_eq!(stream.commands.len(), 2);
+        assert!(matches!(
+            stream.commands[0],
+            Command::DrawInstanced {
+                vertices: 3,
+                instances: 1
+            }
+        ));
+        assert!(matches!(
+            stream.commands[1],
+            Command::DrawInstanced {
+                vertices: 6,
+                instances: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn d3d12_execute_indirect_rejects_unsupported_signatures_and_counts() {
+        let mut runtime = D3d12Runtime::new();
+        let indexed = runtime
+            .create_command_signature(D3D12CommandSignatureDesc {
+                byte_stride: 20,
+                node_mask: 0,
+                arguments: vec![D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                }],
+            })
+            .expect("indexed draw signature");
+        assert!(runtime.command_signature(indexed).is_some());
+
+        let signature = runtime
+            .create_command_signature(D3D12CommandSignatureDesc {
+                byte_stride: 16,
+                node_mask: 0,
+                arguments: vec![D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                }],
+            })
+            .expect("draw signature");
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let arguments = draw_argument_bytes(3, 1);
+        let error = runtime
+            .execute_indirect(list, signature, 1, &arguments, 0, Some(2))
+            .expect_err("count above max must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "invalid ExecuteIndirect: Count 2 exceeds MaxCommandCount 1"
+        );
+
+        let mut nonzero_start = draw_argument_bytes(3, 1);
+        nonzero_start[8..12].copy_from_slice(&7u32.to_le_bytes());
+        let error = runtime
+            .execute_indirect(list, signature, 1, &nonzero_start, 0, None)
+            .expect_err("non-zero start vertex must fail closed");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "unsupported ExecuteIndirect DRAW argument: non-zero start locations (7, 0) are not representable"
+        );
+    }
+
+    #[test]
+    fn d3d12_set_pipeline_state1_rejects_collection_state_object() {
+        let mut runtime = D3d12Runtime::new();
+        let collection = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_COLLECTION,
+                subobjects: vec![D3d12StateSubobject::StateObjectConfig { flags: 0 }],
+            })
+            .expect("collection");
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let error = runtime
+            .set_pipeline_state1_state_object(
+                list,
+                collection,
+                D3d12StateObjectDesc {
+                    object_type: STATE_OBJECT_TYPE_COLLECTION,
+                    subobjects: vec![],
+                },
+            )
+            .expect_err("collection binding must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "SetPipelineState1 cannot bind a collection state object"
+        );
+    }
+
+    #[test]
+    fn d3d12_add_to_state_object_rejects_parent_self_reference() {
+        let mut runtime = D3d12Runtime::new();
+        let parent = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+                subobjects: vec![
+                    D3d12StateSubobject::StateObjectConfig { flags: 0x4 },
+                    D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                        bytecode: vec![1, 2, 3],
+                        exports: vec![],
+                    }),
+                    D3d12StateSubobject::RaytracingPipelineConfig {
+                        max_trace_recursion_depth: 1,
+                    },
+                ],
+            })
+            .expect("parent");
+        let addition = D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects: vec![
+                D3d12StateSubobject::StateObjectConfig { flags: 0x4 },
+                D3d12StateSubobject::ExistingCollection(state_objects::D3d12ExistingCollection {
+                    collection: parent,
+                    exports: vec![],
+                }),
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                },
+            ],
+        };
+        let error = runtime
+            .add_to_state_object(parent, addition)
+            .expect_err("self reference must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "AddToStateObject addition references the parent state object; the addition must be self-contained"
+        );
+    }
+
+    #[test]
+    fn d3d12_state_object_config_rejects_undefined_flags() {
+        let mut runtime = D3d12Runtime::new();
+        let error = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_COLLECTION,
+                subobjects: vec![D3d12StateSubobject::StateObjectConfig { flags: 0x8 }],
+            })
+            .expect_err("undefined state object flags must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "D3D12_STATE_OBJECT_FLAGS 0x8 contain undefined bits"
+        );
+    }
+
+    #[test]
+    fn d3d12_set_program_and_dispatch_graph_use_bound_program() {
+        use crate::gfx::Command;
+        let mut runtime = D3d12Runtime::new();
+        let graph = D3d12WorkGraph {
+            program_name: "graph".to_string(),
+            flags: 0,
+            entrypoints: vec![work_graphs::D3d12NodeId::new("node0", 0)],
+            nodes: vec![work_graphs::D3d12WorkGraphNode {
+                shader: "node0".to_string(),
+                overrides: work_graphs::D3d12NodeOverrides::None,
+            }],
+        };
+        let requirements = graph.memory_requirements();
+        let state_object = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::WorkGraph(graph)],
+            })
+            .expect("work graph state object");
+        let identifier = runtime
+            .work_graph_program_identifier(state_object, "graph")
+            .expect("program identifier");
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let dispatch = D3d12DispatchGraphDesc {
+            mode: work_graphs::DISPATCH_MODE_NODE_CPU_INPUT,
+            entrypoint_index: 0,
+            record_count: 1,
+            record_stride: 8,
+            records: vec![0; 8],
+        };
+        let error = runtime
+            .dispatch_bound_work_graph(list, &dispatch)
+            .expect_err("dispatch without SetProgram must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "DispatchGraph requires a work-graph program bound with SetProgram"
+        );
+        let error = runtime
+            .set_work_graph_program(
+                list,
+                [0xAB; 32],
+                0,
+                Some((0, requirements.min_size_in_bytes)),
+            )
+            .expect_err("unknown program identifier must fail");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "SetProgram received an unknown work-graph program identifier"
+        );
+        runtime
+            .set_work_graph_program(
+                list,
+                identifier,
+                0,
+                Some((0, requirements.min_size_in_bytes)),
+            )
+            .expect("bind work graph program");
+        assert_eq!(
+            runtime
+                .bound_work_graph_program(list)
+                .map(|p| p.program_name.as_str()),
+            Some("graph")
+        );
+        let executed = runtime
+            .dispatch_bound_work_graph(list, &dispatch)
+            .expect("bound dispatch");
+        assert_eq!(executed, 1);
+        let stream = runtime.close_command_list(list).expect("close");
+        assert!(matches!(
+            stream.commands[0],
+            Command::Dispatch { x: 1, y: 1, z: 1 }
+        ));
+    }
+
+    #[test]
+    fn d3d12_gpu_raytracing_rejects_malformed_descriptors_and_reads_back_real_hits() {
+        let mut runtime = D3d12Runtime::new();
+        assert_eq!(
+            runtime.last_ray_dispatch_results(),
+            Vec::<crate::metal_backend::MetalRayResult>::new()
+        );
+        assert_eq!(runtime.last_work_graph_records(), Vec::<u32>::new());
+        let list = runtime.create_graphics_command_list(0, 0, false);
+
+        let vertices: [f32; 9] = [-1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0];
+        let vertex_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                vertices.as_ptr() as *const u8,
+                std::mem::size_of_val(&vertices),
+            )
+        };
+        let indices: [u16; 3] = [0, 1, 2];
+        let index_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                indices.as_ptr() as *const u8,
+                std::mem::size_of_val(&indices),
+            )
+        };
+        runtime.register_raytracing_buffer(0x3000, vertex_bytes.to_vec());
+        runtime.register_raytracing_buffer(0x4000, index_bytes.to_vec());
+
+        let geometry = D3D12RaytracingGeometryDesc {
+            ty: 0,
+            flags: 1,
+            vertex_buffer: 0x3000,
+            vertex_format: 6,
+            vertex_stride: 12,
+            vertex_count: 3,
+            index_buffer: 0x4000,
+            index_format: 57,
+            index_count: 3,
+        };
+        let blas_desc = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x1000,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 0,
+                flags: 2,
+                num_descs: 1,
+                geometries: vec![geometry.clone()],
+            },
+            source_address: 0,
+            scratch_address: 0x2000,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &blas_desc)
+            .expect("real BLAS build");
+        let blas = runtime
+            .acceleration_structure(0x1000)
+            .expect("BLAS metadata");
+        assert_eq!(blas.built, true);
+        assert_ne!(blas.metal_accel_handle, 0);
+        assert_ne!(blas.compacted_size, 0);
+
+        // A second BLAS covers the non-compacted branch and the compatibility
+        // vertex-format aliases used by the Windows oracle vectors.
+        runtime.register_raytracing_buffer(0x5000, vertex_bytes.to_vec());
+        runtime.register_raytracing_buffer(0x5008, index_bytes.to_vec());
+        let plain = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x1100,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 0,
+                flags: 0,
+                num_descs: 1,
+                geometries: vec![D3D12RaytracingGeometryDesc {
+                    vertex_buffer: 0x5000,
+                    index_buffer: 0x5008,
+                    vertex_format: 71,
+                    ..geometry.clone()
+                }],
+            },
+            source_address: 0,
+            scratch_address: 0x2100,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &plain)
+            .expect("non-compacted BLAS build");
+        runtime.register_raytracing_buffer(0x3200, vertex_bytes.to_vec());
+        let non_indexed = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x1300,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 0,
+                flags: 0,
+                num_descs: 1,
+                geometries: vec![D3D12RaytracingGeometryDesc {
+                    vertex_buffer: 0x3200,
+                    index_buffer: 0,
+                    index_count: 0,
+                    ..geometry.clone()
+                }],
+            },
+            source_address: 0,
+            scratch_address: 0x2300,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &non_indexed)
+            .expect("non-indexed BLAS build");
+        let multi = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x1400,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 0,
+                flags: 0,
+                num_descs: 2,
+                geometries: vec![geometry.clone(), geometry.clone()],
+            },
+            source_address: 0,
+            scratch_address: 0x2400,
+        };
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &multi)
+            .expect_err("multiple geometries");
+        assert_eq!(
+            error.message,
+            "bottom-level acceleration structure with multiple geometries must use DescriptorsLayout"
+        );
+
+        // AABB BLAS with real bounding-box bytes.
+        let bounds: [f32; 6] = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+        let bounds_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(bounds.as_ptr() as *const u8, std::mem::size_of_val(&bounds))
+        };
+        runtime.register_raytracing_buffer(0x7000, bounds_bytes.to_vec());
+        let aabb_desc = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x1200,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 0,
+                flags: 0,
+                num_descs: 1,
+                geometries: vec![D3D12RaytracingGeometryDesc {
+                    ty: 1,
+                    flags: 1,
+                    vertex_buffer: 0x7000,
+                    vertex_format: 0,
+                    vertex_stride: 24,
+                    vertex_count: 1,
+                    index_buffer: 0,
+                    index_format: 0,
+                    index_count: 0,
+                }],
+            },
+            source_address: 0,
+            scratch_address: 0x2200,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &aabb_desc)
+            .expect("AABB BLAS build");
+
+        // D3D12 instance descriptor pointing at the first BLAS. A zero
+        // transform exercises the identity fallback and flags 0xF exercises
+        // every instance option bit.
+        let mut instances = [0u8; 64];
+        instances[48..52].copy_from_slice(&0xFF00_0000u32.to_le_bytes());
+        instances[52..56].copy_from_slice(&0x0Fu32.to_le_bytes());
+        instances[56..64].copy_from_slice(&0x1000u64.to_le_bytes());
+        runtime.register_raytracing_instances(0x10_0000, instances.to_vec());
+        let tlas_desc = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x10_0000,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 1,
+                flags: 2,
+                num_descs: 1,
+                geometries: Vec::new(),
+            },
+            source_address: 0,
+            scratch_address: 0x20_0000,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &tlas_desc)
+            .expect("real TLAS build");
+        assert_eq!(
+            runtime
+                .acceleration_structure(0x10_0000)
+                .expect("TLAS metadata")
+                .is_top_level,
+            true
+        );
+        runtime.register_raytracing_instances(0x10_0400, instances.to_vec());
+        let plain_tlas = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x10_0400,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 1,
+                flags: 0,
+                num_descs: 1,
+                geometries: Vec::new(),
+            },
+            source_address: 0,
+            scratch_address: 0x20_0400,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &plain_tlas)
+            .expect("non-compacted TLAS build");
+
+        // Register a Metal ray record and a D3D12 shader-table record.
+        let mut ray = crate::metal_backend::MetalRay {
+            origin: [0.0, 0.0, -1.0],
+            min_distance: 0.0,
+            direction: [0.0, 0.0, 1.0],
+            max_distance: 100.0,
+            sbt_offset: 0,
+            mask: 0xFFFF_FFFF,
+        };
+        let ray_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(&ray as *const _ as *const u8, std::mem::size_of_val(&ray))
+        };
+        runtime.register_raytracing_buffer(0x30_0000, ray_bytes.to_vec());
+        runtime.register_raytracing_buffer(0x31_0000, 7u32.to_le_bytes().to_vec());
+        let dispatch = D3D12DispatchRaysDesc {
+            raygen_shader_start_address: 0x30_0000,
+            raygen_shader_size: std::mem::size_of::<crate::metal_backend::MetalRay>() as u64,
+            miss_shader_start_address: 0,
+            miss_shader_size: 0,
+            miss_shader_stride: 0,
+            hit_group_start_address: 0x31_0000,
+            hit_group_size: 4,
+            hit_group_stride: 4,
+            callable_shader_start_address: 0,
+            callable_shader_size: 0,
+            callable_shader_stride: 0,
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        runtime
+            .dispatch_rays(list, &dispatch)
+            .expect("real DispatchRays");
+        let results = runtime.last_ray_dispatch_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].hit, 1);
+        assert_eq!(results[0].group_index, 7);
+        assert_eq!(results[0].instance_id, 0);
+
+        // Synthetic rays (no registered raygen bytes) and a short shader-table
+        // record still execute real traversal.
+        runtime.register_raytracing_buffer(0x31_0008, vec![1, 2]);
+        let synthetic = D3D12DispatchRaysDesc {
+            raygen_shader_start_address: 0x3F_0000,
+            raygen_shader_size: 0,
+            hit_group_start_address: 0x31_0008,
+            hit_group_size: 2,
+            ..dispatch.clone()
+        };
+        runtime
+            .dispatch_rays(list, &synthetic)
+            .expect("synthetic DispatchRays");
+        assert_eq!(
+            runtime
+                .last_ray_dispatch_results()
+                .first()
+                .expect("synthetic result")
+                .group_index,
+            0
+        );
+
+        // Zero-sized dispatches are valid no-ops.
+        let zero = D3D12DispatchRaysDesc {
+            width: 0,
+            ..dispatch.clone()
+        };
+        runtime.dispatch_rays(list, &zero).expect("zero dispatch");
+        let no_raygen = D3D12DispatchRaysDesc {
+            raygen_shader_start_address: 0,
+            ..dispatch.clone()
+        };
+        runtime.dispatch_rays(list, &no_raygen).expect("no raygen");
+
+        // Malformed build inputs are rejected with exact errors.
+        let mut misaligned = blas_desc.clone();
+        misaligned.dest_address = 0x1001;
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("misaligned destination");
+        assert_eq!(
+            error.message,
+            "BuildRaytracingAccelerationStructure DestAccelerationStructureData 0x1001 is not 256-byte aligned"
+        );
+        misaligned = blas_desc.clone();
+        misaligned.scratch_address = 0x2001;
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("misaligned scratch");
+        assert_eq!(
+            error.message,
+            "BuildRaytracingAccelerationStructure ScratchAccelerationStructureData 0x2001 is not 256-byte aligned"
+        );
+        misaligned = blas_desc.clone();
+        misaligned.scratch_address = misaligned.dest_address;
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("overlapping scratch");
+        assert_eq!(
+            error.message,
+            "BuildRaytracingAccelerationStructure scratch and destination overlap"
+        );
+        misaligned = blas_desc.clone();
+        misaligned.inputs.flags = 0x20;
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("undefined build flags");
+        assert_eq!(
+            error.message,
+            "BuildRaytracingAccelerationStructure flags 0x20 contain undefined bits"
+        );
+        misaligned = blas_desc.clone();
+        misaligned.inputs.ty = 2;
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("undefined structure type");
+        assert_eq!(
+            error.message,
+            "D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE 2 is not defined"
+        );
+        misaligned = blas_desc.clone();
+        misaligned.inputs.num_descs = 0;
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("zero descriptors");
+        assert_eq!(
+            error.message,
+            "BuildRaytracingAccelerationStructure NumDescs must be non-zero"
+        );
+        misaligned = blas_desc.clone();
+        misaligned.inputs.num_descs = 2;
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("descriptor count mismatch");
+        assert_eq!(
+            error.message,
+            "BuildRaytracingAccelerationStructure NumDescs 2 does not match 1 geometry descriptors"
+        );
+        let mut bad_geometry = geometry.clone();
+        bad_geometry.flags = 0x4;
+        misaligned = blas_desc.clone();
+        misaligned.inputs.geometries = vec![bad_geometry];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("undefined geometry flags");
+        assert_eq!(error.message, "geometry 0 flags 0x4 contain undefined bits");
+        bad_geometry = geometry.clone();
+        bad_geometry.vertex_buffer = 0x3001;
+        misaligned.inputs.geometries = vec![bad_geometry];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("misaligned vertex buffer");
+        assert_eq!(
+            error.message,
+            "geometry 0 vertex buffer 0x3001 is not 4-byte aligned"
+        );
+        bad_geometry = geometry.clone();
+        bad_geometry.vertex_stride = 0;
+        misaligned.inputs.geometries = vec![bad_geometry];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("zero stride");
+        assert_eq!(
+            error.message,
+            "geometry 0 vertex stride 0 must be a non-zero multiple of 4"
+        );
+        bad_geometry = geometry.clone();
+        bad_geometry.vertex_stride = 3;
+        misaligned.inputs.geometries = vec![bad_geometry];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("unaligned stride");
+        assert_eq!(
+            error.message,
+            "geometry 0 vertex stride 3 must be a non-zero multiple of 4"
+        );
+        bad_geometry = geometry.clone();
+        bad_geometry.vertex_stride = 4;
+        misaligned.inputs.geometries = vec![bad_geometry];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("short stride for format");
+        assert_eq!(
+            error.message,
+            "geometry 0 vertex stride 4 is smaller than the 12 bytes required by the format"
+        );
+        bad_geometry = geometry.clone();
+        bad_geometry.vertex_count = 2;
+        misaligned.inputs.geometries = vec![bad_geometry];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("short vertex count");
+        assert_eq!(error.message, "geometry 0 vertex count 2 is smaller than 3");
+        bad_geometry = geometry.clone();
+        bad_geometry.index_buffer = 0x4001;
+        misaligned.inputs.geometries = vec![bad_geometry];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("misaligned index buffer");
+        assert_eq!(
+            error.message,
+            "geometry 0 index buffer 0x4001 is not 4-byte aligned"
+        );
+        bad_geometry = geometry.clone();
+        bad_geometry.index_count = 4;
+        misaligned.inputs.geometries = vec![bad_geometry];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("invalid index count");
+        assert_eq!(
+            error.message,
+            "geometry 0 index count 4 is not a non-zero multiple of 3"
+        );
+        bad_geometry = geometry.clone();
+        bad_geometry.vertex_buffer = 0x3100;
+        runtime.register_raytracing_buffer(0x3100, vec![0u8; 4]);
+        misaligned.inputs.geometries = vec![bad_geometry];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("short vertex range");
+        assert_eq!(
+            error.message,
+            "geometry 0 vertex buffer range 36 exceeds the registered 4 bytes"
+        );
+        bad_geometry = geometry.clone();
+        bad_geometry.index_buffer = 0x4100;
+        runtime.register_raytracing_buffer(0x4100, vec![0u8; 2]);
+        misaligned.inputs.geometries = vec![bad_geometry];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("short index range");
+        assert_eq!(
+            error.message,
+            "geometry 0 index buffer range 6 exceeds the registered 2 bytes"
+        );
+        let mut bad_aabb = aabb_desc.clone();
+        bad_aabb.inputs.geometries[0].vertex_buffer = 0x7001;
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &bad_aabb)
+            .expect_err("misaligned AABB buffer");
+        assert_eq!(
+            error.message,
+            "geometry 0 bounding-box buffer 0x7001 is not 4-byte aligned"
+        );
+        bad_aabb = aabb_desc.clone();
+        bad_aabb.inputs.geometries[0].vertex_stride = 20;
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &bad_aabb)
+            .expect_err("short AABB stride");
+        assert_eq!(
+            error.message,
+            "geometry 0 bounding-box stride 20 must be at least 24 and a multiple of 4"
+        );
+        bad_aabb = aabb_desc.clone();
+        bad_aabb.inputs.geometries[0].vertex_count = 0;
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &bad_aabb)
+            .expect_err("zero AABB count");
+        assert_eq!(error.message, "geometry 0 bounding-box count is zero");
+        bad_aabb = aabb_desc.clone();
+        bad_aabb.inputs.geometries[0].vertex_buffer = 0x7100;
+        runtime.register_raytracing_buffer(0x7100, vec![0u8; 8]);
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &bad_aabb)
+            .expect_err("short AABB range");
+        assert_eq!(
+            error.message,
+            "geometry 0 bounding-box range 24 exceeds the registered 8 bytes"
+        );
+        let mut bad_type = geometry.clone();
+        bad_type.ty = 2;
+        misaligned.inputs.geometries = vec![bad_type];
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &misaligned)
+            .expect_err("undefined geometry type");
+        assert_eq!(error.message, "geometry 0 type 2 is not defined");
+
+        assert_eq!(
+            D3d12Runtime::dxgi_raytracing_vertex_format(17, 0).expect("float2"),
+            (crate::metal_backend::VertexFormat::Float2, 8)
+        );
+        assert_eq!(
+            D3d12Runtime::dxgi_raytracing_vertex_format(35, 0).expect("half3"),
+            (crate::metal_backend::VertexFormat::Half3, 8)
+        );
+        assert_eq!(
+            D3d12Runtime::dxgi_raytracing_vertex_format(1, 3)
+                .expect_err("unsupported vertex format")
+                .message,
+            "geometry 3 vertex format 1 is not supported for raytracing"
+        );
+        assert_eq!(
+            D3d12Runtime::dxgi_raytracing_index_format(42, 0)
+                .expect("uint32")
+                .1,
+            4
+        );
+        assert_eq!(
+            D3d12Runtime::dxgi_raytracing_index_format(1, 2)
+                .expect_err("unsupported index format")
+                .message,
+            "geometry 2 index format 1 is not supported for raytracing"
+        );
+
+        let mut postbuild = [0u8; 8];
+        runtime
+            .emit_raytracing_acceleration_structure_postbuild_info(
+                list,
+                1,
+                &[0x1000],
+                &mut postbuild,
+            )
+            .expect("compacted-size postbuild info");
+        assert_eq!(
+            u64::from_le_bytes(postbuild),
+            runtime
+                .acceleration_structure(0x1000)
+                .expect("BLAS metadata")
+                .compacted_size
+        );
+
+        // Instance validation and unknown BLAS references.
+        instances[56..64].copy_from_slice(&0xDEADu64.to_le_bytes());
+        runtime.register_raytracing_instances(0x10_0100, instances.to_vec());
+        let bad_tlas = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x10_0100,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 1,
+                flags: 0,
+                num_descs: 1,
+                geometries: Vec::new(),
+            },
+            source_address: 0,
+            scratch_address: 0x20_0100,
+        };
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &bad_tlas)
+            .expect_err("unknown BLAS reference");
+        assert_eq!(
+            error.message,
+            "instance references unknown acceleration structure 0xdead"
+        );
+        runtime.register_raytracing_instances(0x10_0200, vec![0u8; 8]);
+        let short_tlas = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x10_0200,
+            ..bad_tlas.clone()
+        };
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &short_tlas)
+            .expect_err("short instance range");
+        assert_eq!(
+            error.message,
+            "TLAS instance descriptor range 64 exceeds the registered 8 bytes"
+        );
+        let mut zero_instance = [0u8; 64];
+        zero_instance[56..64].copy_from_slice(&0u64.to_le_bytes());
+        runtime.register_raytracing_instances(0x10_0300, zero_instance.to_vec());
+        let zero_tlas = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x10_0300,
+            ..bad_tlas.clone()
+        };
+        let error = runtime
+            .build_raytracing_acceleration_structure(list, &zero_tlas)
+            .expect_err("missing BLAS reference");
+        assert_eq!(
+            error.message,
+            "top-level acceleration structure instance has a zero AccelerationStructure address"
+        );
+
+        // Dispatch validation.
+        let mut no_tlas = D3d12Runtime::new();
+        let error = no_tlas
+            .dispatch_rays(0, &dispatch)
+            .expect_err("missing TLAS");
+        assert_eq!(
+            error.message,
+            "DispatchRays requires a built top-level acceleration structure"
+        );
+        let overflow = D3D12DispatchRaysDesc {
+            width: u32::MAX,
+            height: u32::MAX,
+            depth: u32::MAX,
+            ..dispatch.clone()
+        };
+        let error = runtime
+            .dispatch_rays(list, &overflow)
+            .expect_err("overflowing dispatch");
+        assert_eq!(error.message, "DispatchRays dimensions overflow");
+        let too_many = D3D12DispatchRaysDesc {
+            width: 16 * 1024 * 1024 + 1,
+            height: 1,
+            depth: 1,
+            ..dispatch.clone()
+        };
+        let error = runtime
+            .dispatch_rays(list, &too_many)
+            .expect_err("oversized dispatch");
+        assert_eq!(
+            error.message,
+            "DispatchRays ray count 16777217 exceeds the 16 MiB per-dispatch limit"
+        );
+        ray.sbt_offset = 1;
+        let _ = ray;
+    }
+
+    #[test]
+    fn d3d12_work_graph_gpu_fanout_rejects_malformed_records_and_runs_on_gpu() {
+        let mut runtime = D3d12Runtime::new();
+        let graph = D3d12WorkGraph {
+            program_name: "gpu".into(),
+            flags: 0,
+            entrypoints: vec![work_graphs::D3d12NodeId::new("node0", 0)],
+            nodes: vec![work_graphs::D3d12WorkGraphNode {
+                shader: "node0".into(),
+                overrides: work_graphs::D3d12NodeOverrides::None,
+            }],
+        };
+        let executable = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::WorkGraph(graph)],
+            })
+            .expect("executable work graph");
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let records = [
+            3u32.to_le_bytes(),
+            1u32.to_le_bytes(),
+            8u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        let desc = work_graphs::D3d12DispatchGraphDesc {
+            mode: work_graphs::DISPATCH_MODE_NODE_GPU_INPUT,
+            entrypoint_index: 0,
+            record_count: 2,
+            record_stride: 8,
+            records,
+        };
+        assert_eq!(
+            runtime
+                .dispatch_work_graph(list, executable, Some("gpu"), &desc, None)
+                .expect("GPU fan-out"),
+            2
+        );
+        assert_eq!(runtime.last_work_graph_records(), vec![9, 4]);
+
+        let zero = work_graphs::D3d12DispatchGraphDesc {
+            record_count: 0,
+            ..desc.clone()
+        };
+        assert_eq!(
+            runtime
+                .dispatch_work_graph(list, executable, Some("gpu"), &zero, None)
+                .expect("zero-record GPU fan-out"),
+            0
+        );
+        let short = work_graphs::D3d12DispatchGraphDesc {
+            record_stride: 4,
+            ..desc.clone()
+        };
+        let error = runtime
+            .dispatch_work_graph(list, executable, Some("gpu"), &short, None)
+            .expect_err("short record stride");
+        assert_eq!(
+            error.message,
+            "work graph record stride 4 is smaller than the 8-byte node/output record"
+        );
+        let missing = work_graphs::D3d12DispatchGraphDesc {
+            record_count: 4,
+            ..desc.clone()
+        };
+        let error = runtime
+            .dispatch_work_graph(list, executable, Some("gpu"), &missing, None)
+            .expect_err("short record range");
+        assert_eq!(
+            error.message,
+            "work graph record range (32 bytes) exceeds the supplied 16 bytes"
+        );
+        let overflow = work_graphs::D3d12DispatchGraphDesc {
+            record_count: u32::MAX,
+            record_stride: u64::MAX,
+            ..desc.clone()
+        };
+        let error = runtime
+            .dispatch_work_graph(list, executable, Some("gpu"), &overflow, None)
+            .expect_err("overflowing record range");
+        assert_eq!(error.message, "work graph record range overflows");
+    }
+
+    #[test]
+    fn d3d12_execute_indirect_gpu_rejects_bad_ranges_and_limits_count_on_gpu() {
+        let mut runtime = D3d12Runtime::new();
+        assert_eq!(runtime.last_indirect_results(), Vec::new());
+        assert_eq!(runtime.last_indirect_effective(), 0);
+        assert_eq!(runtime.last_indirect_native(), false);
+        assert_eq!(runtime.last_indirect_boundary(), None);
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let dispatch_sig = runtime
+            .create_command_signature(D3D12CommandSignatureDesc {
+                byte_stride: 12,
+                node_mask: 0,
+                arguments: vec![D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                }],
+            })
+            .expect("dispatch signature");
+        let args = [
+            2u32.to_le_bytes(),
+            3u32.to_le_bytes(),
+            1u32.to_le_bytes(),
+            4u32.to_le_bytes(),
+            5u32.to_le_bytes(),
+            6u32.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(
+            runtime
+                .execute_indirect_gpu(
+                    list,
+                    dispatch_sig,
+                    2,
+                    &args,
+                    0,
+                    Some(1),
+                    Some((&[1, 0, 0, 0], 0)),
+                )
+                .expect("GPU dispatch decode"),
+            1
+        );
+        assert_eq!(runtime.last_indirect_effective(), 1);
+        assert_eq!(runtime.last_indirect_native(), true);
+        let decoded = runtime.last_indirect_results();
+        assert_eq!(decoded[0].kind, 2);
+        assert_eq!((decoded[0].x, decoded[0].y, decoded[0].z), (2, 3, 1));
+        assert_eq!(decoded[0].enabled, 1);
+        assert_eq!(
+            decoded[1],
+            crate::metal_backend::MetalIndirectResult::default()
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect_gpu(
+                    list,
+                    dispatch_sig,
+                    2,
+                    &args,
+                    0,
+                    Some(2),
+                    Some((&[2, 0, 0, 0], 0)),
+                )
+                .expect("GPU dispatch decode two"),
+            2
+        );
+        let decoded = runtime.last_indirect_results();
+        assert_eq!((decoded[1].x, decoded[1].y, decoded[1].z), (4, 5, 6));
+        let error = runtime
+            .execute_indirect_gpu(list, dispatch_sig, 2, &args, 0, Some(1), Some((&[1, 0], 0)))
+            .expect_err("short count buffer");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect count buffer range 4 exceeds the supplied 2 bytes"
+        );
+        let error = runtime
+            .execute_indirect_gpu(list, 0x9999, 1, &args, 0, None, None)
+            .expect_err("unknown signature");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect with unknown command signature 0x9999"
+        );
+        let error = runtime
+            .execute_indirect_gpu(list, dispatch_sig, 1, &args, 0, Some(2), None)
+            .expect_err("count above max");
+        assert_eq!(
+            error.message,
+            "invalid ExecuteIndirect: Count 2 exceeds MaxCommandCount 1"
+        );
+        let error = runtime
+            .execute_indirect_gpu(list, dispatch_sig, 1, &args, 1, None, None)
+            .expect_err("misaligned offset");
+        assert_eq!(
+            error.message,
+            "invalid ExecuteIndirect: ArgumentBufferOffset 1 is not 4-byte aligned"
+        );
+        let error = runtime
+            .execute_indirect_gpu(list, dispatch_sig, 2, &args[..12], 0, None, None)
+            .expect_err("short argument range");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect argument buffer range 24 exceeds the supplied 12 bytes"
+        );
+        let error = runtime
+            .execute_indirect_gpu(list, dispatch_sig, 2, &args, u64::MAX - 3, Some(2), None)
+            .expect_err("argument range overflow");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect argument buffer range overflows"
+        );
+    }
+
+    #[test]
+    fn d3d12_execute_indirect_draw_rejects_missing_native_pipeline_and_matches_direct_draw() {
+        let mut runtime = D3d12Runtime::new();
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let target = runtime
+            .create_committed_resource(ResourceDesc {
+                name: "native-draw-target".into(),
+                format: DxgiFormat::B8G8R8A8Unorm,
+                heap: HeapType::Default,
+                size: 4 * 4 * 4,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Texture {
+                    sampled: false,
+                    render_target: true,
+                    depth_stencil: false,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("target resource");
+        let vertices: [f32; 9] = [-1.0, -1.0, 0.0, 3.0, -1.0, 0.0, -1.0, 3.0, 0.0];
+        let vertex_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                vertices.as_ptr() as *const u8,
+                std::mem::size_of_val(&vertices),
+            )
+        };
+        let vertex = runtime
+            .create_committed_resource(ResourceDesc {
+                name: "native-draw-vertices".into(),
+                format: DxgiFormat::Unknown,
+                heap: HeapType::Default,
+                size: vertex_bytes.len(),
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Buffer {
+                    role: crate::gfx::BufferRole::Vertex,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("vertex resource");
+        runtime
+            .write_resource_bytes(vertex, vertex_bytes)
+            .expect("upload vertices");
+        assert_eq!(
+            runtime.resource_bytes(vertex).expect("vertex bytes").len(),
+            36
+        );
+        let draw_sig = runtime
+            .create_command_signature(D3D12CommandSignatureDesc {
+                byte_stride: 16,
+                node_mask: 0,
+                arguments: vec![D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                }],
+            })
+            .expect("draw signature");
+        let args = draw_argument_bytes(3, 1);
+        let error = runtime
+            .execute_indirect_gpu(
+                list,
+                draw_sig,
+                1,
+                &args,
+                0,
+                Some(1),
+                Some((&[1, 0, 0, 0], 0)),
+            )
+            .expect_err("missing native pipeline");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect DRAW requires a native graphics pipeline bound by SetPipelineState"
+        );
+        assert_eq!(runtime.last_indirect_native(), false);
+        assert_eq!(
+            runtime
+                .backend()
+                .resource_bytes(target)
+                .expect("target bytes"),
+            &[0u8; 64][..]
+        );
+
+        runtime.bind_native_render_target(list, target, 4, 4, DxgiFormat::B8G8R8A8Unorm);
+        let error = runtime
+            .execute_indirect_gpu(
+                list,
+                draw_sig,
+                1,
+                &args,
+                0,
+                Some(1),
+                Some((&[1, 0, 0, 0], 0)),
+            )
+            .expect_err("missing native pipeline after target");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect DRAW requires a native graphics pipeline bound by SetPipelineState"
+        );
+
+        let root_signature = runtime.create_root_signature(RootSignatureDesc::default());
+        let pso = runtime.create_pipeline_state(
+            root_signature,
+            PipelineStateDesc {
+                label: "native-draw-pso".into(),
+                compute: false,
+                render_target_formats: vec![DxgiFormat::B8G8R8A8Unorm],
+                depth_format: None,
+            },
+        );
+        runtime
+            .register_native_render_pipeline(
+                pso,
+                r#"#include <metal_stdlib>
+using namespace metal;
+struct VOut { float4 position [[position]]; };
+vertex VOut vs_main(uint vid [[vertex_id]], device const float* vertices [[buffer(0)]]) {
+    VOut out;
+    uint base = vid * 3u;
+    out.position = float4(vertices[base], vertices[base + 1u], vertices[base + 2u], 1.0);
+    return out;
+}"#
+                .to_string(),
+                r#"#include <metal_stdlib>
+using namespace metal;
+fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
+                    .to_string(),
+                DxgiFormat::B8G8R8A8Unorm,
+            )
+            .expect("native pipeline");
+        runtime
+            .bind_native_pipeline(list, pso)
+            .expect("bind pipeline");
+        assert_eq!(runtime.native_target_dimensions(target), Some((4, 4)));
+        assert_eq!(
+            runtime
+                .backend()
+                .resource_desc(target)
+                .expect("resource desc")
+                .format,
+            DxgiFormat::B8G8R8A8Unorm
+        );
+        assert_eq!(
+            runtime
+                .backend()
+                .pipeline_state_desc(pso)
+                .expect("pipeline desc")
+                .label,
+            "native-draw-pso"
+        );
+        let heap = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        runtime
+            .write_descriptor(
+                heap,
+                0,
+                ViewDescriptor::Rtv {
+                    resource: target,
+                    format: DxgiFormat::B8G8R8A8Unorm,
+                },
+            )
+            .expect("write RTV descriptor");
+        assert_eq!(
+            matches!(
+                runtime
+                    .backend()
+                    .descriptor_at_view(heap, 0)
+                    .expect("RTV descriptor view"),
+                ViewDescriptor::Rtv { .. }
+            ),
+            true
+        );
+        let error = runtime
+            .execute_indirect_gpu(
+                list,
+                draw_sig,
+                1,
+                &args,
+                0,
+                Some(1),
+                Some((&[1, 0, 0, 0], 0)),
+            )
+            .expect_err("missing vertex buffer");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect DRAW requires a vertex buffer bound by IASetVertexBuffers"
+        );
+        runtime.bind_native_vertex_buffer(list, vertex, 0);
+        assert_eq!(
+            runtime
+                .execute_native_direct_draw(list, 3, 1)
+                .expect("native direct draw"),
+            true
+        );
+        let direct_pixels = runtime
+            .backend()
+            .resource_bytes(target)
+            .expect("direct readback")
+            .to_vec();
+        assert_eq!(direct_pixels[0..4], [0, 0, 255, 255]);
+
+        let targetless_list = runtime.create_graphics_command_list(0, 0, false);
+        runtime
+            .bind_native_pipeline(targetless_list, pso)
+            .expect("bind targetless");
+        runtime.bind_native_vertex_buffer(targetless_list, vertex, 0);
+        assert_eq!(
+            runtime
+                .execute_native_direct_draw(targetless_list, 3, 1)
+                .expect("direct draw missing target"),
+            false
+        );
+        let vertexless_list = runtime.create_graphics_command_list(0, 0, false);
+        runtime
+            .bind_native_pipeline(vertexless_list, pso)
+            .expect("bind vertexless");
+        runtime.bind_native_render_target(vertexless_list, target, 4, 4, DxgiFormat::B8G8R8A8Unorm);
+        assert_eq!(
+            runtime
+                .execute_native_direct_draw(vertexless_list, 3, 1)
+                .expect("direct draw missing vertex"),
+            false
+        );
+        let error = runtime
+            .execute_indirect_gpu(
+                targetless_list,
+                draw_sig,
+                1,
+                &args,
+                0,
+                Some(1),
+                Some((&[1, 0, 0, 0], 0)),
+            )
+            .expect_err("missing render target");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect DRAW requires a render target bound by OMSetRenderTargets"
+        );
+
+        runtime
+            .write_resource_bytes(target, &[0u8; 64])
+            .expect("clear target");
+        assert_eq!(
+            runtime
+                .execute_indirect_gpu(
+                    list,
+                    draw_sig,
+                    1,
+                    &args,
+                    0,
+                    Some(1),
+                    Some((&[1, 0, 0, 0], 0)),
+                )
+                .expect("native indirect draw"),
+            1
+        );
+        assert_eq!(runtime.last_indirect_native(), true);
+        let indirect_pixels = runtime
+            .backend()
+            .resource_bytes(target)
+            .expect("indirect readback")
+            .to_vec();
+        assert_eq!(indirect_pixels, direct_pixels);
+
+        let indices: [u16; 3] = [0, 1, 2];
+        let index_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                indices.as_ptr() as *const u8,
+                std::mem::size_of_val(&indices),
+            )
+        };
+        let index_resource = runtime
+            .create_committed_resource(ResourceDesc {
+                name: "native-draw-indices".into(),
+                format: DxgiFormat::Unknown,
+                heap: HeapType::Default,
+                size: index_bytes.len(),
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Buffer {
+                    role: crate::gfx::BufferRole::Index,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("index resource");
+        runtime
+            .write_resource_bytes(index_resource, index_bytes)
+            .expect("upload indices");
+        runtime.bind_native_index_buffer(list, index_resource, 0, 57);
+        let indexed_sig = runtime
+            .create_command_signature(D3D12CommandSignatureDesc {
+                byte_stride: 20,
+                node_mask: 0,
+                arguments: vec![D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                }],
+            })
+            .expect("indexed signature");
+        let indexed_args = [
+            3u32.to_le_bytes(),
+            1u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        let zero_args = draw_argument_bytes(0, 1);
+        runtime
+            .write_resource_bytes(target, &[0u8; 64])
+            .expect("clear target for disabled command");
+        assert_eq!(
+            runtime
+                .execute_indirect_gpu(
+                    list,
+                    draw_sig,
+                    1,
+                    &zero_args,
+                    0,
+                    Some(1),
+                    Some((&[1, 0, 0, 0], 0)),
+                )
+                .expect("disabled indirect draw"),
+            0
+        );
+        runtime
+            .write_resource_bytes(target, &[0u8; 64])
+            .expect("clear target for indexed");
+        assert_eq!(
+            runtime
+                .execute_indirect_gpu(
+                    list,
+                    indexed_sig,
+                    1,
+                    &indexed_args,
+                    0,
+                    Some(1),
+                    Some((&[1, 0, 0, 0], 0)),
+                )
+                .expect("native indexed draw"),
+            1
+        );
+        assert_eq!(
+            runtime
+                .backend()
+                .resource_bytes(target)
+                .expect("indexed pixels"),
+            &direct_pixels[..]
+        );
+        runtime.bind_native_index_buffer(list, index_resource, 0, 42);
+        runtime
+            .write_resource_bytes(target, &[0u8; 64])
+            .expect("clear target for uint32 indices");
+        assert_eq!(
+            runtime
+                .execute_indirect_gpu(
+                    list,
+                    indexed_sig,
+                    1,
+                    &indexed_args,
+                    0,
+                    Some(1),
+                    Some((&[1, 0, 0, 0], 0)),
+                )
+                .expect("native indexed draw uint32"),
+            1
+        );
+        runtime.bind_native_index_buffer(list, index_resource, 0, 1);
+        let error = runtime
+            .execute_indirect_gpu(
+                list,
+                indexed_sig,
+                1,
+                &indexed_args,
+                0,
+                Some(1),
+                Some((&[1, 0, 0, 0], 0)),
+            )
+            .expect_err("unsupported index format");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect DRAW_INDEXED index format 1 is not supported"
+        );
+        runtime.bind_native_index_buffer(list, index_resource, 0, 57);
+
+        // A fresh runtime exercises first-use native pipeline creation on the
+        // indirect path (no preceding direct draw).
+        let mut first_indirect = D3d12Runtime::new();
+        let first_list = first_indirect.create_graphics_command_list(0, 0, false);
+        let first_sig = first_indirect
+            .create_command_signature(D3D12CommandSignatureDesc {
+                byte_stride: 16,
+                node_mask: 0,
+                arguments: vec![D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                }],
+            })
+            .expect("first draw signature");
+        let first_target = first_indirect
+            .create_committed_resource(ResourceDesc {
+                name: "first-indirect-target".into(),
+                format: DxgiFormat::B8G8R8A8Unorm,
+                heap: HeapType::Default,
+                size: 64,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Texture {
+                    sampled: false,
+                    render_target: true,
+                    depth_stencil: false,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("first target");
+        let first_vertex = first_indirect
+            .create_committed_resource(ResourceDesc {
+                name: "first-indirect-vertex".into(),
+                format: DxgiFormat::Unknown,
+                heap: HeapType::Default,
+                size: 36,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Buffer {
+                    role: crate::gfx::BufferRole::Vertex,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("first vertex");
+        first_indirect
+            .write_resource_bytes(first_vertex, vertex_bytes)
+            .expect("first vertices");
+        let first_root = first_indirect.create_root_signature(RootSignatureDesc::default());
+        let first_pso = first_indirect.create_pipeline_state(
+            first_root,
+            PipelineStateDesc {
+                label: "first-indirect-pso".into(),
+                compute: false,
+                render_target_formats: vec![DxgiFormat::B8G8R8A8Unorm],
+                depth_format: None,
+            },
+        );
+        first_indirect
+            .register_native_render_pipeline(
+                first_pso,
+                r#"#include <metal_stdlib>
+using namespace metal;
+struct VOut { float4 position [[position]]; };
+vertex VOut vs_main(uint vid [[vertex_id]], device const float* vertices [[buffer(0)]]) {
+    VOut out;
+    uint base = vid * 3u;
+    out.position = float4(vertices[base], vertices[base + 1u], vertices[base + 2u], 1.0);
+    return out;
+}"#
+                .to_string(),
+                r#"#include <metal_stdlib>
+using namespace metal;
+fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
+                    .to_string(),
+                DxgiFormat::B8G8R8A8Unorm,
+            )
+            .expect("first pipeline");
+        first_indirect
+            .bind_native_pipeline(first_list, first_pso)
+            .expect("first bind");
+        first_indirect.bind_native_render_target(
+            first_list,
+            first_target,
+            4,
+            4,
+            DxgiFormat::B8G8R8A8Unorm,
+        );
+        first_indirect.bind_native_vertex_buffer(first_list, first_vertex, 0);
+        assert_eq!(
+            first_indirect
+                .execute_indirect_gpu(
+                    first_list,
+                    first_sig,
+                    1,
+                    &args,
+                    0,
+                    Some(1),
+                    Some((&[1, 0, 0, 0], 0)),
+                )
+                .expect("first indirect"),
+            1
+        );
+        assert_eq!(
+            first_indirect
+                .backend()
+                .resource_bytes(first_target)
+                .expect("first pixels")[0..4],
+            [0, 0, 255, 255]
+        );
+        assert_eq!(
+            format!("{:?}", first_indirect).contains("D3d12MetalRayTracing"),
+            true
+        );
+
+        let fault_root = runtime.create_root_signature(RootSignatureDesc::default());
+        let fault_pso = runtime.create_pipeline_state(
+            fault_root,
+            PipelineStateDesc {
+                label: "native-draw-fault-pso".into(),
+                compute: false,
+                render_target_formats: vec![DxgiFormat::B8G8R8A8Unorm],
+                depth_format: None,
+            },
+        );
+        runtime
+            .register_native_render_pipeline(
+                fault_pso,
+                r#"#include <metal_stdlib>
+using namespace metal;
+struct VOut { float4 position [[position]]; };
+vertex VOut vs_main(uint vid [[vertex_id]], device const float* vertices [[buffer(0)]]) {
+    VOut out;
+    uint base = vid * 3u;
+    out.position = float4(vertices[base], vertices[base + 1u], vertices[base + 2u], 1.0);
+    return out;
+}"#
+                .to_string(),
+                r#"#include <metal_stdlib>
+using namespace metal;
+fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
+                    .to_string(),
+                DxgiFormat::B8G8R8A8Unorm,
+            )
+            .expect("fault pipeline registration");
+        let fault_list = runtime.create_graphics_command_list(0, 0, false);
+        runtime
+            .bind_native_pipeline(fault_list, fault_pso)
+            .expect("bind fault pipeline");
+        runtime.bind_native_render_target(fault_list, target, 4, 4, DxgiFormat::B8G8R8A8Unorm);
+        runtime.bind_native_vertex_buffer(fault_list, vertex, 0);
+        crate::metal_backend::set_native_pipeline_creation_fault(true);
+        let error = runtime
+            .execute_native_direct_draw(fault_list, 3, 1)
+            .expect_err("native pipeline creation fault");
+        crate::metal_backend::set_native_pipeline_creation_fault(false);
+        assert_eq!(error.message, "native render pipeline creation fault");
+
+        let mesh_sig = runtime
+            .create_command_signature(D3D12CommandSignatureDesc {
+                byte_stride: 12,
+                node_mask: 0,
+                arguments: vec![D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                }],
+            })
+            .expect("mesh signature");
+        let mesh_args = [1u32, 1, 1].map(|value| value.to_le_bytes()).concat();
+        assert_eq!(
+            runtime
+                .execute_indirect_gpu(list, mesh_sig, 1, &mesh_args, 0, Some(1), None)
+                .expect("mesh typed fallback"),
+            1
+        );
+        assert_eq!(runtime.last_indirect_native(), false);
+        assert_eq!(
+            runtime
+                .last_indirect_boundary()
+                .expect("mesh boundary")
+                .contains("DISPATCH_MESH"),
+            true
+        );
+
+        let no_index_list = runtime.create_graphics_command_list(0, 0, false);
+        runtime
+            .bind_native_pipeline(no_index_list, pso)
+            .expect("bind no-index pipeline");
+        runtime.bind_native_render_target(no_index_list, target, 4, 4, DxgiFormat::B8G8R8A8Unorm);
+        runtime.bind_native_vertex_buffer(no_index_list, vertex, 0);
+        let error = runtime
+            .execute_native_indirect_draw(
+                no_index_list,
+                1,
+                &[crate::metal_backend::MetalIndirectResult {
+                    kind: 1,
+                    x: 3,
+                    y: 1,
+                    z: 0,
+                    w: 0,
+                    enabled: 1,
+                }],
+                1,
+            )
+            .expect_err("missing index buffer");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect DRAW_INDEXED requires an index buffer bound by IASetIndexBuffer"
+        );
+        let mut empty_runtime = D3d12Runtime::new();
+        let empty_list = empty_runtime.create_graphics_command_list(0, 0, false);
+        assert_eq!(
+            empty_runtime
+                .execute_native_direct_draw(empty_list, 3, 1)
+                .expect("no native state"),
+            false
+        );
+        let error = empty_runtime
+            .execute_native_indirect_draw(
+                empty_list,
+                0,
+                &[crate::metal_backend::MetalIndirectResult {
+                    kind: 0,
+                    x: 3,
+                    y: 1,
+                    z: 0,
+                    w: 0,
+                    enabled: 1,
+                }],
+                1,
+            )
+            .expect_err("missing pipeline");
+        assert_eq!(
+            error.message,
+            "ExecuteIndirect DRAW requires a native graphics pipeline bound by SetPipelineState"
+        );
+    }
+
+    fn make_ray_llvm_container(bitcode: &[u8], kind: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        let descriptors_end = 12u32 + 3 * 12;
+        let prog_off = descriptors_end;
+        let prog_size: u32 = 24 + bitcode.len() as u32;
+        data.extend_from_slice(b"PROG");
+        data.extend_from_slice(&prog_off.to_le_bytes());
+        data.extend_from_slice(&prog_size.to_le_bytes());
+        let sign_off = prog_off + prog_size;
+        data.extend_from_slice(b"SIGN");
+        data.extend_from_slice(&sign_off.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        let meta_text =
+            format!("shader_kind={kind}\npayloadSizeInBytes=16\nattributeSizeInBytes=8\n");
+        let meta_off = sign_off + 4;
+        data.extend_from_slice(b"META");
+        data.extend_from_slice(&meta_off.to_le_bytes());
+        data.extend_from_slice(&((5 + meta_text.len()) as u32).to_le_bytes());
+        while data.len() < prog_off as usize {
+            data.push(0);
+        }
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&(bitcode.len() as u32).to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(bitcode);
+        data.extend_from_slice(b"SIG1");
+        data.push(4);
+        data.extend_from_slice(b"main");
+        data.extend_from_slice(meta_text.as_bytes());
+        data
+    }
+
+    fn make_ray_dxil(kind: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        let descriptors_end = 12u32 + 3 * 12;
+        let prog_off = descriptors_end;
+        let prog_size: u32 = 24 + 4;
+        data.extend_from_slice(b"PROG");
+        data.extend_from_slice(&prog_off.to_le_bytes());
+        data.extend_from_slice(&prog_size.to_le_bytes());
+        let sign_off = prog_off + prog_size;
+        data.extend_from_slice(b"SIGN");
+        data.extend_from_slice(&sign_off.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        let meta_text =
+            format!("shader_kind={kind}\npayloadSizeInBytes=16\nattributeSizeInBytes=8\n");
+        let meta_off = sign_off + 4;
+        data.extend_from_slice(b"META");
+        data.extend_from_slice(&meta_off.to_le_bytes());
+        data.extend_from_slice(&((5 + meta_text.len()) as u32).to_le_bytes());
+        while data.len() < prog_off as usize {
+            data.push(0);
+        }
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&64u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0x4243_C0DEu32.to_be_bytes());
+        data.extend_from_slice(b"SIG1");
+        data.push(4);
+        data.extend_from_slice(b"main");
+        data.extend_from_slice(meta_text.as_bytes());
+        data
+    }
+
+    #[test]
+    fn d3d12_translated_raygen_executes_hit_miss_anyhit_callable_and_rejects_bad_stage() {
+        let mut runtime = D3d12Runtime::new();
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let vertices: [f32; 9] = [-1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0];
+        let vertex_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                vertices.as_ptr() as *const u8,
+                std::mem::size_of_val(&vertices),
+            )
+        };
+        let indices: [u16; 3] = [0, 1, 2];
+        let index_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                indices.as_ptr() as *const u8,
+                std::mem::size_of_val(&indices),
+            )
+        };
+        runtime.register_raytracing_buffer(0x3000, vertex_bytes.to_vec());
+        runtime.register_raytracing_buffer(0x4000, index_bytes.to_vec());
+        let geometry = D3D12RaytracingGeometryDesc {
+            ty: 0,
+            flags: 1,
+            vertex_buffer: 0x3000,
+            vertex_format: 6,
+            vertex_stride: 12,
+            vertex_count: 3,
+            index_buffer: 0x4000,
+            index_format: 57,
+            index_count: 3,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(
+                list,
+                &D3D12BuildAccelerationStructureDesc {
+                    dest_address: 0x1000,
+                    inputs: D3D12BuildRaytracingInputs {
+                        ty: 0,
+                        flags: 0,
+                        num_descs: 1,
+                        geometries: vec![geometry],
+                    },
+                    source_address: 0,
+                    scratch_address: 0x2000,
+                },
+            )
+            .expect("BLAS");
+        let mut instances = [0u8; 64];
+        instances[48..52].copy_from_slice(&0xFF00_0000u32.to_le_bytes());
+        instances[56..64].copy_from_slice(&0x1000u64.to_le_bytes());
+        runtime.register_raytracing_instances(0x10_0000, instances.to_vec());
+        runtime
+            .build_raytracing_acceleration_structure(
+                list,
+                &D3D12BuildAccelerationStructureDesc {
+                    dest_address: 0x10_0000,
+                    inputs: D3D12BuildRaytracingInputs {
+                        ty: 1,
+                        flags: 0,
+                        num_descs: 1,
+                        geometries: Vec::new(),
+                    },
+                    source_address: 0,
+                    scratch_address: 0x20_0000,
+                },
+            )
+            .expect("TLAS");
+
+        let ray_dxil = make_ray_dxil("raygeneration");
+        let desc = D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects: vec![
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: ray_dxil,
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: "raygen".into(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                },
+                D3d12StateSubobject::HitGroup(state_objects::D3d12HitGroup {
+                    name: "hg".into(),
+                    ty: 0,
+                    any_hit: None,
+                    closest_hit: Some("chs".into()),
+                    intersection: None,
+                }),
+            ],
+        };
+        let handle = runtime.create_state_object(desc.clone()).expect("RTSO");
+        runtime
+            .set_pipeline_state1_state_object(list, handle, desc)
+            .expect("bind RTSO");
+        let pso = runtime
+            .get_raytracing_pipeline_state(handle)
+            .expect("ray PSO");
+        assert_eq!(pso.ray_entry.as_deref(), Some("raygen"));
+        assert_eq!(
+            pso.ray_msl
+                .as_deref()
+                .expect("translated raygen")
+                .contains("msl_closest_hit"),
+            true
+        );
+        let mut ray = crate::metal_backend::MetalRay {
+            origin: [0.0, 0.0, -1.0],
+            min_distance: 0.0,
+            direction: [0.0, 0.0, 1.0],
+            max_distance: 100.0,
+            sbt_offset: 0,
+            mask: 0xFFFF_FFFF,
+        };
+        let ray_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(&ray as *const _ as *const u8, std::mem::size_of_val(&ray))
+        };
+        runtime.register_raytracing_buffer(0x30_0000, ray_bytes.to_vec());
+        let dispatch = D3D12DispatchRaysDesc {
+            raygen_shader_start_address: 0x30_0000,
+            raygen_shader_size: std::mem::size_of::<crate::metal_backend::MetalRay>() as u64,
+            miss_shader_start_address: 0,
+            miss_shader_size: 0,
+            miss_shader_stride: 0,
+            hit_group_start_address: 0x31_0000,
+            hit_group_size: 4,
+            hit_group_stride: 4,
+            callable_shader_start_address: 0,
+            callable_shader_size: 0,
+            callable_shader_stride: 0,
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        runtime.register_raytracing_buffer(0x31_0000, 1u32.to_le_bytes().to_vec());
+        runtime
+            .dispatch_rays(list, &dispatch)
+            .expect("hit dispatch");
+        let payload = runtime.last_ray_payloads();
+        assert_eq!(payload[0].value[0], 42.0);
+        assert_eq!(payload[0].instance_id, 0);
+
+        ray.origin = [4.0, 4.0, -1.0];
+        let miss_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(&ray as *const _ as *const u8, std::mem::size_of_val(&ray))
+        };
+        runtime.register_raytracing_buffer(0x30_0000, miss_bytes.to_vec());
+        runtime
+            .dispatch_rays(list, &dispatch)
+            .expect("miss dispatch");
+        assert_eq!(runtime.last_ray_payloads()[0].value[0], 7.0);
+
+        ray.origin = [0.0, 0.0, -1.0];
+        let hit_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(&ray as *const _ as *const u8, std::mem::size_of_val(&ray))
+        };
+        runtime.register_raytracing_buffer(0x30_0000, hit_bytes.to_vec());
+        runtime.register_raytracing_buffer(0x31_0000, 0x100u32.to_le_bytes().to_vec());
+        runtime
+            .dispatch_rays(list, &dispatch)
+            .expect("anyhit reject");
+        assert_eq!(runtime.last_ray_payloads()[0].value[0], 7.0);
+        runtime.register_raytracing_buffer(0x31_0000, 3u32.to_le_bytes().to_vec());
+        runtime.dispatch_rays(list, &dispatch).expect("callable");
+        assert_eq!(runtime.last_ray_payloads()[0].value[0], 99.0);
+
+        let ir = r#"define void @raygen(i32 %idx) {
+entry:
+  %i = call i32 @dx.op.dispatchRaysIndex(i32 0)
+  %m = mul i32 %i, 3
+  %a = add i32 %m, 1
+  call void @ray.storePayload(i32 %i, i32 %a)
+  ret void
+}
+declare i32 @dx.op.dispatchRaysIndex(i32)
+declare void @ray.storePayload(i32, i32)
+"#;
+        let bitcode = crate::shader::llvm_assemble_ir(ir).expect("assemble fixture");
+        let container = make_ray_llvm_container(&bitcode, "raygeneration");
+        let (source, entry) =
+            D3d12Runtime::translate_ray_pipeline(&container).expect("bitcode RTSO");
+        assert_eq!(entry.as_deref(), Some("raygen"));
+        let bad_ray_ir = r#"define void @raygen(i32 %idx) {
+entry:
+  fence seq_cst
+  ret void
+}
+"#;
+        let bad_bitcode = crate::shader::llvm_assemble_ir(bad_ray_ir).expect("bad bitcode");
+        let bad_container = make_ray_llvm_container(&bad_bitcode, "raygeneration");
+        let bad_desc = D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects: vec![
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: bad_container,
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: "raygen".into(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                },
+            ],
+        };
+        let bad_handle = runtime
+            .create_state_object(bad_desc.clone())
+            .expect("bad RTSO");
+        let error = runtime
+            .set_pipeline_state1_state_object(list, bad_handle, bad_desc)
+            .expect_err("unsupported ray opcode must fail RTSO");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(error.message, "unsupported LLVM instruction fence");
+
+        let bitcode_msl = source.expect("bitcode raygen MSL");
+        assert_eq!(bitcode_msl.contains("results["), true);
+        assert_eq!(bitcode_msl.contains("= float("), true);
+
+        let bad = make_ray_dxil("unsupported");
+        let error = crate::shader::translate_ray_shader(
+            &bad,
+            crate::shader::ShaderStage::RayGeneration,
+            "raygen",
+        )
+        .expect_err("bad ray kind");
+        assert_eq!(
+            error.message,
+            "ray shader is missing a supported shader_kind metadata marker"
+        );
+        let mismatch = make_ray_dxil("raygeneration");
+        let error = crate::shader::translate_ray_shader(
+            &mismatch,
+            crate::shader::ShaderStage::ClosestHit,
+            "chs",
+        )
+        .expect_err("stage mismatch");
+        assert_eq!(
+            error.message,
+            "ray shader metadata declares raygeneration but export chs requests closesthit"
+        );
+        let source = crate::shader::translate_ray_shader(
+            &mismatch,
+            crate::shader::ShaderStage::Intersection,
+            "isect",
+        );
+        assert_eq!(source.is_err(), true);
+        let (no_source, no_entry) =
+            D3d12Runtime::translate_ray_pipeline(&bad).expect("bad metadata");
+        assert_eq!(no_source, None);
+        assert_eq!(no_entry, None);
+        let non_ray = make_ray_dxil("");
+        let closest_hit = make_ray_dxil("closesthit");
+        let (no_source, no_entry) =
+            D3d12Runtime::translate_ray_pipeline(&closest_hit).expect("non-raygen");
+        assert_eq!(no_source, None);
+        assert_eq!(no_entry, None);
+        let (no_source, no_entry) =
+            D3d12Runtime::translate_ray_pipeline(&non_ray).expect("no kind");
+        assert_eq!(no_source, None);
+        assert_eq!(no_entry, None);
+        let (source, entry) =
+            D3d12Runtime::translate_ray_pipeline(&mismatch).expect("metadata raygen");
+        assert_eq!(entry.as_deref(), Some("raygen"));
+        assert_eq!(source.expect("ray msl").contains("query.intersect"), true);
     }
 }

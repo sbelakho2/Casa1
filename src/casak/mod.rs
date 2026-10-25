@@ -14,10 +14,21 @@
 //!
 //! Everything is self-contained: no guest execution, no global mutable state.
 
+pub mod alpc;
+pub mod config;
+pub mod diagnostics;
 pub mod exec;
+pub mod executive;
+pub mod interrupt;
 pub mod introspection;
 pub mod io;
+pub mod memory;
 pub mod object;
+pub mod pnp;
+pub mod process;
+pub mod security;
+pub mod status;
+pub mod threads;
 
 pub use exec::*;
 pub use io::*;

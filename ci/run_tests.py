@@ -52,11 +52,27 @@ def llvm_tool(name: str) -> str | None:
     override = os.environ.get(f"{name.upper().replace('-', '_')}")
     if override and pathlib.Path(override).is_file():
         return override
-    candidates = [
+    # Prefer the LLVM tools shipped with the active Rust toolchain: their
+    # raw-profile format is guaranteed to match the instrumented binaries.
+    sysroot = subprocess.run(
+        ["rustc", "--print", "sysroot"], capture_output=True, text=True
+    ).stdout.strip()
+    version = subprocess.run(
+        ["rustc", "-vV"], capture_output=True, text=True
+    ).stdout
+    host = next(
+        (line.split(":", 1)[1].strip() for line in version.splitlines()
+         if line.startswith("host:")),
+        None,
+    )
+    candidates = []
+    if sysroot and host:
+        candidates.append(f"{sysroot}/lib/rustlib/{host}/bin/{name}")
+    candidates.extend([
         f"/opt/homebrew/opt/llvm@21/bin/{name}",
         f"/opt/homebrew/opt/llvm/bin/{name}",
         f"/usr/local/opt/llvm/bin/{name}",
-    ]
+    ])
     for candidate in candidates:
         if pathlib.Path(candidate).is_file():
             return candidate

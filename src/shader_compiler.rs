@@ -464,6 +464,12 @@ impl MslShaderGenerator {
             ShaderStage::Gs => self.generate_geometry_entry(&mut source),
             ShaderStage::Hs => self.generate_hull_entry(&mut source),
             ShaderStage::Ds => self.generate_domain_entry(&mut source),
+            ShaderStage::RayGeneration
+            | ShaderStage::AnyHit
+            | ShaderStage::ClosestHit
+            | ShaderStage::Miss
+            | ShaderStage::Intersection
+            | ShaderStage::Callable => {}
         }
 
         source

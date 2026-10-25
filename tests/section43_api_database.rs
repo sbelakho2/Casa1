@@ -212,21 +212,21 @@ fn semantic_axes_keep_callable_separate_from_exact() {
         "the implemented row documents what the math covers"
     );
 
-    // The environment-model rows stay callable while the capability axis
-    // reports the absent subsystem: mscoree models a machine with no CLR.
+    // mscoree exposes the CoreCLR runtimes really installed on the host;
+    // the legacy .NET Framework activation contract remains absent.
     let clr = database
         .lookup("mscoree.dll", "CLRCreateInstance")
         .expect("CLRCreateInstance entry");
     assert_eq!(clr.implementation, ImplementationLevel::Implemented);
     assert_eq!(
         clr.semantic_fidelity,
-        SemanticFidelity::SyntheticEnvironment,
-        "the no-CLR failure contract is an exact environment model"
+        SemanticFidelity::Exact,
+        "the meta host and runtime host are the real installed CoreCLR objects"
     );
     assert_eq!(
         clr.subsystem_capability,
-        SubsystemCapability::Absent,
-        "export dispatch is callable; the CLR capability is zero"
+        SubsystemCapability::Partial,
+        "managed execution works; the .NET Framework activation contract is absent"
     );
     let mf_service = database
         .lookup("mfplat.dll", "MFGetService")

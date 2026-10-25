@@ -73,9 +73,9 @@ use crate::wddm::{
     D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT, D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP,
     D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP2, D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT2,
     D3DKMT_QUERYSTATISTICS_SEGMENT, D3DKMT_QUERYSTATISTICS_SEGMENT2, DeviceHandle,
-    GAMMA_RAMP_ENTRIES, GAMMA_RAMP_TYPE_RAMP, KeyedMutexHandle, Luid, MAX_KMT_ARRAY,
-    MAX_SCHEDULING_PRIORITY, PresentRequest, RenderRequest, SegmentId, SwapChainHandle,
-    SyncObjectHandle, WddmStatisticsSnapshot, WddmSubsystem,
+    GAMMA_RAMP_ENTRIES, GAMMA_RAMP_TYPE_RAMP, GPU_PAGE_SIZE, KeyedMutexHandle, Luid, MAX_KMT_ARRAY,
+    MAX_SCHEDULING_PRIORITY, MapGpuVirtualAddressRequest, PresentRequest, RenderRequest, SegmentId,
+    SubmitCommandRequest, SwapChainHandle, SyncObjectHandle, WddmStatisticsSnapshot, WddmSubsystem,
 };
 #[cfg(test)]
 use crate::wddm::{
@@ -109,6 +109,9 @@ const STATUS_NOT_SUPPORTED: u32 = 0xc000_00bb;
 /// STATUS_INVALID_DEVICE_STATE.
 #[cfg(test)]
 const STATUS_INVALID_DEVICE_STATE: u32 = 0xc000_0184;
+/// STATUS_NOT_FOUND.
+#[cfg(test)]
+const STATUS_NOT_FOUND: u32 = 0xc000_0225;
 /// STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER.
 const STATUS_GRAPHICS_INVALID_DISPLAY_ADAPTER: u32 = 0xc01e_0002;
 /// STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE.
@@ -159,6 +162,40 @@ const CREATEALLOCATION_FLAG_SHARED: u32 = 0x1;
 const PRESENT_FLAG_ALLOW_TEARING: u32 = 0x1;
 /// `D3DDDI_SYNCHRONIZATIONOBJECTTYPE` fence.
 const SYNCOBJECT_TYPE_FENCE: u32 = 3;
+/// Synthetic `D3DKMT_MAPGPUVIRTUALADDRESS` descriptor:
+/// `{ hDevice u32, hAllocation u32, VirtualAddress u64, Size u64,
+///   VirtualAddressOut u64 }`.
+const MAPGPUVA_ALLOCATION: u64 = 4;
+const MAPGPUVA_VIRTUAL_ADDRESS: u64 = 8;
+const MAPGPUVA_SIZE: u64 = 16;
+const MAPGPUVA_OUT: u64 = 24;
+/// Synthetic `D3DKMT_UNMAPGPUVIRTUALADDRESS` descriptor:
+/// `{ hDevice u32, pad u32, VirtualAddress u64, Size u64 }`.
+const UNMAPGPUVA_VIRTUAL_ADDRESS: u64 = 8;
+const UNMAPGPUVA_SIZE: u64 = 16;
+/// Synthetic `D3DKMT_SUBMITCOMMAND` descriptor:
+/// `{ hDevice u32, hContext u32, Allocations ptr, Count u32, Fill u32,
+///   FenceHandle u32, pad u32, FenceValue u64, BytesOut u64, FenceOut u64,
+///   PriorityOut u32, pad u32, ContextIdOut u64, SubmissionIdOut u64 }`.
+const SUBMITCOMMAND_LIST: u64 = 8;
+/// Synthetic `D3DKMT_ESCAPE` descriptor:
+/// `{ hDevice u32, EscapeCode u32, InputPtr ptr, InputSize u32,
+///   OutputSize u32, pad, OutputPtr ptr }`.
+const ESCAPE_CODE_OFFSET: u64 = 4;
+const ESCAPE_INPUT_PTR: u64 = 8;
+const ESCAPE_OUTPUT_PTR: u64 = 24;
+/// Largest private escape payload the synthetic adapter accepts.
+const MAX_ESCAPE_BYTES: u32 = 0x10_0000;
+/// Synthetic `D3DKMT_QUERYVIDEOMEMORYINFO` descriptor:
+/// `{ hDevice u32, SegmentCount in/out u32, Segments ptr, pad,
+///   BudgetOut u64, UsageOut u64, AvailableOut u64 }`.
+const VMEM_SEGMENTS_PTR: u64 = 8;
+/// Segment entry written by `D3DKMT_QUERYVIDEOMEMORYINFO`:
+/// `{ segment u32, pad u32, budget u64, used u64 }`.
+const VMEM_SEGMENT_ENTRY_SIZE: u64 = 24;
+/// Synthetic `D3DKMTPagingFence` descriptor:
+/// `{ hDevice u32, pad u32, FenceOut u64 }`.
+const PAGING_FENCE_OUT: u64 = 8;
 
 /// `KMTQAITYPE_GETSEGMENTSIZE`.
 const KMTQAITYPE_GETSEGMENTSIZE: u32 = 3;
@@ -271,6 +308,18 @@ impl PeHostRuntime {
             HostThunk::D3DKMTDestroyAllocation => self.d3d8thk_destroy_allocation(state, memory),
             HostThunk::D3DKMTMakeResident => self.d3d8thk_make_resident(state, memory),
             HostThunk::D3DKMTEvict => self.d3d8thk_evict(state, memory),
+            HostThunk::D3DKMTMapGpuVirtualAddress => {
+                self.d3d8thk_map_gpu_virtual_address(state, memory)
+            }
+            HostThunk::D3DKMTUnmapGpuVirtualAddress => {
+                self.d3d8thk_unmap_gpu_virtual_address(state, memory)
+            }
+            HostThunk::D3DKMTSubmitCommand => self.d3d8thk_submit_command(state, memory),
+            HostThunk::D3DKMTEscape => self.d3d8thk_escape(state, memory),
+            HostThunk::D3DKMTQueryVideoMemoryInfo => {
+                self.d3d8thk_query_video_memory_info(state, memory)
+            }
+            HostThunk::D3DKMTPagingFence => self.d3d8thk_paging_fence(state, memory),
             HostThunk::D3DKMTQueryAllocationResidency => {
                 self.d3d8thk_query_allocation_residency(state, memory)
             }
@@ -1191,6 +1240,149 @@ impl PeHostRuntime {
             kmt_facade(wddm().d3dkmt_evict(handle, u64::from(self.guest_pid)))?;
         }
         kmt_write_u64(memory, info + 24, 0)
+    }
+
+    fn d3d8thk_map_gpu_virtual_address(
+        &self,
+        state: &CpuState,
+        memory: &mut MemoryImage,
+    ) -> KmtResult<()> {
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let device = DeviceHandle(kmt_read_u32(memory, info)?);
+        let allocation = AllocationHandle(kmt_read_u32(memory, info + MAPGPUVA_ALLOCATION)?);
+        let virtual_address = kmt_read_u64(memory, info + MAPGPUVA_VIRTUAL_ADDRESS)?;
+        let size = kmt_read_u64(memory, info + MAPGPUVA_SIZE)?;
+        if size == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mapped = kmt_facade(wddm().d3dkmt_map_gpu_virtual_address(
+            MapGpuVirtualAddressRequest {
+                device,
+                allocation,
+                virtual_address,
+                size,
+            },
+        ))?;
+        kmt_write_u64(memory, info + MAPGPUVA_OUT, mapped)
+    }
+
+    fn d3d8thk_unmap_gpu_virtual_address(
+        &self,
+        state: &CpuState,
+        memory: &mut MemoryImage,
+    ) -> KmtResult<()> {
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let device = DeviceHandle(kmt_read_u32(memory, info)?);
+        let virtual_address = kmt_read_u64(memory, info + UNMAPGPUVA_VIRTUAL_ADDRESS)?;
+        let size = kmt_read_u64(memory, info + UNMAPGPUVA_SIZE)?;
+        if size == 0 || size % GPU_PAGE_SIZE != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mapping = kmt_facade(wddm().gpu_virtual_address_info(device, virtual_address))?;
+        if mapping.size != size {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        kmt_facade(wddm().d3dkmt_unmap_gpu_virtual_address(device, virtual_address))
+    }
+
+    fn d3d8thk_submit_command(&self, state: &CpuState, memory: &mut MemoryImage) -> KmtResult<()> {
+        let arch = self.guest_arch;
+        let ps = arch.pointer_bytes() as u64;
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let device = DeviceHandle(kmt_read_u32(memory, info)?);
+        let context = ContextHandle(kmt_read_u32(memory, info + 4)?);
+        let list = kmt_read_pointer(memory, info + SUBMITCOMMAND_LIST, arch)?;
+        let count = kmt_read_u32(memory, info + SUBMITCOMMAND_LIST + ps)?;
+        if list == 0 || count == 0 || count as usize > MAX_KMT_ARRAY {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut allocations = Vec::with_capacity(count as usize);
+        for index in 0..u64::from(count) {
+            allocations.push(AllocationHandle(kmt_read_u32(memory, list + index * 4)?));
+        }
+        let fill_value = kmt_read_u32(memory, info + 12 + ps)? as u8;
+        let fence_handle = kmt_read_u32(memory, info + 16 + ps)?;
+        let fence_value = kmt_read_u64(memory, info + kmt_align8(24 + ps))?;
+        let fence = (fence_handle != 0).then_some((SyncObjectHandle(fence_handle), fence_value));
+        let submitted = kmt_facade(wddm().d3dkmt_submit_command(SubmitCommandRequest {
+            device,
+            context,
+            allocations,
+            fill_value,
+            fence,
+        }))?;
+        kmt_write_u64(memory, info + 32 + ps, submitted.bytes_filled)?;
+        kmt_write_u64(memory, info + 40 + ps, submitted.fence_value)?;
+        kmt_write_u32(memory, info + 48 + ps, submitted.effective_priority)?;
+        kmt_write_u64(memory, info + 56 + ps, submitted.context_id)?;
+        kmt_write_u64(memory, info + 64 + ps, submitted.submission_id)
+    }
+
+    fn d3d8thk_escape(&self, state: &CpuState, memory: &mut MemoryImage) -> KmtResult<()> {
+        let arch = self.guest_arch;
+        let ps = arch.pointer_bytes() as u64;
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let device = DeviceHandle(kmt_read_u32(memory, info)?);
+        let escape_code = kmt_read_u32(memory, info + ESCAPE_CODE_OFFSET)?;
+        let input_ptr = kmt_read_pointer(memory, info + ESCAPE_INPUT_PTR, arch)?;
+        let input_size = kmt_read_u32(memory, info + ESCAPE_INPUT_PTR + ps)?;
+        let output_size = kmt_read_u32(memory, info + ESCAPE_INPUT_PTR + ps + 4)?;
+        let output_ptr = kmt_read_pointer(memory, info + ESCAPE_OUTPUT_PTR, arch)?;
+        if input_size > MAX_ESCAPE_BYTES || output_size > MAX_ESCAPE_BYTES {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if input_size != 0 && input_ptr == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if output_size != 0 && output_ptr == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let input = if input_size == 0 {
+            Vec::new()
+        } else {
+            memory
+                .read_bytes(input_ptr, input_size as usize)
+                .map_err(|_| kmt_invalid_pointer())?
+        };
+        kmt_facade(wddm().d3dkmt_escape(device, escape_code, &input)).map(|_| ())
+    }
+
+    fn d3d8thk_query_video_memory_info(
+        &self,
+        state: &CpuState,
+        memory: &mut MemoryImage,
+    ) -> KmtResult<()> {
+        let arch = self.guest_arch;
+        let ps = arch.pointer_bytes() as u64;
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let device = DeviceHandle(kmt_read_u32(memory, info)?);
+        let capacity = kmt_read_u32(memory, info + 4)?;
+        let segments = kmt_read_pointer(memory, info + VMEM_SEGMENTS_PTR, arch)?;
+        let budget_offset = info + kmt_align8(VMEM_SEGMENTS_PTR + ps);
+        let snapshot = kmt_facade(wddm().d3dkmt_query_video_memory_info(device))?;
+        let required = snapshot.segments.len() as u32;
+        kmt_write_u64(memory, budget_offset, snapshot.budget)?;
+        kmt_write_u64(memory, budget_offset + 8, snapshot.usage)?;
+        kmt_write_u64(memory, budget_offset + 16, snapshot.available)?;
+        if segments == 0 || capacity < required {
+            kmt_write_u32(memory, info + 4, required)?;
+            return Err(STATUS_BUFFER_TOO_SMALL);
+        }
+        for (index, segment) in snapshot.segments.iter().enumerate() {
+            let entry = segments + index as u64 * VMEM_SEGMENT_ENTRY_SIZE;
+            kmt_write_u32(memory, entry, segment.segment.0)?;
+            kmt_write_u32(memory, entry + 4, 0)?;
+            kmt_write_u64(memory, entry + 8, segment.budget)?;
+            kmt_write_u64(memory, entry + 16, segment.used)?;
+        }
+        kmt_write_u32(memory, info + 4, required)
+    }
+
+    fn d3d8thk_paging_fence(&self, state: &CpuState, memory: &mut MemoryImage) -> KmtResult<()> {
+        let info = guest_call_arg(state, memory, 0).map_err(|_| kmt_invalid_pointer())?;
+        let device = DeviceHandle(kmt_read_u32(memory, info)?);
+        let fence = kmt_facade(wddm().d3dkmt_paging_fence(device))?;
+        kmt_write_u64(memory, info + PAGING_FENCE_OUT, fence)
     }
 
     fn d3d8thk_query_allocation_residency(
@@ -5967,5 +6159,663 @@ mod tests {
         assert_eq!(resolve("D3DKMTSetCursorPosition"), "set-cursor-position");
         assert_eq!(resolve("D3DKMTSetGammaRamp"), "set-gamma-ramp");
         assert_eq!(resolve("D3DKMTNotARealEntryPoint"), "unsupported");
+    }
+
+    #[test]
+    fn gpu_va_vidmm_paging_dispatch_pins_contracts_on_x86_and_x64() {
+        with_big_stack(|| {
+            for arch in [GuestArch::X86, GuestArch::X64] {
+                let (mut runtime, _directory) = test_runtime(arch);
+                let mut memory = MemoryImage::default();
+                map_scratch(&mut memory);
+                let ps = pointer_size(&runtime);
+                let adapter = open_adapter(&mut runtime, &mut memory);
+                let device = create_device(&mut runtime, &mut memory, adapter, false);
+                let allocation =
+                    create_allocation(&mut runtime, &mut memory, device, 9_100, 0x2000, 0, true);
+                let other =
+                    create_allocation(&mut runtime, &mut memory, device, 9_101, 0x2000, 0, true);
+                let va = if arch == GuestArch::X86 {
+                    0x4100_1000
+                } else {
+                    0x4100_0000
+                };
+                let map = SCRATCH + 0xC00;
+                store_u32(&mut memory, map, device);
+                store_u32(&mut memory, map + MAPGPUVA_ALLOCATION, allocation);
+                store_u64(&mut memory, map + MAPGPUVA_VIRTUAL_ADDRESS, va);
+                store_u64(&mut memory, map + MAPGPUVA_SIZE, 0x1000);
+                store_u64(&mut memory, map + MAPGPUVA_OUT, 0);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTMapGpuVirtualAddress,
+                        &[map]
+                    ),
+                    0
+                );
+                assert_eq!(load_u64(&memory, map + MAPGPUVA_OUT), va);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTMapGpuVirtualAddress,
+                        &[0]
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+                store_u64(&mut memory, map + MAPGPUVA_SIZE, 0);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTMapGpuVirtualAddress,
+                        &[map]
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+                store_u64(&mut memory, map + MAPGPUVA_SIZE, 0x800);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTMapGpuVirtualAddress,
+                        &[map]
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+                store_u64(&mut memory, map + MAPGPUVA_SIZE, 0x1000);
+                store_u32(&mut memory, map + MAPGPUVA_ALLOCATION, other);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTMapGpuVirtualAddress,
+                        &[map]
+                    ),
+                    STATUS_OBJECT_NAME_COLLISION
+                );
+                store_u32(&mut memory, map, 0xFFFF_FFFF);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTMapGpuVirtualAddress,
+                        &[map]
+                    ),
+                    STATUS_INVALID_HANDLE
+                );
+
+                let unmap = SCRATCH + 0xC80;
+                store_u32(&mut memory, unmap, device);
+                store_u32(&mut memory, unmap + 4, 0);
+                store_u64(&mut memory, unmap + UNMAPGPUVA_VIRTUAL_ADDRESS, va);
+                store_u64(&mut memory, unmap + UNMAPGPUVA_SIZE, 0);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTUnmapGpuVirtualAddress,
+                        &[unmap]
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+                store_u64(&mut memory, unmap + UNMAPGPUVA_SIZE, 0x800);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTUnmapGpuVirtualAddress,
+                        &[unmap]
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+                store_u64(&mut memory, unmap + UNMAPGPUVA_SIZE, 0x2000);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTUnmapGpuVirtualAddress,
+                        &[unmap]
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+                store_u64(&mut memory, unmap + UNMAPGPUVA_SIZE, 0x1000);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTUnmapGpuVirtualAddress,
+                        &[unmap]
+                    ),
+                    0
+                );
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTUnmapGpuVirtualAddress,
+                        &[unmap]
+                    ),
+                    STATUS_NOT_FOUND
+                );
+                store_u32(&mut memory, unmap, 0xFFFF_FFFF);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTUnmapGpuVirtualAddress,
+                        &[unmap]
+                    ),
+                    STATUS_INVALID_HANDLE
+                );
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTUnmapGpuVirtualAddress,
+                        &[0]
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+
+                let vmem = SCRATCH + 0xD00;
+                let segments = SCRATCH + 0xD80;
+                let budget_offset = kmt_align8(VMEM_SEGMENTS_PTR + ps);
+                store_u32(&mut memory, vmem, device);
+                store_u32(&mut memory, vmem + 4, 4);
+                store_ptr(&mut memory, vmem + VMEM_SEGMENTS_PTR, segments, arch);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTQueryVideoMemoryInfo,
+                        &[vmem]
+                    ),
+                    0
+                );
+                assert_eq!(load_u32(&memory, vmem + 4), 2);
+                let budget = load_u64(&memory, vmem + budget_offset);
+                assert_eq!(load_u64(&memory, vmem + budget_offset + 8), 0);
+                assert_eq!(load_u64(&memory, vmem + budget_offset + 16), budget);
+                assert_eq!(load_u32(&memory, segments), 0);
+                assert!(load_u64(&memory, segments + 8) > 0);
+                store_u32(&mut memory, vmem + 4, 1);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTQueryVideoMemoryInfo,
+                        &[vmem]
+                    ),
+                    STATUS_BUFFER_TOO_SMALL
+                );
+                assert_eq!(load_u32(&memory, vmem + 4), 2);
+                store_ptr(&mut memory, vmem + VMEM_SEGMENTS_PTR, 0, arch);
+                store_u32(&mut memory, vmem + 4, 0);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTQueryVideoMemoryInfo,
+                        &[vmem]
+                    ),
+                    STATUS_BUFFER_TOO_SMALL
+                );
+                assert_eq!(load_u32(&memory, vmem + 4), 2);
+                store_u32(&mut memory, vmem, 0xFFFF_FFFF);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTQueryVideoMemoryInfo,
+                        &[vmem]
+                    ),
+                    STATUS_INVALID_HANDLE
+                );
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTQueryVideoMemoryInfo,
+                        &[0]
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+
+                let paging = SCRATCH + 0xE00;
+                store_u32(&mut memory, paging, device);
+                store_u32(&mut memory, paging + 4, 0);
+                store_u64(&mut memory, paging + PAGING_FENCE_OUT, u64::MAX);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTPagingFence,
+                        &[paging]
+                    ),
+                    0
+                );
+                let paging_baseline = load_u64(&memory, paging + PAGING_FENCE_OUT);
+                let residency = residency_descriptor(&runtime, &mut memory, device, &[allocation]);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTMakeResident,
+                        &[residency]
+                    ),
+                    0
+                );
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTPagingFence,
+                        &[paging]
+                    ),
+                    0
+                );
+                assert_eq!(
+                    load_u64(&memory, paging + PAGING_FENCE_OUT),
+                    paging_baseline + 1
+                );
+                store_u32(&mut memory, paging, 0xFFFF_FFFF);
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTPagingFence,
+                        &[paging]
+                    ),
+                    STATUS_INVALID_HANDLE
+                );
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTPagingFence,
+                        &[0]
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+
+                let destroy = destroy_allocation_descriptor(
+                    &runtime,
+                    &mut memory,
+                    device,
+                    &[allocation, other],
+                );
+                assert_eq!(
+                    call_status(
+                        &mut runtime,
+                        &mut memory,
+                        HostThunk::D3DKMTDestroyAllocation,
+                        &[destroy]
+                    ),
+                    0
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn submit_command_dispatch_requires_residency_and_pins_outputs() {
+        with_big_stack(|| {
+            let (mut runtime, _directory) = test_runtime(GuestArch::X64);
+            let mut memory = MemoryImage::default();
+            map_scratch(&mut memory);
+            let adapter = open_adapter(&mut runtime, &mut memory);
+            let device = create_device(&mut runtime, &mut memory, adapter, false);
+            let allocation =
+                create_allocation(&mut runtime, &mut memory, device, 9_200, 0x1000, 0, true);
+            let context_descriptor = SCRATCH + 0xC00;
+            store_u32(&mut memory, context_descriptor, device);
+            store_u32(&mut memory, context_descriptor + 4, 0);
+            store_u32(&mut memory, context_descriptor + 8, 5);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTCreateContext,
+                    &[context_descriptor]
+                ),
+                0
+            );
+            let context = load_u32(&memory, context_descriptor + 12);
+            assert_ne!(context, 0);
+            let fence = create_fence(&mut runtime, &mut memory, device, 0);
+
+            let submit = SCRATCH + 0xE00;
+            let list = SCRATCH + 0xE80;
+            store_u32(&mut memory, list, allocation);
+            store_u32(&mut memory, submit, device);
+            store_u32(&mut memory, submit + 4, context);
+            store_ptr(
+                &mut memory,
+                submit + SUBMITCOMMAND_LIST,
+                list,
+                GuestArch::X64,
+            );
+            store_u32(&mut memory, submit + 16, 1);
+            store_u32(&mut memory, submit + 20, 0x5A);
+            store_u32(&mut memory, submit + 24, fence);
+            store_u32(&mut memory, submit + 28, 0);
+            store_u64(&mut memory, submit + 32, 1);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSubmitCommand,
+                    &[submit]
+                ),
+                STATUS_GRAPHICS_ALLOCATION_BUSY
+            );
+            let residency = residency_descriptor(&runtime, &mut memory, device, &[allocation]);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTMakeResident,
+                    &[residency]
+                ),
+                0
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSubmitCommand,
+                    &[submit]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, submit + 40), 0x1000);
+            assert_eq!(load_u64(&memory, submit + 48), 1);
+            assert_eq!(load_u32(&memory, submit + 56), 5);
+            assert_ne!(load_u64(&memory, submit + 64), 0);
+            assert_eq!(load_u64(&memory, submit + 72), 1);
+            store_u64(&mut memory, submit + 32, 2);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSubmitCommand,
+                    &[submit]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, submit + 48), 2);
+            assert_eq!(load_u64(&memory, submit + 72), 2);
+            store_u32(&mut memory, submit + 24, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSubmitCommand,
+                    &[submit]
+                ),
+                0
+            );
+            assert_eq!(load_u64(&memory, submit + 48), 0);
+            store_u32(&mut memory, submit + 24, fence);
+            store_u64(&mut memory, submit + 32, 1);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSubmitCommand,
+                    &[submit]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_u32(&mut memory, submit + 4, 0xFFFF_FFFF);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSubmitCommand,
+                    &[submit]
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            store_u32(&mut memory, submit + 4, context);
+            store_ptr(&mut memory, submit + SUBMITCOMMAND_LIST, 0, GuestArch::X64);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSubmitCommand,
+                    &[submit]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_ptr(
+                &mut memory,
+                submit + SUBMITCOMMAND_LIST,
+                list,
+                GuestArch::X64,
+            );
+            store_u32(&mut memory, submit + 16, 0);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSubmitCommand,
+                    &[submit]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_u32(&mut memory, submit + 16, MAX_KMT_ARRAY as u32 + 1);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSubmitCommand,
+                    &[submit]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTSubmitCommand,
+                    &[0]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+        });
+    }
+
+    #[test]
+    fn escape_dispatch_fails_closed_and_new_imports_resolve() {
+        with_big_stack(|| {
+            let (mut runtime, _directory) = test_runtime(GuestArch::X64);
+            let mut memory = MemoryImage::default();
+            map_scratch(&mut memory);
+            let adapter = open_adapter(&mut runtime, &mut memory);
+            let device = create_device(&mut runtime, &mut memory, adapter, false);
+            let input = SCRATCH + 0xE80;
+            store_u32(&mut memory, input, 0x1122_3344);
+            let escape = SCRATCH + 0xE00;
+            store_u32(&mut memory, escape, device);
+            store_u32(&mut memory, escape + ESCAPE_CODE_OFFSET, 0x0022_0004);
+            store_ptr(
+                &mut memory,
+                escape + ESCAPE_INPUT_PTR,
+                input,
+                GuestArch::X64,
+            );
+            store_u32(&mut memory, escape + 16, 4);
+            store_u32(&mut memory, escape + 20, 0);
+            store_ptr(&mut memory, escape + ESCAPE_OUTPUT_PTR, 0, GuestArch::X64);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEscape,
+                    &[escape]
+                ),
+                STATUS_NOT_SUPPORTED
+            );
+            store_u32(&mut memory, escape + 16, 0);
+            store_ptr(&mut memory, escape + ESCAPE_INPUT_PTR, 0, GuestArch::X64);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEscape,
+                    &[escape]
+                ),
+                STATUS_NOT_SUPPORTED
+            );
+            store_ptr(
+                &mut memory,
+                escape + ESCAPE_INPUT_PTR,
+                input,
+                GuestArch::X64,
+            );
+            store_u32(&mut memory, escape + 16, 4);
+            store_u32(&mut memory, escape, 0xFFFF_FFFF);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEscape,
+                    &[escape]
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            store_u32(&mut memory, escape, device);
+            store_ptr(&mut memory, escape + ESCAPE_INPUT_PTR, 0, GuestArch::X64);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEscape,
+                    &[escape]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_ptr(
+                &mut memory,
+                escape + ESCAPE_INPUT_PTR,
+                input,
+                GuestArch::X64,
+            );
+            store_u32(&mut memory, escape + 16, 0);
+            store_u32(&mut memory, escape + 20, 4);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEscape,
+                    &[escape]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_u32(&mut memory, escape + 20, 0);
+            store_u32(&mut memory, escape + 16, MAX_ESCAPE_BYTES + 1);
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEscape,
+                    &[escape]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            store_u32(&mut memory, escape + 16, 4);
+            store_ptr(
+                &mut memory,
+                escape + ESCAPE_INPUT_PTR,
+                0x9FFF_0000,
+                GuestArch::X64,
+            );
+            assert_eq!(
+                call_status(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::D3DKMTEscape,
+                    &[escape]
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                call_status(&mut runtime, &mut memory, HostThunk::D3DKMTEscape, &[0]),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let resolved = |module: &str, name: &str| ResolvedImport {
+                requested_module: module.to_string(),
+                resolved_module: module.to_string(),
+                symbol: ImportSymbol::ByName {
+                    hint: 0,
+                    name: name.to_string(),
+                },
+                iat_rva: 0,
+                export: ExportSymbol {
+                    ordinal: 0,
+                    name: Some(name.to_string()),
+                    target: ExportTarget::Rva(0),
+                },
+            };
+            for module in ["d3d8thk.dll", "gdi32.dll"] {
+                assert!(matches!(
+                    HostThunk::from_import(&resolved(module, "D3DKMTEscape")),
+                    HostThunk::D3DKMTEscape
+                ));
+                assert!(matches!(
+                    HostThunk::from_import(&resolved(module, "D3DKMTMapGpuVirtualAddress")),
+                    HostThunk::D3DKMTMapGpuVirtualAddress
+                ));
+                assert!(matches!(
+                    HostThunk::from_import(&resolved(module, "D3DKMTUnmapGpuVirtualAddress")),
+                    HostThunk::D3DKMTUnmapGpuVirtualAddress
+                ));
+                assert!(matches!(
+                    HostThunk::from_import(&resolved(module, "D3DKMTSubmitCommand")),
+                    HostThunk::D3DKMTSubmitCommand
+                ));
+                assert!(matches!(
+                    HostThunk::from_import(&resolved(module, "D3DKMTQueryVideoMemoryInfo")),
+                    HostThunk::D3DKMTQueryVideoMemoryInfo
+                ));
+                assert!(matches!(
+                    HostThunk::from_import(&resolved(module, "D3DKMTPagingFence")),
+                    HostThunk::D3DKMTPagingFence
+                ));
+            }
+            assert!(matches!(
+                HostThunk::from_import(&resolved("ntdll.dll", "D3DKMTEscape")),
+                HostThunk::Unsupported { .. }
+            ));
+            for name in [
+                "D3DKMTEscape",
+                "D3DKMTMapGpuVirtualAddress",
+                "D3DKMTUnmapGpuVirtualAddress",
+                "D3DKMTSubmitCommand",
+                "D3DKMTQueryVideoMemoryInfo",
+                "D3DKMTPagingFence",
+            ] {
+                let symbol = ImportSymbol::ByName {
+                    hint: 0,
+                    name: name.to_string(),
+                };
+                for module in ["d3d8thk.dll", "gdi32.dll"] {
+                    assert!(
+                        crate::runtime::is_import_supported(module, &symbol),
+                        "{module}!{name} must resolve to a concrete host thunk"
+                    );
+                    assert_eq!(
+                        crate::runtime::registered_export_implementation_level(module, name),
+                        crate::host_thunks::ImplementationLevel::Implemented,
+                        "{module}!{name} must be registered as implemented"
+                    );
+                }
+            }
+        });
     }
 }

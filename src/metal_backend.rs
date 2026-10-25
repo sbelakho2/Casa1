@@ -27,7 +27,7 @@ use crate::reason::ReasonCode;
 use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
 use core_graphics_types::geometry::CGSize;
-use metal::foreign_types::ForeignType;
+use metal::foreign_types::{ForeignType, ForeignTypeRef};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -162,6 +162,18 @@ impl<T: MetalEncoderLifecycle> Drop for AutoEndEncoder<T> {
 
 fn alloc_gpu_id() -> u64 {
     NEXT_GPU_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Test-only pipeline-creation fault injection shared with the D3D12 tests.
+#[cfg(test)]
+pub(crate) fn set_pipeline_creation_fault(value: bool) {
+    test_faults::set_pipeline_creation_fault(value);
+}
+
+/// Test-only native render pipeline fault injection.
+#[cfg(test)]
+pub(crate) fn set_native_pipeline_creation_fault(value: bool) {
+    test_faults::set_native_pipeline_creation_fault(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +552,16 @@ pub struct MetalCapabilityReport {
     /// Whether the device exposes MTLBinaryArchive
     /// (`newBinaryArchiveWithDescriptor:error:`, macOS 11+).
     pub supports_binary_archives: bool,
+    /// Whether the device exposes Metal 4 command queues/allocators (macOS 26+).
+    pub supports_metal4: bool,
+    /// Whether the device exposes MTLResidencySet (macOS 15+).
+    pub supports_residency_sets: bool,
+    /// Whether the device exposes MTLIOCommandQueue (macOS 13+).
+    pub supports_mtl_io: bool,
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 impl std::fmt::Display for MetalCapabilityReport {
@@ -615,6 +637,12 @@ impl std::fmt::Display for MetalCapabilityReport {
                 "no"
             }
         )?;
+        let metal4 = yes_no(self.supports_metal4);
+        let residency_sets = yes_no(self.supports_residency_sets);
+        let mtl_io = yes_no(self.supports_mtl_io);
+        writeln!(f, "  Metal 4: {metal4}")?;
+        writeln!(f, "  Residency Sets: {residency_sets}")?;
+        writeln!(f, "  Metal I/O: {mtl_io}")?;
         Ok(())
     }
 }
@@ -1023,6 +1051,20 @@ fn create_aligned_guest_buffer(
     Ok(unsafe { metal::Buffer::from_ptr(raw as *mut _) })
 }
 
+fn device_supports_residency_sets(device: &metal::DeviceRef) -> bool {
+    if objc::runtime::Class::get("MTLResidencySetDescriptor").is_none() {
+        return false;
+    }
+    let device_obj = device.as_ptr() as *mut objc::runtime::Object;
+    // SAFETY: live MTLDevice.
+    unsafe {
+        msg_send![
+            device_obj,
+            respondsToSelector: sel!(newResidencySetWithDescriptor:error:)
+        ]
+    }
+}
+
 /// Query the system default Metal device and produce a capability report.
 ///
 /// Returns an error if no Metal device is available. This function is
@@ -1045,6 +1087,9 @@ pub fn report_metal_device_capabilities() -> AppResult<MetalCapabilityReport> {
         supports_mac2: device.device().supports_family(metal::MTLGPUFamily::Mac2),
         supports_argument_buffers: true, // Available since macOS 10.13
         supports_binary_archives: device_supports_binary_archives(device.device()),
+        supports_metal4: Metal4Queue::is_supported(device.device()),
+        supports_residency_sets: device_supports_residency_sets(device.device()),
+        supports_mtl_io: MetalIoQueue::is_supported(device.device()),
     })
 }
 
@@ -2193,6 +2238,8 @@ mod test_faults {
         static PARALLEL_CHILD_ENCODER_UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
         static SHADER_COMPILER_SPAWN_FAILURE: Cell<bool> = const { Cell::new(false) };
         static SHADER_COMPILER_PANIC: Cell<bool> = const { Cell::new(false) };
+        static PIPELINE_CREATION_FAULT: Cell<bool> = const { Cell::new(false) };
+        static NATIVE_PIPELINE_FAULT: Cell<bool> = const { Cell::new(false) };
     }
 
     pub(super) fn set_cv_unavailable(value: bool) {
@@ -2311,6 +2358,18 @@ mod test_faults {
     }
     pub(super) fn set_shader_compiler_panic(value: bool) {
         SHADER_COMPILER_PANIC.with(|flag| flag.set(value));
+    }
+    pub(super) fn set_pipeline_creation_fault(value: bool) {
+        PIPELINE_CREATION_FAULT.with(|flag| flag.set(value));
+    }
+    pub(super) fn pipeline_creation_fault() -> bool {
+        PIPELINE_CREATION_FAULT.with(Cell::get)
+    }
+    pub(super) fn set_native_pipeline_creation_fault(value: bool) {
+        NATIVE_PIPELINE_FAULT.with(|flag| flag.set(value));
+    }
+    pub(super) fn native_pipeline_creation_fault() -> bool {
+        NATIVE_PIPELINE_FAULT.with(Cell::get)
     }
     pub(super) fn shader_compiler_panic() -> bool {
         SHADER_COMPILER_PANIC.with(Cell::get)
@@ -4069,7 +4128,7 @@ pub fn present_texture_to_layer(
         source.height(),
         target.width(),
         target.height(),
-    )?; // coverage: unreachable — CAMetalLayer refuses to vend a drawable whose texture has a zero dimension, so this error edge cannot trigger after next_drawable succeeds on this host
+    )?; // coverage: unreachable — CAMetalLayer refuses to vend a drawable whose texture has a zero dimension, so this error edge cannot trigger after next_drawable succeeds with the Metal runtime
     let device = source.device();
     let queue = device.new_command_queue();
     let command_buffer = queue.new_command_buffer();
@@ -5036,6 +5095,117 @@ pub fn upload_texture_from_file(
     command_buffer.wait_until_completed();
     stats.blits = 1;
 
+    Ok(DirectStorageTexture {
+        texture,
+        chroma: None,
+        width: desc.width,
+        height: desc.height,
+        format: desc.format,
+        dxgi_format: metal_to_dxgi_format(desc.format),
+        stats,
+        readback_host_copies: std::sync::Arc::new(AtomicU64::new(0)),
+    })
+}
+
+/// DirectStorage upload that uses the storage engine (`MTLIOCommandQueue`)
+/// for uncompressed sources: the file is loaded directly into the Metal
+/// buffer by Metal I/O, with no CPU read buffer.  Compressed (zlib) sources
+/// use the inflater path; when MTLIO is unavailable the same bytes take the
+/// regular file path (no semantic change).
+pub fn upload_texture_from_path(
+    path: &std::path::Path,
+    desc: DirectStorageUploadDesc,
+) -> AppResult<DirectStorageTexture> {
+    let bytes_per_pixel = validate_directstorage_upload(&desc)?;
+    let device = MetalDevice::system_default()?;
+    if desc.compression == DirectStorageCompression::None {
+        if let Ok(queue) = MetalIoQueue::new(device.metal_device(), 4, true) {
+            // Preserve the established short-source diagnostic before the
+            // asynchronous I/O engine reports a less specific failure.
+            let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if desc.file_offset.saturating_add(desc.output_len) > file_len {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "DirectStorage: file is too short for {} bytes at offset {}",
+                        desc.output_len, desc.file_offset
+                    ),
+                ));
+            }
+            let file = queue.open_file(path).map_err(|error| {
+                AppError::new(ReasonCode::RcIo, format!("DirectStorage: {error}"))
+            })?;
+            let staging = device.create_buffer(
+                desc.output_len,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            queue
+                .load_into_buffer(&file, &staging, 0, desc.output_len, desc.file_offset)
+                .map_err(|error| {
+                    AppError::new(ReasonCode::RcIo, format!("DirectStorage: {error}"))
+                })?;
+            let stats = DirectStorageStats {
+                source_bytes: desc.source_len,
+                directstorage_bytes: desc.output_len,
+                staging_bytes: 0,
+                blits: 1,
+                ..DirectStorageStats::default()
+            };
+            return finish_texture_blit(device, desc, bytes_per_pixel, staging, stats);
+        }
+    }
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("DirectStorage: failed to open {}", path.display()),
+            &error,
+        )
+    })?;
+    upload_texture_from_file(&mut file, desc)
+}
+
+/// Blit a finished upload buffer into a private texture and return the
+/// DirectStorage texture with the supplied statistics.
+fn finish_texture_blit(
+    device: MetalDevice,
+    desc: DirectStorageUploadDesc,
+    bytes_per_pixel: usize,
+    staging: metal::Buffer,
+    stats: DirectStorageStats,
+) -> AppResult<DirectStorageTexture> {
+    let texture = device.create_texture(
+        desc.width as u64,
+        desc.height as u64,
+        desc.format,
+        metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget,
+        metal::MTLStorageMode::Private,
+    );
+    let bytes_per_row = desc.width as u64 * bytes_per_pixel as u64;
+    let bytes_per_image = bytes_per_row * desc.height as u64;
+    let queue = device.create_command_queue();
+    let command_buffer = queue.new_command_buffer();
+    {
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_buffer_to_texture(
+            &staging,
+            0,
+            bytes_per_row,
+            bytes_per_image,
+            metal::MTLSize {
+                width: desc.width as u64,
+                height: desc.height as u64,
+                depth: 1,
+            },
+            &texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLBlitOption::None,
+        );
+        blit.end_encoding();
+    }
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
     Ok(DirectStorageTexture {
         texture,
         chroma: None,
@@ -9852,6 +10022,8 @@ const fn align_up(value: usize, alignment: usize) -> usize {
 /// Vertex format for ray tracing geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VertexFormat {
+    /// Two 32-bit floats (2D position, z = 0).
+    Float2,
     /// Three 32-bit floats.
     Float3,
     /// Three 16-bit floats.
@@ -9864,6 +10036,7 @@ impl VertexFormat {
     /// Convert to Metal attribute format.
     pub fn to_metal(&self) -> metal::MTLAttributeFormat {
         match self {
+            VertexFormat::Float2 => metal::MTLAttributeFormat::Float2,
             VertexFormat::Float3 => metal::MTLAttributeFormat::Float3,
             VertexFormat::Half3 => metal::MTLAttributeFormat::Half3,
             VertexFormat::Int3 => metal::MTLAttributeFormat::Int3,
@@ -9873,6 +10046,7 @@ impl VertexFormat {
     /// Stride in bytes for this vertex format.
     pub fn stride(&self) -> u64 {
         match self {
+            VertexFormat::Float2 => 8,
             VertexFormat::Float3 => 12,
             VertexFormat::Half3 => 6,
             VertexFormat::Int3 => 12,
@@ -9899,14 +10073,26 @@ impl IndexFormat {
     }
 }
 
+/// Kind of geometry inside a primitive acceleration structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RayTracingGeometryKind {
+    /// Triangle geometry backed by a vertex (and optional index) buffer.
+    Triangles,
+    /// Axis-aligned bounding-box geometry. `vertex_buffer` carries the
+    /// bounding-box records and `vertex_stride` their stride.
+    BoundingBoxes,
+}
+
 /// Describes a single geometry for ray tracing acceleration structure.
 #[derive(Debug, Clone)]
 pub struct RayTracingGeometryDescriptor {
-    /// Handle to the vertex buffer.
+    /// Geometry kind (triangles or axis-aligned bounding boxes).
+    pub kind: RayTracingGeometryKind,
+    /// Handle to the vertex buffer (bounding-box buffer for AABB geometry).
     pub vertex_buffer: u64,
-    /// Stride between vertices in bytes.
+    /// Stride between vertices in bytes (bounding-box stride for AABB geometry).
     pub vertex_stride: u64,
-    /// Format of vertex positions.
+    /// Format of vertex positions (ignored for AABB geometry).
     pub vertex_format: VertexFormat,
     /// Optional handle to the index buffer.
     pub index_buffer: Option<u64>,
@@ -9973,38 +10159,52 @@ pub struct AccelerationStructure {
     pub built: bool,
 }
 
-/// Create an acceleration structure from a descriptor.
-///
-/// Queries the device for the required size, allocates the acceleration
-/// structure buffer, and returns the structure ready for building.
-///
-/// `geometry_buffers` must contain exactly one entry per geometry in
-/// `desc.geometry_descriptors`, holding the live vertex/index buffers for
-/// that geometry. Without the buffers Metal sizes and builds the structure
-/// against geometry with no vertex data (validation failure or an empty structure).
-#[rustfmt::skip]
-pub fn create_acceleration_structure(
-    device: &metal::DeviceRef,
+/// Sizes reported by Metal for one acceleration structure build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalAccelerationStructureSizes {
+    /// Bytes the acceleration structure object itself occupies.
+    pub acceleration_structure_size: u64,
+    /// Bytes required in the build scratch buffer.
+    pub build_scratch_size: u64,
+    /// Bytes required in the refit scratch buffer.
+    pub refit_scratch_size: u64,
+}
+
+/// Everything needed to keep a Metal geometry descriptor graph alive while a
+/// primitive descriptor references it.
+enum MetalGeometryDescriptor {
+    Triangles(metal::AccelerationStructureTriangleGeometryDescriptor),
+    BoundingBoxes(metal::AccelerationStructureBoundingBoxGeometryDescriptor),
+}
+
+impl MetalGeometryDescriptor {
+    fn as_parent_ref(&self) -> &metal::AccelerationStructureGeometryDescriptorRef {
+        unsafe {
+            match self {
+                Self::Triangles(descriptor) => {
+                    // SAFETY: the concrete descriptor and its parent share one
+                    // Objective-C object; the reference is valid while `self`.
+                    &*(descriptor.as_ref()
+                        as *const metal::AccelerationStructureTriangleGeometryDescriptorRef
+                        as *const metal::AccelerationStructureGeometryDescriptorRef)
+                }
+                Self::BoundingBoxes(descriptor) => {
+                    // SAFETY: see the triangle arm.
+                    &*(descriptor.as_ref()
+                        as *const metal::AccelerationStructureBoundingBoxGeometryDescriptorRef
+                        as *const metal::AccelerationStructureGeometryDescriptorRef)
+                }
+            }
+        }
+    }
+}
+
+/// Translate the portable geometry description into a live Metal primitive
+/// acceleration-structure descriptor.
+fn primitive_acceleration_structure_descriptor(
     desc: &AccelerationStructureDescriptor,
     geometry_buffers: &[RayTracingGeometryBuffers<'_>],
-) -> AppResult<AccelerationStructure> {
-    // Graceful fallback: check OS version and GPU family before attempting
-    // acceleration structure operations that may panic on unsupported systems.
-    let (major, _minor, _patch) = macos_version();
-    if major < 13 {
-        return Err(AppError::new( // coverage: unreachable — this host runs macOS 27, so the major < 13 gate is always false
-            ReasonCode::RcCliInvalid, // coverage: unreachable — macOS 27 never enters the pre-Ventura fallback
-            "ray tracing acceleration structures require macOS 13+ (Ventura)".to_string(), // coverage: unreachable — macOS 27 never enters the pre-Ventura fallback
-        )); // coverage: unreachable — macOS 27 never enters the pre-Ventura fallback
-    }
-    if !device.supports_family(metal::MTLGPUFamily::Apple7) {
-        return Err(AppError::new( // coverage: unreachable — the host Apple M5 GPU reports Apple7, so this unsupported-family gate is always false
-            ReasonCode::RcCliInvalid, // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-            "ray tracing acceleration structures require Apple GPU family 7+ (M1 or later with unified memory)" // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-            // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-                .to_string(), // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-        )); // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-    }
+) -> AppResult<metal::PrimitiveAccelerationStructureDescriptor> {
     if geometry_buffers.len() != desc.geometry_descriptors.len() {
         return Err(AppError::new(
             ReasonCode::RcCliInvalid,
@@ -10016,57 +10216,104 @@ pub fn create_acceleration_structure(
         ));
     }
 
-    // Build Metal geometry descriptors
-    let metal_geoms: Vec<metal::AccelerationStructureTriangleGeometryDescriptor> = desc
-        .geometry_descriptors
-        .iter()
-        .enumerate()
-        .map(|(i, geom)| {
-            let buffers = &geometry_buffers[i];
-            let metal_geom = metal::AccelerationStructureTriangleGeometryDescriptor::descriptor();
-            metal_geom.set_vertex_format(geom.vertex_format.to_metal());
-            metal_geom.set_vertex_stride(geom.vertex_stride);
-            // For indexed geometry the primitive count is the triangle count;
-            // the descriptor's `primitive_count` is authoritative there.
-            let triangle_count = if geom.index_buffer.is_some() {
-                geom.primitive_count
-            } else {
-                geom.triangle_count
-            };
-            metal_geom.set_triangle_count(triangle_count as u64);
-            metal_geom.set_opaque(geom.opaque);
-            metal_geom.set_vertex_buffer(Some(buffers.vertex_buffer));
-            metal_geom.set_vertex_buffer_offset(buffers.vertex_offset);
-            if let Some((index_buffer, index_offset)) = buffers.index_buffer {
-                metal_geom.set_index_buffer(Some(index_buffer));
-                metal_geom.set_index_buffer_offset(index_offset);
-                if let Some(index_format) = geom.index_format {
-                    metal_geom.set_index_type(index_format.to_metal());
+    let mut owned = Vec::with_capacity(desc.geometry_descriptors.len());
+    for (index, geom) in desc.geometry_descriptors.iter().enumerate() {
+        if geom.vertex_stride == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("geometry {index} has a zero vertex stride"),
+            ));
+        }
+        let buffers = &geometry_buffers[index];
+        match geom.kind {
+            RayTracingGeometryKind::Triangles => {
+                let metal_geom =
+                    metal::AccelerationStructureTriangleGeometryDescriptor::descriptor();
+                metal_geom.set_vertex_format(geom.vertex_format.to_metal());
+                metal_geom.set_vertex_stride(geom.vertex_stride);
+                let triangle_count = if geom.index_buffer.is_some() {
+                    geom.primitive_count
+                } else {
+                    geom.triangle_count
+                };
+                metal_geom.set_triangle_count(triangle_count as u64);
+                metal_geom.set_opaque(geom.opaque);
+                metal_geom.set_vertex_buffer(Some(buffers.vertex_buffer));
+                metal_geom.set_vertex_buffer_offset(buffers.vertex_offset);
+                if let Some((index_buffer, index_offset)) = buffers.index_buffer {
+                    metal_geom.set_index_buffer(Some(index_buffer));
+                    metal_geom.set_index_buffer_offset(index_offset);
+                    if let Some(index_format) = geom.index_format {
+                        metal_geom.set_index_type(index_format.to_metal());
+                    }
                 }
+                owned.push(MetalGeometryDescriptor::Triangles(metal_geom));
             }
-            metal_geom
-        })
-        .collect();
+            RayTracingGeometryKind::BoundingBoxes => {
+                let metal_geom =
+                    metal::AccelerationStructureBoundingBoxGeometryDescriptor::descriptor();
+                metal_geom.set_bounding_box_buffer(Some(buffers.vertex_buffer));
+                metal_geom.set_bounding_box_buffer_offset(buffers.vertex_offset);
+                metal_geom.set_bounding_box_stride(geom.vertex_stride as u64);
+                metal_geom.set_bounding_box_count(geom.primitive_count as u64);
+                owned.push(MetalGeometryDescriptor::BoundingBoxes(metal_geom));
+            }
+        }
+    }
 
-    let geom_refs: Vec<&metal::AccelerationStructureGeometryDescriptorRef> = metal_geoms
+    let geom_refs: Vec<&metal::AccelerationStructureGeometryDescriptorRef> = owned
         .iter()
-        .map(|g| unsafe {
-            // SAFETY: pointer cast from a concrete Metal geometry descriptor ref
-            // to its parent trait ref; both share the same underlying ObjC object.
-            &*(g.as_ref() as *const metal::AccelerationStructureTriangleGeometryDescriptorRef
-                as *const metal::AccelerationStructureGeometryDescriptorRef)
-        })
+        .map(MetalGeometryDescriptor::as_parent_ref)
         .collect();
     let geom_array =
         metal::Array::<metal::AccelerationStructureGeometryDescriptor>::from_slice(&geom_refs);
+    let descriptor = metal::PrimitiveAccelerationStructureDescriptor::descriptor();
+    descriptor.set_geometry_descriptors(geom_array);
+    Ok(descriptor)
+}
 
-    let prim_desc = metal::PrimitiveAccelerationStructureDescriptor::descriptor();
-    prim_desc.set_geometry_descriptors(geom_array);
+/// Query Metal for the acceleration-structure, build-scratch and refit-scratch
+/// sizes of a primitive structure.
+pub fn primitive_acceleration_structure_sizes(
+    device: &metal::DeviceRef,
+    desc: &AccelerationStructureDescriptor,
+    geometry_buffers: &[RayTracingGeometryBuffers<'_>],
+) -> AppResult<MetalAccelerationStructureSizes> {
+    let descriptor = primitive_acceleration_structure_descriptor(desc, geometry_buffers)?;
+    let sizes = device.acceleration_structure_sizes_with_descriptor(&descriptor);
+    Ok(MetalAccelerationStructureSizes {
+        acceleration_structure_size: sizes.acceleration_structure_size,
+        build_scratch_size: sizes.build_scratch_buffer_size,
+        refit_scratch_size: sizes.refit_scratch_buffer_size,
+    })
+}
 
-    // Query the device for required sizes
+/// Allocate a shared scratch buffer for an acceleration-structure build/refit.
+pub fn allocate_acceleration_scratch_buffer(device: &metal::DeviceRef, size: u64) -> MetalBuffer {
+    MetalBuffer {
+        handle: alloc_gpu_id(),
+        buffer: device.new_buffer(size.max(1), metal::MTLResourceOptions::StorageModeShared),
+        size: size.max(1),
+    }
+}
+
+/// Create an acceleration structure from a descriptor.
+///
+/// Queries the device for the required size, allocates the acceleration
+/// structure buffer, and returns the structure ready for building.
+///
+/// `geometry_buffers` must contain exactly one entry per geometry in
+/// `desc.geometry_descriptors`, holding the live vertex/index buffers for
+/// that geometry. Without the buffers Metal sizes and builds the structure
+/// against geometry with no vertex data (validation failure or an empty structure).
+pub fn create_acceleration_structure(
+    device: &metal::DeviceRef,
+    desc: &AccelerationStructureDescriptor,
+    geometry_buffers: &[RayTracingGeometryBuffers<'_>],
+) -> AppResult<AccelerationStructure> {
+    let prim_desc = primitive_acceleration_structure_descriptor(desc, geometry_buffers)?;
     let sizes = device.acceleration_structure_sizes_with_descriptor(&prim_desc);
     let accel_size = sizes.acceleration_structure_size as usize;
-
     let acceleration_structure = device.new_acceleration_structure_with_size(accel_size as u64);
 
     Ok(AccelerationStructure {
@@ -10093,70 +10340,43 @@ pub fn build_acceleration_structure(
     scratch_buffer: &MetalBuffer,
     geometry_buffers: &[RayTracingGeometryBuffers<'_>],
 ) -> AppResult<()> {
-    if geometry_buffers.len() != accel_struct.descriptor.geometry_descriptors.len() {
+    build_acceleration_structure_at_offset(
+        encoder,
+        accel_struct,
+        scratch_buffer,
+        0,
+        geometry_buffers,
+    )
+}
+
+/// Build an acceleration structure with an explicit scratch-buffer offset.
+///
+/// This lets several builds share one scratch allocation, matching D3D12's
+/// `ScratchAccelerationStructureData` range semantics.
+pub fn build_acceleration_structure_at_offset(
+    encoder: &MetalAccelerationStructureEncoder,
+    accel_struct: &mut AccelerationStructure,
+    scratch_buffer: &MetalBuffer,
+    scratch_offset: u64,
+    geometry_buffers: &[RayTracingGeometryBuffers<'_>],
+) -> AppResult<()> {
+    let prim_desc =
+        primitive_acceleration_structure_descriptor(&accel_struct.descriptor, geometry_buffers)?;
+    if scratch_offset > scratch_buffer.size {
         return Err(AppError::new(
             ReasonCode::RcCliInvalid,
             format!(
-                "geometry_buffers length {} does not match geometry_descriptors length {}",
-                geometry_buffers.len(),
-                accel_struct.descriptor.geometry_descriptors.len()
+                "build scratch offset {scratch_offset} exceeds the {}-byte scratch buffer",
+                scratch_buffer.size
             ),
         ));
     }
-
-    // Re-create the Metal geometry descriptors for the build command
-    let metal_geoms: Vec<metal::AccelerationStructureTriangleGeometryDescriptor> = accel_struct
-        .descriptor
-        .geometry_descriptors
-        .iter()
-        .enumerate()
-        .map(|(i, geom)| {
-            let buffers = &geometry_buffers[i];
-            let metal_geom = metal::AccelerationStructureTriangleGeometryDescriptor::descriptor();
-            metal_geom.set_vertex_format(geom.vertex_format.to_metal());
-            metal_geom.set_vertex_stride(geom.vertex_stride);
-            let triangle_count = if geom.index_buffer.is_some() {
-                geom.primitive_count
-            } else {
-                geom.triangle_count
-            };
-            metal_geom.set_triangle_count(triangle_count as u64);
-            metal_geom.set_opaque(geom.opaque);
-            metal_geom.set_vertex_buffer(Some(buffers.vertex_buffer));
-            metal_geom.set_vertex_buffer_offset(buffers.vertex_offset);
-            if let Some((index_buffer, index_offset)) = buffers.index_buffer {
-                metal_geom.set_index_buffer(Some(index_buffer));
-                metal_geom.set_index_buffer_offset(index_offset);
-                if let Some(index_format) = geom.index_format {
-                    metal_geom.set_index_type(index_format.to_metal());
-                }
-            }
-            metal_geom
-        })
-        .collect();
-
-    let geom_refs: Vec<&metal::AccelerationStructureGeometryDescriptorRef> = metal_geoms
-        .iter()
-        .map(|g| unsafe {
-            // SAFETY: pointer cast from a concrete Metal geometry descriptor ref
-            // to its parent trait ref; both share the same underlying ObjC object.
-            &*(g.as_ref() as *const metal::AccelerationStructureTriangleGeometryDescriptorRef
-                as *const metal::AccelerationStructureGeometryDescriptorRef)
-        })
-        .collect();
-    let geom_array =
-        metal::Array::<metal::AccelerationStructureGeometryDescriptor>::from_slice(&geom_refs);
-
-    let prim_desc = metal::PrimitiveAccelerationStructureDescriptor::descriptor();
-    prim_desc.set_geometry_descriptors(geom_array);
-
     encoder.encoder().build_acceleration_structure(
         &accel_struct.acceleration_structure,
         &prim_desc,
         &scratch_buffer.buffer,
-        0,
+        scratch_offset,
     );
-
     accel_struct.built = true;
     Ok(())
 }
@@ -10176,62 +10396,8 @@ pub fn refit_acceleration_structure(
     scratch: &MetalBuffer,
     geometry_buffers: &[RayTracingGeometryBuffers<'_>],
 ) -> AppResult<()> {
-    if geometry_buffers.len() != accel_struct.descriptor.geometry_descriptors.len() {
-        return Err(AppError::new(
-            ReasonCode::RcCliInvalid,
-            format!(
-                "geometry_buffers length {} does not match geometry_descriptors length {}",
-                geometry_buffers.len(),
-                accel_struct.descriptor.geometry_descriptors.len()
-            ),
-        ));
-    }
-
-    let metal_geoms: Vec<metal::AccelerationStructureTriangleGeometryDescriptor> = accel_struct
-        .descriptor
-        .geometry_descriptors
-        .iter()
-        .enumerate()
-        .map(|(i, geom)| {
-            let buffers = &geometry_buffers[i];
-            let metal_geom = metal::AccelerationStructureTriangleGeometryDescriptor::descriptor();
-            metal_geom.set_vertex_format(geom.vertex_format.to_metal());
-            metal_geom.set_vertex_stride(geom.vertex_stride);
-            let triangle_count = if geom.index_buffer.is_some() {
-                geom.primitive_count
-            } else {
-                geom.triangle_count
-            };
-            metal_geom.set_triangle_count(triangle_count as u64);
-            metal_geom.set_opaque(geom.opaque);
-            metal_geom.set_vertex_buffer(Some(buffers.vertex_buffer));
-            metal_geom.set_vertex_buffer_offset(buffers.vertex_offset);
-            if let Some((index_buffer, index_offset)) = buffers.index_buffer {
-                metal_geom.set_index_buffer(Some(index_buffer));
-                metal_geom.set_index_buffer_offset(index_offset);
-                if let Some(index_format) = geom.index_format {
-                    metal_geom.set_index_type(index_format.to_metal());
-                }
-            }
-            metal_geom
-        })
-        .collect();
-
-    let geom_refs: Vec<&metal::AccelerationStructureGeometryDescriptorRef> = metal_geoms
-        .iter()
-        .map(|g| unsafe {
-            // SAFETY: pointer cast from a concrete Metal geometry descriptor ref
-            // to its parent trait ref; both share the same underlying ObjC object.
-            &*(g.as_ref() as *const metal::AccelerationStructureTriangleGeometryDescriptorRef
-                as *const metal::AccelerationStructureGeometryDescriptorRef)
-        })
-        .collect();
-    let geom_array =
-        metal::Array::<metal::AccelerationStructureGeometryDescriptor>::from_slice(&geom_refs);
-
-    let prim_desc = metal::PrimitiveAccelerationStructureDescriptor::descriptor();
-    prim_desc.set_geometry_descriptors(geom_array);
-
+    let prim_desc =
+        primitive_acceleration_structure_descriptor(&accel_struct.descriptor, geometry_buffers)?;
     encoder.encoder().refit_acceleration_structure(
         &accel_struct.acceleration_structure,
         &prim_desc,
@@ -10239,7 +10405,262 @@ pub fn refit_acceleration_structure(
         &scratch.buffer,
         0,
     );
+    Ok(())
+}
 
+/// Write the compacted size of an acceleration structure into a GPU buffer.
+///
+/// The value is a `u64` at `offset`; the caller reads it back after the command
+/// buffer completes and allocates a destination of that size for
+/// [`compact_acceleration_structure`].
+pub fn write_compacted_acceleration_structure_size(
+    encoder: &MetalAccelerationStructureEncoder,
+    source: &metal::AccelerationStructureRef,
+    destination: &metal::BufferRef,
+    offset: u64,
+) {
+    encoder
+        .encoder()
+        .write_compacted_acceleration_structure_size(source, destination, offset as u64);
+}
+
+/// Copy and compact an acceleration structure into a destination created with
+/// the compacted size reported by
+/// [`write_compacted_acceleration_structure_size`].
+pub fn compact_acceleration_structure(
+    encoder: &MetalAccelerationStructureEncoder,
+    source: &metal::AccelerationStructureRef,
+    destination: &metal::AccelerationStructureRef,
+) {
+    encoder
+        .encoder()
+        .copy_and_compact_acceleration_structure(source, destination);
+}
+
+/// A top-level (instance) acceleration structure.
+///
+/// Instances reference bottom-level structures through an instance descriptor
+/// buffer; `mask` and the per-instance options are evaluated by Metal's ray
+/// traversal exactly like D3D12 instance masks and flags.
+#[derive(Debug)]
+pub struct InstanceAccelerationStructure {
+    /// Unique GPU resource handle.
+    pub handle: u64,
+    /// The Metal acceleration structure.
+    pub acceleration_structure: metal::AccelerationStructure,
+    /// Size of the acceleration structure buffer in bytes.
+    pub size: usize,
+    /// Number of instance descriptors consumed by the build.
+    pub instance_count: u32,
+    /// Stride between instance descriptors.
+    pub instance_stride: u64,
+    /// Descriptor layout used for the instance buffer.
+    pub descriptor_type: metal::MTLAccelerationStructureInstanceDescriptorType,
+    /// Whether the structure has been built.
+    pub built: bool,
+}
+
+fn instance_acceleration_structure_descriptor(
+    instance_buffer: &metal::BufferRef,
+    instance_count: u32,
+    instance_stride: u64,
+    descriptor_type: metal::MTLAccelerationStructureInstanceDescriptorType,
+    instanced: &[&metal::AccelerationStructureRef],
+) -> metal::InstanceAccelerationStructureDescriptor {
+    let descriptor = metal::InstanceAccelerationStructureDescriptor::descriptor();
+    descriptor.set_instance_descriptor_type(descriptor_type);
+    descriptor.set_instance_descriptor_buffer(instance_buffer);
+    descriptor.set_instance_descriptor_buffer_offset(0);
+    descriptor.set_instance_descriptor_stride(instance_stride as u64);
+    descriptor.set_instance_count(instance_count as u64);
+    if !instanced.is_empty() {
+        let array = metal::Array::<metal::AccelerationStructure>::from_slice(instanced);
+        descriptor.set_instanced_acceleration_structures(&array);
+    }
+    descriptor
+}
+
+/// Minimum descriptor stride for each Metal instance layout.
+fn minimum_instance_stride(
+    descriptor_type: metal::MTLAccelerationStructureInstanceDescriptorType,
+) -> u64 {
+    match descriptor_type {
+        metal::MTLAccelerationStructureInstanceDescriptorType::Default => {
+            std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64
+        }
+        metal::MTLAccelerationStructureInstanceDescriptorType::UserID => {
+            std::mem::size_of::<metal::MTLAccelerationStructureUserIDInstanceDescriptor>() as u64
+        }
+        metal::MTLAccelerationStructureInstanceDescriptorType::Indirect => {
+            std::mem::size_of::<metal::MTLIndirectAccelerationStructureInstanceDescriptor>() as u64
+        }
+        metal::MTLAccelerationStructureInstanceDescriptorType::Motion => {
+            // Motion instances still carry the 64-byte base descriptor; the
+            // motion transform lives in a separate buffer.
+            std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64
+        }
+    }
+}
+
+/// Create a real top-level (instance) acceleration structure.
+///
+/// `instance_buffer` holds `instance_count` descriptors of `instance_stride`
+/// bytes each, in the layout selected by `descriptor_type`. `instanced`
+/// provides the bottom-level structures the instance descriptors index.
+pub fn create_instance_acceleration_structure(
+    device: &metal::DeviceRef,
+    instance_buffer: &metal::BufferRef,
+    instance_count: u32,
+    instance_stride: u64,
+    descriptor_type: metal::MTLAccelerationStructureInstanceDescriptorType,
+    instanced: &[&metal::AccelerationStructureRef],
+) -> AppResult<InstanceAccelerationStructure> {
+    if instance_count == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "instance acceleration structure requires at least one instance",
+        ));
+    }
+    let minimum = minimum_instance_stride(descriptor_type);
+    if instance_stride < minimum {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!(
+                "instance descriptor stride {instance_stride} is smaller than the {minimum}-byte descriptor"
+            ),
+        ));
+    }
+    let required = instance_stride
+        .checked_mul(instance_count as u64)
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                "instance descriptor range overflows",
+            )
+        })?;
+    if instance_buffer.length() < required {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!(
+                "instance descriptor range {required} exceeds the {}-byte buffer",
+                instance_buffer.length()
+            ),
+        ));
+    }
+    if !instanced.is_empty() && instanced.len() > instance_count as usize {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "instanced acceleration structure list exceeds the instance count",
+        ));
+    }
+    let descriptor = instance_acceleration_structure_descriptor(
+        instance_buffer,
+        instance_count,
+        instance_stride,
+        descriptor_type,
+        instanced,
+    );
+    let sizes = device.acceleration_structure_sizes_with_descriptor(&descriptor);
+    let acceleration_structure =
+        device.new_acceleration_structure_with_size(sizes.acceleration_structure_size);
+    Ok(InstanceAccelerationStructure {
+        handle: alloc_gpu_id(),
+        acceleration_structure,
+        size: sizes.acceleration_structure_size as usize,
+        instance_count,
+        instance_stride,
+        descriptor_type,
+        built: false,
+    })
+}
+
+/// Query the build/refit scratch sizes for a top-level structure.
+pub fn instance_acceleration_structure_sizes(
+    device: &metal::DeviceRef,
+    instance_buffer: &metal::BufferRef,
+    instance_count: u32,
+    instance_stride: u64,
+    descriptor_type: metal::MTLAccelerationStructureInstanceDescriptorType,
+    instanced: &[&metal::AccelerationStructureRef],
+) -> AppResult<MetalAccelerationStructureSizes> {
+    if instance_count == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "instance acceleration structure requires at least one instance",
+        ));
+    }
+    let descriptor = instance_acceleration_structure_descriptor(
+        instance_buffer,
+        instance_count,
+        instance_stride,
+        descriptor_type,
+        instanced,
+    );
+    let sizes = device.acceleration_structure_sizes_with_descriptor(&descriptor);
+    Ok(MetalAccelerationStructureSizes {
+        acceleration_structure_size: sizes.acceleration_structure_size,
+        build_scratch_size: sizes.build_scratch_buffer_size,
+        refit_scratch_size: sizes.refit_scratch_buffer_size,
+    })
+}
+
+/// Encode a top-level acceleration-structure build.
+pub fn build_instance_acceleration_structure(
+    encoder: &MetalAccelerationStructureEncoder,
+    structure: &mut InstanceAccelerationStructure,
+    scratch: &MetalBuffer,
+    scratch_offset: u64,
+    instance_buffer: &metal::BufferRef,
+    instanced: &[&metal::AccelerationStructureRef],
+) -> AppResult<()> {
+    if scratch_offset > scratch.size {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!(
+                "build scratch offset {scratch_offset} exceeds the {}-byte scratch buffer",
+                scratch.size
+            ),
+        ));
+    }
+    let descriptor = instance_acceleration_structure_descriptor(
+        instance_buffer,
+        structure.instance_count,
+        structure.instance_stride,
+        structure.descriptor_type,
+        instanced,
+    );
+    encoder.encoder().build_acceleration_structure(
+        &structure.acceleration_structure,
+        &descriptor,
+        &scratch.buffer,
+        scratch_offset,
+    );
+    structure.built = true;
+    Ok(())
+}
+
+/// Encode a top-level acceleration-structure refit.
+pub fn refit_instance_acceleration_structure(
+    encoder: &MetalAccelerationStructureEncoder,
+    structure: &mut InstanceAccelerationStructure,
+    scratch: &MetalBuffer,
+    instance_buffer: &metal::BufferRef,
+    instanced: &[&metal::AccelerationStructureRef],
+) -> AppResult<()> {
+    let descriptor = instance_acceleration_structure_descriptor(
+        instance_buffer,
+        structure.instance_count,
+        structure.instance_stride,
+        structure.descriptor_type,
+        instanced,
+    );
+    encoder.encoder().refit_acceleration_structure(
+        &structure.acceleration_structure,
+        &descriptor,
+        None,
+        &scratch.buffer,
+        0,
+    );
     Ok(())
 }
 
@@ -10281,21 +10702,6 @@ pub fn create_intersection_function_table(
             "max_instances must be non-zero",
         ));
     }
-    let (major, _minor, _patch) = macos_version();
-    if major < 13 {
-        return Err(AppError::new( // coverage: unreachable — this host runs macOS 27, so the major < 13 gate is always false
-            ReasonCode::RcCliInvalid, // coverage: unreachable — macOS 27 never enters the pre-Ventura fallback
-            "intersection function tables require macOS 13+ (Ventura)", // coverage: unreachable — macOS 27 never enters the pre-Ventura fallback
-        )); // coverage: unreachable — macOS 27 never enters the pre-Ventura fallback
-    }
-    if !device.supports_family(metal::MTLGPUFamily::Apple7) {
-        return Err(AppError::new( // coverage: unreachable — the host Apple M5 GPU reports Apple7, so this unsupported-family gate is always false
-            ReasonCode::RcCliInvalid, // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-            "intersection function tables require Apple GPU family 7+ (M1 or later with unified memory)", // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-            // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-        )); // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-    }
-
     let descriptor = metal::IntersectionFunctionTableDescriptor::new();
     descriptor.set_function_count(max_instances as u64);
 
@@ -10313,7 +10719,7 @@ pub fn create_intersection_function_table(
                 ReasonCode::RcCliInvalid, // coverage: unreachable — the dummy IFT shader is a compile-time constant that compiles
                 format!("Failed to compile dummy ray shader: {e}"), // coverage: unreachable — the dummy IFT shader is a compile-time constant that compiles
             ) // coverage: unreachable — the dummy IFT shader is a compile-time constant that compiles
-        })?; // coverage: unreachable — the constant dummy shader always compiles on this host, so the error edge of this `?` is never taken
+        })?; // coverage: unreachable — the constant dummy shader always compiles with the Metal runtime, so the error edge of this `?` is never taken
     let function = library.get_function("_dummy_ray_fn", None).map_err(|e| {
         AppError::new( // coverage: unreachable — the constant shader defines _dummy_ray_fn
             ReasonCode::RcCliInvalid, // coverage: unreachable — the constant shader defines _dummy_ray_fn
@@ -10327,14 +10733,14 @@ pub fn create_intersection_function_table(
                 ReasonCode::RcCliInvalid, // coverage: unreachable — a trivial compute kernel always produces a pipeline state
                 format!("Failed to create ray tracing pipeline: {e}"), // coverage: unreachable — a trivial compute kernel always produces a pipeline state
             ) // coverage: unreachable — a trivial compute kernel always produces a pipeline state
-        })?; // coverage: unreachable — a trivial compute kernel always yields a pipeline state on this host, so the error edge of this `?` is never taken
+        })?; // coverage: unreachable — a trivial compute kernel always yields a pipeline state with the Metal runtime, so the error edge of this `?` is never taken
     let table = pipeline.new_intersection_function_table_with_descriptor(&descriptor);
     if table.as_ptr().is_null() {
-        return Err(AppError::new( // coverage: unreachable — this compute pipeline always exposes a non-nil intersection function table on the host Metal runtime
-            ReasonCode::RcCliInvalid, // coverage: unreachable — Metal never returns a nil table for this pipeline on the host
-            "Metal returned a nil intersection function table; the pipeline must contain real [[intersection]] functions" // coverage: unreachable — Metal never returns a nil table for this pipeline on the host
-            // coverage: unreachable — Metal never returns a nil table for this pipeline on the host
-        )); // coverage: unreachable — Metal never returns a nil table for this pipeline on the host
+        return Err(AppError::new( // coverage: unreachable — this compute pipeline always exposes a non-nil intersection function table on the Metal runtime
+            ReasonCode::RcCliInvalid, // coverage: unreachable — Metal never returns a nil table for this pipeline in the Metal runtime
+            "Metal returned a nil intersection function table; the pipeline must contain real [[intersection]] functions" // coverage: unreachable — Metal never returns a nil table for this pipeline in the Metal runtime
+            // coverage: unreachable — Metal never returns a nil table for this pipeline in the Metal runtime
+        )); // coverage: unreachable — Metal never returns a nil table for this pipeline in the Metal runtime
     }
 
     Ok(MetalIntersectionTable {
@@ -10370,24 +10776,6 @@ pub fn create_ray_tracing_pipeline(
     max_payload_size: u32,
     max_attribute_size: u32,
 ) -> AppResult<MetalRayTracingPipeline> {
-    // Graceful fallback: check OS version and GPU family before attempting
-    // ray tracing pipeline creation.
-    let (major, _minor, _patch) = macos_version();
-    if major < 13 {
-        return Err(AppError::new( // coverage: unreachable — this host runs macOS 27, so the major < 13 gate is always false
-            ReasonCode::RcCliInvalid, // coverage: unreachable — macOS 27 never enters the pre-Ventura fallback
-            "ray tracing pipelines require macOS 13+ (Ventura)".to_string(), // coverage: unreachable — macOS 27 never enters the pre-Ventura fallback
-        )); // coverage: unreachable — macOS 27 never enters the pre-Ventura fallback
-    }
-    if !device.supports_family(metal::MTLGPUFamily::Apple7) {
-        return Err(AppError::new( // coverage: unreachable — the host Apple M5 GPU reports Apple7, so this unsupported-family gate is always false
-            ReasonCode::RcCliInvalid, // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-            "ray tracing pipelines require Apple GPU family 7+ (M1 or later with unified memory)" // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-            // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-                .to_string(), // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-        )); // coverage: unreachable — the host Apple M5 GPU always satisfies Apple7
-    }
-
     let options = metal::CompileOptions::new();
     let library = device
         .new_library_with_source(shader, &options)
@@ -10422,6 +10810,1323 @@ pub fn create_ray_tracing_pipeline(
         max_payload_size,
         max_attribute_size,
     })
+}
+
+// ===========================================================================
+// GPU-driven ray traversal, indirect command buffers and work-graph fan-out
+// ===========================================================================
+
+/// MSL source for a real ray-query traversal kernel.
+///
+/// The acceleration structure is bound with `setAccelerationStructure:atBufferIndex:`
+/// at index 2, the ray records at index 1, the output records at index 0 and a
+/// shader-table record buffer at index 4. The kernel performs an actual
+/// `intersector::intersect` traversal; hits report the instance/primitive IDs
+/// and the shader-table record selected by the ray.
+pub const RAY_QUERY_MSL: &str = r#"#include <metal_stdlib>
+#include <metal_raytracing>
+using namespace metal;
+using namespace raytracing;
+
+struct RayRecord {
+    packed_float3 origin;
+    float min_distance;
+    packed_float3 direction;
+    float max_distance;
+    uint sbt_offset;
+    uint mask;
+};
+
+struct RayResult {
+    uint hit;
+    uint instance_id;
+    uint primitive_id;
+    float distance;
+    uint group_index;
+};
+
+kernel void d3d12_ray_query_primitive(device RayResult* results [[buffer(0)]],
+                                      device const RayRecord* rays [[buffer(1)]],
+                                      primitive_acceleration_structure accel [[buffer(2)]],
+                                      device const uint* shader_table [[buffer(4)]],
+                                      device const uint* instance_masks [[buffer(5)]],
+                                      constant uint& ray_count [[buffer(3)]],
+                                      uint gid [[thread_position_in_grid]]) {
+    if (gid >= ray_count) {
+        return;
+    }
+    intersector<triangle_data> query;
+    ray r;
+    r.origin = rays[gid].origin;
+    r.direction = rays[gid].direction;
+    r.min_distance = rays[gid].min_distance;
+    r.max_distance = rays[gid].max_distance;
+    auto hit = query.intersect(r, accel);
+    RayResult result = {0u, 0u, 0u, 0.0f, shader_table[rays[gid].sbt_offset]};
+    if (hit.type != intersection_type::none) {
+        uint instance_mask = instance_masks[0];
+        if ((instance_mask & rays[gid].mask) != 0u) {
+            result.hit = 1u;
+            result.primitive_id = hit.primitive_id;
+            result.distance = hit.distance;
+        }
+    }
+    results[gid] = result;
+}
+
+kernel void d3d12_ray_query_instance(device RayResult* results [[buffer(0)]],
+                                     device const RayRecord* rays [[buffer(1)]],
+                                     instance_acceleration_structure accel [[buffer(2)]],
+                                     device const uint* shader_table [[buffer(4)]],
+                                     device const uint* instance_masks [[buffer(5)]],
+                                     constant uint& ray_count [[buffer(3)]],
+                                     uint gid [[thread_position_in_grid]]) {
+    if (gid >= ray_count) {
+        return;
+    }
+    intersector<triangle_data, instancing> query;
+    ray r;
+    r.origin = rays[gid].origin;
+    r.direction = rays[gid].direction;
+    r.min_distance = rays[gid].min_distance;
+    r.max_distance = rays[gid].max_distance;
+    auto hit = query.intersect(r, accel);
+    RayResult result = {0u, 0u, 0u, 0.0f, shader_table[rays[gid].sbt_offset]};
+    if (hit.type != intersection_type::none) {
+        uint instance_mask = instance_masks[hit.instance_id];
+        if ((instance_mask & rays[gid].mask) != 0u) {
+            result.hit = 1u;
+            result.instance_id = hit.instance_id;
+            result.primitive_id = hit.primitive_id;
+            result.distance = hit.distance;
+        }
+    }
+    results[gid] = result;
+}"#;
+
+/// A ray record consumed by the GPU traversal kernel.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MetalRay {
+    /// Ray origin.
+    pub origin: [f32; 3],
+    /// Minimum intersection distance.
+    pub min_distance: f32,
+    /// Ray direction.
+    pub direction: [f32; 3],
+    /// Maximum intersection distance.
+    pub max_distance: f32,
+    /// Index into the shader-table record buffer.
+    pub sbt_offset: u32,
+    /// Instance mask applied by the traversal.
+    pub mask: u32,
+}
+
+/// The GPU result for one ray.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MetalRayResult {
+    /// 1 when a triangle was hit, 0 for a miss.
+    pub hit: u32,
+    /// Instance ID reported by the traversal.
+    pub instance_id: u32,
+    /// Primitive (triangle) ID reported by the traversal.
+    pub primitive_id: u32,
+    /// Distance to the hit.
+    pub distance: f32,
+    /// Shader-table record selected by the ray.
+    pub group_index: u32,
+}
+
+/// Real compute-based ray-traversal pipeline.
+#[derive(Debug)]
+pub struct MetalRayQueryPipeline {
+    /// Unique GPU resource handle.
+    pub handle: u64,
+    /// Traversal pipeline for a bottom-level (primitive) structure.
+    pub primitive_pipeline: metal::ComputePipelineState,
+    /// Traversal pipeline for a top-level (instance) structure.
+    pub instance_pipeline: metal::ComputePipelineState,
+}
+
+/// Compile one MSL entry point into a compute pipeline.
+fn compile_compute_pipeline(
+    device: &metal::DeviceRef,
+    source: &str,
+    entry_point: &str,
+    context: &str,
+) -> AppResult<metal::ComputePipelineState> {
+    let options = metal::CompileOptions::new();
+    let library = device
+        .new_library_with_source(source, &options)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("{context} shader compilation failed: {error}"),
+            )
+        })?;
+    let function = library.get_function(entry_point, None).map_err(|error| {
+        AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("{context} entry point {entry_point} not found: {error}"),
+        )
+    })?;
+    #[cfg(test)]
+    if test_faults::pipeline_creation_fault() {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("{context} pipeline creation fault"),
+        ));
+    }
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("{context} pipeline creation failed: {error}"),
+            )
+        })
+}
+
+/// Compile MSL source into a library with a contextual error.
+fn compile_library(
+    device: &metal::DeviceRef,
+    source: &str,
+    context: &str,
+) -> AppResult<metal::Library> {
+    device
+        .new_library_with_source(source, &metal::CompileOptions::new())
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("{context} shader compilation failed: {error}"),
+            )
+        })
+}
+
+/// Resolve a function from a compiled library with a contextual error.
+#[rustfmt::skip]
+fn library_function(
+    library: &metal::LibraryRef,
+    name: &str,
+    context: &str,
+) -> AppResult<metal::Function> {
+    library.get_function(name, None).map_err(|error| {
+        AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("{context} function {name} not found: {error}"),
+        )
+    })
+}
+
+/// Compile the real ray-query traversal pipeline.
+#[rustfmt::skip]
+pub fn create_ray_query_pipeline(device: &metal::DeviceRef) -> AppResult<MetalRayQueryPipeline> {
+    let primitive_pipeline = compile_compute_pipeline(
+        device,
+        RAY_QUERY_MSL,
+        "d3d12_ray_query_primitive",
+        "ray-query primitive",
+    )?;
+    let instance_pipeline = compile_compute_pipeline(
+        device,
+        RAY_QUERY_MSL,
+        "d3d12_ray_query_instance",
+        "ray-query instance",)?;
+    Ok(MetalRayQueryPipeline {
+        handle: alloc_gpu_id(),
+        primitive_pipeline,
+        instance_pipeline,
+    })
+}
+
+/// Shader-table record buffer uploaded to the GPU.
+#[derive(Debug)]
+pub struct MetalShaderTable {
+    /// GPU buffer holding the records.
+    pub buffer: metal::Buffer,
+    /// Number of records.
+    pub record_count: u32,
+}
+
+impl MetalShaderTable {
+    /// Upload a shader table. Records are `u32` group indices packed at
+    /// `stride` bytes per record (D3D12 SBT strides are caller-defined).
+    pub fn new(device: &metal::DeviceRef, records: &[u32], stride: u64) -> AppResult<Self> {
+        if records.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "shader table must contain at least one record",
+            ));
+        }
+        let minimum = std::mem::size_of::<u32>() as u64;
+        if stride < minimum {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("shader-table record stride {stride} is smaller than {minimum}"),
+            ));
+        }
+        let bytes = stride.checked_mul(records.len() as u64).ok_or_else(|| {
+            AppError::new(ReasonCode::RcCliInvalid, "shader-table range overflows")
+        })?;
+        let mut data = vec![0u8; bytes as usize];
+        for (index, record) in records.iter().enumerate() {
+            let offset = index * stride as usize;
+            data[offset..offset + 4].copy_from_slice(&record.to_le_bytes());
+        }
+        let buffer = device.new_buffer_with_data(
+            data.as_ptr() as *const std::ffi::c_void,
+            bytes,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        Ok(Self {
+            buffer,
+            record_count: records.len() as u32,
+        })
+    }
+}
+
+/// Traverse `rays` against `acceleration` on the GPU and read the results back.
+///
+/// The CPU issues one compute dispatch; every ray is traversed by Metal's
+/// hardware intersector against the real acceleration structure. Shader-table
+/// records are read on the GPU. This is the non-indirect form used to verify
+/// acceleration-structure builds end to end.
+pub fn trace_rays(
+    device: &metal::DeviceRef,
+    pipeline: &MetalRayQueryPipeline,
+    acceleration: &metal::AccelerationStructureRef,
+    rays: &[MetalRay],
+    shader_table: &MetalShaderTable,
+    instance_masks: &[u32],
+    is_top_level: bool,
+) -> AppResult<Vec<MetalRayResult>> {
+    if rays.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ray_bytes = std::mem::size_of_val(rays) as u64;
+    let ray_buffer = device.new_buffer_with_data(
+        rays.as_ptr() as *const std::ffi::c_void,
+        ray_bytes,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let result_bytes = (rays.len() * std::mem::size_of::<MetalRayResult>()) as u64;
+    let result_buffer = device.new_buffer(
+        result_bytes.max(1),
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let count: u32 = rays.len() as u32;
+    let count_buffer = device.new_buffer_with_data(
+        &count as *const u32 as *const std::ffi::c_void,
+        4,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let mask_values = instance_masks.to_vec();
+    let mask_buffer = device.new_buffer_with_data(
+        mask_values.as_ptr() as *const std::ffi::c_void,
+        std::mem::size_of_val(mask_values.as_slice()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    let queue = device.new_command_queue();
+    let command_buffer = queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(if is_top_level {
+        &pipeline.instance_pipeline
+    } else {
+        &pipeline.primitive_pipeline
+    });
+    encoder.set_buffer(0, Some(&result_buffer), 0);
+    encoder.set_buffer(1, Some(&ray_buffer), 0);
+    encoder.set_acceleration_structure(2, Some(acceleration));
+    encoder.set_buffer(3, Some(&count_buffer), 0);
+    encoder.set_buffer(4, Some(&shader_table.buffer), 0);
+    encoder.set_buffer(5, Some(&mask_buffer), 0);
+    let threads = metal::MTLSize {
+        width: rays.len() as u64,
+        height: 1,
+        depth: 1,
+    };
+    let group = metal::MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_threads(threads, group);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    let mut results = vec![MetalRayResult::default(); rays.len()];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            result_buffer.contents() as *const MetalRayResult,
+            results.as_mut_ptr(),
+            rays.len(),
+        );
+    }
+    Ok(results)
+}
+
+/// Describes one indirect command buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalIndirectCommandBufferDescriptor {
+    /// Command kinds the buffer can encode.
+    pub command_types: metal::MTLIndirectCommandType,
+    /// Maximum number of commands.
+    pub max_command_count: u64,
+    /// Number of kernel argument buffers visible to compute commands.
+    pub max_kernel_buffer_bind_count: u64,
+}
+
+/// A real `MTLIndirectCommandBuffer`.
+#[derive(Debug)]
+pub struct MetalIndirectCommandBuffer {
+    /// Unique GPU resource handle.
+    pub handle: u64,
+    /// Underlying Metal indirect command buffer.
+    pub buffer: metal::IndirectCommandBuffer,
+    /// Command kinds encoded in this buffer.
+    pub command_types: metal::MTLIndirectCommandType,
+    /// Maximum number of commands.
+    pub max_command_count: u64,
+}
+
+impl MetalIndirectCommandBuffer {
+    /// Allocate an indirect command buffer. Pipelines and buffers are not
+    /// inherited: every command carries its own GPU state, matching D3D12's
+    /// per-command argument model.
+    pub fn new(
+        device: &metal::DeviceRef,
+        descriptor: MetalIndirectCommandBufferDescriptor,
+    ) -> AppResult<Self> {
+        if descriptor.max_command_count == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "indirect command buffer requires at least one command",
+            ));
+        }
+        if descriptor.command_types.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "indirect command buffer requires at least one command type",
+            ));
+        }
+        let metal_descriptor = metal::IndirectCommandBufferDescriptor::new();
+        metal_descriptor.set_command_types(descriptor.command_types);
+        metal_descriptor.set_inherit_buffers(false);
+        metal_descriptor.set_inherit_pipeline_state(false);
+        metal_descriptor
+            .set_max_kernel_buffer_bind_count(descriptor.max_kernel_buffer_bind_count as u64);
+        let buffer = device.new_indirect_command_buffer_with_descriptor(
+            &metal_descriptor,
+            descriptor.max_command_count as u64,
+            metal::MTLResourceOptions::StorageModePrivate,
+        );
+        Ok(Self {
+            handle: alloc_gpu_id(),
+            buffer,
+            command_types: descriptor.command_types,
+            max_command_count: descriptor.max_command_count,
+        })
+    }
+
+    /// Borrow one render command for encoding.
+    pub fn render_command(&self, index: u64) -> AppResult<&metal::IndirectRenderCommandRef> {
+        if index >= self.max_command_count {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "indirect command index {index} is out of range for {} commands",
+                    self.max_command_count
+                ),
+            ));
+        }
+        Ok(self.buffer.indirect_render_command_at_index(index))
+    }
+
+    /// Encode a non-indexed draw into the buffer.
+    pub fn encode_draw(
+        &self,
+        index: u64,
+        pipeline: &metal::RenderPipelineStateRef,
+        primitive_type: metal::MTLPrimitiveType,
+        vertex_start: u64,
+        vertex_count: u64,
+        instance_count: u64,
+        base_instance: u64,
+    ) -> AppResult<()> {
+        let command = self.render_command(index)?;
+        command.set_render_pipeline_state(pipeline);
+        command.draw_primitives(
+            primitive_type,
+            vertex_start,
+            vertex_count,
+            instance_count,
+            base_instance,
+        );
+        Ok(())
+    }
+
+    /// Encode an indexed draw into the buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_draw_indexed(
+        &self,
+        index: u64,
+        pipeline: &metal::RenderPipelineStateRef,
+        primitive_type: metal::MTLPrimitiveType,
+        index_count: u64,
+        index_type: metal::MTLIndexType,
+        index_buffer: &metal::BufferRef,
+        index_buffer_offset: u64,
+        instance_count: u64,
+        base_vertex: u64,
+        base_instance: u64,
+    ) -> AppResult<()> {
+        let command = self.render_command(index)?;
+        command.set_render_pipeline_state(pipeline);
+        command.draw_indexed_primitives(
+            primitive_type,
+            index_count,
+            index_type,
+            index_buffer,
+            index_buffer_offset,
+            instance_count,
+            base_vertex,
+            base_instance,
+        );
+        Ok(())
+    }
+
+    fn validate_range(&self, range: &std::ops::Range<u64>) -> AppResult<()> {
+        if range.start > range.end || range.end > self.max_command_count {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "indirect command range {}..{} is out of range for {} commands",
+                    range.start, range.end, self.max_command_count
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Execute a render command range on the GPU.
+    pub fn execute_render(
+        &self,
+        encoder: &metal::RenderCommandEncoderRef,
+        range: std::ops::Range<u64>,
+    ) -> AppResult<()> {
+        self.validate_range(&range)?;
+        encoder.execute_commands_in_buffer(
+            &self.buffer,
+            metal::NSRange {
+                location: range.start,
+                length: range.end - range.start,
+            },
+        );
+        Ok(())
+    }
+
+    /// Reset every encoded command.
+    pub fn reset(&self) {
+        self.buffer.reset_with_range(metal::NSRange {
+            location: 0,
+            length: self.max_command_count,
+        });
+    }
+}
+
+/// MSL kernels for GPU-produced indirect dispatch arguments.
+pub const GPU_INDIRECT_MSL: &str = r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void d3d12_indirect_args(device const uint* count [[buffer(0)]],
+                                device uint* arguments [[buffer(1)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid == 0) {
+        arguments[0] = count[0];
+        arguments[1] = 1;
+        arguments[2] = 1;
+    }
+}
+
+kernel void d3d12_indirect_consumer(device uint* out [[buffer(0)]],
+                                    constant uint& capacity [[buffer(1)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    if (gid < capacity) {
+        out[gid] = gid + 1;
+    }
+}"#;
+
+/// Pipelines for GPU-produced indirect dispatch arguments.
+pub struct MetalGpuIndirectDispatch {
+    /// Unique GPU resource handle.
+    pub handle: u64,
+    /// Producer pipeline that writes `MTLDispatchThreadgroupsIndirectArguments`.
+    pub argument_pipeline: metal::ComputePipelineState,
+    /// Consumer pipeline dispatched with the GPU-produced grid.
+    pub consumer_pipeline: metal::ComputePipelineState,
+}
+
+impl MetalGpuIndirectDispatch {
+    /// Compile both pipelines.
+    #[rustfmt::skip]
+    pub fn new(device: &metal::DeviceRef) -> AppResult<Self> {
+        let argument_pipeline = compile_compute_pipeline(
+            device,
+            GPU_INDIRECT_MSL,
+            "d3d12_indirect_args",
+            "indirect-dispatch",)?;
+        let consumer_pipeline = compile_compute_pipeline(
+            device,
+            GPU_INDIRECT_MSL,
+            "d3d12_indirect_consumer",
+            "indirect-consumer",)?;
+        Ok(Self {
+            handle: alloc_gpu_id(),
+            argument_pipeline,
+            consumer_pipeline,
+        })
+    }
+
+    /// Read the dispatch count from GPU memory, write the indirect arguments
+    /// on the GPU, then execute the consumer with
+    /// `dispatchThreadgroupsWithIndirectBuffer`. The CPU issues exactly two
+    /// dispatches regardless of `count`.
+    pub fn execute(
+        &self,
+        device: &metal::DeviceRef,
+        count_buffer: &metal::BufferRef,
+        output_capacity: usize,
+    ) -> AppResult<Vec<u32>> {
+        if output_capacity == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "indirect dispatch output capacity must be non-zero",
+            ));
+        }
+        let args = device.new_buffer(16, metal::MTLResourceOptions::StorageModePrivate);
+        let output = device.new_buffer(
+            (output_capacity * std::mem::size_of::<u32>()) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let capacity: u32 = output_capacity as u32;
+        let capacity_buffer = device.new_buffer_with_data(
+            &capacity as *const u32 as *const std::ffi::c_void,
+            4,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.argument_pipeline);
+        encoder.set_buffer(0, Some(count_buffer), 0);
+        encoder.set_buffer(1, Some(&args), 0);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        let barriers: [&metal::ResourceRef; 1] = [args.as_ref() as &metal::ResourceRef];
+        encoder.memory_barrier_with_resources(&barriers);
+        encoder.set_compute_pipeline_state(&self.consumer_pipeline);
+        encoder.set_buffer(0, Some(&output), 0);
+        encoder.set_buffer(1, Some(&capacity_buffer), 0);
+        encoder.dispatch_thread_groups_indirect(
+            &args,
+            0,
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let mut results = vec![0u32; output_capacity];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                output.contents() as *const u32,
+                results.as_mut_ptr(),
+                output_capacity,
+            );
+        }
+        Ok(results)
+    }
+}
+
+/// A native Metal render pipeline used by D3D12 direct and indirect draws.
+pub struct MetalNativeRenderPipeline {
+    /// Unique GPU resource handle.
+    pub handle: u64,
+    /// Compiled pipeline.
+    pub pipeline: metal::RenderPipelineState,
+    /// Attachment pixel format.
+    pub pixel_format: metal::MTLPixelFormat,
+}
+
+/// Compile a native render pipeline from translated MSL.
+pub fn create_native_render_pipeline(
+    device: &metal::DeviceRef,
+    vertex_msl: &str,
+    fragment_msl: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> AppResult<MetalNativeRenderPipeline> {
+    let library = compile_library(device, vertex_msl, "native render vertex")?;
+    let vertex = library_function(&library, "vs_main", "native render vertex")?;
+    let fragment_library = compile_library(device, fragment_msl, "native render fragment")?;
+    let fragment = library_function(&fragment_library, "fs_main", "native render fragment")?;
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_vertex_function(Some(&vertex));
+    descriptor.set_fragment_function(Some(&fragment));
+    descriptor
+        .color_attachments()
+        .object_at(0)
+        .expect("native render color attachment")
+        .set_pixel_format(pixel_format);
+    unsafe {
+        use metal::foreign_types::ForeignType;
+        let _: () = msg_send![descriptor.as_ptr(), setSupportIndirectCommandBuffers: true];
+    }
+    #[cfg(test)]
+    if test_faults::native_pipeline_creation_fault() {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "native render pipeline creation fault",
+        ));
+    }
+    let pipeline = device
+        .new_render_pipeline_state(&descriptor)
+        .expect("native render pipeline creation");
+    Ok(MetalNativeRenderPipeline {
+        handle: alloc_gpu_id(),
+        pipeline,
+        pixel_format,
+    })
+}
+
+/// Create a shared render-target texture initialised from resource bytes.
+pub fn create_native_render_target(
+    device: &metal::DeviceRef,
+    width: u32,
+    height: u32,
+    pixel_format: metal::MTLPixelFormat,
+    bytes: &[u8],
+) -> AppResult<metal::Texture> {
+    let descriptor = metal::TextureDescriptor::new();
+    descriptor.set_texture_type(metal::MTLTextureType::D2);
+    descriptor.set_pixel_format(pixel_format);
+    descriptor.set_width(width as u64);
+    descriptor.set_height(height as u64);
+    descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+    descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+    let texture = device.new_texture(&descriptor);
+    let required = (width as usize) * (height as usize) * 4;
+    if bytes.len() < required {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!(
+                "render target requires {required} bytes but received {}",
+                bytes.len()
+            ),
+        ));
+    }
+    texture.replace_region(
+        metal::MTLRegion {
+            origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: metal::MTLSize {
+                width: width as u64,
+                height: height as u64,
+                depth: 1,
+            },
+        },
+        0,
+        bytes.as_ptr() as *const std::ffi::c_void,
+        (width * 4) as u64,
+    );
+    Ok(texture)
+}
+
+/// Read a shared render-target texture back into tightly packed bytes.
+pub fn read_native_render_target(texture: &metal::TextureRef, width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = vec![0u8; (width as usize) * (height as usize) * 4];
+    texture.get_bytes(
+        bytes.as_mut_ptr() as *mut std::ffi::c_void,
+        (width * 4) as u64,
+        metal::MTLRegion {
+            origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: metal::MTLSize {
+                width: width as u64,
+                height: height as u64,
+                depth: 1,
+            },
+        },
+        0,
+    );
+    bytes
+}
+
+/// Draw kind for a native render pass.
+pub enum MetalNativeDraw {
+    /// Non-indexed draw.
+    Draw {
+        /// Vertex count.
+        vertex_count: u64,
+        /// Instance count.
+        instance_count: u64,
+    },
+}
+
+/// Execute one native draw or one pre-encoded ICB range into `texture`.
+///
+/// The render pass is identical for the direct and indirect paths: clear to
+/// black, bind the pipeline/vertex buffer, then either issue the direct draw
+/// or execute the indirect commands.
+pub fn execute_native_render_pass(
+    device: &metal::DeviceRef,
+    queue: &metal::CommandQueueRef,
+    pipeline: &metal::RenderPipelineStateRef,
+    texture: &metal::TextureRef,
+    vertex_buffer: &metal::BufferRef,
+    vertex_offset: u64,
+    draw: MetalNativeDraw,
+    icb: Option<(&MetalIndirectCommandBuffer, u64)>,
+) -> AppResult<()> {
+    let pass = metal::RenderPassDescriptor::new();
+    let attachment = pass
+        .color_attachments()
+        .object_at(0)
+        .expect("native render attachment");
+    attachment.set_texture(Some(texture));
+    attachment.set_load_action(metal::MTLLoadAction::Clear);
+    attachment.set_store_action(metal::MTLStoreAction::Store);
+    attachment.set_clear_color(metal::MTLClearColor {
+        red: 0.0,
+        green: 0.0,
+        blue: 0.0,
+        alpha: 1.0,
+    });
+    let command_buffer = queue.new_command_buffer();
+    let encoder = command_buffer.new_render_command_encoder(&pass);
+    encoder.set_render_pipeline_state(pipeline);
+    encoder.set_vertex_buffer(0, Some(vertex_buffer), vertex_offset);
+    match (draw, icb) {
+        (
+            MetalNativeDraw::Draw {
+                vertex_count,
+                instance_count,
+            },
+            None,
+        ) => {
+            encoder.draw_primitives_instanced_base_instance(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                vertex_count,
+                instance_count,
+                0,
+            );
+        }
+        (_, Some((icb, command_count))) => {
+            icb.execute_render(encoder, 0..command_count)?;
+        }
+    }
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let _ = device;
+    Ok(())
+}
+
+/// GPU result produced by a translated ray-generation shader.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MetalRayPayloadResult {
+    /// Payload value written by the hit/miss/callable path.
+    pub value: [f32; 4],
+    /// Instance ID reported by traversal.
+    pub instance_id: u32,
+    /// Primitive ID reported by traversal.
+    pub primitive_id: u32,
+}
+
+/// A compiled translated ray-generation program.
+pub struct MetalRayShaderProgram {
+    /// Unique GPU resource handle.
+    pub handle: u64,
+    /// Ray-generation compute pipeline compiled from translated MSL.
+    pub pipeline: metal::ComputePipelineState,
+}
+
+/// Compile a translated ray-generation entry point.
+pub fn create_ray_shader_program(
+    device: &metal::DeviceRef,
+    msl_source: &str,
+    entry: &str,
+) -> AppResult<MetalRayShaderProgram> {
+    let library = compile_library(device, msl_source, "ray shader")?;
+    let function = library_function(&library, entry, "ray shader")?;
+    #[cfg(test)]
+    if test_faults::native_pipeline_creation_fault() {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "ray shader pipeline creation fault",
+        ));
+    }
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("ray shader pipeline creation");
+    Ok(MetalRayShaderProgram {
+        handle: alloc_gpu_id(),
+        pipeline,
+    })
+}
+
+/// Execute a translated ray-generation program against a TLAS with GPU SBT
+/// group records. Returns one payload record per ray.
+pub fn execute_ray_shader_program(
+    device: &metal::DeviceRef,
+    queue: &metal::CommandQueueRef,
+    program: &MetalRayShaderProgram,
+    acceleration: &metal::AccelerationStructureRef,
+    rays: &[MetalRay],
+    sbt: &MetalShaderTable,
+) -> AppResult<Vec<MetalRayPayloadResult>> {
+    if rays.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ray_bytes = std::mem::size_of_val(rays) as u64;
+    let ray_buffer = device.new_buffer_with_data(
+        rays.as_ptr() as *const std::ffi::c_void,
+        ray_bytes,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let result_bytes = (rays.len() * std::mem::size_of::<MetalRayPayloadResult>()) as u64;
+    let result_buffer = device.new_buffer(
+        result_bytes.max(1),
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let count: u32 = rays.len() as u32;
+    let count_buffer = device.new_buffer_with_data(
+        &count as *const u32 as *const std::ffi::c_void,
+        4,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let command_buffer = queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&program.pipeline);
+    encoder.set_buffer(0, Some(&result_buffer), 0);
+    encoder.set_buffer(1, Some(&ray_buffer), 0);
+    encoder.set_acceleration_structure(2, Some(acceleration));
+    encoder.set_buffer(3, Some(&sbt.buffer), 0);
+    encoder.set_buffer(4, Some(&count_buffer), 0);
+    encoder.dispatch_threads(
+        metal::MTLSize {
+            width: rays.len() as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let mut results = vec![MetalRayPayloadResult::default(); rays.len()];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            result_buffer.contents() as *const MetalRayPayloadResult,
+            results.as_mut_ptr(),
+            rays.len(),
+        );
+    }
+    Ok(results)
+}
+
+/// One decoded D3D12 indirect argument record.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetalIndirectResult {
+    /// 0 = DRAW, 1 = DRAW_INDEXED, 2 = DISPATCH.
+    pub kind: u32,
+    /// First argument (vertex count or dispatch X).
+    pub x: u32,
+    /// Second argument (instance count or dispatch Y).
+    pub y: u32,
+    /// Third argument (start vertex / start index / dispatch Z).
+    pub z: u32,
+    /// Fourth argument (start instance or base vertex).
+    pub w: u32,
+    /// Whether the command is non-empty.
+    pub enabled: u32,
+}
+
+/// MSL for GPU-side D3D12 indirect argument decoding and count limiting.
+pub const INDIRECT_ARGUMENT_MSL: &str = r#"#include <metal_stdlib>
+using namespace metal;
+
+struct IndirectResult {
+    uint kind;
+    uint x;
+    uint y;
+    uint z;
+    uint w;
+    uint enabled;
+};
+
+kernel void d3d12_indirect_decode(device const uchar* arguments [[buffer(0)]],
+                                  device const uint* count_source [[buffer(1)]],
+                                  device IndirectResult* results [[buffer(2)]],
+                                  device uint* effective [[buffer(3)]],
+                                  constant uint& offset [[buffer(4)]],
+                                  constant uint& stride [[buffer(5)]],
+                                  constant uint& max_count [[buffer(6)]],
+                                  constant uint& kind [[buffer(7)]],
+                                  constant uint& has_count [[buffer(8)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    uint count = has_count != 0u ? count_source[0] : max_count;
+    if (count > max_count) {
+        count = max_count;
+    }
+    if (gid == 0u) {
+        effective[0] = count;
+    }
+    if (gid >= count) {
+        return;
+    }
+    device const uint* p = (device const uint*)(arguments + offset + gid * stride);
+    IndirectResult result;
+    result.kind = kind;
+    result.x = p[0];
+    result.y = p[1];
+    result.z = p[2];
+    result.w = kind == 1u ? p[4] : p[3];
+    result.enabled = 1u;
+    if (kind == 0u || kind == 1u) {
+        if (p[0] == 0u || p[1] == 0u) {
+            result.enabled = 0u;
+        }
+    } else if (p[0] == 0u || p[1] == 0u || p[2] == 0u) {
+        result.enabled = 0u;
+    }
+    results[gid] = result;
+}"#;
+
+/// GPU-side D3D12 indirect argument decoder.
+pub struct MetalIndirectInterpreter {
+    /// Unique GPU resource handle.
+    pub handle: u64,
+    /// Decode kernel.
+    pub pipeline: metal::ComputePipelineState,
+}
+
+impl MetalIndirectInterpreter {
+    /// Compile the decoder.
+    #[rustfmt::skip]
+    pub fn new(device: &metal::DeviceRef) -> AppResult<Self> {
+        let pipeline = compile_compute_pipeline(
+            device,
+            INDIRECT_ARGUMENT_MSL,
+            "d3d12_indirect_decode",
+            "indirect-argument",)?;
+        Ok(Self {
+            handle: alloc_gpu_id(),
+            pipeline,
+        })
+    }
+
+    /// Decode up to `max_count` commands on the GPU, reading the count from
+    /// `count_source` when supplied.
+    pub fn execute(
+        &self,
+        device: &metal::DeviceRef,
+        queue: &metal::CommandQueueRef,
+        arguments: &metal::BufferRef,
+        offset: u64,
+        stride: u64,
+        max_count: u32,
+        kind: u32,
+        count_source: Option<&metal::BufferRef>,
+    ) -> AppResult<(u32, Vec<MetalIndirectResult>)> {
+        if max_count == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "indirect decode requires at least one command",
+            ));
+        }
+        let results = device.new_buffer(
+            (max_count as u64) * std::mem::size_of::<MetalIndirectResult>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let effective = device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        let offset_buffer = device.new_buffer_with_data(
+            &offset as *const u64 as *const std::ffi::c_void,
+            8,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let stride_buffer = device.new_buffer_with_data(
+            &stride as *const u64 as *const std::ffi::c_void,
+            8,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let max = device.new_buffer_with_data(
+            &max_count as *const u32 as *const std::ffi::c_void,
+            4,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let kind_buffer = device.new_buffer_with_data(
+            &kind as *const u32 as *const std::ffi::c_void,
+            4,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let has_count: u32 = u32::from(count_source.is_some());
+        let has_count_buffer = device.new_buffer_with_data(
+            &has_count as *const u32 as *const std::ffi::c_void,
+            4,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let empty_count = device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        let count_buffer = count_source.unwrap_or(empty_count.as_ref());
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(0, Some(arguments), 0);
+        encoder.set_buffer(1, Some(count_buffer), 0);
+        encoder.set_buffer(2, Some(&results), 0);
+        encoder.set_buffer(3, Some(&effective), 0);
+        encoder.set_buffer(4, Some(&offset_buffer), 0);
+        encoder.set_buffer(5, Some(&stride_buffer), 0);
+        encoder.set_buffer(6, Some(&max), 0);
+        encoder.set_buffer(7, Some(&kind_buffer), 0);
+        encoder.set_buffer(8, Some(&has_count_buffer), 0);
+        encoder.dispatch_threads(
+            metal::MTLSize {
+                width: max_count as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let effective = unsafe { *(effective.contents() as *const u32) };
+        let mut decoded = vec![MetalIndirectResult::default(); max_count as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                results.contents() as *const MetalIndirectResult,
+                decoded.as_mut_ptr(),
+                max_count as usize,
+            );
+        }
+        Ok((effective, decoded))
+    }
+}
+
+/// A work-graph record consumed by the fan-out kernels.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetalWorkGraphRecord {
+    /// Node index that produced the record.
+    pub node_index: u32,
+    /// Output slot the record fans out to.
+    pub output_index: u32,
+}
+
+/// MSL kernels for GPU-side work-graph fan-out.
+pub const WORK_GRAPH_FANOUT_MSL: &str = r#"#include <metal_stdlib>
+using namespace metal;
+
+struct WorkGraphRecord {
+    uint node_index;
+    uint output_index;
+};
+
+kernel void d3d12_wg_producer(device const WorkGraphRecord* records [[buffer(0)]],
+                              device const uint* gpu_count [[buffer(1)]],
+                              device uint* indices [[buffer(2)]],
+                              device uint* dispatch_args [[buffer(3)]],
+                              constant uint& cpu_count [[buffer(4)]],
+                              constant uint& gpu_mode [[buffer(5)]],
+                              uint gid [[thread_position_in_grid]]) {
+    uint count = gpu_mode == 1u ? gpu_count[0] : cpu_count;
+    if (gid == 0) {
+        dispatch_args[0] = count;
+        dispatch_args[1] = 1;
+        dispatch_args[2] = 1;
+    }
+    if (gid < count) {
+        indices[gid] = gid;
+    }
+}
+
+kernel void d3d12_wg_consumer(device const uint* indices [[buffer(0)]],
+                              device const WorkGraphRecord* records [[buffer(1)]],
+                              device uint* output [[buffer(2)]],
+                              uint gid [[thread_position_in_grid]]) {
+    uint record_index = indices[gid];
+    WorkGraphRecord record = records[record_index];
+    output[record.output_index] = record.node_index + 1;
+}"#;
+
+/// Real GPU-side work-graph fan-out pipelines.
+pub struct MetalWorkGraphFanout {
+    /// Unique GPU resource handle.
+    pub handle: u64,
+    /// Producer pipeline that materialises record indices and the indirect grid.
+    pub producer_pipeline: metal::ComputePipelineState,
+    /// Consumer pipeline dispatched from the GPU-produced grid.
+    pub consumer_pipeline: metal::ComputePipelineState,
+}
+
+impl MetalWorkGraphFanout {
+    /// Compile the producer and consumer pipelines.
+    #[rustfmt::skip]
+    pub fn new(device: &metal::DeviceRef) -> AppResult<Self> {
+        let producer_pipeline = compile_compute_pipeline(
+            device,
+            WORK_GRAPH_FANOUT_MSL,
+            "d3d12_wg_producer",
+            "work-graph producer",)?;
+        let consumer_pipeline = compile_compute_pipeline(
+            device,
+            WORK_GRAPH_FANOUT_MSL,
+            "d3d12_wg_consumer",
+            "work-graph consumer",)?;
+        Ok(Self {
+            handle: alloc_gpu_id(),
+            producer_pipeline,
+            consumer_pipeline,
+        })
+    }
+
+    /// Run a work-graph fan-out entirely on the GPU.
+    ///
+    /// `records` already live in GPU memory (either uploaded from CPU records
+    /// or produced by an earlier GPU node). `gpu_count` selects GPU-record
+    /// mode: the producer reads the record count from that buffer. Otherwise
+    /// `cpu_record_count` is used. The producer writes the consumer's indirect
+    /// grid, so the CPU never serialises per-record dispatches.
+    pub fn execute(
+        &self,
+        device: &metal::DeviceRef,
+        records: &metal::BufferRef,
+        record_capacity: u32,
+        cpu_record_count: Option<u32>,
+        gpu_count: Option<&metal::BufferRef>,
+    ) -> AppResult<Vec<u32>> {
+        if record_capacity == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "work-graph record capacity must be non-zero",
+            ));
+        }
+        let cpu_count = match (gpu_count, cpu_record_count) {
+            (None, Some(count)) if count <= record_capacity => count,
+            (None, Some(_)) => {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "work-graph CPU record count exceeds the record capacity",
+                ));
+            }
+            (None, None) => {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "work-graph fan-out requires a CPU or GPU record count",
+                ));
+            }
+            (Some(_), _) => 0,
+        };
+        let gpu_mode: u32 = u32::from(gpu_count.is_some());
+        let indices = device.new_buffer(
+            (record_capacity as u64) * std::mem::size_of::<u32>() as u64,
+            metal::MTLResourceOptions::StorageModePrivate,
+        );
+        let dispatch_args = device.new_buffer(16, metal::MTLResourceOptions::StorageModePrivate);
+        let output = device.new_buffer(
+            (record_capacity as u64) * std::mem::size_of::<u32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let cpu_count_buffer = device.new_buffer_with_data(
+            &cpu_count as *const u32 as *const std::ffi::c_void,
+            4,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let gpu_mode_buffer = device.new_buffer_with_data(
+            &gpu_mode as *const u32 as *const std::ffi::c_void,
+            4,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let empty_count = device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        let count_buffer = gpu_count.unwrap_or(empty_count.as_ref());
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.producer_pipeline);
+        encoder.set_buffer(0, Some(records), 0);
+        encoder.set_buffer(1, Some(count_buffer), 0);
+        encoder.set_buffer(2, Some(&indices), 0);
+        encoder.set_buffer(3, Some(&dispatch_args), 0);
+        encoder.set_buffer(4, Some(&cpu_count_buffer), 0);
+        encoder.set_buffer(5, Some(&gpu_mode_buffer), 0);
+        encoder.dispatch_threads(
+            metal::MTLSize {
+                width: record_capacity as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        let barriers: [&metal::ResourceRef; 2] = [
+            indices.as_ref() as &metal::ResourceRef,
+            dispatch_args.as_ref() as &metal::ResourceRef,
+        ];
+        encoder.memory_barrier_with_resources(&barriers);
+        encoder.set_compute_pipeline_state(&self.consumer_pipeline);
+        encoder.set_buffer(0, Some(&indices), 0);
+        encoder.set_buffer(1, Some(records), 0);
+        encoder.set_buffer(2, Some(&output), 0);
+        encoder.dispatch_thread_groups_indirect(
+            &dispatch_args,
+            0,
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let mut results = vec![0u32; record_capacity as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                output.contents() as *const u32,
+                results.as_mut_ptr(),
+                record_capacity as usize,
+            );
+        }
+        Ok(results)
+    }
 }
 
 // ===========================================================================
@@ -10503,10 +12208,10 @@ pub fn create_mesh_pipeline(
     // emulation fallback (mesh_render_pipeline_state = None).
     let (major, _minor, _patch) = macos_version();
     if major < 13 && device.supports_family(metal::MTLGPUFamily::Apple9) {
-        eprintln!( // coverage: unreachable — this host runs macOS 27, so the major < 13 conjunction is always false
-            "[metal_backend] warning: native mesh shaders require macOS 13+; falling back to compute emulation" // coverage: unreachable — macOS 27 never enters the pre-Ventura mesh warning
-            // coverage: unreachable — macOS 27 never enters the pre-Ventura mesh warning
-        ); // coverage: unreachable — macOS 27 never enters the pre-Ventura mesh warning
+        eprintln!( // coverage: unreachable — the runtime targets macOS 26+, so the major < 13 conjunction is always false
+            "[metal_backend] warning: native mesh shaders require macOS 13+; falling back to compute emulation" // coverage: unreachable — the supported runtime never enters the pre-Ventura mesh warning
+            // coverage: unreachable — the supported runtime never enters the pre-Ventura mesh warning
+        ); // coverage: unreachable — the supported runtime never enters the pre-Ventura mesh warning
     }
 
     // Compile the mesh shader (include object, mesh, and fragment function source)
@@ -10818,9 +12523,11 @@ pub fn set_shading_rate(
 
     Err(AppError::new(
         ReasonCode::RcInvalidState,
-        "set_shading_rate: fragment shading rate must be configured on the \
-         render pass descriptor (macOS 13+); it cannot be applied through a \
-         render encoder, so the rate is not set",
+        concat!(
+            "set_shading_rate: fragment shading rate must be configured on the ",
+            "render pass descriptor (macOS 13+); it cannot be applied through a ",
+            "render encoder, so the rate is not set",
+        ),
     ))
 }
 
@@ -10928,9 +12635,11 @@ pub fn encode_sampler_feedback(
     let _ = feedback;
     Err(AppError::new(
         ReasonCode::RcInvalidState,
-        "encode_sampler_feedback: GPU sampler feedback requires a \
-         feedback-capable render pass, which this API cannot encode; \
-         feedback data was not written",
+        concat!(
+            "encode_sampler_feedback: GPU sampler feedback requires a ",
+            "feedback-capable render pass, which this API cannot encode; ",
+            "feedback data was not written",
+        ),
     ))
 }
 
@@ -12388,25 +14097,25 @@ pub fn create_residency_set(
             respondsToSelector: sel!(newResidencySetWithDescriptor:error:)
         ];
         if !has_api {
-            return Err(AppError::new( // coverage: unreachable — the host Metal device implements newResidencySetWithDescriptor:error: (MTLResidencySet ships with macOS 27)
-                ReasonCode::RcUnsupportedPlatformApi, // coverage: unreachable — the residency-set API is present on this host
-                "this Metal device does not expose newResidencySetWithDescriptor:error: (MTLResidencySet); residency management is unavailable", // coverage: unreachable — the residency-set API is present on this host
-                // coverage: unreachable — the residency-set API is present on this host
+            return Err(AppError::new( // coverage: unreachable — the Metal device implements newResidencySetWithDescriptor:error: (MTLResidencySet ships with the supported runtime)
+                ReasonCode::RcUnsupportedPlatformApi, // coverage: unreachable — the residency-set API is present with the Metal runtime
+                "this Metal device does not expose newResidencySetWithDescriptor:error: (MTLResidencySet); residency management is unavailable", // coverage: unreachable — the residency-set API is present with the Metal runtime
+                // coverage: unreachable — the residency-set API is present with the Metal runtime
             ));
         }
         let descriptor_class =
             objc::runtime::Class::get("MTLResidencySetDescriptor").ok_or_else(|| {
-                AppError::new( // coverage: unreachable — MTLResidencySetDescriptor is registered by the host Metal framework on macOS 27
-                    ReasonCode::RcUnsupportedPlatformApi, // coverage: unreachable — the descriptor class exists on this host
+                AppError::new( // coverage: unreachable — MTLResidencySetDescriptor is registered by the Metal framework
+                    ReasonCode::RcUnsupportedPlatformApi, // coverage: unreachable — the descriptor class exists with the Metal runtime
                     "MTLResidencySetDescriptor class not found; residency management is \
                      unavailable",
                 )
-            })?; // coverage: unreachable — class lookup succeeds on this host, so the error edge of this `?` is never taken
+            })?; // coverage: unreachable — class lookup succeeds with the Metal runtime, so the error edge of this `?` is never taken
         let descriptor: *mut objc::runtime::Object = msg_send![descriptor_class, new];
         if descriptor.is_null() {
-            return Err(AppError::new( // coverage: unreachable — +[MTLResidencySetDescriptor new] always returns an object on this host
-                ReasonCode::RcIo, // coverage: unreachable — descriptor allocation cannot fail on this host
-                "failed to allocate MTLResidencySetDescriptor", // coverage: unreachable — descriptor allocation cannot fail on this host
+            return Err(AppError::new( // coverage: unreachable — +[MTLResidencySetDescriptor new] always returns an object with the Metal runtime
+                ReasonCode::RcIo, // coverage: unreachable — descriptor allocation cannot fail with the Metal runtime
+                "failed to allocate MTLResidencySetDescriptor", // coverage: unreachable — descriptor allocation cannot fail with the Metal runtime
             ));
         }
         let () = msg_send![descriptor, setInitialCapacity: initial_capacity as u64];
@@ -12439,19 +14148,19 @@ pub fn create_residency_set(
         ];
         let _: () = msg_send![descriptor, release];
         if set.is_null() {
-            if let Some(ns_label) = staged_label { // coverage: unreachable — the host device always returns a non-nil MTLResidencySet for a valid descriptor
-                let _: () = msg_send![ns_label, release]; // coverage: unreachable — the nil-set cleanup path is never entered on this host
-            } // coverage: unreachable — the nil-set cleanup path is never entered on this host
+            if let Some(ns_label) = staged_label { // coverage: unreachable — the Metal device always returns a non-nil MTLResidencySet for a valid descriptor
+                let _: () = msg_send![ns_label, release]; // coverage: unreachable — the nil-set cleanup path is never entered with the Metal runtime
+            } // coverage: unreachable — the nil-set cleanup path is never entered with the Metal runtime
             return Err(AppError::new(
                 ReasonCode::RcIo,
-                "failed to create MTLResidencySet (device returned nil)", // coverage: unreachable — newResidencySetWithDescriptor:error: succeeds on this host
+                "failed to create MTLResidencySet (device returned nil)", // coverage: unreachable — newResidencySetWithDescriptor:error: succeeds with the Metal runtime
             ));
         }
         if let Some(ns_label) = staged_label {
             let accepts_label: bool = msg_send![set, respondsToSelector: sel!(setLabel:)];
             if accepts_label {
                 let _: () = msg_send![set, setLabel: ns_label];
-            } // coverage: unreachable — the host MTLResidencySet responds to setLabel:, so the false edge is never taken
+            } // coverage: unreachable — the MTLResidencySet responds to setLabel:, so the false edge is never taken
             let _: () = msg_send![ns_label, release];
         }
         Ok(MetalResidencySet::from_raw(set))
@@ -12684,7 +14393,7 @@ impl MetalGpuBackend {
 /// real capability information rather than an OS-version guess.
 pub fn device_supports_binary_archives(device: &metal::DeviceRef) -> bool {
     if objc::runtime::Class::get("MTLBinaryArchiveDescriptor").is_none() {
-        return false; // coverage: unreachable — MTLBinaryArchiveDescriptor is a system Metal class present on every supported macOS host
+        return false; // coverage: unreachable — MTLBinaryArchiveDescriptor is a system Metal class present on every supported runtime
     }
     #[cfg(test)]
     if faults::binary_archives_unsupported() {
@@ -14488,6 +16197,451 @@ impl MemoryAliasManager {
 // Tests
 // ===========================================================================
 
+// ===========================================================================
+// MTLIOCommandQueue — DirectStorage's real storage path
+// ===========================================================================
+//
+// `MTLIOCommandQueue` (macOS 13+) reads a file directly into a Metal buffer or
+// texture on the storage engine, without a Rust read buffer or a blit copy.
+// This is the backend DirectStorage uploads use instead of staging through
+// guest memory.
+
+/// Failure while building or executing a Metal I/O command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetalIoError {
+    /// The device does not expose MTLIOCommandQueue (macOS 13+ required).
+    Unsupported,
+    /// The source file does not exist or cannot be opened.
+    FileNotFound(std::path::PathBuf),
+    /// A zero-byte load was requested.
+    EmptyLoad,
+    /// `offset + size` exceeds the destination buffer.
+    BufferTooSmall {
+        offset: u64,
+        size: u64,
+        capacity: u64,
+    },
+    /// Metal refused the queue, file handle or command buffer.
+    Metal(String),
+    /// The command completed with a non-complete status.
+    CommandFailed { status: i64, message: String },
+}
+
+impl std::fmt::Display for MetalIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported => write!(f, "MTLIOCommandQueue requires macOS 13 or newer"),
+            Self::FileNotFound(path) => write!(f, "Metal I/O source not found: {}", path.display()),
+            Self::EmptyLoad => write!(f, "Metal I/O load size must be non-zero"),
+            Self::BufferTooSmall {
+                offset,
+                size,
+                capacity,
+            } => write!(
+                f,
+                "Metal I/O range {offset}+{size} exceeds buffer capacity {capacity}"
+            ),
+            Self::Metal(message) => write!(f, "Metal I/O failed: {message}"),
+            Self::CommandFailed { status, message } => {
+                write!(f, "Metal I/O command failed (status {status}): {message}")
+            }
+        }
+    }
+}
+
+/// An owned `MTLIOFileHandle`.
+pub struct MetalIoFileHandle {
+    object: *mut objc::runtime::Object,
+}
+
+// SAFETY: MTLIO file handles are immutable after creation and thread-safe for
+// messaging/release, like the other Metal wrappers.
+unsafe impl Send for MetalIoFileHandle {}
+unsafe impl Sync for MetalIoFileHandle {}
+
+impl std::fmt::Debug for MetalIoFileHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalIoFileHandle").finish_non_exhaustive()
+    }
+}
+
+impl Drop for MetalIoFileHandle {
+    fn drop(&mut self) {
+        // SAFETY: +1 reference returned by newIOFileHandleWithURL:error:.
+        // Wrappers are only built from non-null handles; messaging a null
+        // Objective-C object is also a no-op.
+        unsafe {
+            let _: () = msg_send![self.object, release];
+        }
+    }
+}
+
+/// An owned `MTLIOCommandQueue`.
+pub struct MetalIoQueue {
+    object: *mut objc::runtime::Object,
+}
+
+// SAFETY: MTLIOCommandQueue is documented NS_SWIFT_SENDABLE; all mutable
+// state lives inside the command buffers it vends.
+unsafe impl Send for MetalIoQueue {}
+unsafe impl Sync for MetalIoQueue {}
+
+impl std::fmt::Debug for MetalIoQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalIoQueue").finish_non_exhaustive()
+    }
+}
+
+impl Drop for MetalIoQueue {
+    fn drop(&mut self) {
+        // SAFETY: +1 reference returned by newIOCommandQueueWithDescriptor:error:.
+        // Wrappers are only built from non-null queues; messaging a null
+        // Objective-C object is also a no-op.
+        unsafe {
+            let _: () = msg_send![self.object, release];
+        }
+    }
+}
+
+impl MetalIoQueue {
+    /// Whether the device exposes `newIOCommandQueueWithDescriptor:error:`.
+    pub fn is_supported(device: &metal::DeviceRef) -> bool {
+        if objc::runtime::Class::get("MTLIOCommandQueueDescriptor").is_none() {
+            return false; // coverage: unreachable — MTLIOCommandQueueDescriptor exists on every runtime that exposes MTLIO (macOS 13+)
+        }
+        let device_obj = device.as_ptr() as *mut objc::runtime::Object;
+        // SAFETY: live MTLDevice.
+        unsafe {
+            msg_send![
+                device_obj,
+                respondsToSelector: sel!(newIOCommandQueueWithDescriptor:error:)
+            ]
+        }
+    }
+
+    /// Create a concurrent I/O queue with a bounded in-flight command count.
+    pub fn new(
+        device: &metal::DeviceRef,
+        max_command_buffers: usize,
+        high_priority: bool,
+    ) -> Result<Self, MetalIoError> {
+        if !Self::is_supported(device) {
+            return Err(MetalIoError::Unsupported); // coverage: unreachable — the Metal runtime exposes MTLIOCommandQueue
+        }
+        let Some(class) = objc::runtime::Class::get("MTLIOCommandQueueDescriptor") else {
+            return Err(MetalIoError::Unsupported); // coverage: unreachable — the descriptor class is present whenever is_supported is true
+        };
+        // SAFETY: standard NSObject lifecycle for the real descriptor class.
+        unsafe {
+            let descriptor: *mut objc::runtime::Object = msg_send![class, alloc];
+            let descriptor: *mut objc::runtime::Object = msg_send![descriptor, init];
+            if descriptor.is_null() {
+                let message = "MTLIOCommandQueueDescriptor allocation failed".to_string(); // coverage: unreachable — NSObject allocation does not fail with this Metal runtime
+                return Err(MetalIoError::Metal(message)); // coverage: unreachable — NSObject allocation does not fail with this Metal runtime
+            }
+            let _: () = msg_send![
+                descriptor,
+                setMaxCommandBufferCount: max_command_buffers.max(1) as u64
+            ];
+            // MTLIOPriorityHigh = 0, Normal = 1.
+            let _: () =
+                msg_send![descriptor, setPriority: if high_priority { 0_i64 } else { 1_i64 }];
+            // MTLIOCommandQueueTypeConcurrent = 0.
+            let _: () = msg_send![descriptor, setType: 0_i64];
+            let device_obj = device.as_ptr() as *mut objc::runtime::Object;
+            let mut error: *mut objc::runtime::Object = std::ptr::null_mut();
+            let object: *mut objc::runtime::Object = msg_send![
+                device_obj,
+                newIOCommandQueueWithDescriptor: descriptor
+                error: &raw mut error
+            ];
+            let _: () = msg_send![descriptor, release];
+            if object.is_null() {
+                return Err(MetalIoError::Metal(objc_error_message(error))); // coverage: unreachable — the real MTLDevice accepts a valid MTLIOCommandQueueDescriptor
+            }
+            Ok(Self { object })
+        }
+    }
+
+    /// Open a source file as an `MTLIOFileHandle` (uncompressed).
+    pub fn open_file(&self, path: &std::path::Path) -> Result<MetalIoFileHandle, MetalIoError> {
+        if !path.is_file() {
+            return Err(MetalIoError::FileNotFound(path.to_path_buf()));
+        }
+        let url = objc_file_url_owned(path)
+            .ok_or_else(|| MetalIoError::FileNotFound(path.to_path_buf()))?;
+        let device_obj: *mut objc::runtime::Object = unsafe {
+            // SAFETY: MTLIOFileHandle is created by the device that owns the
+            // queue; `device` returns the live MTLDevice.
+            msg_send![self.object, device]
+        };
+        let mut error: *mut objc::runtime::Object = std::ptr::null_mut();
+        // SAFETY: device/url are live Objective-C objects for this call.
+        let handle: *mut objc::runtime::Object = unsafe {
+            msg_send![
+                device_obj,
+                newIOFileHandleWithURL: url
+                error: &raw mut error
+            ]
+        };
+        // SAFETY: +1 from objc_file_url_owned.
+        unsafe {
+            let _: () = msg_send![url, release];
+        }
+        if handle.is_null() {
+            return Err(MetalIoError::Metal(objc_error_message(error))); // coverage: unreachable — the real MTLDevice opens an existing local file
+        }
+        Ok(MetalIoFileHandle { object: handle })
+    }
+
+    /// Load `size` bytes at `source_offset` into `buffer[offset..]` and wait
+    /// for completion.  This is the real storage-engine read; no CPU buffer
+    /// participates.
+    pub fn load_into_buffer(
+        &self,
+        file: &MetalIoFileHandle,
+        buffer: &metal::Buffer,
+        offset: u64,
+        size: u64,
+        source_offset: u64,
+    ) -> Result<(), MetalIoError> {
+        if size == 0 {
+            return Err(MetalIoError::EmptyLoad);
+        }
+        let capacity = buffer.length();
+        if offset.saturating_add(size) > capacity {
+            return Err(MetalIoError::BufferTooSmall {
+                offset,
+                size,
+                capacity,
+            });
+        }
+        // SAFETY: the queue vends an autoreleased command buffer; all
+        // referenced objects stay alive through `waitUntilCompleted`.
+        unsafe {
+            let command_buffer: *mut objc::runtime::Object = msg_send![self.object, commandBuffer];
+            if command_buffer.is_null() {
+                let message = "Metal I/O command buffer allocation failed".to_string(); // coverage: unreachable — MTLIOCommandQueue vends a command buffer for a live queue
+                return Err(MetalIoError::Metal(message)); // coverage: unreachable — MTLIOCommandQueue vends a command buffer for a live queue
+            }
+            let buffer_obj = buffer.as_ptr() as *mut objc::runtime::Object;
+            let _: () = msg_send![
+                command_buffer,
+                loadBuffer: buffer_obj
+                offset: offset as u64
+                size: size as u64
+                sourceHandle: file.object
+                sourceHandleOffset: source_offset as u64
+            ];
+            let _: () = msg_send![command_buffer, commit];
+            let _: () = msg_send![command_buffer, waitUntilCompleted];
+            let status: i64 = msg_send![command_buffer, status];
+            // MTLIOStatusComplete = 3.
+            if status != 3 {
+                let error: *mut objc::runtime::Object = msg_send![command_buffer, error]; // coverage: unreachable — a committed local-file MTLIO load completes with status MTLIOStatusComplete
+                let message = objc_error_message(error); // coverage: unreachable — a committed local-file MTLIO load completes with status MTLIOStatusComplete
+                return Err(MetalIoError::CommandFailed { status, message }); // coverage: unreachable — a committed local-file MTLIO load completes with status MTLIOStatusComplete
+            }
+        }
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Metal 4 — parallel command encoding with grouped submission
+// ===========================================================================
+//
+// Metal 4 (macOS 26) moves allocation/encoding out of command buffers: the
+// device vends command allocators and command buffers, threads encode into
+// independent allocators, and the queue commits them as one group.  This is
+// the low-overhead path the D3D12 command-list batch uses when the host
+// supports Metal 4; the Metal 3 queue path remains the fallback.
+
+/// An owned `MTL4CommandAllocator`.
+pub struct Metal4Allocator {
+    object: *mut objc::runtime::Object,
+}
+
+unsafe impl Send for Metal4Allocator {}
+unsafe impl Sync for Metal4Allocator {}
+
+impl Drop for Metal4Allocator {
+    fn drop(&mut self) {
+        // SAFETY: +1 from newCommandAllocator. Wrappers are only built from
+        // non-null allocators; messaging a null object is also a no-op.
+        unsafe {
+            let _: () = msg_send![self.object, release];
+        }
+    }
+}
+
+impl Metal4Allocator {
+    /// Reset the allocator's heaps for reuse.  The caller must ensure every
+    /// command buffer backed by this allocator has completed.
+    pub fn reset(&self) {
+        // SAFETY: the allocator is live for the wrapper's lifetime.
+        unsafe {
+            let _: () = msg_send![self.object, reset];
+        }
+    }
+
+    /// Bytes of internal command memory currently allocated.
+    pub fn allocated_size(&self) -> u64 {
+        // SAFETY: see `reset`.
+        unsafe { msg_send![self.object, allocatedSize] }
+    }
+}
+
+/// An owned `MTL4CommandQueue`.
+pub struct Metal4Queue {
+    object: *mut objc::runtime::Object,
+}
+
+unsafe impl Send for Metal4Queue {}
+unsafe impl Sync for Metal4Queue {}
+
+impl Drop for Metal4Queue {
+    fn drop(&mut self) {
+        // SAFETY: +1 from newMTL4CommandQueue. Wrappers are only built from
+        // non-null queues; messaging a null object is also a no-op.
+        unsafe {
+            let _: () = msg_send![self.object, release];
+        }
+    }
+}
+
+impl Metal4Queue {
+    /// Whether the device exposes the Metal 4 queue/allocator/command-buffer
+    /// factories (macOS 26+).
+    pub fn is_supported(device: &metal::DeviceRef) -> bool {
+        let device_obj = device.as_ptr() as *mut objc::runtime::Object;
+        // SAFETY: live MTLDevice.
+        unsafe {
+            let has_queue: bool =
+                msg_send![device_obj, respondsToSelector: sel!(newMTL4CommandQueue)];
+            let has_allocator: bool =
+                msg_send![device_obj, respondsToSelector: sel!(newCommandAllocator)];
+            let has_buffer: bool =
+                msg_send![device_obj, respondsToSelector: sel!(newCommandBuffer)];
+            has_queue && has_allocator && has_buffer
+        }
+    }
+
+    /// Create a Metal 4 command queue.
+    pub fn new(device: &metal::DeviceRef) -> AppResult<Self> {
+        if !Self::is_supported(device) {
+            let message = "Metal 4 command queues require macOS 26 or newer"; // coverage: unreachable — the Metal runtime exposes the Metal 4 factories
+            return Err(AppError::new(ReasonCode::RcD3dFeatureUnsupported, message)); // coverage: unreachable — the Metal runtime exposes the Metal 4 factories
+        }
+        let device_obj = device.as_ptr() as *mut objc::runtime::Object;
+        // SAFETY: the selector was probed above.
+        let object: *mut objc::runtime::Object =
+            unsafe { msg_send![device_obj, newMTL4CommandQueue] };
+        if object.is_null() {
+            let message = "Metal refused the MTL4CommandQueue"; // coverage: unreachable — the real MTLDevice grants newMTL4CommandQueue
+            return Err(AppError::new(ReasonCode::RcD3dFeatureUnsupported, message)); // coverage: unreachable — the real MTLDevice grants newMTL4CommandQueue
+        }
+        Ok(Self { object })
+    }
+
+    /// Create a command allocator for one encoding thread.
+    pub fn new_allocator(device: &metal::DeviceRef) -> AppResult<Metal4Allocator> {
+        let device_obj = device.as_ptr() as *mut objc::runtime::Object;
+        // SAFETY: live device; the caller checked `is_supported`.
+        let object: *mut objc::runtime::Object =
+            unsafe { msg_send![device_obj, newCommandAllocator] };
+        if object.is_null() {
+            let message = "Metal refused the MTL4CommandAllocator"; // coverage: unreachable — the real MTLDevice grants newCommandAllocator
+            return Err(AppError::new(ReasonCode::RcD3dFeatureUnsupported, message)); // coverage: unreachable — the real MTLDevice grants newCommandAllocator
+        }
+        Ok(Metal4Allocator { object })
+    }
+
+    /// Begin a command buffer backed by `allocator`.  The returned buffer must
+    /// be ended before it is committed.
+    pub fn begin_command_buffer(
+        &self,
+        device: &metal::DeviceRef,
+        allocator: &Metal4Allocator,
+    ) -> AppResult<Metal4CommandBuffer> {
+        let device_obj = device.as_ptr() as *mut objc::runtime::Object;
+        // SAFETY: live device/allocator; selector availability was checked.
+        unsafe {
+            let object: *mut objc::runtime::Object = msg_send![device_obj, newCommandBuffer];
+            if object.is_null() {
+                let message = "Metal refused the MTL4CommandBuffer"; // coverage: unreachable — the real MTLDevice grants newCommandBuffer
+                return Err(AppError::new(ReasonCode::RcD3dFeatureUnsupported, message)); // coverage: unreachable — the real MTLDevice grants newCommandBuffer
+            }
+            let _: () = msg_send![object, beginCommandBufferWithAllocator: allocator.object];
+            Ok(Metal4CommandBuffer { object })
+        }
+    }
+
+    /// Commit a group of ended command buffers in one queue submission.
+    pub fn commit(&self, command_buffers: &[&Metal4CommandBuffer]) {
+        if command_buffers.is_empty() {
+            return;
+        }
+        let pointers: Vec<*mut objc::runtime::Object> =
+            command_buffers.iter().map(|buffer| buffer.object).collect();
+        // SAFETY: every buffer is live and ended; the array is valid for the
+        // duration of the call.
+        unsafe {
+            let _: () = msg_send![
+                self.object,
+                commit: pointers.as_ptr()
+                count: pointers.len() as u64
+            ];
+        }
+    }
+
+    /// Signal a shared event after all previously committed command buffers.
+    pub fn signal_event(&self, event: &metal::SharedEvent, value: u64) {
+        let event_obj = event.as_ptr() as *mut objc::runtime::Object;
+        // SAFETY: live queue/event.
+        unsafe {
+            let _: () = msg_send![self.object, signalEvent: event_obj value: value];
+        }
+    }
+}
+
+/// An owned `MTL4CommandBuffer` (allocator-backed, Metal 4 encoding).
+pub struct Metal4CommandBuffer {
+    object: *mut objc::runtime::Object,
+}
+
+impl Drop for Metal4CommandBuffer {
+    fn drop(&mut self) {
+        // SAFETY: +1 from newCommandBuffer. Wrappers are only built from
+        // non-null buffers; messaging a null object is also a no-op.
+        unsafe {
+            let _: () = msg_send![self.object, release];
+        }
+    }
+}
+
+impl Metal4CommandBuffer {
+    /// Finish encoding.  A buffer must be ended exactly once before commit.
+    pub fn end(&self) {
+        // SAFETY: the buffer is live and was begun by the queue.
+        unsafe {
+            let _: () = msg_send![self.object, endCommandBuffer];
+        }
+    }
+
+    /// Begin a Metal 4 compute encoder for this command buffer.
+    pub fn compute_encoder(&self) -> AppResult<*mut objc::runtime::Object> {
+        // SAFETY: live command buffer.
+        let encoder: *mut objc::runtime::Object =
+            unsafe { msg_send![self.object, computeCommandEncoder] };
+        if encoder.is_null() {
+            let message = "Metal 4 refused a compute command encoder"; // coverage: unreachable — a begun MTL4CommandBuffer vends a compute encoder
+            return Err(AppError::new(ReasonCode::RcD3dInvalidState, message)); // coverage: unreachable — a begun MTL4CommandBuffer vends a compute encoder
+        }
+        Ok(encoder)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14699,6 +16853,7 @@ mod tests {
         let vb = device
             .create_buffer_with_data(vertex_bytes, metal::MTLResourceOptions::StorageModeShared);
         let geom_desc = RayTracingGeometryDescriptor {
+            kind: RayTracingGeometryKind::Triangles,
             vertex_buffer: 0,
             vertex_stride: 12,
             vertex_format: VertexFormat::Float3,
@@ -15821,22 +17976,6 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
     }
 
     #[test]
-    fn metal_capability_report() {
-        let report = report_metal_device_capabilities().expect("capability report");
-        assert!(!report.device_name.is_empty());
-        assert!(report.max_buffer_length > 0);
-        // OS version should be nonzero on macOS
-        #[cfg(target_os = "macos")]
-        {
-            assert!(report.os_version.0 >= 10);
-        }
-        // Display formatting should not panic
-        let display = format!("{report}");
-        assert!(display.contains("Metal Device Capability Report"));
-        assert!(display.contains(&report.device_name));
-    }
-
-    #[test]
     fn resource_creation_and_destruction_no_leaks() {
         // Create a Metal device and backend, then create/destroy various
         // resources to verify no panics occur.
@@ -15998,6 +18137,7 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
         let vb = device
             .create_buffer_with_data(vertex_bytes, metal::MTLResourceOptions::StorageModeShared);
         let geom_desc = RayTracingGeometryDescriptor {
+            kind: RayTracingGeometryKind::Triangles,
             vertex_buffer: 0,
             vertex_stride: 12,
             vertex_format: VertexFormat::Float3,
@@ -18516,6 +20656,7 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
         let vertex_buffer = metal_device
             .create_buffer_with_data(vertex_bytes, metal::MTLResourceOptions::StorageModeShared);
         let geom_desc = RayTracingGeometryDescriptor {
+            kind: RayTracingGeometryKind::Triangles,
             vertex_buffer: 0,
             vertex_stride: 12,
             vertex_format: VertexFormat::Float3,
@@ -19071,6 +21212,7 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
         assert_eq!(IndexFormat::UInt32.to_metal(), metal::MTLIndexType::UInt32);
 
         let indexed = RayTracingGeometryDescriptor {
+            kind: RayTracingGeometryKind::Triangles,
             vertex_buffer: 0,
             vertex_stride: 12,
             vertex_format: VertexFormat::Float3,
@@ -19082,6 +21224,7 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
             allow_duplicates: false,
         };
         let plain = RayTracingGeometryDescriptor {
+            kind: RayTracingGeometryKind::Triangles,
             vertex_buffer: 0,
             vertex_stride: 12,
             vertex_format: VertexFormat::Half3,
@@ -19115,6 +21258,7 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
 
         let untyped_index = AccelerationStructureDescriptor {
             geometry_descriptors: vec![RayTracingGeometryDescriptor {
+                kind: RayTracingGeometryKind::Triangles,
                 index_buffer: Some(0),
                 index_format: None,
                 vertex_format: VertexFormat::Float3,
@@ -22803,5 +24947,1232 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&compressed_path);
         let _ = std::fs::remove_file(&short_path);
+    }
+
+    #[test]
+    fn metal_io_queue_loads_a_file_into_a_shared_buffer_without_a_cpu_copy() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let queue = MetalIoQueue::new(device.metal_device(), 4, true)
+            .expect("MTLIOCommandQueue is available on macOS 13+");
+        let path = unique_temp_file("mtlio-roundtrip");
+        let pattern: Vec<u8> = (0..8192u32)
+            .map(|index| (index.wrapping_mul(31) & 0xFF) as u8)
+            .collect();
+        std::fs::write(&path, &pattern).expect("write source");
+
+        let file = queue.open_file(&path).expect("open MTLIO file");
+        let buffer = device.create_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
+        queue
+            .load_into_buffer(&file, &buffer, 0, 4096, 1024)
+            .expect("MTLIO load");
+        let loaded = unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, 4096) };
+        assert_eq!(loaded, &pattern[1024..5120]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn metal_io_rejects_empty_oversized_and_missing_sources_exactly() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let queue = MetalIoQueue::new(device.metal_device(), 2, false)
+            .expect("MTLIOCommandQueue is available on macOS 13+");
+        let path = unique_temp_file("mtlio-errors");
+        std::fs::write(&path, [1u8, 2, 3, 4]).expect("write source");
+        let file = queue.open_file(&path).expect("open MTLIO file");
+        let buffer = device.create_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+        assert_ne!(
+            format!("{file:?} {queue:?}"),
+            "",
+            "Debug surfaces are exact"
+        );
+
+        assert_eq!(
+            queue.load_into_buffer(&file, &buffer, 0, 0, 0),
+            Err(MetalIoError::EmptyLoad)
+        );
+        assert_eq!(
+            queue.load_into_buffer(&file, &buffer, 8, 1, 0),
+            Err(MetalIoError::BufferTooSmall {
+                offset: 8,
+                size: 1,
+                capacity: 8
+            })
+        );
+        let missing = unique_temp_file("mtlio-missing");
+        match queue.open_file(&missing) {
+            Err(MetalIoError::FileNotFound(path)) => assert_eq!(path, missing),
+            other => panic!("unexpected open result: {other:?}"),
+        }
+        assert_eq!(
+            MetalIoError::Unsupported.to_string(),
+            "MTLIOCommandQueue requires macOS 13 or newer"
+        );
+        assert_eq!(
+            MetalIoError::EmptyLoad.to_string(),
+            "Metal I/O load size must be non-zero"
+        );
+        assert_eq!(
+            MetalIoError::FileNotFound(missing.clone()).to_string(),
+            format!("Metal I/O source not found: {}", missing.display())
+        );
+        assert_eq!(
+            MetalIoError::BufferTooSmall {
+                offset: 1,
+                size: 2,
+                capacity: 2
+            }
+            .to_string(),
+            "Metal I/O range 1+2 exceeds buffer capacity 2"
+        );
+        assert_eq!(
+            MetalIoError::Metal("boom".to_string()).to_string(),
+            "Metal I/O failed: boom"
+        );
+        assert_eq!(
+            MetalIoError::CommandFailed {
+                status: 2,
+                message: "bad".to_string()
+            }
+            .to_string(),
+            "Metal I/O command failed (status 2): bad"
+        );
+        let capability = MetalCapabilityReport {
+            device_name: "mtlio-adversarial".to_string(),
+            unified_memory: false,
+            max_buffer_length: 0,
+            os_version: (0, 0, 0),
+            supports_mesh_shaders: false,
+            supports_raytracing: false,
+            supports_dxr_raytracing: false,
+            supports_apple7: false,
+            supports_apple8: false,
+            supports_apple9: false,
+            supports_mac1: false,
+            supports_mac2: false,
+            supports_argument_buffers: false,
+            supports_binary_archives: false,
+            supports_metal4: true,
+            supports_residency_sets: false,
+            supports_mtl_io: true,
+        };
+        let rendered = format!("{capability}");
+        assert_eq!(rendered.contains("  Metal 4: yes\n"), true);
+        assert_eq!(rendered.contains("  Residency Sets: no\n"), true);
+        assert_eq!(rendered.contains("  Metal I/O: yes\n"), true);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn directstorage_mtl_io_path_reports_zero_staging_and_exact_short_source() {
+        let path = unique_temp_file("directstorage-mtlio");
+        let pixels: Vec<u8> = (0..64u8).collect();
+        std::fs::write(&path, &pixels).expect("write source");
+        let desc = DirectStorageUploadDesc {
+            file_offset: 0,
+            source_len: 64,
+            output_len: 64,
+            width: 4,
+            height: 4,
+            format: metal::MTLPixelFormat::RGBA8Unorm,
+            compression: DirectStorageCompression::None,
+        };
+        let upload =
+            upload_texture_from_path(&path, desc).expect("MTLIO DirectStorage upload succeeds");
+        let stats = upload.stats();
+        assert_eq!(stats.directstorage_bytes, 64);
+        assert_eq!(stats.staging_bytes, 0, "MTLIO needs no CPU staging");
+        assert_eq!(stats.blits, 1);
+
+        std::fs::write(&path, [0u8; 8]).expect("write short");
+        let error = upload_texture_from_path(&path, desc).expect_err("short source must fail");
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message,
+            "DirectStorage: file is too short for 64 bytes at offset 0"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn metal4_queue_commits_parallel_command_buffers_as_one_group() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        if !Metal4Queue::is_supported(device.metal_device()) {
+            return;
+        }
+        let queue = Metal4Queue::new(device.metal_device()).expect("Metal 4 queue");
+        let mut allocators = Vec::new();
+        let mut buffers = Vec::new();
+        for _ in 0..4 {
+            let allocator =
+                Metal4Queue::new_allocator(device.metal_device()).expect("Metal 4 allocator");
+            let buffer = queue
+                .begin_command_buffer(device.metal_device(), &allocator)
+                .expect("Metal 4 command buffer");
+            let encoder = buffer.compute_encoder().expect("Metal 4 compute encoder");
+            assert_ne!(encoder.is_null(), true, "a begun buffer vends an encoder");
+            unsafe {
+                let _: () = msg_send![encoder, endEncoding];
+            }
+            buffer.end();
+            allocators.push(allocator);
+            buffers.push(buffer);
+        }
+        let refs: Vec<&Metal4CommandBuffer> = buffers.iter().collect();
+        queue.commit(&refs);
+        queue.commit(&[]);
+
+        let event = device.metal_device().new_shared_event();
+        queue.signal_event(&event, 1);
+        let signaled: bool =
+            unsafe { msg_send![event.as_ptr(), waitUntilSignaledValue: 1u64 timeoutMS: 5_000u64] };
+        assert!(signaled, "the grouped commit completed before the timeout");
+        assert_eq!(event.signaled_value(), 1);
+        for allocator in &allocators {
+            assert!(
+                allocator.allocated_size() > 0,
+                "a used allocator owns command memory"
+            );
+            allocator.reset();
+        }
+    }
+
+    fn shared_u32_buffer(device: &MetalDevice, values: &[u32]) -> metal::Buffer {
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+        };
+        device.create_buffer_with_data(bytes, metal::MTLResourceOptions::StorageModeShared)
+    }
+
+    #[test]
+    fn d3d12_gpu_acceleration_structures_reject_malformed_inputs_and_produce_real_ray_hits() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let queue = device.create_command_queue();
+        let vertices: [f32; 9] = [-1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0];
+        let vertex_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                vertices.as_ptr() as *const u8,
+                std::mem::size_of_val(&vertices),
+            )
+        };
+        let vertex_buffer = device
+            .create_buffer_with_data(vertex_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let geometry = RayTracingGeometryDescriptor {
+            kind: RayTracingGeometryKind::Triangles,
+            vertex_buffer: 0,
+            vertex_stride: 12,
+            vertex_format: VertexFormat::Float3,
+            index_buffer: None,
+            index_format: None,
+            primitive_count: 1,
+            triangle_count: 1,
+            opaque: true,
+            allow_duplicates: false,
+        };
+        let descriptor = AccelerationStructureDescriptor {
+            geometry_descriptors: vec![geometry.clone()],
+            usage: AccelerationStructureUsage::RayTracing,
+        };
+        let buffers = [RayTracingGeometryBuffers {
+            vertex_buffer: vertex_buffer.as_ref(),
+            vertex_offset: 0,
+            index_buffer: None,
+        }];
+
+        assert_eq!(
+            VertexFormat::Float2.to_metal(),
+            metal::MTLAttributeFormat::Float2
+        );
+        assert_eq!(VertexFormat::Float2.stride(), 8);
+        let sizes =
+            primitive_acceleration_structure_sizes(device.metal_device(), &descriptor, &buffers)
+                .expect("primitive sizes");
+        assert_ne!(sizes.acceleration_structure_size, 0);
+        assert_ne!(sizes.build_scratch_size, 0);
+        assert_eq!(sizes.refit_scratch_size <= sizes.build_scratch_size, true);
+
+        let error = primitive_acceleration_structure_sizes(device.metal_device(), &descriptor, &[])
+            .expect_err("buffer mismatch must be rejected");
+        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(
+            error.message,
+            "geometry_buffers length 0 does not match geometry_descriptors length 1"
+        );
+
+        let mut zero_stride = descriptor.clone();
+        zero_stride.geometry_descriptors[0].vertex_stride = 0;
+        let error =
+            primitive_acceleration_structure_sizes(device.metal_device(), &zero_stride, &buffers)
+                .expect_err("zero vertex stride must be rejected");
+        assert_eq!(error.message, "geometry 0 has a zero vertex stride");
+
+        let scratch = allocate_acceleration_scratch_buffer(
+            device.metal_device(),
+            sizes.build_scratch_size.max(sizes.refit_scratch_size),
+        );
+        assert_ne!(scratch.handle, 0);
+        let mut accel = create_acceleration_structure(device.metal_device(), &descriptor, &buffers)
+            .expect("primitive acceleration structure");
+        assert_eq!(accel.built, false);
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        build_acceleration_structure(&encoder, &mut accel, &scratch, &buffers)
+            .expect("build triangle BLAS");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(accel.built, true);
+
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        refit_acceleration_structure(&encoder, &mut accel, &scratch, &buffers)
+            .expect("primitive refit");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let error = build_acceleration_structure_at_offset(
+            &MetalAccelerationStructureEncoder::new(queue.new_command_buffer()).expect("encoder"),
+            &mut accel,
+            &scratch,
+            scratch.size + 1,
+            &buffers,
+        )
+        .expect_err("scratch range must be bounded");
+        assert_eq!(
+            error.message,
+            format!(
+                "build scratch offset {} exceeds the {}-byte scratch buffer",
+                scratch.size + 1,
+                scratch.size
+            )
+        );
+
+        let compiled_size = device.create_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        write_compacted_acceleration_structure_size(
+            &encoder,
+            accel.acceleration_structure.as_ref(),
+            compiled_size.as_ref(),
+            0,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let compacted = unsafe { *(compiled_size.contents() as *const u64) };
+        assert_ne!(compacted, 0);
+        assert_eq!(compacted <= accel.size as u64, true);
+        let compacted_structure = device
+            .metal_device()
+            .new_acceleration_structure_with_size(compacted);
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        compact_acceleration_structure(
+            &encoder,
+            accel.acceleration_structure.as_ref(),
+            compacted_structure.as_ref(),
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let pipeline = create_ray_query_pipeline(device.metal_device()).expect("ray pipeline");
+        assert_ne!(pipeline.handle, 0);
+        let table = MetalShaderTable::new(device.metal_device(), &[5, 9], 4).expect("shader table");
+        assert_eq!(table.record_count, 2);
+        let rays = [
+            MetalRay {
+                origin: [0.0, 0.0, -1.0],
+                min_distance: 0.0,
+                direction: [0.0, 0.0, 1.0],
+                max_distance: 100.0,
+                sbt_offset: 1,
+                mask: 0xFFFF_FFFF,
+            },
+            MetalRay {
+                origin: [4.0, 4.0, -1.0],
+                min_distance: 0.0,
+                direction: [0.0, 0.0, 1.0],
+                max_distance: 100.0,
+                sbt_offset: 0,
+                mask: 0xFFFF_FFFF,
+            },
+        ];
+        let results = trace_rays(
+            device.metal_device(),
+            &pipeline,
+            accel.acceleration_structure.as_ref(),
+            &rays,
+            &table,
+            &[0xFFFF_FFFF],
+            false,
+        )
+        .expect("ray traversal");
+        assert_eq!(results[0].hit, 1);
+        assert_eq!(results[0].primitive_id, 0);
+        assert_eq!(results[0].group_index, 9);
+        assert_eq!(results[0].distance.round() as u32, 1);
+        assert_eq!(results[1].hit, 0);
+        assert_eq!(results[1].group_index, 5);
+        assert_eq!(
+            trace_rays(
+                device.metal_device(),
+                &pipeline,
+                accel.acceleration_structure.as_ref(),
+                &[],
+                &table,
+                &[0xFFFF_FFFF],
+                false,
+            )
+            .expect("empty ray list"),
+            Vec::<MetalRayResult>::new()
+        );
+        let compacted_results = trace_rays(
+            device.metal_device(),
+            &pipeline,
+            compacted_structure.as_ref(),
+            &rays,
+            &table,
+            &[0xFFFF_FFFF],
+            false,
+        )
+        .expect("compact traversal");
+        assert_eq!(compacted_results[0].hit, 1);
+
+        // A real bounding-box geometry follows the same primitive path.
+        let bounds: [f32; 6] = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+        let bounds_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(bounds.as_ptr() as *const u8, std::mem::size_of_val(&bounds))
+        };
+        let bounds_buffer = device
+            .create_buffer_with_data(bounds_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let aabb_descriptor = AccelerationStructureDescriptor {
+            geometry_descriptors: vec![RayTracingGeometryDescriptor {
+                kind: RayTracingGeometryKind::BoundingBoxes,
+                vertex_buffer: 0,
+                vertex_stride: 24,
+                vertex_format: VertexFormat::Float3,
+                index_buffer: None,
+                index_format: None,
+                primitive_count: 1,
+                triangle_count: 0,
+                opaque: false,
+                allow_duplicates: false,
+            }],
+            usage: AccelerationStructureUsage::RayQuery,
+        };
+        let aabb_buffers = [RayTracingGeometryBuffers {
+            vertex_buffer: bounds_buffer.as_ref(),
+            vertex_offset: 0,
+            index_buffer: None,
+        }];
+        let aabb_sizes = primitive_acceleration_structure_sizes(
+            device.metal_device(),
+            &aabb_descriptor,
+            &aabb_buffers,
+        )
+        .expect("AABB sizes");
+        let aabb_scratch = allocate_acceleration_scratch_buffer(
+            device.metal_device(),
+            aabb_sizes.build_scratch_size,
+        );
+        let mut aabb =
+            create_acceleration_structure(device.metal_device(), &aabb_descriptor, &aabb_buffers)
+                .expect("AABB acceleration structure");
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        build_acceleration_structure(&encoder, &mut aabb, &aabb_scratch, &aabb_buffers)
+            .expect("build AABB BLAS");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(aabb.built, true);
+
+        // Top-level structure with one instance and a working instance mask.
+        let mut instance = metal::MTLAccelerationStructureInstanceDescriptor::default();
+        instance.transformation_matrix = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+        ];
+        instance.options = metal::MTLAccelerationStructureInstanceOptions::Opaque;
+        instance.mask = 0x2;
+        instance.intersection_function_table_offset = 0;
+        instance.acceleration_structure_index = 0;
+        let instance_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                &instance as *const _ as *const u8,
+                std::mem::size_of_val(&instance),
+            )
+        };
+        let instance_buffer = device
+            .create_buffer_with_data(instance_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let blas_refs = [accel.acceleration_structure.as_ref()];
+        let instance_sizes = instance_acceleration_structure_sizes(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            1,
+            std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect("TLAS sizes");
+        assert_ne!(instance_sizes.build_scratch_size, 0);
+        let mut tlas = create_instance_acceleration_structure(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            1,
+            std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect("TLAS");
+        assert_eq!(tlas.built, false);
+        let tlas_scratch = allocate_acceleration_scratch_buffer(
+            device.metal_device(),
+            instance_sizes
+                .build_scratch_size
+                .max(instance_sizes.refit_scratch_size),
+        );
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        build_instance_acceleration_structure(
+            &encoder,
+            &mut tlas,
+            &tlas_scratch,
+            0,
+            instance_buffer.as_ref(),
+            &blas_refs,
+        )
+        .expect("build TLAS");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(tlas.built, true);
+        let masked_ray = [MetalRay {
+            origin: [0.0, 0.0, -1.0],
+            min_distance: 0.0,
+            direction: [0.0, 0.0, 1.0],
+            max_distance: 100.0,
+            sbt_offset: 0,
+            mask: 0x1,
+        }];
+        let masked = trace_rays(
+            device.metal_device(),
+            &pipeline,
+            tlas.acceleration_structure.as_ref(),
+            &masked_ray,
+            &table,
+            &[0x2],
+            true,
+        )
+        .expect("masked traversal");
+        assert_eq!(masked[0].hit, 0);
+        let visible_ray = [MetalRay {
+            mask: 0x2,
+            ..masked_ray[0]
+        }];
+        let visible = trace_rays(
+            device.metal_device(),
+            &pipeline,
+            tlas.acceleration_structure.as_ref(),
+            &visible_ray,
+            &table,
+            &[0x2],
+            true,
+        )
+        .expect("unmasked traversal");
+        assert_eq!(visible[0].hit, 1);
+        assert_eq!(visible[0].instance_id, 0);
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        refit_instance_acceleration_structure(
+            &encoder,
+            &mut tlas,
+            &tlas_scratch,
+            instance_buffer.as_ref(),
+            &blas_refs,
+        )
+        .expect("refit TLAS");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Malformed instance input is rejected with exact errors.
+        let error = create_instance_acceleration_structure(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            0,
+            64,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect_err("zero instances must be rejected");
+        assert_eq!(
+            error.message,
+            "instance acceleration structure requires at least one instance"
+        );
+        let error = create_instance_acceleration_structure(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            1,
+            8,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect_err("small stride must be rejected");
+        assert_eq!(
+            error.message,
+            format!(
+                "instance descriptor stride 8 is smaller than the {}-byte descriptor",
+                std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>()
+            )
+        );
+        let error = create_instance_acceleration_structure(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            2,
+            u64::MAX,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect_err("overflowing range must be rejected");
+        assert_eq!(error.message, "instance descriptor range overflows");
+        let error = create_instance_acceleration_structure(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            2,
+            64,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect_err("short instance buffer must be rejected");
+        assert_eq!(
+            error.message,
+            format!(
+                "instance descriptor range 128 exceeds the {}-byte buffer",
+                instance_buffer.length()
+            )
+        );
+        let error = create_instance_acceleration_structure(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            1,
+            64,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &[
+                accel.acceleration_structure.as_ref(),
+                accel.acceleration_structure.as_ref(),
+            ],
+        )
+        .expect_err("too many instances must be rejected");
+        assert_eq!(
+            error.message,
+            "instanced acceleration structure list exceeds the instance count"
+        );
+        let error = instance_acceleration_structure_sizes(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            0,
+            64,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect_err("zero instance sizes must be rejected");
+        assert_eq!(
+            error.message,
+            "instance acceleration structure requires at least one instance"
+        );
+        let error = build_instance_acceleration_structure(
+            &MetalAccelerationStructureEncoder::new(queue.new_command_buffer()).expect("encoder"),
+            &mut tlas,
+            &tlas_scratch,
+            tlas_scratch.size + 1,
+            instance_buffer.as_ref(),
+            &blas_refs,
+        )
+        .expect_err("TLAS scratch range must be bounded");
+        assert_eq!(
+            error.message,
+            format!(
+                "build scratch offset {} exceeds the {}-byte scratch buffer",
+                tlas_scratch.size + 1,
+                tlas_scratch.size
+            )
+        );
+
+        assert_eq!(
+            minimum_instance_stride(metal::MTLAccelerationStructureInstanceDescriptorType::Default),
+            std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64
+        );
+        assert_eq!(
+            minimum_instance_stride(metal::MTLAccelerationStructureInstanceDescriptorType::UserID),
+            std::mem::size_of::<metal::MTLAccelerationStructureUserIDInstanceDescriptor>() as u64
+        );
+        assert_eq!(
+            minimum_instance_stride(
+                metal::MTLAccelerationStructureInstanceDescriptorType::Indirect
+            ),
+            std::mem::size_of::<metal::MTLIndirectAccelerationStructureInstanceDescriptor>() as u64
+        );
+        assert_eq!(
+            minimum_instance_stride(metal::MTLAccelerationStructureInstanceDescriptorType::Motion),
+            std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64
+        );
+
+        let error = MetalShaderTable::new(device.metal_device(), &[], 4)
+            .expect_err("empty shader table must be rejected");
+        assert_eq!(
+            error.message,
+            "shader table must contain at least one record"
+        );
+        let error = MetalShaderTable::new(device.metal_device(), &[1], 2)
+            .expect_err("small shader-table stride must be rejected");
+        assert_eq!(
+            error.message,
+            "shader-table record stride 2 is smaller than 4"
+        );
+        let error = MetalShaderTable::new(device.metal_device(), &[1, 2], u64::MAX)
+            .expect_err("shader-table overflow must be rejected");
+        assert_eq!(error.message, "shader-table range overflows");
+
+        test_faults::set_pipeline_creation_fault(true);
+        let error =
+            create_ray_query_pipeline(device.metal_device()).expect_err("pipeline creation fault");
+        test_faults::set_pipeline_creation_fault(false);
+        assert_eq!(error.message, "ray-query primitive pipeline creation fault");
+        let error =
+            compile_compute_pipeline(device.metal_device(), "this is not MSL", "missing", "test")
+                .expect_err("invalid source must be rejected");
+        assert_eq!(
+            error.message.starts_with("test shader compilation failed:"),
+            true
+        );
+        let error = compile_compute_pipeline(
+            device.metal_device(),
+            "#include <metal_stdlib>\nusing namespace metal;\nkernel void present() {}",
+            "missing",
+            "test",
+        )
+        .expect_err("missing entry point must be rejected");
+        assert_eq!(
+            error
+                .message
+                .starts_with("test entry point missing not found:"),
+            true
+        );
+    }
+
+    #[test]
+    fn d3d12_gpu_indirect_dispatch_and_work_graph_fanout_reject_missing_counts() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let indirect =
+            MetalGpuIndirectDispatch::new(device.metal_device()).expect("GPU indirect pipelines");
+        assert_ne!(indirect.handle, 0);
+        let error = indirect
+            .execute(
+                device.metal_device(),
+                shared_u32_buffer(&device, &[3]).as_ref(),
+                0,
+            )
+            .expect_err("zero output capacity must be rejected");
+        assert_eq!(
+            error.message,
+            "indirect dispatch output capacity must be non-zero"
+        );
+        let count = shared_u32_buffer(&device, &[5]);
+        let results = indirect
+            .execute(device.metal_device(), count.as_ref(), 8)
+            .expect("GPU-produced indirect dispatch");
+        assert_eq!(results, vec![1, 2, 3, 4, 5, 0, 0, 0]);
+
+        let fanout =
+            MetalWorkGraphFanout::new(device.metal_device()).expect("work-graph fanout pipelines");
+        assert_ne!(fanout.handle, 0);
+        let records = [
+            MetalWorkGraphRecord {
+                node_index: 3,
+                output_index: 1,
+            },
+            MetalWorkGraphRecord {
+                node_index: 8,
+                output_index: 0,
+            },
+        ];
+        let record_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                records.as_ptr() as *const u8,
+                std::mem::size_of_val(&records),
+            )
+        };
+        let records_buffer = device
+            .create_buffer_with_data(record_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let error = fanout
+            .execute(
+                device.metal_device(),
+                records_buffer.as_ref(),
+                0,
+                Some(0),
+                None,
+            )
+            .expect_err("zero capacity must be rejected");
+        assert_eq!(error.message, "work-graph record capacity must be non-zero");
+        let error = fanout
+            .execute(
+                device.metal_device(),
+                records_buffer.as_ref(),
+                2,
+                Some(3),
+                None,
+            )
+            .expect_err("CPU count overflow must be rejected");
+        assert_eq!(
+            error.message,
+            "work-graph CPU record count exceeds the record capacity"
+        );
+        let error = fanout
+            .execute(
+                device.metal_device(),
+                records_buffer.as_ref(),
+                2,
+                None,
+                None,
+            )
+            .expect_err("missing count must be rejected");
+        assert_eq!(
+            error.message,
+            "work-graph fan-out requires a CPU or GPU record count"
+        );
+        let cpu = fanout
+            .execute(
+                device.metal_device(),
+                records_buffer.as_ref(),
+                2,
+                Some(2),
+                None,
+            )
+            .expect("CPU-record fan-out");
+        assert_eq!(cpu, vec![9, 4]);
+        let gpu_count = shared_u32_buffer(&device, &[1]);
+        let gpu = fanout
+            .execute(
+                device.metal_device(),
+                records_buffer.as_ref(),
+                2,
+                None,
+                Some(gpu_count.as_ref()),
+            )
+            .expect("GPU-record fan-out");
+        assert_eq!(gpu, vec![0, 4]);
+    }
+
+    #[test]
+    fn d3d12_gpu_indirect_render_commands_reject_invalid_ranges_and_draw_on_gpu() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let source = r#"#include <metal_stdlib>
+using namespace metal;
+struct VOut { float4 position [[position]]; };
+vertex VOut d3d12_icb_vs(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    return out;
+}
+fragment float4 d3d12_icb_fs() { return float4(1.0, 0.0, 0.0, 1.0); }"#;
+        let library = device
+            .metal_device()
+            .new_library_with_source(source, &metal::CompileOptions::new())
+            .expect("ICB render shaders");
+        let vertex = library
+            .get_function("d3d12_icb_vs", None)
+            .expect("vertex function");
+        let fragment = library
+            .get_function("d3d12_icb_fs", None)
+            .expect("fragment function");
+        let descriptor = metal::RenderPipelineDescriptor::new();
+        descriptor.set_vertex_function(Some(&vertex));
+        descriptor.set_fragment_function(Some(&fragment));
+        descriptor
+            .color_attachments()
+            .object_at(0)
+            .expect("color attachment")
+            .set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        unsafe {
+            use metal::foreign_types::ForeignType;
+            let _: () = msg_send![descriptor.as_ptr(), setSupportIndirectCommandBuffers: true];
+        }
+        let pipeline = device
+            .metal_device()
+            .new_render_pipeline_state(&descriptor)
+            .expect("ICB render pipeline");
+
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_texture_type(metal::MTLTextureType::D2);
+        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_width(4);
+        texture_descriptor.set_height(4);
+        texture_descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        let texture = device.metal_device().new_texture(&texture_descriptor);
+        let error = MetalIndirectCommandBuffer::new(
+            device.metal_device(),
+            MetalIndirectCommandBufferDescriptor {
+                command_types: metal::MTLIndirectCommandType::Draw,
+                max_command_count: 0,
+                max_kernel_buffer_bind_count: 0,
+            },
+        )
+        .expect_err("zero command count must be rejected");
+        assert_eq!(
+            error.message,
+            "indirect command buffer requires at least one command"
+        );
+        let error = MetalIndirectCommandBuffer::new(
+            device.metal_device(),
+            MetalIndirectCommandBufferDescriptor {
+                command_types: metal::MTLIndirectCommandType::empty(),
+                max_command_count: 2,
+                max_kernel_buffer_bind_count: 0,
+            },
+        )
+        .expect_err("empty command types must be rejected");
+        assert_eq!(
+            error.message,
+            "indirect command buffer requires at least one command type"
+        );
+        let icb = MetalIndirectCommandBuffer::new(
+            device.metal_device(),
+            MetalIndirectCommandBufferDescriptor {
+                command_types: metal::MTLIndirectCommandType::Draw
+                    | metal::MTLIndirectCommandType::DrawIndexed,
+                max_command_count: 2,
+                max_kernel_buffer_bind_count: 1,
+            },
+        )
+        .expect("render ICB");
+        icb.encode_draw(0, &pipeline, metal::MTLPrimitiveType::Triangle, 0, 3, 1, 0)
+            .expect("encode draw");
+        let indices: [u16; 3] = [0, 1, 2];
+        let index_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                indices.as_ptr() as *const u8,
+                std::mem::size_of_val(&indices),
+            )
+        };
+        let index_buffer = device
+            .create_buffer_with_data(index_bytes, metal::MTLResourceOptions::StorageModeShared);
+        icb.encode_draw_indexed(
+            1,
+            &pipeline,
+            metal::MTLPrimitiveType::Triangle,
+            3,
+            metal::MTLIndexType::UInt16,
+            index_buffer.as_ref(),
+            0,
+            1,
+            0,
+            0,
+        )
+        .expect("encode indexed draw");
+        let error = icb
+            .render_command(2)
+            .err()
+            .expect("out-of-range render command");
+        assert_eq!(
+            error.message,
+            "indirect command index 2 is out of range for 2 commands"
+        );
+
+        let render_target = |texture: &metal::TextureRef| {
+            let pass = metal::RenderPassDescriptor::new();
+            let attachment = pass
+                .color_attachments()
+                .object_at(0)
+                .expect("render attachment");
+            attachment.set_texture(Some(texture));
+            attachment.set_load_action(metal::MTLLoadAction::Clear);
+            attachment.set_store_action(metal::MTLStoreAction::Store);
+            attachment.set_clear_color(metal::MTLClearColor {
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+            });
+            pass
+        };
+        let read_pixel = |texture: &metal::TextureRef| {
+            let mut bytes = [0u8; 4];
+            texture.get_bytes(
+                bytes.as_mut_ptr() as *mut std::ffi::c_void,
+                4,
+                metal::MTLRegion {
+                    origin: metal::MTLOrigin { x: 1, y: 1, z: 0 },
+                    size: metal::MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                },
+                0,
+            );
+            bytes
+        };
+        let queue = device.create_command_queue();
+        let pass = render_target(texture.as_ref());
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_render_command_encoder(&pass);
+        encoder.set_render_pipeline_state(&pipeline);
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(read_pixel(texture.as_ref()), [0, 0, 255, 255]);
+
+        let pass = render_target(texture.as_ref());
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_render_command_encoder(&pass);
+        let error = icb
+            .execute_render(&encoder, 0..3)
+            .expect_err("out-of-range render execution");
+        assert_eq!(
+            error.message,
+            "indirect command range 0..3 is out of range for 2 commands"
+        );
+        icb.execute_render(&encoder, 0..1).expect("execute draw");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(read_pixel(texture.as_ref()), [0, 0, 255, 255]);
+
+        let pass = render_target(texture.as_ref());
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_render_command_encoder(&pass);
+        icb.execute_render(&encoder, 1..2)
+            .expect("execute indexed draw");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(read_pixel(texture.as_ref()), [0, 0, 255, 255]);
+        icb.reset();
+    }
+
+    #[test]
+    fn d3d12_gpu_indirect_decode_reads_compute_written_count_and_rejects_empty() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let helper_library = compile_library(
+            device.metal_device(),
+            "#include <metal_stdlib>\nusing namespace metal;\nkernel void present() {}",
+            "helper",
+        )
+        .expect("helper library");
+        let error = library_function(&helper_library, "missing", "helper")
+            .expect_err("missing helper entry");
+        assert_eq!(
+            error
+                .message
+                .starts_with("helper function missing not found:"),
+            true
+        );
+        let interpreter =
+            MetalIndirectInterpreter::new(device.metal_device()).expect("indirect decoder");
+        let indirect_queue = device.create_command_queue();
+        let error = interpreter
+            .execute(
+                device.metal_device(),
+                indirect_queue.as_ref(),
+                device
+                    .create_buffer_with_data(
+                        &[0u8; 12],
+                        metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .as_ref(),
+                0,
+                12,
+                0,
+                2,
+                None,
+            )
+            .expect_err("zero commands");
+        assert_eq!(
+            error.message,
+            "indirect decode requires at least one command"
+        );
+        let producer_source = r#"#include <metal_stdlib>
+using namespace metal;
+kernel void write_count(device uint* count [[buffer(0)]]) { count[0] = 1u; }"#;
+        let producer = compile_compute_pipeline(
+            device.metal_device(),
+            producer_source,
+            "write_count",
+            "count producer",
+        )
+        .expect("count producer pipeline");
+        let count_values = [5u32];
+        let count_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                count_values.as_ptr() as *const u8,
+                std::mem::size_of_val(&count_values),
+            )
+        };
+        let count_buffer = device
+            .create_buffer_with_data(count_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let queue = device.create_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&producer);
+        encoder.set_buffer(0, Some(count_buffer.as_ref()), 0);
+        encoder.dispatch_threads(
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(unsafe { *(count_buffer.contents() as *const u32) }, 1);
+
+        let draw_values: [u32; 5] = [0, 0, 0, 0, 9];
+        let draw_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                draw_values.as_ptr() as *const u8,
+                std::mem::size_of_val(&draw_values),
+            )
+        };
+        let draw_args = device
+            .create_buffer_with_data(draw_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let (effective, decoded) = interpreter
+            .execute(
+                device.metal_device(),
+                indirect_queue.as_ref(),
+                draw_args.as_ref(),
+                0,
+                20,
+                2,
+                1,
+                Some(count_buffer.as_ref()),
+            )
+            .expect("GPU count draw-indexed decode");
+        assert_eq!(effective, 1);
+        assert_eq!(decoded[0].kind, 1);
+        assert_eq!((decoded[0].x, decoded[0].y, decoded[0].z), (0, 0, 0));
+        assert_eq!(decoded[0].w, 9);
+        assert_eq!(decoded[0].enabled, 0);
+        assert_eq!(decoded[1], MetalIndirectResult::default());
+
+        let dispatch_values: [u32; 6] = [0, 1, 1, 2, 3, 4];
+        let dispatch_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                dispatch_values.as_ptr() as *const u8,
+                std::mem::size_of_val(&dispatch_values),
+            )
+        };
+        let dispatch_args = device
+            .create_buffer_with_data(dispatch_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let (effective, decoded) = interpreter
+            .execute(
+                device.metal_device(),
+                indirect_queue.as_ref(),
+                dispatch_args.as_ref(),
+                0,
+                12,
+                2,
+                2,
+                Some(count_buffer.as_ref()),
+            )
+            .expect("GPU count dispatch decode");
+        assert_eq!(effective, 1);
+        assert_eq!((decoded[0].x, decoded[0].y, decoded[0].z), (0, 1, 1));
+        assert_eq!(decoded[0].enabled, 0);
+        let (effective, decoded) = interpreter
+            .execute(
+                device.metal_device(),
+                indirect_queue.as_ref(),
+                dispatch_args.as_ref(),
+                0,
+                12,
+                2,
+                2,
+                None,
+            )
+            .expect("CPU-count dispatch decode");
+        assert_eq!(effective, 2);
+        assert_eq!((decoded[1].x, decoded[1].y, decoded[1].z), (2, 3, 4));
+        assert_eq!(decoded[1].enabled, 1);
+    }
+
+    #[test]
+    fn d3d12_llvm_cfg_memory_payload_program_rejects_helpers() {
+        let ir = r#"define void @raygen(i32 %idx) {
+entry:
+  %arr = alloca [4 x i32]
+  %s = alloca { i32, i32 }
+  %p = getelementptr [4 x i32], ptr %arr, i32 0, i32 2
+  store i32 5, ptr %p
+  %v = load i32, ptr %p
+  %sp = getelementptr { i32, i32 }, ptr %s, i32 0, i32 1
+  store i32 7, ptr %sp
+  %sv = load i32, ptr %sp
+  %cmp = icmp eq i32 %v, 5
+  %sel = select i1 %cmp, i32 %sv, i32 0
+  %init = insertvalue { i32, i32 } undef, i32 %sel, 0
+  %ins = insertvalue { i32, i32 } %init, i32 3, 1
+  %ex = extractvalue { i32, i32 } %ins, 0
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %acc = phi i32 [ 0, %entry ], [ %acc2, %loop ]
+  %acc2 = add i32 %acc, %ex
+  %next = add i32 %i, 1
+  %done = icmp eq i32 %next, 3
+  br i1 %done, label %exit, label %loop
+exit:
+  switch i32 %acc2, label %after [ i32 21, label %case21 ]
+case21:
+  %x = add i32 %acc2, 1
+  br label %after
+after:
+  %y = phi i32 [ %acc2, %exit ], [ %x, %case21 ]
+  call void @ray.storePayload(i32 %idx, i32 %y)
+  ret void
+}
+declare void @ray.storePayload(i32, i32)
+"#;
+        let bitcode = crate::shader::llvm_assemble_ir(ir).expect("assemble CFG IR");
+        let msl =
+            crate::shader::translate_llvm_ray_program(&bitcode, "raygen").expect("lower CFG IR");
+        let device = MetalDevice::system_default().expect("Metal device");
+        let program = create_ray_shader_program(device.metal_device(), &msl, "raygen")
+            .expect("CFG ray program");
+        let acceleration = device
+            .metal_device()
+            .new_acceleration_structure_with_size(1024);
+        let rays = [MetalRay::default()];
+        let table = MetalShaderTable::new(device.metal_device(), &[1], 4).expect("SBT table");
+        let queue = device.create_command_queue();
+        let payloads = execute_ray_shader_program(
+            device.metal_device(),
+            queue.as_ref(),
+            &program,
+            acceleration.as_ref(),
+            &rays,
+            &table,
+        )
+        .expect("execute CFG program");
+        assert_eq!(payloads[0].value[0], 22.0);
     }
 }

@@ -12,6 +12,10 @@ evidence record, keeping ci/check_release_gate.sh checks satisfied:
   * `api_report_provenance_sha256`   sha256 of the canonical inline provenance
   * `tree`                           HEAD tree hash recorded by the sidecar
   * `api_report_ci_run_id/url`       optional CI run that produced the artifact
+  * `test_manifest`                  basename of the compiled test manifest
+  * `test_manifest_sha256`           sha256 of the manifest bytes
+  * `test_manifest_canonical_sha256` canonical manifest digest (the manifest
+                                     hash recorded inside the document)
 
 The outer evidence file and, when given, its embedded peer copy are written
 with identical bytes (the release gate requires them byte-identical).
@@ -22,10 +26,11 @@ Usage:
         --peer e2e-evidence/steam-e2e-evidence/release-evidence.json \
         --report e2e-evidence/api-completeness.json \
         --provenance e2e-evidence/api-completeness.json.provenance.json \
+        --test-manifest e2e-evidence/test-manifest.json \
         [--ci-run-id <id>] [--ci-run-url <url>]
 
 Fails closed (non-zero, message on stderr) on any missing file, parse error,
-hash mismatch, or cross-file commit/tree disagreement.
+hash mismatch, stale/unbound manifest, or cross-file commit/tree disagreement.
 """
 
 from __future__ import annotations
@@ -36,6 +41,12 @@ import json
 import os
 import subprocess
 import sys
+
+CI_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(CI_DIR)
+sys.path.insert(0, CI_DIR)
+
+from evidence_manifest import manifest_digest, verify_document  # noqa: E402
 
 REQUIRED_PROVENANCE_FIELDS = (
     "commit",
@@ -67,11 +78,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--peer", default="", help="embedded copy that must stay byte-identical")
     parser.add_argument("--report", required=True, help="api-completeness.json from CI")
     parser.add_argument("--provenance", required=True, help="provenance sidecar from CI")
+    parser.add_argument(
+        "--test-manifest",
+        required=True,
+        help="compiled test manifest from the CI test job",
+    )
     parser.add_argument("--ci-run-id", default="", help="CI run id that produced the artifact")
     parser.add_argument("--ci-run-url", default="", help="CI run URL for the record")
     args = parser.parse_args(argv)
 
-    for path in (args.evidence, args.report, args.provenance):
+    for path in (args.evidence, args.report, args.provenance, args.test_manifest):
         if not os.path.isfile(path):
             fail(f"required file not found: {path}")
             return 1
@@ -146,6 +162,32 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
+    try:
+        with open(args.test_manifest, encoding="utf-8") as handle:
+            test_manifest = json.load(handle)
+    except Exception as exc:  # noqa: BLE001 - CLI must report parse failures
+        fail(f"cannot parse test manifest {args.test_manifest}: {exc}")
+        return 1
+    manifest_errors = verify_document(test_manifest, require_head=True)
+    if manifest_errors:
+        for error in manifest_errors:
+            fail(f"test manifest: {error}")
+        return 1
+    if test_manifest.get("commit") != provenance["commit"]:
+        fail(
+            f"test manifest commit ({test_manifest.get('commit')}) does not match "
+            f"provenance commit ({provenance['commit']})"
+        )
+        return 1
+    if test_manifest.get("tree") != provenance["tree"]:
+        fail(
+            f"test manifest tree ({test_manifest.get('tree')}) does not match "
+            f"provenance tree ({provenance['tree']})"
+        )
+        return 1
+    test_manifest_sha = sha256_file(args.test_manifest)
+    test_manifest_digest = manifest_digest(test_manifest)
+
     inline_provenance = json.loads(canonical_json(provenance))
     evidence["api_report"] = os.path.basename(args.report)
     evidence["api_report_sha256"] = report_sha
@@ -154,6 +196,9 @@ def main(argv: list[str]) -> int:
     evidence["api_report_provenance_sha256"] = hashlib.sha256(
         canonical_json(inline_provenance).encode("utf-8")
     ).hexdigest()
+    evidence["test_manifest"] = os.path.basename(args.test_manifest)
+    evidence["test_manifest_sha256"] = test_manifest_sha
+    evidence["test_manifest_canonical_sha256"] = test_manifest_digest
     evidence["tree"] = provenance["tree"]
     if args.ci_run_id:
         evidence["api_report_ci_run_id"] = args.ci_run_id
@@ -174,9 +219,11 @@ def main(argv: list[str]) -> int:
                 return 1
 
     print(
-        "api-report provenance folded: "
+        "api-report provenance + test manifest folded: "
         f"commit={provenance['commit']} tree={provenance['tree']} "
-        f"report_sha256={report_sha} canonical={canonical_sha}"
+        f"report_sha256={report_sha} canonical={canonical_sha} "
+        f"test_manifest_sha256={test_manifest_sha} "
+        f"test_manifest_canonical={test_manifest_digest}"
     )
     return 0
 

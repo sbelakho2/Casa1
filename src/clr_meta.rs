@@ -455,6 +455,11 @@ pub(crate) enum ClrObject {
         runtimes: Vec<ClrRuntime>,
         cursor: usize,
     },
+    RuntimeHost {
+        refcount: u32,
+        runtime: ClrRuntime,
+        started: bool,
+    },
 }
 
 impl ClrObject {
@@ -463,7 +468,8 @@ impl ClrObject {
         match self {
             Self::MetaHost { refcount }
             | Self::RuntimeInfo { refcount, .. }
-            | Self::Enumerator { refcount, .. } => *refcount,
+            | Self::Enumerator { refcount, .. }
+            | Self::RuntimeHost { refcount, .. } => *refcount,
         }
     }
 
@@ -471,7 +477,8 @@ impl ClrObject {
         match self {
             Self::MetaHost { refcount }
             | Self::RuntimeInfo { refcount, .. }
-            | Self::Enumerator { refcount, .. } => *refcount = value,
+            | Self::Enumerator { refcount, .. }
+            | Self::RuntimeHost { refcount, .. } => *refcount = value,
         }
     }
 }
@@ -550,6 +557,50 @@ impl ClrHostObjects {
         );
     }
 
+    pub(crate) fn insert_runtime_host(&self, pid: u32, address: u64, runtime: ClrRuntime) {
+        let mut table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        table.objects.insert(
+            (pid, address),
+            ClrObject::RuntimeHost {
+                refcount: 1,
+                runtime,
+                started: false,
+            },
+        );
+    }
+
+    /// Run `body` with an `ICLRRuntimeHost` object's runtime and mark it
+    /// started for the `GetCurrentAppDomainId` contract.
+    pub(crate) fn start_runtime_host(&self, pid: u32, address: u64) -> Option<()> {
+        let mut table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match table.objects.get_mut(&(pid, address)) {
+            Some(ClrObject::RuntimeHost { started, .. }) => {
+                *started = true;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn runtime_host_state(&self, pid: u32, address: u64) -> Option<(ClrRuntime, bool)> {
+        let table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match table.objects.get(&(pid, address)) {
+            Some(ClrObject::RuntimeHost {
+                runtime, started, ..
+            }) => Some((runtime.clone(), *started)),
+            _ => None,
+        }
+    }
+
     /// Add one reference.  Returns the new count, or `None` for an unknown
     /// object (the guest passed a pointer that is not a CLR object).
     pub(crate) fn add_ref(&self, pid: u32, address: u64) -> Option<u32> {
@@ -578,6 +629,18 @@ impl ClrHostObjects {
             object.set_refcount(next);
         }
         Some(next)
+    }
+
+    /// The runtime behind a runtime-info object, without recording a status.
+    pub(crate) fn runtime_info(&self, pid: u32, address: u64) -> Option<ClrRuntime> {
+        let table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match table.objects.get(&(pid, address)) {
+            Some(ClrObject::RuntimeInfo { runtime, .. }) => Some(runtime.clone()),
+            _ => None,
+        }
     }
 
     #[allow(dead_code)] // refcount assertions in the adversarial tests
@@ -1281,6 +1344,11 @@ mod tests {
         assert_eq!(objects.loaded_versions(1), Vec::<String>::new());
         assert_eq!(objects.is_loaded(1, "8.0.31"), false);
         assert_eq!(objects.set_thread_pinned(1, true), false);
+        assert_eq!(
+            objects.start_runtime_host(1, 0x1000),
+            None,
+            "a meta host cannot be started as a runtime host"
+        );
     }
 
     #[test]
