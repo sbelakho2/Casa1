@@ -3058,6 +3058,12 @@
  "duplicate_file_handle_survives_source_close": [
   "(bytes, b\"steam\")"
  ],
+ "duplicate_handle_aliases_tagged_usb_handles_until_last_close": [
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, duplicate, &[process, source, process, out as u32, 0, 0, 0], ), 1 )",
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, close, &[alias]), 1 )",
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, close, &[source]), 1 )",
+  "(alias, source)"
+ ],
  "duplicate_handle_checks_access": [
   "( manager.duplicate_handle(1, source, 2, FILE_WRITE_DATA, false), Err(STATUS_ACCESS_DENIED) )",
   "(manager.require_access(2, dup, FILE_READ_DATA).unwrap(), id)",
@@ -3102,6 +3108,14 @@
   "( manager.connect(request(0x500, 0x31)), Err(STATUS_OBJECT_NAME_COLLISION) )",
   "( manager.connect(request(0x501, 0x30)), Err(STATUS_OBJECT_NAME_COLLISION) )",
   "(manager.vector_objects(0x40), vec![0x600, 0x601])"
+ ],
+ "duplicated_serial_and_usb_handles_share_lifetime_until_last_close": [
+  "( serial_config(serial).expect(\"config\").baud_rate, SerialConfig::default().baud_rate )",
+  "( duplicate_serial(serial), Err(DeviceError::NotOpen { id: StableDeviceId::from_raw(serial) }) )",
+  "(usb_device_id(usb_copy), Ok(device_id))",
+  "( duplicate_usb(usb), Err(DeviceError::NotOpen { id: StableDeviceId::from_raw(usb) }) )",
+  "(serial_copy, serial)",
+  "(usb_copy, usb)"
  ],
  "dwm_window_attribute_dispatch": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, get, &[ 0x10_000, 0, /* DWMWA_NCRENDERING_ENABLED */ value as u32, 4 ] ), 0, \"DwmGetWindowAttribute(DWMWA_NCRENDERING_ENABLED) returns S_OK\" )",
