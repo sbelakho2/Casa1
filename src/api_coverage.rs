@@ -442,6 +442,28 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:evidence_ui_gdi_focus_and_message_a_thunks",
     ),
     evidence_conformance("user32.dll", "MessageBoxW", "casa1-conformance:section1"),
+    // Real physical-device bridge: raw-input registration and payloads come
+    // from IOKit HID devices, not synthetic descriptors.
+    conformance(
+        "user32.dll",
+        "RegisterRawInputDevices",
+        "casa1-conformance:real_hid_report_feed_builds_wm_input_and_raw_data_exactly",
+    ),
+    conformance(
+        "user32.dll",
+        "GetRawInputData",
+        "casa1-conformance:real_hid_report_feed_builds_wm_input_and_raw_data_exactly",
+    ),
+    conformance(
+        "user32.dll",
+        "GetRawInputDeviceInfoW",
+        "casa1-conformance:physical_raw_input_tables_and_device_info_sizes_are_real",
+    ),
+    conformance(
+        "user32.dll",
+        "GetRegisteredRawInputDevices",
+        "casa1-conformance:raw_input_registration_flags_and_remove_edges_are_exact",
+    ),
     evidence_conformance(
         "user32.dll",
         "MonitorFromPoint",
@@ -6567,6 +6589,46 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     ),
     conformance(
         "kernel32.dll",
+        "DeviceIoControl",
+        "casa1-conformance:usb_dispatch_ioctls_enumerate_validate_and_reject_stale",
+    ),
+    conformance(
+        "kernel32.dll",
+        "GetCommState",
+        "casa1-conformance:serial_comm_ioctls_roundtrip_and_config_boundaries",
+    ),
+    conformance(
+        "kernel32.dll",
+        "SetCommState",
+        "casa1-conformance:serial_comm_ioctls_roundtrip_and_config_boundaries",
+    ),
+    conformance(
+        "kernel32.dll",
+        "GetCommTimeouts",
+        "casa1-conformance:serial_comm_ioctls_roundtrip_and_config_boundaries",
+    ),
+    conformance(
+        "kernel32.dll",
+        "SetCommTimeouts",
+        "casa1-conformance:serial_comm_ioctls_roundtrip_and_config_boundaries",
+    ),
+    conformance(
+        "kernel32.dll",
+        "PurgeComm",
+        "casa1-conformance:serial_comm_ioctls_roundtrip_and_config_boundaries",
+    ),
+    conformance(
+        "kernel32.dll",
+        "ClearCommError",
+        "casa1-conformance:serial_comm_ioctls_roundtrip_and_config_boundaries",
+    ),
+    conformance(
+        "kernel32.dll",
+        "EscapeCommFunction",
+        "casa1-conformance:serial_com_dispatch_rejects_invalid_busy_and_stale_handles",
+    ),
+    conformance(
+        "kernel32.dll",
         "FindResourceA",
         "casa1-conformance:section11",
     ),
@@ -9825,6 +9887,21 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "d3d12.dll",
         "D3D12CreateDevice",
         "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    conformance(
+        "tbs.dll",
+        "Tbsi_Context_Create",
+        "casa1-conformance:tbs_tpm_dispatch_rejects_bad_contracts_and_runs_startup_exactly",
+    ),
+    conformance(
+        "tbs.dll",
+        "Tbsip_Submit_Command",
+        "casa1-conformance:tbs_tpm_dispatch_rejects_bad_contracts_and_runs_startup_exactly",
+    ),
+    conformance(
+        "tbs.dll",
+        "Tbsip_Context_Close",
+        "casa1-conformance:tbs_tpm_dispatch_rejects_bad_contracts_and_runs_startup_exactly",
     ),
     conformance(
         "d3d8thk.dll",

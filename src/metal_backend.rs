@@ -11047,12 +11047,29 @@ pub struct MetalShaderTable {
     pub buffer: metal::Buffer,
     /// Number of records.
     pub record_count: u32,
+    /// Bytes between consecutive records.
+    pub stride: u64,
+    /// Byte offset of the local-root arguments inside a record. The first
+    /// four bytes hold this bridge's SBT group index.
+    pub local_root_offset: u64,
 }
 
 impl MetalShaderTable {
     /// Upload a shader table. Records are `u32` group indices packed at
     /// `stride` bytes per record (D3D12 SBT strides are caller-defined).
     pub fn new(device: &metal::DeviceRef, records: &[u32], stride: u64) -> AppResult<Self> {
+        Self::with_local_roots(device, records, &[], stride)
+    }
+
+    /// Upload a shader table whose records carry `stride - 4` bytes of
+    /// local-root arguments after the group index. `local_roots` is the
+    /// concatenation of every record's local-root bytes (in record order).
+    pub fn with_local_roots(
+        device: &metal::DeviceRef,
+        records: &[u32],
+        local_roots: &[u8],
+        stride: u64,
+    ) -> AppResult<Self> {
         if records.is_empty() {
             return Err(AppError::new(
                 ReasonCode::RcCliInvalid,
@@ -11066,6 +11083,19 @@ impl MetalShaderTable {
                 format!("shader-table record stride {stride} is smaller than {minimum}"),
             ));
         }
+        let local_root_bytes = (stride - minimum) as usize;
+        let expected = local_root_bytes.checked_mul(records.len()).ok_or_else(|| {
+            AppError::new(ReasonCode::RcCliInvalid, "shader-table range overflows")
+        })?;
+        if !local_roots.is_empty() && local_roots.len() != expected {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "shader-table local-root bytes {} do not match {expected}",
+                    local_roots.len()
+                ),
+            ));
+        }
         let bytes = stride.checked_mul(records.len() as u64).ok_or_else(|| {
             AppError::new(ReasonCode::RcCliInvalid, "shader-table range overflows")
         })?;
@@ -11073,6 +11103,11 @@ impl MetalShaderTable {
         for (index, record) in records.iter().enumerate() {
             let offset = index * stride as usize;
             data[offset..offset + 4].copy_from_slice(&record.to_le_bytes());
+            if !local_roots.is_empty() {
+                let source = index * local_root_bytes;
+                data[offset + 4..offset + 4 + local_root_bytes]
+                    .copy_from_slice(&local_roots[source..source + local_root_bytes]);
+            }
         }
         let buffer = device.new_buffer_with_data(
             data.as_ptr() as *const std::ffi::c_void,
@@ -11082,6 +11117,8 @@ impl MetalShaderTable {
         Ok(Self {
             buffer,
             record_count: records.len() as u32,
+            stride,
+            local_root_offset: std::mem::size_of::<u32>() as u64,
         })
     }
 }
@@ -11647,7 +11684,11 @@ pub fn execute_native_render_pass(
 }
 
 /// GPU result produced by a translated ray-generation shader.
-#[repr(C)]
+///
+/// The layout mirrors the MSL `RayPayloadResult` emitted by
+/// `crate::shader::translate_llvm_ray_program`. Every field after `value` is
+/// 32-bit so the Rust `#[repr(C)]` and Metal C layouts agree.
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MetalRayPayloadResult {
     /// Payload value written by the hit/miss/callable path.
@@ -11656,6 +11697,138 @@ pub struct MetalRayPayloadResult {
     pub instance_id: u32,
     /// Primitive ID reported by traversal.
     pub primitive_id: u32,
+    /// Distance to the current hit (0 on a miss).
+    pub distance: f32,
+    /// D3D12 hit kind (0xFE for a built-in triangle hit, 0 on a miss).
+    pub hit_kind: u32,
+    /// Ray dispatch dimensions (x, y, z).
+    pub dispatch: [u32; 3],
+    /// Raw 32-bit payload words written by `ray.storePayloadField`.
+    pub payload: [u32; crate::shader::RAY_PAYLOAD_WORDS],
+    /// Triangle barycentric coordinates (x, y) of the hit.
+    pub barycentrics: [f32; 2],
+    /// Ray origin transformed into the hit instance's object space.
+    pub object_origin: [f32; 3],
+    /// Ray direction transformed into the hit instance's object space.
+    pub object_direction: [f32; 3],
+    /// Object-to-world transform rows as stored by D3D12 (row-major 3x4).
+    pub object_to_world: [f32; 12],
+    /// World-to-object inverse rows, row-major 3x4.
+    pub world_to_object: [f32; 12],
+    /// DXR ray flags supplied to the most recent trace call.
+    pub ray_flags: u32,
+    /// DXR ray TMax for the most recent trace call.
+    pub ray_tmax: f32,
+    /// Geometry index reported by the candidate.
+    pub ray_geometry_index: u32,
+    /// DXR candidate type (0 = triangle, 1 = procedural).
+    pub candidate_type: u32,
+    /// Candidate instance ID.
+    pub candidate_instance: u32,
+    /// Candidate primitive ID.
+    pub candidate_primitive: u32,
+    /// Candidate geometry index.
+    pub candidate_geometry: u32,
+    /// Candidate object-space ray origin.
+    pub candidate_object_origin: [f32; 3],
+    /// Candidate object-space ray direction.
+    pub candidate_object_direction: [f32; 3],
+    /// Candidate object-to-world rows (row-major 3x4).
+    pub candidate_object_to_world: [f32; 12],
+    /// Candidate world-to-object rows (row-major 3x4).
+    pub candidate_world_to_object: [f32; 12],
+    /// Hit attributes produced by `reportHit`/barycentrics.
+    pub attributes: [f32; 4],
+    /// Any-hit accepted the candidate.
+    pub accepted: u32,
+    /// Any-hit requested the search to end.
+    pub end_search: u32,
+    /// Any-hit ignored the candidate.
+    pub ignored: u32,
+}
+
+impl MetalRayPayloadResult {
+    /// Read one 32-bit payload word, or `None` when the field is out of range.
+    pub fn payload_word(&self, field: usize) -> Option<u32> {
+        self.payload.get(field).copied()
+    }
+
+    /// Read one payload word reinterpreted as `f32`, or `None` when out of
+    /// range.
+    pub fn payload_float(&self, field: usize) -> Option<f32> {
+        self.payload.get(field).map(|word| f32::from_bits(*word))
+    }
+}
+
+/// Dispatch dimensions supplied to a translated ray-generation kernel.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalRayDispatchInfo {
+    /// DispatchRays width.
+    pub width: u32,
+    /// DispatchRays height.
+    pub height: u32,
+    /// DispatchRays depth.
+    pub depth: u32,
+}
+
+impl Default for MetalRayDispatchInfo {
+    fn default() -> Self {
+        Self {
+            width: 1,
+            height: 1,
+            depth: 1,
+        }
+    }
+}
+
+/// Per-instance geometry binding for ray attribute fetch.
+///
+/// `vertex_offset` and `index_offset` index the flattened attribute/index
+/// arrays uploaded with a ray dispatch, and `triangle_count` bounds the
+/// primitive IDs reported by Metal.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetalRayGeometryBinding {
+    /// First entry in the flattened vertex-attribute array.
+    pub vertex_offset: u32,
+    /// First entry in the flattened triangle-index array.
+    pub index_offset: u32,
+    /// Number of triangles in this instance.
+    pub triangle_count: u32,
+    /// Reserved for alignment.
+    pub reserved: u32,
+}
+
+/// One procedural AABB candidate supplied to the compute traversal.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MetalRayAabb {
+    /// Object-space AABB minimum.
+    pub min: [f32; 3],
+    /// Object-space AABB maximum.
+    pub max: [f32; 3],
+    /// TLAS instance containing this box.
+    pub instance_id: u32,
+    /// Geometry index reported to the intersection stage.
+    pub geometry_index: u32,
+    /// SBT group selecting the intersection export.
+    pub group: u32,
+    /// Reserved for alignment.
+    pub reserved: u32,
+}
+
+/// Flattened vertex/index/procedural data for one ray dispatch.
+#[derive(Debug, Clone, Default)]
+pub struct MetalRayGeometryData {
+    /// Per-vertex attributes (first four components of the vertex).
+    pub vertices: Vec<[f32; 4]>,
+    /// Triangle corner indices into `vertices`.
+    pub indices: Vec<u32>,
+    /// Per-instance offsets into `vertices`/`indices`.
+    pub bindings: Vec<MetalRayGeometryBinding>,
+    /// Procedural AABB candidates.
+    pub aabbs: Vec<MetalRayAabb>,
 }
 
 /// A compiled translated ray-generation program.
@@ -11690,8 +11863,75 @@ pub fn create_ray_shader_program(
     })
 }
 
+/// Identity object-to-world rows in D3D12's row-major 3x4 layout.
+pub const RAY_INSTANCE_IDENTITY_ROWS: [f32; 12] = [
+    1.0, 0.0, 0.0, 0.0, //
+    0.0, 1.0, 0.0, 0.0, //
+    0.0, 0.0, 1.0, 0.0,
+];
+
+/// Transpose D3D12 row-major 3x4 rows into MSL column-major 4x4 columns.
+///
+/// Translation sits in column 3 (`rows[3]`, `rows[7]`, `rows[11]`) and the
+/// implicit fourth row is `(0, 0, 0, 1)`.
+pub fn transpose_instance_rows(rows: &[f32; 12]) -> [f32; 16] {
+    let mut columns = [0.0f32; 16];
+    for column in 0..4 {
+        for row in 0..3 {
+            columns[column * 4 + row] = rows[row * 4 + column];
+        }
+        columns[column * 4 + 3] = if column == 3 { 1.0 } else { 0.0 };
+    }
+    columns
+}
+
+/// Invert a D3D12 row-major 3x4 object-to-world transform.
+///
+/// Returns the world-to-object rows in the same layout, or `None` when the
+/// linear part is singular (DXR requires instance transforms to be invertible).
+pub fn invert_affine_instance_transform(rows: &[f32; 12]) -> Option<[f32; 12]> {
+    let (a, b, c) = (rows[0], rows[1], rows[2]);
+    let (d, e, f) = (rows[4], rows[5], rows[6]);
+    let (g, h, i) = (rows[8], rows[9], rows[10]);
+    let determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if determinant.abs() <= f32::EPSILON {
+        return None;
+    }
+    let inverse = [
+        (e * i - f * h) / determinant,
+        (c * h - b * i) / determinant,
+        (b * f - c * e) / determinant,
+        (f * g - d * i) / determinant,
+        (a * i - c * g) / determinant,
+        (c * d - a * f) / determinant,
+        (d * h - e * g) / determinant,
+        (b * g - a * h) / determinant,
+        (a * e - b * d) / determinant,
+    ];
+    let (tx, ty, tz) = (rows[3], rows[7], rows[11]);
+    Some([
+        inverse[0],
+        inverse[1],
+        inverse[2],
+        -(inverse[0] * tx + inverse[1] * ty + inverse[2] * tz),
+        inverse[3],
+        inverse[4],
+        inverse[5],
+        -(inverse[3] * tx + inverse[4] * ty + inverse[5] * tz),
+        inverse[6],
+        inverse[7],
+        inverse[8],
+        -(inverse[6] * tx + inverse[7] * ty + inverse[8] * tz),
+    ])
+}
+
 /// Execute a translated ray-generation program against a TLAS with GPU SBT
 /// group records. Returns one payload record per ray.
+///
+/// `instance_transforms` holds the TLAS instance object-to-world rows in
+/// D3D12 row-major 3x4 order. They are transposed to MSL column-major columns
+/// by the kernel (`float4x4(row0, row1, row2, ...)`) and the world-to-object
+/// inverse is precomputed on the CPU.
 pub fn execute_ray_shader_program(
     device: &metal::DeviceRef,
     queue: &metal::CommandQueueRef,
@@ -11699,9 +11939,54 @@ pub fn execute_ray_shader_program(
     acceleration: &metal::AccelerationStructureRef,
     rays: &[MetalRay],
     sbt: &MetalShaderTable,
+    dispatch: MetalRayDispatchInfo,
+    instance_transforms: &[[f32; 12]],
+) -> AppResult<Vec<MetalRayPayloadResult>> {
+    execute_ray_shader_program_with_geometry(
+        device,
+        queue,
+        program,
+        acceleration,
+        rays,
+        sbt,
+        dispatch,
+        instance_transforms,
+        &MetalRayGeometryData::default(),
+    )
+}
+
+/// Execute a translated ray program with per-vertex and procedural geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_ray_shader_program_with_geometry(
+    device: &metal::DeviceRef,
+    queue: &metal::CommandQueueRef,
+    program: &MetalRayShaderProgram,
+    acceleration: &metal::AccelerationStructureRef,
+    rays: &[MetalRay],
+    sbt: &MetalShaderTable,
+    dispatch: MetalRayDispatchInfo,
+    instance_transforms: &[[f32; 12]],
+    geometry: &MetalRayGeometryData,
 ) -> AppResult<Vec<MetalRayPayloadResult>> {
     if rays.is_empty() {
         return Ok(Vec::new());
+    }
+    if instance_transforms.is_empty() {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "ray shader execution requires at least one instance transform",
+        ));
+    }
+    let mut packed_transforms = Vec::with_capacity(instance_transforms.len() * 32);
+    for (index, rows) in instance_transforms.iter().enumerate() {
+        let inverse = invert_affine_instance_transform(rows).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("ray instance transform {index} is singular"),
+            )
+        })?;
+        packed_transforms.extend_from_slice(&transpose_instance_rows(rows));
+        packed_transforms.extend_from_slice(&transpose_instance_rows(&inverse));
     }
     let ray_bytes = std::mem::size_of_val(rays) as u64;
     let ray_buffer = device.new_buffer_with_data(
@@ -11720,6 +12005,78 @@ pub fn execute_ray_shader_program(
         4,
         metal::MTLResourceOptions::StorageModeShared,
     );
+    let transform_buffer = device.new_buffer_with_data(
+        packed_transforms.as_ptr() as *const std::ffi::c_void,
+        std::mem::size_of_val(packed_transforms.as_slice()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let vertex_storage = if geometry.vertices.is_empty() {
+        vec![[0.0f32; 4]]
+    } else {
+        geometry.vertices.clone()
+    };
+    let index_storage = if geometry.indices.is_empty() {
+        vec![0u32]
+    } else {
+        geometry.indices.clone()
+    };
+    let vertex_buffer = device.new_buffer_with_data(
+        vertex_storage.as_ptr().cast::<std::ffi::c_void>(),
+        std::mem::size_of_val(vertex_storage.as_slice()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let index_buffer = device.new_buffer_with_data(
+        index_storage.as_ptr().cast::<std::ffi::c_void>(),
+        std::mem::size_of_val(index_storage.as_slice()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let binding_words: Vec<u32> = geometry
+        .bindings
+        .iter()
+        .flat_map(|binding| {
+            [
+                binding.vertex_offset,
+                binding.index_offset,
+                binding.triangle_count,
+                binding.reserved,
+            ]
+        })
+        .collect();
+    let binding_storage = if binding_words.is_empty() {
+        vec![0u32]
+    } else {
+        binding_words
+    };
+    let aabb_storage = if geometry.aabbs.is_empty() {
+        vec![MetalRayAabb::default()]
+    } else {
+        geometry.aabbs.clone()
+    };
+    let binding_buffer = device.new_buffer_with_data(
+        binding_storage.as_ptr().cast::<std::ffi::c_void>(),
+        std::mem::size_of_val(binding_storage.as_slice()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let aabb_buffer = device.new_buffer_with_data(
+        aabb_storage.as_ptr().cast::<std::ffi::c_void>(),
+        std::mem::size_of_val(aabb_storage.as_slice()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let dispatch_words = [
+        dispatch.width,
+        dispatch.height,
+        dispatch.depth,
+        instance_transforms.len() as u32,
+        sbt.stride as u32,
+        sbt.local_root_offset as u32,
+        geometry.bindings.len() as u32,
+        geometry.aabbs.len() as u32,
+    ];
+    let dispatch_buffer = device.new_buffer_with_data(
+        dispatch_words.as_ptr() as *const std::ffi::c_void,
+        std::mem::size_of_val(&dispatch_words) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&program.pipeline);
@@ -11728,6 +12085,12 @@ pub fn execute_ray_shader_program(
     encoder.set_acceleration_structure(2, Some(acceleration));
     encoder.set_buffer(3, Some(&sbt.buffer), 0);
     encoder.set_buffer(4, Some(&count_buffer), 0);
+    encoder.set_buffer(5, Some(&transform_buffer), 0);
+    encoder.set_buffer(6, Some(&dispatch_buffer), 0);
+    encoder.set_buffer(7, Some(&vertex_buffer), 0);
+    encoder.set_buffer(8, Some(&index_buffer), 0);
+    encoder.set_buffer(9, Some(&binding_buffer), 0);
+    encoder.set_buffer(10, Some(&aabb_buffer), 0);
     encoder.dispatch_threads(
         metal::MTLSize {
             width: rays.len() as u64,
@@ -26171,8 +26534,637 @@ declare void @ray.storePayload(i32, i32)
             acceleration.as_ref(),
             &rays,
             &table,
+            MetalRayDispatchInfo::default(),
+            &[RAY_INSTANCE_IDENTITY_ROWS],
         )
         .expect("execute CFG program");
         assert_eq!(payloads[0].value[0], 22.0);
+    }
+
+    #[test]
+    fn d3d12_llvm_ray_stage_modules_compile_with_candidate_and_control_intrinsics() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let stages = [
+            (
+                crate::shader::ShaderStage::ClosestHit,
+                "msl_closest_hit",
+                true,
+            ),
+            (crate::shader::ShaderStage::AnyHit, "msl_any_hit", true),
+            (crate::shader::ShaderStage::Miss, "msl_miss", true),
+            (crate::shader::ShaderStage::Callable, "msl_callable", true),
+            (
+                crate::shader::ShaderStage::Intersection,
+                "msl_intersection",
+                false,
+            ),
+        ];
+        let ir = r#"define void @stage_entry() {
+entry:
+  %h = call ptr @dx.op.getShaderRecordBufferHandle(i32 0)
+  %p = getelementptr i32, ptr %h, i32 0
+  %local = load i32, ptr %p
+  %flags = call i32 @dx.op.rayFlags(i32 1)
+  %tmax = call float @dx.op.rayTMax(i32 2)
+  %geom = call i32 @dx.op.rayGeometryIndex(i32 3)
+  %ct = call i32 @dx.op.candidateType(i32 4)
+  %ci = call i32 @dx.op.candidateInstanceID(i32 5)
+  %cp = call i32 @dx.op.candidatePrimitiveID(i32 6)
+  %cg = call i32 @dx.op.candidateGeometryIndex(i32 7)
+  %co = call <3 x float> @dx.op.candidateObjectRayOrigin(i32 8)
+  %cd = call <3 x float> @dx.op.candidateObjectRayDirection(i32 9)
+  %cw = call [3 x <4 x float>] @dx.op.candidateWorldToObject3x4(i32 10)
+  %a = call float @dx.op.attributeAtVertex(i32 11, i32 0, i32 0)
+  %r = call i1 @dx.op.reportHit(i32 12, float %tmax, i32 %ct, i32 %ci, ptr null)
+  call void @dx.op.acceptHitAndEndSearch(i32 13)
+  call void @dx.op.ignoreHit(i32 14)
+  call void @dx.op.traceRay(i32 15, ptr null, i32 3, i32 -1, i32 0, i32 1, i32 0, float 0.0, float 0.0, float -1.0, float 0.0, float 0.0, float 0.0, float 1.0, float 100.0, i32 0)
+  call void @dx.op.callShader(i32 16, i32 1, i32 0)
+  call void @ray.storePayloadField(i32 0, i32 %local)
+  call void @ray.storePayloadField(i32 1, i32 %flags)
+  call void @ray.storePayloadField(i32 2, i32 %geom)
+  call void @ray.storePayloadField(i32 3, i32 %cp)
+  call void @ray.storePayloadField(i32 4, i32 %cg)
+  call void @ray.storePayloadField(i32 5, float %a)
+  ret void
+}
+declare ptr @dx.op.getShaderRecordBufferHandle(i32)
+declare i32 @dx.op.rayFlags(i32)
+declare float @dx.op.rayTMax(i32)
+declare i32 @dx.op.rayGeometryIndex(i32)
+declare i32 @dx.op.candidateType(i32)
+declare i32 @dx.op.candidateInstanceID(i32)
+declare i32 @dx.op.candidatePrimitiveID(i32)
+declare i32 @dx.op.candidateGeometryIndex(i32)
+declare <3 x float> @dx.op.candidateObjectRayOrigin(i32)
+declare <3 x float> @dx.op.candidateObjectRayDirection(i32)
+declare [3 x <4 x float>] @dx.op.candidateWorldToObject3x4(i32)
+declare float @dx.op.attributeAtVertex(i32, i32, i32)
+declare i1 @dx.op.reportHit(i32, float, i32, i32, ptr)
+declare void @dx.op.acceptHitAndEndSearch(i32)
+declare void @dx.op.ignoreHit(i32)
+declare void @dx.op.traceRay(i32, ptr, i32, i32, i32, i32, i32, float, float, float, float, float, float, float, float, i32)
+declare void @dx.op.callShader(i32, i32, i32)
+declare void @ray.storePayloadField(i32, ...)
+"#;
+        let bitcode = crate::shader::llvm_assemble_ir(ir).expect("stage IR");
+        for (stage, function, compile) in stages {
+            let source =
+                crate::shader::translate_llvm_ray_stage_program(&bitcode, stage, "stage_entry")
+                    .expect("translate stage");
+            assert_eq!(source.contains(function), true, "missing {function}");
+            if compile {
+                device
+                    .metal_device()
+                    .new_library_with_source(&source, &metal::CompileOptions::new())
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} stage did not compile: {error}\n{source}",
+                            stage.as_str()
+                        )
+                    });
+            } else {
+                assert_eq!(source.contains("bool msl_intersection"), true);
+            }
+        }
+    }
+
+    #[test]
+    fn d3d12_llvm_ray_attribute_at_vertex_fetches_bound_buffer() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let queue = device.create_command_queue();
+        let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let position_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                positions.as_ptr() as *const u8,
+                std::mem::size_of_val(&positions),
+            )
+        };
+        let position_buffer = device
+            .create_buffer_with_data(position_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let descriptor = AccelerationStructureDescriptor {
+            geometry_descriptors: vec![RayTracingGeometryDescriptor {
+                kind: RayTracingGeometryKind::Triangles,
+                vertex_buffer: 0,
+                vertex_stride: 12,
+                vertex_format: VertexFormat::Float3,
+                index_buffer: None,
+                index_format: None,
+                primitive_count: 1,
+                triangle_count: 1,
+                opaque: true,
+                allow_duplicates: false,
+            }],
+            usage: AccelerationStructureUsage::RayTracing,
+        };
+        let buffers = [RayTracingGeometryBuffers {
+            vertex_buffer: position_buffer.as_ref(),
+            vertex_offset: 0,
+            index_buffer: None,
+        }];
+        let sizes =
+            primitive_acceleration_structure_sizes(device.metal_device(), &descriptor, &buffers)
+                .expect("primitive sizes");
+        let scratch = allocate_acceleration_scratch_buffer(
+            device.metal_device(),
+            sizes.build_scratch_size.max(sizes.refit_scratch_size),
+        );
+        let mut blas = create_acceleration_structure(device.metal_device(), &descriptor, &buffers)
+            .expect("primitive acceleration structure");
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        build_acceleration_structure(&encoder, &mut blas, &scratch, &buffers)
+            .expect("build triangle BLAS");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let mut instance = metal::MTLAccelerationStructureInstanceDescriptor::default();
+        instance.transformation_matrix = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+        ];
+        instance.options = metal::MTLAccelerationStructureInstanceOptions::Opaque;
+        instance.mask = 0xFFFF_FFFF;
+        instance.acceleration_structure_index = 0;
+        let instance_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                &instance as *const _ as *const u8,
+                std::mem::size_of_val(&instance),
+            )
+        };
+        let instance_buffer = device
+            .create_buffer_with_data(instance_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let blas_refs = [blas.acceleration_structure.as_ref()];
+        let instance_sizes = instance_acceleration_structure_sizes(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            1,
+            std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect("TLAS sizes");
+        let mut tlas = create_instance_acceleration_structure(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            1,
+            std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect("TLAS");
+        let tlas_scratch = allocate_acceleration_scratch_buffer(
+            device.metal_device(),
+            instance_sizes
+                .build_scratch_size
+                .max(instance_sizes.refit_scratch_size),
+        );
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        build_instance_acceleration_structure(
+            &encoder,
+            &mut tlas,
+            &tlas_scratch,
+            0,
+            instance_buffer.as_ref(),
+            &blas_refs,
+        )
+        .expect("build TLAS");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let ir = r#"define void @raygen(i32 %idx) {
+entry:
+  call void @dx.op.traceRay(i32 0, ptr null, i32 3, i32 -1, i32 0, i32 1, i32 0, float 0.25, float 0.25, float -1.0, float 0.0, float 0.0, float 0.0, float 1.0, float 100.0, i32 0)
+  %a0 = call float @dx.op.attributeAtVertex(i32 1, i32 0, i32 0)
+  %a1 = call float @dx.op.attributeAtVertex(i32 2, i32 0, i32 1)
+  %a2 = call float @dx.op.attributeAtVertex(i32 3, i32 0, i32 2)
+  %bc = call <2 x float> @dx.op.barycentrics(i32 4)
+  %u = extractelement <2 x float> %bc, i32 0
+  %v = extractelement <2 x float> %bc, i32 1
+  %w0 = fsub float 1.0, %u
+  %w = fsub float %w0, %v
+  %p0 = fmul float %a0, %w
+  %p1 = fmul float %a1, %u
+  %p2 = fmul float %a2, %v
+  %s0 = fadd float %p0, %p1
+  %s1 = fadd float %s0, %p2
+  call void @ray.storePayloadField(i32 0, float %s1)
+  ret void
+}
+declare void @dx.op.traceRay(i32, ptr, i32, i32, i32, i32, i32, float, float, float, float, float, float, float, float, i32)
+declare float @dx.op.attributeAtVertex(i32, i32, i32)
+declare <2 x float> @dx.op.barycentrics(i32)
+declare void @ray.storePayloadField(i32, ...)
+"#;
+        let bitcode = crate::shader::llvm_assemble_ir(ir).expect("attribute IR");
+        let msl = crate::shader::translate_llvm_ray_program(&bitcode, "raygen")
+            .expect("lower attribute IR");
+        let program = create_ray_shader_program(device.metal_device(), &msl, "raygen")
+            .expect("attribute program");
+        let geometry = MetalRayGeometryData {
+            vertices: vec![
+                [10.0, 0.0, 0.0, 1.0],
+                [20.0, 0.0, 0.0, 1.0],
+                [40.0, 0.0, 0.0, 1.0],
+            ],
+            indices: vec![0, 1, 2],
+            bindings: vec![MetalRayGeometryBinding {
+                vertex_offset: 0,
+                index_offset: 0,
+                triangle_count: 1,
+                reserved: 0,
+            }],
+            aabbs: Vec::new(),
+        };
+        let rays = [MetalRay {
+            origin: [0.25, 0.25, -1.0],
+            min_distance: 0.0,
+            direction: [0.0, 0.0, 1.0],
+            max_distance: 100.0,
+            sbt_offset: 0,
+            mask: 0xFFFF_FFFF,
+        }];
+        let table = MetalShaderTable::new(device.metal_device(), &[0], 4).expect("SBT table");
+        let payloads = execute_ray_shader_program_with_geometry(
+            device.metal_device(),
+            queue.as_ref(),
+            &program,
+            tlas.acceleration_structure.as_ref(),
+            &rays,
+            &table,
+            MetalRayDispatchInfo::default(),
+            &[RAY_INSTANCE_IDENTITY_ROWS],
+            &geometry,
+        )
+        .expect("execute attribute program");
+        assert_eq!(
+            (payloads[0].payload_float(0).expect("attribute") - 20.0).abs() < 1e-4,
+            true
+        );
+        assert_eq!(payloads[0].primitive_id, 0);
+    }
+
+    #[test]
+    fn d3d12_llvm_ray_intrinsics_reject_invalid_transforms_and_read_back_hit_edges() {
+        d3d12_llvm_ray_stage_modules_compile_with_candidate_and_control_intrinsics();
+        d3d12_llvm_ray_attribute_at_vertex_fetches_bound_buffer();
+        let device = MetalDevice::system_default().expect("Metal device");
+        let queue = device.create_command_queue();
+        let vertices: [f32; 9] = [-1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0];
+        let vertex_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                vertices.as_ptr() as *const u8,
+                std::mem::size_of_val(&vertices),
+            )
+        };
+        let vertex_buffer = device
+            .create_buffer_with_data(vertex_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let descriptor = AccelerationStructureDescriptor {
+            geometry_descriptors: vec![RayTracingGeometryDescriptor {
+                kind: RayTracingGeometryKind::Triangles,
+                vertex_buffer: 0,
+                vertex_stride: 12,
+                vertex_format: VertexFormat::Float3,
+                index_buffer: None,
+                index_format: None,
+                primitive_count: 1,
+                triangle_count: 1,
+                opaque: true,
+                allow_duplicates: false,
+            }],
+            usage: AccelerationStructureUsage::RayTracing,
+        };
+        let buffers = [RayTracingGeometryBuffers {
+            vertex_buffer: vertex_buffer.as_ref(),
+            vertex_offset: 0,
+            index_buffer: None,
+        }];
+        let sizes =
+            primitive_acceleration_structure_sizes(device.metal_device(), &descriptor, &buffers)
+                .expect("primitive sizes");
+        let scratch = allocate_acceleration_scratch_buffer(
+            device.metal_device(),
+            sizes.build_scratch_size.max(sizes.refit_scratch_size),
+        );
+        let mut blas = create_acceleration_structure(device.metal_device(), &descriptor, &buffers)
+            .expect("primitive acceleration structure");
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        build_acceleration_structure(&encoder, &mut blas, &scratch, &buffers)
+            .expect("build triangle BLAS");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let mut instance = metal::MTLAccelerationStructureInstanceDescriptor::default();
+        instance.transformation_matrix = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 10.0],
+        ];
+        instance.options = metal::MTLAccelerationStructureInstanceOptions::Opaque;
+        instance.mask = 0xFFFF_FFFF;
+        instance.intersection_function_table_offset = 0;
+        instance.acceleration_structure_index = 0;
+        let instance_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                &instance as *const _ as *const u8,
+                std::mem::size_of_val(&instance),
+            )
+        };
+        let instance_buffer = device
+            .create_buffer_with_data(instance_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let blas_refs = [blas.acceleration_structure.as_ref()];
+        let instance_sizes = instance_acceleration_structure_sizes(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            1,
+            std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect("TLAS sizes");
+        let mut tlas = create_instance_acceleration_structure(
+            device.metal_device(),
+            instance_buffer.as_ref(),
+            1,
+            std::mem::size_of::<metal::MTLAccelerationStructureInstanceDescriptor>() as u64,
+            metal::MTLAccelerationStructureInstanceDescriptorType::Default,
+            &blas_refs,
+        )
+        .expect("TLAS");
+        let tlas_scratch = allocate_acceleration_scratch_buffer(
+            device.metal_device(),
+            instance_sizes
+                .build_scratch_size
+                .max(instance_sizes.refit_scratch_size),
+        );
+        let command_buffer = queue.new_command_buffer();
+        let encoder =
+            MetalAccelerationStructureEncoder::new(command_buffer).expect("acceleration encoder");
+        build_instance_acceleration_structure(
+            &encoder,
+            &mut tlas,
+            &tlas_scratch,
+            0,
+            instance_buffer.as_ref(),
+            &blas_refs,
+        )
+        .expect("build TLAS");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let ir = r#"define void @raygen(i32 %idx) {
+entry:
+  %d = call { i32, i32, i32 } @dx.op.dispatchRaysDimensions(i32 143)
+  %dx = extractvalue { i32, i32, i32 } %d, 0
+  %dy = extractvalue { i32, i32, i32 } %d, 1
+  %dz = extractvalue { i32, i32, i32 } %d, 2
+  %t = call float @dx.op.rayTCurrent(i32 149)
+  %k = call i32 @dx.op.hitKind(i32 150)
+  %inst = call i32 @dx.op.instanceID(i32 151)
+  %prim = call i32 @dx.op.primitiveID(i32 152)
+  %o2w = call [3 x <4 x float>] @dx.op.objectToWorld3x4(i32 145)
+  %w2o = call [3 x <4 x float>] @dx.op.worldToObject3x4(i32 147)
+  %wrow = extractvalue [3 x <4 x float>] %w2o, 2
+  %wtz = extractelement <4 x float> %wrow, i32 3
+  call void @ray.storePayloadField(i32 0, i32 %dx)
+  call void @ray.storePayloadField(i32 1, i32 %dy)
+  call void @ray.storePayloadField(i32 2, i32 %dz)
+  call void @ray.storePayloadField(i32 3, float %t)
+  call void @ray.storePayloadField(i32 4, i32 %k)
+  call void @ray.storePayloadField(i32 5, i32 %inst)
+  call void @ray.storePayloadField(i32 6, i32 %prim)
+  call void @ray.storePayloadField(i32 7, float %wtz)
+  ret void
+}
+declare { i32, i32, i32 } @dx.op.dispatchRaysDimensions(i32)
+declare float @dx.op.rayTCurrent(i32)
+declare i32 @dx.op.hitKind(i32)
+declare i32 @dx.op.instanceID(i32)
+declare i32 @dx.op.primitiveID(i32)
+declare [3 x <4 x float>] @dx.op.objectToWorld3x4(i32)
+declare [3 x <4 x float>] @dx.op.worldToObject3x4(i32)
+declare void @ray.storePayloadField(i32, ...)
+"#;
+        let bitcode = crate::shader::llvm_assemble_ir(ir).expect("assemble intrinsic fixture");
+        let msl = crate::shader::translate_llvm_ray_program(&bitcode, "raygen")
+            .expect("lower intrinsic fixture");
+        let program = create_ray_shader_program(device.metal_device(), &msl, "raygen")
+            .expect("intrinsic ray program");
+        let rays: Vec<MetalRay> = (0..24)
+            .map(|index| MetalRay {
+                origin: [
+                    -0.5 + (index % 2) as f32 * 0.5,
+                    -0.5 + ((index / 2) % 3) as f32 * 0.5,
+                    -1.0,
+                ],
+                min_distance: 0.0,
+                direction: [0.0, 0.0, 1.0],
+                max_distance: 100.0,
+                sbt_offset: 0,
+                mask: 0xFFFF_FFFF,
+            })
+            .collect();
+        let table = MetalShaderTable::new(device.metal_device(), &[0], 4).expect("SBT table");
+        let dispatch = MetalRayDispatchInfo {
+            width: 2,
+            height: 3,
+            depth: 4,
+        };
+        let transform = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 10.0];
+        let payloads = execute_ray_shader_program(
+            device.metal_device(),
+            queue.as_ref(),
+            &program,
+            tlas.acceleration_structure.as_ref(),
+            &rays,
+            &table,
+            dispatch,
+            &[transform],
+        )
+        .expect("execute intrinsic program");
+        assert_eq!(payloads.len(), 24);
+        let payload = payloads[0];
+        assert_eq!(payload.payload_word(0), Some(2));
+        assert_eq!(payload.payload_word(1), Some(3));
+        assert_eq!(payload.payload_word(2), Some(4));
+        assert_eq!(
+            payload.payload_float(3).map(|value| value.round() as u32),
+            Some(11)
+        );
+        assert_eq!(payload.payload_word(4), Some(0xFE));
+        assert_eq!(payload.payload_word(5), Some(0));
+        assert_eq!(payload.payload_word(6), Some(0));
+        assert_eq!(payload.payload_float(7), Some(-10.0));
+        assert_eq!(payload.payload_word(8), None);
+        assert_eq!(payload.dispatch, [2, 3, 4]);
+        assert_eq!(payload.distance.round() as u32, 11);
+        assert_eq!(payload.hit_kind, 0xFE);
+        assert_eq!(payload.instance_id, 0);
+        assert_eq!(payload.primitive_id, 0);
+        assert_eq!(payload.object_to_world[11], 10.0);
+        assert_eq!(payload.world_to_object[11], -10.0);
+        assert_eq!(payload.object_origin[2], -11.0);
+        assert_eq!(
+            invert_affine_instance_transform(&RAY_INSTANCE_IDENTITY_ROWS),
+            Some(RAY_INSTANCE_IDENTITY_ROWS)
+        );
+        let empty_error = execute_ray_shader_program(
+            device.metal_device(),
+            queue.as_ref(),
+            &program,
+            tlas.acceleration_structure.as_ref(),
+            &rays,
+            &table,
+            dispatch,
+            &[],
+        )
+        .expect_err("empty transform table must be rejected");
+        assert_eq!(empty_error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(
+            empty_error.message,
+            "ray shader execution requires at least one instance transform"
+        );
+        let singular = [0.0f32; 12];
+        let singular_error = execute_ray_shader_program(
+            device.metal_device(),
+            queue.as_ref(),
+            &program,
+            tlas.acceleration_structure.as_ref(),
+            &rays,
+            &table,
+            dispatch,
+            &[singular],
+        )
+        .expect_err("singular transform must be rejected");
+        assert_eq!(singular_error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(
+            singular_error.message,
+            "ray instance transform 0 is singular"
+        );
+        assert_eq!(invert_affine_instance_transform(&singular), None);
+        assert_eq!(MetalRayPayloadResult::default().payload_float(0), Some(0.0));
+
+        let nested_ir = r#"define void @raygen(i32 %idx) {
+entry:
+  %h = call ptr @dx.op.getShaderRecordBufferHandle(i32 0)
+  %p0 = getelementptr i32, ptr %h, i32 0
+  %l0 = load i32, ptr %p0
+  %p1 = getelementptr i32, ptr %h, i32 1
+  %l1 = load i32, ptr %p1
+  call void @dx.op.traceRay(i32 1, ptr null, i32 3, i32 -1, i32 0, i32 1, i32 0, float 0.0, float 0.0, float -1.0, float 0.0, float 0.0, float 0.0, float 1.0, float 100.0, i32 0)
+  %flags = call i32 @dx.op.rayFlags(i32 2)
+  %tmax = call float @dx.op.rayTMax(i32 3)
+  %geom = call i32 @dx.op.rayGeometryIndex(i32 4)
+  %ct = call i32 @dx.op.candidateType(i32 5)
+  %ci = call i32 @dx.op.candidateInstanceID(i32 6)
+  %cp = call i32 @dx.op.candidatePrimitiveID(i32 7)
+  %cg = call i32 @dx.op.candidateGeometryIndex(i32 8)
+  %co = call <3 x float> @dx.op.candidateObjectRayOrigin(i32 9)
+  %coz = extractelement <3 x float> %co, i32 2
+  %c2w = call [3 x <4 x float>] @dx.op.candidateObjectToWorld3x4(i32 10)
+  %row = extractvalue [3 x <4 x float>] %c2w, 2
+  %tz = extractelement <4 x float> %row, i32 3
+  %attr = call float @dx.op.attributeAtVertex(i32 11, i32 0, i32 0)
+  call void @ray.storePayloadField(i32 0, i32 %l0)
+  call void @ray.storePayloadField(i32 1, i32 %l1)
+  call void @ray.storePayloadField(i32 2, i32 %flags)
+  call void @ray.storePayloadField(i32 3, float %tmax)
+  call void @ray.storePayloadField(i32 4, i32 %geom)
+  call void @ray.storePayloadField(i32 5, i32 %ct)
+  call void @ray.storePayloadField(i32 6, i32 %ci)
+  call void @ray.storePayloadField(i32 7, i32 %cp)
+  ret void
+}
+declare ptr @dx.op.getShaderRecordBufferHandle(i32)
+declare void @dx.op.traceRay(i32, ptr, i32, i32, i32, i32, i32, float, float, float, float, float, float, float, float, i32)
+declare i32 @dx.op.rayFlags(i32)
+declare float @dx.op.rayTMax(i32)
+declare i32 @dx.op.rayGeometryIndex(i32)
+declare i32 @dx.op.candidateType(i32)
+declare i32 @dx.op.candidateInstanceID(i32)
+declare i32 @dx.op.candidatePrimitiveID(i32)
+declare i32 @dx.op.candidateGeometryIndex(i32)
+declare <3 x float> @dx.op.candidateObjectRayOrigin(i32)
+declare [3 x <4 x float>] @dx.op.candidateObjectToWorld3x4(i32)
+declare float @dx.op.attributeAtVertex(i32, i32, i32)
+declare void @ray.storePayloadField(i32, ...)
+"#;
+        let nested_bitcode = crate::shader::llvm_assemble_ir(nested_ir).expect("nested IR");
+        let nested_msl = crate::shader::translate_llvm_ray_program(&nested_bitcode, "raygen")
+            .expect("lower nested IR");
+        let nested_program =
+            create_ray_shader_program(device.metal_device(), &nested_msl, "raygen")
+                .expect("nested ray program");
+        let mut local_roots = vec![0u8; 8];
+        local_roots[0..4].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        local_roots[4..8].copy_from_slice(&0x5566_7788u32.to_le_bytes());
+        let nested_table =
+            MetalShaderTable::with_local_roots(device.metal_device(), &[0], &local_roots, 12)
+                .expect("SBT local roots");
+        let nested_ray = [MetalRay {
+            origin: [0.0, 0.0, -1.0],
+            min_distance: 0.0,
+            direction: [0.0, 0.0, 1.0],
+            max_distance: 100.0,
+            sbt_offset: 0,
+            mask: 0xFFFF_FFFF,
+        }];
+        let nested = execute_ray_shader_program(
+            device.metal_device(),
+            queue.as_ref(),
+            &nested_program,
+            tlas.acceleration_structure.as_ref(),
+            &nested_ray,
+            &nested_table,
+            MetalRayDispatchInfo::default(),
+            &[transform],
+        )
+        .expect("execute nested ray program");
+        assert_eq!(nested[0].payload_word(0), Some(0x1122_3344));
+        assert_eq!(nested[0].payload_word(1), Some(0x5566_7788));
+        assert_eq!(nested[0].payload_word(2), Some(3));
+        assert_eq!(nested[0].payload_float(3), Some(100.0));
+        assert_eq!(nested[0].payload_word(4), Some(0));
+        assert_eq!(nested[0].payload_word(5), Some(0));
+        assert_eq!(nested[0].payload_word(6), Some(0));
+        assert_eq!(nested[0].payload_word(7), Some(0));
+        assert_eq!(nested[0].ray_flags, 3);
+        assert_eq!(nested[0].ray_tmax, 100.0);
+        assert_eq!(nested[0].ray_geometry_index, 0);
+        assert_eq!(nested[0].candidate_type, 0);
+        assert_eq!(nested[0].candidate_instance, 0);
+        assert_eq!(nested[0].candidate_primitive, 0);
+        assert_eq!(nested[0].candidate_geometry, 0);
+        assert_eq!(nested[0].candidate_object_origin[2].round(), -11.0);
+        assert_eq!(nested[0].candidate_object_to_world[11], 10.0);
+        assert_eq!(nested[0].hit_kind, 0xFE);
+        assert_eq!(nested[0].attributes[0] > 0.0, true);
+        let bad_roots =
+            MetalShaderTable::with_local_roots(device.metal_device(), &[0], &[1u8; 3], 12)
+                .expect_err("short local roots");
+        assert_eq!(
+            bad_roots.message,
+            "shader-table local-root bytes 3 do not match 8"
+        );
+        assert_eq!(
+            MetalRayDispatchInfo::default(),
+            MetalRayDispatchInfo {
+                width: 1,
+                height: 1,
+                depth: 1
+            }
+        );
     }
 }

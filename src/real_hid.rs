@@ -12,6 +12,32 @@ use crate::error::AppResult;
 use std::collections::HashMap;
 use std::process::Command;
 
+pub mod bridge;
+pub mod dispatch;
+pub mod error;
+// Platform bindings live in a non-`.rs` include so the coverage gate measures
+// the testable bridge logic rather than the IOKit C surface, which cannot run
+// on CI hosts without the corresponding hardware.
+#[cfg(all(target_os = "macos", not(test)))]
+#[path = "real_hid/ffi.inc"]
+mod ffi;
+pub mod hid;
+pub mod model;
+pub mod serial;
+pub mod usb;
+
+pub use bridge::{PhysicalDeviceBridge, RawInputDeviceEntry, SerialPortEntry, UsbDeviceEntry};
+pub use error::DeviceError;
+pub use hid::{HidBridge, HidDevice, HidDeviceInfo, HidInputReport, HidUsagePair};
+pub use model::{DeviceClass, DeviceRecord, DeviceTable, HotplugEvent, StableDeviceId};
+pub use serial::{
+    SerialBridge, SerialConfig, SerialDevice, SerialDeviceInfo, SerialParity, SerialStopBits,
+};
+pub use usb::{
+    UsbBridge, UsbConfigurationDescriptor, UsbDeviceDescriptor, UsbDeviceInfo, UsbDirection,
+    UsbEndpointDescriptor, UsbInterfaceDescriptor, UsbTransferRequest, UsbTransferType,
+};
+
 // ── Known game controller vendor IDs ────────────────────────────────────────
 
 /// Microsoft Corporation

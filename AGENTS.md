@@ -2,6 +2,10 @@
 
 ## Testing policy
 
+- Do NOT re-test code that already passed and has not changed. Test only new or
+  changed code that has never been exercised. Reuse prior test/gate results and
+  run the narrowest affected filter; a full gate rerun is warranted only when
+  shared build/test/gate infrastructure changed, never after unrelated edits.
 - New tests MUST exercise a failure path, invalid/edge input, boundary condition,
   concurrency/race, resource lifecycle, or adversarial condition.
 - Do not add happy-path-only tests: existing happy-path coverage is sufficient,

@@ -2253,6 +2253,48 @@ impl PeHostRuntime {
         let output_buffer = guest_call_arg(state, memory, 8)?;
         let output_length = guest_call_arg_u32(state, memory, 9)?;
 
+        if crate::real_hid::dispatch::is_usb(u64::from(file_handle)) {
+            let info_offset = match self.guest_arch {
+                GuestArch::X64 => 8_u64,
+                GuestArch::X86 => 4_u64,
+            };
+            let bytes_ret_ptr = if io_status_block != 0 {
+                io_status_block + info_offset
+            } else {
+                0
+            };
+            let win32 = self.usb_io_control(
+                memory,
+                u64::from(file_handle),
+                io_control_code,
+                input_buffer,
+                input_length,
+                output_buffer,
+                output_length,
+                bytes_ret_ptr,
+            );
+            let status = if win32 == 0 {
+                nt::STATUS_SUCCESS
+            } else {
+                nt::dos_error_to_nt_status(win32)
+            };
+            let information = if bytes_ret_ptr != 0 {
+                read_u32(memory, bytes_ret_ptr).unwrap_or(0)
+            } else {
+                0
+            };
+            write_io_status_block(
+                state,
+                memory,
+                io_status_block,
+                status,
+                u64::from(information),
+                self.guest_arch,
+            )?;
+            state.set(Register::Rax, u64::from(status.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
         if crate::driver_island::is_island_device_handle(self, file_handle) {
             let result = crate::driver_island::dispatch_island_device_io(
                 self,

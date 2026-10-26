@@ -1,9 +1,22 @@
 use crate::error::{AppError, AppResult};
 use crate::mac_window;
-use crate::real_hid::HidMonitor;
+use crate::real_hid::{
+    DeviceClass, DeviceError, HidDevice, HidDeviceInfo, HidInputReport, HotplugEvent,
+    PhysicalDeviceBridge, RawInputDeviceEntry, SerialConfig, SerialDevice, SerialDeviceInfo,
+    SerialPortEntry, StableDeviceId, UsbDeviceEntry, UsbDeviceInfo, UsbTransferRequest,
+};
 use crate::reason::ReasonCode;
 use crate::util;
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+impl PartialEq for AppError {
+    fn eq(&self, other: &Self) -> bool {
+        self.code == other.code
+            && self.message == other.message
+            && self.reproduction_hints == other.reproduction_hints
+    }
+}
 
 // ── macOS CoreGraphics FFI for real keyboard state ──────────────────────
 #[cfg(target_os = "macos")]
@@ -1128,6 +1141,158 @@ pub struct RawInputRegistration {
     pub target_hwnd: Option<Hwnd>,
 }
 
+pub const RIDEV_REMOVE: u32 = 0x0000_0001;
+pub const RIDEV_EXCLUDE: u32 = 0x0000_0010;
+pub const RIDEV_PAGEONLY: u32 = 0x0000_0020;
+pub const RIDEV_NOLEGACY: u32 = 0x0000_0030;
+pub const RIDEV_INPUTSINK: u32 = 0x0000_0100;
+pub const RIDEV_CAPTUREMOUSE: u32 = 0x0000_0200;
+pub const RIDEV_NOHOTKEYS: u32 = 0x0000_0200;
+pub const RIDEV_APPKEYS: u32 = 0x0000_0400;
+pub const RIDEV_EXINPUTSINK: u32 = 0x0000_1000;
+pub const RIDEV_DEVNOTIFY: u32 = 0x0000_2000;
+
+const RAWINPUT_REGISTRATION_FLAGS: u32 = RIDEV_REMOVE
+    | RIDEV_EXCLUDE
+    | RIDEV_PAGEONLY
+    | RIDEV_NOLEGACY
+    | RIDEV_INPUTSINK
+    | RIDEV_CAPTUREMOUSE
+    | RIDEV_NOHOTKEYS
+    | RIDEV_APPKEYS
+    | RIDEV_EXINPUTSINK
+    | RIDEV_DEVNOTIFY;
+
+fn same_raw_input_registration(left: &RawInputRegistration, right: &RawInputRegistration) -> bool {
+    left.usage_page == right.usage_page
+        && left.usage == right.usage
+        && left.target_hwnd == right.target_hwnd
+}
+
+fn hid_device_identity(info: &HidDeviceInfo) -> String {
+    info.serial_number
+        .as_deref()
+        .filter(|serial| !serial.is_empty())
+        .map(str::to_string)
+        .or_else(|| info.location_id.map(|location| format!("{location:08X}")))
+        .unwrap_or_else(|| format!("{:016X}", info.registry_entry_id))
+}
+
+fn hid_device_path(info: &HidDeviceInfo) -> String {
+    format!(
+        "\\??\\HID#VID_{:04X}&PID_{:04X}#{}#{{{:016X}}}",
+        info.vendor_id,
+        info.product_id,
+        hid_device_identity(info),
+        info.registry_entry_id
+    )
+}
+
+fn controller_guid(spec: &ControllerSpec) -> String {
+    util::deterministic_guid(
+        &format!(
+            "{:04x}:{:04x}:{}:{}:{:?}",
+            spec.vendor_id, spec.product_id, spec.serial, spec.name, spec.kind
+        ),
+        true,
+    )
+}
+
+fn controller_spec_from_hid(info: &HidDeviceInfo) -> ControllerSpec {
+    let xinput_capable = info.is_game_controller();
+    ControllerSpec {
+        name: info
+            .product
+            .clone()
+            .unwrap_or_else(|| format!("HID {:04X}:{:04X}", info.vendor_id, info.product_id)),
+        kind: if xinput_capable {
+            ControllerKind::Xbox
+        } else {
+            ControllerKind::ThirdPartyXInput
+        },
+        transport: ControllerTransport::Hid,
+        vendor_id: info.vendor_id,
+        product_id: info.product_id,
+        serial: hid_device_identity(info),
+        xinput_capable,
+        battery: BatteryInfo {
+            level_percent: 100,
+            wired: true,
+        },
+        axes: BTreeMap::from([
+            (DeviceAxis::X, 0),
+            (DeviceAxis::Y, 0),
+            (DeviceAxis::Z, 0),
+            (DeviceAxis::Rx, 0),
+            (DeviceAxis::Ry, 0),
+            (DeviceAxis::Rz, 0),
+        ]),
+        calibrations: BTreeMap::from([
+            (
+                DeviceAxis::X,
+                AxisCalibration {
+                    min: -32768,
+                    center: 0,
+                    max: 32767,
+                },
+            ),
+            (
+                DeviceAxis::Y,
+                AxisCalibration {
+                    min: -32768,
+                    center: 0,
+                    max: 32767,
+                },
+            ),
+            (
+                DeviceAxis::Z,
+                AxisCalibration {
+                    min: -32768,
+                    center: 0,
+                    max: 32767,
+                },
+            ),
+            (
+                DeviceAxis::Rx,
+                AxisCalibration {
+                    min: -32768,
+                    center: 0,
+                    max: 32767,
+                },
+            ),
+            (
+                DeviceAxis::Ry,
+                AxisCalibration {
+                    min: -32768,
+                    center: 0,
+                    max: 32767,
+                },
+            ),
+            (
+                DeviceAxis::Rz,
+                AxisCalibration {
+                    min: -32768,
+                    center: 0,
+                    max: 32767,
+                },
+            ),
+        ]),
+        buttons: BTreeSet::from([
+            "A".to_string(),
+            "B".to_string(),
+            "X".to_string(),
+            "Y".to_string(),
+            "LB".to_string(),
+            "RB".to_string(),
+            "BACK".to_string(),
+            "START".to_string(),
+            "LTHUMB".to_string(),
+            "RTHUMB".to_string(),
+        ]),
+        supported_effects: BTreeSet::new(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WindowState {
     pub hwnd: Hwnd,
@@ -1393,8 +1558,14 @@ pub struct User32Subsystem {
     pub tray_icon_callbacks: BTreeMap<u32, (u32, u32)>,
     /// Registered raw input devices
     raw_input_devices: Vec<RawInputRegistration>,
-    /// HID monitor for game controller hotplug detection (Phase 5.3.2).
-    hid_monitor: HidMonitor,
+    /// Real host HID/USB/serial discovery and device handles.
+    physical_devices: PhysicalDeviceBridge,
+    /// Stable host device IDs registered for guest dispatch.
+    device_handles: BTreeMap<u64, DeviceClass>,
+    /// Controller GUID per stable HID device ID (hotplug removal).
+    controller_device_guids: BTreeMap<u64, String>,
+    /// Real HID reports awaiting GetRawInputData.
+    pending_raw_input: VecDeque<RawInputData>,
     /// Touch and pen input state (WM_TOUCH / WM_POINTER).
     touch_state: TouchState,
     /// GDI+ subsystem state (Phase 2.7).
@@ -1642,7 +1813,10 @@ impl User32Subsystem {
             z_order: Vec::new(),
             cef_browser_handles: BTreeMap::new(),
             raw_input_devices: Vec::new(),
-            hid_monitor: HidMonitor::new(),
+            physical_devices: PhysicalDeviceBridge::new(),
+            device_handles: BTreeMap::new(),
+            controller_device_guids: BTreeMap::new(),
+            pending_raw_input: VecDeque::new(),
             touch_state: TouchState::default(),
             gdiplus_state: GdiplusState::default(),
             key_state: [0u8; 256],
@@ -5784,19 +5958,25 @@ impl User32Subsystem {
         self.input_owner.as_deref()
     }
 
-    /// Register raw input devices.
+    /// Register raw input devices.  Registrations are only filters; the device
+    /// table always comes from the real [`PhysicalDeviceBridge`] scan.
     pub fn register_raw_input_devices(
         &mut self,
         devices: &[RawInputRegistration],
     ) -> AppResult<()> {
         for device in devices {
-            // Replace existing registration with same (usage_page, usage, target_hwnd)
-            self.raw_input_devices.retain(|d| {
-                !(d.usage_page == device.usage_page
-                    && d.usage == device.usage
-                    && d.target_hwnd == device.target_hwnd)
-            });
-            self.raw_input_devices.push(device.clone());
+            let unknown = device.flags & !RAWINPUT_REGISTRATION_FLAGS;
+            if unknown != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcInputUnsupported,
+                    format!("unsupported raw input flags 0x{unknown:08x}"),
+                ));
+            }
+            self.raw_input_devices
+                .retain(|existing| !same_raw_input_registration(existing, device));
+            if device.flags & RIDEV_REMOVE == 0 {
+                self.raw_input_devices.push(device.clone());
+            }
         }
         Ok(())
     }
@@ -5807,21 +5987,20 @@ impl User32Subsystem {
         // Real Win32 constants (winuser.h):
         //   RID_INPUT = 0x10000003, RID_DEVICE_INFO = 0x10000004,
         //   RID_HEADER = 0x10000005.
-        // The previous 0x10000001/0x10000002 values matched nothing, so any
-        // guest passing the real constants got the wrong size. The legacy
-        // values are still accepted defensively.
         match command {
             // RID_HEADER → sizeof(RAWINPUTHEADER) = 24 (x64) / 20 (x86)
             0x10000005 | 0x10000001 => Ok(24),
-            // RID_INPUT → sizeof(RAWINPUT): 48 for mouse, 40 for keyboard,
-            // 36 + report length for HID. The device type is not known from
-            // the command alone, so return the largest fixed size (mouse);
-            // HID callers must size from their report length.
-            0x10000003 | 0x10000002 => Ok(48),
+            // RID_INPUT is the exact serialized size of the pending real HID
+            // report; with no queued report there is nothing to return.
+            0x10000003 | 0x10000002 => Ok(self
+                .pending_raw_input
+                .front()
+                .map(|raw| raw.to_bytes().len() as u32)
+                .unwrap_or(0)),
             // RID_DEVICE_INFO → sizeof(RID_DEVICE_INFO) = 24
             0x10000004 => Ok(24),
             _ => Err(AppError::new(
-                crate::reason::ReasonCode::RcInputUnsupported,
+                ReasonCode::RcInputUnsupported,
                 format!("unknown raw input command {command:#x}"),
             )),
         }
@@ -5847,26 +6026,209 @@ impl User32Subsystem {
         total
     }
 
+    /// The real HID devices currently registered for raw input.
+    pub fn raw_input_table(&self) -> Vec<RawInputDeviceEntry> {
+        self.physical_devices.raw_input_table()
+    }
+
+    /// Real serial ports mapped to Windows COM names.
+    pub fn serial_ports(&self) -> Vec<SerialPortEntry> {
+        self.physical_devices.serial_ports()
+    }
+
+    /// Real USB devices with descriptor counts.
+    pub fn usb_devices(&self) -> Vec<UsbDeviceEntry> {
+        self.physical_devices.usb_devices()
+    }
+
     /// Return the number of bytes needed for a RID_DEVICE_INFO structure for
-    /// the given device handle (or the default size if unknown).
-    pub fn raw_input_device_info_size(&self, _handle: u64, command: u32) -> AppResult<u32> {
+    /// the given real device handle.
+    pub fn raw_input_device_info_size(&self, handle: u64, command: u32) -> AppResult<u32> {
+        let info = self.hid_device_info(handle)?;
         match command {
-            // RIDI_DEVICENAME → wide-char string length in bytes
+            // RIDI_DEVICENAME → wide-char device path (including NUL).
             0x20000001 => {
-                // Return size of "\\??\\HID#default#col01" (approx 28 wide chars = 56 bytes)
-                Ok(56)
+                Ok(((self.raw_input_device_name(handle)?.encode_utf16().count() + 1) * 2) as u32)
             }
             // RIDI_DEVICEINFO → sizeof(RID_DEVICE_INFO) = 24
             0x20000002 => Ok(24),
-            // RIDI_PREPARSEDDATA → synthetic HID pre-parsed data buffer
-            // Windows returns the raw HID report descriptor bytes as pre-parsed data.
-            // We return a standard 5-button mouse HID report descriptor (50 bytes).
-            0x20000003 => Ok(50),
+            // RIDI_PREPARSEDDATA → the device's real HID report descriptor.
+            0x20000003 => Ok(info.report_descriptor.len() as u32),
             _ => Err(AppError::new(
-                crate::reason::ReasonCode::RcInputUnsupported,
+                ReasonCode::RcInputUnsupported,
                 format!("unknown raw input device info command {command:#x}"),
             )),
         }
+    }
+
+    /// Real HID device handle → `IOHIDDevice`-backed device info.
+    pub fn hid_device_info(&self, handle: u64) -> Result<&HidDeviceInfo, DeviceError> {
+        let id = self.stable_id_for_handle(handle)?;
+        self.physical_devices
+            .hid()
+            .device(id)
+            .ok_or(DeviceError::DeviceMissing { id })
+    }
+
+    /// Real Windows-shaped device interface path derived from host identity.
+    pub fn raw_input_device_name(&self, handle: u64) -> Result<String, DeviceError> {
+        Ok(hid_device_path(self.hid_device_info(handle)?))
+    }
+
+    /// The real raw HID report descriptor bytes for `RIDI_PREPARSEDDATA`.
+    pub fn raw_input_preparsed_data(&self, handle: u64) -> Result<Vec<u8>, DeviceError> {
+        Ok(self.hid_device_info(handle)?.report_descriptor.clone())
+    }
+
+    /// Feed one real IOKit input report into `WM_INPUT` / GetRawInputData.
+    pub fn push_hid_input_report(&mut self, handle: u64, report: HidInputReport) -> AppResult<()> {
+        let info = self.hid_device_info(handle)?.clone();
+        if report.data.is_empty() || report.data.len() > info.max_input_report_size {
+            return Err(DeviceError::InvalidReportLength {
+                expected: info.max_input_report_size,
+                actual: report.data.len(),
+            }
+            .into());
+        }
+        let registration = self.raw_input_devices.iter().rev().find(|registration| {
+            registration.usage_page == info.usage_page
+                && (registration.usage == 0 || registration.usage == info.usage)
+        });
+        let Some(registration) = registration else {
+            return Ok(());
+        };
+        let target = registration.target_hwnd.or(self.foreground);
+        let raw = RawInputData::hid(handle, u64::from(target.unwrap_or(0)), report.data);
+        let size = raw.header.dw_size;
+        self.enqueue(Message {
+            hwnd: target,
+            kind: MessageKind::RawInput,
+            wparam: 2,
+            lparam: size as i64,
+            translated: false,
+            device_id: Some(format!("hid:{handle:016x}")),
+        })?;
+        if self.pending_raw_input.len() >= 256 {
+            self.pending_raw_input.pop_front();
+        }
+        self.pending_raw_input.push_back(raw);
+        Ok(())
+    }
+
+    /// Take the next real `RAWINPUT` payload for GetRawInputData.
+    pub fn take_raw_input(&mut self) -> Option<RawInputData> {
+        self.pending_raw_input.pop_front()
+    }
+
+    pub fn pending_raw_input_count(&self) -> usize {
+        self.pending_raw_input.len()
+    }
+
+    pub fn physical_devices(&self) -> &PhysicalDeviceBridge {
+        &self.physical_devices
+    }
+
+    pub fn physical_devices_mut(&mut self) -> &mut PhysicalDeviceBridge {
+        &mut self.physical_devices
+    }
+
+    /// Scan the real host buses and refresh the dispatch handle table.
+    pub fn refresh_physical_devices(&mut self) -> AppResult<Vec<HotplugEvent>> {
+        let events = self.physical_devices.refresh()?;
+        self.sync_device_handles();
+        Ok(events)
+    }
+
+    /// Register every real host stable ID in the dispatch handle table.
+    pub fn sync_device_handles(&mut self) {
+        self.device_handles = self
+            .physical_devices
+            .devices()
+            .into_iter()
+            .map(|record| (record.id.as_u64(), record.class))
+            .collect();
+    }
+
+    pub fn device_class_for_handle(&self, handle: u64) -> Option<DeviceClass> {
+        self.device_handles.get(&handle).copied()
+    }
+
+    pub fn device_handle_count(&self) -> usize {
+        self.device_handles.len()
+    }
+
+    fn stable_id_for_handle(&self, handle: u64) -> Result<StableDeviceId, DeviceError> {
+        if self.device_handles.contains_key(&handle) {
+            Ok(StableDeviceId::from_raw(handle))
+        } else {
+            Err(DeviceError::DeviceMissing {
+                id: StableDeviceId::from_raw(handle),
+            })
+        }
+    }
+
+    pub fn open_hid_handle(&self, handle: u64) -> AppResult<HidDevice> {
+        let id = self.stable_id_for_handle(handle)?;
+        Ok(self.physical_devices.hid().open(id)?)
+    }
+
+    pub fn open_serial_handle(&self, handle: u64, config: SerialConfig) -> AppResult<SerialDevice> {
+        let id = self.stable_id_for_handle(handle)?;
+        Ok(self.physical_devices.open_serial(id, config)?)
+    }
+
+    pub fn serial_device_info(&self, handle: u64) -> Option<SerialDeviceInfo> {
+        let id = StableDeviceId::from_raw(handle);
+        self.physical_devices.serial().device(id).cloned()
+    }
+
+    pub fn serial_configure(device: &mut SerialDevice, config: SerialConfig) -> AppResult<()> {
+        Ok(device.configure(config)?)
+    }
+
+    pub fn serial_read(
+        device: &mut SerialDevice,
+        buffer: &mut [u8],
+        timeout: std::time::Duration,
+    ) -> AppResult<usize> {
+        Ok(device.read(buffer, timeout)?)
+    }
+
+    pub fn serial_write(
+        device: &mut SerialDevice,
+        buffer: &[u8],
+        timeout: std::time::Duration,
+    ) -> AppResult<usize> {
+        Ok(device.write(buffer, timeout)?)
+    }
+
+    pub fn serial_close(device: &mut SerialDevice) -> AppResult<()> {
+        Ok(device.close()?)
+    }
+
+    pub fn validate_usb_transfer(
+        &self,
+        handle: u64,
+        request: &UsbTransferRequest,
+    ) -> AppResult<()> {
+        let id = self.stable_id_for_handle(handle)?;
+        Ok(self.physical_devices.validate_usb_transfer(id, request)?)
+    }
+
+    pub fn submit_usb_transfer(
+        &self,
+        handle: u64,
+        request: &UsbTransferRequest,
+    ) -> AppResult<Vec<u8>> {
+        let id = self.stable_id_for_handle(handle)?;
+        Ok(self.physical_devices.usb().submit_transfer(id, request)?)
+    }
+
+    pub fn usb_device_info(&self, handle: u64) -> Result<&UsbDeviceInfo, DeviceError> {
+        let id = self.stable_id_for_handle(handle)?;
+        self.physical_devices
+            .usb_device(id)
+            .ok_or(DeviceError::DeviceMissing { id })
     }
 
     pub fn window_state(&self, hwnd: Hwnd) -> AppResult<WindowState> {
@@ -6089,163 +6451,46 @@ impl User32Subsystem {
         Ok(self.controller_by_xinput_slot(slot)?.guid.clone())
     }
 
-    /// Polls for game controller hotplug events (connections/disconnections).
-    ///
-    /// Uses the macOS HID monitor to detect newly connected or disconnected
-    /// game controllers and updates the internal controller state accordingly.
-    ///
-    /// New controllers are added with a standard gamepad layout (six axes,
-    /// ten buttons) and appropriate XInput classification. Disconnected
-    /// controllers are removed from the controller map.
-    ///
-    /// This method is polling-based and should be called regularly from the
-    /// main input loop (e.g., [`poll_live_input`](crate::pe_runtime::PeHostRuntime::poll_live_input)).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the underlying HID scan (`ioreg`) fails
-    /// critically. Temporary failures (e.g., `ioreg` not available) are
-    /// handled gracefully and return `Ok(())`.
+    /// Refresh the real host device table and apply controller hotplug deltas.
     pub fn poll_controller_hotplug(&mut self) -> AppResult<()> {
-        let (added, removed) = self.hid_monitor.poll_for_changes()?;
+        let events = self.refresh_physical_devices()?;
+        self.apply_physical_hotplug(&events)
+    }
 
-        for controller in added {
-            // Build a standard ControllerSpec from the detected host controller.
-            let spec = ControllerSpec {
-                name: controller.name.clone(),
-                kind: if controller.xinput_capable {
-                    ControllerKind::Xbox
-                } else {
-                    ControllerKind::ThirdPartyXInput
-                },
-                transport: ControllerTransport::Hid,
-                vendor_id: controller.vendor_id,
-                product_id: controller.product_id,
-                serial: controller.identifier.clone(),
-                xinput_capable: controller.xinput_capable,
-                battery: BatteryInfo {
-                    level_percent: 100,
-                    wired: true,
-                },
-                axes: BTreeMap::from([
-                    (DeviceAxis::X, 0),
-                    (DeviceAxis::Y, 0),
-                    (DeviceAxis::Z, 0),
-                    (DeviceAxis::Rx, 0),
-                    (DeviceAxis::Ry, 0),
-                    (DeviceAxis::Rz, 0),
-                ]),
-                calibrations: BTreeMap::from([
-                    (
-                        DeviceAxis::X,
-                        AxisCalibration {
-                            min: -32768,
-                            center: 0,
-                            max: 32767,
-                        },
-                    ),
-                    (
-                        DeviceAxis::Y,
-                        AxisCalibration {
-                            min: -32768,
-                            center: 0,
-                            max: 32767,
-                        },
-                    ),
-                    (
-                        DeviceAxis::Z,
-                        AxisCalibration {
-                            min: -32768,
-                            center: 0,
-                            max: 32767,
-                        },
-                    ),
-                    (
-                        DeviceAxis::Rx,
-                        AxisCalibration {
-                            min: -32768,
-                            center: 0,
-                            max: 32767,
-                        },
-                    ),
-                    (
-                        DeviceAxis::Ry,
-                        AxisCalibration {
-                            min: -32768,
-                            center: 0,
-                            max: 32767,
-                        },
-                    ),
-                    (
-                        DeviceAxis::Rz,
-                        AxisCalibration {
-                            min: -32768,
-                            center: 0,
-                            max: 32767,
-                        },
-                    ),
-                ]),
-                buttons: BTreeSet::from([
-                    "A".to_string(),
-                    "B".to_string(),
-                    "X".to_string(),
-                    "Y".to_string(),
-                    "LB".to_string(),
-                    "RB".to_string(),
-                    "BACK".to_string(),
-                    "START".to_string(),
-                    "LTHUMB".to_string(),
-                    "RTHUMB".to_string(),
-                ]),
-                supported_effects: BTreeSet::new(),
-            };
-
-            // Use the existing add_controller infrastructure.
-            let target_window = self.foreground;
-            self.add_controller(target_window, spec)?;
-        }
-
-        for controller in removed {
-            // add_controller derives the storage guid from
-            // deterministic_guid(vendor, product, serial, name, kind) — the
-            // raw HID identifier is NOT the guid. Reproduce the guid here,
-            // falling back to a serial match for controllers registered
-            // through a different path, so disconnected controllers actually
-            // get removed instead of erroring out of the hotplug poll.
-            let kind = if controller.xinput_capable {
-                ControllerKind::Xbox
-            } else {
-                ControllerKind::ThirdPartyXInput
-            };
-            let guid = util::deterministic_guid(
-                &format!(
-                    "{:04x}:{:04x}:{}:{}:{:?}",
-                    controller.vendor_id,
-                    controller.product_id,
-                    controller.identifier,
-                    controller.name,
-                    kind
-                ),
-                true,
-            );
-            if self.remove_controller(self.foreground, &guid).is_err() {
-                let fallback = self
-                    .controllers
-                    .iter()
-                    .find(|(_, c)| c.spec.serial == controller.identifier)
-                    .map(|(guid, _)| guid.clone());
-                match fallback {
-                    Some(guid) => {
-                        let _ = self.remove_controller(self.foreground, &guid);
+    /// Apply real [`HotplugEvent`] deltas to the controller/XInput state.
+    pub fn apply_physical_hotplug(&mut self, events: &[HotplugEvent]) -> AppResult<()> {
+        for event in events {
+            match event {
+                HotplugEvent::Arrived(record) => {
+                    if record.class != DeviceClass::Hid {
+                        continue;
                     }
-                    None => eprintln!(
-                        "[User32] poll_controller_hotplug: no registered controller matches removed device '{}'",
-                        controller.identifier
-                    ),
+                    let Some(info) = self.physical_devices.hid().device(record.id).cloned() else {
+                        continue;
+                    };
+                    if !info.is_game_controller() {
+                        continue;
+                    }
+                    let spec = controller_spec_from_hid(&info);
+                    let guid = controller_guid(&spec);
+                    if self.controllers.contains_key(&guid) {
+                        continue;
+                    }
+                    self.add_controller(self.foreground, spec)?;
+                    self.controller_device_guids
+                        .insert(record.id.as_u64(), guid);
+                }
+                HotplugEvent::Removed { record } => {
+                    let Some(guid) = self.controller_device_guids.remove(&record.id.as_u64())
+                    else {
+                        continue;
+                    };
+                    if self.controllers.contains_key(&guid) {
+                        self.remove_controller(self.foreground, &guid)?;
+                    }
                 }
             }
         }
-
         Ok(())
     }
 
@@ -7747,6 +7992,676 @@ mod tests {
         );
         assert!(!user32.has_window(hwnd));
     }
+
+    fn hid_fixture(id: u64, usage: u16, product: &str) -> HidDeviceInfo {
+        HidDeviceInfo {
+            id: StableDeviceId::from_raw(id),
+            registry_entry_id: id,
+            vendor_id: 0x045e,
+            product_id: 0x028e,
+            usage_page: 1,
+            usage,
+            usage_pairs: vec![crate::real_hid::hid::HidUsagePair {
+                usage_page: 1,
+                usage,
+            }],
+            manufacturer: Some("Microsoft".to_string()),
+            product: Some(product.to_string()),
+            serial_number: Some(format!("serial-{id:016x}")),
+            transport: Some("USB".to_string()),
+            location_id: Some(0x1234),
+            report_descriptor: vec![0x05, 0x01, 0x09, 0x05, 0xc0],
+            max_input_report_size: 64,
+            max_output_report_size: 8,
+            max_feature_report_size: 8,
+        }
+    }
+
+    fn serial_fixture(id: u64, path: &str) -> SerialDeviceInfo {
+        SerialDeviceInfo {
+            id: StableDeviceId::from_raw(id),
+            registry_entry_id: id,
+            callout_path: path.to_string(),
+            dialin_path: Some(path.replace("/dev/cu.", "/dev/tty.")),
+            tty_device: Some(format!("tty-{id:016x}")),
+            base_name: Some(format!("base-{id:016x}")),
+            client_type: Some("IOSerialBSDClientType".to_string()),
+        }
+    }
+
+    fn usb_fixture() -> UsbDeviceInfo {
+        UsbDeviceInfo {
+            id: StableDeviceId::from_raw(0x202),
+            registry_entry_id: 0x202,
+            descriptor: crate::real_hid::UsbDeviceDescriptor {
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                bcd_device: 0x0100,
+                class: 0,
+                subclass: 0,
+                protocol: 0,
+                max_packet_size0: 64,
+                num_configurations: 1,
+            },
+            manufacturer: Some("Fixture".to_string()),
+            product: Some("USB Fixture".to_string()),
+            serial_number: None,
+            vendor_string: None,
+            location_id: None,
+            current_configuration: Some(1),
+            configurations: vec![crate::real_hid::UsbConfigurationDescriptor {
+                value: 1,
+                attributes: 0x80,
+                max_power_ma: 100,
+                interfaces: vec![crate::real_hid::UsbInterfaceDescriptor {
+                    number: 0,
+                    alternate_setting: 0,
+                    class: 3,
+                    subclass: 0,
+                    protocol: 0,
+                    endpoints: vec![crate::real_hid::UsbEndpointDescriptor {
+                        address: 0x81,
+                        number: 1,
+                        direction: crate::real_hid::UsbDirection::In,
+                        transfer_type: crate::real_hid::UsbTransferType::Interrupt,
+                        attributes: 3,
+                        max_packet_size: 8,
+                        interval: 10,
+                    }],
+                }],
+            }],
+            raw_configuration_descriptors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn physical_raw_input_tables_and_device_info_sizes_are_real() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert_eq!(user32.physical_devices().device_count(), 0);
+        assert!(user32.raw_input_table().is_empty());
+        assert!(user32.serial_ports().is_empty());
+        assert!(user32.usb_devices().is_empty());
+        assert_eq!(user32.device_handle_count(), 0);
+        assert_eq!(user32.raw_input_device_count(), 0);
+
+        let hid = hid_fixture(0x101, 5, "Controller");
+        let _ = user32
+            .physical_devices_mut()
+            .hid_mut()
+            .apply(vec![hid.clone()]);
+        user32.sync_device_handles();
+        assert_eq!(user32.device_handle_count(), 1);
+        assert_eq!(
+            user32.device_class_for_handle(hid.id.as_u64()),
+            Some(DeviceClass::Hid)
+        );
+        assert_eq!(
+            user32.raw_input_table(),
+            vec![RawInputDeviceEntry {
+                handle: hid.id.as_u64(),
+                device_id: hid.id,
+                usage_page: 1,
+                usage: 5,
+                vendor_id: 0x045e,
+                product_id: 0x028e,
+                name: "Controller".to_string(),
+            }]
+        );
+        assert_eq!(user32.raw_input_data_size(0x10000003), Ok(0));
+        assert_eq!(user32.raw_input_data_size(0x10000005), Ok(24));
+        assert_eq!(user32.raw_input_data_size(0x10000004), Ok(24));
+        let unsupported = user32.raw_input_data_size(0xdead).unwrap_err();
+        assert_eq!(unsupported.code, ReasonCode::RcInputUnsupported);
+        assert_eq!(unsupported.message, "unknown raw input command 0xdead");
+
+        let expected_name =
+            "\\??\\HID#VID_045E&PID_028E#serial-0000000000000101#{0000000000000101}";
+        assert_eq!(
+            user32.raw_input_device_name(hid.id.as_u64()),
+            Ok(expected_name.to_string())
+        );
+        let expected_size = ((expected_name.encode_utf16().count() + 1) * 2) as u32;
+        assert_eq!(
+            user32.raw_input_device_info_size(hid.id.as_u64(), 0x20000001),
+            Ok(expected_size)
+        );
+        assert_eq!(
+            user32.raw_input_device_info_size(hid.id.as_u64(), 0x20000002),
+            Ok(24)
+        );
+        assert_eq!(
+            user32.raw_input_device_info_size(hid.id.as_u64(), 0x20000003),
+            Ok(hid.report_descriptor.len() as u32)
+        );
+        assert_eq!(
+            user32.raw_input_preparsed_data(hid.id.as_u64()),
+            Ok(hid.report_descriptor.clone())
+        );
+        let unknown_info = user32
+            .raw_input_device_info_size(hid.id.as_u64(), 0xdead)
+            .unwrap_err();
+        assert_eq!(unknown_info.code, ReasonCode::RcInputUnsupported);
+        assert_eq!(
+            unknown_info.message,
+            "unknown raw input device info command 0xdead"
+        );
+        let missing_id = StableDeviceId::from_raw(0x999);
+        let missing = user32
+            .raw_input_device_info_size(missing_id.as_u64(), 0x20000002)
+            .unwrap_err();
+        assert_eq!(missing.code, ReasonCode::RcNotFound);
+        assert_eq!(
+            missing.message,
+            format!("device {missing_id} is not present")
+        );
+        assert_eq!(
+            user32.hid_device_info(missing_id.as_u64()).unwrap_err(),
+            DeviceError::DeviceMissing { id: missing_id }
+        );
+        let mut opened = user32
+            .open_hid_handle(hid.id.as_u64())
+            .expect("open registered HID handle");
+        assert!(opened.is_open());
+        assert_eq!(opened.close(), Ok(()));
+    }
+
+    #[test]
+    fn hid_device_path_and_controller_spec_fallbacks_are_exact() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let mut by_location = hid_fixture(0x103, 5, "Controller");
+        by_location.serial_number = None;
+        by_location.location_id = Some(0xabcd);
+        let mut by_registry = hid_fixture(0x104, 5, "Controller");
+        by_registry.serial_number = None;
+        by_registry.location_id = None;
+        let _ = user32
+            .physical_devices_mut()
+            .hid_mut()
+            .apply(vec![by_location.clone(), by_registry.clone()]);
+        user32.sync_device_handles();
+        assert_eq!(
+            user32.raw_input_device_name(by_location.id.as_u64()),
+            Ok("\\??\\HID#VID_045E&PID_028E#0000ABCD#{0000000000000103}".to_string())
+        );
+        assert_eq!(
+            user32.raw_input_device_name(by_registry.id.as_u64()),
+            Ok("\\??\\HID#VID_045E&PID_028E#0000000000000104#{0000000000000104}".to_string())
+        );
+
+        let mut nameless = hid_fixture(0x105, 0x80, "ignored");
+        nameless.product = None;
+        let spec = controller_spec_from_hid(&nameless);
+        assert_eq!(spec.name, "HID 045E:028E");
+        assert_eq!(spec.kind, ControllerKind::ThirdPartyXInput);
+        assert!(!spec.xinput_capable);
+    }
+
+    #[test]
+    fn raw_input_registration_flags_and_remove_edges_are_exact() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let registration = RawInputRegistration {
+            usage_page: 1,
+            usage: 5,
+            flags: RIDEV_INPUTSINK,
+            target_hwnd: Some(0x2222),
+        };
+        assert_eq!(
+            user32.register_raw_input_devices(std::slice::from_ref(&registration)),
+            Ok(())
+        );
+        assert_eq!(user32.raw_input_device_count(), 1);
+        assert_eq!(
+            user32.register_raw_input_devices(std::slice::from_ref(&registration)),
+            Ok(())
+        );
+        assert_eq!(user32.raw_input_device_count(), 1);
+        let mut small = Vec::new();
+        assert_eq!(user32.get_registered_raw_input_devices(&mut small), 1);
+        let mut output = vec![RawInputRegistration {
+            usage_page: 0,
+            usage: 0,
+            flags: 0,
+            target_hwnd: None,
+        }];
+        assert_eq!(user32.get_registered_raw_input_devices(&mut output), 1);
+        assert_eq!(output[0].usage_page, 1);
+        assert_eq!(output[0].usage, 5);
+        assert_eq!(output[0].flags, RIDEV_INPUTSINK);
+        assert_eq!(output[0].target_hwnd, Some(0x2222));
+
+        assert_eq!(
+            user32.register_raw_input_devices(&[RawInputRegistration {
+                flags: RIDEV_REMOVE,
+                ..registration.clone()
+            }]),
+            Ok(())
+        );
+        assert_eq!(user32.raw_input_device_count(), 0);
+
+        assert_eq!(
+            user32.register_raw_input_devices(&[RawInputRegistration {
+                flags: RIDEV_PAGEONLY | RIDEV_EXINPUTSINK,
+                ..registration
+            }]),
+            Ok(())
+        );
+        assert_eq!(user32.raw_input_device_count(), 1);
+
+        let error = user32
+            .register_raw_input_devices(&[RawInputRegistration {
+                usage_page: 1,
+                usage: 5,
+                flags: 0x8000_0000,
+                target_hwnd: None,
+            }])
+            .unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcInputUnsupported);
+        assert_eq!(error.message, "unsupported raw input flags 0x80000000");
+        assert_eq!(user32.raw_input_data_size(0x10000001), Ok(24));
+        assert_eq!(user32.raw_input_data_size(0x10000002), Ok(0));
+    }
+
+    #[test]
+    fn real_hid_report_feed_builds_wm_input_and_raw_data_exactly() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let hid = hid_fixture(0x101, 5, "Controller");
+        let _ = user32
+            .physical_devices_mut()
+            .hid_mut()
+            .apply(vec![hid.clone()]);
+        user32.sync_device_handles();
+        assert_eq!(
+            user32.register_raw_input_devices(&[RawInputRegistration {
+                usage_page: 1,
+                usage: 5,
+                flags: RIDEV_INPUTSINK,
+                target_hwnd: Some(0x2222),
+            }]),
+            Ok(())
+        );
+        assert_eq!(
+            user32.push_hid_input_report(
+                hid.id.as_u64(),
+                HidInputReport {
+                    report_id: 1,
+                    data: vec![1, 2, 3, 4],
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(user32.pending_raw_input_count(), 1);
+        assert_eq!(user32.raw_input_data_size(0x10000003), Ok(36));
+        let raw = user32.take_raw_input().expect("real raw HID input");
+        assert_eq!(raw.header.dw_type, 2);
+        assert_eq!(raw.header.dw_size, 36);
+        assert_eq!(raw.header.h_device, hid.id.as_u64());
+        assert_eq!(raw.header.w_param, 0x2222);
+        match raw.data {
+            RawInputDeviceData::Hid(hid) => {
+                assert_eq!(hid.dw_size_hid, 4);
+                assert_eq!(hid.dw_count, 1);
+                assert_eq!(hid.b_raw_data, vec![1, 2, 3, 4]);
+            }
+            other => panic!("expected RAWHID, got {other:?}"),
+        }
+        assert!(user32.take_raw_input().is_none());
+        assert_eq!(user32.raw_input_data_size(0x10000003), Ok(0));
+
+        let empty = user32
+            .push_hid_input_report(
+                hid.id.as_u64(),
+                HidInputReport {
+                    report_id: 0,
+                    data: Vec::new(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(empty.code, ReasonCode::RcInvalidParameter);
+        assert_eq!(
+            empty.message,
+            "invalid report length 0; expected at most 64"
+        );
+        let long = user32
+            .push_hid_input_report(
+                hid.id.as_u64(),
+                HidInputReport {
+                    report_id: 0,
+                    data: vec![0; 65],
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            long.message,
+            "invalid report length 65; expected at most 64"
+        );
+
+        assert_eq!(
+            user32.register_raw_input_devices(&[RawInputRegistration {
+                usage_page: 1,
+                usage: 5,
+                flags: RIDEV_REMOVE,
+                target_hwnd: Some(0x2222),
+            }]),
+            Ok(())
+        );
+        assert_eq!(
+            user32.push_hid_input_report(
+                hid.id.as_u64(),
+                HidInputReport {
+                    report_id: 0,
+                    data: vec![7],
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(user32.pending_raw_input_count(), 0);
+
+        assert_eq!(
+            user32.register_raw_input_devices(&[RawInputRegistration {
+                usage_page: 1,
+                usage: 5,
+                flags: RIDEV_INPUTSINK,
+                target_hwnd: None,
+            }]),
+            Ok(())
+        );
+        for byte in 0..257_u16 {
+            assert_eq!(
+                user32.push_hid_input_report(
+                    hid.id.as_u64(),
+                    HidInputReport {
+                        report_id: 0,
+                        data: vec![byte as u8],
+                    }
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!(user32.pending_raw_input_count(), 256);
+        let first = user32.take_raw_input().expect("capped queue keeps reports");
+        match first.data {
+            RawInputDeviceData::Hid(hid) => assert_eq!(hid.b_raw_data, vec![1]),
+            other => panic!("expected RAWHID, got {other:?}"),
+        }
+        while user32.take_raw_input().is_some() {}
+        assert_eq!(user32.pending_raw_input_count(), 0);
+    }
+
+    #[test]
+    fn physical_hotplug_and_controller_state_are_real_and_stale_safe() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let controller = hid_fixture(0x101, 5, "Controller");
+        let peripheral = hid_fixture(0x102, 0x80, "Sensor");
+        let _ = user32
+            .physical_devices_mut()
+            .hid_mut()
+            .apply(vec![controller.clone(), peripheral.clone()]);
+        user32.sync_device_handles();
+        assert_eq!(user32.device_handle_count(), 2);
+
+        assert_eq!(
+            user32.apply_physical_hotplug(&[HotplugEvent::Arrived(controller.record())]),
+            Ok(())
+        );
+        assert_eq!(user32.controllers.len(), 1);
+        let guid = user32
+            .controllers
+            .keys()
+            .next()
+            .expect("controller guid")
+            .clone();
+        let spec = &user32.controllers[&guid].spec;
+        assert_eq!(spec.vendor_id, 0x045e);
+        assert_eq!(spec.product_id, 0x028e);
+        assert_eq!(spec.name, "Controller");
+        assert_eq!(spec.serial, "serial-0000000000000101");
+        assert!(spec.xinput_capable);
+
+        assert_eq!(
+            user32.apply_physical_hotplug(&[HotplugEvent::Arrived(controller.record())]),
+            Ok(())
+        );
+        assert_eq!(user32.controllers.len(), 1);
+        assert_eq!(
+            user32.apply_physical_hotplug(&[HotplugEvent::Arrived(peripheral.record())]),
+            Ok(())
+        );
+        assert_eq!(user32.controllers.len(), 1);
+        let usb_record = crate::real_hid::DeviceRecord {
+            id: StableDeviceId::from_raw(0x303),
+            class: DeviceClass::Usb,
+            vendor_id: Some(0x1234),
+            product_id: Some(0x5678),
+            manufacturer: None,
+            product: None,
+            serial_number: None,
+            path: None,
+            registry_entry_id: 0x303,
+        };
+        assert_eq!(
+            user32.apply_physical_hotplug(&[HotplugEvent::Arrived(usb_record.clone())]),
+            Ok(())
+        );
+        assert_eq!(user32.controllers.len(), 1);
+        let unknown_hid = crate::real_hid::DeviceRecord {
+            id: StableDeviceId::from_raw(0x999),
+            class: DeviceClass::Hid,
+            vendor_id: Some(0x045e),
+            product_id: Some(0x028e),
+            manufacturer: None,
+            product: None,
+            serial_number: None,
+            path: None,
+            registry_entry_id: 0x999,
+        };
+        assert_eq!(
+            user32.apply_physical_hotplug(&[HotplugEvent::Arrived(unknown_hid)]),
+            Ok(())
+        );
+        assert_eq!(user32.controllers.len(), 1);
+
+        assert_eq!(
+            user32.apply_physical_hotplug(&[HotplugEvent::Removed {
+                record: controller.record()
+            }]),
+            Ok(())
+        );
+        assert_eq!(user32.controllers.len(), 0);
+        assert_eq!(
+            user32.apply_physical_hotplug(&[HotplugEvent::Removed { record: usb_record }]),
+            Ok(())
+        );
+        assert_eq!(user32.apply_physical_hotplug(&[]), Ok(()));
+
+        assert_eq!(user32.poll_controller_hotplug(), Ok(()));
+        assert_eq!(user32.device_handle_count(), 0);
+        assert_eq!(user32.device_class_for_handle(controller.id.as_u64()), None);
+        let stale = user32
+            .open_hid_handle(controller.id.as_u64())
+            .err()
+            .expect("stale HID handle must fail");
+        assert_eq!(stale.code, ReasonCode::RcNotFound);
+        assert_eq!(
+            stale.message,
+            format!("device {} is not present", controller.id)
+        );
+    }
+
+    #[test]
+    fn serial_com_surface_and_errors_are_exact() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let serial = serial_fixture(0x401, "/dev/cu.casa1-test");
+        let _ = user32
+            .physical_devices_mut()
+            .serial_mut()
+            .apply(vec![serial.clone()]);
+        user32.sync_device_handles();
+        assert_eq!(user32.serial_ports().len(), 1);
+        let port = &user32.serial_ports()[0];
+        assert_eq!(port.com_port, "COM1");
+        assert_eq!(port.callout_path, "/dev/cu.casa1-test");
+        assert_eq!(
+            user32.serial_device_info(serial.id.as_u64()),
+            Some(serial.clone())
+        );
+        assert_eq!(user32.serial_device_info(0xdead), None);
+
+        let invalid = SerialConfig {
+            baud_rate: 0,
+            ..SerialConfig::default()
+        };
+        let error = user32
+            .open_serial_handle(serial.id.as_u64(), invalid)
+            .err()
+            .expect("invalid serial config must fail");
+        assert_eq!(error.code, ReasonCode::RcInvalidParameter);
+        assert_eq!(error.message, "invalid baud_rate: unsupported rate");
+
+        let mut device = user32
+            .open_serial_handle(serial.id.as_u64(), SerialConfig::default())
+            .expect("open real serial bridge fixture");
+        let configured = SerialConfig {
+            baud_rate: 9_600,
+            data_bits: 8,
+            parity: crate::real_hid::SerialParity::Even,
+            stop_bits: crate::real_hid::SerialStopBits::Two,
+        };
+        assert_eq!(
+            User32Subsystem::serial_configure(&mut device, configured),
+            Ok(())
+        );
+        assert_eq!(device.config(), configured);
+        let mut buffer = [0u8; 4];
+        assert_eq!(
+            User32Subsystem::serial_read(&mut device, &mut [], std::time::Duration::ZERO),
+            Ok(0)
+        );
+        let read_error =
+            User32Subsystem::serial_read(&mut device, &mut buffer, std::time::Duration::ZERO)
+                .unwrap_err();
+        assert_eq!(read_error.code, ReasonCode::RcInputUnsupported);
+        assert_eq!(
+            read_error.message,
+            "unsupported feature: serial read requires macOS termios"
+        );
+        assert_eq!(
+            User32Subsystem::serial_write(&mut device, &[], std::time::Duration::ZERO),
+            Ok(0)
+        );
+        let write_error =
+            User32Subsystem::serial_write(&mut device, &buffer, std::time::Duration::ZERO)
+                .unwrap_err();
+        assert_eq!(write_error.code, ReasonCode::RcInputUnsupported);
+        assert_eq!(
+            write_error.message,
+            "unsupported feature: serial write requires macOS termios"
+        );
+        assert_eq!(User32Subsystem::serial_close(&mut device), Ok(()));
+        let close_error = User32Subsystem::serial_close(&mut device).unwrap_err();
+        assert_eq!(close_error.code, ReasonCode::RcInvalidState);
+        assert_eq!(
+            close_error.message,
+            format!("device {} is already closed", serial.id)
+        );
+
+        let missing = user32
+            .open_serial_handle(0xdead, SerialConfig::default())
+            .err()
+            .expect("missing serial handle must fail");
+        assert_eq!(missing.code, ReasonCode::RcNotFound);
+        assert_eq!(missing.message, "device 000000000000dead is not present");
+    }
+
+    #[test]
+    fn usb_transfer_validation_and_unsupported_surface_are_exact() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let usb = usb_fixture();
+        let _ = user32
+            .physical_devices_mut()
+            .usb_mut()
+            .apply(vec![usb.clone()]);
+        user32.sync_device_handles();
+        assert_eq!(
+            user32.usb_devices(),
+            vec![UsbDeviceEntry {
+                handle: usb.id.as_u64(),
+                device_id: usb.id,
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                configurations: 1,
+                interfaces: 1,
+                endpoints: 1,
+            }]
+        );
+        assert_eq!(user32.usb_device_info(usb.id.as_u64()), Ok(&usb));
+
+        let request = UsbTransferRequest {
+            interface_number: 0,
+            endpoint_address: 0x81,
+            transfer_type: crate::real_hid::UsbTransferType::Interrupt,
+            direction: crate::real_hid::UsbDirection::In,
+            flags: 0,
+            length: 8,
+        };
+        assert_eq!(
+            user32.validate_usb_transfer(usb.id.as_u64(), &request),
+            Ok(())
+        );
+        assert_eq!(
+            user32.submit_usb_transfer(usb.id.as_u64(), &request),
+            Err(AppError::new(
+                ReasonCode::RcInputUnsupported,
+                "unsupported feature: usb data transfer"
+            ))
+        );
+        let unsupported_flag = user32
+            .validate_usb_transfer(
+                usb.id.as_u64(),
+                &UsbTransferRequest {
+                    flags: 0x8000_0000,
+                    ..request.clone()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(unsupported_flag.code, ReasonCode::RcInputUnsupported);
+        assert_eq!(
+            unsupported_flag.message,
+            "unsupported USB transfer flag 0x80000000"
+        );
+        let iso = user32
+            .validate_usb_transfer(
+                usb.id.as_u64(),
+                &UsbTransferRequest {
+                    transfer_type: crate::real_hid::UsbTransferType::Isochronous,
+                    ..request
+                },
+            )
+            .unwrap_err();
+        assert_eq!(iso.code, ReasonCode::RcInputUnsupported);
+        assert_eq!(iso.message, "unsupported USB transfer type Isochronous");
+        let missing = user32
+            .validate_usb_transfer(
+                0xdead,
+                &UsbTransferRequest {
+                    interface_number: 0,
+                    endpoint_address: 0x81,
+                    transfer_type: crate::real_hid::UsbTransferType::Interrupt,
+                    direction: crate::real_hid::UsbDirection::In,
+                    flags: 0,
+                    length: 8,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(missing.code, ReasonCode::RcNotFound);
+        assert_eq!(missing.message, "device 000000000000dead is not present");
+        let missing_info = user32.usb_device_info(0xdead).unwrap_err();
+        assert_eq!(
+            missing_info,
+            DeviceError::DeviceMissing {
+                id: StableDeviceId::from_raw(0xdead)
+            }
+        );
+    }
 }
 
 fn compose_dead_char(dead: char, base: char) -> Option<char> {
@@ -9243,9 +10158,9 @@ impl RawInputData {
         Self {
             header: RawInputHeader {
                 dw_type: 2, // RIM_TYPEHID
-                // Serialized layout: 24-byte RAWINPUTHEADER + 12-byte RAWHID
-                // (dwSizeHid + dwCount) + raw data = 36 + len.
-                dw_size: 36 + report.len() as u32,
+                // Serialized layout: 24-byte RAWINPUTHEADER + 8-byte RAWHID
+                // (dwSizeHid + dwCount) + raw data = 32 + len.
+                dw_size: 32 + report.len() as u32,
                 h_device: device,
                 w_param: hwnd,
             },

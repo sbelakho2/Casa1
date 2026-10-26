@@ -1525,6 +1525,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) animation_settings: u32,
     pub(crate) error_mode: u32,
     pub(crate) last_error: u32,
+    /// Lazily opened TBS/TPM adapter for this game environment.
+    pub(crate) tbs: Option<crate::tpm::tbs::TbsAdapter>,
     pub(crate) invalid_parameter_handler: u64,
     // ── Patch 6b: CRT errno / doserrno model ────────────────────────────────
     /// TLS vector slot holding the per-thread errno int pointer. 0 = not yet
@@ -2531,6 +2533,7 @@ impl PeHostRuntime {
             animation_settings: 0,
             error_mode: 0,
             last_error: 0,
+            tbs: None,
             invalid_parameter_handler: 0,
             crt_errno_slot: 0,
             crt_doserrno_slot: 0,

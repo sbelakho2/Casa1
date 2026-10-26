@@ -8,6 +8,13 @@
   "( dispatch_x86( &mut fixture, HostThunk::WicFrameEncodeUnsupported, &[frame as u32, THUMBNAIL_OUT as u32] ), u64::from(WIC_E_CODECNOTHANDLED) )",
   "(read_ptr(&fixture, THUMBNAIL_OUT), 0)"
  ],
+ "absent_objects_are_rejected_with_exact_handle_rc": [
+  "( rc(&read_public(&mut tpm, 0x8000_0001)), rc_handle(TPM_RC_HANDLE, 1) )",
+  "(rc(&run(&mut tpm, &quote)), rc_handle(TPM_RC_HANDLE, 1))",
+  "(rc(&run(&mut tpm, &load)), rc_handle(TPM_RC_HANDLE, 1))",
+  "( rc(&run(&mut tpm, &lockout_primary)), rc_handle(TPM_RC_HIERARCHY, 1) )",
+  "(rc(&run(&mut tpm, &null_primary)), TPM_RC_SUCCESS)"
+ ],
  "absent_serial_uuid_error_status_is_pinned": [
   "( identity.require_serial().unwrap_err(), IdentityError::FactAbsent(\"IOPlatformSerialNumber\") )",
   "( identity.require_uuid().unwrap_err(), IdentityError::FactAbsent(\"IOPlatformUUID\") )",
@@ -224,6 +231,14 @@
   "( dispatch_x86_thunk( &mut runtime, &mut memory, get_user_name, &[buffer as u32, size as u32], ), 0 )",
   "(runtime.last_error, ERROR_MORE_DATA)",
   "( dispatch_x86_thunk(&mut runtime, &mut memory, init_sd, &[descriptor as u32, 1]), 1 )"
+ ],
+ "aggregate_bridge_tables_and_dispatch_accessors_are_exact": [
+  "(bridge.device_count(), 4)",
+  "(records.len(), 4)",
+  "(records[0].class, DeviceClass::Hid)",
+  "(records[1].class, DeviceClass::Usb)",
+  "(records[2].class, DeviceClass::Serial)",
+  "(records[2].id, serial_b.id)"
  ],
  "alertable_apcs_wake_wait_and_non_alertable_apcs_do_not": [
   "( manager.thread_state(created.id), Some(KernelThreadState::Ready) )",
@@ -533,6 +548,14 @@
  ],
  "backend_activation_resolution_matches_pure_resolver": [
   "( backend.resolve_activation_device(None), Err(AudioActivationDeviceFailure::NoDevices) )"
+ ],
+ "bad_password_and_bad_hmac_are_rejected_with_exact_rc": [
+  "(rc(&response), TPM_RC_BAD_AUTH)",
+  "(tpm.transient_handles().len(), 0)",
+  "(rc(&session_response), TPM_RC_SUCCESS)",
+  "( rc(&run(&mut tpm, &bad_hmac)), rc_session(TPM_RC_AUTH_FAIL, 1) )",
+  "(rc(&good_response), TPM_RC_SUCCESS)",
+  "(auth.u32().expect(\"session count\"), 1)"
  ],
  "bcrypt_thunk_hash_random_and_aes_roundtrip": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, open, &[provider_out as u32, sha_alg as u32, 0, 0], ), 0 )",
@@ -1639,6 +1662,14 @@
   "( memory.read_bytes(buffer, 6).expect(\"buffer\"), [b'1', b'2', b'3', b'4', b'5', 0] )",
   "(runtime.crt_errno_get(&mut memory), 0)"
  ],
+ "crypto_rejects_unknown_hash_and_pads_short_moduli_exactly": [
+  "(super::crypto::hash(TPM_ALG_SHA1, b\"abc\").unwrap().len(), 20)",
+  "( super::crypto::hash(TPM_ALG_SHA256, b\"abc\").unwrap().len(), 32 )",
+  "( super::crypto::hash(TPM_ALG_SHA384, b\"abc\").unwrap().len(), 48 )",
+  "( super::crypto::hash(TPM_ALG_SHA512, b\"abc\").unwrap().len(), 64 )",
+  "(super::crypto::hash(TPM_ALG_ERROR, b\"abc\"), None)",
+  "(super::crypto::hash_len(TPM_ALG_SHA1), Some(20))"
+ ],
  "current_process_id_and_nt_query_information_process_share_the_guest_pid": [
   "(NtStatus::from_raw(rax as u32), STATUS_SUCCESS)",
   "( nt_pid, win32_pid, \"NtQueryInformationProcess reports the Win32 current pid\" )",
@@ -1820,6 +1851,14 @@
  "d3d12_llvm_cfg_memory_payload_program_rejects_helpers": [
   "(payloads[0].value[0], 22.0)"
  ],
+ "d3d12_llvm_ray_intrinsics_reject_invalid_transforms_and_read_back_hit_edges": [
+  "(payloads.len(), 24)",
+  "(payload.payload_word(0), Some(2))",
+  "(payload.payload_word(1), Some(3))",
+  "(payload.payload_word(2), Some(4))",
+  "( payload.payload_float(3).map(|value| value.round() as u32), Some(11) )",
+  "(payload.payload_word(4), Some(0xFE))"
+ ],
  "d3d12_native_indirect_shell_rejects_missing_state_and_binds_gpu_resources": [
   "(state.get(Register::Rax), 0)",
   "( runtime .d3d12_runtime .resource_bytes(target) .expect(\"target readback\")[0..4], [0, 0, 255, 255] )"
@@ -1829,6 +1868,18 @@
   "(runtime.iosurface_present_count(), 0)",
   "(runtime.surface_writes(), 0)",
   "(&frame.bytes[..pixels.len()], &pixels)"
+ ],
+ "d3d12_ray_procedural_intersection_accepts_and_rejects": [
+  "(results[0].hit_kind, 0xFF)",
+  "(results[0].candidate_type, 1)",
+  "(results[0].distance, 1.5)",
+  "(results[0].attributes[0], 5.0)",
+  "(results[0].accepted, 1)",
+  "(results[1].hit_kind, 0)"
+ ],
+ "d3d12_ray_stage_artifacts_reject_bad_bitcode_with_exact_error": [
+  "(error.code, ReasonCode::RcDxilInvalid)",
+  "(error.message, \"unsupported LLVM instruction fence\")"
  ],
  "d3d12_set_pipeline_state1_rejects_collection_state_object": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
@@ -1889,7 +1940,8 @@
   "( pso.ray_msl .as_deref() .expect(\"translated raygen\") .contains(\"msl_closest_hit\"), true )",
   "(payload[0].value[0], 42.0)",
   "(payload[0].instance_id, 0)",
-  "(runtime.last_ray_payloads()[0].value[0], 7.0)"
+  "(payload[0].primitive_id, 0)",
+  "(payload[0].distance.round() as u32, 11)"
  ],
  "d3d12_update_subresource_direct_shared_backing_rejects_staged_fallback": [
   "( runtime .resource_storage_mode(resource) .expect(\"storage mode\"), MetalStorageMode::Shared )",
@@ -2412,6 +2464,14 @@
   "( subsystem .d3dkmt_acquire_keyed_mutex(mutex, 0x22, 0, 7) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
   "( subsystem.allocation_info(allocation).unwrap_err().status(), STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE )",
   "( subsystem .allocation_info(survivor) .expect(\"shared alias survives\") .size, 16 )"
+ ],
+ "device_error_every_variant_maps_to_exact_windows_and_reason_code": [
+  "(error.windows_error(), *windows)",
+  "(error.reason_code(), *reason)",
+  "(error.to_string(), *text)",
+  "(app.code, *reason)",
+  "(app.message, *text)",
+  "(converted.code, ReasonCode::RcNotFound)"
  ],
  "device_hotplug_stale_removal_releases_hog": [
   "( backend.hog_mode_held(stale), false, \"a device removed by hotplug loses its hog lease\" )"
@@ -3031,6 +3091,10 @@
   "(analysis.aliasing_barriers_required, 1)",
   "(analysis.aliasing_barriers_elided, 1)"
  ],
+ "duplicate_unplug_scan_reports_a_single_removal": [
+  "( table.reconcile(vec![device.clone()]), Vec::<HotplugEvent>::new() )",
+  "( table.reconcile(Vec::new()), vec![HotplugEvent::Removed { record: device }] )"
+ ],
  "duplicate_vectors_and_shared_polarity_are_exact": [
   "(manager.connected_count(), 1)",
   "(manager.query(0x500).unwrap().id, first)",
@@ -3099,6 +3163,20 @@
   "(protocol, casa1::network::HttpProtocol::Http3)",
   "(protocol2, casa1::network::HttpProtocol::Http11)"
  ],
+ "ecc_quote_signature_rejects_tampered_attest_and_attest_shape_is_exact": [
+  "(rc(&response), TPM_RC_SUCCESS)",
+  "(signature_alg, TPM_ALG_ECDSA)",
+  "(verifying.verify(&attest, &signature).is_ok(), true)",
+  "(reader.u32().expect(\"magic\"), TPM_GENERATED_VALUE)",
+  "(reader.u16().expect(\"type\"), TPM_ST_ATTEST_QUOTE)"
+ ],
+ "empty_bridge_tables_are_missing_devices_not_synthetic": [
+  "(bridge.device_count(), 0)",
+  "(bridge.raw_input_table(), Vec::<RawInputDeviceEntry>::new())",
+  "(bridge.serial_ports(), Vec::<SerialPortEntry>::new())",
+  "(bridge.usb_devices(), Vec::<UsbDeviceEntry>::new())",
+  "(bridge.devices(), Vec::<DeviceRecord>::new())"
+ ],
  "empty_module_and_handle_lists_report_zero_counts_and_are_never_stale": [
   "(modules.len(), 8)",
   "(u32::from_le_bytes(modules[0..4].try_into().unwrap()), 0)",
@@ -3158,9 +3236,70 @@
   "(renderer.frame_index, frame_index + 1)",
   "( renderer.pool_buffer.load(Ordering::Relaxed), (frame_index + 1) % POOL_BUFFER_COUNT, \"a frameless end_frame must rotate the pool exactly once\" )"
  ],
+ "engine_capability_pcr_and_state_machine_reject_invalid_parameters": [
+  "(rc(&nv_define(&mut tpm, 0x0150_0300, 8)), TPM_RC_SUCCESS)",
+  "(rc(&properties), TPM_RC_SUCCESS)",
+  "(properties[10], 1)",
+  "( u32::from_be_bytes([ properties[11], properties[12], properties[13], properties[14] ]), 1 )",
+  "(rc(&algorithms), TPM_RC_SUCCESS)",
+  "(algorithms[10], 1)"
+ ],
  "engine_categories_follow_parent_chains": [
   "(engine.category_gain(2), 0.25)",
   "(engine.category_gain(9), 1.0)"
+ ],
+ "engine_create_load_flush_and_read_public_errors_are_exact": [
+  "( rc(&run(&mut tpm, &missing_parent)), rc_handle(TPM_RC_HANDLE, 1) )",
+  "( rc(&load_child(&mut tpm, parent, &[], &ecc_template())), TPM_RC_INTEGRITY )",
+  "(&private[..4], b\"CPK1\")",
+  "( rc(&load_child( &mut tpm, parent, &build_private(parent + 1, &public_hash), &public )), TPM_RC_INTEGRITY )",
+  "( rc(&load_child( &mut tpm, parent, &build_private(parent, &[0u8; 32]), &public )), TPM_RC_INTEGRITY )",
+  "(rc(&flush(&mut tpm, session_handle)), TPM_RC_SUCCESS)"
+ ],
+ "engine_creation_and_quote_reject_out_of_range_pcr_selections": [
+  "( rc(&run( &mut tpm, &command( TPM_ST_SESSIONS, TPM_CC_CREATE_PRIMARY, &[TPM_RH_OWNER], &create_params, &[password_entry(&[])], ) )), rc_parameter(TPM_RC_VALUE, 4) )",
+  "( rc(&run( &mut tpm, &command( TPM_ST_SESSIONS, TPM_CC_CREATE, &[parent], &create_params, &[password_entry(&[])], ) )), rc_parameter(TPM_RC_VALUE, 4) )",
+  "( rc(&run( &mut tpm, &command( TPM_ST_SESSIONS, TPM_CC_QUOTE, &[parent], &{ let mut params = Vec::new(); params.extend_from_slice(&tpm2b(b\"qualifying\")); params.extend_from_slice(&TPM_ALG_NULL.to_be_bytes()); params.extend_from_slice(&selection); params }, &[password_entry(&[])], ) )), rc_parameter(TPM_RC_VALUE, 3) )"
+ ],
+ "engine_nv_role_permission_and_lifecycle_reject_invalid_auth": [
+  "( rc(&run(&mut tpm, &invalid_lockout)), rc_handle(TPM_RC_HIERARCHY, 1) )",
+  "( rc(&run(&mut tpm, &invalid_endorsement)), rc_handle(TPM_RC_HIERARCHY, 1) )",
+  "( rc(&run(&mut tpm, &invalid_null)), rc_handle(TPM_RC_HIERARCHY, 1) )",
+  "( rc(&run(&mut tpm, &invalid_hierarchy_auth)), rc_handle(TPM_RC_HIERARCHY, 1) )",
+  "( rc(&run( &mut tpm, &command( TPM_ST_SESSIONS, TPM_CC_NV_DEFINE_SPACE, &[TPM_RH_OWNER], &invalid_name_params, &[password_entry(&[])], ) )), rc_parameter(TPM_RC_HASH, 2) )",
+  "( rc(&nv_define_with_hierarchy( &mut tpm, TPM_RH_PLATFORM, platform_index, 8, platform_attributes )), TPM_RC_SUCCESS )"
+ ],
+ "engine_persist_failure_and_malformed_auth_areas_are_exact": [
+  "(matches!(failure, Err(PersistError::Io(_))), true)",
+  "(rc(&run(&mut tpm, &short_handles)), TPM_RC_SIZE)",
+  "(rc(&run(&mut tpm, &missing_auth_size)), TPM_RC_AUTHSIZE)",
+  "(rc(&run(&mut tpm, &too_many_sessions)), TPM_RC_AUTHSIZE)",
+  "(rc(&run(&mut tpm, &rejected_sessions)), TPM_RC_AUTHSIZE)"
+ ],
+ "engine_quote_rejects_unsupported_key_object_type": [
+  "( rc(&run(&mut tpm, &quote_command(handle, &[0]))), rc_parameter(TPM_RC_TYPE, 1) )"
+ ],
+ "engine_quote_rejects_unsupported_schemes_and_non_signing_keys": [
+  "( rc(&run(&mut tpm, &quote_command(rsa_handle, &[0]))), TPM_RC_SUCCESS )",
+  "( rc(&run( &mut tpm, &quote_command_with_scheme(rsa_handle, &[0], TPM_ALG_RSASSA, TPM_ALG_SHA256) )), TPM_RC_SUCCESS )",
+  "( rc(&run( &mut tpm, &quote_command_with_scheme(rsa_handle, &[0], TPM_ALG_RSASSA, TPM_ALG_SHA1) )), rc_parameter(TPM_RC_HASH, 2) )",
+  "( rc(&run(&mut tpm, &quote_command(ecc_handle, &[0]))), TPM_RC_SUCCESS )",
+  "( rc(&run( &mut tpm, &quote_command_with_scheme(ecc_handle, &[0], TPM_ALG_ECDSA, TPM_ALG_SHA256) )), TPM_RC_SUCCESS )",
+  "( rc(&run( &mut tpm, &quote_command_with_scheme(ecc_handle, &[0], TPM_ALG_RSASSA, TPM_ALG_SHA256) )), rc_parameter(TPM_RC_SCHEME, 2) )"
+ ],
+ "engine_start_auth_session_rejects_each_bad_parameter": [
+  "(rc(&run(&mut tpm, &bad_in)), rc_handle(TPM_RC_HANDLE, 1))",
+  "(rc(&run(&mut tpm, &bad_out)), rc_handle(TPM_RC_HANDLE, 2))",
+  "( rc(&run( &mut tpm, &build(&[0x11; 16], &[0x22], TPM_SE_HMAC, None, TPM_ALG_SHA256) )), rc_parameter(TPM_RC_SIZE, 2) )",
+  "( rc(&run( &mut tpm, &build( &[0x11; 16], &[], TPM_SE_HMAC, Some((TPM_ALG_AES, 128, TPM_ALG_NULL)), TPM_ALG_SHA256 ) )), rc_parameter(TPM_RC_SYMMETRIC, 4) )",
+  "( rc(&run( &mut tpm, &build(&[0x11; 16], &[], TPM_SE_POLICY, None, TPM_ALG_SHA256) )), rc_parameter(TPM_RC_VALUE, 3) )",
+  "( rc(&run( &mut tpm, &build(&[0x11; 16], &[], TPM_SE_HMAC, None, TPM_ALG_SHA1) )), rc_parameter(TPM_RC_HASH, 5) )"
+ ],
+ "engine_template_validation_rejects_each_invalid_field": [
+  "(rc(&create_primary(&mut tpm, &template, &[])), expected)",
+  "( super::engine::validate_template(&template).unwrap_err(), rc_parameter(TPM_RC_TYPE, 2) )",
+  "( super::engine::key_from_seed(&[0u8; 32], &template).err(), Some(TPM_RC_TYPE) )",
+  "( super::engine::selected_indices(&out_of_range, 1).unwrap_err(), rc_parameter(TPM_RC_VALUE, 1) )"
  ],
  "enhanced_denuvo_anti_debug": [
   "(emulator.nt_query_information_process(7), 0)",
@@ -4045,6 +4184,14 @@
   "(InputPrimitive::Triangle.vertex_count(), 3)",
   "(InputPrimitive::TriangleAdjacency.vertex_count(), 6)"
  ],
+ "get_capability_rejects_unknown_capability_and_reports_commands": [
+  "(rc(&response), TPM_RC_SUCCESS)",
+  "(more, 0)",
+  "(rc(&handles), TPM_RC_SUCCESS)",
+  "(handle_reader.u8().expect(\"moreData\"), 0)",
+  "(handle_reader.u32().expect(\"handle count\"), 0)",
+  "(rc(&run(&mut tpm, &unknown)), rc_parameter(TPM_RC_VALUE, 1))"
+ ],
  "get_cp_info_and_is_valid_code_page_cover_the_standard_code_pages": [
   "(result, 1)",
   "( memory.read_u32(cp_info_ptr as u64).expect(\"max char size\"), 1 )",
@@ -4153,6 +4300,11 @@
   "(memory.read_u32(bytes_ptr).unwrap(), 0)",
   "(memory.read_u32(key_ptr).unwrap(), 0)",
   "(memory.read_u32(overlapped_ptr).unwrap(), 0)"
+ ],
+ "get_random_rejects_oversized_request_and_returns_exact_zero_length": [
+  "(rc(&run(&mut tpm, &too_many)), rc_parameter(TPM_RC_VALUE, 1))",
+  "(rc(&response), TPM_RC_SUCCESS)",
+  "(&response[10..], &[0, 0])"
  ],
  "get_version_ex_w_and_rtl_get_version_report_the_same_version": [
   "(rax, 1, \"GetVersionExW succeeds\")",
@@ -4550,6 +4702,61 @@
   "(error.code, ReasonCode::RcIo)",
   "( error.message.starts_with(&format!( \"heap {heap_id} out of memory: a 4096x4096 texture needs\" )), true )",
   "(backend.heap_usage(heap_id).expect(\"heap usage\").0, 0)"
+ ],
+ "hid_device_path_and_controller_spec_fallbacks_are_exact": [
+  "( user32.raw_input_device_name(by_location.id.as_u64()), Ok(\"\\\\??\\\\HID#VID_045E&PID_028E#0000ABCD#{0000000000000103}\".to_string()) )",
+  "( user32.raw_input_device_name(by_registry.id.as_u64()), Ok(\"\\\\??\\\\HID#VID_045E&PID_028E#0000000000000104#{0000000000000104}\".to_string()) )",
+  "(spec.name, \"HID 045E:028E\")",
+  "(spec.kind, ControllerKind::ThirdPartyXInput)"
+ ],
+ "hid_double_open_and_double_close_are_exact_errors": [
+  "(state.begin(id), Ok(()))",
+  "(state.begin(id), Err(DeviceError::AlreadyOpen { id }))",
+  "(state.end(), Ok(id))",
+  "(state.end(), Err(DeviceError::AlreadyClosed { id }))"
+ ],
+ "hid_invalid_report_lengths_are_rejected_exactly": [
+  "( validate_report_length(9, 8), Err(DeviceError::InvalidReportLength { expected: 8, actual: 9 }) )",
+  "( validate_report_length(0, 8), Err(DeviceError::InvalidReportLength { expected: 8, actual: 0 }) )"
+ ],
+ "hid_missing_handle_open_is_exact_and_not_permission": [
+  "( bridge.open(id).map(|_| ()), Err(DeviceError::DeviceMissing { id }) )"
+ ],
+ "hid_open_failure_and_poisoned_registry_edges_are_exact": [
+  "( bridge.open(failing.id).map(|_| ()), Err(DeviceError::Unsupported { feature: \"injected open failure\" }) )",
+  "( poisoned.open(info.id).map(|_| ()), Err(DeviceError::Io { operation: \"hid open registry\", os_code: 0 }) )",
+  "(device.drain_reports(), Vec::new())",
+  "(device.read_report(Duration::ZERO), Ok(None))"
+ ],
+ "hid_real_device_permission_denied_or_double_open_is_exact": [
+  "(operation, \"IOHIDManagerOpen\")",
+  "(feature, \"HID enumeration requires macOS IOKit\")",
+  "( bridge.open(info.id).map(|_| ()), Err(DeviceError::AlreadyOpen { id: info.id }) )",
+  "(device.close(), Ok(()))",
+  "( device.close(), Err(DeviceError::AlreadyClosed { id: info.id }) )",
+  "(id, info.id)"
+ ],
+ "hid_report_handle_lifecycle_edges_and_usage_detection_are_exact": [
+  "( info.record().path.as_deref(), Some(\"IOHIDDevice:0000000000000055\") )",
+  "(bridge.devices().len(), 0)",
+  "(bridge.table().len(), 0)",
+  "( bridge.open(info.id).map(|_| ()), Err(DeviceError::DeviceMissing { id: info.id }) )",
+  "( bridge .open_checked(info.id, info.vendor_id, info.product_id) .map(|_| ()), Err(DeviceError::DeviceMissing { id: info.id }) )",
+  "( bridge.apply(vec![info.clone()]), vec![HotplugEvent::Arrived(info.record())] )"
+ ],
+ "hid_stale_handle_after_unplug_is_missing_exactly": [
+  "( bridge.apply(vec![info.clone()]), vec![HotplugEvent::Arrived(info.record())] )",
+  "( bridge.apply(Vec::new()), vec![HotplugEvent::Removed { record: info.record() }] )",
+  "( bridge.open(info.id).map(|_| ()), Err(DeviceError::DeviceMissing { id: info.id }) )"
+ ],
+ "hid_vendor_mismatch_handle_is_rejected_exactly": [
+  "( ensure_vendor(&info, 0x054c, 0x0ce6), Err(DeviceError::VendorMismatch { id: info.id, expected_vendor: 0x054c, expected_product: 0x0ce6, actual_vendor: 0x045e, actual_product: 0x028e, }) )"
+ ],
+ "hierarchy_change_auth_rejects_stale_auth_and_persists_new_auth": [
+  "(rc(&run(&mut tpm, &bad)), TPM_RC_BAD_AUTH)",
+  "(rc(&run(&mut tpm, &good)), TPM_RC_SUCCESS)",
+  "( tpm.hierarchy_auth(super::state::Hierarchy::Owner), b\"new-owner-secret\" )",
+  "(rc(&run(&mut tpm, &stale)), TPM_RC_BAD_AUTH)"
  ],
  "high_address_edge_page_outside_flat_window_is_never_flat_resident": [
   "(store.materialised_page_count(), 1)",
@@ -6192,6 +6399,12 @@
   "(runtime.real_guest_frames, 0, \"GDI pixels are not presents\")",
   "(runtime.real_guest_frames, 1)"
  ],
+ "load_rejects_tampered_private_blob_and_round_trips_exact_public_area": [
+  "( rc(&load_child(&mut tpm, parent, &tampered, &public)), TPM_RC_INTEGRITY )",
+  "(rc(&response), TPM_RC_SUCCESS)",
+  "(name, expected.as_slice())",
+  "(rc(&flush(&mut tpm, handle)), TPM_RC_SUCCESS)"
+ ],
  "load_type_lib_parses_msft_typelib_and_reports_real_errors": [
   "( dispatch_x86( &mut fixture, HostThunk::OleLoadTypeLib, &[NAME as u32, OUT as u32] ), 0, \"LoadTypeLib\" )",
   "( call_slot(&mut fixture, type_lib, 3, &[type_lib as u32, STAT as u32]), 0 )",
@@ -6279,6 +6492,11 @@
  "malformed_cdn_routing_empty": [
   "(result.unwrap().len(), 0)"
  ],
+ "malformed_command_size_and_tag_are_rejected_with_exact_rc": [
+  "(rc(&short), TPM_RC_COMMAND_SIZE)",
+  "(rc(&run(&mut tpm, &oversized)), TPM_RC_COMMAND_SIZE)",
+  "(rc(&run(&mut tpm, &bad_tag)), TPM_RC_TAG)"
+ ],
  "malformed_images_and_wrong_format_access_fail_with_real_hrs": [
   "( create_decoder_from_stream(&mut fixture, factory, stream).0, u64::from(WINCODEC_ERR_BADIMAGE) )",
   "( create_decoder_from_stream(&mut fixture, factory, stream).0, u64::from(WINCODEC_ERR_BADIMAGE), \"progressive JPEG without tables or scans\" )",
@@ -6296,6 +6514,11 @@
   "( select_runtime( &ClrVersion::parse_request(\"8.0.31.1\").expect(\"valid\"), &installed ), None, \"a request with more components than the installed runtime never matches\" )",
   "(exact.version_string(), \"8.0.31\")",
   "(floating.version_string(), \"8.0.31\")"
+ ],
+ "malformed_parameter_size_and_auth_area_are_rejected": [
+  "(rc(&response), TPM_RC_SIZE)",
+  "(rc(&run(&mut tpm, &trailing)), TPM_RC_SIZE)",
+  "(rc(&run(&mut tpm, &trailing)), TPM_RC_AUTHSIZE)"
  ],
  "malformed_version_strings_are_rejected_without_guessing": [
   "( ClrVersion::parse_request(malformed), None, \"malformed version {malformed:?} must be rejected\" )",
@@ -6710,6 +6933,14 @@
  ],
  "mmapped_file_empty_file": [
   "(mf.size, 0)"
+ ],
+ "model_stable_ids_and_table_clear_edges_are_exact": [
+  "(DeviceClass::Hid.as_str(), \"hid\")",
+  "(DeviceClass::Usb.as_str(), \"usb\")",
+  "(DeviceClass::Serial.as_str(), \"serial\")",
+  "(id.as_u64(), 0x7817_8703_29fa_74f7)",
+  "(id.to_string(), \"7817870329fa74f7\")",
+  "(named.display_name(), \"Controller\")"
  ],
  "module_information_truncates_a_maximum_path_and_keeps_the_base_and_size_exact": [
   "(bytes.len(), 8 + SYSTEM_MODULE_ENTRY_SIZE * 2)",
@@ -7200,6 +7431,12 @@
   "(memory.read_u32(apc_flag).unwrap(), 0xABCD, \"APC ran\")",
   "( dispatch_x86_thunk(&mut runtime, &mut memory, test_alert, &[]), 0, \"NtTestAlert reports STATUS_SUCCESS with an empty queue\" )"
  ],
+ "nt_usb_ioctls_route_to_the_host_bridge_with_exact_statuses": [
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, thunk, &[ handle, 0, 0, 0, iosb as u32, IOCTL_USB_ENUMERATE_DEVICES, 0, 0, out as u32, 32, ], ), u64::from(crate::ntdll::STATUS_SUCCESS.raw()) )",
+  "(memory.read_u32(iosb + 4).expect(\"information\"), 0)",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, thunk, &[ handle, 0, 0, 0, iosb as u32, 0x00FF_FFFF, 0, 0, out as u32, 32 ], ), u64::from(crate::ntdll::STATUS_NOT_SUPPORTED.raw()) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, thunk, &[ handle, 0, 0, 0, iosb as u32, IOCTL_USB_VALIDATE_TRANSFER, 0, 0, out as u32, 32, ], ), u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw()) )"
+ ],
  "nt_wait_on_suspended_thread_stays_pending_until_resumed_and_exited": [
   "(prev, 0)",
   "( session .win32() .thread_suspend_count(thread_id) .expect(\"count\"), 1 )",
@@ -7349,6 +7586,20 @@
   "(channel.read_plane(0).expect(\"luma plane\"), vec![255u8; 8])",
   "(channel.read_plane(1).expect(\"chroma plane\"), vec![128u8; 4])",
   "(channel.to_rgba8().expect(\"RGBA decode\"), vec![255u8; 32])"
+ ],
+ "nv_bounds_lock_and_uninitialized_reads_are_rejected": [
+  "(rc(&nv_define(&mut tpm, index, 8)), TPM_RC_SUCCESS)",
+  "( rc(&nv_read(&mut tpm, TPM_RH_OWNER, index, 0, 4)), TPM_RC_NV_UNINITIALIZED )",
+  "( rc(&nv_write(&mut tpm, TPM_RH_OWNER, index, 0, b\"abcd\")), TPM_RC_SUCCESS )",
+  "( rc(&nv_write(&mut tpm, TPM_RH_OWNER, index, 6, b\"abcd\")), TPM_RC_NV_RANGE )",
+  "( rc(&nv_read(&mut tpm, TPM_RH_OWNER, index, 6, 4)), TPM_RC_NV_RANGE )",
+  "( rc(&nv_read(&mut tpm, TPM_RH_OWNER, 0x0150_00FF, 0, 1)), rc_handle(TPM_RC_HANDLE, 2) )"
+ ],
+ "nv_define_rejects_duplicate_invalid_index_and_zero_size": [
+  "(rc(&nv_define(&mut tpm, 0x0150_0020, 8)), TPM_RC_SUCCESS)",
+  "(rc(&nv_define(&mut tpm, 0x0150_0020, 8)), TPM_RC_NV_DEFINED)",
+  "( rc(&nv_define(&mut tpm, 0x0000_0001, 8)), rc_parameter(TPM_RC_VALUE, 2) )",
+  "(rc(&nv_define(&mut tpm, 0x0150_0021, 0)), TPM_RC_NV_SIZE)"
  ],
  "nvidia_and_amd_profiles_report_vendor_compatible_adapter_ids": [
   "(nvidia.adapter.vendor_id, 0x10de)",
@@ -7594,6 +7845,14 @@
   "(cache.entry_count(), 3)",
   "(cache.entry_count(), 1)"
  ],
+ "pcr_boundary_indices_are_rejected_with_exact_rc": [
+  "( rc(&run(&mut tpm, &out_of_range_extend)), rc_handle(TPM_RC_VALUE, 1) )",
+  "( rc(&run(&mut tpm, &out_of_range_read)), rc_parameter(TPM_RC_VALUE, 1) )",
+  "(rc(&run(&mut tpm, &wrong_hash_read)), TPM_RC_HASH)",
+  "(rc(&run(&mut tpm, &unbanked_extend)), TPM_RC_HASH)",
+  "(rc(&run(&mut tpm, &valid_extend)), TPM_RC_SUCCESS)",
+  "(tpm.pcr(7), Some(super::crypto::sha256(&expected_input)))"
+ ],
  "pe32_device_ioctl_dispatches_through_x86_irp": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS )",
   "(status, STATUS_SUCCESS)",
@@ -7662,6 +7921,52 @@
  ],
  "performance_profile_disables_debug": [
   "(profile.instruction_budget, 0)"
+ ],
+ "persistence_corruption_is_rejected_and_never_reset": [
+  "(rc(&run(&mut tpm, &startup())), TPM_RC_SUCCESS)",
+  "(rc(&nv_define(&mut tpm, 0x0150_0040, 8)), TPM_RC_SUCCESS)",
+  "(reopened.nv_indices(), vec![0x0150_0040])",
+  "(rc(&run(&mut reopened, &startup())), TPM_RC_SUCCESS)",
+  "(reloaded.raw, persisted_public.raw)",
+  "( error, TpmError::Persist(PersistError::Corrupt(Corruption::ChecksumMismatch)) )"
+ ],
+ "persistence_decode_io_and_atomic_cleanup_reject_bad_envelopes": [
+  "( super::persist::decode(&bad_magic).unwrap_err(), PersistError::Corrupt(Corruption::BadMagic) )",
+  "( super::persist::decode(&bad_length).unwrap_err(), PersistError::Corrupt(Corruption::LengthMismatch { declared: payload_len + 1, actual: payload_len, }) )",
+  "(kind, std::io::ErrorKind::IsADirectory)",
+  "(matches!(error, PersistError::Io(_)), true)",
+  "(leftovers, Vec::<String>::new())"
+ ],
+ "persistence_rejects_valid_checksum_with_invalid_payload_shape": [
+  "( Tpm::open(path.as_path()).err().expect(\"invalid payload\"), TpmError::Persist(PersistError::Corrupt(Corruption::InvalidPcrCount( PCR_COUNT - 1 ))) )"
+ ],
+ "persistence_short_header_and_version_are_rejected": [
+  "( Tpm::open(short.as_path()).err().expect(\"short header\"), TpmError::Persist(PersistError::Corrupt(Corruption::ShortHeader)) )",
+  "( Tpm::open(version.as_path()).err().expect(\"version\"), TpmError::Persist(PersistError::Corrupt(Corruption::UnsupportedVersion(7))) )"
+ ],
+ "persistence_validation_rejects_each_invalid_state_shape": [
+  "(state.validate(), Err(Corruption::StateVersion(0)))",
+  "( state.validate(), Err(Corruption::InvalidPcrCount(PCR_COUNT - 1)) )",
+  "( state.validate(), Err(Corruption::InvalidAuth(MAX_DIGEST_SIZE + 1)) )",
+  "( state.validate(), Err(Corruption::InvalidNvCount(MAX_NV_INDICES + 1)) )",
+  "( state.validate(), Err(Corruption::InvalidNvIndex(0x0000_0001)) )",
+  "( state.validate(), Err(Corruption::InvalidNvIndex(0x0150_0001)) )"
+ ],
+ "physical_hotplug_and_controller_state_are_real_and_stale_safe": [
+  "(user32.device_handle_count(), 2)",
+  "( user32.apply_physical_hotplug(&[HotplugEvent::Arrived(controller.record())]), Ok(()) )",
+  "(user32.controllers.len(), 1)",
+  "(spec.vendor_id, 0x045e)",
+  "(spec.product_id, 0x028e)",
+  "(spec.name, \"Controller\")"
+ ],
+ "physical_raw_input_tables_and_device_info_sizes_are_real": [
+  "(user32.physical_devices().device_count(), 0)",
+  "(user32.device_handle_count(), 0)",
+  "(user32.raw_input_device_count(), 0)",
+  "(user32.device_handle_count(), 1)",
+  "( user32.device_class_for_handle(hid.id.as_u64()), Some(DeviceClass::Hid) )",
+  "( user32.raw_input_table(), vec![RawInputDeviceEntry { handle: hid.id.as_u64(), device_id: hid.id, usage_page: 1, usage: 5, vendor_id: 0x045e, product_id: 0x028e, name: \"Controller\".to_string(), }] )"
  ],
  "pipe_read_begin_completion_is_scoped_to_request_id": [
   "(completion.bytes, b\"payload\")",
@@ -8498,6 +8803,12 @@
   "(promoted.tier, TranslationTier::Tier1)",
   "( promoted.ir, vec![ IrInstruction::MovImm { dst: Register::Rax, value: 0x1122_3344, }, IrInstruction::AddImm { dst: Register::Rax, value: 1, width: 8, }, ] )"
  ],
+ "raw_input_registration_flags_and_remove_edges_are_exact": [
+  "( user32.register_raw_input_devices(std::slice::from_ref(&registration)), Ok(()) )",
+  "(user32.raw_input_device_count(), 1)",
+  "(user32.get_registered_raw_input_devices(&mut small), 1)",
+  "(user32.get_registered_raw_input_devices(&mut output), 1)"
+ ],
  "ray_stage_qualifiers_reject_unknown_stages_and_map_exactly": [
   "(ShaderStage::RayGeneration.msl_qualifier(), \"kernel\")",
   "(ShaderStage::AnyHit.msl_qualifier(), \"void\")",
@@ -8601,6 +8912,14 @@
  ],
  "real_external_windows_xaudio2_imports_trace_through_pe_runtime": [
   "(canonical_output.exit_code, 0)"
+ ],
+ "real_hid_report_feed_builds_wm_input_and_raw_data_exactly": [
+  "( user32.register_raw_input_devices(&[RawInputRegistration { usage_page: 1, usage: 5, flags: RIDEV_INPUTSINK, target_hwnd: Some(0x2222), }]), Ok(()) )",
+  "( user32.push_hid_input_report( hid.id.as_u64(), HidInputReport { report_id: 1, data: vec![1, 2, 3, 4], } ), Ok(()) )",
+  "(user32.pending_raw_input_count(), 1)",
+  "(user32.raw_input_data_size(0x10000003), Ok(36))",
+  "(raw.header.dw_type, 2)",
+  "(raw.header.dw_size, 36)"
  ],
  "real_managed_assembly_metadata_matches_and_non_pe_is_rejected": [
   "( version_from_file(&assembly), Ok(\"v4.0.30319\".to_string()), \"CoreCLR assemblies carry the real CLI metadata version\" )",
@@ -8773,6 +9092,12 @@
   "(state.get(Register::Rsi), lhs + 3)",
   "(state.get(Register::Rdi), rhs + 3)"
  ],
+ "repeated_create_flush_does_not_leak_handles": [
+  "(rc(&flush(&mut tpm, handle)), TPM_RC_SUCCESS)",
+  "(tpm.transient_handles().len(), 0)",
+  "( rc(&read_public(&mut tpm, handle)), rc_handle(TPM_RC_HANDLE, 1) )",
+  "( rc(&flush(&mut tpm, 0x8000_FFFF)), rc_parameter(TPM_RC_HANDLE, 1) )"
+ ],
  "reply_receive_reply_and_cancel_semantics_are_exact": [
   "( port.reply(no_reply, vec![9]).err(), Some(STATUS_REPLY_MESSAGE_MISMATCH) )",
   "(port.reply(request, vec![7, 7]), Ok(()))",
@@ -8916,6 +9241,14 @@
   "(dos, ERROR_ACCESS_DENIED)",
   "(dos_error_to_errno(dos), libc::EACCES)"
  ],
+ "rsa_quote_signature_rejects_tampered_attest_and_pcr_digest_matches": [
+  "( rc(&run(&mut tpm, &quote_command_no_sessions(handle, &[3]))), TPM_RC_AUTH_MISSING )",
+  "( rc(&run( &mut tpm, &quote_command_with_scheme(handle, &[3], TPM_ALG_RSAPSS, TPM_ALG_SHA256) )), rc_parameter(TPM_RC_SCHEME, 2) )",
+  "(rc(&run(&mut tpm, &extend)), TPM_RC_SUCCESS)",
+  "(rc(&response), TPM_RC_SUCCESS)",
+  "(signature_alg, TPM_ALG_RSASSA)",
+  "(reader.u32().expect(\"magic\"), TPM_GENERATED_VALUE)"
+ ],
  "rtl_and_native_helpers_exercise_the_canonical_layouts": [
   "(X64_CONTEXT_GPR_OFFSETS[0], 0x20)",
   "(X64_CONTEXT_GPR_OFFSETS[4], 0x40)",
@@ -9057,6 +9390,9 @@
  "self_modifying_code_recompilation_stress": [
   "( rt.blocks_compiled, stress_count as u64, \"all {} recompilations should have occurred\", stress_count )"
  ],
+ "self_test_failure_is_reported_as_exact_tpm_rc": [
+  "(rc(&response), TPM_RC_FAILURE)"
+ ],
  "semantic_axes_keep_callable_separate_from_exact": [
   "( x3daudio_calculate.implementation, ImplementationLevel::Implemented, \"the real spatial-math dispatch is Implemented\" )",
   "( x3daudio_calculate.semantic_fidelity, SemanticFidelity::Exact, \"the documented speaker model is implemented for real\" )",
@@ -9080,6 +9416,62 @@
   "(port.sent_count(), 2)",
   "(message.id, first)"
  ],
+ "serial_busy_or_missing_host_port_is_exact_never_synthetic": [
+  "( bridge.open(info.id, SerialConfig::default()).map(|_| ()), Err(DeviceError::Busy { path: info.callout_path.clone() }) )",
+  "(first.close(), Ok(()))",
+  "(path, info.callout_path)",
+  "(operation, \"open\")",
+  "(id, info.id)"
+ ],
+ "serial_com_dispatch_rejects_invalid_busy_and_stale_handles": [
+  "(runtime.last_error, 0)",
+  "(crate::real_hid::dispatch::serial_handle_count(), 1)",
+  "(second, INVALID_HANDLE_VALUE as u32)",
+  "(runtime.last_error, ERROR_SHARING_VIOLATION)",
+  "(invalid, INVALID_HANDLE_VALUE as u32)",
+  "(runtime.last_error, ERROR_FILE_NOT_FOUND)"
+ ],
+ "serial_com_surface_and_errors_are_exact": [
+  "(user32.serial_ports().len(), 1)",
+  "(port.com_port, \"COM1\")",
+  "(port.callout_path, \"/dev/cu.casa1-test\")",
+  "( user32.serial_device_info(serial.id.as_u64()), Some(serial.clone()) )",
+  "(user32.serial_device_info(0xdead), None)",
+  "(error.code, ReasonCode::RcInvalidParameter)"
+ ],
+ "serial_comm_ioctls_roundtrip_and_config_boundaries": [
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, get_state, &[handle, dcb as u32],), 1 )",
+  "(read_u32(&memory, dcb).unwrap_or(0), 28)",
+  "(read_u32(&memory, dcb + 4).unwrap_or(0), 115_200)",
+  "(memory.read_u8(dcb + 18).unwrap_or(0), 8)",
+  "(memory.read_u8(dcb + 19).unwrap_or(0), 0)",
+  "(memory.read_u8(dcb + 20).unwrap_or(0), 0)"
+ ],
+ "serial_config_boundaries_are_rejected_exactly": [
+  "( SerialConfig { baud_rate: 0, ..base } .validate(), Err(DeviceError::InvalidArgument { field: \"baud_rate\", reason: \"unsupported rate\" }) )",
+  "( SerialConfig { data_bits: 4, ..base } .validate(), Err(DeviceError::InvalidArgument { field: \"data_bits\", reason: \"must be between 5 and 8\" }) )",
+  "( SerialConfig { data_bits: 9, ..base } .validate(), Err(DeviceError::InvalidArgument { field: \"data_bits\", reason: \"must be between 5 and 8\" }) )",
+  "( SerialConfig { stop_bits: SerialStopBits::OnePointFive, ..base } .validate(), Err(DeviceError::Unsupported { feature: \"serial 1.5 stop bits\" }) )",
+  "( SerialConfig { parity: SerialParity::Mark, ..base } .validate(), Err(DeviceError::Unsupported { feature: \"serial parity mark/space\" }) )",
+  "( SerialConfig { baud_rate: 50, data_bits: 5, ..base } .validate(), Ok(()) )"
+ ],
+ "serial_device_lifecycle_and_config_boundaries_are_exact": [
+  "(record.class, DeviceClass::Serial)",
+  "(record.path.as_deref(), Some(\"/dev/cu.casa1-test\"))",
+  "(record.product.as_deref(), Some(\"casa1-test\"))",
+  "(record.vendor_id, None)",
+  "(bridge.devices().len(), 0)",
+  "(bridge.table().len(), 0)"
+ ],
+ "serial_double_open_and_close_are_exact_via_state": [
+  "(state.begin(id), Ok(()))",
+  "(state.begin(id), Err(DeviceError::AlreadyOpen { id }))",
+  "(state.end(), Ok(id))",
+  "(state.end(), Err(DeviceError::AlreadyClosed { id }))"
+ ],
+ "serial_missing_device_open_is_exact_and_never_synthetic": [
+  "( bridge.open(id, SerialConfig::default()).map(|_| ()), Err(DeviceError::DeviceMissing { id }) )"
+ ],
  "service_loop_dispatches_large_control_at_fragment_boundary": [
   "( host.host(&DplayAppDesc::new(\"Service Loop\", 8), localhost()), S_OK )",
   "(client.connect(host_addr, \"Client\", &[]), S_OK)",
@@ -9093,6 +9485,14 @@
   "( island.pool_allocation_count(), 1, \"ExAllocatePoolWithTag allocated a tagged CasaK block\" )",
   "( island.pool_free_count(), 1, \"ExFreePoolWithTag freed the tagged block\" )",
   "(island.pool_used_bytes(), 0)"
+ ],
+ "session_authorize_rejects_each_malformed_auth_shape": [
+  "( session::authorize(&mut tpm, TPM_CC_GET_RANDOM, &[], &[], &[], &[owner]).unwrap_err(), TPM_RC_AUTH_MISSING )",
+  "( session::authorize( &mut tpm, TPM_CC_GET_RANDOM, &[], &[], std::slice::from_ref(&pw), &[] ) .unwrap_err(), TPM_RC_AUTHSIZE )",
+  "( session::authorize(&mut tpm, TPM_CC_GET_RANDOM, &[], &[], &[], &[]).unwrap(), Vec::new() )",
+  "( session::authorize( &mut tpm, TPM_CC_GET_RANDOM, &[TPM_RH_OWNER], &[], std::slice::from_ref(&nonce_pw), &[owner] ) .unwrap_err(), TPM_RC_SIZE )",
+  "( session::authorize( &mut tpm, TPM_CC_GET_RANDOM, &[TPM_RH_OWNER], &[], std::slice::from_ref(&attributed_pw), &[owner] ) .unwrap_err(), TPM_RC_ATTRIBUTES )",
+  "( session::authorize( &mut tpm, TPM_CC_GET_RANDOM, &[TPM_RH_OWNER], &[], std::slice::from_ref(&wrong_pw), &[owner] ) .unwrap_err(), TPM_RC_BAD_AUTH )"
  ],
  "session_group_control_rejects_spoofs_and_pins_allocation_outcomes": [
   "(allocation.result, S_OK)",
@@ -9462,6 +9862,21 @@
   "(manager.stop_device(child).unwrap(), PowerState::D3)",
   "(manager.stop_device(child), Err(STATUS_INVALID_DEVICE_STATE))"
  ],
+ "startup_shutdown_state_machine_rejects_out_of_order_calls": [
+  "(rc(&run(&mut tpm, &startup())), TPM_RC_INITIALIZE)",
+  "( rc(&run(&mut tpm, &bad_self_test)), rc_parameter(TPM_RC_VALUE, 1) )",
+  "(rc(&run(&mut tpm, &full_self_test)), TPM_RC_SUCCESS)",
+  "(rc(&run(&mut tpm, &shutdown)), TPM_RC_SUCCESS)",
+  "(rc(&run(&mut tpm, &get_random)), TPM_RC_INITIALIZE)"
+ ],
+ "state_hierarchy_roles_and_public_area_reject_invalid_encodings": [
+  "( Hierarchy::from_handle(TPM_RH_PLATFORM), Some(Hierarchy::Platform) )",
+  "(Hierarchy::Endorsement.handle(), TPM_RH_ENDORSEMENT)",
+  "(Hierarchy::Lockout.handle(), TPM_RH_LOCKOUT)",
+  "(Hierarchy::Platform.handle(), TPM_RH_PLATFORM)",
+  "(Hierarchy::Endorsement.seed(&state), state.endorsement_seed)",
+  "(Hierarchy::Lockout.seed(&state), state.lockout_seed)"
+ ],
  "state_machine_controls_pump_readiness": [
   "(runtime.pending_guest_threads.len(), 1)",
   "(runtime.pending_guest_threads.len(), 2)",
@@ -9537,6 +9952,12 @@
  ],
  "steam_zero_touch_stack_uses_no_network": [
   "(stack.state, ConnectionState::Disconnected)"
+ ],
+ "stir_random_rejects_oversized_entropy_and_changes_the_next_output": [
+  "(first.len(), 34)",
+  "(rc(&response), TPM_RC_SUCCESS)",
+  "( rc(&run( &mut tpm, &command(TPM_ST_NO_SESSIONS, TPM_CC_STIR_RANDOM, &[], &stir, &[]), )), TPM_RC_SIZE )",
+  "(first, second)"
  ],
  "stolen_completion_port_packet_repark_never_resumes_the_waiter": [
   "(drained.len(), 1)",
@@ -10765,11 +11186,34 @@
   "(leading_type(\"{ i32, i32 } rest\"), \"{ i32, i32 }\")",
   "(llvm_type_to_msl(\"<2 x i64>\").unwrap(), \"long2\")"
  ],
+ "t_llvm_ray_intrinsic_malformed_shapes_and_payload_errors_are_exact": [
+  "(llvm_type_to_msl(\"[4 x <4 x float>]\").unwrap(), \"float4x4\")",
+  "( llvm_type_to_msl(\"[2 x <4 x float>]\").unwrap_err().message, \"unsupported LLVM array type [2 x <4 x float>]\" )",
+  "(error.code, ReasonCode::RcDxilInvalid)",
+  "(error.message, message)"
+ ],
  "t_llvm_ray_memory_errors_name_the_failing_operation": [
   "(error.code, ReasonCode::RcDxilInvalid)",
   "(error.message, expected)",
   "( lower_llvm_ir_ray_body(\"define void @raygen() {\\nentry:\\n ret void\\n}\\n\", \"missing\") .unwrap_err() .message, \"LLVM IR has no definition for @missing\" )",
   "( lower_llvm_ir_ray_body(\"define void @raygen()\\n\", \"raygen\") .unwrap_err() .message, \"LLVM IR definition @raygen has no body\" )"
+ ],
+ "t_llvm_ray_stages_compile_from_own_bitcode_and_select_sbt_functions": [
+  "( source.contains(&format!(\"{function_name}(\")), true, \"missing {function_name}\" ); assert_eq!(source.contains(\"h = __sbt_local_root;\"), true); assert_eq!(source.contains(\"t = (float)(__ray_tmax);\"), true); assert_eq!(source.contains(\"g = (int)(__ray_geometry_index);\"), true); assert_eq!(source.contains(\"ct = (int)(__candidate_type);\"), true); assert_eq!(source.contains(\"ci = (int)(__candidate_instance);\"), true); assert_eq!(source.contains(\"cp = (int)(__candidate_primitive);\"), true); assert_eq!(source.contains(\"cg = (int)(__candidate_geometry);\"), true); assert_eq!( source.contains(\"uint __slot = __ioff + __hit_primitive * 3u + uint(0);\"), true ); assert_eq!( source.contains(\"__hit_distance = float(1.000000e+00);\"), true ); assert_eq!(source.contains(\"__accepted = 1u; __end_search = 1u;\"), true); if boolean { assert_eq!(source.contains(\"return __accepted != 0u;\"), true); } if matches!(stage, ShaderStage::ClosestHit) { let raygen = translate_llvm_ray_stage_program(&bitcode, ShaderStage::RayGeneration, \"entry\") .expect(\"raygen delegation\"); assert_eq!(raygen.contains(\"kernel void entry\"), true); } } let error = translate_llvm_ray_stage_program(b\"BC\\xc0\\xde\", ShaderStage::Vs, \"entry\") .expect_err(\"non-ray stage\"); assert_eq!(error.message, \"vs is not a ray shader stage\"); }",
+  "(source.contains(\"h = __sbt_local_root;\"), true)",
+  "(source.contains(\"t = (float)(__ray_tmax);\"), true)",
+  "(source.contains(\"g = (int)(__ray_geometry_index);\"), true)",
+  "(source.contains(\"ct = (int)(__candidate_type);\"), true)",
+  "(source.contains(\"ci = (int)(__candidate_instance);\"), true)"
+ ],
+ "t_llvm_ray_trace_control_candidate_and_shader_record_intrinsics_lower": [
+  "(msl.contains(expected), true, \"missing {expected}\")",
+  "( error.message, \"dx.op.attributeAtVertex is missing argument 2\" )"
+ ],
+ "t_llvm_ray_transform_identity_intrinsics_and_payload_pointer_edges": [
+  "( ray_entry_points(&raw).expect(\"raw entries\"), vec![\"raw\".to_string()] )",
+  "( ray_entry_points(&malformed).expect(\"malformed entries\"), Vec::<String>::new() )",
+  "(msl.contains(expected), true, \"missing {expected}\")"
  ],
  "t_msl_artifact_extractor_rejects_malformed_and_preserves_source": [
   "(error.code, ReasonCode::RcDxilInvalid)",
@@ -10788,6 +11232,53 @@
  ],
  "t_shader_cache_insert_and_get": [
   "(retrieved.unwrap().payload.mtl_library_bytes, vec![1, 2, 3])"
+ ],
+ "tbs_context_lifecycle_and_buffer_errors_are_exact": [
+  "( adapter.tbsi_context_create(&TbsContextParams::v1(), &mut context), TBS_SUCCESS )",
+  "( adapter.tbsip_submit_command( context, 0, TbsPriority::Normal.as_u32(), &startup_command, &mut response, &mut size, ), TBS_SUCCESS )",
+  "(response_code(&response[..size as usize]), TPM_RC_SUCCESS)",
+  "( adapter.tbsip_submit_command( context, 0, TbsPriority::Normal.as_u32(), &startup_command, &mut tiny, &mut tiny_size, ), TBS_E_INSUFFICIENT_BUFFER )",
+  "(adapter.tbsip_context_close(context), TBS_SUCCESS)",
+  "(adapter.tbsip_context_close(context), TBS_E_INVALID_CONTEXT)"
+ ],
+ "tbs_context_limit_and_malformed_submit_are_exact": [
+  "(adapter.tpm().pcr(0).is_some(), true)",
+  "(adapter.tpm_mut().is_started(), false)",
+  "( adapter.tbsi_context_create(&TbsContextParams::v1(), &mut first), TBS_SUCCESS )",
+  "( adapter.tbsi_context_create(&TbsContextParams::v2(0), &mut context), TBS_SUCCESS )",
+  "( adapter.tbsi_context_create(&TbsContextParams::v1(), &mut overflow), super::tbs::TBS_E_TOO_MANY_TBS_CONTEXTS )",
+  "( adapter .submit_command(first, 0, TbsPriority::Normal, &startup_command, &mut tiny) .unwrap_err(), TbsError::InsufficientBuffer )"
+ ],
+ "tbs_open_and_submit_map_persist_errors_to_exact_codes": [
+  "( adapter.tpm().state_path(), Some(root.join(\"tpm2\").join(\"state.bin\").as_path()) )",
+  "( TbsAdapter::open_environment(&corrupt_root) .err() .expect(\"corrupt\") .code(), super::tbs::TBS_E_INTERNAL_ERROR )",
+  "( TbsAdapter::open_environment(&io_root) .err() .expect(\"io\") .code(), super::tbs::TBS_E_IOERROR )",
+  "( adapter.tbsi_context_create(&TbsContextParams::v1(), &mut context), TBS_SUCCESS )",
+  "( adapter.tbsip_submit_command( context, 0, TbsPriority::Normal.as_u32(), &startup_command, &mut response, &mut size, ), super::tbs::TBS_E_IOERROR )",
+  "(rc(&response), TPM_RC_SUCCESS)"
+ ],
+ "tbs_parameters_priorities_and_error_codes_are_exact": [
+  "( TbsContextParams::v2(3).version, super::tbs::TBS_CONTEXT_VERSION_TWO )",
+  "(TbsContextParams::v2(3).flags, 3)",
+  "(TbsPriority::from_u32(200), Some(TbsPriority::High))",
+  "(TbsPriority::from_u32(300), Some(TbsPriority::System))",
+  "( TbsPriority::from_u32(0x8000_0000), Some(TbsPriority::Maximum) )",
+  "(TbsPriority::from_u32(1), None)"
+ ],
+ "tbs_rejects_bad_locality_priority_and_context": [
+  "( adapter.tbsi_context_create(&TbsContextParams::v1(), &mut context), TBS_SUCCESS )",
+  "( adapter.tbsip_submit_command( context, 5, TbsPriority::Normal.as_u32(), &startup_command, &mut response, &mut size, ), TBS_E_BAD_PARAMETER )",
+  "( adapter.tbsip_submit_command(context, 0, 999, &startup_command, &mut response, &mut size,), TBS_E_BAD_PARAMETER )",
+  "( adapter.tbsip_submit_command( 999, 0, TbsPriority::Normal.as_u32(), &startup_command, &mut response, &mut size, ), TBS_E_INVALID_CONTEXT )",
+  "( adapter.tbsi_context_create(&invalid_params, &mut ignored), TBS_E_INVALID_CONTEXT_PARAM )"
+ ],
+ "tbs_tpm_dispatch_rejects_bad_contracts_and_runs_startup_exactly": [
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, context_create, &[0, out as u32]), u64::from(crate::tpm::tbs::TBS_E_BAD_PARAMETER) )",
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, context_create, &[0, 0]), u64::from(crate::tpm::tbs::TBS_E_INVALID_OUTPUT_POINTER) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, context_create, &[params as u32, out as u32] ), u64::from(crate::tpm::tbs::TBS_E_INVALID_CONTEXT_PARAM) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, context_create, &[params as u32, out as u32] ), 0 )",
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, close, &[0xDEAD]), u64::from(crate::tpm::tbs::TBS_E_INVALID_CONTEXT) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, submit, &[ context as u32, 0, 100, command_ptr as u32, command.len() as u32, response as u32, response_len as u32, ] ), 0 )"
  ],
  "telemetry_id_rejects_foreign_machine_guid": [
   "(a, b)",
@@ -11656,6 +12147,14 @@
   "( monitor.create_restricted_token(Sid::users(), [], []), Err(STATUS_INSUFFICIENT_RESOURCES) )",
   "(monitor.token_count(), 64)"
  ],
+ "tpm_accessors_and_capacity_exhaustion_are_exact": [
+  "(tpm.state_path(), None)",
+  "(tpm.is_started(), false)",
+  "(tpm.pcr(PCR_COUNT), None)",
+  "(tpm.pcr_update_counter(), 0)",
+  "(format!(\"{:?}\", tpm).contains(\"Tpm\"), true)",
+  "(Tpm::default().is_started(), false)"
+ ],
  "trace_replay_matches_captured_output_and_rejects_env_mismatch": [
   "(replay_output, captured_canonical)",
   "(config_error.code, ReasonCode::RcTraceEnvMismatch)",
@@ -11767,6 +12266,10 @@
   "( call_slot( &mut fixture, typelib, 5, &[typelib as u32, index, OUT as u32] ), 0, \"GetTypeInfoType({index})\" )",
   "(fixture.memory.read_u32(OUT).unwrap(), expected)"
  ],
+ "unknown_command_and_pre_startup_command_are_rejected": [
+  "(rc(&run(&mut tpm, &get_random)), TPM_RC_INITIALIZE)",
+  "(rc(&run(&mut tpm, &unknown)), TPM_RC_COMMAND_CODE)"
+ ],
  "unknown_object_operations_are_rejected": [
   "( objects.with_runtime_info(1, 0x1000, 0, |_| ()), None, \"a meta host is not a runtime info object\" )",
   "(objects.next_enum_item(1, 0x1000), None)",
@@ -11781,6 +12284,11 @@
  ],
  "unload_error_restores_registration_and_reports_invalid_parameter": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtUnloadDriver, &[service_path], ), STATUS_INVALID_PARAMETER, \"a failed DriverUnload must be reported as INVALID_PARAMETER\" )"
+ ],
+ "unplug_race_reconcile_removes_once_and_never_synthesizes_devices": [
+  "( table.reconcile(vec![device.clone()]), vec![HotplugEvent::Arrived(device.clone())] )",
+  "( table.reconcile(Vec::new()), vec![HotplugEvent::Removed { record: device.clone() }] )",
+  "(table.reconcile(Vec::new()), Vec::<HotplugEvent>::new())"
  ],
  "unsupported_avx512_evex_instruction_returns_precise_error": [
   "( e.code, ReasonCode::RcUnimplInsn, \"Unsupported EVEX instruction should return RcUnimplInsn\" )",
@@ -11883,6 +12391,68 @@
   "(result, 0x8007_0057)",
   "(runtime.last_error, ERROR_INVALID_PARAMETER)",
   "(result, 0x8004_01E4)"
+ ],
+ "usb_descriptor_truncation_and_precedence_edges_are_exact": [
+  "( parse_configuration_descriptors(&[8, 2, 0, 0, 0, 0, 0, 0]), Err(DeviceError::MalformedDescriptor { offset: 0, reason: \"configuration descriptor is too short\" }) )",
+  "( parse_configuration_descriptors(&[ 9, 2, 0, 0, 0, 1, 0, 0x80, 50, 8, 4, 0, 0, 1, 3, 0, 0 ]), Err(DeviceError::MalformedDescriptor { offset: 9, reason: \"interface descriptor is too short\" }) )",
+  "( parse_configuration_descriptors(&[ 9, 2, 0, 0, 0, 1, 0, 0x80, 50, 7, 5, 0x81, 3, 8, 0, 10 ]), Err(DeviceError::MalformedDescriptor { offset: 9, reason: \"endpoint descriptor precedes interface\" }) )",
+  "( parse_configuration_descriptors(&[ 9, 2, 0, 0, 0, 1, 0, 0x80, 50, 9, 4, 0, 0, 1, 3, 0, 0, 0, 6, 5, 0x81, 3, 8, 0 ]), Err(DeviceError::MalformedDescriptor { offset: 18, reason: \"endpoint descriptor is too short\" }) )",
+  "( parse_configuration_descriptors(&[]), Err(DeviceError::MalformedDescriptor { offset: 0, reason: \"missing configuration descriptor\" }) )",
+  "(configurations.len(), 1)"
+ ],
+ "usb_dispatch_ioctls_enumerate_validate_and_reject_stale": [
+  "(runtime.last_error, 0)",
+  "(crate::real_hid::dispatch::usb_handle_count(), 1)",
+  "( crate::real_hid::dispatch::usb_path(u64::from(handle)), Ok(\"IOUSBHostDevice:0000000000000202\".to_string()) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, ioctl, &[ handle, IOCTL_USB_ENUMERATE_DEVICES, 0, 0, out as u32, 32, bytes_ret as u32, 0, ], ), 1 )",
+  "(read_u32(&memory, bytes_ret).unwrap_or(0), 32)"
+ ],
+ "usb_isochronous_transfer_is_rejected_exactly": [
+  "( device().validate_transfer(&request), Err(DeviceError::UnsupportedTransferType { kind: UsbTransferType::Isochronous }) )"
+ ],
+ "usb_known_but_unsupported_transfer_flags_are_rejected_exactly": [
+  "( request.validate_flags(), Err(DeviceError::UnsupportedTransferFlag { flag: USB_TRANSFER_FLAG_NO_DMA_MAP }) )"
+ ],
+ "usb_malformed_descriptor_is_rejected_exactly": [
+  "( parse_configuration_descriptors(&[9, 2, 0, 0]), Err(DeviceError::MalformedDescriptor { offset: 0, reason: \"descriptor length is invalid or truncated\" }) )",
+  "( parse_configuration_descriptors(&[4, 4, 0, 0]), Err(DeviceError::MalformedDescriptor { offset: 0, reason: \"interface descriptor precedes configuration\" }) )"
+ ],
+ "usb_missing_device_handle_is_exact_and_never_synthetic": [
+  "( bridge.validate_transfer(id, &request), Err(DeviceError::DeviceMissing { id }) )"
+ ],
+ "usb_missing_endpoint_is_rejected_exactly": [
+  "( device().validate_transfer(&request), Err(DeviceError::EndpointMissing { interface: 0, endpoint: 0x82 }) )"
+ ],
+ "usb_multi_configuration_descriptor_boundary_keeps_interfaces_paired": [
+  "(configurations.len(), 2)",
+  "(configurations[0].value, 1)",
+  "(configurations[0].interfaces.len(), 1)",
+  "(configurations[0].interfaces[0].endpoints.len(), 1)",
+  "(configurations[0].interfaces[0].endpoints[0].address, 0x81)",
+  "(configurations[1].value, 2)"
+ ],
+ "usb_real_enumeration_missing_devices_never_synthesized": [
+  "(events.len(), bridge.devices().len())",
+  "(feature, \"USB enumeration requires macOS IOKit\")"
+ ],
+ "usb_transfer_validation_and_unsupported_surface_are_exact": [
+  "( user32.usb_devices(), vec![UsbDeviceEntry { handle: usb.id.as_u64(), device_id: usb.id, vendor_id: 0x1234, product_id: 0x5678, configurations: 1, interfaces: 1, endpoints: 1, }] )",
+  "(user32.usb_device_info(usb.id.as_u64()), Ok(&usb))",
+  "( user32.validate_usb_transfer(usb.id.as_u64(), &request), Ok(()) )",
+  "( user32.submit_usb_transfer(usb.id.as_u64(), &request), Err(AppError::new( ReasonCode::RcInputUnsupported, \"unsupported feature: usb data transfer\" )) )",
+  "(unsupported_flag.code, ReasonCode::RcInputUnsupported)",
+  "( unsupported_flag.message, \"unsupported USB transfer flag 0x80000000\" )"
+ ],
+ "usb_transfer_validation_rejects_every_unsupported_edge_exactly": [
+  "( UsbTransferType::from_bits(0), Some(UsbTransferType::Control) )",
+  "( UsbTransferType::from_bits(1), Some(UsbTransferType::Isochronous) )",
+  "(UsbTransferType::from_bits(2), Some(UsbTransferType::Bulk))",
+  "( UsbTransferType::from_bits(3), Some(UsbTransferType::Interrupt) )",
+  "(UsbTransferType::Control.as_str(), \"control\")",
+  "(UsbTransferType::Isochronous.as_str(), \"isochronous\")"
+ ],
+ "usb_unknown_transfer_flags_are_rejected_exactly": [
+  "( request.validate_flags(), Err(DeviceError::UnsupportedTransferFlag { flag: 0x8000_0000 }) )"
  ],
  "user32_dialog_item_rejects_invalid_parent_and_id": [
   "( user32 .get_dlg_item(0xDEAD_BEEF, 1) .expect(\"unknown parent is not an error\"), None, \"an unknown parent must not materialize a dialog item\" )",

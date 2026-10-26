@@ -235,6 +235,7 @@ pub mod steam_protocol;
 pub mod steamvr;
 pub mod telemetry;
 pub mod threads;
+pub mod tpm;
 pub mod trace;
 pub mod user32;
 pub mod util;

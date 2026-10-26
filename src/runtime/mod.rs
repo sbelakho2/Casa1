@@ -1743,6 +1743,9 @@ pub(crate) struct ImageListInfo {
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone)]
 pub enum HostThunk {
+    TbsiContextCreate,
+    TbsipSubmitCommand,
+    TbsipContextClose,
     CreateDXGIFactory1,
     CreateDXGIFactory2,
     DXGIFactoryEnumAdapters,
@@ -2882,6 +2885,13 @@ pub enum HostThunk {
     CreateFileW,
     AreFileApisANSI,
     FlushFileBuffers,
+    GetCommState,
+    SetCommState,
+    GetCommTimeouts,
+    SetCommTimeouts,
+    PurgeComm,
+    ClearCommError,
+    EscapeCommFunction,
     GetCurrentPackageId,
     GetSystemTimeAsFileTime,
     GetSystemTimePreciseAsFileTime,
@@ -11707,6 +11717,145 @@ pub(crate) fn jit_construction_selected(
 }
 
 impl PeHostRuntime {
+    fn ensure_serial_ports(&mut self) {
+        if self.user32.serial_ports().is_empty() {
+            let _ = self.user32.refresh_physical_devices();
+        }
+    }
+
+    fn serial_port_for_path(&self, path: &str) -> Option<crate::real_hid::SerialPortEntry> {
+        let ports = self.user32.serial_ports();
+        if let Some(index) = com_port_index(path) {
+            let com_port = format!("COM{index}");
+            return ports
+                .into_iter()
+                .find(|port| port.com_port.eq_ignore_ascii_case(&com_port));
+        }
+        let trimmed = path.trim_start_matches("\\\\.\\");
+        ports.into_iter().find(|port| {
+            port.callout_path == path
+                || port.dialin_path.as_deref() == Some(path)
+                || port.callout_path.trim_start_matches("/dev/") == trimmed
+        })
+    }
+
+    fn open_serial_dispatch(&mut self, path: &str) -> Result<u64, DispatchOpenError> {
+        let port = self
+            .serial_port_for_path(path)
+            .ok_or(DispatchOpenError::NotFound)?;
+        let device = self
+            .user32
+            .physical_devices()
+            .open_serial(port.device_id, crate::real_hid::SerialConfig::default())
+            .map_err(DispatchOpenError::Device)?;
+        crate::real_hid::dispatch::register_serial(device).map_err(DispatchOpenError::Device)
+    }
+
+    fn open_usb_dispatch(&mut self, path: &str) -> Result<u64, DispatchOpenError> {
+        let id = parse_usb_dispatch_path(path).ok_or(DispatchOpenError::InvalidParameter)?;
+        let id = crate::real_hid::StableDeviceId::from_raw(id);
+        if self.user32.usb_devices().is_empty() {
+            let _ = self.user32.refresh_physical_devices();
+        }
+        let device = self
+            .user32
+            .physical_devices()
+            .usb_device(id)
+            .ok_or(DispatchOpenError::NotFound)?;
+        let path = device
+            .record()
+            .path
+            .unwrap_or_else(|| format!("IOUSBHostDevice:{:016x}", device.registry_entry_id));
+        Ok(crate::real_hid::dispatch::register_usb(id, path))
+    }
+
+    fn usb_io_control(
+        &mut self,
+        memory: &mut MemoryImage,
+        handle: u64,
+        io_code: u32,
+        in_buffer: u64,
+        in_size: u32,
+        out_buffer: u64,
+        out_size: u32,
+        bytes_ret_ptr: u64,
+    ) -> u32 {
+        let id = match crate::real_hid::dispatch::usb_device_id(handle) {
+            Ok(id) => id,
+            Err(error) => return error.windows_error(),
+        };
+        match io_code {
+            IOCTL_USB_ENUMERATE_DEVICES => {
+                let entries = self.user32.usb_devices();
+                let required = (entries.len() * 32) as u32;
+                if bytes_ret_ptr != 0 {
+                    write_u32(memory, bytes_ret_ptr, required);
+                }
+                if out_size < required {
+                    return ERROR_INSUFFICIENT_BUFFER;
+                }
+                for (index, entry) in entries.iter().enumerate() {
+                    let base = out_buffer + (index as u64 * 32);
+                    write_u64(memory, base, entry.handle);
+                    write_u32(memory, base + 8, u32::from(entry.vendor_id));
+                    write_u32(memory, base + 12, u32::from(entry.product_id));
+                    write_u32(memory, base + 16, entry.configurations as u32);
+                    write_u32(memory, base + 20, entry.interfaces as u32);
+                    write_u32(memory, base + 24, entry.endpoints as u32);
+                    write_u32(memory, base + 28, entry.device_id.as_u64() as u32);
+                }
+                0
+            }
+            IOCTL_USB_VALIDATE_TRANSFER | IOCTL_USB_SUBMIT_TRANSFER => {
+                if in_buffer == 0 || in_size < 24 {
+                    return ERROR_INVALID_PARAMETER;
+                }
+                let mut fields = [0u32; 6];
+                for (index, field) in fields.iter_mut().enumerate() {
+                    let Ok(value) = read_u32(memory, in_buffer + (index as u64 * 4)) else {
+                        return 998; // ERROR_NOACCESS
+                    };
+                    *field = value;
+                }
+                let direction = match fields[3] {
+                    0 => crate::real_hid::UsbDirection::Out,
+                    1 => crate::real_hid::UsbDirection::In,
+                    _ => return ERROR_INVALID_PARAMETER,
+                };
+                let request = crate::real_hid::UsbTransferRequest {
+                    interface_number: fields[0] as u8,
+                    endpoint_address: fields[1] as u8,
+                    transfer_type: crate::real_hid::UsbTransferType::from_bits(fields[2] as u8)
+                        .unwrap_or(crate::real_hid::UsbTransferType::Control),
+                    direction,
+                    flags: fields[4],
+                    length: fields[5] as usize,
+                };
+                let result = if io_code == IOCTL_USB_VALIDATE_TRANSFER {
+                    self.user32
+                        .physical_devices()
+                        .validate_usb_transfer(id, &request)
+                } else {
+                    self.user32
+                        .physical_devices()
+                        .usb()
+                        .submit_transfer(id, &request)
+                        .map(|_| ())
+                };
+                match result {
+                    Ok(()) => {
+                        if bytes_ret_ptr != 0 {
+                            write_u32(memory, bytes_ret_ptr, 0);
+                        }
+                        0
+                    }
+                    Err(error) => error.windows_error(),
+                }
+            }
+            _ => ERROR_NOT_SUPPORTED,
+        }
+    }
+
     /// Precompile the whole mapped image at `entry` when enabled.
     pub(crate) fn precompile_image(
         &mut self,
@@ -13993,6 +14142,157 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    fn ensure_tbs_adapter(&mut self) -> Result<&mut crate::tpm::tbs::TbsAdapter, u32> {
+        if self.tbs.is_none() {
+            let root = self.win32.ge().root.clone();
+            match crate::tpm::tbs::TbsAdapter::open_environment(&root) {
+                Ok(adapter) => self.tbs = Some(adapter),
+                Err(error) => return Err(error.code()),
+            }
+        }
+        Ok(self.tbs.as_mut().expect("TBS adapter initialized"))
+    }
+
+    fn write_guest_bytes(
+        &self,
+        memory: &mut MemoryImage,
+        address: u64,
+        bytes: &[u8],
+    ) -> AppResult<()> {
+        for (offset, byte) in bytes.iter().enumerate() {
+            memory.write_u8(address + offset as u64, *byte);
+        }
+        Ok(())
+    }
+
+    fn dispatch_tbs_context_create(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::tpm::tbs::{TBS_E_INVALID_OUTPUT_POINTER, TbsContextParams};
+        let params_ptr = guest_call_arg(state, memory, 0)?;
+        let out_ptr = guest_call_arg(state, memory, 1)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(TBS_E_INVALID_OUTPUT_POINTER));
+            return Ok(());
+        }
+        if params_ptr == 0 {
+            state.set(
+                Register::Rax,
+                u64::from(crate::tpm::tbs::TBS_E_BAD_PARAMETER),
+            );
+            return Ok(());
+        }
+        let version = memory.read_u32(params_ptr)?;
+        let flags = if version == crate::tpm::tbs::TBS_CONTEXT_VERSION_TWO {
+            memory.read_u32(params_ptr + 4)?
+        } else {
+            0
+        };
+        let params = TbsContextParams { version, flags };
+        let adapter = match self.ensure_tbs_adapter() {
+            Ok(adapter) => adapter,
+            Err(code) => {
+                state.set(Register::Rax, u64::from(code));
+                return Ok(());
+            }
+        };
+        match adapter.context_create(&params) {
+            Ok(context) => {
+                write_guest_pointer(memory, out_ptr, context, self.guest_arch)?;
+                state.set(Register::Rax, 0);
+            }
+            Err(error) => state.set(Register::Rax, u64::from(error.code())),
+        }
+        Ok(())
+    }
+
+    fn dispatch_tbs_submit_command(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::tpm::tbs::{
+            TBS_E_BAD_PARAMETER, TBS_E_INSUFFICIENT_BUFFER, TBS_E_INVALID_OUTPUT_POINTER,
+            TbsPriority,
+        };
+        let context = guest_call_arg(state, memory, 0)?;
+        let locality = guest_call_arg_u32(state, memory, 1)?;
+        let priority = guest_call_arg_u32(state, memory, 2)?;
+        let command_ptr = guest_call_arg(state, memory, 3)?;
+        let command_len = guest_call_arg_u32(state, memory, 4)? as usize;
+        let response_ptr = guest_call_arg(state, memory, 5)?;
+        let response_len_ptr = guest_call_arg(state, memory, 6)?;
+        if response_len_ptr == 0 {
+            state.set(Register::Rax, u64::from(TBS_E_INVALID_OUTPUT_POINTER));
+            return Ok(());
+        }
+        if command_ptr == 0 && command_len != 0 {
+            state.set(Register::Rax, u64::from(TBS_E_BAD_PARAMETER));
+            return Ok(());
+        }
+        if command_len > crate::tpm::constants::MAX_COMMAND_SIZE {
+            state.set(
+                Register::Rax,
+                u64::from(crate::tpm::tbs::TBS_E_BUFFER_TOO_LARGE),
+            );
+            return Ok(());
+        }
+        let Some(priority) = TbsPriority::from_u32(priority) else {
+            state.set(Register::Rax, u64::from(TBS_E_BAD_PARAMETER));
+            return Ok(());
+        };
+        let requested = memory.read_u32(response_len_ptr)? as usize;
+        let command = if command_len == 0 {
+            Vec::new()
+        } else {
+            memory.read_bytes(command_ptr, command_len)?
+        };
+        let adapter = match self.ensure_tbs_adapter() {
+            Ok(adapter) => adapter,
+            Err(code) => {
+                state.set(Register::Rax, u64::from(code));
+                return Ok(());
+            }
+        };
+        let mut response = vec![0_u8; crate::tpm::constants::MAX_COMMAND_SIZE.max(requested)];
+        match adapter.submit_command(context, locality as u8, priority, &command, &mut response) {
+            Ok(length) => {
+                if length > requested || response_ptr == 0 {
+                    memory.write_u32(response_len_ptr, length as u32);
+                    state.set(Register::Rax, u64::from(TBS_E_INSUFFICIENT_BUFFER));
+                } else {
+                    self.write_guest_bytes(memory, response_ptr, &response[..length])?;
+                    memory.write_u32(response_len_ptr, length as u32);
+                    state.set(Register::Rax, 0);
+                }
+            }
+            Err(error) => state.set(Register::Rax, u64::from(error.code())),
+        }
+        Ok(())
+    }
+
+    fn dispatch_tbs_context_close(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let context = guest_call_arg(state, memory, 0)?;
+        let adapter = match self.ensure_tbs_adapter() {
+            Ok(adapter) => adapter,
+            Err(code) => {
+                state.set(Register::Rax, u64::from(code));
+                return Ok(());
+            }
+        };
+        match adapter.context_close(context) {
+            Ok(()) => state.set(Register::Rax, 0),
+            Err(error) => state.set(Register::Rax, u64::from(error.code())),
+        }
+        Ok(())
+    }
+
     fn dispatch_import_if_present(
         &mut self,
         thunk_address: u64,
@@ -14291,6 +14591,15 @@ impl PeHostRuntime {
         let arg = |index: usize| guest_call_arg(state, memory, index).unwrap_or(0);
 
         match thunk {
+            HostThunk::TbsiContextCreate => {
+                self.dispatch_tbs_context_create(state, memory)?;
+            }
+            HostThunk::TbsipSubmitCommand => {
+                self.dispatch_tbs_submit_command(state, memory)?;
+            }
+            HostThunk::TbsipContextClose => {
+                self.dispatch_tbs_context_close(state, memory)?;
+            }
             HostThunk::CreateDXGIFactory1 => {
                 let out_ptr = state.get(Register::Rdx);
                 if out_ptr == 0 {
@@ -20305,15 +20614,31 @@ impl PeHostRuntime {
                 let size_ptr = state.get(Register::R9);
                 let _cb_size = guest_call_arg_u32(state, memory, 4)?;
                 if command == 0x10000003 { // RID_INPUT
-                    // Return size required for raw input data
                     let data_size = self.user32.raw_input_data_size(command).unwrap_or(40);
-                    if size_ptr != 0 {
-                        write_u32(memory, size_ptr, data_size);
+                    if data_ptr == 0 {
+                        if size_ptr != 0 {
+                            write_u32(memory, size_ptr, data_size);
+                        }
+                        state.set(Register::Rax, data_size as u64);
+                    } else if let Some(event) = self.user32.take_raw_input() {
+                        let bytes = event.to_bytes();
+                        let needed = bytes.len() as u32;
+                        if size_ptr != 0 {
+                            write_u32(memory, size_ptr, needed);
+                        }
+                        if needed > _cb_size {
+                            self.last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+                            state.set(Register::Rax, u64::MAX);
+                        } else {
+                            self.write_guest_bytes(memory, data_ptr, &bytes)?;
+                            state.set(Register::Rax, u64::from(needed));
+                        }
+                    } else {
+                        if size_ptr != 0 {
+                            write_u32(memory, size_ptr, 0);
+                        }
+                        state.set(Register::Rax, 0);
                     }
-                    if data_ptr != 0 {
-                        memory.map_bytes(data_ptr, &vec![0u8; data_size as usize]);
-                    }
-                    state.set(Register::Rax, data_size as u64);
                 } else {
                     if size_ptr != 0 {
                         write_u32(memory, size_ptr, 0);
@@ -20332,9 +20657,16 @@ impl PeHostRuntime {
                 let size_ptr = state.get(Register::R9);
                 match command {
                     // RIDI_DEVICENAME → wide-char device path
-                    0x20000002 => {
-                        let device_name = "\\??\\HID\\VID_045E&PID_028E\\6&1b8c7a2a&0&0000\0";
-                        let name_units: Vec<u16> = device_name.encode_utf16().collect();
+                    0x20000002 => 'device_name: {
+                        let device_name = match self.user32.raw_input_device_name(_handle) {
+                            Ok(name) => name,
+                            Err(_) => {
+                                self.last_error = 6; // ERROR_INVALID_HANDLE
+                                state.set(Register::Rax, u64::from(u32::MAX));
+                                break 'device_name;
+                            }
+                        };
+                        let name_units: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
                         let needed = (name_units.len() * 2) as u32;
                         if size_ptr != 0 {
                             let current_size = memory.read_u32(size_ptr)?;
@@ -20348,9 +20680,17 @@ impl PeHostRuntime {
                         state.set(Register::Rax, if needed > 0 { 1 } else { 0 });
                     }
                     // RIDI_PREPARSEDDATA → synthetic HID report descriptor
-                    0x20000003 => {
-                        // Standard 5-button mouse HID report descriptor (50 bytes)
-                        let preparsed: [u8; 52] = [
+                    0x20000003 => 'preparsed: {
+                        let preparsed = match self.user32.raw_input_preparsed_data(_handle) {
+                            Ok(descriptor) => descriptor,
+                            Err(_) => {
+                                self.last_error = 6; // ERROR_INVALID_HANDLE
+                                state.set(Register::Rax, u64::from(u32::MAX));
+                                break 'preparsed;
+                            }
+                        };
+                        #[allow(unused)]
+                        let _legacy_descriptor: [u8; 52] = [
                             0x05, 0x01,       // Usage Page (Generic Desktop)
                             0x09, 0x02,       // Usage (Mouse)
                             0xA1, 0x01,       // Collection (Application)
@@ -33516,8 +33856,86 @@ impl PeHostRuntime {
                     read_u32(memory, security_attributes + inherit_offset)? != 0
                 };
 
+                // Route real serial ports and USB dispatch devices.
+                if looks_like_serial_path(&raw_path) {
+                    self.ensure_serial_ports();
+                    match self.open_serial_dispatch(&raw_path) {
+                        Ok(handle) => {
+                            state.set(Register::Rax, handle);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "CreateFileW",
+                                BTreeMap::from([
+                                    ("path_raw".to_string(), json!(raw_path)),
+                                    ("path".to_string(), json!(path)),
+                                    ("serial_handle".to_string(), json!(handle)),
+                                ]),
+                                json!(handle),
+                            );
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                            self.last_error = dispatch_open_error_win32(&error);
+                            self.record_fs_first_failure(
+                                state,
+                                "CreateFileW",
+                                "serial open failed",
+                                "",
+                                None,
+                            );
+                            self.push_trace(
+                                "file",
+                                "CreateFileW",
+                                BTreeMap::from([
+                                    ("path_raw".to_string(), json!(raw_path)),
+                                    ("path".to_string(), json!(path)),
+                                    ("error".to_string(), json!(self.last_error)),
+                                ]),
+                                json!(INVALID_HANDLE_VALUE),
+                            );
+                        }
+                    }
+                } else if looks_like_usb_path(&raw_path) {
+                    match self.open_usb_dispatch(&raw_path) {
+                        Ok(handle) => {
+                            state.set(Register::Rax, handle);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "CreateFileW",
+                                BTreeMap::from([
+                                    ("path_raw".to_string(), json!(raw_path)),
+                                    ("path".to_string(), json!(path)),
+                                    ("usb_handle".to_string(), json!(handle)),
+                                ]),
+                                json!(handle),
+                            );
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                            self.last_error = dispatch_open_error_win32(&error);
+                            self.record_fs_first_failure(
+                                state,
+                                "CreateFileW",
+                                "usb open failed",
+                                "",
+                                None,
+                            );
+                            self.push_trace(
+                                "file",
+                                "CreateFileW",
+                                BTreeMap::from([
+                                    ("path_raw".to_string(), json!(raw_path)),
+                                    ("path".to_string(), json!(path)),
+                                    ("error".to_string(), json!(self.last_error)),
+                                ]),
+                                json!(INVALID_HANDLE_VALUE),
+                            );
+                        }
+                    }
                 // Route `\\.\pipe\*` paths to the named-pipe client opener.
-                if raw_path.starts_with("\\\\.\\pipe\\") || raw_path.starts_with("\\\\?\\pipe\\") {
+                } else if raw_path.starts_with("\\\\.\\pipe\\") || raw_path.starts_with("\\\\?\\pipe\\") {
                     match self.win32.open_named_pipe_client(&raw_path, inheritable) {
                         Ok(handle) => {
                             state.set(Register::Rax, handle as u64);
@@ -34692,6 +35110,51 @@ impl PeHostRuntime {
                 let length = guest_call_arg(state, memory, 2)? as usize;
                 let bytes_read_ptr = guest_call_arg(state, memory, 3)?;
                 let overlapped = guest_call_arg(state, memory, 4)?;
+                if crate::real_hid::dispatch::is_serial(u64::from(handle)) {
+                    if bytes_read_ptr != 0 {
+                        write_u32(memory, bytes_read_ptr, 0);
+                    }
+                    let error = if overlapped != 0 {
+                        Some(ERROR_NOT_SUPPORTED)
+                    } else if length > crate::real_hid::dispatch::MAX_SERIAL_TRANSFER {
+                        Some(ERROR_INVALID_PARAMETER)
+                    } else if buffer_ptr == 0 && length != 0 {
+                        Some(ERROR_INVALID_PARAMETER)
+                    } else {
+                        None
+                    };
+                    if let Some(error) = error {
+                        state.set(Register::Rax, 0);
+                        self.last_error = error;
+                        return Ok(None);
+                    }
+                    if length == 0 {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                    let timeout = crate::real_hid::dispatch::serial_timeouts(u64::from(handle))
+                        .map(|timeouts| timeouts.read_timeout())
+                        .unwrap_or_default();
+                    let mut buffer = vec![0u8; length];
+                    match crate::real_hid::dispatch::serial_read(
+                        u64::from(handle),
+                        &mut buffer,
+                        timeout,
+                    ) {
+                        Ok(read) => {
+                            memory.map_bytes(buffer_ptr, &buffer[..read]);
+                            write_u32(memory, bytes_read_ptr, read as u32);
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = error.windows_error();
+                        }
+                    }
+                    return Ok(None);
+                }
                 // Event handle recorded in the guest OVERLAPPED struct
                 // (hEvent at offset 16 on x86, 24 on x64).
                 let overlapped_event = if overlapped != 0 {
@@ -34966,6 +35429,50 @@ impl PeHostRuntime {
                 let length = guest_call_arg(state, memory, 2)? as usize;
                 let bytes_written_ptr = guest_call_arg(state, memory, 3)?;
                 let overlapped = guest_call_arg(state, memory, 4)?;
+                if crate::real_hid::dispatch::is_serial(u64::from(handle)) {
+                    if bytes_written_ptr != 0 {
+                        write_u32(memory, bytes_written_ptr, 0);
+                    }
+                    let error = if overlapped != 0 {
+                        Some(ERROR_NOT_SUPPORTED)
+                    } else if length > crate::real_hid::dispatch::MAX_SERIAL_TRANSFER {
+                        Some(ERROR_INVALID_PARAMETER)
+                    } else if buffer_ptr == 0 && length != 0 {
+                        Some(ERROR_INVALID_PARAMETER)
+                    } else {
+                        None
+                    };
+                    if let Some(error) = error {
+                        state.set(Register::Rax, 0);
+                        self.last_error = error;
+                        return Ok(None);
+                    }
+                    if length == 0 {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                    let bytes = read_window(memory, buffer_ptr, length)?;
+                    let timeout = crate::real_hid::dispatch::serial_timeouts(u64::from(handle))
+                        .map(|timeouts| timeouts.write_timeout())
+                        .unwrap_or_default();
+                    match crate::real_hid::dispatch::serial_write(
+                        u64::from(handle),
+                        &bytes,
+                        timeout,
+                    ) {
+                        Ok(written) => {
+                            write_u32(memory, bytes_written_ptr, written as u32);
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = error.windows_error();
+                        }
+                    }
+                    return Ok(None);
+                }
                 // Event handle recorded in the guest OVERLAPPED struct
                 // (hEvent at offset 16 on x86, 24 on x64).
                 let overlapped_event = if overlapped != 0 {
@@ -35268,6 +35775,19 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
+                if crate::real_hid::dispatch::is_serial(u64::from(handle)) {
+                    match crate::real_hid::dispatch::serial_flush(u64::from(handle)) {
+                        Ok(()) => {
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = error.windows_error();
+                        }
+                    }
+                    return Ok(None);
+                }
                 match self.win32.flush_file_buffers(handle) {
                     Ok(()) => {
                         state.set(Register::Rax, 1);
@@ -35282,6 +35802,238 @@ impl PeHostRuntime {
                     Err(error) => {
                         state.set(Register::Rax, 0);
                         self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::GetCommState => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let dcb = guest_call_arg(state, memory, 1)?;
+                if dcb == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                match crate::real_hid::dispatch::serial_config(u64::from(handle)) {
+                    Ok(config) => {
+                        write_u32(memory, dcb, 28);
+                        write_u32(memory, dcb + 4, config.baud_rate);
+                        write_u32(memory, dcb + 8, 1 | (1 << 4) | (1 << 12));
+                        write_u16(memory, dcb + 12, 0);
+                        write_u16(memory, dcb + 14, 0);
+                        write_u16(memory, dcb + 16, 0);
+                        write_u8(memory, dcb + 18, config.data_bits);
+                        write_u8(
+                            memory,
+                            dcb + 19,
+                            match config.parity {
+                                crate::real_hid::SerialParity::None => 0,
+                                crate::real_hid::SerialParity::Odd => 1,
+                                crate::real_hid::SerialParity::Even => 2,
+                                crate::real_hid::SerialParity::Mark => 3,
+                                crate::real_hid::SerialParity::Space => 4,
+                            },
+                        );
+                        write_u8(
+                            memory,
+                            dcb + 20,
+                            match config.stop_bits {
+                                crate::real_hid::SerialStopBits::One => 0,
+                                crate::real_hid::SerialStopBits::OnePointFive => 1,
+                                crate::real_hid::SerialStopBits::Two => 2,
+                            },
+                        );
+                        write_u8(memory, dcb + 21, 0x11);
+                        write_u8(memory, dcb + 22, 0x13);
+                        write_u8(memory, dcb + 23, 0);
+                        write_u8(memory, dcb + 24, 0x1a);
+                        write_u8(memory, dcb + 25, 0);
+                        write_u16(memory, dcb + 26, 0);
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = error.windows_error();
+                    }
+                }
+            }
+            HostThunk::SetCommState => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let dcb = guest_call_arg(state, memory, 1)?;
+                if dcb == 0 || read_u32(memory, dcb).unwrap_or(0) < 28 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                let parity = match memory.read_u8(dcb + 19).unwrap_or(0) {
+                    0 => crate::real_hid::SerialParity::None,
+                    1 => crate::real_hid::SerialParity::Odd,
+                    2 => crate::real_hid::SerialParity::Even,
+                    3 => crate::real_hid::SerialParity::Mark,
+                    4 => crate::real_hid::SerialParity::Space,
+                    _ => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        return Ok(None);
+                    }
+                };
+                let stop_bits = match memory.read_u8(dcb + 20).unwrap_or(0) {
+                    0 => crate::real_hid::SerialStopBits::One,
+                    1 => crate::real_hid::SerialStopBits::OnePointFive,
+                    2 => crate::real_hid::SerialStopBits::Two,
+                    _ => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        return Ok(None);
+                    }
+                };
+                let config = crate::real_hid::SerialConfig {
+                    baud_rate: read_u32(memory, dcb + 4).unwrap_or(0),
+                    data_bits: memory.read_u8(dcb + 18).unwrap_or(0),
+                    parity,
+                    stop_bits,
+                };
+                match crate::real_hid::dispatch::serial_configure(u64::from(handle), config) {
+                    Ok(()) => {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = error.windows_error();
+                    }
+                }
+            }
+            HostThunk::GetCommTimeouts => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let timeouts_ptr = guest_call_arg(state, memory, 1)?;
+                if timeouts_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                match crate::real_hid::dispatch::serial_timeouts(u64::from(handle)) {
+                    Ok(timeouts) => {
+                        write_u32(memory, timeouts_ptr, timeouts.read_interval_timeout);
+                        write_u32(
+                            memory,
+                            timeouts_ptr + 4,
+                            timeouts.read_total_timeout_multiplier,
+                        );
+                        write_u32(
+                            memory,
+                            timeouts_ptr + 8,
+                            timeouts.read_total_timeout_constant,
+                        );
+                        write_u32(
+                            memory,
+                            timeouts_ptr + 12,
+                            timeouts.write_total_timeout_multiplier,
+                        );
+                        write_u32(
+                            memory,
+                            timeouts_ptr + 16,
+                            timeouts.write_total_timeout_constant,
+                        );
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = error.windows_error();
+                    }
+                }
+            }
+            HostThunk::SetCommTimeouts => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let timeouts_ptr = guest_call_arg(state, memory, 1)?;
+                if timeouts_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                let timeouts = crate::real_hid::dispatch::CommTimeouts {
+                    read_interval_timeout: read_u32(memory, timeouts_ptr).unwrap_or(0),
+                    read_total_timeout_multiplier: read_u32(memory, timeouts_ptr + 4)
+                        .unwrap_or(0),
+                    read_total_timeout_constant: read_u32(memory, timeouts_ptr + 8).unwrap_or(0),
+                    write_total_timeout_multiplier: read_u32(memory, timeouts_ptr + 12)
+                        .unwrap_or(0),
+                    write_total_timeout_constant: read_u32(memory, timeouts_ptr + 16)
+                        .unwrap_or(0),
+                };
+                match crate::real_hid::dispatch::set_serial_timeouts(
+                    u64::from(handle),
+                    timeouts,
+                ) {
+                    Ok(()) => {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = error.windows_error();
+                    }
+                }
+            }
+            HostThunk::PurgeComm => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let flags = guest_call_arg_u32(state, memory, 1)?;
+                const PURGE_ALL: u32 = 0x0000_000f;
+                if flags & !PURGE_ALL != 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                let result = if flags & (0x0000_0004 | 0x0000_0008) != 0 {
+                    crate::real_hid::dispatch::serial_flush(u64::from(handle))
+                } else {
+                    crate::real_hid::dispatch::serial_clear_error(u64::from(handle))
+                };
+                match result {
+                    Ok(()) => {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = error.windows_error();
+                    }
+                }
+            }
+            HostThunk::ClearCommError => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let errors_ptr = guest_call_arg(state, memory, 1)?;
+                let stat_ptr = guest_call_arg(state, memory, 2)?;
+                match crate::real_hid::dispatch::serial_clear_error(u64::from(handle)) {
+                    Ok(()) => {
+                        if errors_ptr != 0 {
+                            write_u32(memory, errors_ptr, 0);
+                        }
+                        if stat_ptr != 0 {
+                            write_u32(memory, stat_ptr, 0);
+                            write_u32(memory, stat_ptr + 4, 0);
+                        }
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = error.windows_error();
+                    }
+                }
+            }
+            HostThunk::EscapeCommFunction => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let function = guest_call_arg_u32(state, memory, 1)?;
+                match crate::real_hid::dispatch::serial_escape(u64::from(handle), function) {
+                    Ok(()) => {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = error.windows_error();
                     }
                 }
             }
@@ -35371,6 +36123,21 @@ impl PeHostRuntime {
                         BTreeMap::from([("handle".to_string(), json!(handle))]),
                         json!(1),
                     );
+                } else if crate::real_hid::dispatch::is_serial(u64::from(handle)) {
+                    match crate::real_hid::dispatch::close_serial(u64::from(handle)) {
+                        Ok(()) => {
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = error.windows_error();
+                        }
+                    }
+                } else if crate::real_hid::dispatch::is_usb(u64::from(handle)) {
+                    let _ = crate::real_hid::dispatch::close_usb(u64::from(handle));
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
                 } else {
                     self.ads_handles.remove(&handle);
                     match self.win32.close_handle(handle) {
@@ -35437,6 +36204,50 @@ impl PeHostRuntime {
                     self.win32.process_state(target_process_handle)?;
                     let same_access = options & 0x0000_0002 != 0;
                     let close_source = options & 0x0000_0001 != 0;
+                    if crate::real_hid::dispatch::is_serial(u64::from(source_handle)) {
+                        match crate::real_hid::dispatch::duplicate_serial(u64::from(source_handle)) {
+                            Ok(duplicate) => {
+                                write_guest_pointer(
+                                    memory,
+                                    target_handle_ptr,
+                                    duplicate,
+                                    self.guest_arch,
+                                )?;
+                                if close_source {
+                                    let _ = crate::real_hid::dispatch::close_serial(u64::from(source_handle));
+                                }
+                                state.set(Register::Rax, 1);
+                                self.last_error = 0;
+                            }
+                            Err(error) => {
+                                state.set(Register::Rax, 0);
+                                self.last_error = error.windows_error();
+                            }
+                        }
+                        return Ok(None);
+                    }
+                    if crate::real_hid::dispatch::is_usb(u64::from(source_handle)) {
+                        match crate::real_hid::dispatch::duplicate_usb(u64::from(source_handle)) {
+                            Ok(duplicate) => {
+                                write_guest_pointer(
+                                    memory,
+                                    target_handle_ptr,
+                                    duplicate,
+                                    self.guest_arch,
+                                )?;
+                                if close_source {
+                                    crate::real_hid::dispatch::close_usb(u64::from(source_handle));
+                                }
+                                state.set(Register::Rax, 1);
+                                self.last_error = 0;
+                            }
+                            Err(error) => {
+                                state.set(Register::Rax, 0);
+                                self.last_error = error.windows_error();
+                            }
+                        }
+                        return Ok(None);
+                    }
                     match self.win32.duplicate_handle(
                         source_handle,
                         desired_access,
@@ -52399,6 +53210,21 @@ impl PeHostRuntime {
                 let out_buffer = arg(4);
                 let out_size = arg(5) as u32;
                 let bytes_ret_ptr = arg(6);
+                if crate::real_hid::dispatch::is_usb(u64::from(handle)) {
+                    let result = self.usb_io_control(
+                        memory,
+                        u64::from(handle),
+                        io_code,
+                        in_buffer,
+                        in_size,
+                        out_buffer,
+                        out_size,
+                        bytes_ret_ptr,
+                    );
+                    state.set(Register::Rax, u64::from(result == 0));
+                    self.last_error = result;
+                    return Ok(None);
+                }
                 // Shared device/IOCTL dispatch (NtDeviceIoControlFile routes
                 // through the same table).
                 self.dispatch_device_io_control_common(
@@ -68567,6 +69393,15 @@ impl HostThunk {
     fn from_import(import: &ResolvedImport) -> Self {
         let dll = import.resolved_module.to_ascii_lowercase();
         match (&dll[..], &import.symbol) {
+            ("tbs.dll", ImportSymbol::ByName { name, .. }) if name == "Tbsi_Context_Create" => {
+                Self::TbsiContextCreate
+            }
+            ("tbs.dll", ImportSymbol::ByName { name, .. }) if name == "Tbsip_Submit_Command" => {
+                Self::TbsipSubmitCommand
+            }
+            ("tbs.dll", ImportSymbol::ByName { name, .. }) if name == "Tbsip_Context_Close" => {
+                Self::TbsipContextClose
+            }
             ("dxgi.dll", ImportSymbol::ByName { name, .. }) if name == "CreateDXGIFactory1" => {
                 Self::CreateDXGIFactory1
             }
@@ -71218,6 +72053,27 @@ impl HostThunk {
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "FlushFileBuffers" => {
                 Self::FlushFileBuffers
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCommState" => {
+                Self::GetCommState
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetCommState" => {
+                Self::SetCommState
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCommTimeouts" => {
+                Self::GetCommTimeouts
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetCommTimeouts" => {
+                Self::SetCommTimeouts
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "PurgeComm" => {
+                Self::PurgeComm
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "ClearCommError" => {
+                Self::ClearCommError
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "EscapeCommFunction" => {
+                Self::EscapeCommFunction
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LocalAlloc" => {
                 Self::LocalAlloc
@@ -80105,6 +80961,13 @@ impl HostThunk {
             Self::NtReadFile | Self::NtWriteFile => 36,
             Self::NtLoadDriver | Self::NtUnloadDriver => 4,
             // ── kernel32 core surface (x86 stdcall byte counts) ────────────
+            Self::GetCommState
+            | Self::SetCommState
+            | Self::GetCommTimeouts
+            | Self::SetCommTimeouts
+            | Self::PurgeComm
+            | Self::EscapeCommFunction => 8,
+            Self::ClearCommError => 12,
             Self::DisableThreadLibraryCalls => 4,
             Self::ExpandEnvironmentStringsW => 12,
             Self::GetFileInformationByHandleEx => 16,
@@ -83020,6 +83883,49 @@ fn creation_disposition_from_win32(value: u32) -> AppResult<CreationDisposition>
 /// Public so the release gates can pin Steam's observed error codes against
 /// the exact mapping the thunks use (this is the guest-visible mapping, not
 /// `AppError::last_error()`).
+pub const IOCTL_USB_ENUMERATE_DEVICES: u32 = 0x0022_2400;
+const IOCTL_USB_VALIDATE_TRANSFER: u32 = 0x0022_2404;
+const IOCTL_USB_SUBMIT_TRANSFER: u32 = 0x0022_2408;
+
+#[derive(Debug)]
+enum DispatchOpenError {
+    NotFound,
+    InvalidParameter,
+    Device(crate::real_hid::DeviceError),
+}
+
+fn dispatch_open_error_win32(error: &DispatchOpenError) -> u32 {
+    match error {
+        DispatchOpenError::NotFound => ERROR_FILE_NOT_FOUND,
+        DispatchOpenError::InvalidParameter => ERROR_INVALID_PARAMETER,
+        DispatchOpenError::Device(error) => error.windows_error(),
+    }
+}
+
+fn com_port_index(path: &str) -> Option<u32> {
+    let upper = path.to_ascii_uppercase();
+    let rest = upper.strip_prefix("\\\\.\\COM")?;
+    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+fn looks_like_serial_path(path: &str) -> bool {
+    path.to_ascii_uppercase().starts_with("\\\\.\\COM") || path.starts_with("/dev/")
+}
+
+fn looks_like_usb_path(path: &str) -> bool {
+    path.starts_with("\\\\.\\Casa1Usb#")
+}
+
+fn parse_usb_dispatch_path(path: &str) -> Option<u64> {
+    let rest = path.strip_prefix("\\\\.\\Casa1Usb#")?;
+    (rest.len() == 16 && rest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| u64::from_str_radix(rest, 16).ok())
+        .flatten()
+}
+
 pub fn last_error_from_app_error(error: &AppError) -> u32 {
     match error.code {
         ReasonCode::RcFsNotFound => ERROR_FILE_NOT_FOUND,
@@ -104672,6 +105578,332 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_handle_aliases_tagged_usb_handles_until_last_close() {
+        with_big_stack(|| {
+            let (mut runtime, _temp) = test_runtime("duplicate-usb");
+            let duplicate = runtime.alloc_host_thunk(HostThunk::DuplicateHandle);
+            let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+            let source = crate::real_hid::dispatch::register_usb(
+                crate::real_hid::StableDeviceId::from_raw(0xCA5A_0003),
+                "usb-dup".to_string(),
+            ) as u32;
+            let out = 0x40_000_u64;
+            let mut memory = MemoryImage::default();
+            memory.map_bytes(out, &[0_u8; 8]);
+            let process = runtime.win32.current_process_handle();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    duplicate,
+                    &[process, source, process, out as u32, 0, 0, 0],
+                ),
+                1
+            );
+            let alias =
+                read_guest_pointer(&memory, out, GuestArch::X86).expect("duplicate handle") as u32;
+            assert_ne!(alias, source);
+            assert!(crate::real_hid::dispatch::is_usb(u64::from(alias)));
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[alias]),
+                1
+            );
+            assert!(
+                crate::real_hid::dispatch::is_usb(u64::from(source)),
+                "closing the alias keeps the original device"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[source]),
+                1
+            );
+            assert!(!crate::real_hid::dispatch::is_usb(u64::from(source)));
+        });
+    }
+
+    #[test]
+    fn nt_usb_ioctls_route_to_the_host_bridge_with_exact_statuses() {
+        with_big_stack(|| {
+            let (mut runtime, _temp) = test_runtime("nt-usb-ioctl");
+            let thunk = runtime.alloc_host_thunk(HostThunk::NtDeviceIoControlFile);
+            let handle = crate::real_hid::dispatch::register_usb(
+                crate::real_hid::StableDeviceId::from_raw(0xCA5A_0001),
+                "test-usb".to_string(),
+            ) as u32;
+            let mut memory = MemoryImage::default();
+            let iosb = 0x40_000_u64;
+            let out = 0x41_000_u64;
+            memory.map_bytes(iosb, &[0_u8; 24]);
+            memory.map_bytes(out, &[0_u8; 32]);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    thunk,
+                    &[
+                        handle,
+                        0,
+                        0,
+                        0,
+                        iosb as u32,
+                        IOCTL_USB_ENUMERATE_DEVICES,
+                        0,
+                        0,
+                        out as u32,
+                        32,
+                    ],
+                ),
+                u64::from(crate::ntdll::STATUS_SUCCESS.raw())
+            );
+            assert_eq!(memory.read_u32(iosb + 4).expect("information"), 0);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    thunk,
+                    &[
+                        handle,
+                        0,
+                        0,
+                        0,
+                        iosb as u32,
+                        0x00FF_FFFF,
+                        0,
+                        0,
+                        out as u32,
+                        32
+                    ],
+                ),
+                u64::from(crate::ntdll::STATUS_NOT_SUPPORTED.raw())
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    thunk,
+                    &[
+                        handle,
+                        0,
+                        0,
+                        0,
+                        iosb as u32,
+                        IOCTL_USB_VALIDATE_TRANSFER,
+                        0,
+                        0,
+                        out as u32,
+                        32,
+                    ],
+                ),
+                u64::from(crate::ntdll::STATUS_INVALID_PARAMETER.raw())
+            );
+        });
+    }
+
+    #[test]
+    fn tbs_tpm_dispatch_rejects_bad_contracts_and_runs_startup_exactly() {
+        with_big_stack(|| {
+            let (mut runtime, _temp) = test_runtime("tbs-tpm");
+            let context_create = runtime.alloc_host_thunk(HostThunk::TbsiContextCreate);
+            let submit = runtime.alloc_host_thunk(HostThunk::TbsipSubmitCommand);
+            let close = runtime.alloc_host_thunk(HostThunk::TbsipContextClose);
+            let mut memory = MemoryImage::default();
+            let params = 0x40_000_u64;
+            let out = 0x40_100_u64;
+            let response = 0x41_000_u64;
+            let response_len = 0x42_000_u64;
+            memory.map_bytes(params, &[0_u8; 8]);
+            memory.map_bytes(out, &[0_u8; 8]);
+            memory.map_bytes(response, &[0_u8; 64]);
+            memory.map_bytes(response_len, &[0_u8; 4]);
+            memory.write_u32(params, 1);
+
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, context_create, &[0, out as u32]),
+                u64::from(crate::tpm::tbs::TBS_E_BAD_PARAMETER)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, context_create, &[0, 0]),
+                u64::from(crate::tpm::tbs::TBS_E_INVALID_OUTPUT_POINTER)
+            );
+            memory.write_u32(params, 9);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    context_create,
+                    &[params as u32, out as u32]
+                ),
+                u64::from(crate::tpm::tbs::TBS_E_INVALID_CONTEXT_PARAM)
+            );
+            memory.write_u32(params, 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    context_create,
+                    &[params as u32, out as u32]
+                ),
+                0
+            );
+            let context = read_guest_pointer(&memory, out, GuestArch::X86).expect("context");
+
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[0xDEAD]),
+                u64::from(crate::tpm::tbs::TBS_E_INVALID_CONTEXT)
+            );
+
+            // TPM2_Startup(CLEAR): tag 0x8001, size 12, command 0x144.
+            let command = [
+                0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x44, 0x00, 0x00,
+            ];
+            let command_ptr = 0x43_000_u64;
+            memory.map_bytes(command_ptr, &command);
+            memory.write_u32(response_len, 64);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    submit,
+                    &[
+                        context as u32,
+                        0,
+                        100,
+                        command_ptr as u32,
+                        command.len() as u32,
+                        response as u32,
+                        response_len as u32,
+                    ]
+                ),
+                0
+            );
+            assert_eq!(memory.read_u32(response_len).expect("length"), 10);
+            let tag = u16::from_be_bytes(
+                memory
+                    .read_bytes(response, 2)
+                    .expect("tag")
+                    .try_into()
+                    .expect("tag bytes"),
+            );
+            let size = u32::from_be_bytes(
+                memory
+                    .read_bytes(response + 2, 4)
+                    .expect("size")
+                    .try_into()
+                    .expect("size bytes"),
+            );
+            let rc = u32::from_be_bytes(
+                memory
+                    .read_bytes(response + 6, 4)
+                    .expect("rc")
+                    .try_into()
+                    .expect("rc bytes"),
+            );
+            assert_eq!(tag, 0x8001);
+            assert_eq!(size, 10);
+            assert_eq!(rc, 0);
+
+            // A smaller caller buffer reports the required size and no bytes.
+            memory.write_u32(response_len, 4);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    submit,
+                    &[
+                        context as u32,
+                        0,
+                        100,
+                        command_ptr as u32,
+                        command.len() as u32,
+                        response as u32,
+                        response_len as u32,
+                    ]
+                ),
+                u64::from(crate::tpm::tbs::TBS_E_INSUFFICIENT_BUFFER)
+            );
+            assert_eq!(memory.read_u32(response_len).expect("required"), 10);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    submit,
+                    &[
+                        context as u32,
+                        0,
+                        999,
+                        command_ptr as u32,
+                        12,
+                        response as u32,
+                        response_len as u32
+                    ]
+                ),
+                u64::from(crate::tpm::tbs::TBS_E_BAD_PARAMETER)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    submit,
+                    &[
+                        context as u32,
+                        0,
+                        100,
+                        command_ptr as u32,
+                        70_000,
+                        response as u32,
+                        response_len as u32
+                    ]
+                ),
+                u64::from(crate::tpm::tbs::TBS_E_BUFFER_TOO_LARGE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    submit,
+                    &[
+                        context as u32,
+                        0,
+                        100,
+                        0,
+                        4,
+                        response as u32,
+                        response_len as u32
+                    ]
+                ),
+                u64::from(crate::tpm::tbs::TBS_E_BAD_PARAMETER)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    submit,
+                    &[
+                        context as u32,
+                        0,
+                        100,
+                        command_ptr as u32,
+                        12,
+                        response as u32,
+                        0
+                    ]
+                ),
+                u64::from(crate::tpm::tbs::TBS_E_INVALID_OUTPUT_POINTER)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[context as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[context as u32]),
+                u64::from(crate::tpm::tbs::TBS_E_INVALID_CONTEXT)
+            );
+        });
+    }
+
+    #[test]
     fn evidence_mscoree_clr_absent_semantics() {
         with_big_stack(|| {
             let (mut runtime, _tmp) = test_runtime("evidence-mscoree");
@@ -117519,6 +118751,709 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
         let bytes = memory.read_bytes(address, 4).expect("read u32");
         u32::from_le_bytes(bytes.try_into().expect("4 bytes"))
     }
+
+    fn serial_dispatch_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn install_serial_dispatch_fixture(
+        runtime: &mut PeHostRuntime,
+        id: u64,
+        path: &str,
+    ) -> crate::real_hid::StableDeviceId {
+        let info = crate::real_hid::SerialDeviceInfo {
+            id: crate::real_hid::StableDeviceId::from_raw(id),
+            registry_entry_id: id,
+            callout_path: path.to_string(),
+            dialin_path: Some(path.replace("/dev/cu.", "/dev/tty.")),
+            tty_device: Some(format!("tty-{id:016x}")),
+            base_name: Some(format!("base-{id:016x}")),
+            client_type: Some("IOSerialBSDClientType".to_string()),
+        };
+        runtime
+            .user32
+            .physical_devices_mut()
+            .serial_mut()
+            .apply(vec![info.clone()]);
+        runtime.user32.sync_device_handles();
+        info.id
+    }
+
+    fn install_usb_dispatch_fixture(
+        runtime: &mut PeHostRuntime,
+    ) -> crate::real_hid::StableDeviceId {
+        let info = crate::real_hid::UsbDeviceInfo {
+            id: crate::real_hid::StableDeviceId::from_raw(0x202),
+            registry_entry_id: 0x202,
+            descriptor: crate::real_hid::UsbDeviceDescriptor {
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                bcd_device: 0x0100,
+                class: 0,
+                subclass: 0,
+                protocol: 0,
+                max_packet_size0: 64,
+                num_configurations: 1,
+            },
+            manufacturer: Some("Fixture".to_string()),
+            product: Some("USB Fixture".to_string()),
+            serial_number: None,
+            vendor_string: None,
+            location_id: None,
+            current_configuration: Some(1),
+            configurations: vec![crate::real_hid::UsbConfigurationDescriptor {
+                value: 1,
+                attributes: 0x80,
+                max_power_ma: 100,
+                interfaces: vec![crate::real_hid::UsbInterfaceDescriptor {
+                    number: 0,
+                    alternate_setting: 0,
+                    class: 3,
+                    subclass: 0,
+                    protocol: 0,
+                    endpoints: vec![crate::real_hid::UsbEndpointDescriptor {
+                        address: 0x81,
+                        number: 1,
+                        direction: crate::real_hid::UsbDirection::In,
+                        transfer_type: crate::real_hid::UsbTransferType::Interrupt,
+                        attributes: 3,
+                        max_packet_size: 8,
+                        interval: 10,
+                    }],
+                }],
+            }],
+            raw_configuration_descriptors: Vec::new(),
+        };
+        runtime
+            .user32
+            .physical_devices_mut()
+            .usb_mut()
+            .apply(vec![info.clone()]);
+        runtime.user32.sync_device_handles();
+        info.id
+    }
+
+    #[test]
+    fn serial_com_dispatch_rejects_invalid_busy_and_stale_handles() {
+        let _guard = serial_dispatch_test_lock();
+        crate::real_hid::dispatch::reset_for_tests();
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "serial-dispatch-errors",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            install_serial_dispatch_fixture(&mut runtime, 0x401, "/dev/cu.casa1-test");
+            let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+            let path = runtime
+                .alloc_utf16_string(&mut memory, "\\\\.\\COM1")
+                .expect("COM1 path");
+            let handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_file,
+                &[path as u32, 0x8000_0000, 0, 0, 3, 0, 0],
+            ) as u32;
+            assert_ne!(handle, INVALID_HANDLE_VALUE as u32);
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(crate::real_hid::dispatch::serial_handle_count(), 1);
+
+            let second = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_file,
+                &[path as u32, 0x8000_0000, 0, 0, 3, 0, 0],
+            ) as u32;
+            assert_eq!(second, INVALID_HANDLE_VALUE as u32);
+            assert_eq!(runtime.last_error, ERROR_SHARING_VIOLATION);
+
+            let invalid_path = runtime
+                .alloc_utf16_string(&mut memory, "\\\\.\\COM9")
+                .expect("COM9 path");
+            let invalid = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_file,
+                &[invalid_path as u32, 0x8000_0000, 0, 0, 3, 0, 0],
+            ) as u32;
+            assert_eq!(invalid, INVALID_HANDLE_VALUE as u32);
+            assert_eq!(runtime.last_error, ERROR_FILE_NOT_FOUND);
+
+            let device_path = runtime
+                .alloc_utf16_string(&mut memory, "/dev/cu.casa1-test")
+                .expect("device path");
+            let by_path = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_file,
+                &[device_path as u32, 0x8000_0000, 0, 0, 3, 0, 0],
+            ) as u32;
+            assert_eq!(
+                by_path, INVALID_HANDLE_VALUE as u32,
+                "the first COM1 handle is still open"
+            );
+
+            let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle]),
+                1
+            );
+            assert_eq!(runtime.last_error, 0);
+            let purge_stale = runtime.alloc_host_thunk(HostThunk::PurgeComm);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, purge_stale, &[handle, 0]),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle]),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+
+            let read = runtime.alloc_host_thunk(HostThunk::ReadFile);
+            let buffer = 0x70_000_u64;
+            memory.map_bytes(buffer, &[0u8; 8]);
+            let bytes_read = 0x70_100_u64;
+            write_u32(&mut memory, bytes_read, 0xdead_beef);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    read,
+                    &[handle, buffer as u32, 1, bytes_read as u32, 0],
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+            assert_eq!(read_u32(&memory, bytes_read).unwrap_or(0), 0);
+
+            let events = runtime
+                .user32
+                .refresh_physical_devices()
+                .expect("refresh empty host");
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].device().id,
+                crate::real_hid::StableDeviceId::from_raw(0x401)
+            );
+            assert!(runtime.user32.serial_ports().is_empty());
+            let create_after = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+            let after_removal = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_after,
+                &[path as u32, 0x8000_0000, 0, 0, 3, 0, 0],
+            ) as u32;
+            assert_eq!(after_removal, INVALID_HANDLE_VALUE as u32);
+            assert_eq!(runtime.last_error, ERROR_FILE_NOT_FOUND);
+        });
+    }
+
+    #[test]
+    fn serial_comm_ioctls_roundtrip_and_config_boundaries() {
+        let _guard = serial_dispatch_test_lock();
+        crate::real_hid::dispatch::reset_for_tests();
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "serial-comm-dispatch",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            install_serial_dispatch_fixture(&mut runtime, 0x402, "/dev/cu.casa1-comm");
+            let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+            let path = runtime
+                .alloc_utf16_string(&mut memory, "\\\\.\\COM1")
+                .expect("COM1 path");
+            let handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_file,
+                &[path as u32, 0x8000_0000, 0, 0, 3, 0, 0],
+            ) as u32;
+            assert_ne!(handle, INVALID_HANDLE_VALUE as u32);
+
+            let dcb = 0x71_000_u64;
+            memory.map_bytes(dcb, &[0u8; 64]);
+            let get_state = runtime.alloc_host_thunk(HostThunk::GetCommState);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_state, &[handle, dcb as u32],),
+                1
+            );
+            assert_eq!(read_u32(&memory, dcb).unwrap_or(0), 28);
+            assert_eq!(read_u32(&memory, dcb + 4).unwrap_or(0), 115_200);
+            assert_eq!(memory.read_u8(dcb + 18).unwrap_or(0), 8);
+            assert_eq!(memory.read_u8(dcb + 19).unwrap_or(0), 0);
+            assert_eq!(memory.read_u8(dcb + 20).unwrap_or(0), 0);
+
+            write_u32(&mut memory, dcb, 28);
+            write_u32(&mut memory, dcb + 4, 9_600);
+            memory.write_u8(dcb + 18, 8);
+            memory.write_u8(dcb + 19, 2);
+            memory.write_u8(dcb + 20, 2);
+            let set_state = runtime.alloc_host_thunk(HostThunk::SetCommState);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_state, &[handle, dcb as u32],),
+                1
+            );
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_state, &[handle, dcb as u32],),
+                1
+            );
+            assert_eq!(read_u32(&memory, dcb + 4).unwrap_or(0), 9_600);
+            assert_eq!(memory.read_u8(dcb + 19).unwrap_or(0), 2);
+            assert_eq!(memory.read_u8(dcb + 20).unwrap_or(0), 2);
+
+            write_u32(&mut memory, dcb + 4, 12_345);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_state, &[handle, dcb as u32],),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_state, &[handle, 0]),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+            let timeouts = 0x72_000_u64;
+            memory.map_bytes(timeouts, &[0u8; 32]);
+            for (index, value) in [10u32, 2, 30, 4, 50].iter().enumerate() {
+                write_u32(&mut memory, timeouts + (index as u64 * 4), *value);
+            }
+            let set_timeouts = runtime.alloc_host_thunk(HostThunk::SetCommTimeouts);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_timeouts,
+                    &[handle, timeouts as u32],
+                ),
+                1
+            );
+            let get_timeouts = runtime.alloc_host_thunk(HostThunk::GetCommTimeouts);
+            for offset in [0u64, 4, 8, 12, 16] {
+                write_u32(&mut memory, timeouts + offset, 0);
+            }
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_timeouts,
+                    &[handle, timeouts as u32],
+                ),
+                1
+            );
+            assert_eq!(read_u32(&memory, timeouts).unwrap_or(0), 10);
+            assert_eq!(read_u32(&memory, timeouts + 8).unwrap_or(0), 30);
+            assert_eq!(read_u32(&memory, timeouts + 16).unwrap_or(0), 50);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_timeouts, &[handle, 0],),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_timeouts, &[handle, 0],),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+            let purge = runtime.alloc_host_thunk(HostThunk::PurgeComm);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, purge, &[handle, 5]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, purge, &[handle, 0x10]),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+            let errors = 0x73_000_u64;
+            let stat = 0x73_010_u64;
+            memory.map_bytes(errors, &[0xff; 16]);
+            let clear = runtime.alloc_host_thunk(HostThunk::ClearCommError);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    clear,
+                    &[handle, errors as u32, stat as u32],
+                ),
+                1
+            );
+            assert_eq!(read_u32(&memory, errors).unwrap_or(0xff), 0);
+            assert_eq!(read_u32(&memory, stat).unwrap_or(0xff), 0);
+
+            let escape = runtime.alloc_host_thunk(HostThunk::EscapeCommFunction);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, escape, &[handle, 0]),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, escape, &[handle, 5]),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_NOT_SUPPORTED);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, escape, &[handle, 9]),
+                0
+            );
+
+            let flush = runtime.alloc_host_thunk(HostThunk::FlushFileBuffers);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, flush, &[handle]),
+                1
+            );
+
+            let read = runtime.alloc_host_thunk(HostThunk::ReadFile);
+            let write = runtime.alloc_host_thunk(HostThunk::WriteFile);
+            let buffer = 0x74_000_u64;
+            memory.map_bytes(buffer, &[1u8; 16]);
+            let count = 0x74_100_u64;
+            for (thunk, length, buffer_ptr, expected_error) in [
+                (read, 0, 0, 0),
+                (write, 0, 0, 0),
+                (read, 1, 0, ERROR_INVALID_PARAMETER),
+                (write, 1, 0, ERROR_INVALID_PARAMETER),
+                (
+                    read,
+                    crate::real_hid::dispatch::MAX_SERIAL_TRANSFER + 1,
+                    buffer as u32,
+                    ERROR_INVALID_PARAMETER,
+                ),
+                (
+                    write,
+                    crate::real_hid::dispatch::MAX_SERIAL_TRANSFER + 1,
+                    buffer as u32,
+                    ERROR_INVALID_PARAMETER,
+                ),
+                (read, 4, buffer as u32, ERROR_NOT_SUPPORTED),
+                (write, 4, buffer as u32, ERROR_NOT_SUPPORTED),
+            ] {
+                let result = dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    thunk,
+                    &[handle, buffer_ptr, length as u32, count as u32, 0],
+                );
+                if expected_error == 0 {
+                    assert_eq!(result, 1);
+                    assert_eq!(runtime.last_error, 0);
+                } else {
+                    assert_eq!(result, 0);
+                    assert_eq!(runtime.last_error, expected_error);
+                }
+            }
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    read,
+                    &[handle, buffer as u32, 4, count as u32, 0x74_200],
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_NOT_SUPPORTED);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    write,
+                    &[handle, buffer as u32, 4, count as u32, 0x74_200],
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_NOT_SUPPORTED);
+
+            let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_state, &[handle, dcb as u32]),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+        });
+    }
+
+    #[test]
+    fn usb_dispatch_ioctls_enumerate_validate_and_reject_stale() {
+        let _guard = serial_dispatch_test_lock();
+        crate::real_hid::dispatch::reset_for_tests();
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "usb-dispatch-ioctls",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            install_usb_dispatch_fixture(&mut runtime);
+            let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+            let path = runtime
+                .alloc_utf16_string(&mut memory, "\\\\.\\Casa1Usb#0000000000000202")
+                .expect("usb path");
+            let handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_file,
+                &[path as u32, 0x8000_0000, 0, 0, 3, 0, 0],
+            ) as u32;
+            assert_ne!(handle, INVALID_HANDLE_VALUE as u32);
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(crate::real_hid::dispatch::usb_handle_count(), 1);
+            assert_eq!(
+                crate::real_hid::dispatch::usb_path(u64::from(handle)),
+                Ok("IOUSBHostDevice:0000000000000202".to_string())
+            );
+
+            let ioctl = runtime.alloc_host_thunk(HostThunk::DeviceIoControl);
+            let out = 0x75_000_u64;
+            let bytes_ret = 0x75_200_u64;
+            memory.map_bytes(out, &[0u8; 64]);
+            write_u32(&mut memory, bytes_ret, 0xdead_beef);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    ioctl,
+                    &[
+                        handle,
+                        IOCTL_USB_ENUMERATE_DEVICES,
+                        0,
+                        0,
+                        out as u32,
+                        32,
+                        bytes_ret as u32,
+                        0,
+                    ],
+                ),
+                1
+            );
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(read_u32(&memory, bytes_ret).unwrap_or(0), 32);
+            assert_eq!(
+                read_u64(&memory, out).unwrap_or(0),
+                0x202,
+                "stable device id is published"
+            );
+            assert_eq!(read_u32(&memory, out + 8).unwrap_or(0), 0x1234);
+            assert_eq!(read_u32(&memory, out + 12).unwrap_or(0), 0x5678);
+            assert_eq!(read_u32(&memory, out + 16).unwrap_or(0), 1);
+            assert_eq!(read_u32(&memory, out + 20).unwrap_or(0), 1);
+            assert_eq!(read_u32(&memory, out + 24).unwrap_or(0), 1);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    ioctl,
+                    &[
+                        handle,
+                        IOCTL_USB_ENUMERATE_DEVICES,
+                        0,
+                        0,
+                        out as u32,
+                        0,
+                        bytes_ret as u32,
+                        0,
+                    ],
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(read_u32(&memory, bytes_ret).unwrap_or(0), 32);
+
+            let input = 0x76_000_u64;
+            memory.map_bytes(input, &[0u8; 32]);
+            for (index, value) in [0u32, 0x81, 3, 1, 0, 8].iter().enumerate() {
+                write_u32(&mut memory, input + (index as u64 * 4), *value);
+            }
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    ioctl,
+                    &[
+                        handle,
+                        IOCTL_USB_VALIDATE_TRANSFER,
+                        input as u32,
+                        24,
+                        out as u32,
+                        0,
+                        bytes_ret as u32,
+                        0,
+                    ],
+                ),
+                1
+            );
+            assert_eq!(runtime.last_error, 0);
+
+            write_u32(&mut memory, input + 8, 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    ioctl,
+                    &[
+                        handle,
+                        IOCTL_USB_VALIDATE_TRANSFER,
+                        input as u32,
+                        24,
+                        out as u32,
+                        0,
+                        bytes_ret as u32,
+                        0,
+                    ],
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_NOT_SUPPORTED);
+
+            write_u32(&mut memory, input + 8, 3);
+            write_u32(&mut memory, input + 16, 0x8000_0000);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    ioctl,
+                    &[
+                        handle,
+                        IOCTL_USB_VALIDATE_TRANSFER,
+                        input as u32,
+                        24,
+                        out as u32,
+                        0,
+                        bytes_ret as u32,
+                        0,
+                    ],
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_NOT_SUPPORTED);
+
+            write_u32(&mut memory, input + 16, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    ioctl,
+                    &[
+                        handle,
+                        IOCTL_USB_SUBMIT_TRANSFER,
+                        input as u32,
+                        24,
+                        out as u32,
+                        0,
+                        bytes_ret as u32,
+                        0,
+                    ],
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_NOT_SUPPORTED);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    ioctl,
+                    &[handle, 0x1234, 0, 0, out as u32, 0, bytes_ret as u32, 0],
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_NOT_SUPPORTED);
+
+            let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle]),
+                1
+            );
+            assert_eq!(crate::real_hid::dispatch::usb_handle_count(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    ioctl,
+                    &[
+                        handle,
+                        IOCTL_USB_ENUMERATE_DEVICES,
+                        0,
+                        0,
+                        out as u32,
+                        32,
+                        bytes_ret as u32,
+                        0
+                    ],
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+            let reopened = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_file,
+                &[path as u32, 0x8000_0000, 0, 0, 3, 0, 0],
+            ) as u32;
+            assert_ne!(reopened, INVALID_HANDLE_VALUE as u32);
+            let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[reopened]),
+                1
+            );
+
+            let malformed = runtime
+                .alloc_utf16_string(&mut memory, "\\\\.\\Casa1Usb#xyz")
+                .expect("malformed usb path");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_file,
+                    &[malformed as u32, 0x8000_0000, 0, 0, 3, 0, 0],
+                ) as u32,
+                INVALID_HANDLE_VALUE as u32
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+            let missing = runtime
+                .alloc_utf16_string(&mut memory, "\\\\.\\Casa1Usb#0000000000000999")
+                .expect("missing usb path");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_file,
+                    &[missing as u32, 0x8000_0000, 0, 0, 3, 0, 0],
+                ) as u32,
+                INVALID_HANDLE_VALUE as u32
+            );
+            assert_eq!(runtime.last_error, ERROR_FILE_NOT_FOUND);
+        });
+    }
 }
 
 fn read_d3d12_command_queue_desc(
@@ -128706,8 +130641,27 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
         },
     ];
 
+    let tbs_exports = vec![
+        ExportSymbol {
+            ordinal: 1,
+            name: Some("Tbsi_Context_Create".to_string()),
+            target: ExportTarget::Rva(0x7000),
+        },
+        ExportSymbol {
+            ordinal: 2,
+            name: Some("Tbsip_Submit_Command".to_string()),
+            target: ExportTarget::Rva(0x7010),
+        },
+        ExportSymbol {
+            ordinal: 3,
+            name: Some("Tbsip_Context_Close".to_string()),
+            target: ExportTarget::Rva(0x7020),
+        },
+    ];
+
     let mut tables = BTreeMap::from([
         ("advapi32.dll".to_string(), advapi32_exports),
+        ("tbs.dll".to_string(), tbs_exports),
         ("bcrypt.dll".to_string(), bcrypt_exports),
         ("cfgmgr32.dll".to_string(), cfgmgr32_exports),
         ("comctl32.dll".to_string(), comctl32_exports),

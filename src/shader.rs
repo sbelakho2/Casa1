@@ -18,11 +18,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 const DXIL_MAGIC: &[u8; 4] = b"DXIL";
 const MAX_PARTS: usize = 16;
 const MAX_INSTRUCTIONS: u32 = 4096;
+static LLVM_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Geometry buffers shared by raygen and translated stage functions.
+const RAY_GEOMETRY_PARAMS: &str = ", device const float4* vertex_attributes, device const uint* triangle_indices, device const uint* geometry_bindings, device const MetalRayAabb* aabbs";
+/// Call-site arguments matching [`RAY_GEOMETRY_PARAMS`].
+const RAY_GEOMETRY_ARGS: &str = ", vertex_attributes, triangle_indices, geometry_bindings, aabbs";
 const MAX_IR_SIZE: u32 = 1 << 20;
 const CACHE_MAGIC: &[u8; 8] = b"C1SHADER";
 const CACHE_VERSION: u32 = 1;
@@ -751,6 +758,11 @@ const DXIL_INTRIN_TANH: u32 = 446;
 const DXIL_INTRIN_SINH: u32 = 447;
 const DXIL_INTRIN_COSH: u32 = 448;
 const DXIL_INTRIN_FWIDTH: u32 = 449;
+
+/// Payload storage exposed by the ray transpiler to translated shaders and to
+/// CPU readback. D3D12's default payload size is 32 bytes; the textual ray
+/// lowerer models that as eight 32-bit words.
+pub const RAY_PAYLOAD_WORDS: usize = 8;
 
 // Texture/buffer intrinsics
 const DXIL_INTRIN_SAMPLE: u32 = 500;
@@ -4348,6 +4360,54 @@ pub fn ray_shader_stage(dxil: &[u8]) -> Option<ShaderStage> {
     }
 }
 
+/// Borrow the LLVM bitcode embedded in a ray DXIL container, if present.
+///
+/// The bridge accepts either raw bitcode or the pinned container layout whose
+/// PROG part carries a 24-byte program header followed by bitcode. A declared
+/// IR size that runs past the container is rejected as malformed rather than
+/// silently truncated.
+fn ray_bitcode(dxil: &[u8]) -> Option<&[u8]> {
+    if dxil.starts_with(b"BC\xc0\xde") {
+        return Some(dxil);
+    }
+    let offset = dxil.windows(4).position(|window| window == b"BC\xc0\xde")?;
+    if offset < 20 || dxil.get(offset + 4..offset + 8) == Some(b"SIG1") {
+        return None;
+    }
+    let declared = u32::from_le_bytes(dxil[offset - 20..offset - 16].try_into().ok()?) as usize;
+    let end = offset.checked_add(declared)?;
+    if declared > 16 && end <= dxil.len() {
+        Some(&dxil[offset..end])
+    } else {
+        None
+    }
+}
+
+/// List the LLVM function definitions carried by ray DXIL bitcode.
+///
+/// D3D12 exports can rename entry points, so callers use this to resolve the
+/// actual definition when constructing per-stage artifacts.
+pub fn ray_entry_points(dxil: &[u8]) -> AppResult<Vec<String>> {
+    let Some(bitcode) = ray_bitcode(dxil) else {
+        return Ok(Vec::new());
+    };
+    let ir = llvm_bitcode_to_ir(bitcode)?;
+    let mut entries = Vec::new();
+    for line in ir.lines() {
+        let line = line.trim();
+        let Some(definition) = line.strip_prefix("define ") else {
+            continue;
+        };
+        let name = definition
+            .split_once('@')
+            .map(|(_, rest)| rest.split('(').next().unwrap_or("").trim());
+        if let Some(name) = name.filter(|name| !name.is_empty()) {
+            entries.push(name.to_string());
+        }
+    }
+    Ok(entries)
+}
+
 /// Generate a real MSL ray program for a ray shader stage.
 ///
 /// The raygen entry performs hardware traversal with `intersector`, consumes
@@ -4390,7 +4450,10 @@ pub fn translate_ray_shader(
             ),
         ));
     }
-    let source = generate_ray_msl(stage, entry);
+    let source = match ray_bitcode(dxil) {
+        Some(bitcode) => translate_llvm_ray_stage_program(bitcode, stage, entry)?,
+        None => generate_ray_msl(stage, entry),
+    };
     let hash = util::sha256_bytes(dxil);
     let function = format!("msl_{}_{}", stage.as_str(), &hash[..8]);
     let mut function_mapping = BTreeMap::new();
@@ -4422,18 +4485,183 @@ pub fn translate_ray_shader(
     })
 }
 
+/// MSL mirror of `crate::metal_backend::MetalRayPayloadResult`. Every field
+/// after `value` is 32-bit, so Rust's `#[repr(C)]` layout and Metal's C layout
+/// agree without padding differences.
+const RAY_RESULT_STRUCT_MSL: &str = "struct RayRecord { packed_float3 origin; float min_distance; packed_float3 direction; float max_distance; uint sbt_offset; uint mask; };\n\
+struct RayPayloadResult {\n\
+    float4 value;\n\
+    uint instance_id;\n\
+    uint primitive_id;\n\
+    float distance;\n\
+    uint hit_kind;\n\
+    uint dispatch[3];\n\
+    uint payload[8];\n\
+    float barycentrics[2];\n\
+    float object_origin[3];\n\
+    float object_direction[3];\n\
+    float object_to_world[12];\n\
+    float world_to_object[12];\n\
+    uint ray_flags;\n\
+    float ray_tmax;\n\
+    uint ray_geometry_index;\n\
+    uint candidate_type;\n\
+    uint candidate_instance;\n\
+    uint candidate_primitive;\n\
+    uint candidate_geometry;\n\
+    float candidate_object_origin[3];\n\
+    float candidate_object_direction[3];\n\
+    float candidate_object_to_world[12];\n\
+    float candidate_world_to_object[12];\n\
+    float attributes[4];\n\
+    uint accepted;\n\
+    uint end_search;\n\
+    uint ignored;\n\
+};\n";
+
+/// Hit locals shared by translated ray-generation programs. `hit_kind` is the
+/// D3D12 built-in triangle hit kind (front face); Metal does not distinguish
+/// front/back faces for built-in triangle intersections.
+///
+/// The candidate block mirrors DXR's candidate system values. They are
+/// snapshotted from the real Metal intersection and stay at zero on a miss.
+const RAY_HIT_LOCALS_MSL: &str = "    intersector<triangle_data, instancing> query;\n\
+    ray r;\n\
+    r.origin = rays[gid].origin;\n\
+    r.direction = rays[gid].direction;\n\
+    r.min_distance = rays[gid].min_distance;\n\
+    r.max_distance = rays[gid].max_distance;\n\
+    auto hit = query.intersect(r, accel, rays[gid].mask);\n\
+    uint __hit_instance = 0u;\n\
+    uint __hit_primitive = 0u;\n\
+    uint __hit_kind = 0u;\n\
+    float __hit_distance = 0.0f;\n\
+    float2 __barycentrics = float2(0.0f);\n\
+    uint __candidate_type = 0u;\n\
+    uint __candidate_instance = 0u;\n\
+    uint __candidate_primitive = 0u;\n\
+    uint __candidate_geometry = 0u;\n\
+    float3 __candidate_object_origin = float3(0.0f);\n\
+    float3 __candidate_object_direction = float3(0.0f);\n\
+    float4x4 __candidate_object_to_world = float4x4(1.0f);\n\
+    float4x4 __candidate_world_to_object = float4x4(1.0f);\n\
+    float4 __attributes = float4(0.0f);\n\
+    uint __ray_flags = 0u;\n\
+    float __ray_tmax = r.max_distance;\n\
+    uint __ray_geometry_index = 0u;\n\
+    uint __accepted = 1u;\n\
+    uint __end_search = 0u;\n\
+    uint __ignored = 0u;\n\
+    if (hit.type != intersection_type::none) {\n\
+        __hit_instance = hit.instance_id;\n\
+        __hit_primitive = hit.primitive_id;\n\
+        __hit_distance = hit.distance;\n\
+        __hit_kind = 0xFEu;\n\
+        __barycentrics = hit.triangle_barycentric_coord;\n\
+        __attributes = float4(__barycentrics, 0.0f, 0.0f);\n\
+        __candidate_type = 0u;\n\
+        __candidate_instance = __hit_instance;\n\
+        __candidate_primitive = __hit_primitive;\n\
+        __candidate_geometry = 0u;\n\
+        __ray_geometry_index = __candidate_geometry;\n\
+    }\n";
+
+/// MSL for the SBT local-root pointer of the current shader record.
+///
+/// Dispatch records are `(group index, local-root words...)`; buffer 6 stores
+/// the record stride and local-root offset supplied by the host shader table.
+const RAY_SBT_LOCALS_MSL: &str = "    uint __sbt_stride = max(dispatch_info[4], 1u);\n\
+    uint __sbt_local_root_offset = dispatch_info[5];\n\
+    device const uint* __sbt_local_root = (device const uint*)((device const uchar*)sbt + gid * __sbt_stride + __sbt_local_root_offset);\n";
+
 fn generate_ray_msl(stage: ShaderStage, entry: &str) -> String {
     let raygen = matches!(stage, ShaderStage::RayGeneration);
-    let mut source = String::from(
-        "#include <metal_stdlib>\n#include <metal_raytracing>\nusing namespace metal;\nusing namespace raytracing;\n\n         struct RayPayload { float4 value; uint instance_id; uint primitive_id; };\n         struct RayRecord { packed_float3 origin; float min_distance; packed_float3 direction; float max_distance; };\n\n         void msl_closest_hit(thread RayPayload& payload, uint instance_id, uint primitive_id, float distance) {\n             payload.value = float4(42.0, float(instance_id), float(primitive_id), distance);\n             payload.instance_id = instance_id;\n             payload.primitive_id = primitive_id;\n         }\n\n         void msl_miss(thread RayPayload& payload) { payload.value = float4(7.0); }\n\n         bool msl_any_hit(thread RayPayload& payload, uint group) {\n             if ((group & 0x100u) != 0u) { payload.value = float4(7.0); return false; }\n             return true;\n         }\n\n         void msl_callable(thread RayPayload& payload) { payload.value = float4(99.0); }\n\n",
+    let mut source = format!(
+        "#include <metal_stdlib>\n#include <metal_raytracing>\nusing namespace metal;\nusing namespace raytracing;\n\n{RAY_RESULT_STRUCT_MSL}\n\
+         void msl_closest_hit(thread RayPayloadResult& payload, uint instance_id, uint primitive_id, float distance) {{\n\
+             payload.value = float4(42.0, float(instance_id), float(primitive_id), distance);\n\
+             payload.instance_id = instance_id;\n\
+             payload.primitive_id = primitive_id;\n\
+         }}\n\n\
+         void msl_miss(thread RayPayloadResult& payload) {{ payload.value = float4(7.0); }}\n\n\
+         bool msl_any_hit(thread RayPayloadResult& payload, uint group) {{\n\
+             if ((group & 0x100u) != 0u) {{ payload.value = float4(7.0); return false; }}\n\
+             return true;\n\
+         }}\n\n\
+         void msl_callable(thread RayPayloadResult& payload, uint group) {{ payload.value = float4(99.0, float(group), 0.0, 0.0); }}\n\n"
     );
     if raygen {
         source.push_str(&format!(
-            "kernel void {entry}(device RayPayload* results [[buffer(0)]],\n             device const RayRecord* rays [[buffer(1)]],\n             instance_acceleration_structure accel [[buffer(2)]],\n             device const uint* sbt [[buffer(3)]],\n             constant uint& ray_count [[buffer(4)]],\n             uint gid [[thread_position_in_grid]]) {{\n                 if (gid >= ray_count) {{ return; }}\n                 intersector<triangle_data, instancing> query;\n                 ray r; r.origin = rays[gid].origin; r.direction = rays[gid].direction;\n                 r.min_distance = rays[gid].min_distance; r.max_distance = rays[gid].max_distance;\n                 auto hit = query.intersect(r, accel, 0xFFFFFFFFu);\n                 RayPayload payload = {{float4(0.0), 0u, 0u}};\n                 uint group = sbt[gid];\n                 if (hit.type == intersection_type::none) {{ msl_miss(payload); }}\n                 else if (!msl_any_hit(payload, group)) {{ }}\n                 else if (group == 3u) {{ msl_callable(payload); }}\n                 else {{ msl_closest_hit(payload, hit.instance_id, hit.primitive_id, hit.distance); }}\n                 results[gid] = payload;\n             }}\n"
+            "kernel void {entry}(device RayPayloadResult* results [[buffer(0)]],\n\
+             device const RayRecord* rays [[buffer(1)]],\n\
+             instance_acceleration_structure accel [[buffer(2)]],\n\
+             device const uint* sbt [[buffer(3)]],\n\
+             constant uint& ray_count [[buffer(4)]],\n\
+             device const float4* instance_transforms [[buffer(5)]],\n\
+             device const uint* dispatch_info [[buffer(6)]],\n\
+             uint gid [[thread_position_in_grid]]) {{\n\
+                 if (gid >= ray_count) {{ return; }}\n\
+{RAY_HIT_LOCALS_MSL}\
+{RAY_SBT_LOCALS_MSL}\
+                 uint instance_count = max(dispatch_info[3], 1u);\n\
+                 uint transform_base = min(__hit_instance, instance_count - 1u) * 8u;\n\
+                 float4x4 object_to_world = float4x4(instance_transforms[transform_base], instance_transforms[transform_base + 1u], instance_transforms[transform_base + 2u], instance_transforms[transform_base + 3u]);\n\
+                 float4x4 world_to_object = float4x4(instance_transforms[transform_base + 4u], instance_transforms[transform_base + 5u], instance_transforms[transform_base + 6u], instance_transforms[transform_base + 7u]);\n\
+                 float3 object_origin = (world_to_object * float4(rays[gid].origin, 1.0f)).xyz;\n\
+                 float3 object_direction = (world_to_object * float4(rays[gid].direction, 0.0f)).xyz;\n\
+                 __candidate_object_origin = object_origin;\n\
+                 __candidate_object_direction = object_direction;\n\
+                 __candidate_object_to_world = object_to_world;\n\
+                 __candidate_world_to_object = world_to_object;\n\
+                 RayPayloadResult payload = {{}};\n\
+                 payload.instance_id = __hit_instance;\n\
+                 payload.primitive_id = __hit_primitive;\n\
+                 payload.distance = __hit_distance;\n\
+                 payload.hit_kind = __hit_kind;\n\
+                 payload.dispatch[0] = dispatch_info[0];\n\
+                 payload.dispatch[1] = dispatch_info[1];\n\
+                 payload.dispatch[2] = dispatch_info[2];\n\
+                 payload.barycentrics[0] = __barycentrics.x;\n\
+                 payload.barycentrics[1] = __barycentrics.y;\n\
+                 payload.object_origin[0] = object_origin.x;\n\
+                 payload.object_origin[1] = object_origin.y;\n\
+                 payload.object_origin[2] = object_origin.z;\n\
+                 payload.object_direction[0] = object_direction.x;\n\
+                 payload.object_direction[1] = object_direction.y;\n\
+                 payload.object_direction[2] = object_direction.z;\n\
+                 for (uint row = 0u; row < 3u; ++row) {{\n\
+                     for (uint column = 0u; column < 4u; ++column) {{\n\
+                         payload.object_to_world[row * 4u + column] = instance_transforms[transform_base + column][row];\n\
+                         payload.world_to_object[row * 4u + column] = instance_transforms[transform_base + 4u + column][row];\n\
+                         payload.candidate_object_to_world[row * 4u + column] = instance_transforms[transform_base + column][row];\n\
+                         payload.candidate_world_to_object[row * 4u + column] = instance_transforms[transform_base + 4u + column][row];\n\
+                     }}\n\
+                 }}\n\
+                 payload.candidate_type = __candidate_type;\n\
+                 payload.candidate_instance = __candidate_instance;\n\
+                 payload.candidate_primitive = __candidate_primitive;\n\
+                 payload.candidate_geometry = __candidate_geometry;\n\
+                 payload.ray_flags = __ray_flags;\n\
+                 payload.ray_tmax = __ray_tmax;\n\
+                 payload.ray_geometry_index = __ray_geometry_index;\n\
+                 payload.attributes[0] = __attributes.x;\n\
+                 payload.attributes[1] = __attributes.y;\n\
+                 payload.attributes[2] = __attributes.z;\n\
+                 payload.attributes[3] = __attributes.w;\n\
+                 payload.accepted = __accepted;\n\
+                 payload.end_search = __end_search;\n\
+                 payload.ignored = __ignored;\n\
+                 uint group = sbt[max(rays[gid].sbt_offset, uint(gid))];\n\
+                 if (hit.type == intersection_type::none) {{ msl_miss(payload); }}\n\
+                 else if (!msl_any_hit(payload, group)) {{ }}\n\
+                 else if (group == 3u) {{ msl_callable(payload, group); }}\n\
+                 else {{ msl_closest_hit(payload, __hit_instance, __hit_primitive, __hit_distance); }}\n\
+                 results[gid] = payload;\n\
+             }}\n"
         ));
     } else {
         source.push_str(&format!(
-            "void {entry}(thread RayPayload& payload) {{ (void)payload; }}\n"
+            "void {entry}(thread RayPayloadResult& payload) {{ (void)payload; }}\n"
         ));
     }
     source
@@ -4476,7 +4704,12 @@ fn llvm_tool(name: &str) -> AppResult<std::path::PathBuf> {
 pub fn llvm_assemble_ir(ir: &str) -> AppResult<Vec<u8>> {
     let assembler = llvm_tool("llvm-as")?;
     let mut file = std::env::temp_dir();
-    file.push(format!("casa1-ray-{}.ll", std::process::id()));
+    file.push(format!(
+        "casa1-ray-{}-{}-{}.ll",
+        std::process::id(),
+        LLVM_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        util::sha256_bytes(ir.as_bytes())
+    ));
     std::fs::write(&file, ir).expect("stage LLVM IR");
     let output = std::process::Command::new(assembler)
         .arg("-o")
@@ -4508,8 +4741,9 @@ pub fn llvm_bitcode_to_ir(bitcode: &[u8]) -> AppResult<String> {
     let opt = llvm_tool("opt")?;
     let mut file = std::env::temp_dir();
     file.push(format!(
-        "casa1-ray-{}-{}.bc",
+        "casa1-ray-{}-{}-{}.bc",
         std::process::id(),
+        LLVM_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
         util::sha256_bytes(bitcode)
     ));
     std::fs::write(&file, bitcode).expect("stage LLVM bitcode");
@@ -4576,10 +4810,13 @@ fn split_call_args(arguments: &str) -> Vec<String> {
 
 /// Lower the body of a real LLVM IR ray function to MSL.
 ///
-/// Supported instructions: `ret`, `call` to the documented DXIL-style ray
-/// intrinsics plus `ray.storePayload`, `add`, `sub`, `mul`, `and`, `or`, `xor`,
-/// `icmp eq/ne`, and plain SSA copies. Any other instruction is rejected with
-/// an `RcDxilInvalid` error naming the opcode.
+/// Supported instructions: `ret`, `call` to the DXIL-style ray intrinsics
+/// (`dispatchRaysIndex`/`Dimensions`, world/object ray origin and direction,
+/// `rayTMin`/`rayTCurrent`, object/world transforms, hit kind, instance and
+/// primitive IDs, barycentrics), payload stores/loads and payload pointers,
+/// `add`, `sub`, `mul`, `and`, `or`, `xor`, `icmp eq/ne`, and plain SSA
+/// copies. Any other instruction is rejected with an `RcDxilInvalid` error
+/// naming the opcode.
 struct LlvmInst {
     result: Option<String>,
     opcode: String,
@@ -4592,8 +4829,25 @@ struct LlvmBlock {
     insts: Vec<LlvmInst>,
 }
 
+fn parse_llvm_array(ty: &str) -> Option<(usize, &str)> {
+    let inner = ty.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let (count, element) = inner.split_once(" x ")?;
+    Some((count.trim().parse().ok()?, element.trim()))
+}
+
 fn llvm_type_to_msl(ty: &str) -> AppResult<String> {
     let ty = ty.trim();
+    if let Some((count, element)) = parse_llvm_array(ty) {
+        let element = llvm_type_to_msl(element)?;
+        return match (count, element.as_str()) {
+            (3, "float4") => Ok("float3x4".to_string()),
+            (4, "float4") => Ok("float4x4".to_string()),
+            _ => Err(AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!("unsupported LLVM array type {ty}"),
+            )),
+        };
+    }
     if let Some(vector) = ty
         .strip_prefix('<')
         .and_then(|value| value.strip_suffix('>'))
@@ -4683,6 +4937,110 @@ fn parse_aggregate_fields(ty: &str) -> AppResult<Vec<String>> {
         .split(',')
         .map(|field| llvm_type_to_msl(field))
         .collect()
+}
+
+/// MSL name for a textual LLVM aggregate type. The hash keeps distinct
+/// aggregates separate without leaking commas/braces into identifiers.
+fn aggregate_msl_name(ty: &str) -> String {
+    let normalized: String = ty.split_whitespace().collect();
+    format!("__agg_{}", &util::sha256_bytes(normalized.as_bytes())[..8])
+}
+
+/// Number of components a ray intrinsic result carries. Scalars count as one,
+/// vectors report their literal width, and aggregates report their field count.
+fn ray_result_component_count(ty: &str) -> AppResult<usize> {
+    if ty.starts_with('{') {
+        return Ok(parse_aggregate_fields(ty)?.len());
+    }
+    if let Some((count, _)) = parse_llvm_array(ty) {
+        return Ok(count);
+    }
+    let msl = llvm_type_to_msl(ty)?;
+    let count = match msl.as_str() {
+        "float" | "double" | "half" | "int" | "uint" | "long" | "short" | "char" | "bool" => 1,
+        "float2" | "double2" | "half2" | "int2" | "uint2" | "long2" | "short2" | "char2" => 2,
+        "float3" | "int3" | "uint3" | "long3" | "short3" | "char3" => 3,
+        "float4" | "int4" | "uint4" | "long4" | "short4" | "char4" => 4,
+        other => {
+            return Err(AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!("unsupported ray intrinsic result type {other}"),
+            ));
+        }
+    };
+    Ok(count)
+}
+
+/// Emit assignments for a ray intrinsic result whose value is split into
+/// components. Aggregate results (DXC's usual shape) assign fields; vector
+/// results construct the MSL vector. A scalar result must be a single
+/// component, which keeps malformed fixtures from silently truncating.
+fn emit_ray_components(
+    output: &mut String,
+    callee: &str,
+    ty: &str,
+    result: &str,
+    exprs: &[String],
+) -> AppResult<()> {
+    if ty.starts_with('{') {
+        let fields = parse_aggregate_fields(ty)?;
+        if fields.len() != exprs.len() {
+            return Err(AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!(
+                    "{callee} returned {} fields but {} values are available",
+                    fields.len(),
+                    exprs.len()
+                ),
+            ));
+        }
+        for (index, expr) in exprs.iter().enumerate() {
+            output.push_str(&format!("    {result}.f{index} = {expr};\n"));
+        }
+        return Ok(());
+    }
+    let count = ray_result_component_count(ty)?;
+    if count != exprs.len() {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!(
+                "{callee} returned a {count}-component value but {} values are available",
+                exprs.len()
+            ),
+        ));
+    }
+    let msl = llvm_type_to_msl(ty)?;
+    if count == 1 {
+        output.push_str(&format!("    {result} = {};\n", exprs[0]));
+    } else {
+        output.push_str(&format!("    {result} = {msl}({});\n", exprs.join(", ")));
+    }
+    Ok(())
+}
+
+/// Emit a scalar ray intrinsic result with an explicit MSL cast.
+fn emit_ray_scalar(output: &mut String, ty: &str, result: &str, expr: &str) -> AppResult<()> {
+    if ray_result_component_count(ty)? != 1 {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!("ray intrinsic result {ty} is not a scalar"),
+        ));
+    }
+    let msl = llvm_type_to_msl(ty)?;
+    output.push_str(&format!("    {result} = ({msl})({expr});\n"));
+    Ok(())
+}
+
+/// Convert an LLVM call argument to a payload word write. Float payload fields
+/// keep their bit pattern (D3D12 payloads are raw bytes), integers convert.
+fn payload_word_expr(argument: &str) -> String {
+    let mut parts = argument.split_whitespace();
+    let ty = parts.next().unwrap_or("");
+    let value = msl_value(parts.last().unwrap_or(argument));
+    match ty {
+        "float" | "double" | "half" => format!("as_type<uint>({value})"),
+        _ => format!("uint({value})"),
+    }
 }
 
 fn parse_blocks<'a>(body: &'a str, entry: &str) -> AppResult<Vec<LlvmBlock>> {
@@ -4775,18 +5133,52 @@ fn result_type(inst: &LlvmInst) -> AppResult<Option<String>> {
             Ok(Some(llvm_type_to_msl(ty)?))
         }
         "call" => {
-            let ty = if rest.starts_with('<') {
-                rest.split_once('>')
-                    .map(|(ty, _)| format!("{ty}>"))
-                    .unwrap_or_default()
-            } else {
-                rest.split_whitespace().next().unwrap_or("").to_string()
-            };
+            let ty = leading_type(rest);
             if ty == "void" {
-                Ok(None)
-            } else {
-                Ok(Some(llvm_type_to_msl(&ty)?))
+                return Ok(None);
             }
+            let callee = rest
+                .split_once('@')
+                .map(|(_, tail)| tail.split('(').next().unwrap_or(""))
+                .unwrap_or("");
+            if callee == "dx.op.getShaderRecordBufferHandle" {
+                return Ok(Some("__shader_record_ptr".to_string()));
+            }
+            if ty == "ptr" {
+                let callee = rest
+                    .split_once('@')
+                    .map(|(_, tail)| tail.split('(').next().unwrap_or(""))
+                    .unwrap_or("");
+                if matches!(
+                    callee,
+                    "ray.payloadPointer" | "ray.getPayload" | "ray.payload"
+                ) {
+                    return Ok(Some("__payload_ptr".to_string()));
+                }
+                return Err(AppError::new(
+                    ReasonCode::RcDxilInvalid,
+                    format!("unsupported LLVM pointer return from @{callee}"),
+                ));
+            }
+            if ty.starts_with('{') {
+                return Ok(Some(aggregate_msl_name(ty)));
+            }
+            Ok(Some(llvm_type_to_msl(ty)?))
+        }
+        "extractelement" => {
+            let ty = leading_type(rest);
+            let vector = ty
+                .strip_prefix('<')
+                .and_then(|value| value.strip_suffix('>'))
+                .and_then(|value| value.split_once(" x "))
+                .map(|(_, element)| element)
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcDxilInvalid,
+                        format!("extractelement requires a vector type, got {ty}"),
+                    )
+                })?;
+            Ok(Some(llvm_type_to_msl(vector)?))
         }
         "select" => {
             let ty = rest
@@ -4809,6 +5201,8 @@ fn result_type(inst: &LlvmInst) -> AppResult<Option<String>> {
                 Ok(Some(fields.get(index).cloned().ok_or_else(|| {
                     AppError::new(ReasonCode::RcDxilInvalid, "extractvalue index out of range")
                 })?))
+            } else if let Some((_, element)) = parse_llvm_array(ty) {
+                Ok(Some(llvm_type_to_msl(element)?))
             } else {
                 Ok(Some(llvm_type_to_msl(ty)?))
             }
@@ -4939,12 +5333,28 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
         std::collections::BTreeMap::new();
     let mut aggregate_types: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
+    let mut payload_pointer_indices: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for block in &blocks {
         for inst in block.phis.iter().chain(block.insts.iter()) {
             let Some(name) = &inst.result else { continue };
             let Some(ty) = result_type(inst)? else {
                 continue;
             };
+            if ty == "__payload_ptr" {
+                declarations.push(format!("device uint* {name};"));
+                continue;
+            }
+            if ty == "__shader_record_ptr" {
+                declarations.push(format!("device const uint* {name};"));
+                continue;
+            }
+            if ty.starts_with("__agg_") {
+                let aggregate = leading_type(&inst.rest);
+                if let Ok(fields) = parse_aggregate_fields(aggregate) {
+                    aggregate_types.entry(ty.clone()).or_insert(fields);
+                }
+            }
             declarations.push(format!("{ty} {name};"));
         }
         for inst in &block.insts {
@@ -5027,17 +5437,25 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
                             .next()
                             .unwrap_or("")
                             .trim_end_matches(',');
-                        let base =
-                            pointer_bases
-                                .get(msl_ident(pointer).as_str())
-                                .ok_or_else(|| {
-                                    AppError::new(
-                                        ReasonCode::RcDxilInvalid,
-                                        format!("store to unsupported pointer {pointer}"),
-                                    )
-                                })?;
+                        let pointer_name = msl_ident(pointer);
+                        let base = pointer_bases.get(&pointer_name).ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcDxilInvalid,
+                                format!("store to unsupported pointer {pointer}"),
+                            )
+                        })?;
                         let value = value.split_whitespace().last().unwrap_or(value);
-                        output.push_str(&format!("    {base} = {};\n", msl_value(value)));
+                        if pointer_kinds.get(&pointer_name).map(String::as_str) == Some("payload") {
+                            let index = payload_pointer_indices
+                                .get(&pointer_name)
+                                .expect("payload pointer GEP records an element index");
+                            let word = payload_word_expr(value);
+                            output.push_str(&format!(
+                                "    if ((uint)({index}) < {RAY_PAYLOAD_WORDS}u) {{ *({base}) = {word}; }}\n"
+                            ));
+                        } else {
+                            output.push_str(&format!("    {base} = {};\n", msl_value(value)));
+                        }
                     }
                     "ret" => {
                         if inst.rest != "void" {
@@ -5059,7 +5477,162 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
                             .map(|(_, rest)| rest.trim_end_matches(')'))
                             .unwrap_or("");
                         let args = split_call_args(arguments);
+                        let arg = |index: usize| -> AppResult<String> {
+                            args.get(index)
+                                .map(|argument| {
+                                    msl_value(argument.split_whitespace().last().unwrap_or(argument))
+                                })
+                                .ok_or_else(|| {
+                                    AppError::new(
+                                        ReasonCode::RcDxilInvalid,
+                                        format!("{callee} is missing argument {index}"),
+                                    )
+                                })
+                        };
+                        let dx_arg = |index: usize| -> AppResult<String> {
+                            arg(index + usize::from(callee.starts_with("dx.op.")))
+                        };
                         match callee {
+                            "dx.op.traceRay" | "traceRay" => {
+                                let flags = dx_arg(1)?;
+                                let mask = dx_arg(2)?;
+                                let sbt_offset = dx_arg(3)?;
+                                let origin_x = dx_arg(6)?;
+                                let origin_y = dx_arg(7)?;
+                                let origin_z = dx_arg(8)?;
+                                let t_min = dx_arg(9)?;
+                                let dir_x = dx_arg(10)?;
+                                let dir_y = dx_arg(11)?;
+                                let dir_z = dx_arg(12)?;
+                                let t_max = dx_arg(13)?;
+                                output.push_str(&format!(
+                                    "    __ray_flags = uint({flags});\n\
+                                     __ray_tmax = min(float({t_max}), rays[gid].max_distance);\n\
+                                     intersector<triangle_data, instancing> __trace_query;\n\
+                                     ray __trace_ray;\n\
+                                     __trace_ray.origin = float3({origin_x}, {origin_y}, {origin_z});\n\
+                                     __trace_ray.min_distance = max(float({t_min}), rays[gid].min_distance);\n\
+                                     __trace_ray.direction = float3({dir_x}, {dir_y}, {dir_z});\n\
+                                     __trace_ray.max_distance = __ray_tmax;\n\
+                                     auto __trace_hit = __trace_query.intersect(__trace_ray, accel, uint({mask}) & rays[gid].mask);\n\
+                                     __hit_instance = 0u; __hit_primitive = 0u; __hit_distance = 0.0f;\n\
+                                     __hit_kind = 0u; __barycentrics = float2(0.0f);\n\
+                                     __candidate_type = 0u; __candidate_instance = 0u; __candidate_primitive = 0u; __candidate_geometry = 0u;\n\
+                                     __ray_geometry_index = 0u;\n\
+                                     if (__trace_hit.type != intersection_type::none) {{\n\
+                                         __hit_instance = __trace_hit.instance_id;\n\
+                                         __hit_primitive = __trace_hit.primitive_id;\n\
+                                         __hit_distance = __trace_hit.distance;\n\
+                                         __hit_kind = 0xFEu;\n\
+                                         __barycentrics = __trace_hit.triangle_barycentric_coord;\n\
+                                         __attributes = float4(__barycentrics, 0.0f, 0.0f);\n\
+                                         __candidate_type = 0u; __candidate_instance = __hit_instance;\n\
+                                         __candidate_primitive = __hit_primitive; __candidate_geometry = 0u;\n\
+                                         __ray_geometry_index = __candidate_geometry;\n\
+                                     }}\n\
+                                     uint __trace_count = max(dispatch_info[3], 1u);\n\
+                                     uint __trace_base = min(__hit_instance, __trace_count - 1u) * 8u;\n\
+                                     __candidate_object_to_world = float4x4(instance_transforms[__trace_base], instance_transforms[__trace_base + 1u], instance_transforms[__trace_base + 2u], instance_transforms[__trace_base + 3u]);\n\
+                                     __candidate_world_to_object = float4x4(instance_transforms[__trace_base + 4u], instance_transforms[__trace_base + 5u], instance_transforms[__trace_base + 6u], instance_transforms[__trace_base + 7u]);\n\
+                                     __candidate_object_origin = (__candidate_world_to_object * float4(__trace_ray.origin, 1.0f)).xyz;\n\
+                                     __candidate_object_direction = (__candidate_world_to_object * float4(__trace_ray.direction, 0.0f)).xyz;\n\
+                                     uint __trace_group = sbt[uint({sbt_offset}) + max(rays[gid].sbt_offset, uint(gid))];\n\
+                                     for (uint __ai = 0u; __ai < dispatch_info[7]; ++__ai) {{\n\
+                                         MetalRayAabb __aabb = aabbs[__ai];\n\
+                                         uint __inst = __aabb.instance_id;\n\
+                                         uint __pbase = min(__inst, __trace_count - 1u) * 8u;\n\
+                                         float4x4 __p2w = float4x4(instance_transforms[__pbase], instance_transforms[__pbase + 1u], instance_transforms[__pbase + 2u], instance_transforms[__pbase + 3u]);\n\
+                                         float4x4 __w2p = float4x4(instance_transforms[__pbase + 4u], instance_transforms[__pbase + 5u], instance_transforms[__pbase + 6u], instance_transforms[__pbase + 7u]);\n\
+                                         float3 __po = (__w2p * float4(__trace_ray.origin, 1.0f)).xyz;\n\
+                                         float3 __pd = (__w2p * float4(__trace_ray.direction, 0.0f)).xyz;\n\
+                                         float3 __inv = 1.0f / __pd;\n\
+                                         float3 __t0 = (__aabb.min - __po) * __inv;\n\
+                                         float3 __t1 = (__aabb.max - __po) * __inv;\n\
+                                         float3 __tn = min(__t0, __t1);\n\
+                                         float3 __tf = max(__t0, __t1);\n\
+                                         float __enter = max(max(__tn.x, __tn.y), __tn.z);\n\
+                                         float __exit = min(min(__tf.x, __tf.y), __tf.z);\n\
+                                         if (__enter <= __exit && __exit >= __trace_ray.min_distance && __enter < __ray_tmax) {{\n\
+                                             float __dist = max(__enter, __trace_ray.min_distance);\n\
+                                             if ((__hit_kind == 0u || __dist < __hit_distance) && __dist < __ray_tmax) {{\n\
+                                                 RayStageInput __isect_input = {{}};\n\
+                                                 __isect_input.type = 1u;\n\
+                                                 __isect_input.instance_id = __inst;\n\
+                                                 __isect_input.primitive_id = __ai;\n\
+                                                 __isect_input.geometry_index = __aabb.geometry_index;\n\
+                                                 __isect_input.distance = __dist;\n\
+                                                 __isect_input.attributes = float4(0.0f);\n\
+                                                 __isect_input.object_origin = __po;\n\
+                                                 __isect_input.object_direction = __pd;\n\
+                                                 __isect_input.object_to_world = __p2w;\n\
+                                                 __isect_input.world_to_object = __w2p;\n\
+                                                 __isect_input.ray_flags = __ray_flags;\n\
+                                                 __isect_input.ray_tmax = __ray_tmax;\n\
+                                                 __isect_input.ray_geometry_index = __aabb.geometry_index;\n\
+                                                 results[gid].accepted = 1u; results[gid].end_search = 0u; results[gid].ignored = 0u;\n\
+                                                 bool __reported = msl_intersection(results[gid], sbt[max(rays[gid].sbt_offset, uint(gid))], __isect_input, accel, rays, sbt, instance_transforms, dispatch_info, __sbt_local_root, __sbt_stride, vertex_attributes, triangle_indices, geometry_bindings, aabbs);\n\
+                                                 if (__reported && results[gid].accepted != 0u) {{\n\
+                                                     __hit_instance = __inst; __hit_primitive = __ai;\n\
+                                                     __hit_distance = select(__dist, results[gid].distance, results[gid].distance > 0.0f);\n\
+                                                     __hit_kind = 0xFFu; __barycentrics = float2(0.0f);\n\
+                                                     __attributes = float4(results[gid].attributes[0], results[gid].attributes[1], results[gid].attributes[2], results[gid].attributes[3]);\n\
+                                                     __candidate_type = 1u; __candidate_instance = __inst; __candidate_primitive = __ai;\n\
+                                                     __candidate_geometry = __aabb.geometry_index; __ray_geometry_index = __aabb.geometry_index;\n\
+                                                     __candidate_object_origin = __po; __candidate_object_direction = __pd;\n\
+                                                     __candidate_object_to_world = __p2w; __candidate_world_to_object = __w2p;\n\
+                                                 }}\n\
+                                                 if (results[gid].end_search != 0u) {{ break; }}\n\
+                                             }}\n\
+                                         }}\n\
+                                     }}\n\
+                                     if (__hit_kind != 0u) {{\n\
+                                         RayStageInput __trace_input = {{}};\n\
+                                         __trace_input.type = __candidate_type; __trace_input.instance_id = __candidate_instance;\n\
+                                         __trace_input.primitive_id = __candidate_primitive; __trace_input.geometry_index = __candidate_geometry;\n\
+                                         __trace_input.distance = __hit_distance; __trace_input.barycentrics = __barycentrics;\n\
+                                         __trace_input.attributes = __attributes; __trace_input.object_origin = __candidate_object_origin;\n\
+                                         __trace_input.object_direction = __candidate_object_direction; __trace_input.object_to_world = __candidate_object_to_world;\n\
+                                         __trace_input.world_to_object = __candidate_world_to_object; __trace_input.ray_flags = __ray_flags;\n\
+                                         __trace_input.ray_tmax = __ray_tmax; __trace_input.ray_geometry_index = __ray_geometry_index;\n\
+                                         if (msl_any_hit(results[gid], __trace_group, __trace_input, accel, rays, sbt, instance_transforms, dispatch_info, __sbt_local_root, __sbt_stride, vertex_attributes, triangle_indices, geometry_bindings, aabbs)) {{\n\
+                                             msl_closest_hit(results[gid], __trace_group, __trace_input, accel, rays, sbt, instance_transforms, dispatch_info, __sbt_local_root, __sbt_stride, vertex_attributes, triangle_indices, geometry_bindings, aabbs);\n\
+                                         }}\n\
+                                     }} else {{\n\
+                                         RayStageInput __miss_input = {{}};\n\
+                                         __miss_input.ray_flags = __ray_flags; __miss_input.ray_tmax = __ray_tmax;\n\
+                                         msl_miss(results[gid], __trace_group, __miss_input, accel, rays, sbt, instance_transforms, dispatch_info, __sbt_local_root, __sbt_stride, vertex_attributes, triangle_indices, geometry_bindings, aabbs);\n\
+                                     }}\n\
+                                     results[gid].instance_id = __hit_instance; results[gid].primitive_id = __hit_primitive;\n\
+                                     results[gid].distance = __hit_distance; results[gid].hit_kind = __hit_kind;\n\
+                                     results[gid].barycentrics[0] = __barycentrics.x; results[gid].barycentrics[1] = __barycentrics.y;\n\
+                                     results[gid].ray_flags = __ray_flags; results[gid].ray_tmax = __ray_tmax;\n\
+                                     results[gid].ray_geometry_index = __ray_geometry_index; results[gid].candidate_type = __candidate_type;\n\
+                                     results[gid].candidate_instance = __candidate_instance; results[gid].candidate_primitive = __candidate_primitive;\n\
+                                     results[gid].candidate_geometry = __candidate_geometry;\n\
+                                     results[gid].attributes[0] = __attributes.x; results[gid].attributes[1] = __attributes.y;\n\
+                                     results[gid].attributes[2] = __attributes.z; results[gid].attributes[3] = __attributes.w;\n"
+                                ));
+                            }
+                            "dx.op.callShader" | "callShader" => {
+                                let shader_index = dx_arg(0)?;
+                                output.push_str(&format!(
+                                    "    {{ RayStageInput __call_input = {{}};\n\
+     __call_input.type = __candidate_type; __call_input.instance_id = __candidate_instance; __call_input.primitive_id = __candidate_primitive; __call_input.geometry_index = __candidate_geometry; __call_input.distance = __hit_distance; __call_input.barycentrics = __barycentrics; __call_input.attributes = __attributes; __call_input.object_origin = __candidate_object_origin; __call_input.object_direction = __candidate_object_direction; __call_input.object_to_world = __candidate_object_to_world; __call_input.world_to_object = __candidate_world_to_object; __call_input.ray_flags = __ray_flags; __call_input.ray_tmax = __ray_tmax; __call_input.ray_geometry_index = __ray_geometry_index;\n\
+     msl_callable(results[gid], sbt[uint({shader_index}) + max(rays[gid].sbt_offset, uint(gid))], __call_input, accel, rays, sbt, instance_transforms, dispatch_info, __sbt_local_root, __sbt_stride, vertex_attributes, triangle_indices, geometry_bindings, aabbs); }}\n"
+                                ));
+                            }
+                            "dx.op.acceptHitAndEndSearch" | "acceptHitAndEndSearch" => {
+                                output.push_str(
+                                    "    __accepted = 1u; __end_search = 1u; __ignored = 0u;\n\
+                                     results[gid].accepted = 1u; results[gid].end_search = 1u; results[gid].ignored = 0u;\n",
+                                );
+                            }
+                            "dx.op.ignoreHit" | "ignoreHit" => {
+                                output.push_str(
+                                    "    __accepted = 0u; __ignored = 1u; __end_search = 0u;\n\
+                                     results[gid].accepted = 0u; results[gid].ignored = 1u; results[gid].end_search = 0u;\n",
+                                );
+                            }
                             "ray.storePayload" => {
                                 let index = args
                                     .first()
@@ -5089,6 +5662,31 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
                                     })?;
                                 output.push_str(&format!(
                                     "    results[{index}].value[0] = float({value});\n"
+                                ));
+                            }
+                            "ray.storePayloadField" | "ray.storePayloadStruct" => {
+                                let field = args
+                                    .first()
+                                    .map(|argument| {
+                                        msl_value(
+                                            argument.split_whitespace().last().unwrap_or(argument),
+                                        )
+                                    })
+                                    .ok_or_else(|| {
+                                        AppError::new(
+                                            ReasonCode::RcDxilInvalid,
+                                            format!("{callee} is missing argument 0"),
+                                        )
+                                    })?;
+                                let value = args.get(1).ok_or_else(|| {
+                                    AppError::new(
+                                        ReasonCode::RcDxilInvalid,
+                                        format!("{callee} is missing argument 1"),
+                                    )
+                                })?;
+                                let word = payload_word_expr(value);
+                                output.push_str(&format!(
+                                    "    if ((uint)({field}) < {RAY_PAYLOAD_WORDS}u) {{ results[gid].payload[{field}] = {word}; }}\n"
                                 ));
                             }
                             other => {
@@ -5222,7 +5820,7 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
             match inst.opcode.as_str() {
                 "alloca" => {}
                 "getelementptr" => {
-                    let ty = leading_type(&inst.rest);
+                    let ty = leading_type(&inst.rest).trim_end_matches(',');
                     let tail = inst.rest[ty.len()..].trim();
                     let base_part = tail.split("ptr ").nth(1).ok_or_else(|| {
                         AppError::new(ReasonCode::RcDxilInvalid, "getelementptr without base")
@@ -5243,8 +5841,20 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
                         .or_else(|| indices.first())
                         .cloned()
                         .unwrap_or_else(|| "0".into());
-                    let expr = if pointer_kinds.get(base).map(String::as_str) == Some("struct") {
+                    let kind = pointer_kinds.get(base).map(String::as_str);
+                    let expr = if kind == Some("struct") {
                         format!("{base_expr}.f{index}")
+                    } else if kind == Some("payload_ptr") {
+                        payload_pointer_indices.insert(result.clone(), index.clone());
+                        pointer_kinds.insert(result.clone(), "payload".to_string());
+                        format!("{base_expr} + ({index})")
+                    } else if kind == Some("payload") {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "getelementptr on payload pointer %{base} has no scalar element type"
+                            ),
+                        ));
                     } else {
                         format!("{base_expr}[{index}]")
                     };
@@ -5265,7 +5875,29 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
                             format!("load from unsupported pointer %{pointer}"),
                         )
                     })?;
-                    output.push_str(&format!("    {result} = {base};\n"));
+                    if pointer_kinds.get(&pointer).map(String::as_str) == Some("payload") {
+                        let index = payload_pointer_indices
+                            .get(&pointer)
+                            .expect("payload pointer GEP records an element index");
+                        let ty = leading_type(&inst.rest).trim_end_matches(',');
+                        let msl = llvm_type_to_msl(ty)?;
+                        let read = match msl.as_str() {
+                            "float" => format!("as_type<float>(*({base}))"),
+                            "int" => format!("as_type<int>(*({base}))"),
+                            "uint" => format!("*({base})"),
+                            other => {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("payload load has unsupported type {other}"),
+                                ));
+                            }
+                        };
+                        output.push_str(&format!(
+                            "    {result} = 0; if ((uint)({index}) < {RAY_PAYLOAD_WORDS}u) {{ {result} = {read}; }}\n"
+                        ));
+                    } else {
+                        output.push_str(&format!("    {result} = {base};\n"));
+                    }
                 }
                 "extractvalue" => {
                     let ty = leading_type(&inst.rest);
@@ -5274,10 +5906,35 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
                         AppError::new(ReasonCode::RcDxilInvalid, "extractvalue without index")
                     })?;
                     let value = value.split_whitespace().last().unwrap_or(value);
+                    if parse_llvm_array(ty).is_some() {
+                        output.push_str(&format!(
+                            "    {result} = {}[{}];\n",
+                            msl_ident(value.trim()),
+                            index.trim()
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "    {result} = {}.f{};\n",
+                            msl_ident(value.trim()),
+                            index.trim()
+                        ));
+                    }
+                }
+                "extractelement" => {
+                    let ty = leading_type(&inst.rest);
+                    let tail = inst.rest[ty.len()..].trim();
+                    let (value, index) = tail.split_once(',').ok_or_else(|| {
+                        AppError::new(ReasonCode::RcDxilInvalid, "extractelement without index")
+                    })?;
+                    let value = value.split_whitespace().last().unwrap_or(value);
                     output.push_str(&format!(
-                        "    {result} = {}.f{};\n",
+                        "    {result} = {}[{}];\n",
                         msl_ident(value.trim()),
-                        index.trim()
+                        index
+                            .split_whitespace()
+                            .last()
+                            .unwrap_or(index)
+                            .trim_end_matches(',')
                     ));
                 }
                 "insertvalue" => {
@@ -5358,9 +6015,121 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
                                 )
                             })
                     };
+                    let dx_scalar = |index: usize| -> AppResult<String> {
+                        scalar(index + usize::from(callee.starts_with("dx.op.")))
+                    };
+                    let ty = leading_type(&inst.rest);
                     match callee {
                         "dx.op.dispatchRaysIndex" => {
-                            output.push_str(&format!("    {result} = int(gid);\n"))
+                            let count = ray_result_component_count(ty)?;
+                            if count == 1 {
+                                let exprs = vec!["int(gid)".to_string()];
+                                emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                            } else if count == 3 {
+                                let exprs = vec![
+                                    "int(dispatch_info[0])".to_string(),
+                                    "int(dispatch_info[1])".to_string(),
+                                    "int(dispatch_info[2])".to_string(),
+                                ];
+                                emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                            } else {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!(
+                                        "{callee} returned a {count}-component value in @{entry}"
+                                    ),
+                                ));
+                            }
+                        }
+                        "dx.op.dispatchRaysDimensions" => {
+                            let exprs = vec![
+                                "int(dispatch_info[0])".to_string(),
+                                "int(dispatch_info[1])".to_string(),
+                                "int(dispatch_info[2])".to_string(),
+                            ];
+                            emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                        }
+                        "dx.op.objectToWorld" | "dx.op.objectToWorld3x4" => {
+                            let count = ray_result_component_count(ty)?;
+                            if !(3..=4).contains(&count) {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("{callee} returned an unsupported matrix shape in @{entry}"),
+                                ));
+                            }
+                            let exprs: Vec<String> = (0..count)
+                                .map(|index| format!("transpose(__object_to_world)[{index}]"))
+                                .collect();
+                            emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                        }
+                        "dx.op.worldToObject" | "dx.op.worldToObject3x4" => {
+                            let count = ray_result_component_count(ty)?;
+                            if !(3..=4).contains(&count) {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("{callee} returned an unsupported matrix shape in @{entry}"),
+                                ));
+                            }
+                            let exprs: Vec<String> = (0..count)
+                                .map(|index| format!("transpose(__world_to_object)[{index}]"))
+                                .collect();
+                            emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                        }
+                        "dx.op.rayTCurrent" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__hit_distance")?;
+                        }
+                        "dx.op.hitKind" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__hit_kind")?;
+                        }
+                        "dx.op.instanceID" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__hit_instance")?;
+                        }
+                        "dx.op.primitiveID" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__hit_primitive")?;
+                        }
+                        "dx.op.barycentrics" | "dx.op.barycentrics2" => {
+                            let count = ray_result_component_count(ty)?;
+                            if count != 2 {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("{callee} must return two components in @{entry}"),
+                                ));
+                            }
+                            let exprs = vec![
+                                "__barycentrics.x".to_string(),
+                                "__barycentrics.y".to_string(),
+                            ];
+                            emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                        }
+                        "dx.op.objectRayOrigin" => {
+                            let count = ray_result_component_count(ty)?;
+                            if count != 3 {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("{callee} must return three components in @{entry}"),
+                                ));
+                            }
+                            let exprs = vec![
+                                "__object_origin.x".to_string(),
+                                "__object_origin.y".to_string(),
+                                "__object_origin.z".to_string(),
+                            ];
+                            emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                        }
+                        "dx.op.objectRayDirection" => {
+                            let count = ray_result_component_count(ty)?;
+                            if count != 3 {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("{callee} must return three components in @{entry}"),
+                                ));
+                            }
+                            let exprs = vec![
+                                "__object_direction.x".to_string(),
+                                "__object_direction.y".to_string(),
+                                "__object_direction.z".to_string(),
+                            ];
+                            emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
                         }
                         "dx.op.worldRayOrigin" => {
                             output.push_str(&format!("    {result} = rays[gid].origin;\n"))
@@ -5370,6 +6139,154 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
                         }
                         "dx.op.rayTMin" => {
                             output.push_str(&format!("    {result} = rays[gid].min_distance;\n"))
+                        }
+                        "dx.op.rayFlags" | "rayFlags" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__ray_flags")?;
+                        }
+                        "dx.op.rayTMax" | "rayTMax" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__ray_tmax")?;
+                        }
+                        "dx.op.rayGeometryIndex" | "rayGeometryIndex" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__ray_geometry_index")?;
+                        }
+                        "dx.op.candidateType" | "candidateType" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__candidate_type")?;
+                        }
+                        "dx.op.candidateInstanceID" | "candidateInstanceID" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__candidate_instance")?;
+                        }
+                        "dx.op.candidatePrimitiveID" | "candidatePrimitiveID" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__candidate_primitive")?;
+                        }
+                        "dx.op.candidateGeometryIndex" | "candidateGeometryIndex" => {
+                            emit_ray_scalar(&mut output, ty, &result, "__candidate_geometry")?;
+                        }
+                        "dx.op.candidateObjectRayOrigin" | "candidateObjectRayOrigin" => {
+                            let count = ray_result_component_count(ty)?;
+                            if count != 3 {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("{callee} must return three components in @{entry}"),
+                                ));
+                            }
+                            let exprs = vec![
+                                "__candidate_object_origin.x".to_string(),
+                                "__candidate_object_origin.y".to_string(),
+                                "__candidate_object_origin.z".to_string(),
+                            ];
+                            emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                        }
+                        "dx.op.candidateObjectRayDirection" | "candidateObjectRayDirection" => {
+                            let count = ray_result_component_count(ty)?;
+                            if count != 3 {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("{callee} must return three components in @{entry}"),
+                                ));
+                            }
+                            let exprs = vec![
+                                "__candidate_object_direction.x".to_string(),
+                                "__candidate_object_direction.y".to_string(),
+                                "__candidate_object_direction.z".to_string(),
+                            ];
+                            emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                        }
+                        "dx.op.candidateObjectToWorld3x4" | "candidateObjectToWorld3x4" | "dx.op.candidateObjectToWorld" | "candidateObjectToWorld" => {
+                            let count = ray_result_component_count(ty)?;
+                            if !(3..=4).contains(&count) {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("{callee} returned an unsupported matrix shape in @{entry}"),
+                                ));
+                            }
+                            let exprs: Vec<String> = (0..count)
+                                .map(|index| {
+                                    format!("transpose(__candidate_object_to_world)[{index}]")
+                                })
+                                .collect();
+                            emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                        }
+                        "dx.op.candidateWorldToObject3x4" | "candidateWorldToObject3x4" | "dx.op.candidateWorldToObject" | "candidateWorldToObject" => {
+                            let count = ray_result_component_count(ty)?;
+                            if !(3..=4).contains(&count) {
+                                return Err(AppError::new(
+                                    ReasonCode::RcDxilInvalid,
+                                    format!("{callee} returned an unsupported matrix shape in @{entry}"),
+                                ));
+                            }
+                            let exprs: Vec<String> = (0..count)
+                                .map(|index| {
+                                    format!("transpose(__candidate_world_to_object)[{index}]")
+                                })
+                                .collect();
+                            emit_ray_components(&mut output, callee, ty, &result, &exprs)?;
+                        }
+                        "dx.op.attributeAtVertex" | "attributeAtVertex" => {
+                            let attribute = dx_scalar(0)?;
+                            let vertex = dx_scalar(1)?;
+                            output.push_str(&format!(
+                                "    {{ uint __vb = min(__candidate_instance, max(dispatch_info[6], 1u) - 1u);\n\
+                                     uint __voff = geometry_bindings[__vb * 4u];\n\
+                                     uint __ioff = geometry_bindings[__vb * 4u + 1u];\n\
+                                     uint __slot = __ioff + __hit_primitive * 3u + uint({vertex});\n\
+                                     uint __vidx = triangle_indices[__slot];\n\
+                                     {result} = vertex_attributes[__voff + __vidx][uint({attribute}) & 3u]; }}\n"
+                            ));
+                        }
+                        "dx.op.getShaderRecordBufferHandle" | "getShaderRecordBufferHandle" => {
+                            output.push_str(&format!(
+                                "    {result} = __sbt_local_root;\n"
+                            ));
+                            pointer_bases.insert(result.clone(), "__sbt_local_root".to_string());
+                            pointer_kinds.insert(result.clone(), "shader_record".to_string());
+                        }
+                        "dx.op.reportHit" | "reportHit" => {
+                            let distance = dx_scalar(0)?;
+                            let attribute0 = dx_scalar(1)?;
+                            let attribute1 = dx_scalar(2)?;
+                            output.push_str(&format!(
+                                "    __hit_distance = float({distance});\n\
+                                 __attributes = float4(as_type<float>(uint({attribute0})), as_type<float>(uint({attribute1})), 0.0f, 0.0f);\n\
+                                 __accepted = 1u; __end_search = 0u; __ignored = 0u;\n\
+                                 results[gid].distance = __hit_distance;\n\
+                                 results[gid].attributes[0] = __attributes.x; results[gid].attributes[1] = __attributes.y; results[gid].attributes[2] = __attributes.z; results[gid].attributes[3] = __attributes.w;\n\
+                                 results[gid].accepted = 1u; results[gid].end_search = 0u; results[gid].ignored = 0u; results[gid].candidate_type = 1u;\n"
+                            ));
+                            if ray_result_component_count(ty)? == 1 {
+                                output.push_str(&format!("    {result} = true;\n"));
+                            }
+                        }
+                        "ray.payloadPointer" | "ray.getPayload" | "ray.payload" => {
+                            output.push_str(&format!(
+                                "    {result} = (device uint*)results[gid].payload;\n"
+                            ));
+                            pointer_bases.insert(
+                                result.clone(),
+                                "(device uint*)results[gid].payload".to_string(),
+                            );
+                            pointer_kinds.insert(result.clone(), "payload_ptr".to_string());
+                        }
+                        "ray.loadPayloadField" => {
+                            let field = scalar(0)?;
+                            let msl = llvm_type_to_msl(ty)?;
+                            let read = match msl.as_str() {
+                                "float" => format!(
+                                    "as_type<float>(results[gid].payload[{field}])"
+                                ),
+                                "int" => format!("as_type<int>(results[gid].payload[{field}])"),
+                                "uint" => format!("results[gid].payload[{field}]"),
+                                other => {
+                                    return Err(AppError::new(
+                                        ReasonCode::RcDxilInvalid,
+                                        format!(
+                                            "ray.loadPayloadField returned unsupported type {other}"
+                                        ),
+                                    ));
+                                }
+                            };
+                            output.push_str(&format!(
+                                "    {result} = 0; if ((uint)({field}) < {RAY_PAYLOAD_WORDS}u) {{ {result} = {read}; }}\n"
+                            ));
                         }
                         "ray.storePayload" => {
                             let index = scalar(0)?;
@@ -5464,20 +6381,346 @@ pub fn lower_llvm_ir_ray_body(ir: &str, entry: &str) -> AppResult<String> {
     Ok(format!("{struct_defs}{}", output))
 }
 
+/// Default SBT stage helpers used when a raygen program has no separately
+/// translated stage bitcode. They write deterministic payload values so a
+/// nested `traceRay`/`callShader` never observes uninitialized state.
+fn ray_default_stage_msl() -> String {
+    let context = format!(
+        "device const RayRecord* rays, device const uint* sbt, device const float4* instance_transforms, device const uint* dispatch_info, device const uint* __sbt_local_root, uint __sbt_stride{RAY_GEOMETRY_PARAMS}"
+    );
+    format!(
+        "void msl_closest_hit(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, instance_acceleration_structure accel, {context}) {{\n\
+    (void)group;\n\
+    payload.value = float4(42.0, float(input.instance_id), float(input.primitive_id), input.distance);\n\
+    payload.instance_id = input.instance_id;\n\
+    payload.primitive_id = input.primitive_id;\n\
+    payload.distance = input.distance;\n\
+}}\n\
+void msl_miss(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, instance_acceleration_structure accel, {context}) {{ (void)input; (void)group; payload.value = float4(7.0); }}\n\
+bool msl_any_hit(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, instance_acceleration_structure accel, {context}) {{\n\
+    (void)input;\n\
+    if ((group & 0x100u) != 0u) {{ payload.value = float4(7.0); return false; }}\n\
+    payload.accepted = 1u;\n\
+    return true;\n\
+}}\n\
+void msl_callable(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, instance_acceleration_structure accel, {context}) {{\n\
+    (void)input;\n\
+    payload.value = float4(99.0, float(group), 0.0, 0.0);\n\
+    payload.accepted = 1u;\n\
+}}\n\
+bool msl_intersection(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, instance_acceleration_structure accel, {context}) {{\n\
+    (void)payload; (void)group; (void)input;\n\
+    return false;\n\
+}}\n"
+    )
+}
+
 /// Translate real LLVM bitcode into an MSL raygen kernel body.
+///
+/// The generated kernel owns real hardware traversal, so hit-derived
+/// intrinsics (`RayTCurrent`, `HitKind`, `InstanceID`, `PrimitiveID`,
+/// barycentrics) read the intersection it just performed. Object/world
+/// transforms come from the per-instance table bound at buffer 5.
 pub fn translate_llvm_ray_program(bitcode: &[u8], entry: &str) -> AppResult<String> {
     let ir = llvm_bitcode_to_ir(bitcode)?;
     let body = lower_llvm_ir_ray_body(&ir, entry)?;
     let (prefix, code) = body.split_once("__bb = 0;").unwrap_or(("", body.as_str()));
+    let defaults = ray_default_stage_msl();
     Ok(format!(
-        "#include <metal_stdlib>\nusing namespace metal;\n\n{prefix}\n\
-         struct RayRecord {{ packed_float3 origin; float min_distance; packed_float3 direction; float max_distance; }};\n\
-         struct RayPayloadResult {{ float4 value; uint instance_id; uint primitive_id; }};\n\n\
+        "#include <metal_stdlib>\n#include <metal_raytracing>\nusing namespace metal;\nusing namespace raytracing;\n\n{prefix}\n{RAY_RESULT_STRUCT_MSL}\n{RAY_STAGE_INPUT_MSL}\n{defaults}\n\
          kernel void {entry}(device RayPayloadResult* results [[buffer(0)]],\n\
                              device const RayRecord* rays [[buffer(1)]],\n\
+                             instance_acceleration_structure accel [[buffer(2)]],\n\
+                             device const uint* sbt [[buffer(3)]],\n\
                              constant uint& ray_count [[buffer(4)]],\n\
+                             device const float4* instance_transforms [[buffer(5)]],\n\
+                             device const uint* dispatch_info [[buffer(6)]],\n\
+                             device const float4* vertex_attributes [[buffer(7)]],\n\
+                             device const uint* triangle_indices [[buffer(8)]],\n\
+                             device const uint* geometry_bindings [[buffer(9)]],\n\
+                             device const MetalRayAabb* aabbs [[buffer(10)]],\n\
                              uint gid [[thread_position_in_grid]]) {{\n\
-             if (gid >= ray_count) {{ return; }}\n    uint __bb = 0; {code}\n}}\n"
+             if (gid >= ray_count) {{ return; }}\n\
+{RAY_HIT_LOCALS_MSL}\
+{RAY_SBT_LOCALS_MSL}\
+             uint __instance_count = max(dispatch_info[3], 1u);\n\
+             uint __transform_base = min(__hit_instance, __instance_count - 1u) * 8u;\n\
+             float4x4 __object_to_world = float4x4(instance_transforms[__transform_base], instance_transforms[__transform_base + 1u], instance_transforms[__transform_base + 2u], instance_transforms[__transform_base + 3u]);\n\
+             float4x4 __world_to_object = float4x4(instance_transforms[__transform_base + 4u], instance_transforms[__transform_base + 5u], instance_transforms[__transform_base + 6u], instance_transforms[__transform_base + 7u]);\n\
+             float3 __object_origin = (__world_to_object * float4(rays[gid].origin, 1.0f)).xyz;\n\
+             float3 __object_direction = (__world_to_object * float4(rays[gid].direction, 0.0f)).xyz;\n\
+             __candidate_object_origin = __object_origin;\n\
+             __candidate_object_direction = __object_direction;\n\
+             __candidate_object_to_world = __object_to_world;\n\
+             __candidate_world_to_object = __world_to_object;\n\
+             RayPayloadResult __empty = {{}};\n\
+             results[gid] = __empty;\n\
+             results[gid].instance_id = __hit_instance;\n\
+             results[gid].primitive_id = __hit_primitive;\n\
+             results[gid].distance = __hit_distance;\n\
+             results[gid].hit_kind = __hit_kind;\n\
+             results[gid].dispatch[0] = dispatch_info[0];\n\
+             results[gid].dispatch[1] = dispatch_info[1];\n\
+             results[gid].dispatch[2] = dispatch_info[2];\n\
+             results[gid].barycentrics[0] = __barycentrics.x;\n\
+             results[gid].barycentrics[1] = __barycentrics.y;\n\
+             results[gid].object_origin[0] = __object_origin.x;\n\
+             results[gid].object_origin[1] = __object_origin.y;\n\
+             results[gid].object_origin[2] = __object_origin.z;\n\
+             results[gid].object_direction[0] = __object_direction.x;\n\
+             results[gid].object_direction[1] = __object_direction.y;\n\
+             results[gid].object_direction[2] = __object_direction.z;\n\
+             for (uint __row = 0u; __row < 3u; ++__row) {{\n\
+                 for (uint __column = 0u; __column < 4u; ++__column) {{\n\
+                     results[gid].object_to_world[__row * 4u + __column] = instance_transforms[__transform_base + __column][__row];\n\
+                     results[gid].world_to_object[__row * 4u + __column] = instance_transforms[__transform_base + 4u + __column][__row];\n\
+                     results[gid].candidate_object_to_world[__row * 4u + __column] = instance_transforms[__transform_base + __column][__row];\n\
+                     results[gid].candidate_world_to_object[__row * 4u + __column] = instance_transforms[__transform_base + 4u + __column][__row];\n\
+                 }}\n\
+             }}\n\
+             results[gid].ray_flags = __ray_flags;\n\
+             results[gid].ray_tmax = __ray_tmax;\n\
+             results[gid].ray_geometry_index = __ray_geometry_index;\n\
+             results[gid].candidate_type = __candidate_type;\n\
+             results[gid].candidate_instance = __candidate_instance;\n\
+             results[gid].candidate_primitive = __candidate_primitive;\n\
+             results[gid].candidate_geometry = __candidate_geometry;\n\
+             results[gid].candidate_object_origin[0] = __candidate_object_origin.x;\n\
+             results[gid].candidate_object_origin[1] = __candidate_object_origin.y;\n\
+             results[gid].candidate_object_origin[2] = __candidate_object_origin.z;\n\
+             results[gid].candidate_object_direction[0] = __candidate_object_direction.x;\n\
+             results[gid].candidate_object_direction[1] = __candidate_object_direction.y;\n\
+             results[gid].candidate_object_direction[2] = __candidate_object_direction.z;\n\
+             results[gid].attributes[0] = __attributes.x;\n\
+             results[gid].attributes[1] = __attributes.y;\n\
+             results[gid].attributes[2] = __attributes.z;\n\
+             results[gid].attributes[3] = __attributes.w;\n\
+             results[gid].accepted = __accepted;\n\
+             results[gid].end_search = __end_search;\n\
+             results[gid].ignored = __ignored;\n\
+             uint __bb = 0; {code}\n\
+             results[gid].instance_id = __hit_instance;\n\
+             results[gid].primitive_id = __hit_primitive;\n\
+             results[gid].distance = __hit_distance;\n\
+             results[gid].hit_kind = __hit_kind;\n\
+             results[gid].barycentrics[0] = __barycentrics.x;\n\
+             results[gid].barycentrics[1] = __barycentrics.y;\n\
+             results[gid].ray_flags = __ray_flags;\n\
+             results[gid].ray_tmax = __ray_tmax;\n\
+             results[gid].ray_geometry_index = __ray_geometry_index;\n\
+             results[gid].candidate_type = __candidate_type;\n\
+             results[gid].candidate_instance = __candidate_instance;\n\
+             results[gid].candidate_primitive = __candidate_primitive;\n\
+             results[gid].candidate_geometry = __candidate_geometry;\n\
+             results[gid].candidate_object_origin[0] = __candidate_object_origin.x;\n\
+             results[gid].candidate_object_origin[1] = __candidate_object_origin.y;\n\
+             results[gid].candidate_object_origin[2] = __candidate_object_origin.z;\n\
+             results[gid].candidate_object_direction[0] = __candidate_object_direction.x;\n\
+             results[gid].candidate_object_direction[1] = __candidate_object_direction.y;\n\
+             results[gid].candidate_object_direction[2] = __candidate_object_direction.z;\n\
+             for (uint __row = 0u; __row < 3u; ++__row) {{\n\
+                 for (uint __column = 0u; __column < 4u; ++__column) {{\n\
+                     results[gid].candidate_object_to_world[__row * 4u + __column] = __candidate_object_to_world[__column][__row];\n\
+                     results[gid].candidate_world_to_object[__row * 4u + __column] = __candidate_world_to_object[__column][__row];\n\
+                 }}\n\
+             }}\n\
+             results[gid].attributes[0] = __attributes.x;\n\
+             results[gid].attributes[1] = __attributes.y;\n\
+             results[gid].attributes[2] = __attributes.z;\n\
+             results[gid].attributes[3] = __attributes.w;\n\
+             results[gid].accepted = __accepted;\n\
+             results[gid].end_search = __end_search;\n\
+             results[gid].ignored = __ignored;\n\
+}}\n"
+    ))
+}
+
+/// Candidate inputs supplied to a translated non-raygen stage.
+///
+/// The raygen wrapper snapshots these from the real Metal intersection before
+/// invoking the stage function, so candidate system values are deterministic
+/// and never synthesized independently of the traversal.
+const RAY_STAGE_INPUT_MSL: &str = "struct RayStageInput {\n\
+    uint type;\n\
+    uint instance_id;\n\
+    uint primitive_id;\n\
+    uint geometry_index;\n\
+    float distance;\n\
+    float2 barycentrics;\n\
+    float4 attributes;\n\
+    float3 object_origin;\n\
+    float3 object_direction;\n\
+    float4x4 object_to_world;\n\
+    float4x4 world_to_object;\n\
+    uint ray_flags;\n\
+    float ray_tmax;\n\
+    uint ray_geometry_index;\n\
+};\n\
+struct MetalRayAabb {\n\
+    packed_float3 min;\n\
+    packed_float3 max;\n\
+    uint instance_id;\n\
+    uint geometry_index;\n\
+    uint group;\n\
+    uint reserved;\n\
+};\n";
+
+/// Stage-local mirrors of the raygen variables referenced by lowered bodies.
+const RAY_STAGE_LOCALS_MSL: &str = "    uint gid = 0u;\n\
+    device RayPayloadResult* results = &payload;\n\
+    uint __hit_instance = input.instance_id;\n\
+    uint __hit_primitive = input.primitive_id;\n\
+    uint __hit_kind = (input.type == 0u) ? 0xFEu : 0xFFu;\n\
+    float __hit_distance = input.distance;\n\
+    float2 __barycentrics = input.barycentrics;\n\
+    uint __candidate_type = input.type;\n\
+    uint __candidate_instance = input.instance_id;\n\
+    uint __candidate_primitive = input.primitive_id;\n\
+    uint __candidate_geometry = input.geometry_index;\n\
+    float3 __candidate_object_origin = input.object_origin;\n\
+    float3 __candidate_object_direction = input.object_direction;\n\
+    float4x4 __candidate_object_to_world = input.object_to_world;\n\
+    float4x4 __candidate_world_to_object = input.world_to_object;\n\
+    float4x4 __object_to_world = input.object_to_world;\n\
+    float4x4 __world_to_object = input.world_to_object;\n\
+    float3 __object_origin = input.object_origin;\n\
+    float3 __object_direction = input.object_direction;\n\
+    float4 __attributes = input.attributes;\n\
+    uint __ray_flags = input.ray_flags;\n\
+    float __ray_tmax = input.ray_tmax;\n\
+    uint __ray_geometry_index = input.ray_geometry_index;\n\
+    uint __accepted = 1u;\n\
+    uint __end_search = 0u;\n\
+    uint __ignored = 0u;\n";
+
+fn ray_stage_parameters(_stage: ShaderStage) -> String {
+    format!(
+        "device RayPayloadResult& payload, uint group, thread const RayStageInput& input, \
+         instance_acceleration_structure accel, device const RayRecord* rays, \
+         device const uint* sbt, device const float4* instance_transforms, \
+         device const uint* dispatch_info, device const uint* __sbt_local_root, \
+         uint __sbt_stride{RAY_GEOMETRY_PARAMS}"
+    )
+}
+
+/// Translate one non-raygen ray stage from its own LLVM bitcode.
+///
+/// Raygen delegates to [`translate_llvm_ray_program`]. Hit, miss, callable and
+/// intersection stages consume the candidate snapshot captured by the raygen
+/// traversal and can themselves issue nested `traceRay`/`callShader` calls
+/// through the same Metal intersector. Every stage writes the shared payload
+/// and attribute state, so the SBT-selected function has real side effects.
+pub fn translate_llvm_ray_stage_program(
+    bitcode: &[u8],
+    stage: ShaderStage,
+    entry: &str,
+) -> AppResult<String> {
+    if matches!(stage, ShaderStage::RayGeneration) {
+        return translate_llvm_ray_program(bitcode, entry);
+    }
+    if !matches!(
+        stage,
+        ShaderStage::AnyHit
+            | ShaderStage::ClosestHit
+            | ShaderStage::Miss
+            | ShaderStage::Intersection
+            | ShaderStage::Callable
+    ) {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!("{} is not a ray shader stage", stage.as_str()),
+        ));
+    }
+    let ir = llvm_bitcode_to_ir(bitcode)?;
+    let body = lower_llvm_ir_ray_body(&ir, entry)?;
+    let (prefix, code) = body.split_once("__bb = 0;").unwrap_or(("", body.as_str()));
+    let (qualifier, bool_return) = match stage {
+        ShaderStage::AnyHit => ("bool", true),
+        ShaderStage::ClosestHit => ("void", false),
+        ShaderStage::Miss => ("void", false),
+        ShaderStage::Intersection => ("bool", true),
+        ShaderStage::Callable => ("void", false),
+        _ => unreachable!("ray stage set is exhaustive"), // coverage: unreachable
+    };
+    let params = ray_stage_parameters(stage);
+    let body = if bool_return {
+        code.replace("return;", "return __accepted != 0u;")
+    } else {
+        code.to_string()
+    };
+    let tail = if bool_return {
+        "    return __accepted != 0u;"
+    } else {
+        "    return;"
+    };
+    let function_name = match stage {
+        ShaderStage::AnyHit => "msl_any_hit",
+        ShaderStage::ClosestHit => "msl_closest_hit",
+        ShaderStage::Miss => "msl_miss",
+        ShaderStage::Intersection => "msl_intersection",
+        ShaderStage::Callable => "msl_callable",
+        _ => unreachable!("ray stage set is exhaustive"), // coverage: unreachable
+    };
+    let context = format!(
+        "instance_acceleration_structure accel, device const RayRecord* rays, device const uint* sbt, device const float4* instance_transforms, device const uint* dispatch_info, device const uint* __sbt_local_root, uint __sbt_stride{RAY_GEOMETRY_PARAMS}"
+    );
+    let mut defaults = String::new();
+    let default_bodies = [
+        (
+            "msl_closest_hit",
+            format!(
+                "void msl_closest_hit(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, {context}) {{\n    (void)group;\n    payload.value = float4(42.0, float(input.instance_id), float(input.primitive_id), input.distance);\n    payload.instance_id = input.instance_id;\n    payload.primitive_id = input.primitive_id;\n    payload.distance = input.distance;\n}}\n"
+            ),
+        ),
+        (
+            "msl_miss",
+            format!(
+                "void msl_miss(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, {context}) {{ payload.value = float4(7.0); (void)input; }}\n"
+            ),
+        ),
+        (
+            "msl_any_hit",
+            format!(
+                "bool msl_any_hit(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, {context}) {{\n    (void)input;\n    if ((group & 0x100u) != 0u) {{ payload.value = float4(7.0); return false; }}\n    payload.accepted = 1u;\n    return true;\n}}\n"
+            ),
+        ),
+        (
+            "msl_callable",
+            format!(
+                "void msl_callable(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, {context}) {{\n    (void)input;\n    payload.value = float4(99.0, float(group), 0.0, 0.0);\n    payload.accepted = 1u;\n}}\n"
+            ),
+        ),
+        (
+            "msl_intersection",
+            format!(
+                "bool msl_intersection(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, {context}) {{\n    (void)payload; (void)group; (void)input;\n    return false;\n}}\n"
+            ),
+        ),
+    ];
+    for (name, body) in default_bodies {
+        if name != function_name {
+            defaults.push_str(&body);
+        }
+    }
+    let arguments = format!(
+        "payload, group, input, accel, rays, sbt, instance_transforms, dispatch_info, __sbt_local_root, __sbt_stride{RAY_GEOMETRY_ARGS}"
+    );
+    let stage_init = if matches!(stage, ShaderStage::Intersection) {
+        "    __accepted = 0u;\n"
+    } else {
+        ""
+    };
+    let wrapper = if bool_return {
+        format!("{qualifier} {entry}({params}) {{ return {function_name}({arguments}); }}")
+    } else {
+        format!("{qualifier} {entry}({params}) {{ {function_name}({arguments}); }}")
+    };
+    Ok(format!(
+        "#include <metal_stdlib>\n#include <metal_raytracing>\nusing namespace metal;\nusing namespace raytracing;\n\n{prefix}\n{RAY_RESULT_STRUCT_MSL}\n{RAY_STAGE_INPUT_MSL}\n{defaults}\
+         {qualifier} {function_name}({params}) {{\n\
+{RAY_STAGE_LOCALS_MSL}{stage_init}\
+         uint __bb = 0;\n{body}\n{tail}\n}}\n\
+         {wrapper}\n"
     ))
 }
 
@@ -7484,5 +8727,443 @@ declare void @ray.storePayload(i32, i32)
             llvm_type_to_msl("<2 x short>"),
             llvm_type_to_msl("<2 x char>"),
         );
+    }
+
+    #[test]
+    fn t_llvm_ray_transform_identity_intrinsics_and_payload_pointer_edges() {
+        t_llvm_ray_trace_control_candidate_and_shader_record_intrinsics_lower();
+        t_llvm_ray_stages_compile_from_own_bitcode_and_select_sbt_functions();
+        let raw = llvm_assemble_ir("define void @raw() {\nentry:\n ret void\n}\n").expect("raw");
+        assert_eq!(
+            ray_entry_points(&raw).expect("raw entries"),
+            vec!["raw".to_string()]
+        );
+        let mut malformed = vec![0u8; 20];
+        malformed[0..4].copy_from_slice(&9_999u32.to_le_bytes());
+        malformed.extend_from_slice(b"BC\xc0\xde!\x00\x00\x00");
+        assert_eq!(
+            ray_entry_points(&malformed).expect("malformed entries"),
+            Vec::<String>::new()
+        );
+        let ir = r#"define void @raygen(i32 %idx) {
+entry:
+  %dim = call { i32, i32, i32 } @dx.op.dispatchRaysDimensions(i32 143)
+  %dx = extractvalue { i32, i32, i32 } %dim, 0
+  %dy = extractvalue { i32, i32, i32 } %dim, 1
+  %dz = extractvalue { i32, i32, i32 } %dim, 2
+  %dimv = call <3 x i32> @dx.op.dispatchRaysDimensions(i32 143)
+  %dvx = extractelement <3 x i32> %dimv, i32 0
+  %idx3 = call <3 x i32> @dx.op.dispatchRaysIndex(i32 0)
+  %ix = extractelement <3 x i32> %idx3, i32 0
+  %o2w = call [3 x <4 x float>] @dx.op.objectToWorld3x4(i32 145)
+  %orow = extractvalue [3 x <4 x float>] %o2w, 1
+  %ox = extractelement <4 x float> %orow, i32 3
+  %o2wg = call { <4 x float>, <4 x float>, <4 x float> } @dx.op.objectToWorld(i32 144)
+  %orowg = extractvalue { <4 x float>, <4 x float>, <4 x float> } %o2wg, 2
+  %oz = extractelement <4 x float> %orowg, i32 2
+  %w2o = call [3 x <4 x float>] @dx.op.worldToObject3x4(i32 147)
+  %wrow = extractvalue [3 x <4 x float>] %w2o, 0
+  %wx = extractelement <4 x float> %wrow, i32 3
+  %w2og = call { <4 x float>, <4 x float>, <4 x float> } @dx.op.worldToObject(i32 146)
+  %wrowg = extractvalue { <4 x float>, <4 x float>, <4 x float> } %w2og, 1
+  %wy = extractelement <4 x float> %wrowg, i32 1
+  %t = call float @dx.op.rayTCurrent(i32 149)
+  %k = call i32 @dx.op.hitKind(i32 150)
+  %inst = call i32 @dx.op.instanceID(i32 151)
+  %prim = call i32 @dx.op.primitiveID(i32 152)
+  %b = call <2 x float> @dx.op.barycentrics(i32 153)
+  %bx = extractelement <2 x float> %b, i32 0
+  %ba = call { float, float } @dx.op.barycentrics2(i32 153)
+  %by = extractvalue { float, float } %ba, 1
+  %oo = call <3 x float> @dx.op.objectRayOrigin(i32 154)
+  %oox = extractelement <3 x float> %oo, i32 0
+  %od = call { float, float, float } @dx.op.objectRayDirection(i32 155)
+  %ody = extractvalue { float, float, float } %od, 1
+  call void @ray.storePayloadField(i32 0, i32 %dx)
+  call void @ray.storePayloadField(i32 1, float %t)
+  call void @ray.storePayloadStruct(i32 2, i32 %k)
+  call void @ray.storePayloadField(i32 3, i32 %inst)
+  call void @ray.storePayloadField(i32 4, i32 %prim)
+  call void @ray.storePayloadField(i32 5, float %bx)
+  call void @ray.storePayloadField(i32 6, float %by)
+  call void @ray.storePayloadField(i32 7, float %oox)
+  %p = call ptr @ray.payloadPointer()
+  %f = getelementptr i32, ptr %p, i32 5
+  store i32 77, ptr %f
+  %v = load i32, ptr %f
+  call void @ray.storePayloadField(i32 0, i32 %v)
+  %p2 = call ptr @ray.getPayload()
+  %f2 = getelementptr [8 x i32], ptr %p2, i32 0, i32 6
+  store i32 88, ptr %f2
+  %vf = call float @ray.loadPayloadField(i32 6)
+  %vi = call i32 @ray.loadPayloadField(i32 6)
+  call void @ray.storePayloadField(i32 1, float %vf)
+  call void @ray.storePayloadField(i32 2, i32 %vi)
+  ret void
+}
+declare { i32, i32, i32 } @dx.op.dispatchRaysDimensions(i32)
+declare <3 x i32> @dx.op.dispatchRaysIndex(i32)
+declare [3 x <4 x float>] @dx.op.objectToWorld3x4(i32)
+declare { <4 x float>, <4 x float>, <4 x float> } @dx.op.objectToWorld(i32)
+declare [3 x <4 x float>] @dx.op.worldToObject3x4(i32)
+declare { <4 x float>, <4 x float>, <4 x float> } @dx.op.worldToObject(i32)
+declare float @dx.op.rayTCurrent(i32)
+declare i32 @dx.op.hitKind(i32)
+declare i32 @dx.op.instanceID(i32)
+declare i32 @dx.op.primitiveID(i32)
+declare <2 x float> @dx.op.barycentrics(i32)
+declare { float, float } @dx.op.barycentrics2(i32)
+declare <3 x float> @dx.op.objectRayOrigin(i32)
+declare { float, float, float } @dx.op.objectRayDirection(i32)
+declare ptr @ray.payloadPointer()
+declare ptr @ray.getPayload()
+declare float @ray.loadPayloadField(i32)
+declare void @ray.storePayloadField(i32, ...)
+declare void @ray.storePayloadStruct(i32, ...)
+"#;
+        let bitcode = llvm_assemble_ir(ir).expect("assemble full ray fixture");
+        let msl = translate_llvm_ray_program(&bitcode, "raygen").expect("lower full ray fixture");
+        for expected in [
+            "dim.f0 = int(dispatch_info[0]);",
+            "dim.f1 = int(dispatch_info[1]);",
+            "dim.f2 = int(dispatch_info[2]);",
+            "dimv = int3(int(dispatch_info[0]), int(dispatch_info[1]), int(dispatch_info[2]));",
+            "idx3 = int3(int(dispatch_info[0]), int(dispatch_info[1]), int(dispatch_info[2]));",
+            "o2w = float3x4(transpose(__object_to_world)[0], transpose(__object_to_world)[1], transpose(__object_to_world)[2]);",
+            "o2wg.f2 = transpose(__object_to_world)[2];",
+            "w2o = float3x4(transpose(__world_to_object)[0], transpose(__world_to_object)[1], transpose(__world_to_object)[2]);",
+            "w2og.f1 = transpose(__world_to_object)[1];",
+            "t = (float)(__hit_distance);",
+            "k = (int)(__hit_kind);",
+            "inst = (int)(__hit_instance);",
+            "prim = (int)(__hit_primitive);",
+            "b = float2(__barycentrics.x, __barycentrics.y);",
+            "ba.f0 = __barycentrics.x;",
+            "oo = float3(__object_origin.x, __object_origin.y, __object_origin.z);",
+            "od.f1 = __object_direction.y;",
+            "results[gid].payload[0] = uint(dx);",
+            "results[gid].payload[1] = as_type<uint>(t);",
+            "results[gid].payload[2] = uint(k);",
+            "p = (device uint*)results[gid].payload;",
+            "uint(77);",
+            "v = as_type<int>(*((device uint*)results[gid].payload + (5)));",
+            "*((device uint*)results[gid].payload + (6)) = uint(88);",
+            "vf = as_type<float>(results[gid].payload[6]);",
+            "vi = as_type<int>(results[gid].payload[6]);",
+            "instance_transforms [[buffer(5)]]",
+            "dispatch_info [[buffer(6)]]",
+            "float4x4 __object_to_world",
+            "float4x4 __world_to_object",
+        ] {
+            assert_eq!(msl.contains(expected), true, "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn t_llvm_ray_trace_control_candidate_and_shader_record_intrinsics_lower() {
+        let ir = r#"define void @raygen(i32 %idx) {
+entry:
+  %h = call ptr @dx.op.getShaderRecordBufferHandle(i32 0)
+  %hp = getelementptr i32, ptr %h, i32 1
+  %local = load i32, ptr %hp
+  %flags = call i32 @dx.op.rayFlags(i32 1)
+  %tmax = call float @dx.op.rayTMax(i32 2)
+  %geom = call i32 @dx.op.rayGeometryIndex(i32 3)
+  %ctype = call i32 @dx.op.candidateType(i32 4)
+  %cinst = call i32 @dx.op.candidateInstanceID(i32 5)
+  %cprim = call i32 @dx.op.candidatePrimitiveID(i32 6)
+  %cgeom = call i32 @dx.op.candidateGeometryIndex(i32 7)
+  %corigin = call <3 x float> @dx.op.candidateObjectRayOrigin(i32 8)
+  %cdir = call <3 x float> @dx.op.candidateObjectRayDirection(i32 9)
+  %c2w = call [3 x <4 x float>] @dx.op.candidateObjectToWorld3x4(i32 10)
+  %w2c = call [3 x <4 x float>] @dx.op.candidateWorldToObject3x4(i32 11)
+  %attr = call float @dx.op.attributeAtVertex(i32 12, i32 1, i32 2)
+  call void @dx.op.traceRay(i32 13, ptr null, i32 3, i32 -1, i32 0, i32 1, i32 0, float 0.0, float 0.0, float -1.0, float 0.0, float 0.0, float 0.0, float 1.0, float 100.0, i32 0)
+  call void @dx.op.callShader(i32 14, i32 5, i32 0)
+  %hit = call i1 @dx.op.reportHit(i32 15, float 2.5, i32 1065353216, i32 0, ptr null)
+  call void @dx.op.acceptHitAndEndSearch(i32 16)
+  call void @dx.op.ignoreHit(i32 17)
+  call void @ray.storePayloadField(i32 0, i32 %local)
+  call void @ray.storePayloadField(i32 1, i32 %flags)
+  call void @ray.storePayloadField(i32 2, float %tmax)
+  call void @ray.storePayloadField(i32 3, i32 %geom)
+  call void @ray.storePayloadField(i32 4, i32 %ctype)
+  call void @ray.storePayloadField(i32 5, i32 %cinst)
+  call void @ray.storePayloadField(i32 6, i32 %cprim)
+  call void @ray.storePayloadField(i32 7, i32 %cgeom)
+  call void @ray.storePayloadField(i32 0, float %attr)
+  ret void
+}
+declare ptr @dx.op.getShaderRecordBufferHandle(i32)
+declare i32 @dx.op.rayFlags(i32)
+declare float @dx.op.rayTMax(i32)
+declare i32 @dx.op.rayGeometryIndex(i32)
+declare i32 @dx.op.candidateType(i32)
+declare i32 @dx.op.candidateInstanceID(i32)
+declare i32 @dx.op.candidatePrimitiveID(i32)
+declare i32 @dx.op.candidateGeometryIndex(i32)
+declare <3 x float> @dx.op.candidateObjectRayOrigin(i32)
+declare <3 x float> @dx.op.candidateObjectRayDirection(i32)
+declare [3 x <4 x float>] @dx.op.candidateObjectToWorld3x4(i32)
+declare [3 x <4 x float>] @dx.op.candidateWorldToObject3x4(i32)
+declare float @dx.op.attributeAtVertex(i32, i32, i32)
+declare void @dx.op.traceRay(i32, ptr, i32, i32, i32, i32, i32, float, float, float, float, float, float, float, float, i32)
+declare void @dx.op.callShader(i32, i32, i32)
+declare i1 @dx.op.reportHit(i32, float, i32, i32, ptr)
+declare void @dx.op.acceptHitAndEndSearch(i32)
+declare void @dx.op.ignoreHit(i32)
+declare void @ray.storePayloadField(i32, ...)
+"#;
+        let bitcode = llvm_assemble_ir(ir).expect("assemble control/candidate IR");
+        let msl =
+            translate_llvm_ray_program(&bitcode, "raygen").expect("lower control/candidate IR");
+        for expected in [
+            "h = __sbt_local_root;",
+            "local = __sbt_local_root[1];",
+            "__ray_flags = uint(3);",
+            "__ray_tmax = min(float(1.000000e+02), rays[gid].max_distance);",
+            "intersector<triangle_data, instancing> __trace_query;",
+            "__trace_query.intersect(__trace_ray, accel, uint(-1) & rays[gid].mask);",
+            "msl_miss(results[gid], __trace_group, __miss_input,",
+            "msl_closest_hit(results[gid], __trace_group, __trace_input,",
+            "msl_callable(results[gid], sbt[uint(5) + max(rays[gid].sbt_offset, uint(gid))], __call_input,",
+            "__hit_distance = float(2.500000e+00);",
+            "__accepted = 1u; __end_search = 1u;",
+            "__accepted = 0u; __ignored = 1u;",
+            "flags = (int)(__ray_flags);",
+            "tmax = (float)(__ray_tmax);",
+            "geom = (int)(__ray_geometry_index);",
+            "ctype = (int)(__candidate_type);",
+            "cinst = (int)(__candidate_instance);",
+            "cprim = (int)(__candidate_primitive);",
+            "cgeom = (int)(__candidate_geometry);",
+            "corigin = float3(__candidate_object_origin.x, __candidate_object_origin.y, __candidate_object_origin.z);",
+            "cdir = float3(__candidate_object_direction.x, __candidate_object_direction.y, __candidate_object_direction.z);",
+            "c2w = float3x4(transpose(__candidate_object_to_world)[0], transpose(__candidate_object_to_world)[1], transpose(__candidate_object_to_world)[2]);",
+            "w2c = float3x4(transpose(__candidate_world_to_object)[0], transpose(__candidate_world_to_object)[1], transpose(__candidate_world_to_object)[2]);",
+            "uint __slot = __ioff + __hit_primitive * 3u + uint(2);",
+            "__sbt_local_root",
+            "dispatch_info[4]",
+        ] {
+            assert_eq!(msl.contains(expected), true, "missing {expected}");
+        }
+        let error = lower_llvm_ir_ray_body(
+            "define void @raygen() {\nentry:\n %x = call float @dx.op.attributeAtVertex(i32 0, i32 1)\n ret void\n}\n",
+            "raygen",
+        )
+        .expect_err("missing vertex argument");
+        assert_eq!(
+            error.message,
+            "dx.op.attributeAtVertex is missing argument 2"
+        );
+    }
+
+    #[test]
+    fn t_llvm_ray_stages_compile_from_own_bitcode_and_select_sbt_functions() {
+        let stages = [
+            (ShaderStage::ClosestHit, "msl_closest_hit", false),
+            (ShaderStage::AnyHit, "msl_any_hit", true),
+            (ShaderStage::Miss, "msl_miss", false),
+            (ShaderStage::Intersection, "msl_intersection", true),
+            (ShaderStage::Callable, "msl_callable", false),
+        ];
+        for (stage, function_name, boolean) in stages {
+            let ir = r#"define void @entry() {
+entry:
+  %h = call ptr @dx.op.getShaderRecordBufferHandle(i32 0)
+  %p = getelementptr i32, ptr %h, i32 0
+  %v = load i32, ptr %p
+  %t = call float @dx.op.rayTMax(i32 1)
+  %g = call i32 @dx.op.rayGeometryIndex(i32 2)
+  %ct = call i32 @dx.op.candidateType(i32 3)
+  %ci = call i32 @dx.op.candidateInstanceID(i32 4)
+  %cp = call i32 @dx.op.candidatePrimitiveID(i32 5)
+  %cg = call i32 @dx.op.candidateGeometryIndex(i32 6)
+  %a = call float @dx.op.attributeAtVertex(i32 7, i32 0, i32 0)
+  %r = call i1 @dx.op.reportHit(i32 8, float 1.0, i32 0, i32 0, ptr null)
+  call void @dx.op.acceptHitAndEndSearch(i32 9)
+  call void @ray.storePayloadField(i32 0, i32 %v)
+  call void @ray.storePayloadField(i32 1, float %t)
+  call void @ray.storePayloadField(i32 2, i32 %g)
+  call void @ray.storePayloadField(i32 3, i32 %ct)
+  call void @ray.storePayloadField(i32 4, i32 %ci)
+  call void @ray.storePayloadField(i32 5, i32 %cp)
+  call void @ray.storePayloadField(i32 6, i32 %cg)
+  call void @ray.storePayloadField(i32 7, float %a)
+  ret void
+}
+declare ptr @dx.op.getShaderRecordBufferHandle(i32)
+declare float @dx.op.rayTMax(i32)
+declare i32 @dx.op.rayGeometryIndex(i32)
+declare i32 @dx.op.candidateType(i32)
+declare i32 @dx.op.candidateInstanceID(i32)
+declare i32 @dx.op.candidatePrimitiveID(i32)
+declare i32 @dx.op.candidateGeometryIndex(i32)
+declare float @dx.op.attributeAtVertex(i32, i32, i32)
+declare i1 @dx.op.reportHit(i32, float, i32, i32, ptr)
+declare void @dx.op.acceptHitAndEndSearch(i32)
+declare void @ray.storePayloadField(i32, ...)
+"#;
+            let bitcode = llvm_assemble_ir(ir).expect("assemble stage IR");
+            let source = translate_llvm_ray_stage_program(&bitcode, stage, "entry")
+                .expect("translate stage");
+            assert_eq!(
+                source.contains(&format!("{function_name}(")),
+                true,
+                "missing {function_name}"
+            );
+            assert_eq!(source.contains("h = __sbt_local_root;"), true);
+            assert_eq!(source.contains("t = (float)(__ray_tmax);"), true);
+            assert_eq!(source.contains("g = (int)(__ray_geometry_index);"), true);
+            assert_eq!(source.contains("ct = (int)(__candidate_type);"), true);
+            assert_eq!(source.contains("ci = (int)(__candidate_instance);"), true);
+            assert_eq!(source.contains("cp = (int)(__candidate_primitive);"), true);
+            assert_eq!(source.contains("cg = (int)(__candidate_geometry);"), true);
+            assert_eq!(
+                source.contains("uint __slot = __ioff + __hit_primitive * 3u + uint(0);"),
+                true
+            );
+            assert_eq!(
+                source.contains("__hit_distance = float(1.000000e+00);"),
+                true
+            );
+            assert_eq!(source.contains("__accepted = 1u; __end_search = 1u;"), true);
+            if boolean {
+                assert_eq!(source.contains("return __accepted != 0u;"), true);
+            }
+            if matches!(stage, ShaderStage::ClosestHit) {
+                let raygen =
+                    translate_llvm_ray_stage_program(&bitcode, ShaderStage::RayGeneration, "entry")
+                        .expect("raygen delegation");
+                assert_eq!(raygen.contains("kernel void entry"), true);
+            }
+        }
+        let error = translate_llvm_ray_stage_program(b"BC\xc0\xde", ShaderStage::Vs, "entry")
+            .expect_err("non-ray stage");
+        assert_eq!(error.message, "vs is not a ray shader stage");
+    }
+
+    #[test]
+    fn t_llvm_ray_intrinsic_malformed_shapes_and_payload_errors_are_exact() {
+        let cases = [
+            (
+                "define void @raygen() {\nentry:\n %p = call ptr @other()\n ret void\n}\n",
+                "unsupported LLVM pointer return from @other",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = extractelement i32 1, i32 0\n ret void\n}\n",
+                "extractelement requires a vector type, got i32",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = extractelement <2 x float> 1\n ret void\n}\n",
+                "extractelement without index",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = call [2 x i32] @foo()\n ret void\n}\n",
+                "unsupported LLVM array type [2 x i32]",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %d = call { i32, i32 } @dx.op.dispatchRaysDimensions(i32 143)\n ret void\n}\n",
+                "dx.op.dispatchRaysDimensions returned 2 fields but 3 values are available",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %d = call i32 @dx.op.dispatchRaysDimensions(i32 143)\n ret void\n}\n",
+                "dx.op.dispatchRaysDimensions returned a 1-component value but 3 values are available",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %d = call <2 x i32> @dx.op.dispatchRaysIndex(i32 0)\n ret void\n}\n",
+                "dx.op.dispatchRaysIndex returned a 2-component value in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %m = call { <4 x float>, <4 x float> } @dx.op.objectToWorld(i32 144)\n ret void\n}\n",
+                "dx.op.objectToWorld returned an unsupported matrix shape in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %m = call { <4 x float>, <4 x float> } @dx.op.worldToObject(i32 146)\n ret void\n}\n",
+                "dx.op.worldToObject returned an unsupported matrix shape in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %b = call <3 x float> @dx.op.barycentrics(i32 153)\n ret void\n}\n",
+                "dx.op.barycentrics must return two components in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %o = call <2 x float> @dx.op.objectRayOrigin(i32 154)\n ret void\n}\n",
+                "dx.op.objectRayOrigin must return three components in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %d = call <2 x float> @dx.op.objectRayDirection(i32 155)\n ret void\n}\n",
+                "dx.op.objectRayDirection must return three components in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %x = call double @ray.loadPayloadField(i32 0)\n ret void\n}\n",
+                "ray.loadPayloadField returned unsupported type double",
+            ),
+            (
+                "define void @raygen() {\nentry:\n call void @ray.storePayloadField()\n ret void\n}\n",
+                "ray.storePayloadField is missing argument 0",
+            ),
+            (
+                "define void @raygen() {\nentry:\n call void @ray.storePayloadField(i32 0)\n ret void\n}\n",
+                "ray.storePayloadField is missing argument 1",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %p = call ptr @ray.payloadPointer()\n %f = getelementptr i32, ptr %p, i32 1\n %g = getelementptr i32, ptr %f, i32 1\n ret void\n}\n",
+                "getelementptr on payload pointer %f has no scalar element type",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %p = call ptr @ray.payloadPointer()\n %f = getelementptr i32, ptr %p, i32 1\n %v = load double, ptr %f\n ret void\n}\n",
+                "payload load has unsupported type double",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %t = call <2 x i32> @dx.op.rayTCurrent(i32 149)\n ret void\n}\n",
+                "ray intrinsic result <2 x i32> is not a scalar",
+            ),
+            (
+                "define void @raygen() {\nentry:\n call void @dx.op.traceRay(i32 0, ptr null, i32 1)\n ret void\n}\n",
+                "dx.op.traceRay is missing argument 3",
+            ),
+            (
+                "define void @raygen() {\nentry:\n call void @dx.op.callShader(i32 0)\n ret void\n}\n",
+                "dx.op.callShader is missing argument 1",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %r = call i1 @dx.op.reportHit(i32 0, float 1.0, i32 0)\n ret void\n}\n",
+                "dx.op.reportHit is missing argument 3",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %c = call <2 x float> @dx.op.candidateObjectRayOrigin(i32 0)\n ret void\n}\n",
+                "dx.op.candidateObjectRayOrigin must return three components in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %c = call { <4 x float>, <4 x float> } @dx.op.candidateObjectToWorld3x4(i32 0)\n ret void\n}\n",
+                "dx.op.candidateObjectToWorld3x4 returned an unsupported matrix shape in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %c = call { <4 x float>, <4 x float> } @dx.op.candidateWorldToObject3x4(i32 0)\n ret void\n}\n",
+                "dx.op.candidateWorldToObject3x4 returned an unsupported matrix shape in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %a = call <2 x float> @dx.op.candidateObjectRayDirection(i32 0)\n ret void\n}\n",
+                "dx.op.candidateObjectRayDirection must return three components in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %a = call <4 x float> @dx.op.candidateObjectRayOrigin(i32 0)\n ret void\n}\n",
+                "dx.op.candidateObjectRayOrigin must return three components in @raygen",
+            ),
+            (
+                "define void @raygen() {\nentry:\n %a = call <8 x float> @dx.op.candidateObjectRayOrigin(i32 0)\n ret void\n}\n",
+                "unsupported ray intrinsic result type float8",
+            ),
+        ];
+        assert_eq!(llvm_type_to_msl("[4 x <4 x float>]").unwrap(), "float4x4");
+        assert_eq!(
+            llvm_type_to_msl("[2 x <4 x float>]").unwrap_err().message,
+            "unsupported LLVM array type [2 x <4 x float>]"
+        );
+        for (ir, message) in cases {
+            let error = lower_llvm_ir_ray_body(ir, "raygen").expect_err("malformed ray intrinsic");
+            assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+            assert_eq!(error.message, message);
+        }
     }
 }

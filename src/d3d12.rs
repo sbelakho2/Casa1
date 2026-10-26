@@ -105,6 +105,26 @@ pub struct D3D12RaytracingPipelineState {
     /// Entry point exported for the translated ray-generation shader.
     #[serde(default)]
     pub ray_entry: Option<String>,
+    /// Per-export ray stage artifacts translated from that stage's own DXIL.
+    ///
+    /// D3D12 selects these through the SBT shader identifier; each entry is a
+    /// complete MSL module for the stage so hit, miss, callable and
+    /// intersection programs are compiled independently of the raygen body.
+    #[serde(default)]
+    pub ray_stages: BTreeMap<String, D3D12RayShaderArtifact>,
+}
+
+/// One compiled ray-stage artifact retained on a raytracing PSO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct D3D12RayShaderArtifact {
+    /// D3D12 stage name recorded by the DXIL metadata.
+    pub stage: String,
+    /// Entry point lowered from the stage bitcode.
+    pub entry: String,
+    /// Translated MSL source for this stage.
+    pub source: String,
+    /// Stable per-state-object index encoded into SBT records.
+    pub function_index: u32,
 }
 
 /// An acceleration structure managed through the D3D12 bridge.
@@ -324,6 +344,11 @@ struct D3d12NativeCommandState {
 struct D3d12MetalStructure {
     structure: metal::AccelerationStructure,
     instance_masks: Vec<u32>,
+    /// D3D12 row-major 3x4 object-to-world rows for each TLAS instance. BLAS
+    /// structures keep this empty.
+    instance_transforms: Vec<[f32; 12]>,
+    /// Flattened vertex/index/AABB data for a BLAS or TLAS.
+    geometry: crate::metal_backend::MetalRayGeometryData,
 }
 
 struct D3d12MetalRayTracingInner {
@@ -2969,6 +2994,8 @@ impl D3d12Runtime {
             }
             let mut metal_instances = Vec::with_capacity(desc.inputs.num_descs as usize);
             let mut instance_masks = Vec::with_capacity(desc.inputs.num_descs as usize);
+            let mut instance_transforms = Vec::with_capacity(desc.inputs.num_descs as usize);
+            let mut instance_geometry = Vec::with_capacity(desc.inputs.num_descs as usize);
             let mut instanced_handles = Vec::new();
             for address in &referenced {
                 let handle = inner.guest_to_handle.get(address).copied().ok_or_else(|| {
@@ -2992,19 +3019,23 @@ impl D3d12Runtime {
                         "top-level acceleration structure instance has a zero AccelerationStructure address",
                     ));
                 }
+                instance_geometry.push(address);
                 let structure_index = referenced
                     .iter()
                     .position(|candidate| *candidate == address)
                     .expect("referenced address was resolved");
                 let mut instance = metal::MTLAccelerationStructureInstanceDescriptor::default();
+                let mut transform_rows = [0.0f32; 12];
                 for row in 0..3 {
                     for column in 0..4 {
                         let source = offset + (row * 4 + column) * 4;
-                        instance.transformation_matrix[column][row] = f32::from_le_bytes(
+                        let value = f32::from_le_bytes(
                             instance_bytes[source..source + 4]
                                 .try_into()
                                 .expect("4-byte transform element"),
                         );
+                        instance.transformation_matrix[column][row] = value;
+                        transform_rows[row * 4 + column] = value;
                     }
                 }
                 let identity = [
@@ -3015,6 +3046,7 @@ impl D3d12Runtime {
                 ];
                 if instance.transformation_matrix == [[0.0f32; 3]; 4] {
                     instance.transformation_matrix = identity;
+                    transform_rows = crate::metal_backend::RAY_INSTANCE_IDENTITY_ROWS;
                 }
                 let id_and_mask = u32::from_le_bytes(
                     instance_bytes[offset + 48..offset + 52]
@@ -3049,6 +3081,7 @@ impl D3d12Runtime {
                 instance.intersection_function_table_offset = 0;
                 instance.acceleration_structure_index = structure_index as u32;
                 instance_masks.push(instance.mask);
+                instance_transforms.push(transform_rows);
                 metal_instances.push(instance);
             }
             let instance_bytes: &[u8] = unsafe {
@@ -3125,12 +3158,46 @@ impl D3d12Runtime {
             } else {
                 (tlas.acceleration_structure, tlas.size as u64)
             };
+            let mut tlas_geometry = crate::metal_backend::MetalRayGeometryData::default();
+            for (instance_index, address) in instance_geometry.iter().enumerate() {
+                let blas_handle = inner.guest_to_handle[address];
+                let Some(blas) = inner.structures.get(&blas_handle) else {
+                    continue; // coverage: unreachable — TLAS only references mapped BLAS
+                };
+                if let Some(binding) = blas.geometry.bindings.first() {
+                    let vertex_offset = tlas_geometry.vertices.len() as u32;
+                    let index_offset = tlas_geometry.indices.len() as u32;
+                    tlas_geometry
+                        .vertices
+                        .extend_from_slice(&blas.geometry.vertices);
+                    tlas_geometry.indices.extend_from_slice(&blas.geometry.indices);
+                    tlas_geometry.bindings.push(
+                        crate::metal_backend::MetalRayGeometryBinding {
+                            vertex_offset,
+                            index_offset,
+                            triangle_count: binding.triangle_count,
+                            reserved: 0,
+                        },
+                    );
+                } else {
+                    tlas_geometry
+                        .bindings
+                        .push(crate::metal_backend::MetalRayGeometryBinding::default());
+                }
+                for aabb in &blas.geometry.aabbs {
+                    let mut candidate = *aabb;
+                    candidate.instance_id = instance_index as u32;
+                    tlas_geometry.aabbs.push(candidate);
+                }
+            }
             let handle = alloc_d3d12_metal_handle();
             inner.structures.insert(
                 handle,
                 D3d12MetalStructure {
                     structure,
                     instance_masks,
+                    instance_transforms,
+                    geometry: tlas_geometry,
                 },
             );
             inner.guest_to_handle.insert(desc.dest_address, handle);
@@ -3154,6 +3221,7 @@ impl D3d12Runtime {
             }
             let mut metal_geometries = Vec::new();
             let mut metal_buffers = Vec::new();
+            let mut blas_geometry = crate::metal_backend::MetalRayGeometryData::default();
             for (index, geometry) in desc.inputs.geometries.iter().enumerate() {
                 if geometry.flags & !(GEOMETRY_FLAG_OPAQUE | GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT) != 0
                 {
@@ -3247,6 +3315,12 @@ impl D3d12Runtime {
                                 ),
                             ));
                         }
+                        blas_geometry.vertices = Self::raytracing_vertex_attributes(
+                            geometry.vertex_format,
+                            geometry.vertex_stride,
+                            &vertex_bytes,
+                            geometry.vertex_count,
+                        );
                         let vertex_buffer = inner.device.new_buffer_with_data(
                             vertex_bytes.as_ptr() as *const std::ffi::c_void,
                             vertex_required,
@@ -3268,6 +3342,11 @@ impl D3d12Runtime {
                                     ),
                                 ));
                             }
+                            blas_geometry.indices = Self::raytracing_indices(
+                                geometry.index_format,
+                                &index_bytes,
+                                geometry.index_count,
+                            );
                             let buffer = inner.device.new_buffer_with_data(
                                 index_bytes.as_ptr() as *const std::ffi::c_void,
                                 index_required,
@@ -3275,6 +3354,7 @@ impl D3d12Runtime {
                             );
                             (Some((buffer, index_required)), index_required)
                         } else {
+                            blas_geometry.indices = (0..geometry.vertex_count).collect();
                             (None, 0)
                         };
                         let _ = index_required;
@@ -3298,6 +3378,19 @@ impl D3d12Runtime {
                             opaque: geometry.flags & GEOMETRY_FLAG_OPAQUE != 0,
                             allow_duplicates: false,
                         });
+                        let triangle_count = if indexed {
+                            geometry.index_count / 3
+                        } else {
+                            geometry.vertex_count / 3
+                        };
+                        blas_geometry.bindings.push(
+                            crate::metal_backend::MetalRayGeometryBinding {
+                                vertex_offset: 0,
+                                index_offset: 0,
+                                triangle_count,
+                                reserved: 0,
+                            },
+                        );
                         metal_buffers.push((vertex_buffer, index_buffer));
                     }
                     1 => {
@@ -3340,6 +3433,11 @@ impl D3d12Runtime {
                                 ),
                             ));
                         }
+                        blas_geometry.aabbs = Self::raytracing_aabbs(
+                            &bytes,
+                            geometry.vertex_stride,
+                            geometry.vertex_count,
+                        );
                         let buffer = inner.device.new_buffer_with_data(
                             bytes.as_ptr() as *const std::ffi::c_void,
                             required,
@@ -3428,6 +3526,8 @@ impl D3d12Runtime {
                 D3d12MetalStructure {
                     structure,
                     instance_masks: vec![0xFFFF_FFFF],
+                    instance_transforms: Vec::new(),
+                    geometry: blas_geometry,
                 },
             );
             inner.guest_to_handle.insert(desc.dest_address, handle);
@@ -3490,6 +3590,106 @@ impl D3d12Runtime {
                 format!("geometry {index} vertex format {other} is not supported for raytracing"),
             )),
         }
+    }
+
+    fn half_to_f32(bits: u16) -> f32 {
+        let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exponent = (bits >> 10) & 0x1F;
+        let mantissa = (bits & 0x03FF) as f32;
+        if exponent == 0 {
+            sign * mantissa * 2.0f32.powi(-24)
+        } else if exponent == 0x1F {
+            if mantissa == 0.0 {
+                sign * f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        } else {
+            sign * (1.0 + mantissa / 1024.0) * 2.0f32.powi(exponent as i32 - 15)
+        }
+    }
+
+    fn raytracing_vertex_attributes(
+        format: u32,
+        stride: u32,
+        bytes: &[u8],
+        count: u32,
+    ) -> Vec<[f32; 4]> {
+        let mut vertices = Vec::with_capacity(count as usize);
+        for vertex in 0..count as usize {
+            let base = vertex * stride as usize;
+            let mut attributes = [0.0f32; 4];
+            match format {
+                6 | 71 | 80 => {
+                    for (component, slot) in attributes.iter_mut().take(3).enumerate() {
+                        let offset = base + component * 4;
+                        *slot = f32::from_le_bytes(
+                            bytes[offset..offset + 4].try_into().expect("vertex float"),
+                        );
+                    }
+                }
+                17 => {
+                    for (component, slot) in attributes.iter_mut().take(2).enumerate() {
+                        let offset = base + component * 4;
+                        *slot = f32::from_le_bytes(
+                            bytes[offset..offset + 4].try_into().expect("vertex float2"),
+                        );
+                    }
+                }
+                35 => {
+                    for (component, slot) in attributes.iter_mut().take(3).enumerate() {
+                        let offset = base + component * 2;
+                        let raw = u16::from_le_bytes(
+                            bytes[offset..offset + 2].try_into().expect("vertex half"),
+                        );
+                        *slot = Self::half_to_f32(raw);
+                    }
+                }
+                _ => {} // coverage: unreachable — callers validate the vertex format
+            }
+            attributes[3] = 1.0;
+            vertices.push(attributes);
+        }
+        vertices
+    }
+
+    fn raytracing_indices(format: u32, bytes: &[u8], count: u32) -> Vec<u32> {
+        let mut indices = Vec::with_capacity(count as usize);
+        for index in 0..count as usize {
+            indices.push(if format == 57 {
+                let offset = index * 2;
+                u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("u16 index")) as u32
+            } else {
+                let offset = index * 4;
+                u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("u32 index"))
+            });
+        }
+        indices
+    }
+
+    fn raytracing_aabbs(
+        bytes: &[u8],
+        stride: u32,
+        count: u32,
+    ) -> Vec<crate::metal_backend::MetalRayAabb> {
+        let mut aabbs = Vec::with_capacity(count as usize);
+        for index in 0..count as usize {
+            let base = index * stride as usize;
+            let mut bounds = [0.0f32; 6];
+            for (component, slot) in bounds.iter_mut().enumerate() {
+                let offset = base + component * 4;
+                *slot = f32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("AABB"));
+            }
+            aabbs.push(crate::metal_backend::MetalRayAabb {
+                min: [bounds[0], bounds[1], bounds[2]],
+                max: [bounds[3], bounds[4], bounds[5]],
+                instance_id: 0,
+                geometry_index: 0,
+                group: 0,
+                reserved: 0,
+            });
+        }
+        aabbs
     }
 
     fn dxgi_raytracing_index_format(
@@ -3661,6 +3861,7 @@ impl D3d12Runtime {
             attribute_size,
             ray_msl,
             ray_entry,
+            ray_stages: BTreeMap::new(),
         };
         self.raytracing_pipeline_states
             .insert(state_object_ptr, pso);
@@ -3891,7 +4092,32 @@ impl D3d12Runtime {
                 .structures
                 .get(&tlas.metal_accel_handle)
                 .expect("bound top-level acceleration structure has a Metal object");
-            let payloads = crate::metal_backend::execute_ray_shader_program(&inner.device, &inner.queue, program, structure.structure.as_ref(), &rays, &table)?;
+            let mut geometry = structure.geometry.clone();
+            if let Some(intersection) = pso
+                .ray_stages
+                .values()
+                .find(|artifact| artifact.stage == "intersection")
+            {
+                for aabb in &mut geometry.aabbs {
+                    aabb.group = intersection.function_index;
+                }
+            }
+            let execution = crate::metal_backend::execute_ray_shader_program_with_geometry(
+                &inner.device,
+                &inner.queue,
+                program,
+                structure.structure.as_ref(),
+                &rays,
+                &table,
+                crate::metal_backend::MetalRayDispatchInfo {
+                    width: desc.width,
+                    height: desc.height,
+                    depth: desc.depth,
+                },
+                &structure.instance_transforms,
+                &geometry,
+            );
+            let payloads = execution?;
             inner.last_ray_payloads = payloads;
             drop(inner);
             return self.backend.record_dispatch_rays(
@@ -4666,6 +4892,171 @@ impl D3d12Runtime {
         Ok((Some(source.to_string()), Some(entry.to_string())))
     }
 
+    /// Locate a top-level MSL function by name, including its body.
+    #[rustfmt::skip]
+    fn msl_function_span(source: &str, name: &str) -> Option<(usize, usize)> {
+        let spaced = format!(" {name}(");
+        let lined = format!("\n{name}(");
+        let at = source
+            .find(&spaced)
+            .map(|index| index + 1)
+            .or_else(|| source.find(&lined).map(|index| index + 1))?;
+        let start = source[..at].rfind('\n').map(|index| index + 1).unwrap_or(0);
+        let open = source[at..].find('{').map(|index| at + index)?;
+        let mut depth = 0usize;
+        for (offset, character) in source[open..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((start, open + offset + 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None // coverage: unreachable — translated MSL functions have balanced braces
+    }
+
+    /// Replace default SBT helpers in the raygen module with the functions
+    /// compiled from each stage's own bitcode.
+    #[rustfmt::skip]
+    fn combine_ray_stages(
+        raygen: &str,
+        stages: &BTreeMap<String, D3D12RayShaderArtifact>,
+    ) -> String {
+        let mut combined = raygen.to_string();
+        let mut definitions = String::new();
+        let mut by_function: BTreeMap<&str, Vec<&D3D12RayShaderArtifact>> = BTreeMap::new();
+        for artifact in stages.values() {
+            let function = match artifact.stage.as_str() {
+                "closesthit" => "msl_closest_hit",
+                "anyhit" => "msl_any_hit",
+                "miss" => "msl_miss",
+                "callable" => "msl_callable",
+                "intersection" => "msl_intersection",
+                _ => continue,
+            };
+            by_function.entry(function).or_default().push(artifact);
+        }
+        for (function, mut artifacts) in by_function {
+            artifacts.sort_by_key(|artifact| artifact.function_index);
+            if let Some((start, end)) = Self::msl_function_span(&combined, function) {
+                combined.replace_range(start..end, "");
+            }
+            let boolean = matches!(function, "msl_any_hit" | "msl_intersection");
+            let mut cases = String::new();
+            for artifact in &artifacts {
+                let Some((start, end)) = Self::msl_function_span(&artifact.source, function) else {
+                    continue; // coverage: unreachable — each artifact carries its stage function
+                };
+                let renamed = format!("{function}_{}", artifact.function_index);
+                let compiled = artifact.source[start..end].replacen(
+                    &format!("{function}("),
+                    &format!("{renamed}("),
+                    1,
+                );
+                definitions.push('\n');
+                definitions.push_str(&compiled);
+                definitions.push('\n');
+                if boolean {
+                    cases.push_str(&format!(
+                        "        case {}u: {{ return {renamed}(payload, group, input, accel, rays, sbt, instance_transforms, dispatch_info, __sbt_local_root, __sbt_stride, vertex_attributes, triangle_indices, geometry_bindings, aabbs); }}\n",
+                        artifact.function_index
+                    ));
+                } else {
+                    cases.push_str(&format!(
+                        "        case {}u: {{ {renamed}(payload, group, input, accel, rays, sbt, instance_transforms, dispatch_info, __sbt_local_root, __sbt_stride, vertex_attributes, triangle_indices, geometry_bindings, aabbs); break; }}\n",
+                        artifact.function_index
+                    ));
+                }
+            }
+            let return_type = if boolean { "bool" } else { "void" };
+            let default_return = if boolean { "return false;" } else { "return;" };
+            definitions.push_str(&format!(
+                "\n{return_type} {function}(device RayPayloadResult& payload, uint group, thread const RayStageInput& input, instance_acceleration_structure accel, device const RayRecord* rays, device const uint* sbt, device const float4* instance_transforms, device const uint* dispatch_info, device const uint* __sbt_local_root, uint __sbt_stride, device const float4* vertex_attributes, device const uint* triangle_indices, device const uint* geometry_bindings, device const MetalRayAabb* aabbs) {{\n    switch (group) {{\n{cases}    }}\n    {default_return}\n}}\n"
+            ));
+        }
+        let kernel = combined.find("kernel void ").unwrap_or(combined.len());
+        combined.insert_str(kernel, &definitions);
+        combined
+    }
+
+    #[rustfmt::skip]
+    fn translate_ray_stage_artifact(
+        dxil: &[u8],
+        stage: crate::shader::ShaderStage,
+        entry: &str,
+        function_index: u32,
+    ) -> AppResult<D3D12RayShaderArtifact> {
+        let output = crate::shader::translate_ray_shader(dxil, stage, entry)?;
+        let source = crate::shader::msl_source_from_library_bytes(&output.mtl_library_bytes)?;
+        Ok(D3D12RayShaderArtifact {
+            stage: stage.as_str().to_string(),
+            entry: entry.to_string(),
+            source: source.to_string(),
+            function_index,
+        })
+    }
+
+    /// Translate every DXIL library export that declares a ray stage.
+    ///
+    /// Each stage is lowered from its own bitcode, not from the raygen body.
+    #[rustfmt::skip]
+    fn translate_ray_stage_artifacts(
+        object: &D3d12StateObject,
+    ) -> AppResult<BTreeMap<String, D3D12RayShaderArtifact>> {
+        let mut stages = BTreeMap::new();
+        for subobject in &object.subobjects {
+            let D3d12StateSubobject::DxilLibrary(library) = subobject else {
+                continue;
+            };
+            let Some(stage) = crate::shader::ray_shader_stage(&library.bytecode) else {
+                continue;
+            };
+            let defined = crate::shader::ray_entry_points(&library.bytecode)?;
+            let exports: Vec<String> = library
+                .exports
+                .iter()
+                .map(|export| {
+                    export
+                        .export_to_rename
+                        .clone()
+                        .unwrap_or_else(|| export.name.clone())
+                })
+                .collect();
+            let candidates: Vec<String> = if exports.is_empty() {
+                defined.clone()
+            } else {
+                exports.iter().chain(defined.iter()).cloned().collect()
+            };
+            let mut last_error = None;
+            let mut translated = false;
+            for entry in candidates {
+                match Self::translate_ray_stage_artifact(
+                    &library.bytecode,
+                    stage,
+                    &entry,
+                    stages.len() as u32,
+                ) {
+                    Ok(artifact) => {
+                        stages.insert(entry, artifact);
+                        translated = true;
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if !translated
+                && let Some(error) = last_error
+            {
+                return Err(error);
+            }
+        }
+        Ok(stages)
+    }
+
     pub fn set_pipeline_state1_state_object(
         &mut self,
         list: CommandListId,
@@ -4685,6 +5076,17 @@ impl D3d12Runtime {
         }
         let dxil = object.first_dxil().unwrap_or(&[]).to_vec();
         let (ray_msl, ray_entry) = Self::translate_ray_pipeline(&dxil)?;
+        let ray_stages = Self::translate_ray_stage_artifacts(&object)?;
+        let bitcode_raygen = !crate::shader::ray_entry_points(&dxil)
+            .unwrap_or_default()
+            .is_empty();
+        let ray_msl = ray_msl.map(|source| {
+            if bitcode_raygen {
+                Self::combine_ray_stages(&source, &ray_stages)
+            } else {
+                source
+            }
+        });
         let (max_recursion_depth, payload_size, attribute_size) =
             if let Some((depth, _flags)) = object.pipeline_config {
                 let (payload, attribute) = object.shader_config.unwrap_or((32, 8));
@@ -4701,6 +5103,7 @@ impl D3d12Runtime {
                 attribute_size,
                 ray_msl: ray_msl.clone(),
                 ray_entry: ray_entry.clone(),
+                ray_stages,
             },
         );
         self.pipeline_state_objects.insert(list, state_object_ptr);
@@ -11175,7 +11578,549 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
     }
 
     #[test]
+    fn d3d12_ray_state_object_compiles_each_stage_from_its_own_bitcode() {
+        let stages = [
+            ("raygeneration", "raygen", "kernel void raygen"),
+            ("closesthit", "chs_entry", "void msl_closest_hit"),
+            ("anyhit", "ahs_entry", "bool msl_any_hit"),
+            ("miss", "miss_entry", "void msl_miss"),
+            ("callable", "call_entry", "void msl_callable"),
+            ("intersection", "isect_entry", "bool msl_intersection"),
+        ];
+        let mut subobjects = Vec::new();
+        for (kind, entry, _) in stages {
+            let ir = format!(
+                "define void @{entry}() {{\nentry:\n  %c = call i32 @dx.op.candidateType(i32 0)\n  call void @ray.storePayloadField(i32 0, i32 %c)\n  ret void\n}}\ndeclare i32 @dx.op.candidateType(i32)\ndeclare void @ray.storePayloadField(i32, ...)\n"
+            );
+            let bitcode = crate::shader::llvm_assemble_ir(&ir).expect("stage bitcode");
+            let container = make_ray_llvm_container(&bitcode, kind);
+            subobjects.push(D3d12StateSubobject::DxilLibrary(
+                state_objects::D3d12DxilLibrary {
+                    bytecode: container,
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: entry.into(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                },
+            ));
+        }
+        let bare_ir = "define void @chs_bare() {\nentry:\n  ret void\n}\n";
+        let bare_bitcode = crate::shader::llvm_assemble_ir(bare_ir).expect("bare stage bitcode");
+        subobjects.push(D3d12StateSubobject::DxilLibrary(
+            state_objects::D3d12DxilLibrary {
+                bytecode: make_ray_llvm_container(&bare_bitcode, "closesthit"),
+                exports: Vec::new(),
+            },
+        ));
+        subobjects.push(D3d12StateSubobject::RaytracingPipelineConfig {
+            max_trace_recursion_depth: 1,
+        });
+        let desc = D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects,
+        };
+        let mut runtime = D3d12Runtime::new();
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let handle = runtime.create_state_object(desc.clone()).expect("RTSO");
+        runtime
+            .set_pipeline_state1_state_object(list, handle, desc)
+            .expect("bind RTSO");
+        let pso = runtime
+            .get_raytracing_pipeline_state(handle)
+            .expect("ray PSO");
+        assert_eq!(pso.ray_stages.len(), stages.len() + 1);
+        assert_eq!(pso.ray_stages["chs_bare"].stage, "closesthit",);
+        for (kind, entry, function) in stages {
+            let artifact = pso.ray_stages.get(entry).expect("stage artifact");
+            assert_eq!(artifact.stage, kind);
+            assert_eq!(artifact.entry, entry);
+            assert_eq!(
+                artifact.source.contains(function),
+                true,
+                "{kind} missing {function}"
+            );
+        }
+        assert_eq!(
+            pso.ray_stages["raygen"].source.contains("query.intersect"),
+            true
+        );
+        let combined = pso.ray_msl.as_deref().expect("combined raygen");
+        assert_eq!(combined.contains("float4(42.0"), false);
+        assert_eq!(combined.contains("group & 0x100u"), false);
+        assert_eq!(combined.contains("msl_closest_hit"), true);
+        assert_eq!(combined.contains("msl_intersection"), true);
+        let metal = crate::metal_backend::MetalDevice::system_default()
+            .expect("Metal device for combined raygen");
+        crate::metal_backend::create_ray_shader_program(metal.metal_device(), combined, "raygen")
+            .expect("combined raygen compiles");
+        assert_eq!(
+            pso.ray_stages["isect_entry"]
+                .source
+                .contains("msl_intersection"),
+            true
+        );
+    }
+
+    #[test]
+    fn d3d12_ray_stage_artifacts_reject_bad_bitcode_with_exact_error() {
+        let ir = "define void @other() {\nentry:\n  fence seq_cst\n  ret void\n}\n";
+        let bitcode = crate::shader::llvm_assemble_ir(ir).expect("bad stage bitcode");
+        let container = make_ray_llvm_container(&bitcode, "closesthit");
+        let desc = D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects: vec![
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: container,
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: "missing_entry".into(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                },
+            ],
+        };
+        let mut runtime = D3d12Runtime::new();
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let handle = runtime.create_state_object(desc.clone()).expect("bad RTSO");
+        let error = runtime
+            .set_pipeline_state1_state_object(list, handle, desc)
+            .expect_err("bad stage bitcode");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(error.message, "unsupported LLVM instruction fence");
+    }
+
+    fn ray_test_state_object(
+        runtime: &mut D3d12Runtime,
+        list: CommandListId,
+        stages: &[(&str, &str, &str)],
+    ) -> AppResult<u64> {
+        let mut subobjects = Vec::new();
+        for (kind, entry, ir) in stages {
+            let bitcode = crate::shader::llvm_assemble_ir(ir).expect("stage bitcode");
+            subobjects.push(D3d12StateSubobject::DxilLibrary(
+                state_objects::D3d12DxilLibrary {
+                    bytecode: make_ray_llvm_container(&bitcode, kind),
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: entry.to_string(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                },
+            ));
+        }
+        subobjects.push(D3d12StateSubobject::RaytracingPipelineConfig {
+            max_trace_recursion_depth: 1,
+        });
+        let desc = D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects,
+        };
+        let handle = runtime.create_state_object(desc.clone())?;
+        runtime.set_pipeline_state1_state_object(list, handle, desc)?;
+        Ok(handle)
+    }
+
+    fn ray_test_attribute_formats(runtime: &mut D3d12Runtime, list: CommandListId) {
+        let float2: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let float2_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(float2.as_ptr() as *const u8, std::mem::size_of_val(&float2))
+        };
+        runtime.register_raytracing_buffer(0x1400, float2_bytes.to_vec());
+        let u16_indices: [u16; 3] = [0, 1, 2];
+        let u16_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                u16_indices.as_ptr() as *const u8,
+                std::mem::size_of_val(&u16_indices),
+            )
+        };
+        runtime.register_raytracing_buffer(0x1408, u16_bytes.to_vec());
+        let float2_blas = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x14_0000,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 0,
+                flags: 0,
+                num_descs: 1,
+                geometries: vec![D3D12RaytracingGeometryDesc {
+                    ty: 0,
+                    flags: 1,
+                    vertex_buffer: 0x1400,
+                    vertex_format: 17,
+                    vertex_stride: 8,
+                    vertex_count: 4,
+                    index_buffer: 0x1408,
+                    index_format: 57,
+                    index_count: 3,
+                }],
+            },
+            source_address: 0,
+            scratch_address: 0x15_0000,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &float2_blas)
+            .expect("float2 BLAS");
+
+        let halves: [u16; 16] = [
+            0x3C00, 0x4000, 0x4200, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x7C00, 0x0000, 0x0000,
+            0x0000, 0x7E00, 0x0000, 0x0000, 0x0000,
+        ];
+        let half_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(halves.as_ptr() as *const u8, std::mem::size_of_val(&halves))
+        };
+        runtime.register_raytracing_buffer(0x1500, half_bytes.to_vec());
+        let u32_indices: [u32; 3] = [0, 1, 2];
+        let u32_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                u32_indices.as_ptr() as *const u8,
+                std::mem::size_of_val(&u32_indices),
+            )
+        };
+        runtime.register_raytracing_buffer(0x1508, u32_bytes.to_vec());
+        let half_blas = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x15_0000,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 0,
+                flags: 0,
+                num_descs: 1,
+                geometries: vec![D3D12RaytracingGeometryDesc {
+                    ty: 0,
+                    flags: 1,
+                    vertex_buffer: 0x1500,
+                    vertex_format: 35,
+                    vertex_stride: 8,
+                    vertex_count: 4,
+                    index_buffer: 0x1508,
+                    index_format: 42,
+                    index_count: 3,
+                }],
+            },
+            source_address: 0,
+            scratch_address: 0x16_0000,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &half_blas)
+            .expect("half BLAS");
+    }
+
+    fn ray_test_triangle_tlas(runtime: &mut D3d12Runtime, list: CommandListId) {
+        let vertices: [f32; 9] = [-1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0];
+        let vertex_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                vertices.as_ptr() as *const u8,
+                std::mem::size_of_val(&vertices),
+            )
+        };
+        runtime.register_raytracing_buffer(0x1000, vertex_bytes.to_vec());
+        let blas = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x10_0000,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 0,
+                flags: 0,
+                num_descs: 1,
+                geometries: vec![D3D12RaytracingGeometryDesc {
+                    ty: 0,
+                    flags: 1,
+                    vertex_buffer: 0x1000,
+                    vertex_format: 6,
+                    vertex_stride: 12,
+                    vertex_count: 3,
+                    index_buffer: 0,
+                    index_format: 0,
+                    index_count: 0,
+                }],
+            },
+            source_address: 0,
+            scratch_address: 0x11_0000,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &blas)
+            .expect("triangle BLAS");
+        let mut instances = [0u8; 64];
+        instances[48..52].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        instances[52..56].copy_from_slice(&0x07u32.to_le_bytes());
+        instances[56..64].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        runtime.register_raytracing_instances(0x20_0000, instances.to_vec());
+        let tlas = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x20_0000,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 1,
+                flags: 0,
+                num_descs: 1,
+                geometries: Vec::new(),
+            },
+            source_address: 0,
+            scratch_address: 0x21_0000,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &tlas)
+            .expect("triangle TLAS");
+    }
+
+    fn ray_test_aabb_tlas(runtime: &mut D3d12Runtime, list: CommandListId) {
+        let bounds: [f32; 6] = [-1.0, -1.0, 0.0, 1.0, 1.0, 1.0];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(bounds.as_ptr() as *const u8, std::mem::size_of_val(&bounds))
+        };
+        runtime.register_raytracing_buffer(0x1800, bytes.to_vec());
+        let blas = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x12_0000,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 0,
+                flags: 0,
+                num_descs: 1,
+                geometries: vec![D3D12RaytracingGeometryDesc {
+                    ty: 1,
+                    flags: 1,
+                    vertex_buffer: 0x1800,
+                    vertex_format: 0,
+                    vertex_stride: 24,
+                    vertex_count: 1,
+                    index_buffer: 0,
+                    index_format: 0,
+                    index_count: 0,
+                }],
+            },
+            source_address: 0,
+            scratch_address: 0x13_0000,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &blas)
+            .expect("AABB BLAS");
+        let mut instances = [0u8; 64];
+        instances[48..52].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        instances[52..56].copy_from_slice(&0x07u32.to_le_bytes());
+        instances[56..64].copy_from_slice(&0x12_0000u64.to_le_bytes());
+        runtime.register_raytracing_instances(0x22_0000, instances.to_vec());
+        let tlas = D3D12BuildAccelerationStructureDesc {
+            dest_address: 0x22_0000,
+            inputs: D3D12BuildRaytracingInputs {
+                ty: 1,
+                flags: 0,
+                num_descs: 1,
+                geometries: Vec::new(),
+            },
+            source_address: 0,
+            scratch_address: 0x23_0000,
+        };
+        runtime
+            .build_raytracing_acceleration_structure(list, &tlas)
+            .expect("AABB TLAS");
+    }
+
+    fn ray_dispatch(
+        runtime: &mut D3d12Runtime,
+        list: CommandListId,
+        rays: &[crate::metal_backend::MetalRay],
+        records: &[u32],
+    ) -> Vec<crate::metal_backend::MetalRayPayloadResult> {
+        let ray_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(rays.as_ptr() as *const u8, std::mem::size_of_val(rays))
+        };
+        runtime.register_raytracing_buffer(0x30_0000, ray_bytes.to_vec());
+        let mut table = Vec::new();
+        for record in records {
+            table.extend_from_slice(&record.to_le_bytes());
+        }
+        runtime.register_raytracing_buffer(0x31_0000, table);
+        let desc = D3D12DispatchRaysDesc {
+            raygen_shader_start_address: 0x30_0000,
+            raygen_shader_size: std::mem::size_of_val(rays) as u64,
+            miss_shader_start_address: 0,
+            miss_shader_size: 0,
+            miss_shader_stride: 0,
+            hit_group_start_address: 0x31_0000,
+            hit_group_size: (records.len() * 4) as u64,
+            hit_group_stride: 4,
+            callable_shader_start_address: 0,
+            callable_shader_size: 0,
+            callable_shader_stride: 0,
+            width: rays.len() as u32,
+            height: 1,
+            depth: 1,
+        };
+        runtime.dispatch_rays(list, &desc).expect("dispatch rays");
+        runtime.last_ray_payloads()
+    }
+
+    #[test]
+    fn d3d12_ray_sbt_selects_multiple_closest_and_miss_exports() {
+        let raygen = r#"define void @raygen() {
+entry:
+  %idx = call i32 @dx.op.dispatchRaysIndex(i32 1)
+  call void @ray.storePayloadField(i32 1, i32 %idx)
+  call void @dx.op.traceRay(i32 0, ptr null, i32 3, i32 -1, i32 0, i32 1, i32 0, float 0.0, float 0.0, float -1.0, float 0.0, float 0.0, float 0.0, float 1.0, float 100.0, i32 0)
+  ret void
+}
+declare i32 @dx.op.dispatchRaysIndex(i32)
+declare void @ray.storePayloadField(i32, ...)
+declare void @dx.op.traceRay(i32, ptr, i32, i32, i32, i32, i32, float, float, float, float, float, float, float, float, i32)
+"#;
+        let closest_a = "define void @chs_a() {\nentry:\n  call void @ray.storePayloadField(i32 0, i32 111)\n  ret void\n}\ndeclare void @ray.storePayloadField(i32, ...)\n";
+        let closest_b = "define void @chs_b() {\nentry:\n  call void @ray.storePayloadField(i32 0, i32 222)\n  ret void\n}\ndeclare void @ray.storePayloadField(i32, ...)\n";
+        let miss_a = "define void @miss_a() {\nentry:\n  call void @ray.storePayloadField(i32 0, i32 333)\n  ret void\n}\ndeclare void @ray.storePayloadField(i32, ...)\n";
+        let miss_b = "define void @miss_b() {\nentry:\n  call void @ray.storePayloadField(i32 0, i32 444)\n  ret void\n}\ndeclare void @ray.storePayloadField(i32, ...)\n";
+        let mut runtime = D3d12Runtime::new();
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let handle = ray_test_state_object(
+            &mut runtime,
+            list,
+            &[
+                ("raygeneration", "raygen", raygen),
+                ("closesthit", "chs_a", closest_a),
+                ("closesthit", "chs_b", closest_b),
+                ("miss", "miss_a", miss_a),
+                ("miss", "miss_b", miss_b),
+            ],
+        )
+        .expect("ray state object");
+        ray_test_triangle_tlas(&mut runtime, list);
+        let pso = runtime
+            .get_raytracing_pipeline_state(handle)
+            .expect("ray PSO")
+            .clone();
+        let chs_a_index = pso.ray_stages["chs_a"].function_index;
+        let chs_b_index = pso.ray_stages["chs_b"].function_index;
+        let miss_a_index = pso.ray_stages["miss_a"].function_index;
+        let miss_b_index = pso.ray_stages["miss_b"].function_index;
+        let hit_rays = [
+            crate::metal_backend::MetalRay {
+                origin: [0.0, 0.0, -1.0],
+                min_distance: 0.0,
+                direction: [0.0, 0.0, 1.0],
+                max_distance: 100.0,
+                sbt_offset: 0,
+                mask: 0xFFFF_FFFF,
+            },
+            crate::metal_backend::MetalRay {
+                origin: [0.0, 0.0, -1.0],
+                min_distance: 0.0,
+                direction: [0.0, 0.0, 1.0],
+                max_distance: 100.0,
+                sbt_offset: 1,
+                mask: 0xFFFF_FFFF,
+            },
+        ];
+        let hits = ray_dispatch(&mut runtime, list, &hit_rays, &[chs_a_index, chs_b_index]);
+        assert_eq!(hits[0].payload_word(1), Some(0));
+        assert_eq!(hits[1].payload_word(1), Some(1));
+        assert_eq!(hits[0].payload_word(0), Some(111));
+        assert_eq!(hits[1].payload_word(0), Some(222));
+
+        let miss_rays = [
+            crate::metal_backend::MetalRay {
+                origin: [100.0, 100.0, -1.0],
+                min_distance: 0.0,
+                direction: [0.0, 0.0, 1.0],
+                max_distance: 0.5,
+                sbt_offset: 0,
+                mask: 0,
+            },
+            crate::metal_backend::MetalRay {
+                origin: [100.0, 100.0, -1.0],
+                min_distance: 0.0,
+                direction: [0.0, 0.0, 1.0],
+                max_distance: 0.5,
+                sbt_offset: 1,
+                mask: 0,
+            },
+        ];
+        let misses = ray_dispatch(
+            &mut runtime,
+            list,
+            &miss_rays,
+            &[miss_a_index, miss_b_index],
+        );
+        assert_eq!(misses[0].payload_word(0), Some(333));
+        assert_eq!(misses[1].payload_word(0), Some(444));
+    }
+
+    #[test]
+    fn d3d12_ray_procedural_intersection_accepts_and_rejects() {
+        let raygen = r#"define void @raygen() {
+entry:
+  call void @dx.op.traceRay(i32 0, ptr null, i32 3, i32 -1, i32 0, i32 1, i32 0, float 0.0, float 0.0, float -1.0, float 0.0, float 0.0, float 0.0, float 1.0, float 100.0, i32 0)
+  ret void
+}
+declare void @dx.op.traceRay(i32, ptr, i32, i32, i32, i32, i32, float, float, float, float, float, float, float, float, i32)
+"#;
+        let accept = r#"define void @isect_accept() {
+entry:
+  %r = call i1 @dx.op.reportHit(i32 0, float 1.5, i32 1084227584, i32 0, ptr null)
+  call void @dx.op.acceptHitAndEndSearch(i32 1)
+  ret void
+}
+declare i1 @dx.op.reportHit(i32, float, i32, i32, ptr)
+declare void @dx.op.acceptHitAndEndSearch(i32)
+"#;
+        let reject = r#"define void @isect_reject() {
+entry:
+  %r = call i1 @dx.op.reportHit(i32 0, float 1.5, i32 1084227584, i32 0, ptr null)
+  call void @dx.op.ignoreHit(i32 1)
+  ret void
+}
+declare i1 @dx.op.reportHit(i32, float, i32, i32, ptr)
+declare void @dx.op.ignoreHit(i32)
+"#;
+        let mut runtime = D3d12Runtime::new();
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let handle = ray_test_state_object(
+            &mut runtime,
+            list,
+            &[
+                ("raygeneration", "raygen", raygen),
+                ("intersection", "isect_accept", accept),
+                ("intersection", "isect_reject", reject),
+            ],
+        )
+        .expect("procedural state object");
+        ray_test_aabb_tlas(&mut runtime, list);
+        let pso = runtime
+            .get_raytracing_pipeline_state(handle)
+            .expect("ray PSO")
+            .clone();
+        let accept_index = pso.ray_stages["isect_accept"].function_index;
+        let reject_index = pso.ray_stages["isect_reject"].function_index;
+        let rays = [
+            crate::metal_backend::MetalRay {
+                origin: [0.0, 0.0, -1.0],
+                min_distance: 0.0,
+                direction: [0.0, 0.0, 1.0],
+                max_distance: 100.0,
+                sbt_offset: 0,
+                mask: 0xFFFF_FFFF,
+            },
+            crate::metal_backend::MetalRay {
+                origin: [0.0, 0.0, -1.0],
+                min_distance: 0.0,
+                direction: [0.0, 0.0, 1.0],
+                max_distance: 100.0,
+                sbt_offset: 1,
+                mask: 0xFFFF_FFFF,
+            },
+        ];
+        let results = ray_dispatch(&mut runtime, list, &rays, &[accept_index, reject_index]);
+        assert_eq!(results[0].hit_kind, 0xFF);
+        assert_eq!(results[0].candidate_type, 1);
+        assert_eq!(results[0].distance, 1.5);
+        assert_eq!(results[0].attributes[0], 5.0);
+        assert_eq!(results[0].accepted, 1);
+        assert_eq!(results[1].hit_kind, 0);
+        assert_eq!(results[1].accepted, 0);
+        assert_eq!(results[1].ignored, 1);
+    }
+
+    #[test]
     fn d3d12_translated_raygen_executes_hit_miss_anyhit_callable_and_rejects_bad_stage() {
+        d3d12_ray_state_object_compiles_each_stage_from_its_own_bitcode();
+        d3d12_ray_stage_artifacts_reject_bad_bitcode_with_exact_error();
+        d3d12_ray_sbt_selects_multiple_closest_and_miss_exports();
+        d3d12_ray_procedural_intersection_accepts_and_rejects();
+        let mut format_runtime = D3d12Runtime::new();
+        let format_list = format_runtime.create_graphics_command_list(0, 0, false);
+        ray_test_attribute_formats(&mut format_runtime, format_list);
         let mut runtime = D3d12Runtime::new();
         let list = runtime.create_graphics_command_list(0, 0, false);
         let vertices: [f32; 9] = [-1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0];
@@ -11222,6 +12167,13 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
             )
             .expect("BLAS");
         let mut instances = [0u8; 64];
+        // Row-major 3x4 object-to-world: identity linear part plus a z
+        // translation of 10, so the hit distance and transform readback prove
+        // the instance table is actually bound to the shader.
+        instances[0..4].copy_from_slice(&1.0f32.to_le_bytes());
+        instances[20..24].copy_from_slice(&1.0f32.to_le_bytes());
+        instances[40..44].copy_from_slice(&1.0f32.to_le_bytes());
+        instances[44..48].copy_from_slice(&10.0f32.to_le_bytes());
         instances[48..52].copy_from_slice(&0xFF00_0000u32.to_le_bytes());
         instances[56..64].copy_from_slice(&0x1000u64.to_le_bytes());
         runtime.register_raytracing_instances(0x10_0000, instances.to_vec());
@@ -11316,6 +12268,11 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
         let payload = runtime.last_ray_payloads();
         assert_eq!(payload[0].value[0], 42.0);
         assert_eq!(payload[0].instance_id, 0);
+        assert_eq!(payload[0].primitive_id, 0);
+        assert_eq!(payload[0].distance.round() as u32, 11);
+        assert_eq!(payload[0].hit_kind, 0xFE);
+        assert_eq!(payload[0].object_to_world[11], 10.0);
+        assert_eq!(payload[0].world_to_object[11], -10.0);
 
         ray.origin = [4.0, 4.0, -1.0];
         let miss_bytes: &[u8] = unsafe {

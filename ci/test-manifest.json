@@ -567,6 +567,27 @@
         "via": "test"
       }
     ],
+    "casa1-conformance:physical_raw_input_tables_and_device_info_sizes_are_real": [
+      {
+        "target": "casa1",
+        "test": "user32::tests::physical_raw_input_tables_and_device_info_sizes_are_real",
+        "via": "test"
+      }
+    ],
+    "casa1-conformance:raw_input_registration_flags_and_remove_edges_are_exact": [
+      {
+        "target": "casa1",
+        "test": "user32::tests::raw_input_registration_flags_and_remove_edges_are_exact",
+        "via": "test"
+      }
+    ],
+    "casa1-conformance:real_hid_report_feed_builds_wm_input_and_raw_data_exactly": [
+      {
+        "target": "casa1",
+        "test": "user32::tests::real_hid_report_feed_builds_wm_input_and_raw_data_exactly",
+        "via": "test"
+      }
+    ],
     "casa1-conformance:rich_edit_register_entries_create_real_windows": [
       {
         "target": "casa1",
@@ -607,6 +628,20 @@
         "target": "section34_phase3",
         "test": "",
         "via": "target"
+      }
+    ],
+    "casa1-conformance:serial_com_dispatch_rejects_invalid_busy_and_stale_handles": [
+      {
+        "target": "casa1",
+        "test": "runtime::tests::serial_com_dispatch_rejects_invalid_busy_and_stale_handles",
+        "via": "test"
+      }
+    ],
+    "casa1-conformance:serial_comm_ioctls_roundtrip_and_config_boundaries": [
+      {
+        "target": "casa1",
+        "test": "runtime::tests::serial_comm_ioctls_roundtrip_and_config_boundaries",
+        "via": "test"
       }
     ],
     "casa1-conformance:sh_create_explorer_taskband_creates_one_real_taskband_session": [
@@ -651,6 +686,13 @@
         "via": "test"
       }
     ],
+    "casa1-conformance:tbs_tpm_dispatch_rejects_bad_contracts_and_runs_startup_exactly": [
+      {
+        "target": "casa1",
+        "test": "runtime::tests::tbs_tpm_dispatch_rejects_bad_contracts_and_runs_startup_exactly",
+        "via": "test"
+      }
+    ],
     "casa1-conformance:test_d2d1_create_factory": [
       {
         "target": "casa1",
@@ -669,6 +711,13 @@
       {
         "target": "casa1",
         "test": "runtime::tests::test_pe_import_resolution_d3d11",
+        "via": "test"
+      }
+    ],
+    "casa1-conformance:usb_dispatch_ioctls_enumerate_validate_and_reject_stale": [
+      {
+        "target": "casa1",
+        "test": "runtime::tests::usb_dispatch_ioctls_enumerate_validate_and_reject_stale",
         "via": "test"
       }
     ],
@@ -827,7 +876,7 @@
       }
     ]
   },
-  "commit": "89b646d0f6cb9767328d8319f8cf8281bf3a15e1",
+  "commit": "5215783abd12ae36c8dc720fcd1bdfe9725d9598",
   "declared": {
     "conformance": [
       "casa1-conformance:activation_default_device_completes_async_with_real_endpoint",
@@ -911,21 +960,28 @@
       "casa1-conformance:msi_reads_real_compound_database",
       "casa1-conformance:nt_create_process_creates_real_native_child",
       "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+      "casa1-conformance:physical_raw_input_tables_and_device_info_sizes_are_real",
+      "casa1-conformance:raw_input_registration_flags_and_remove_edges_are_exact",
+      "casa1-conformance:real_hid_report_feed_builds_wm_input_and_raw_data_exactly",
       "casa1-conformance:rich_edit_register_entries_create_real_windows",
       "casa1-conformance:section1",
       "casa1-conformance:section11",
       "casa1-conformance:section28",
       "casa1-conformance:section28_com",
       "casa1-conformance:section34_phase3",
+      "casa1-conformance:serial_com_dispatch_rejects_invalid_busy_and_stale_handles",
+      "casa1-conformance:serial_comm_ioctls_roundtrip_and_config_boundaries",
       "casa1-conformance:sh_create_explorer_taskband_creates_one_real_taskband_session",
       "casa1-conformance:sh_create_links_writes_a_real_parseable_lnk_file",
       "casa1-conformance:sh_navigate_to_favorite_adds_lists_and_removes_real_records",
       "casa1-conformance:sh_open_folder_window_opens_and_closes_real_window_sessions",
       "casa1-conformance:steam_api_context_init_initialises_context",
       "casa1-conformance:submit_command_dispatch_requires_residency_and_pins_outputs",
+      "casa1-conformance:tbs_tpm_dispatch_rejects_bad_contracts_and_runs_startup_exactly",
       "casa1-conformance:test_d2d1_create_factory",
       "casa1-conformance:test_dwrite_create_factory",
       "casa1-conformance:test_pe_import_resolution_d3d11",
+      "casa1-conformance:usb_dispatch_ioctls_enumerate_validate_and_reject_stale",
       "casa1-conformance:winhttp_open_close_session",
       "casa1-conformance:x3daudio_calculate_dispatch_writes_real_dsp_values"
     ],
@@ -955,7 +1011,7 @@
   },
   "deferred_differential": [],
   "kind": "casa1-test-manifest",
-  "manifest_sha256": "c2034802ddb0935f4d6f5f14f1d83ea39232f29b292c45b37993c2be2ba9f800",
+  "manifest_sha256": "faec0fb993306fb930d3a25450d2f40961ff7c80f831fc6ac12952d71131a809",
   "schema_version": 2,
   "source": {
     "command": "cargo test --no-run --lib --bins --tests --features vulkan,opengl,websocket --message-format=json; <executable> --list [--ignored]",
@@ -1447,6 +1503,10 @@
         "d3d12::tests::d3d12_guest_initial_data_rejects_window_edges_and_counts_zero_staging",
         "d3d12::tests::d3d12_present_falls_back_when_iosurface_is_unavailable",
         "d3d12::tests::d3d12_present_rejects_mismatched_channel_format",
+        "d3d12::tests::d3d12_ray_procedural_intersection_accepts_and_rejects",
+        "d3d12::tests::d3d12_ray_sbt_selects_multiple_closest_and_miss_exports",
+        "d3d12::tests::d3d12_ray_stage_artifacts_reject_bad_bitcode_with_exact_error",
+        "d3d12::tests::d3d12_ray_state_object_compiles_each_stage_from_its_own_bitcode",
         "d3d12::tests::d3d12_set_pipeline_state1_rejects_collection_state_object",
         "d3d12::tests::d3d12_set_program_and_dispatch_graph_use_bound_program",
         "d3d12::tests::d3d12_state_object_config1_requires_recursion_and_attribute_limits",
@@ -2056,6 +2116,9 @@
         "metal_backend::tests::d3d12_gpu_indirect_dispatch_and_work_graph_fanout_reject_missing_counts",
         "metal_backend::tests::d3d12_gpu_indirect_render_commands_reject_invalid_ranges_and_draw_on_gpu",
         "metal_backend::tests::d3d12_llvm_cfg_memory_payload_program_rejects_helpers",
+        "metal_backend::tests::d3d12_llvm_ray_attribute_at_vertex_fetches_bound_buffer",
+        "metal_backend::tests::d3d12_llvm_ray_intrinsics_reject_invalid_transforms_and_read_back_hit_edges",
+        "metal_backend::tests::d3d12_llvm_ray_stage_modules_compile_with_candidate_and_control_intrinsics",
         "metal_backend::tests::depth_bounds_emulation",
         "metal_backend::tests::depth_bounds_reject_invalid_limits_and_unemulatable_enable_with_exact_errors",
         "metal_backend::tests::destroy_texture_rejects_stale_heap_and_breaks_at_owning_heap",
@@ -2431,10 +2494,39 @@
         "real_fs::tests::path_authorizer_blocks_operations",
         "real_fs::tests::resolver_rejects_symlink_escape",
         "real_fs::tests::split_drive_reserved_device_with_extension",
+        "real_hid::bridge::tests::aggregate_bridge_tables_and_dispatch_accessors_are_exact",
+        "real_hid::bridge::tests::empty_bridge_tables_are_missing_devices_not_synthetic",
+        "real_hid::error::tests::device_error_every_variant_maps_to_exact_windows_and_reason_code",
+        "real_hid::hid::tests::hid_double_open_and_double_close_are_exact_errors",
+        "real_hid::hid::tests::hid_invalid_report_lengths_are_rejected_exactly",
+        "real_hid::hid::tests::hid_missing_handle_open_is_exact_and_not_permission",
+        "real_hid::hid::tests::hid_open_failure_and_poisoned_registry_edges_are_exact",
+        "real_hid::hid::tests::hid_real_device_permission_denied_or_double_open_is_exact",
+        "real_hid::hid::tests::hid_report_handle_lifecycle_edges_and_usage_detection_are_exact",
+        "real_hid::hid::tests::hid_stale_handle_after_unplug_is_missing_exactly",
+        "real_hid::hid::tests::hid_vendor_mismatch_handle_is_rejected_exactly",
+        "real_hid::model::tests::duplicate_unplug_scan_reports_a_single_removal",
+        "real_hid::model::tests::model_stable_ids_and_table_clear_edges_are_exact",
+        "real_hid::model::tests::unplug_race_reconcile_removes_once_and_never_synthesizes_devices",
+        "real_hid::serial::tests::serial_busy_or_missing_host_port_is_exact_never_synthetic",
+        "real_hid::serial::tests::serial_config_boundaries_are_rejected_exactly",
+        "real_hid::serial::tests::serial_device_lifecycle_and_config_boundaries_are_exact",
+        "real_hid::serial::tests::serial_double_open_and_close_are_exact_via_state",
+        "real_hid::serial::tests::serial_missing_device_open_is_exact_and_never_synthetic",
         "real_hid::tests::test_is_game_controller_by_name",
         "real_hid::tests::test_known_vendor_non_controller_is_filtered",
         "real_hid::tests::test_parse_sony_controller",
         "real_hid::tests::test_xinput_capable_detection",
+        "real_hid::usb::tests::usb_descriptor_truncation_and_precedence_edges_are_exact",
+        "real_hid::usb::tests::usb_isochronous_transfer_is_rejected_exactly",
+        "real_hid::usb::tests::usb_known_but_unsupported_transfer_flags_are_rejected_exactly",
+        "real_hid::usb::tests::usb_malformed_descriptor_is_rejected_exactly",
+        "real_hid::usb::tests::usb_missing_device_handle_is_exact_and_never_synthetic",
+        "real_hid::usb::tests::usb_missing_endpoint_is_rejected_exactly",
+        "real_hid::usb::tests::usb_multi_configuration_descriptor_boundary_keeps_interfaces_paired",
+        "real_hid::usb::tests::usb_real_enumeration_missing_devices_never_synthesized",
+        "real_hid::usb::tests::usb_transfer_validation_rejects_every_unsupported_edge_exactly",
+        "real_hid::usb::tests::usb_unknown_transfer_flags_are_rejected_exactly",
         "real_net::tests::dns_resolver_fails_for_invalid_host",
         "real_net::tests::dns_resolver_resolves_ipv4_loopback",
         "real_net::tests::dns_resolver_resolves_localhost",
@@ -3056,6 +3148,7 @@
         "runtime::tests::nt_create_thread_ex_create_suspended_defers_host_launch",
         "runtime::tests::nt_create_thread_ex_spawns_the_native_child_for_real",
         "runtime::tests::nt_test_alert_returns_user_apc_only_when_delivered",
+        "runtime::tests::nt_usb_ioctls_route_to_the_host_bridge_with_exact_statuses",
         "runtime::tests::ole32_ole_initialize_uninitialize_dispatch",
         "runtime::tests::oleaut32_null_arguments_report_e_invalidarg_dispatch",
         "runtime::tests::open_thread_returns_thread_handle",
@@ -3072,6 +3165,8 @@
         "runtime::tests::redraw_window_queues_paint_like_invalidate_rect",
         "runtime::tests::reg_close_key_on_non_key_handle_is_invalid_handle",
         "runtime::tests::rich_edit_register_entries_create_real_windows",
+        "runtime::tests::serial_com_dispatch_rejects_invalid_busy_and_stale_handles",
+        "runtime::tests::serial_comm_ioctls_roundtrip_and_config_boundaries",
         "runtime::tests::set_class_long_w_dispatch_returns_previous_value",
         "runtime::tests::set_clipboard_data_reads_exact_block_and_returns_handle",
         "runtime::tests::set_current_directory_w_empty_path_returns_false",
@@ -3088,6 +3183,7 @@
         "runtime::tests::steam_api_context_init_initialises_context",
         "runtime::tests::steam_api_shutdown_clears_state",
         "runtime::tests::steam_api_write_mini_dump_writes_dump_file_dispatch",
+        "runtime::tests::tbs_tpm_dispatch_rejects_bad_contracts_and_runs_startup_exactly",
         "runtime::tests::terminate_thread_forces_exit_with_code",
         "runtime::tests::test_com_multiple_objects_independent_lifetimes",
         "runtime::tests::test_com_object_addref_unknown_address_fails",
@@ -3123,6 +3219,7 @@
         "runtime::tests::test_write_guest_bytes_checked_rejects_null",
         "runtime::tests::tls_alloc_exhaustion_reports_not_enough_memory",
         "runtime::tests::urlmon_bind_ctx_moniker_and_status_callback_dispatch",
+        "runtime::tests::usb_dispatch_ioctls_enumerate_validate_and_reject_stale",
         "runtime::tests::verify_version_info_w_matches_win11_profile_and_rejects_higher_build_x86",
         "runtime::tests::version_dll_query_roundtrip_dispatch",
         "runtime::tests::volume_identity_refuses_unpublished_fields_and_derives_stable_object_ids",
@@ -3262,7 +3359,11 @@
         "shader::tests::t_llvm_ray_control_flow_and_aggregates_rejects_helper_lowering",
         "shader::tests::t_llvm_ray_frontend_rejects_malformed_ir_and_missing_tools",
         "shader::tests::t_llvm_ray_helper_and_error_paths_are_exact",
+        "shader::tests::t_llvm_ray_intrinsic_malformed_shapes_and_payload_errors_are_exact",
         "shader::tests::t_llvm_ray_memory_errors_name_the_failing_operation",
+        "shader::tests::t_llvm_ray_stages_compile_from_own_bitcode_and_select_sbt_functions",
+        "shader::tests::t_llvm_ray_trace_control_candidate_and_shader_record_intrinsics_lower",
+        "shader::tests::t_llvm_ray_transform_identity_intrinsics_and_payload_pointer_edges",
         "shader::tests::t_msl_artifact_extractor_rejects_malformed_and_preserves_source",
         "shader::tests::t_parse_dxil_container_invalid_magic",
         "shader::tests::t_parse_dxil_container_truncated",
@@ -3356,6 +3457,47 @@
         "threads::tests::mutex_try_acquire_fails_when_owned",
         "threads::tests::semaphore_release_exceeds_max_fails",
         "threads::tests::srwlock_exclusive_and_shared",
+        "tpm::tests::absent_objects_are_rejected_with_exact_handle_rc",
+        "tpm::tests::bad_password_and_bad_hmac_are_rejected_with_exact_rc",
+        "tpm::tests::crypto_rejects_unknown_hash_and_pads_short_moduli_exactly",
+        "tpm::tests::ecc_quote_signature_rejects_tampered_attest_and_attest_shape_is_exact",
+        "tpm::tests::engine_capability_pcr_and_state_machine_reject_invalid_parameters",
+        "tpm::tests::engine_create_load_flush_and_read_public_errors_are_exact",
+        "tpm::tests::engine_creation_and_quote_reject_out_of_range_pcr_selections",
+        "tpm::tests::engine_nv_role_permission_and_lifecycle_reject_invalid_auth",
+        "tpm::tests::engine_persist_failure_and_malformed_auth_areas_are_exact",
+        "tpm::tests::engine_quote_rejects_unsupported_key_object_type",
+        "tpm::tests::engine_quote_rejects_unsupported_schemes_and_non_signing_keys",
+        "tpm::tests::engine_start_auth_session_rejects_each_bad_parameter",
+        "tpm::tests::engine_template_validation_rejects_each_invalid_field",
+        "tpm::tests::get_capability_rejects_unknown_capability_and_reports_commands",
+        "tpm::tests::get_random_rejects_oversized_request_and_returns_exact_zero_length",
+        "tpm::tests::hierarchy_change_auth_rejects_stale_auth_and_persists_new_auth",
+        "tpm::tests::load_rejects_tampered_private_blob_and_round_trips_exact_public_area",
+        "tpm::tests::malformed_command_size_and_tag_are_rejected_with_exact_rc",
+        "tpm::tests::malformed_parameter_size_and_auth_area_are_rejected",
+        "tpm::tests::nv_bounds_lock_and_uninitialized_reads_are_rejected",
+        "tpm::tests::nv_define_rejects_duplicate_invalid_index_and_zero_size",
+        "tpm::tests::pcr_boundary_indices_are_rejected_with_exact_rc",
+        "tpm::tests::persistence_corruption_is_rejected_and_never_reset",
+        "tpm::tests::persistence_decode_io_and_atomic_cleanup_reject_bad_envelopes",
+        "tpm::tests::persistence_rejects_valid_checksum_with_invalid_payload_shape",
+        "tpm::tests::persistence_short_header_and_version_are_rejected",
+        "tpm::tests::persistence_validation_rejects_each_invalid_state_shape",
+        "tpm::tests::repeated_create_flush_does_not_leak_handles",
+        "tpm::tests::rsa_quote_signature_rejects_tampered_attest_and_pcr_digest_matches",
+        "tpm::tests::self_test_failure_is_reported_as_exact_tpm_rc",
+        "tpm::tests::session_authorize_rejects_each_malformed_auth_shape",
+        "tpm::tests::startup_shutdown_state_machine_rejects_out_of_order_calls",
+        "tpm::tests::state_hierarchy_roles_and_public_area_reject_invalid_encodings",
+        "tpm::tests::stir_random_rejects_oversized_entropy_and_changes_the_next_output",
+        "tpm::tests::tbs_context_lifecycle_and_buffer_errors_are_exact",
+        "tpm::tests::tbs_context_limit_and_malformed_submit_are_exact",
+        "tpm::tests::tbs_open_and_submit_map_persist_errors_to_exact_codes",
+        "tpm::tests::tbs_parameters_priorities_and_error_codes_are_exact",
+        "tpm::tests::tbs_rejects_bad_locality_priority_and_context",
+        "tpm::tests::tpm_accessors_and_capacity_exhaustion_are_exact",
+        "tpm::tests::unknown_command_and_pre_startup_command_are_rejected",
         "trace::tests::test_backward_compat_validation_rejects_old_format",
         "trace::tests::test_load_trace_empty_file",
         "trace::tests::test_load_trace_invalid_json",
@@ -3379,9 +3521,15 @@
         "user32::tests::gdiplus_region_rect_membership_and_bounds",
         "user32::tests::gdiplus_repeated_create_destroy_does_not_leak_handles",
         "user32::tests::get_touch_input_info_invalid_handle_returns_error",
+        "user32::tests::hid_device_path_and_controller_spec_fallbacks_are_exact",
         "user32::tests::invalidate_window_queues_paint_once",
         "user32::tests::monitor_from_window_returns_window_monitor_or_primary_fallback",
+        "user32::tests::physical_hotplug_and_controller_state_are_real_and_stale_safe",
+        "user32::tests::physical_raw_input_tables_and_device_info_sizes_are_real",
+        "user32::tests::raw_input_registration_flags_and_remove_edges_are_exact",
+        "user32::tests::real_hid_report_feed_builds_wm_input_and_raw_data_exactly",
         "user32::tests::register_touch_window_creates_entry",
+        "user32::tests::serial_com_surface_and_errors_are_exact",
         "user32::tests::skip_pointer_frame_removes_pointer_state",
         "user32::tests::test_empty_clipboard_clears_data",
         "user32::tests::test_empty_clipboard_no_open",
@@ -3405,6 +3553,7 @@
         "user32::tests::timer_deadline_cache_recomputes_after_earliest_replace_and_kill_race",
         "user32::tests::track_popup_menu_validates_menu_and_refreshes_window",
         "user32::tests::unregister_touch_window_removes_entry",
+        "user32::tests::usb_transfer_validation_and_unsupported_surface_are_exact",
         "user32::tests::user32_dialog_item_rejects_invalid_parent_and_id",
         "user32::tests::user32_nonzero_ns_window_pointer_owner_thread_edge_reaches_appkit_calls",
         "user32::tests::user32_track_popup_menu_invalid_hwnd_and_zero_target_edges",
@@ -4579,6 +4728,6 @@
     "host": "aarch64-apple-darwin",
     "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
   },
-  "tree": "3a5aa8013400cde8c8fb6f721770f9cb537fa7a3",
+  "tree": "d03789e1759dc267e7e143152bd8586d2ebf174a",
   "unbound": []
 }
