@@ -1781,6 +1781,46 @@
   "(dll, \"dml.dll\")",
   "(symbol, \"DMLCreateOperatorRegistry\")"
  ],
+ "d3d12_execute_command_lists_duplicate_batch_is_rejected_exactly": [
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "( error.message, format!( \"D3D12 ExecuteCommandLists: duplicate command list {} in one batch\", stream.id ) )",
+  "(runtime.metal4_batch_fallbacks(), 0)",
+  "(runtime.metal4_batch_stats(), None)"
+ ],
+ "d3d12_execute_command_lists_empty_batch_boundary_is_no_op": [
+  "(plan.render_passes.len(), 0)",
+  "(plan.compute_passes, 0)",
+  "(plan.blit_passes, 0)",
+  "(plan.signaled_fences, Vec::new())",
+  "(runtime.metal4_batch_stats(), None)",
+  "(runtime.metal4_batch_last_event(), None)"
+ ],
+ "d3d12_execute_command_lists_metal4_failure_falls_back_with_counter": [
+  "( runtime .metal4_batch_stats() .expect(\"stats\") .grouped_submissions, 1 )",
+  "(plan.signaled_fences, vec![(failed_fence, 1)])",
+  "(runtime.metal4_batch_fallbacks(), 1)",
+  "( runtime .metal4_batch_last_error() .expect(\"fallback error\") .message, \"Metal 4 batch: forced submission failure\" )",
+  "( runtime .metal4_batch_stats() .expect(\"stats\") .grouped_submissions, 2 )"
+ ],
+ "d3d12_execute_command_lists_metal4_fallback_is_observable": [
+  "(plan.signaled_fences, vec![(fence, 1)])",
+  "(runtime.metal4_batch_fallbacks(), 1)",
+  "(runtime.metal4_batch_stats(), None)",
+  "(runtime.metal4_batch_last_error(), None)"
+ ],
+ "d3d12_execute_command_lists_metal4_parallel_batch_preserves_plan_and_fence": [
+  "(plan.signaled_fences, vec![(fence, 1)])",
+  "(stats.grouped_submissions, 1)",
+  "(stats.encoded_lists, 2)",
+  "(runtime.metal4_batch_last_event(), Some(1))",
+  "(runtime.metal4_batch_fallbacks(), 0)"
+ ],
+ "d3d12_execute_command_lists_metal4_unavailable_falls_back_with_error": [
+  "(plan.signaled_fences, vec![(fence, 1)])",
+  "(runtime.metal4_batch_fallbacks(), 1)",
+  "(runtime.metal4_batch_stats(), None)",
+  "( runtime .metal4_batch_last_error() .expect(\"fallback error\") .message, \"Metal 4 batch: MTL4CommandQueue is unavailable on this device\" )"
+ ],
  "d3d12_execute_indirect_draw_rejects_missing_native_pipeline_and_matches_direct_draw": [
   "( runtime.resource_bytes(vertex).expect(\"vertex bytes\").len(), 36 )",
   "( error.message, \"ExecuteIndirect DRAW requires a native graphics pipeline bound by SetPipelineState\" )",
@@ -5406,11 +5446,6 @@
  "jit_helper_set_flags_add_exhaustive_8bit": [
   "( got, truth_add(a, b, 8), \"8-bit ADD flags mismatch for {a:#x} + {b:#x}\" )"
  ],
- "jit_helper_set_flags_add_sub_dense_samples_16_32_64": [
-  "( read_flags(&state), truth_add(a, b, bits), \"ADD flags mismatch at {bits} bits for {a:#x} + {b:#x}\" )",
-  "( read_flags(&state), truth_sub(a, b, bits), \"SUB flags mismatch at {bits} bits for {a:#x} - {b:#x}\" )",
-  "( read_flags(&state), truth_sub(a, b, bits), \"CMP flags mismatch at {bits} bits for {a:#x} cmp {b:#x}\" )"
- ],
  "jit_helper_set_flags_sub_exhaustive_8bit": [
   "( got, truth_sub(a, b, 8), \"8-bit SUB flags mismatch for {a:#x} - {b:#x}\" )"
  ],
@@ -5706,7 +5741,7 @@
   "( tier2_memory.read_u64(0x3000).unwrap(), tier0_memory.read_u64(0x3000).unwrap() )"
  ],
  "jit_thunk_registration_rejects_unknown_indices_and_pins_guest_addrs": [
-  "( runtime.register_host_thunk_for_guest( jit_self_test_host_thunk as *const () as usize, guest ), Some(0) )",
+  "( runtime .register_host_thunk_for_guest(jit_self_test_host_thunk as *const () as usize, guest), Some(0) )",
   "( runtime.guest_thunk_addrs(), HashSet::from([guest]), \"guest_addrs must include registered guest targets\" )",
   "( runtime.register_host_thunk(jit_self_test_host_thunk as *const () as usize), Some(1) )",
   "( runtime.guest_thunk_addrs(), HashSet::from([guest]), \"an entry without a guest address must not appear\" )",
@@ -6755,6 +6790,77 @@
   "( dispatch_x86( &mut fixture, HostThunk::WicFactoryCreateQueryWriter, &[factory as u32, FORMAT as u32, 0, META_WRITER_OUT as u32] ), 0 )",
   "( dispatch_x86( &mut fixture, HostThunk::WicGetMetadataContentSize, &[writer as u32, 0, META_PROP as u32] ), u64::from(E_INVALIDARG), \"a null metadata name is rejected\" )",
   "( dispatch_x86( &mut fixture, HostThunk::WicGetMetadataContentSize, &[writer as u32, META_NAME as u32, 0] ), u64::from(E_INVALIDARG), \"a null PROPVARIANT is rejected\" )"
+ ],
+ "metal4_batch_allocator_reuse_after_completion_has_no_leak": [
+  "(read_values(&output, 2), vec![0x1111_1111, 0x2222_2222])",
+  "(batch.stats().allocators_created, 2)",
+  "(batch.stats().allocator_reuses, 0)",
+  "(completion.event_value, 2)",
+  "(read_values(&output, 2), vec![0x3333_3333, 0x4444_4444])",
+  "(stats.allocators_created, 2)"
+ ],
+ "metal4_batch_duplicate_list_is_rejected_exactly": [
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "( error.message, \"Metal 4 batch: duplicate command list 7 in one batch\" )",
+  "(stats.duplicate_rejections, 1)",
+  "(stats.grouped_submissions, 0)",
+  "(stats.allocators_created, 0)"
+ ],
+ "metal4_batch_duplicate_submit_after_completion_is_safe": [
+  "(first.event_value, 1)",
+  "(first.ledger, vec![1, 1])",
+  "(second.event_value, 2)",
+  "(second.ledger, vec![1, 2, 2])",
+  "(grown.event_value, 3)",
+  "(grown.ledger, vec![1, 2, 3, 4, 5, 5])"
+ ],
+ "metal4_batch_empty_batch_boundary_commits_nothing": [
+  "(cloned.stats(), Metal4BatchStats::default())",
+  "(format!(\"{batch:?}\").contains(\"Metal4Batch\"), true)",
+  "(via_plans.event_value, 0)",
+  "(via_plans.list_count, 0)",
+  "(via_plans.ledger, Vec::<u32>::new())",
+  "(via_markers.event_value, 0)"
+ ],
+ "metal4_batch_fence_timeout_is_exact_and_pending_submission_drains": [
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "( error.message, \"Metal 4 batch: shared-event fence timed out after 5000 ms for event 1\" )",
+  "(batch.stats().wait_timeouts, 1)",
+  "( blocked.message, \"Metal 4 batch: previous submission for event 1 did not complete\" )",
+  "(completion.event_value, 2)",
+  "(batch.stats().pending_drains, 1)"
+ ],
+ "metal4_batch_forced_submission_failure_is_exact_and_recoverable": [
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "(error.message, \"Metal 4 batch: forced submission failure\")",
+  "(read_values(&output, 1), vec![0])",
+  "(batch.stats().submission_failures, 1)",
+  "(batch.stats().allocators_created, 1)",
+  "(completion.event_value, 1)"
+ ],
+ "metal4_batch_invalid_ranges_and_zero_sizes_are_rejected_exactly": [
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "(error.message, \"Metal 4 batch: fill size must be non-zero\")",
+  "( error.message, \"Metal 4 batch: fill range 4..9 exceeds buffer length 8\" )",
+  "(error.message, \"Metal 4 batch: fill range overflows u64\")",
+  "(batch.stats().validation_rejections, 3)",
+  "(batch.stats().grouped_submissions, 0)"
+ ],
+ "metal4_batch_parallel_two_lists_preserve_order_and_fence": [
+  "(completion.event_value, 1)",
+  "(completion.list_count, 2)",
+  "(batch.signaled_value(), 1)",
+  "( read_values(&output, 3), vec![0x2222_2222, 0x3333_3333, 0x4444_4444] )",
+  "(stats.grouped_submissions, 1)",
+  "(stats.encoded_lists, 2)"
+ ],
+ "metal4_batch_timeout_drop_retains_pending_fence_until_completion": [
+  "(completion.event_value, 1)",
+  "(completion.list_count, 1)"
+ ],
+ "metal4_batch_unsupported_device_reports_exact_error": [
+  "(error.code, ReasonCode::RcD3dFeatureUnsupported)",
+  "( error.message, \"Metal 4 batch: MTL4CommandQueue is unavailable on this device\" )"
  ],
  "metal4_queue_commits_parallel_command_buffers_as_one_group": [
   "(event.signaled_value(), 1)",

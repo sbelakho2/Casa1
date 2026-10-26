@@ -16973,6 +16973,11 @@ pub struct Metal4CommandBuffer {
     object: *mut objc::runtime::Object,
 }
 
+// MTL4CommandBuffer messaging is thread-safe; encoding is serialized per
+// buffer by construction, while another thread may commit/signal the queue.
+unsafe impl Send for Metal4CommandBuffer {}
+unsafe impl Sync for Metal4CommandBuffer {}
+
 impl Drop for Metal4CommandBuffer {
     fn drop(&mut self) {
         // SAFETY: +1 from newCommandBuffer. Wrappers are only built from
@@ -17002,6 +17007,123 @@ impl Metal4CommandBuffer {
             return Err(AppError::new(ReasonCode::RcD3dInvalidState, message)); // coverage: unreachable — a begun MTL4CommandBuffer vends a compute encoder
         }
         Ok(encoder)
+    }
+
+    /// Begin a compute encoder that ends itself exactly once on drop.
+    pub fn begin_compute_encoder(&self) -> AppResult<Metal4ComputeEncoder> {
+        let object = self.compute_encoder()?;
+        Ok(Metal4ComputeEncoder {
+            object,
+            ended: false,
+        })
+    }
+
+    /// Mark a residency set's allocations resident for this command buffer.
+    pub fn use_residency_set(&self, set: &MetalResidencySet) {
+        // SAFETY: live command buffer and residency set.
+        unsafe {
+            let _: () = msg_send![self.object, useResidencySet: set.object];
+        }
+    }
+}
+
+/// A begun Metal 4 compute encoder.
+///
+/// `MTL4ComputeCommandEncoder` exposes the copy/fill commands the batch
+/// executor needs; the wrapper guarantees `endEncoding` runs exactly once,
+/// including on early returns.
+pub struct Metal4ComputeEncoder {
+    object: *mut objc::runtime::Object,
+    ended: bool,
+}
+
+impl Drop for Metal4ComputeEncoder {
+    fn drop(&mut self) {
+        self.end_encoding();
+    }
+}
+
+impl Metal4ComputeEncoder {
+    /// Copy `size` bytes between two buffers.
+    pub fn copy_buffer(
+        &self,
+        source: &metal::BufferRef,
+        source_offset: u64,
+        destination: &metal::BufferRef,
+        destination_offset: u64,
+        size: u64,
+    ) {
+        let source_obj = source.as_ptr() as *mut objc::runtime::Object;
+        let destination_obj = destination.as_ptr() as *mut objc::runtime::Object;
+        // SAFETY: both buffers are live; the batch executor validated the
+        // ranges against each buffer's length before encoding.
+        unsafe {
+            let _: () = msg_send![
+                self.object,
+                copyFromBuffer: source_obj
+                sourceOffset: source_offset
+                toBuffer: destination_obj
+                destinationOffset: destination_offset
+                size: size
+            ];
+        }
+    }
+
+    /// Fill `size` bytes of a buffer with a constant byte value.
+    pub fn fill_buffer(&self, buffer: &metal::BufferRef, offset: u64, size: u64, value: u8) {
+        let buffer_obj = buffer.as_ptr() as *mut objc::runtime::Object;
+        let range = metal::NSRange {
+            location: offset,
+            length: size,
+        };
+        // SAFETY: the buffer is live; the batch executor validated the range.
+        unsafe {
+            let _: () = msg_send![self.object, fillBuffer: buffer_obj range: range value: value];
+        }
+    }
+
+    /// Wait for a producer fence before this encoder's blit-stage work.
+    pub fn wait_for_fence(&self, fence: &metal::FenceRef) {
+        const MTL_STAGE_BLIT: u64 = 1 << 28;
+        let fence_obj = fence.as_ptr() as *mut objc::runtime::Object;
+        // SAFETY: the encoder and fence are live; the caller retains both
+        // through submission and completion.
+        unsafe {
+            let _: () = msg_send![
+                self.object,
+                waitForFence: fence_obj
+                beforeEncoderStages: MTL_STAGE_BLIT
+            ];
+        }
+    }
+
+    /// Publish a producer fence after this encoder's blit-stage work.
+    pub fn update_fence(&self, fence: &metal::FenceRef) {
+        const MTL_STAGE_BLIT: u64 = 1 << 28;
+        let fence_obj = fence.as_ptr() as *mut objc::runtime::Object;
+        // SAFETY: the encoder and fence are live and retained by the caller.
+        unsafe {
+            let _: () = msg_send![
+                self.object,
+                updateFence: fence_obj
+                afterEncoderStages: MTL_STAGE_BLIT
+            ];
+        }
+    }
+
+    /// End encoding explicitly. Dropping the wrapper afterwards is a no-op.
+    pub fn end(mut self) {
+        self.end_encoding();
+    }
+
+    fn end_encoding(&mut self) {
+        if !self.ended {
+            // SAFETY: the encoder is live and has not been ended.
+            unsafe {
+                let _: () = msg_send![self.object, endEncoding];
+            }
+            self.ended = true;
+        }
     }
 }
 

@@ -18,6 +18,8 @@ fn alloc_d3d12_metal_handle() -> u64 {
 
 #[path = "d3d12_directml.rs"]
 pub mod directml;
+#[path = "metal4_batch.rs"]
+pub mod metal4_batch;
 #[path = "d3d12_state_objects.rs"]
 pub mod state_objects;
 #[path = "d3d12_work_graphs.rs"]
@@ -551,6 +553,16 @@ pub struct D3d12Runtime {
     native_command_states: BTreeMap<CommandListId, D3d12NativeCommandState>,
     /// Render-target dimensions keyed by resource.
     native_target_dimensions: BTreeMap<ResourceId, (u32, u32)>,
+    /// Metal 4 grouped executor for ExecuteCommandLists, created on first use.
+    metal4_batch: Option<metal4_batch::Metal4Batch>,
+    /// True when this host refused Metal 4; batches then use the CPU fallback.
+    metal4_batch_disabled: bool,
+    /// ExecuteCommandLists batches that used the CPU fallback.
+    metal4_batch_fallbacks: u64,
+    /// Most recent Metal 4 batch failure that caused a fallback.
+    metal4_batch_last_error: Option<AppError>,
+    /// Shared-event value of the most recent successful grouped submission.
+    metal4_batch_last_event: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -774,6 +786,11 @@ impl Default for D3d12Runtime {
             pso_native_pipelines: BTreeMap::new(),
             native_command_states: BTreeMap::new(),
             native_target_dimensions: BTreeMap::new(),
+            metal4_batch: None,
+            metal4_batch_disabled: false,
+            metal4_batch_fallbacks: 0,
+            metal4_batch_last_error: None,
+            metal4_batch_last_event: None,
         }
     }
 }
@@ -838,6 +855,11 @@ impl D3d12Runtime {
             pso_native_pipelines: BTreeMap::new(),
             native_command_states: BTreeMap::new(),
             native_target_dimensions: BTreeMap::new(),
+            metal4_batch: None,
+            metal4_batch_disabled: false,
+            metal4_batch_fallbacks: 0,
+            metal4_batch_last_error: None,
+            metal4_batch_last_event: None,
         }
     }
 
@@ -2948,6 +2970,8 @@ impl D3d12Runtime {
         streams: &[ImmutableCommandStream],
         signal: Option<(FenceId, u64)>,
     ) -> AppResult<MetalCommandBufferPlan> {
+        Self::validate_command_list_batch(streams)?;
+        self.submit_metal4_batch(streams);
         // Drain queued WriteBufferImmediate requests; the aliasing overlap
         // set is also reset so both stay bounded across frames.
         self.drain_pending_immediate_writes();
@@ -2973,10 +2997,99 @@ impl D3d12Runtime {
         streams: &[ImmutableCommandStream],
         signal: Option<(FenceId, u64)>,
     ) -> AppResult<MetalCommandBufferPlan> {
+        Self::validate_command_list_batch(streams)?;
+        self.submit_metal4_batch(streams);
         self.drain_pending_immediate_writes();
         self.clear_aliasing_overlaps();
         self.backend
             .execute_command_lists_parallel(queue, streams, signal)
+    }
+
+    /// Reject the same command list appearing twice in one ExecuteCommandLists
+    /// batch. D3D12 permits re-executing a closed list in a later batch, but a
+    /// duplicate inside one batch would alias two Metal 4 encodings.
+    fn validate_command_list_batch(streams: &[ImmutableCommandStream]) -> AppResult<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for stream in streams {
+            if !seen.insert(stream.id) {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "D3D12 ExecuteCommandLists: duplicate command list {} in one batch",
+                        stream.id
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode the batch into Metal 4 command buffers and submit it as one
+    /// group when the host supports Metal 4. Failures fall back to the
+    /// authoritative CPU execution path and stay observable through the
+    /// fallback counters; they never alter the returned plan.
+    fn submit_metal4_batch(&mut self, streams: &[ImmutableCommandStream]) {
+        if streams.is_empty() {
+            return;
+        }
+        if self.metal4_batch_disabled {
+            self.metal4_batch_fallbacks += 1;
+            return;
+        }
+        if self.metal4_batch.is_none() {
+            match metal4_batch::Metal4Batch::new() {
+                Ok(batch) => self.metal4_batch = Some(batch),
+                Err(error) => {
+                    self.metal4_batch_disabled = true;
+                    self.metal4_batch_fallbacks += 1;
+                    self.metal4_batch_last_error = Some(error);
+                    return;
+                }
+            }
+        }
+        let ids: Vec<CommandListId> = streams.iter().map(|stream| stream.id).collect();
+        let result = self
+            .metal4_batch
+            .as_mut()
+            .expect("Metal 4 batch was initialised above")
+            .execute_markers(&ids);
+        match result {
+            Ok(completion) => {
+                self.metal4_batch_last_error = None;
+                self.metal4_batch_last_event = Some(completion.event_value);
+            }
+            Err(error) => {
+                self.metal4_batch_fallbacks += 1;
+                self.metal4_batch_last_error = Some(error);
+            }
+        }
+    }
+
+    /// Metal 4 grouped-submission counters, if a batch has been created.
+    pub fn metal4_batch_stats(&self) -> Option<metal4_batch::Metal4BatchStats> {
+        self.metal4_batch
+            .as_ref()
+            .map(metal4_batch::Metal4Batch::stats)
+    }
+
+    /// ExecuteCommandLists batches that used the CPU fallback.
+    pub fn metal4_batch_fallbacks(&self) -> u64 {
+        self.metal4_batch_fallbacks
+    }
+
+    /// Most recent Metal 4 batch failure that caused a fallback.
+    pub fn metal4_batch_last_error(&self) -> Option<&AppError> {
+        self.metal4_batch_last_error.as_ref()
+    }
+
+    /// Shared-event value of the most recent successful grouped submission.
+    pub fn metal4_batch_last_event(&self) -> Option<u64> {
+        self.metal4_batch_last_event
+    }
+
+    #[cfg(test)]
+    fn disable_metal4_batch_for_test(&mut self) {
+        self.metal4_batch_disabled = true;
     }
 
     /// Analyse barrier hazards across command streams without executing them.
@@ -13074,5 +13187,181 @@ entry:
                 "MetalFX present: NV12 swapchains are not supported by the MetalFX present path"
             );
         }
+    }
+
+    fn closed_stream(runtime: &mut D3d12Runtime) -> ImmutableCommandStream {
+        let root_signature = runtime.create_root_signature(RootSignatureDesc::default());
+        let pipeline_state = runtime.create_pipeline_state(
+            root_signature,
+            PipelineStateDesc {
+                label: "metal4-batch".to_string(),
+                compute: false,
+                render_target_formats: vec![DxgiFormat::R8G8B8A8Unorm],
+                depth_format: None,
+            },
+        );
+        let allocator = runtime.create_command_allocator();
+        let list = runtime.create_graphics_command_list(allocator, pipeline_state, false);
+        runtime
+            .close_command_list(list)
+            .expect("close empty command list")
+    }
+
+    #[test]
+    fn d3d12_execute_command_lists_metal4_parallel_batch_preserves_plan_and_fence() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        if !crate::metal_backend::Metal4Queue::is_supported(&device) {
+            return;
+        }
+        let mut runtime = D3d12Runtime::new();
+        let queue = runtime.create_command_queue();
+        let fence = runtime.create_fence(0);
+        let first = closed_stream(&mut runtime);
+        let second = closed_stream(&mut runtime);
+        let plan = runtime
+            .execute_command_lists_parallel(queue, &[first, second], Some((fence, 1)))
+            .expect("grouped ExecuteCommandLists");
+        assert_eq!(plan.signaled_fences, vec![(fence, 1)]);
+        let stats = runtime.metal4_batch_stats().expect("Metal 4 stats");
+        assert_eq!(stats.grouped_submissions, 1);
+        assert_eq!(stats.encoded_lists, 2);
+        assert_eq!(runtime.metal4_batch_last_event(), Some(1));
+        assert_eq!(runtime.metal4_batch_fallbacks(), 0);
+    }
+
+    #[test]
+    fn d3d12_execute_command_lists_duplicate_batch_is_rejected_exactly() {
+        let mut runtime = D3d12Runtime::new();
+        let queue = runtime.create_command_queue();
+        let stream = closed_stream(&mut runtime);
+        let duplicate = ImmutableCommandStream {
+            id: stream.id,
+            commands: stream.commands.clone(),
+        };
+        let error = runtime
+            .execute_command_lists(queue, &[stream.clone(), duplicate], None)
+            .expect_err("duplicate list must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!(
+                "D3D12 ExecuteCommandLists: duplicate command list {} in one batch",
+                stream.id
+            )
+        );
+        assert_eq!(runtime.metal4_batch_fallbacks(), 0);
+        assert_eq!(runtime.metal4_batch_stats(), None);
+    }
+
+    #[test]
+    fn d3d12_execute_command_lists_metal4_unavailable_falls_back_with_error() {
+        metal4_batch::force_unsupported(true);
+        let mut runtime = D3d12Runtime::new();
+        let queue = runtime.create_command_queue();
+        let fence = runtime.create_fence(0);
+        let stream = closed_stream(&mut runtime);
+        let plan = runtime
+            .execute_command_lists(queue, &[stream], Some((fence, 1)))
+            .expect("fallback ExecuteCommandLists");
+        metal4_batch::force_unsupported(false);
+        assert_eq!(plan.signaled_fences, vec![(fence, 1)]);
+        assert_eq!(runtime.metal4_batch_fallbacks(), 1);
+        assert_eq!(runtime.metal4_batch_stats(), None);
+        assert_eq!(
+            runtime
+                .metal4_batch_last_error()
+                .expect("fallback error")
+                .message,
+            "Metal 4 batch: MTL4CommandQueue is unavailable on this device"
+        );
+    }
+
+    #[test]
+    fn d3d12_execute_command_lists_empty_batch_boundary_is_no_op() {
+        let mut runtime = D3d12Runtime::new();
+        let queue = runtime.create_command_queue();
+        let plan = runtime
+            .execute_command_lists(queue, &[], None)
+            .expect("empty ExecuteCommandLists");
+        assert_eq!(plan.render_passes.len(), 0);
+        assert_eq!(plan.compute_passes, 0);
+        assert_eq!(plan.blit_passes, 0);
+        assert_eq!(plan.signaled_fences, Vec::new());
+        assert_eq!(runtime.metal4_batch_stats(), None);
+        assert_eq!(runtime.metal4_batch_last_event(), None);
+    }
+
+    #[test]
+    fn d3d12_execute_command_lists_metal4_fallback_is_observable() {
+        let mut runtime = D3d12Runtime::new();
+        runtime.disable_metal4_batch_for_test();
+        let queue = runtime.create_command_queue();
+        let fence = runtime.create_fence(0);
+        let stream = closed_stream(&mut runtime);
+        let plan = runtime
+            .execute_command_lists(queue, &[stream], Some((fence, 1)))
+            .expect("fallback ExecuteCommandLists");
+        assert_eq!(plan.signaled_fences, vec![(fence, 1)]);
+        assert_eq!(runtime.metal4_batch_fallbacks(), 1);
+        assert_eq!(runtime.metal4_batch_stats(), None);
+        assert_eq!(runtime.metal4_batch_last_error(), None);
+    }
+
+    #[test]
+    fn d3d12_execute_command_lists_metal4_failure_falls_back_with_counter() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        if !crate::metal_backend::Metal4Queue::is_supported(&device) {
+            return;
+        }
+        let mut runtime = D3d12Runtime::new();
+        let queue = runtime.create_command_queue();
+        let first_fence = runtime.create_fence(0);
+        let first = closed_stream(&mut runtime);
+        runtime
+            .execute_command_lists(queue, &[first], Some((first_fence, 1)))
+            .expect("initial Metal 4 batch");
+        assert_eq!(
+            runtime
+                .metal4_batch_stats()
+                .expect("stats")
+                .grouped_submissions,
+            1
+        );
+
+        metal4_batch::force_submission_failure(true);
+        let failed_fence = runtime.create_fence(0);
+        let failed = closed_stream(&mut runtime);
+        let plan = runtime
+            .execute_command_lists(queue, &[failed], Some((failed_fence, 1)))
+            .expect("CPU fallback after Metal 4 failure");
+        metal4_batch::force_submission_failure(false);
+        assert_eq!(plan.signaled_fences, vec![(failed_fence, 1)]);
+        assert_eq!(runtime.metal4_batch_fallbacks(), 1);
+        assert_eq!(
+            runtime
+                .metal4_batch_last_error()
+                .expect("fallback error")
+                .message,
+            "Metal 4 batch: forced submission failure"
+        );
+
+        let recovered_fence = runtime.create_fence(0);
+        let recovered = closed_stream(&mut runtime);
+        runtime
+            .execute_command_lists(queue, &[recovered], Some((recovered_fence, 1)))
+            .expect("recovered Metal 4 batch");
+        assert_eq!(
+            runtime
+                .metal4_batch_stats()
+                .expect("stats")
+                .grouped_submissions,
+            2
+        );
+        assert_eq!(runtime.metal4_batch_fallbacks(), 1);
+        assert_eq!(runtime.metal4_batch_last_error(), None);
     }
 }
