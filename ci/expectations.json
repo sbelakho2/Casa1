@@ -1779,8 +1779,7 @@
  ],
  "d3d12_dml_dll_imports_resolve_and_reject_unsupported_registry_export": [
   "(dll, \"dml.dll\")",
-  "(symbol, \"DMLCreateOperatorRegistry\")",
-  "(state.get(Register::Rax), 0)"
+  "(symbol, \"DMLCreateOperatorRegistry\")"
  ],
  "d3d12_execute_indirect_draw_rejects_missing_native_pipeline_and_matches_direct_draw": [
   "( runtime.resource_bytes(vertex).expect(\"vertex bytes\").len(), 36 )",
@@ -6796,6 +6795,86 @@
   "( MetalIoError::Unsupported.to_string(), \"MTLIOCommandQueue requires macOS 13 or newer\" )",
   "( MetalIoError::EmptyLoad.to_string(), \"Metal I/O load size must be non-zero\" )",
   "( MetalIoError::FileNotFound(missing.clone()).to_string(), format!(\"Metal I/O source not found: {}\", missing.display()) )"
+ ],
+ "metalfx_present_additional_swapchain_paths_scale_and_fallback": [
+  "(runtime.metalfx_scaled_present_count(), 1)",
+  "(frame.width, 8)",
+  "(frame.height, 4)",
+  "(frame.format, DxgiFormat::R8G8B8A8Unorm)",
+  "(runtime.metalfx_scaled_present_count(), 0)",
+  "(runtime.metalfx_fallback_count(), 1)"
+ ],
+ "metalfx_present_nv12_and_missing_channel_fall_back_with_exact_errors": [
+  "(runtime.metalfx_scaled_present_count(), 0)",
+  "(runtime.metalfx_fallback_count(), 1)",
+  "(error.code, ReasonCode::RcD3dFeatureUnsupported)",
+  "( error.message, \"MetalFX present: NV12 swapchains are not supported by the MetalFX present path\" )",
+  "(runtime.presented_frame(nv12).expect(\"NV12 frame\").width, 4)",
+  "(runtime.disable_metalfx_present(nv12), true)"
+ ],
+ "metalfx_present_rejects_unsupported_mode_format_and_sizes_before_enabling": [
+  "(runtime.metalfx_present_configured(swapchain), false)",
+  "(temporal.code, ReasonCode::RcD3dFeatureUnsupported)",
+  "( temporal.message, \"MetalFX present: temporal mode requires per-frame depth and motion textures and is \\ not supported by the DXGI present path\" )",
+  "(zero.code, ReasonCode::RcInvalidParameter)",
+  "( zero.message, \"MetalFX present: output size 0x4 must be non-zero\" )"
+ ],
+ "metalfx_present_scales_known_pattern_and_resize_failure_falls_back_exactly": [
+  "(runtime.metalfx_present_configured(swapchain), true)",
+  "(runtime.metalfx_present_options(swapchain), Some(options))",
+  "(runtime.metalfx_scaled_present_count(), 1)",
+  "(runtime.metalfx_fallback_count(), 0)",
+  "(frame.width, 8)",
+  "(frame.height, 4)"
+ ],
+ "metalfx_spatial_known_pattern_readback_and_lifecycle": [
+  "(scaler.config(), &config)",
+  "(scaler.input_content_size(), (4, 4))",
+  "(format!(\"{scaler:?}\").contains(\"SpatialScaler\"), true)",
+  "(error.code, ReasonCode::RcInvalidParameter)",
+  "( error.message, \"MetalFX spatial: input content size 0x4 must be non-zero\" )"
+ ],
+ "metalfx_spatial_rejects_bad_sizes_and_mismatched_formats": [
+  "(error.code, ReasonCode::RcInvalidParameter)",
+  "( error.message, \"MetalFX spatial: input size 0x4 must be non-zero\" )",
+  "( error.message, \"MetalFX spatial: output size 8x0 must be non-zero\" )",
+  "( error.message, \"MetalFX spatial: output 2x8 must be at least input 4x4\" )"
+ ],
+ "metalfx_temporal_reactive_mask_requires_enabled_and_matching_texture": [
+  "(error.code, ReasonCode::RcInvalidParameter)",
+  "( error.message, \"MetalFX temporal: reactive mask texture is required when the descriptor enables a reactive mask\" )",
+  "(error.code, ReasonCode::RcGfxFormatUnsupported)",
+  "( error.message, \"MetalFX temporal: reactive mask texture format RG16Float does not match descriptor R8Unorm\" )",
+  "( error.message, \"MetalFX temporal: reactive mask texture 32x32 does not match expected 16x16\" )"
+ ],
+ "metalfx_temporal_rejects_missing_history_inputs_and_double_reset_lifecycle": [
+  "(spatial_supported(device.as_ref()), true)",
+  "(metal_fx_available(), true)",
+  "(scaler.config(), &config)",
+  "(scaler.input_content_size(), (16, 16))",
+  "(format!(\"{scaler:?}\").contains(\"TemporalScaler\"), true)",
+  "(scaler.history_valid(), false)"
+ ],
+ "metalfx_temporal_rejects_unsupported_depth_motion_and_reactive_formats": [
+  "(error.code, ReasonCode::RcInvalidParameter)",
+  "( error.message, \"MetalFX temporal: input size 8x8 is below the 16x16 minimum required by MetalFX\" )",
+  "( error.message, \"MetalFX temporal: output 8x8 must be at least input 16x16\" )",
+  "(error.code, ReasonCode::RcGfxFormatUnsupported)",
+  "( error.message, \"MetalFX temporal: unsupported depth format Depth24Unorm_Stencil8 (supported: Depth32Float)\" )"
+ ],
+ "metalfx_unavailable_reports_exact_unsupported_error": [
+  "(spatial.code, ReasonCode::RcUnsupportedPlatformApi)",
+  "( spatial.message, \"MetalFX is unavailable: MetalFX.framework did not expose \\ MTLFXSpatialScalerDescriptor on this host\" )",
+  "(temporal.code, ReasonCode::RcUnsupportedPlatformApi)",
+  "( temporal.message, \"MetalFX is unavailable: MetalFX.framework did not expose \\ MTLFXTemporalScalerDescriptor on this host\" )"
+ ],
+ "metalfx_unsupported_device_and_reactive_selector_report_exact_errors": [
+  "(spatial.code, ReasonCode::RcD3dFeatureUnsupported)",
+  "( spatial.message, \"MetalFX spatial scaling is not supported by this Metal device\" )",
+  "(temporal_device.code, ReasonCode::RcD3dFeatureUnsupported)",
+  "( temporal_device.message, \"MetalFX temporal scaling is not supported by this Metal device\" )",
+  "(temporal.code, ReasonCode::RcUnsupportedPlatformApi)",
+  "( temporal.message, \"MetalFX temporal: reactive masks require macOS 14.4 \\ (setReactiveMaskTextureEnabled: is unavailable)\" )"
  ],
  "mf_begin_get_event_cancel_prevents_callback": [
   "( begin_get_event(&mut runtime, &mut memory, graph.source, MF_CB_OBJECT), u64::from(0x8000_000A_u32) )",

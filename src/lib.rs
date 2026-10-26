@@ -195,6 +195,7 @@ pub mod logging;
 pub mod mac_window;
 pub mod media;
 pub mod metal_backend;
+pub mod metal_fx;
 pub mod metal_renderer;
 pub mod midi;
 pub mod network;

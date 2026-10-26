@@ -59,6 +59,56 @@ pub struct D3d12DeviceInfo {
     pub features: D3d12FeatureOptions,
 }
 
+/// MetalFX mode requested for the opt-in DXGI present path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetalFxPresentMode {
+    /// Spatial upscaling; the only mode the present path can drive without
+    /// per-frame temporal inputs.
+    Spatial,
+    /// Temporal upscaling. The wrapper supports it directly, but a DXGI
+    /// present would need depth/motion textures, so opting the present path
+    /// into it is rejected explicitly instead of silently degrading quality.
+    Temporal,
+}
+
+/// Explicit opt-in configuration for the MetalFX DXGI present path.
+///
+/// The present path never enables MetalFX on its own. Enabling requires both a
+/// real scaler (or an exact unsupported error) and an explicit output size, so
+/// the quality change is always caller-visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalFxPresentOptions {
+    pub mode: MetalFxPresentMode,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub color_processing_mode: crate::metal_fx::MetalFxColorProcessingMode,
+}
+
+impl MetalFxPresentOptions {
+    /// Spatial upscale to `output_width` x `output_height`.
+    pub fn spatial(output_width: u32, output_height: u32) -> Self {
+        Self {
+            mode: MetalFxPresentMode::Spatial,
+            output_width,
+            output_height,
+            color_processing_mode: crate::metal_fx::MetalFxColorProcessingMode::Perceptual,
+        }
+    }
+}
+
+/// A configured MetalFX present path for one swapchain.
+#[derive(Debug)]
+struct MetalFxPresentState {
+    options: MetalFxPresentOptions,
+    config: crate::metal_fx::SpatialScalerConfig,
+    scaler: crate::metal_fx::SpatialScaler,
+    command_queue: metal::CommandQueue,
+    output_texture: metal::Texture,
+    output_alias: metal::Texture,
+    output_channel: crate::metal_backend::IoSurfacePresentChannel,
+    output_format: DxgiFormat,
+}
+
 /// The decoded Metal sampler configuration for a D3D12_FILTER value.
 ///
 /// The reduction field is carried as the real [`D3D12FilterReduction`] enum:
@@ -455,6 +505,19 @@ pub struct D3d12Runtime {
     /// Requests for a swapchain format this host could not represent; the
     /// request fell back to the caller's typed format.
     swapchain_format_fallbacks: u64,
+    /// Opt-in MetalFX present state keyed by swapchain. Empty unless a caller
+    /// explicitly called [`D3d12Runtime::enable_metalfx_present`].
+    metalfx_present: BTreeMap<SwapchainId, std::sync::Arc<std::sync::Mutex<MetalFxPresentState>>>,
+    /// Presents that succeeded through MetalFX.
+    metalfx_scaled_presents: u64,
+    /// Presents that fell back to the existing path after MetalFX failed.
+    metalfx_fallbacks: u64,
+    /// Most recent MetalFX present error (kept observable even after a
+    /// fallback, so a quality downgrade is never silent).
+    metalfx_last_error: Option<AppError>,
+    /// Swapchain whose frame was produced by MetalFX on the last successful
+    /// present, if any.
+    metalfx_last_scaled_swapchain: Option<SwapchainId>,
     /// Textures created through the DirectStorage / initial-data path, keyed by
     /// the translated resource id.
     gpu_textures: BTreeMap<ResourceId, crate::metal_backend::DirectStorageTexture>,
@@ -557,6 +620,104 @@ fn build_nv12_channels(
     Some(channels)
 }
 
+/// DXGI format of the IOSurface-backed MetalFX output texture.
+fn metalfx_output_dxgi_format(format: metal::MTLPixelFormat) -> DxgiFormat {
+    match format {
+        metal::MTLPixelFormat::BGRA8Unorm => DxgiFormat::B8G8R8A8Unorm,
+        _ => DxgiFormat::R8G8B8A8Unorm,
+    }
+}
+
+#[rustfmt::skip]
+fn unreachable_no_metal_device_error() -> AppError { AppError::new(ReasonCode::RcD3dInvalidState, "MetalFX present: no Metal device available") } // coverage: unreachable — the system default Metal device exists on this host
+#[rustfmt::skip]
+fn unreachable_scaler_status_error(status: metal::MTLCommandBufferStatus) -> AppError { AppError::new(ReasonCode::RcD3dInvalidState, format!("MetalFX present: scaler command buffer completed with status {status:?}")) } // coverage: unreachable — a valid MetalFX encode plus blit completes
+
+/// Build a real spatial scaler plus the private output texture and the
+/// IOSurface alias that present binds.
+fn build_metalfx_present_state(
+    desc: &SwapchainDesc,
+    options: MetalFxPresentOptions,
+) -> AppResult<MetalFxPresentState> {
+    if options.mode != MetalFxPresentMode::Spatial {
+        return Err(AppError::new(
+            ReasonCode::RcD3dFeatureUnsupported,
+            "MetalFX present: temporal mode requires per-frame depth and motion textures and is \
+             not supported by the DXGI present path",
+        ));
+    }
+    if options.output_width == 0 || options.output_height == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcInvalidParameter,
+            format!(
+                "MetalFX present: output size {}x{} must be non-zero",
+                options.output_width, options.output_height
+            ),
+        ));
+    }
+    if options.output_width < desc.width || options.output_height < desc.height {
+        return Err(AppError::new(
+            ReasonCode::RcInvalidParameter,
+            format!(
+                "MetalFX present: output {}x{} must be at least the swapchain size {}x{}",
+                options.output_width, options.output_height, desc.width, desc.height
+            ),
+        ));
+    }
+    let input_format = crate::metal_backend::dxgi_to_metal_format(desc.format);
+    if !crate::metal_fx::is_supported_present_format(input_format) {
+        return Err(AppError::new(
+            ReasonCode::RcGfxFormatUnsupported,
+            format!(
+                "MetalFX present: swapchain format {:?} ({input_format:?}) is not supported; the \
+                 DXGI present path requires B8G8R8A8Unorm or R8G8B8A8Unorm",
+                desc.format
+            ),
+        ));
+    }
+    let config = crate::metal_fx::SpatialScalerConfig {
+        input_width: desc.width,
+        input_height: desc.height,
+        output_width: options.output_width,
+        output_height: options.output_height,
+        color_format: input_format,
+        output_format: input_format,
+        color_processing_mode: options.color_processing_mode,
+    };
+    let Some(device) = metal::Device::system_default() else {
+        return Err(unreachable_no_metal_device_error()); // coverage: unreachable — the system default Metal device exists
+    };
+    let scaler = crate::metal_fx::SpatialScaler::new(device.as_ref(), config)?;
+    let mut output_channel = crate::metal_backend::IoSurfacePresentChannel::new(
+        options.output_width,
+        options.output_height,
+        input_format,
+    )?; // coverage: unreachable — validated output sizes allocate an IOSurface on this host
+    let output_alias = output_channel.metal_texture()?.to_owned();
+
+    let descriptor = metal::TextureDescriptor::new();
+    descriptor.set_texture_type(metal::MTLTextureType::D2);
+    descriptor.set_pixel_format(input_format);
+    descriptor.set_width(options.output_width as u64);
+    descriptor.set_height(options.output_height as u64);
+    descriptor
+        .set_usage(metal::MTLTextureUsage::ShaderWrite | metal::MTLTextureUsage::RenderTarget);
+    descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+    descriptor.set_sample_count(1);
+    let output_texture = device.new_texture(&descriptor);
+
+    Ok(MetalFxPresentState {
+        options,
+        config,
+        scaler,
+        command_queue: device.new_command_queue(),
+        output_texture,
+        output_alias,
+        output_channel,
+        output_format: metalfx_output_dxgi_format(input_format),
+    })
+}
+
 impl Default for D3d12Runtime {
     fn default() -> Self {
         Self {
@@ -594,6 +755,11 @@ impl Default for D3d12Runtime {
             extra_swapchains: BTreeMap::new(),
             nv12_presents: 0,
             swapchain_format_fallbacks: 0,
+            metalfx_present: BTreeMap::new(),
+            metalfx_scaled_presents: 0,
+            metalfx_fallbacks: 0,
+            metalfx_last_error: None,
+            metalfx_last_scaled_swapchain: None,
             gpu_textures: BTreeMap::new(),
             directstorage_bytes: 0,
             staging_bytes: 0,
@@ -653,6 +819,11 @@ impl D3d12Runtime {
             extra_swapchains: BTreeMap::new(),
             nv12_presents: 0,
             swapchain_format_fallbacks: 0,
+            metalfx_present: BTreeMap::new(),
+            metalfx_scaled_presents: 0,
+            metalfx_fallbacks: 0,
+            metalfx_last_error: None,
+            metalfx_last_scaled_swapchain: None,
             gpu_textures: BTreeMap::new(),
             directstorage_bytes: 0,
             staging_bytes: 0,
@@ -939,6 +1110,178 @@ impl D3d12Runtime {
         self.backend.query_format_support(format)
     }
 
+    /// Opt the DXGI present path into MetalFX spatial upscaling.
+    ///
+    /// This is the only way MetalFX is activated for presents: nothing changes
+    /// quality unless the caller invokes this method. Unsupported hosts,
+    /// swapchain formats, modes and sizes return an exact error and leave the
+    /// existing present path untouched.
+    pub fn enable_metalfx_present(
+        &mut self,
+        swapchain: SwapchainId,
+        options: MetalFxPresentOptions,
+    ) -> AppResult<()> {
+        let desc = self.backend.swapchain_state(swapchain)?.desc;
+        let state = build_metalfx_present_state(&desc, options)?;
+        self.metalfx_present
+            .insert(swapchain, std::sync::Arc::new(std::sync::Mutex::new(state)));
+        self.metalfx_last_error = None;
+        self.metalfx_last_scaled_swapchain = None;
+        Ok(())
+    }
+
+    /// Disable MetalFX for `swapchain`; returns whether a configuration existed.
+    pub fn disable_metalfx_present(&mut self, swapchain: SwapchainId) -> bool {
+        if self.metalfx_last_scaled_swapchain == Some(swapchain) {
+            self.metalfx_last_scaled_swapchain = None;
+        }
+        self.metalfx_present.remove(&swapchain).is_some()
+    }
+
+    /// Whether `swapchain` has an explicit MetalFX present configuration.
+    pub fn metalfx_present_configured(&self, swapchain: SwapchainId) -> bool {
+        self.metalfx_present.contains_key(&swapchain)
+    }
+
+    /// The exact options the caller opted into, when configured.
+    pub fn metalfx_present_options(&self, swapchain: SwapchainId) -> Option<MetalFxPresentOptions> {
+        self.metalfx_present
+            .get(&swapchain)
+            .and_then(|state| state.lock().ok().map(|state| state.options))
+    }
+
+    /// Presents that actually ran through MetalFX.
+    pub fn metalfx_scaled_present_count(&self) -> u64 {
+        self.metalfx_scaled_presents
+    }
+
+    /// Presents or resize refreshes that fell back after a MetalFX failure.
+    pub fn metalfx_fallback_count(&self) -> u64 {
+        self.metalfx_fallbacks
+    }
+
+    /// The last MetalFX failure, retained even after falling back so the
+    /// quality downgrade stays observable.
+    pub fn metalfx_last_error(&self) -> Option<&AppError> {
+        self.metalfx_last_error.as_ref()
+    }
+
+    fn record_metalfx_fallback(&mut self, error: AppError) {
+        self.metalfx_fallbacks += 1;
+        self.metalfx_last_error = Some(error);
+    }
+
+    /// Rebuild the scaler and output surface after a swapchain resize. A
+    /// configuration that no longer fits is dropped and reported through the
+    /// fallback counters; the normal present path keeps working.
+    fn refresh_metalfx_present(&mut self, swapchain: SwapchainId, desc: &SwapchainDesc) {
+        let Some(options) = self
+            .metalfx_present
+            .get(&swapchain)
+            .and_then(|state| state.lock().ok().map(|state| state.options))
+        else {
+            return;
+        };
+        match build_metalfx_present_state(desc, options) {
+            Ok(state) => {
+                self.metalfx_present
+                    .insert(swapchain, std::sync::Arc::new(std::sync::Mutex::new(state)));
+                self.metalfx_last_error = None;
+            }
+            Err(error) => {
+                self.metalfx_present.remove(&swapchain);
+                self.metalfx_last_scaled_swapchain = None;
+                self.record_metalfx_fallback(error);
+            }
+        }
+    }
+
+    /// Encode one MetalFX spatial upscale from the swapchain's IOSurface
+    /// texture into the configured output surface. Returns `None` (and records
+    /// the exact error) so the caller can present through the existing path.
+    fn try_metalfx_present(
+        &mut self,
+        swapchain: SwapchainId,
+    ) -> Option<(crate::metal_backend::IoSurfacePresentChannel, DxgiFormat)> {
+        let Some(state) = self.metalfx_present.get(&swapchain).cloned() else {
+            return None;
+        };
+        match self.encode_metalfx_frame(swapchain, &state) {
+            Ok(presented) => {
+                self.metalfx_last_error = None;
+                Some(presented)
+            }
+            Err(error) => {
+                self.record_metalfx_fallback(error);
+                None
+            }
+        }
+    }
+
+    fn encode_metalfx_frame(
+        &mut self,
+        swapchain: SwapchainId,
+        state: &std::sync::Arc<std::sync::Mutex<MetalFxPresentState>>,
+    ) -> AppResult<(crate::metal_backend::IoSurfacePresentChannel, DxgiFormat)> {
+        let is_primary = self.present_swapchain == Some(swapchain);
+        let nv12 = if is_primary {
+            !self.primary_nv12.is_empty()
+        } else {
+            self.extra_swapchains
+                .get(&swapchain)
+                .map(|set| !set.nv12.is_empty())
+                .unwrap_or(false)
+        };
+        if nv12 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dFeatureUnsupported,
+                "MetalFX present: NV12 swapchains are not supported by the MetalFX present path",
+            ));
+        }
+        let source = if is_primary {
+            self.iosurface_channels.first_mut()
+        } else {
+            self.extra_swapchains
+                .get_mut(&swapchain)
+                .and_then(|set| set.pixel.first_mut())
+        };
+        let Some(source) = source else {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("MetalFX present: swapchain {swapchain} has no pixel present channel"),
+            ));
+        };
+        let source_texture = source.metal_texture()?.to_owned();
+        let state = state.lock().expect("MetalFX present state lock poisoned");
+        let command_buffer = state.command_queue.new_command_buffer();
+        state
+            .scaler
+            .encode(command_buffer, &source_texture, &state.output_texture)?;
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture(
+            &state.output_texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize::new(
+                state.config.output_width as u64,
+                state.config.output_height as u64,
+                1,
+            ),
+            &state.output_alias,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
+            return Err(unreachable_scaler_status_error(command_buffer.status())); // coverage: unreachable — a valid encode plus blit completes
+        }
+        Ok((state.output_channel.clone(), state.output_format))
+    }
+
     pub fn create_swapchain(&mut self, desc: SwapchainDesc) -> AppResult<SwapchainId> {
         let swapchain = self.backend.create_swapchain(desc.clone())?;
         // Capability + allocation probe; on failure presents use the
@@ -1091,6 +1434,8 @@ impl D3d12Runtime {
                 set.nv12.clear();
             }
         }
+        let desc = self.backend.swapchain_state(swapchain)?.desc;
+        self.refresh_metalfx_present(swapchain, &desc);
         Ok(())
     }
 
@@ -1119,6 +1464,7 @@ impl D3d12Runtime {
                 .map(|set| set.pixel.len())
                 .unwrap_or(0)
         };
+        let metalfx_output = self.try_metalfx_present(swapchain);
 
         if nv12_len > 0 {
             if nv12_len != backbuffer_ids.len() {
@@ -1212,7 +1558,10 @@ impl D3d12Runtime {
                 }
             }
             channels[0].metal_texture()?;
-            let presented = channels[0].clone();
+            let presented = metalfx_output
+                .clone()
+                .map(|(channel, _)| channel)
+                .unwrap_or_else(|| channels[0].clone());
             self.iosurface_presents += 1;
             self.backend.set_presented_surface(Some(presented));
         } else {
@@ -1220,11 +1569,37 @@ impl D3d12Runtime {
             self.backend.set_presented_nv12_surface(None);
             self.fallback_uploads += backbuffer_ids.len() as u64;
         }
-        self.backend
-            .present(swapchain, sync_interval, allow_tearing)
+        let used_metalfx = metalfx_output.is_some();
+        let result = self
+            .backend
+            .present(swapchain, sync_interval, allow_tearing);
+        if result.is_ok() {
+            if used_metalfx {
+                self.metalfx_scaled_presents += 1;
+                self.metalfx_last_scaled_swapchain = Some(swapchain);
+            } else {
+                self.metalfx_last_scaled_swapchain = None;
+            }
+        } // coverage: unreachable — lcov attributes the if-join to this brace
+        result
     }
 
     pub fn presented_frame(&self, swapchain: SwapchainId) -> AppResult<PresentedFrame> {
+        if self.metalfx_last_scaled_swapchain == Some(swapchain) {
+            if let Some(state) = self.metalfx_present.get(&swapchain) {
+                let state = state.lock().expect("MetalFX present state lock poisoned");
+                return Ok(PresentedFrame {
+                    width: state.output_channel.width(),
+                    height: state.output_channel.height(),
+                    format: state.output_format,
+                    bytes: state.output_channel.read_pixels()?,
+                    source: crate::gfx::FrameSource::DxgiD3D12,
+                    stride: state.output_channel.width() as usize * 4,
+                    sequence: self.iosurface_presents,
+                    timestamp: std::time::Instant::now(),
+                });
+            }
+        }
         let is_primary = self.present_swapchain == Some(swapchain);
         if is_primary {
             if let Some(channel) = self.primary_nv12.first() {
@@ -12397,5 +12772,307 @@ entry:
             D3d12Runtime::translate_ray_pipeline(&mismatch).expect("metadata raygen");
         assert_eq!(entry.as_deref(), Some("raygen"));
         assert_eq!(source.expect("ray msl").contains("query.intersect"), true);
+    }
+
+    fn metalfx_swapchain(runtime: &mut D3d12Runtime) -> SwapchainId {
+        runtime
+            .create_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create MetalFX swapchain")
+    }
+
+    #[test]
+    fn metalfx_present_rejects_unsupported_mode_format_and_sizes_before_enabling() {
+        let mut runtime = D3d12Runtime::from_backend(GraphicsBackend::new());
+        let swapchain = metalfx_swapchain(&mut runtime);
+        assert_eq!(runtime.metalfx_present_configured(swapchain), false);
+
+        let temporal = runtime
+            .enable_metalfx_present(
+                swapchain,
+                MetalFxPresentOptions {
+                    mode: MetalFxPresentMode::Temporal,
+                    output_width: 8,
+                    output_height: 4,
+                    color_processing_mode: crate::metal_fx::MetalFxColorProcessingMode::Linear,
+                },
+            )
+            .expect_err("the DXGI present path cannot drive temporal scaling");
+        assert_eq!(temporal.code, ReasonCode::RcD3dFeatureUnsupported);
+        assert_eq!(
+            temporal.message,
+            "MetalFX present: temporal mode requires per-frame depth and motion textures and is \
+             not supported by the DXGI present path"
+        );
+        assert_eq!(runtime.metalfx_present_configured(swapchain), false);
+
+        let zero = runtime
+            .enable_metalfx_present(swapchain, MetalFxPresentOptions::spatial(0, 4))
+            .expect_err("zero output width must be rejected");
+        assert_eq!(zero.code, ReasonCode::RcInvalidParameter);
+        assert_eq!(
+            zero.message,
+            "MetalFX present: output size 0x4 must be non-zero"
+        );
+
+        let small = runtime
+            .enable_metalfx_present(swapchain, MetalFxPresentOptions::spatial(2, 4))
+            .expect_err("output narrower than the swapchain must be rejected");
+        assert_eq!(small.code, ReasonCode::RcInvalidParameter);
+        assert_eq!(
+            small.message,
+            "MetalFX present: output 2x4 must be at least the swapchain size 4x2"
+        );
+
+        let unsupported = runtime
+            .create_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R16G16B16A16Float,
+                buffer_count: 2,
+            })
+            .expect("unsupported-format swapchain still exists");
+        let format = runtime
+            .enable_metalfx_present(unsupported, MetalFxPresentOptions::spatial(8, 4))
+            .expect_err("unsupported swapchain format must be rejected");
+        assert_eq!(format.code, ReasonCode::RcGfxFormatUnsupported);
+        assert_eq!(
+            format.message,
+            "MetalFX present: swapchain format R16G16B16A16Float (RGBA16Float) is not supported; \
+             the DXGI present path requires B8G8R8A8Unorm or R8G8B8A8Unorm"
+        );
+        assert_eq!(runtime.metalfx_present_configured(unsupported), false);
+        runtime
+            .resize_buffers(swapchain, 2, 4, 2, DxgiFormat::R8G8B8A8Unorm)
+            .expect("resize without a MetalFX configuration is a no-op for MetalFX");
+    }
+
+    #[test]
+    fn metalfx_present_scales_known_pattern_and_resize_failure_falls_back_exactly() {
+        let mut runtime = D3d12Runtime::new();
+        let swapchain = metalfx_swapchain(&mut runtime);
+        let options = MetalFxPresentOptions::spatial(8, 4);
+        runtime
+            .enable_metalfx_present(swapchain, options)
+            .expect("enable spatial MetalFX present");
+        assert_eq!(runtime.metalfx_present_configured(swapchain), true);
+        assert_eq!(runtime.metalfx_present_options(swapchain), Some(options));
+
+        let mut source = vec![0u8; 4 * 2 * 4];
+        for y in 0..2 {
+            for x in 0..4 {
+                let color = match (x < 2, y == 0) {
+                    (true, true) => [255u8, 0, 0, 255],
+                    (false, true) => [0, 255, 0, 255],
+                    (true, false) => [0, 0, 255, 255],
+                    (false, false) => [255, 255, 255, 255],
+                };
+                let offset = (y * 4 + x) * 4;
+                source[offset..offset + 4].copy_from_slice(&color);
+            }
+        }
+        runtime.iosurface_channels[0]
+            .write_pixels(&source)
+            .expect("write known source pattern");
+
+        runtime
+            .present(swapchain, 1, false)
+            .expect("MetalFX present");
+        assert_eq!(runtime.metalfx_scaled_present_count(), 1);
+        assert_eq!(runtime.metalfx_fallback_count(), 0);
+
+        let frame = runtime.presented_frame(swapchain).expect("scaled frame");
+        assert_eq!(frame.width, 8);
+        assert_eq!(frame.height, 4);
+        assert_eq!(frame.format, DxgiFormat::R8G8B8A8Unorm);
+        assert_eq!(frame.bytes.len(), 8 * 4 * 4);
+        for (x, y, channel) in [(2usize, 1usize, 0usize), (5, 1, 1), (2, 3, 2)] {
+            let offset = (y * 8 + x) * 4;
+            let pixel = &frame.bytes[offset..offset + 4];
+            assert_eq!(
+                pixel[channel] > pixel[(channel + 1) % 3],
+                true,
+                "known quadrant colour must dominate at ({x},{y}): {pixel:?}"
+            );
+        }
+
+        runtime
+            .present(swapchain, 1, false)
+            .expect("second MetalFX present");
+        assert_eq!(runtime.metalfx_scaled_present_count(), 2);
+        assert_eq!(runtime.disable_metalfx_present(swapchain), true);
+        assert_eq!(runtime.disable_metalfx_present(swapchain), false);
+        runtime.metalfx_last_scaled_swapchain = Some(swapchain);
+        let fallback_frame = runtime
+            .presented_frame(swapchain)
+            .expect("a missing scaler state falls back to the source surface");
+        assert_eq!(fallback_frame.width, 4);
+        runtime
+            .enable_metalfx_present(swapchain, options)
+            .expect("re-enable MetalFX present");
+
+        runtime
+            .resize_buffers(swapchain, 2, 6, 3, DxgiFormat::R8G8B8A8Unorm)
+            .expect("resize within the MetalFX output size");
+        assert_eq!(runtime.metalfx_present_configured(swapchain), true);
+        runtime
+            .present(swapchain, 1, false)
+            .expect("scaled resized present");
+        assert_eq!(runtime.metalfx_scaled_present_count(), 3);
+        assert_eq!(runtime.metalfx_fallback_count(), 0);
+        assert_eq!(
+            runtime
+                .presented_frame(swapchain)
+                .expect("resized frame")
+                .width,
+            8
+        );
+
+        runtime
+            .resize_buffers(swapchain, 2, 16, 8, DxgiFormat::R8G8B8A8Unorm)
+            .expect("resize beyond the configured output");
+        assert_eq!(runtime.metalfx_present_configured(swapchain), false);
+        assert_eq!(runtime.metalfx_fallback_count(), 1);
+        let error = runtime
+            .metalfx_last_error()
+            .expect("resize fallback keeps the exact error");
+        assert_eq!(error.code, ReasonCode::RcInvalidParameter);
+        assert_eq!(
+            error.message,
+            "MetalFX present: output 8x4 must be at least the swapchain size 16x8"
+        );
+        runtime
+            .present(swapchain, 1, false)
+            .expect("fallback present");
+        assert_eq!(runtime.metalfx_scaled_present_count(), 3);
+        let frame = runtime.presented_frame(swapchain).expect("fallback frame");
+        assert_eq!(frame.width, 16);
+        assert_eq!(frame.height, 8);
+        assert_eq!(frame.format, DxgiFormat::R8G8B8A8Unorm);
+        runtime
+            .resize_buffers(swapchain, 2, 16, 8, DxgiFormat::R8G8B8A8Unorm)
+            .expect("a later resize with no MetalFX state is a no-op for MetalFX");
+    }
+
+    #[test]
+    fn metalfx_present_nv12_and_missing_channel_fall_back_with_exact_errors() {
+        let mut runtime = D3d12Runtime::new();
+        let nv12 = runtime
+            .create_nv12_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("NV12 swapchain");
+        if !runtime.primary_nv12.is_empty() {
+            runtime
+                .enable_metalfx_present(nv12, MetalFxPresentOptions::spatial(8, 4))
+                .expect("configure MetalFX on top of an NV12 swapchain");
+            runtime
+                .present(nv12, 1, false)
+                .expect("NV12 fallback present");
+            assert_eq!(runtime.metalfx_scaled_present_count(), 0);
+            assert_eq!(runtime.metalfx_fallback_count(), 1);
+            let error = runtime.metalfx_last_error().expect("NV12 fallback error");
+            assert_eq!(error.code, ReasonCode::RcD3dFeatureUnsupported);
+            assert_eq!(
+                error.message,
+                "MetalFX present: NV12 swapchains are not supported by the MetalFX present path"
+            );
+            assert_eq!(runtime.presented_frame(nv12).expect("NV12 frame").width, 4);
+            assert_eq!(runtime.disable_metalfx_present(nv12), true);
+        }
+
+        let mut runtime = D3d12Runtime::new();
+        let swapchain = metalfx_swapchain(&mut runtime);
+        runtime
+            .enable_metalfx_present(swapchain, MetalFxPresentOptions::spatial(8, 4))
+            .expect("enable MetalFX before losing the channel");
+        runtime.iosurface_channels.clear();
+        runtime
+            .present(swapchain, 1, false)
+            .expect("missing-channel fallback present");
+        assert_eq!(runtime.metalfx_scaled_present_count(), 0);
+        assert_eq!(runtime.metalfx_fallback_count(), 1);
+        let error = runtime
+            .metalfx_last_error()
+            .expect("missing-channel fallback error");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            format!("MetalFX present: swapchain {swapchain} has no pixel present channel")
+        );
+    }
+
+    #[test]
+    fn metalfx_present_additional_swapchain_paths_scale_and_fallback() {
+        let mut runtime = D3d12Runtime::new();
+        let extra = runtime
+            .create_additional_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("additional pixel swapchain");
+        runtime
+            .enable_metalfx_present(extra, MetalFxPresentOptions::spatial(8, 4))
+            .expect("enable MetalFX on the additional swapchain");
+        let pattern = vec![64u8; 4 * 2 * 4];
+        runtime
+            .extra_swapchains
+            .get_mut(&extra)
+            .expect("additional channel set")
+            .pixel[0]
+            .write_pixels(&pattern)
+            .expect("write additional pattern");
+        runtime
+            .present(extra, 1, false)
+            .expect("scaled additional present");
+        assert_eq!(runtime.metalfx_scaled_present_count(), 1);
+        let frame = runtime
+            .presented_frame(extra)
+            .expect("additional scaled frame");
+        assert_eq!(frame.width, 8);
+        assert_eq!(frame.height, 4);
+        assert_eq!(frame.format, DxgiFormat::R8G8B8A8Unorm);
+
+        let mut runtime = D3d12Runtime::new();
+        let extra_nv12 = runtime
+            .create_additional_nv12_swapchain(SwapchainDesc {
+                width: 4,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("additional NV12 swapchain");
+        if runtime
+            .extra_swapchains
+            .get(&extra_nv12)
+            .map(|set| !set.nv12.is_empty())
+            .unwrap_or(false)
+        {
+            runtime
+                .enable_metalfx_present(extra_nv12, MetalFxPresentOptions::spatial(8, 4))
+                .expect("enable MetalFX on the additional NV12 swapchain");
+            runtime
+                .present(extra_nv12, 1, false)
+                .expect("additional NV12 fallback present");
+            assert_eq!(runtime.metalfx_scaled_present_count(), 0);
+            assert_eq!(runtime.metalfx_fallback_count(), 1);
+            let error = runtime
+                .metalfx_last_error()
+                .expect("additional NV12 fallback error");
+            assert_eq!(error.code, ReasonCode::RcD3dFeatureUnsupported);
+            assert_eq!(
+                error.message,
+                "MetalFX present: NV12 swapchains are not supported by the MetalFX present path"
+            );
+        }
     }
 }
