@@ -5634,7 +5634,7 @@ fn d3d12_state_object_and_work_graph_dispatch_error_paths_are_pinned() {
         for (index, byte) in identifier.iter().enumerate() {
             memory.write_u8(set_desc + 8 + index as u64, *byte);
         }
-        write_u32(&mut memory, set_desc + 40, 0x2);
+        write_u32(&mut memory, set_desc + 40, 0x4);
         state.set(Register::Rsp, base + 0x340);
         state.set(Register::Rcx, list);
         state.set(Register::Rdx, set_desc);

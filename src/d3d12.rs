@@ -416,6 +416,8 @@ struct D3d12MetalRayTracingInner {
     last_ray_results: Vec<crate::metal_backend::MetalRayResult>,
     work_graph: Option<crate::metal_backend::MetalWorkGraphFanout>,
     last_work_graph_records: Vec<u32>,
+    work_graph_node_programs:
+        BTreeMap<(u64, String, u32), crate::metal_backend::MetalWorkGraphNodeProgram>,
     indirect_interpreter: Option<crate::metal_backend::MetalIndirectInterpreter>,
     native_render_pipelines: BTreeMap<u64, metal::RenderPipelineState>,
     ray_shader_programs: BTreeMap<u64, crate::metal_backend::MetalRayShaderProgram>,
@@ -3356,6 +3358,7 @@ impl D3d12Runtime {
                 last_ray_results: Vec::new(),
                 work_graph: None,
                 last_work_graph_records: Vec::new(),
+                work_graph_node_programs: BTreeMap::new(),
                 indirect_interpreter: None,
                 native_render_pipelines: BTreeMap::new(),
                 ray_shader_programs: BTreeMap::new(),
@@ -5675,7 +5678,7 @@ impl D3d12Runtime {
         backing_memory: Option<(u64, u64)>,
         node_local_root_arguments_table: Option<D3d12GpuRangeAndStride>,
     ) -> AppResult<()> {
-        if flags & !work_graphs::WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES != 0 {
+        if flags & !work_graphs::WORK_GRAPH_FLAGS_VALID != 0 {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 format!("D3D12_WORK_GRAPH_FLAGS {flags:#x} contain undefined bits"),
@@ -5715,6 +5718,114 @@ impl D3d12Runtime {
         self.work_graph_programs.get(&list)
     }
 
+    /// Compile (and cache) a work-graph node's guest shader body.
+    ///
+    /// Returns `Ok(false)` when the node has no DXIL library export in the
+    /// state object; otherwise the export is translated from DXIL to MSL and
+    /// compiled into a compute pipeline with the work-graph node ABI bound.
+    /// Malformed DXIL fails with the exact translation/compile error.
+    pub fn ensure_work_graph_node_program(
+        &mut self,
+        state_object: u64,
+        program_name: Option<&str>,
+        node_index: u32,
+    ) -> AppResult<bool> {
+        let graph = self.select_work_graph(state_object, program_name)?.clone();
+        let node = graph.nodes.get(node_index as usize).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "work graph node index {node_index} is out of range for {} nodes",
+                    graph.nodes.len()
+                ),
+            )
+        })?;
+        let key = (
+            state_object,
+            program_name.unwrap_or(&graph.program_name).to_string(),
+            node_index,
+        );
+        let bridge = self.metal_raytracing()?;
+        {
+            let inner = bridge
+                .inner
+                .lock()
+                .expect("Metal raytracing bridge lock poisoned");
+            if inner.work_graph_node_programs.contains_key(&key) {
+                return Ok(true);
+            }
+        }
+        let Some(dxil) = self
+            .state_objects
+            .get(&state_object)
+            .and_then(|object| object.export_bytecode(&node.shader))
+            .map(<[u8]>::to_vec)
+        else {
+            return Ok(false);
+        };
+        let mesh = node.is_mesh();
+        let mut inner = bridge
+            .inner
+            .lock()
+            .expect("Metal raytracing bridge lock poisoned");
+        let compiled = crate::metal_backend::MetalWorkGraphNodeProgram::from_dxil(
+            &inner.device,
+            &dxil,
+            &node.shader,
+            crate::shader::ShaderStage::Cs,
+            (64, 1, 1),
+            mesh,
+        )?;
+        inner.work_graph_node_programs.insert(key, compiled);
+        Ok(true)
+    }
+
+    /// Execute a compiled work-graph node shader with explicit resource
+    /// bindings.
+    ///
+    /// The guest node body reads packed records, its UAVs, descriptor table
+    /// and root constants, and appends opaque output records to the
+    /// current-node-output buffer. Returns `Ok(None)` when the node has no
+    /// guest shader body (the caller then keeps the topology-only dispatch).
+    pub fn execute_work_graph_node_shader(
+        &mut self,
+        list: CommandListId,
+        state_object: u64,
+        program_name: Option<&str>,
+        node_index: u32,
+        bindings: &crate::metal_backend::MetalWorkGraphNodeBindings<'_>,
+    ) -> AppResult<Option<crate::metal_backend::MetalWorkGraphNodeRun>> {
+        if !self.ensure_work_graph_node_program(state_object, program_name, node_index)? {
+            return Ok(None);
+        }
+        let graph = self.select_work_graph(state_object, program_name)?.clone();
+        let key = (
+            state_object,
+            program_name.unwrap_or(&graph.program_name).to_string(),
+            node_index,
+        );
+        let bridge = self.metal_raytracing()?;
+        let inner = bridge
+            .inner
+            .lock()
+            .expect("Metal raytracing bridge lock poisoned");
+        let program = inner
+            .work_graph_node_programs
+            .get(&key)
+            .expect("work-graph node program compiled");
+        let run = program.execute(&inner.device, bindings)?;
+        let mesh = program.mesh;
+        let threadgroup = program.threadgroup_size.0.max(1);
+        drop(inner);
+        let groups = run.threads.max(1).div_ceil(threadgroup).max(1);
+        if mesh {
+            self.backend.record_dispatch_mesh(list, groups, 1, 1)?;
+        } else {
+            self.backend.record_dispatch(list, groups, 1, 1)?;
+        }
+        Ok(Some(run))
+    }
+
     /// `ID3D12GraphicsCommandList10::DispatchGraph` using the program bound by
     /// `SetProgram`.
     pub fn dispatch_bound_work_graph(
@@ -5732,12 +5843,13 @@ impl D3d12Runtime {
                     "DispatchGraph requires a work-graph program bound with SetProgram",
                 )
             })?;
-        self.dispatch_work_graph(
+        self.dispatch_work_graph_with_flags(
             list,
             program.state_object,
             Some(&program.program_name),
             desc,
             program.backing_memory,
+            program.flags,
         )
     }
 
@@ -5764,15 +5876,56 @@ impl D3d12Runtime {
         desc: &D3d12DispatchGraphDesc,
         backing_memory: Option<(u64, u64)>,
     ) -> AppResult<u32> {
+        self.dispatch_work_graph_with_flags(
+            list,
+            state_object,
+            program_name,
+            desc,
+            backing_memory,
+            work_graphs::WORK_GRAPH_FLAG_NONE,
+        )
+    }
+
+    /// Execute a work graph with the program-binding flags that `SetProgram`
+    /// recorded. `D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER`
+    /// requires a graphics node reachable from the entrypoint and CPU record
+    /// input, because Metal preserves that order by serialising each graphics
+    /// dispatch in record order.
+    pub fn dispatch_work_graph_with_flags(
+        &mut self,
+        list: CommandListId,
+        state_object: u64,
+        program_name: Option<&str>,
+        desc: &D3d12DispatchGraphDesc,
+        backing_memory: Option<(u64, u64)>,
+        flags: u32,
+    ) -> AppResult<u32> {
         let graph = self.select_work_graph(state_object, program_name)?.clone();
+        if flags & !work_graphs::WORK_GRAPH_FLAGS_VALID != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("D3D12_WORK_GRAPH_FLAGS {flags:#x} contain undefined bits"),
+            ));
+        }
         if let Some((offset, size)) = backing_memory {
             graph.validate_backing_memory(offset, size)?;
         }
-        if matches!(
+        let gpu_input = matches!(
             desc.mode,
             work_graphs::DISPATCH_MODE_NODE_GPU_INPUT
                 | work_graphs::DISPATCH_MODE_MULTI_NODE_GPU_INPUT
-        ) {
+        );
+        let ordered_rasterization = (flags | graph.flags)
+            & work_graphs::WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER
+            != 0;
+        if ordered_rasterization {
+            graph.validate_ordered_rasterization_requested(
+                desc.entrypoint_index,
+                gpu_input,
+                true,
+            )?;
+        }
+        if gpu_input {
             return self.dispatch_work_graph_gpu(list, &graph, desc);
         }
         graph.validate_cpu_records(
@@ -5784,7 +5937,11 @@ impl D3d12Runtime {
         let plan = if graph.uses_record_semantics() {
             let records =
                 graph.parse_records(&desc.records, desc.record_count, desc.record_stride)?;
-            graph.record_plan(desc.entrypoint_index, &records)?
+            graph.record_plan_with_ordering(
+                desc.entrypoint_index,
+                &records,
+                ordered_rasterization,
+            )?
         } else {
             graph.dispatch_plan(desc.entrypoint_index, desc.record_count, desc.record_stride)?
         };
@@ -9848,11 +10005,11 @@ mod tests {
             .work_graph_program_identifier(executable, "graph")
             .expect("identifier");
         let error = runtime
-            .set_work_graph_program(list, identifier, 0x2, None)
+            .set_work_graph_program(list, identifier, 0x4, None)
             .unwrap_err();
         assert_eq!(
             error.message,
-            "D3D12_WORK_GRAPH_FLAGS 0x2 contain undefined bits"
+            "D3D12_WORK_GRAPH_FLAGS 0x4 contain undefined bits"
         );
         runtime
             .set_work_graph_program(
@@ -11671,6 +11828,347 @@ mod tests {
                 size: 24,
                 stride: 8,
             })
+        );
+    }
+
+    #[test]
+    fn d3d12_work_graph_ordered_rasterization_is_serialized_and_gpu_input_fails_closed() {
+        use crate::gfx::Command;
+        use work_graphs::{
+            D3D12_NODE_TYPE_PROGRAM, D3D12_NODE_TYPE_SHADER, D3d12BroadcastingLaunchOverrides,
+            D3d12MeshLaunchOverrides, D3d12NodeId, D3d12NodeOutputOverrides, D3d12NodeOverrides,
+            D3d12WorkGraphNode, WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER,
+        };
+        let node_id = |name: &str| D3d12NodeId::new(name, 0);
+        let graph = D3d12WorkGraph {
+            program_name: "ordered".to_string(),
+            flags: 0,
+            entrypoints: vec![node_id("root")],
+            nodes: vec![
+                D3d12WorkGraphNode {
+                    node_type: D3D12_NODE_TYPE_SHADER,
+                    shader: "root".to_string(),
+                    overrides: D3d12NodeOverrides::Broadcasting(D3d12BroadcastingLaunchOverrides {
+                        new_name: Some(node_id("root")),
+                        output_overrides: vec![D3d12NodeOutputOverrides {
+                            output_index: 0,
+                            new_name: Some(node_id("mesh")),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                },
+                D3d12WorkGraphNode {
+                    node_type: D3D12_NODE_TYPE_PROGRAM,
+                    shader: "mesh".to_string(),
+                    overrides: D3d12NodeOverrides::Mesh(D3d12MeshLaunchOverrides {
+                        new_name: Some(node_id("mesh")),
+                        dispatch_grid: Some([1, 1, 1]),
+                        ..Default::default()
+                    }),
+                },
+            ],
+        };
+        let mut runtime = D3d12Runtime::new();
+        let executable = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::WorkGraph(graph)],
+            })
+            .expect("ordered executable");
+        let identifier = runtime
+            .work_graph_program_identifier(executable, "ordered")
+            .expect("ordered identifier");
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        runtime
+            .set_work_graph_program(
+                list,
+                identifier,
+                WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER,
+                None,
+            )
+            .expect("ordered program");
+        let mut records = Vec::new();
+        for _ in 0..2 {
+            records.extend_from_slice(&0u32.to_le_bytes());
+            records.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let cpu_desc = D3d12DispatchGraphDesc {
+            mode: work_graphs::DISPATCH_MODE_NODE_CPU_INPUT,
+            entrypoint_index: 0,
+            record_count: 2,
+            record_stride: 8,
+            records,
+        };
+        assert_eq!(
+            runtime
+                .dispatch_bound_work_graph(list, &cpu_desc)
+                .expect("ordered CPU dispatch"),
+            3
+        );
+        let stream = runtime
+            .close_command_list(list)
+            .expect("close ordered list");
+        assert_eq!(stream.commands.len(), 3);
+        assert!(matches!(
+            stream.commands[0],
+            Command::Dispatch { x: 2, y: 1, z: 1 }
+        ));
+        assert!(matches!(
+            stream.commands[1],
+            Command::DispatchMesh { x: 1, y: 1, z: 1 }
+        ));
+        assert!(matches!(
+            stream.commands[2],
+            Command::DispatchMesh { x: 1, y: 1, z: 1 }
+        ));
+
+        let gpu_list = runtime.create_graphics_command_list(0, 0, false);
+        runtime
+            .set_work_graph_program(
+                gpu_list,
+                identifier,
+                WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER,
+                None,
+            )
+            .expect("ordered GPU program");
+        let gpu_desc = D3d12DispatchGraphDesc {
+            mode: work_graphs::DISPATCH_MODE_NODE_GPU_INPUT,
+            ..cpu_desc.clone()
+        };
+        let error = runtime
+            .dispatch_bound_work_graph(gpu_list, &gpu_desc)
+            .expect_err("GPU input cannot preserve order");
+        assert_eq!(
+            error.message,
+            "D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER cannot be \
+             preserved for GPU-produced work-graph records on Metal"
+        );
+
+        // The flag requires a reachable graphics node.
+        let compute_graph = D3d12WorkGraph {
+            program_name: "compute".to_string(),
+            flags: WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER,
+            entrypoints: vec![node_id("root")],
+            nodes: vec![D3d12WorkGraphNode {
+                node_type: D3D12_NODE_TYPE_SHADER,
+                shader: "root".to_string(),
+                overrides: D3d12NodeOverrides::Broadcasting(D3d12BroadcastingLaunchOverrides {
+                    new_name: Some(node_id("root")),
+                    ..Default::default()
+                }),
+            }],
+        };
+        let compute = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::WorkGraph(compute_graph)],
+            })
+            .expect("compute executable");
+        let compute_id = runtime
+            .work_graph_program_identifier(compute, "compute")
+            .expect("compute identifier");
+        let compute_list = runtime.create_graphics_command_list(0, 0, false);
+        runtime
+            .set_work_graph_program(
+                compute_list,
+                compute_id,
+                WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER,
+                None,
+            )
+            .expect("compute program");
+        let error = runtime
+            .dispatch_bound_work_graph(compute_list, &cpu_desc)
+            .expect_err("no graphics node");
+        assert_eq!(
+            error.message,
+            "D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER requires a \
+             graphics (mesh) node reachable from the entrypoint"
+        );
+
+        let invalid_list = runtime.create_graphics_command_list(0, 0, false);
+        let error = runtime
+            .dispatch_work_graph_with_flags(
+                invalid_list,
+                executable,
+                Some("ordered"),
+                &cpu_desc,
+                None,
+                0x4,
+            )
+            .expect_err("undefined dispatch flags");
+        assert_eq!(
+            error.message,
+            "D3D12_WORK_GRAPH_FLAGS 0x4 contain undefined bits"
+        );
+    }
+
+    fn work_graph_dxil_container(entry: &str) -> Vec<u8> {
+        let mut program = Vec::new();
+        program.extend_from_slice(&0u32.to_le_bytes());
+        program.extend_from_slice(&0u32.to_le_bytes());
+        for _ in 0..3 {
+            program.extend_from_slice(&1u32.to_le_bytes());
+        }
+        program.extend_from_slice(&0u32.to_le_bytes());
+        let mut metadata = vec![entry.len() as u8];
+        metadata.extend_from_slice(entry.as_bytes());
+        let parts = [
+            (*b"PROG", program),
+            (*b"SIGN", b"aabb".to_vec()),
+            (*b"META", metadata),
+        ];
+        let header_size = 12 + parts.len() * 12;
+        let mut offset = header_size as u32;
+        let mut descriptors = Vec::new();
+        for (kind, payload) in &parts {
+            descriptors.push((*kind, offset, payload.len() as u32));
+            offset += payload.len() as u32;
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"DXIL");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        for (kind, offset, size) in &descriptors {
+            bytes.extend_from_slice(kind);
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for (_, payload) in &parts {
+            bytes.extend_from_slice(payload);
+        }
+        bytes
+    }
+
+    #[test]
+    fn d3d12_work_graph_node_program_resolves_guest_dxil_and_rejects_malformed_shaders() {
+        use state_objects::{D3d12DxilLibrary, D3d12ExportDesc};
+        use work_graphs::{
+            D3D12_NODE_TYPE_SHADER, D3d12NodeId, D3d12NodeOverrides, D3d12WorkGraphNode,
+        };
+        let node_id = |name: &str| D3d12NodeId::new(name, 0);
+        let graph = D3d12WorkGraph {
+            program_name: "shader".to_string(),
+            flags: 0,
+            entrypoints: vec![node_id("node0")],
+            nodes: vec![D3d12WorkGraphNode {
+                node_type: D3D12_NODE_TYPE_SHADER,
+                shader: "node0".to_string(),
+                overrides: D3d12NodeOverrides::None,
+            }],
+        };
+        let mut runtime = D3d12Runtime::new();
+        let executable = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![
+                    D3d12StateSubobject::WorkGraph(graph.clone()),
+                    D3d12StateSubobject::DxilLibrary(D3d12DxilLibrary {
+                        bytecode: work_graph_dxil_container("node0"),
+                        exports: vec![D3d12ExportDesc {
+                            name: "node0".to_string(),
+                            export_to_rename: None,
+                            flags: 0,
+                        }],
+                    }),
+                ],
+            })
+            .expect("executable with DXIL");
+        assert_eq!(
+            runtime
+                .ensure_work_graph_node_program(executable, Some("shader"), 0)
+                .expect("compile guest node"),
+            true
+        );
+        let error = runtime
+            .ensure_work_graph_node_program(executable, Some("shader"), 5)
+            .expect_err("node index out of range");
+        assert_eq!(
+            error.message,
+            "work graph node index 5 is out of range for 1 nodes"
+        );
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let run = runtime
+            .execute_work_graph_node_shader(
+                list,
+                executable,
+                Some("shader"),
+                0,
+                &crate::metal_backend::MetalWorkGraphNodeBindings {
+                    records: &[],
+                    record_count: 0,
+                    record_stride: 8,
+                    output_capacity: 1,
+                    output_stride: 8,
+                    resources: &[],
+                    descriptor_table: &[],
+                    root_constants: &[],
+                    persistent: false,
+                },
+            )
+            .expect("guest node execution")
+            .expect("guest node program");
+        assert_eq!(run.threads, 0);
+        assert_eq!(run.outputs, Vec::new());
+
+        // A graph without a matching DXIL export keeps the topological path.
+        let plain = D3d12WorkGraph {
+            program_name: "plain".to_string(),
+            flags: 0,
+            entrypoints: vec![node_id("plain")],
+            nodes: vec![D3d12WorkGraphNode {
+                node_type: D3D12_NODE_TYPE_SHADER,
+                shader: "plain".to_string(),
+                overrides: D3d12NodeOverrides::None,
+            }],
+        };
+        let plain_object = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::WorkGraph(plain)],
+            })
+            .expect("plain executable");
+        assert_eq!(
+            runtime
+                .ensure_work_graph_node_program(plain_object, Some("plain"), 0)
+                .expect("no DXIL body"),
+            false
+        );
+
+        // Malformed DXIL fails with the translator's exact error.
+        let bad = D3d12WorkGraph {
+            program_name: "bad".to_string(),
+            flags: 0,
+            entrypoints: vec![node_id("badnode")],
+            nodes: vec![D3d12WorkGraphNode {
+                node_type: D3D12_NODE_TYPE_SHADER,
+                shader: "badnode".to_string(),
+                overrides: D3d12NodeOverrides::None,
+            }],
+        };
+        let bad_object = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![
+                    D3d12StateSubobject::WorkGraph(bad),
+                    D3d12StateSubobject::DxilLibrary(D3d12DxilLibrary {
+                        bytecode: b"not a DXIL container".to_vec(),
+                        exports: vec![D3d12ExportDesc {
+                            name: "badnode".to_string(),
+                            export_to_rename: None,
+                            flags: 0,
+                        }],
+                    }),
+                ],
+            })
+            .expect("bad executable");
+        let error = runtime
+            .ensure_work_graph_node_program(bad_object, Some("bad"), 0)
+            .expect_err("malformed shader");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(
+            error.message,
+            "work graph node shader translation failed in parse: invalid DXIL container header"
         );
     }
 

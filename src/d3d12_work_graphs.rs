@@ -46,6 +46,11 @@ pub const NODE_OVERRIDES_COMMON_COMPUTE: u32 = 4;
 
 pub const WORK_GRAPH_FLAG_NONE: u32 = 0;
 pub const WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES: u32 = 0x1;
+/// `D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER`.
+pub const WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER: u32 = 0x2;
+/// Every flag defined by D3D12_WORK_GRAPH_FLAGS.
+pub const WORK_GRAPH_FLAGS_VALID: u32 = WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES
+    | WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER;
 
 pub const D3D12_PROGRAM_TYPE_GENERIC_PIPELINE: u32 = 1;
 pub const D3D12_PROGRAM_TYPE_RAYTRACING_PIPELINE: u32 = 4;
@@ -335,6 +340,55 @@ impl D3d12WorkGraphRecord {
     }
 }
 
+/// A record with its complete opaque payload.
+///
+/// The first eight bytes of a D3D12 work-graph record are the node/output
+/// header; every remaining byte (`record_stride - 8`) belongs to the node and
+/// is carried through the graph unchanged. Payloads may exceed eight bytes and
+/// are never interpreted by the bridge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3d12WorkGraphPayloadRecord {
+    pub node_index: u32,
+    pub output_index: u32,
+    pub payload: Vec<u8>,
+}
+
+impl D3d12WorkGraphPayloadRecord {
+    pub fn header(&self) -> D3d12WorkGraphRecord {
+        D3d12WorkGraphRecord {
+            node_index: self.node_index,
+            output_index: self.output_index,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.header().is_empty()
+    }
+
+    /// Encode this record at `record_stride` bytes per record.
+    pub fn encode(&self, record_stride: u64) -> AppResult<Vec<u8>> {
+        if record_stride < WORK_GRAPH_RECORD_HEADER_SIZE {
+            return Err(invalid(format!(
+                "work graph record stride {record_stride} is smaller than the 8-byte \
+                 node/output record"
+            )));
+        }
+        let payload_len = (record_stride - WORK_GRAPH_RECORD_HEADER_SIZE) as usize;
+        if self.payload.len() > payload_len {
+            return Err(invalid(format!(
+                "work graph record payload is {} bytes but the stride {record_stride} only \
+                 leaves {payload_len} payload bytes",
+                self.payload.len()
+            )));
+        }
+        let mut bytes = vec![0u8; record_stride as usize];
+        bytes[0..4].copy_from_slice(&self.node_index.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.output_index.to_le_bytes());
+        bytes[8..8 + self.payload.len()].copy_from_slice(&self.payload);
+        Ok(bytes)
+    }
+}
+
 impl D3d12WorkGraph {
     /// Parse a D3D12_WORK_GRAPH_DESC from guest memory.
     pub fn parse(memory: &dyn StateObjectMemory, desc: u64) -> AppResult<Self> {
@@ -346,7 +400,7 @@ impl D3d12WorkGraph {
             return Err(invalid("work graph ProgramName is empty"));
         }
         let flags = memory.read_u32(desc + 8)?;
-        if flags & !WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES != 0 {
+        if flags & !WORK_GRAPH_FLAGS_VALID != 0 {
             return Err(invalid(format!(
                 "work graph flags {flags:#x} contain undefined bits"
             )));
@@ -539,6 +593,90 @@ impl D3d12WorkGraph {
             .iter()
             .find(|output| output.output_index == output_index)?;
         self.resolve_node(output.new_name.as_ref()?)
+    }
+
+    /// Whether `D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER`
+    /// was requested for this graph.
+    pub fn uses_ordered_rasterization(&self) -> bool {
+        self.flags & WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER != 0
+    }
+
+    /// Nodes reachable from an entrypoint through declared output edges.
+    pub fn reachable_nodes(&self, entrypoint_index: u32) -> AppResult<BTreeSet<u32>> {
+        let entry_node = self.validate_entrypoint(entrypoint_index)?;
+        let include_all = self.flags & WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES != 0;
+        let mut reached = BTreeSet::new();
+        let mut queue = vec![entry_node];
+        for (index, node) in self.nodes.iter().enumerate() {
+            if include_all || node.overrides.program_entry() == Some(true) {
+                queue.push(index as u32);
+            }
+        }
+        while let Some(node_index) = queue.pop() {
+            if !reached.insert(node_index) {
+                continue;
+            }
+            for output_index in 0..self.nodes[node_index as usize].output_count() {
+                if let Some(target) = self.edge_target(node_index, output_index) {
+                    queue.push(target);
+                }
+            }
+        }
+        Ok(reached)
+    }
+
+    /// Validate ordered rasterization against what the Metal execution model
+    /// can preserve.
+    ///
+    /// CPU record input is executed in the caller's record order, so the
+    /// bridge can serialise graphics-node dispatches in exactly that order.
+    /// GPU node input has no stable CPU-visible order: record counts and
+    /// compaction are produced by GPU atomics, so Metal cannot preserve the
+    /// D3D12 ordering contract and the request fails closed instead of
+    /// silently reordering rasterisation.
+    pub fn validate_ordered_rasterization(
+        &self,
+        entrypoint_index: u32,
+        gpu_input: bool,
+    ) -> AppResult<()> {
+        self.validate_ordered_rasterization_requested(
+            entrypoint_index,
+            gpu_input,
+            self.uses_ordered_rasterization(),
+        )
+    }
+
+    /// Validate an explicit ordered-rasterisation request.
+    ///
+    /// `SetProgram` carries its own `D3D12_WORK_GRAPH_FLAGS`, which may differ
+    /// from the graph description's flags; callers pass the effective request
+    /// explicitly so the graph's declared flag is not silently ignored.
+    pub fn validate_ordered_rasterization_requested(
+        &self,
+        entrypoint_index: u32,
+        gpu_input: bool,
+        requested: bool,
+    ) -> AppResult<()> {
+        if !requested {
+            return Ok(());
+        }
+        let reached = self.reachable_nodes(entrypoint_index)?;
+        if !reached
+            .iter()
+            .any(|index| self.nodes[*index as usize].is_mesh())
+        {
+            return Err(invalid(
+                "D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER requires a \
+                 graphics (mesh) node reachable from the entrypoint",
+            ));
+        }
+        if gpu_input {
+            return Err(invalid(
+                "D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER cannot be \
+                 preserved for GPU-produced work-graph records on Metal",
+            ));
+        }
+        Ok(())
     }
 
     /// Validate node/output structure, limits, arrays, cycles and depth.
@@ -819,6 +957,17 @@ impl D3d12WorkGraph {
         entrypoint_index: u32,
         records: &[D3d12WorkGraphRecord],
     ) -> AppResult<Vec<D3d12WorkGraphDispatch>> {
+        self.record_plan_with_ordering(entrypoint_index, records, self.uses_ordered_rasterization())
+    }
+
+    /// Dispatch sequence for CPU records with an explicit ordered-rasterisation
+    /// request (the effective `SetProgram` flags).
+    pub fn record_plan_with_ordering(
+        &self,
+        entrypoint_index: u32,
+        records: &[D3d12WorkGraphRecord],
+        ordered_rasterization: bool,
+    ) -> AppResult<Vec<D3d12WorkGraphDispatch>> {
         let entry_node = self.validate_entrypoint(entrypoint_index)?;
         if records.is_empty() {
             return Ok(Vec::new());
@@ -902,6 +1051,16 @@ impl D3d12WorkGraph {
         let mut plan = Vec::new();
         for node_index in order {
             if counts[node_index] == 0 {
+                continue;
+            }
+            if ordered_rasterization && self.nodes[node_index].is_mesh() {
+                for _ in 0..counts[node_index] {
+                    if let Some(dispatch) =
+                        self.dispatch_for_node(entrypoint_index, node_index as u32, 1)?
+                    {
+                        plan.push(dispatch);
+                    }
+                }
                 continue;
             }
             if let Some(dispatch) =
@@ -1013,6 +1172,52 @@ impl D3d12WorkGraph {
             }
             parsed.push(record);
         }
+        Ok(parsed)
+    }
+
+    /// Parse records including their complete opaque payload.
+    ///
+    /// The 8-byte node/output header is validated exactly like
+    /// [`Self::parse_records`]; bytes `8..record_stride` are preserved verbatim
+    /// so downstream nodes observe the same payload the producing node wrote.
+    pub fn parse_payload_records(
+        &self,
+        records: &[u8],
+        record_count: u32,
+        record_stride: u64,
+    ) -> AppResult<Vec<D3d12WorkGraphPayloadRecord>> {
+        let headers = self.parse_records(records, record_count, record_stride)?;
+        let payload_len = record_stride.saturating_sub(WORK_GRAPH_RECORD_HEADER_SIZE) as usize;
+        let mut parsed = Vec::with_capacity(headers.len());
+        let mut header_iter = headers.into_iter();
+        for index in 0..record_count as usize {
+            let offset = index * record_stride as usize;
+            let header = D3d12WorkGraphRecord {
+                node_index: u32::from_le_bytes(
+                    records[offset..offset + 4]
+                        .try_into()
+                        .expect("4-byte node index"),
+                ),
+                output_index: u32::from_le_bytes(
+                    records[offset + 4..offset + 8]
+                        .try_into()
+                        .expect("4-byte output index"),
+                ),
+            };
+            if header.is_empty() {
+                continue;
+            }
+            let expected = header_iter
+                .next()
+                .expect("validated record headers preserve their order");
+            debug_assert_eq!(expected, header);
+            parsed.push(D3d12WorkGraphPayloadRecord {
+                node_index: header.node_index,
+                output_index: header.output_index,
+                payload: records[offset + 8..offset + 8 + payload_len].to_vec(),
+            });
+        }
+        debug_assert!(header_iter.next().is_none());
         Ok(parsed)
     }
 
@@ -1878,9 +2083,9 @@ mod tests {
         let error = D3d12WorkGraph::parse(&broken, desc).unwrap_err();
         assert_eq!(error.message, "work graph ProgramName is empty");
         let (mut broken, desc) = all_overrides_memory();
-        put_u32(&mut broken.data, 0x208, 2);
+        put_u32(&mut broken.data, 0x208, 4);
         let error = D3d12WorkGraph::parse(&broken, desc).unwrap_err();
-        assert_eq!(error.message, "work graph flags 0x2 contain undefined bits");
+        assert_eq!(error.message, "work graph flags 0x4 contain undefined bits");
         let (mut broken, desc) = all_overrides_memory();
         put_u32(&mut broken.data, 0x20c, 65_536);
         let error = D3d12WorkGraph::parse(&broken, desc).unwrap_err();
@@ -2072,10 +2277,10 @@ mod tests {
     fn work_graph_undefined_flags_are_rejected() {
         let mut memory = base_memory();
         put_wide(&mut memory.data, 0x100, "graph");
-        let desc = write_desc(&mut memory.data, 0x2, 0, 0, 0, 0);
+        let desc = write_desc(&mut memory.data, 0x4, 0, 0, 0, 0);
         let error = D3d12WorkGraph::parse(&memory, desc).unwrap_err();
         assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
-        assert_eq!(error.message, "work graph flags 0x2 contain undefined bits");
+        assert_eq!(error.message, "work graph flags 0x4 contain undefined bits");
     }
 
     #[test]
@@ -2971,5 +3176,94 @@ mod tests {
         graph
             .validate()
             .expect("mesh node without overrides validates");
+    }
+
+    #[test]
+    fn work_graph_ordered_rasterization_and_payload_records_are_pinned() {
+        let ordered_flags = WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER;
+        let graph = D3d12WorkGraph {
+            program_name: "graph".to_string(),
+            flags: ordered_flags,
+            entrypoints: vec![node_id("root")],
+            nodes: vec![
+                shader_node(
+                    "root",
+                    D3d12NodeOverrides::Broadcasting(D3d12BroadcastingLaunchOverrides {
+                        new_name: Some(node_id("root")),
+                        output_overrides: vec![output(0, Some("mesh"), None)],
+                        ..Default::default()
+                    }),
+                ),
+                mesh_node("mesh", Some([1, 1, 1])),
+            ],
+        };
+        assert!(graph.uses_ordered_rasterization());
+        graph
+            .validate_ordered_rasterization(0, false)
+            .expect("CPU records preserve rasterisation order");
+        let error = graph.validate_ordered_rasterization(0, true).unwrap_err();
+        assert_eq!(
+            error.message,
+            "D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER cannot be \
+             preserved for GPU-produced work-graph records on Metal"
+        );
+
+        // The flag requires a reachable graphics node.
+        let mut compute_only = graph.clone();
+        compute_only.nodes.pop();
+        compute_only.nodes[0].overrides =
+            D3d12NodeOverrides::Broadcasting(D3d12BroadcastingLaunchOverrides {
+                new_name: Some(node_id("root")),
+                ..Default::default()
+            });
+        let error = compute_only
+            .validate_ordered_rasterization(0, false)
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER requires a \
+             graphics (mesh) node reachable from the entrypoint"
+        );
+
+        // Payloads beyond the 8-byte header survive parsing and re-encoding.
+        let record_stride = 24u64;
+        let mut bytes = Vec::new();
+        for index in 0..3u32 {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            for word in 0..4u32 {
+                bytes.extend_from_slice(&(index * 10 + word).to_le_bytes());
+            }
+        }
+        let payloads = graph
+            .parse_payload_records(&bytes, 3, record_stride)
+            .expect("opaque payload records");
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads[2].payload.len(), 16);
+        assert_eq!(&payloads[2].payload[0..4], &20u32.to_le_bytes());
+        assert_eq!(
+            payloads[2]
+                .encode(record_stride)
+                .expect("re-encode payload"),
+            bytes[2 * record_stride as usize..3 * record_stride as usize].to_vec()
+        );
+        assert_eq!(
+            payloads[0]
+                .encode(8)
+                .expect_err("payload too large for the stride")
+                .message,
+            "work graph record payload is 16 bytes but the stride 8 only leaves 0 payload bytes"
+        );
+
+        // Ordered rasterisation serialises one mesh dispatch per record.
+        let headers = payloads
+            .iter()
+            .map(D3d12WorkGraphPayloadRecord::header)
+            .collect::<Vec<_>>();
+        let plan = graph.record_plan(0, &headers).expect("ordered plan");
+        assert_eq!(plan.len(), 4);
+        assert_eq!(plan[0].record_count, 3);
+        assert!(plan[1..].iter().all(|dispatch| dispatch.mesh));
+        assert!(plan[1..].iter().all(|dispatch| dispatch.record_count == 1));
     }
 }

@@ -225,6 +225,26 @@ impl D3d12StateObject {
                 _ => None,
             })
     }
+
+    /// Resolve the DXIL library bytecode that defines an exported shader.
+    ///
+    /// Work-graph nodes name an export, not a bytecode blob. The export may be
+    /// either the final exported name or the library name it is renamed from.
+    pub fn export_bytecode(&self, export: &str) -> Option<&[u8]> {
+        self.subobjects
+            .iter()
+            .find_map(|subobject| match subobject {
+                D3d12StateSubobject::DxilLibrary(library)
+                    if library.exports.iter().any(|candidate| {
+                        candidate.name == export
+                            || candidate.export_to_rename.as_deref() == Some(export)
+                    }) =>
+                {
+                    Some(library.bytecode.as_slice())
+                }
+                _ => None,
+            })
+    }
 }
 
 /// Parse a D3D12_STATE_OBJECT_DESC from guest memory.

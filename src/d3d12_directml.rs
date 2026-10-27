@@ -1966,6 +1966,818 @@ impl DmlRuntime {
                 let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
                 plan(DmlOpKind::Cast, vec![input], output, Vec::new(), None)
             }
+            dml_ops::DML_OPERATOR_ACTIVATION_HARDMAX
+            | dml_ops::DML_OPERATOR_ACTIVATION_LOG_SOFTMAX => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let kind = if ty == dml_ops::DML_OPERATOR_ACTIVATION_HARDMAX {
+                    dml_ops::DmlSoftmaxKind::Hardmax
+                } else {
+                    dml_ops::DmlSoftmaxKind::LogSoftmax
+                };
+                let axes = vec![input.sizes.len().saturating_sub(1) as u32];
+                plan(
+                    DmlOpKind::SoftmaxEx { kind, axes },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ACTIVATION_SOFTMAX1
+            | dml_ops::DML_OPERATOR_ACTIVATION_LOG_SOFTMAX1
+            | dml_ops::DML_OPERATOR_ACTIVATION_HARDMAX1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let axis_count = read_u32(memory, payload + 16)?;
+                let axes = read_u32_list(memory, read_ptr(memory, payload + 24)?, axis_count)?;
+                let kind = match ty {
+                    dml_ops::DML_OPERATOR_ACTIVATION_SOFTMAX1 => dml_ops::DmlSoftmaxKind::Softmax1,
+                    dml_ops::DML_OPERATOR_ACTIVATION_LOG_SOFTMAX1 => {
+                        dml_ops::DmlSoftmaxKind::LogSoftmax1
+                    }
+                    _ => dml_ops::DmlSoftmaxKind::Hardmax1,
+                };
+                plan(
+                    DmlOpKind::SoftmaxEx { kind, axes },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ACTIVATION_PARAMETERIZED_RELU => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let slope = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                plan(
+                    DmlOpKind::ExActivation {
+                        activation: dml_ops::DmlExActivation::ParameterizedRelu,
+                    },
+                    vec![input, slope],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ACTIVATION_PARAMETRIC_SOFTPLUS => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let alpha = read_f32(memory, payload + 16)?;
+                let beta = read_f32(memory, payload + 20)?;
+                plan(
+                    DmlOpKind::ExActivation {
+                        activation: dml_ops::DmlExActivation::ParametricSoftplus { alpha, beta },
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ACTIVATION_SCALED_ELU => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let alpha = read_f32(memory, payload + 16)?;
+                let gamma = read_f32(memory, payload + 20)?;
+                plan(
+                    DmlOpKind::ExActivation {
+                        activation: dml_ops::DmlExActivation::ScaledElu { alpha, gamma },
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ACTIVATION_SHRINK => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let bias = read_f32(memory, payload + 16)?;
+                let threshold = read_f32(memory, payload + 20)?;
+                plan(
+                    DmlOpKind::ExActivation {
+                        activation: dml_ops::DmlExActivation::Shrink { bias, threshold },
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ACTIVATION_CELU => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let alpha = read_f32(memory, payload + 16)?;
+                plan(
+                    DmlOpKind::ExActivation {
+                        activation: dml_ops::DmlExActivation::Celu { alpha },
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ACTIVATION_RELU_GRAD => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let gradient = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                plan(
+                    DmlOpKind::ReluGrad,
+                    vec![input, gradient],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_IF => {
+                let condition = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let a = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let b = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                plan(
+                    DmlOpKind::If,
+                    vec![condition, a, b],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_BIT_NOT
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_BIT_COUNT => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let kind = if ty == dml_ops::DML_OPERATOR_ELEMENT_WISE_BIT_NOT {
+                    DmlOpKind::BitNot
+                } else {
+                    DmlOpKind::BitCount
+                };
+                plan(kind, vec![input], output, Vec::new(), None)
+            }
+            dml_ops::DML_OPERATOR_LP_POOLING | dml_ops::DML_OPERATOR_LP_POOLING1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let dimension_count = read_u32(memory, payload + 16)?;
+                let strides =
+                    read_u32_list(memory, read_ptr(memory, payload + 24)?, dimension_count)?;
+                let window =
+                    read_u32_list(memory, read_ptr(memory, payload + 32)?, dimension_count)?;
+                let start_padding =
+                    read_u32_list(memory, read_ptr(memory, payload + 40)?, dimension_count)?;
+                let end_padding =
+                    read_u32_list(memory, read_ptr(memory, payload + 48)?, dimension_count)?;
+                let (dilations, p) = if ty == dml_ops::DML_OPERATOR_LP_POOLING1 {
+                    let dilations =
+                        read_u32_list(memory, read_ptr(memory, payload + 56)?, dimension_count)?;
+                    (dilations, read_u32(memory, payload + 64)?)
+                } else {
+                    (Vec::new(), read_u32(memory, payload + 56)?)
+                };
+                plan(
+                    DmlOpKind::LpPooling {
+                        is_v1: ty == dml_ops::DML_OPERATOR_LP_POOLING1,
+                        p,
+                        strides,
+                        window,
+                        start_padding,
+                        end_padding,
+                        dilations,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_LP_NORMALIZATION => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let axis = read_u32(memory, payload + 16)?;
+                let epsilon = read_f32(memory, payload + 20)?;
+                let p = read_u32(memory, payload + 24)?;
+                plan(
+                    DmlOpKind::LpNormalization { axis, epsilon, p },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_VALUE_SCALE_2D => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let scale = read_f32(memory, payload + 16)?;
+                let channel_count = read_u32(memory, payload + 20)?;
+                let bias = read_f32_list(memory, read_ptr(memory, payload + 24)?, channel_count)?;
+                plan(
+                    DmlOpKind::ValueScale2D {
+                        scale,
+                        channel_count,
+                        bias,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_SPACE_TO_DEPTH
+            | dml_ops::DML_OPERATOR_DEPTH_TO_SPACE
+            | dml_ops::DML_OPERATOR_SPACE_TO_DEPTH1
+            | dml_ops::DML_OPERATOR_DEPTH_TO_SPACE1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let block_size = read_u32(memory, payload + 16)?;
+                let order = if ty == dml_ops::DML_OPERATOR_SPACE_TO_DEPTH1
+                    || ty == dml_ops::DML_OPERATOR_DEPTH_TO_SPACE1
+                {
+                    read_u32(memory, payload + 20)?
+                } else {
+                    0
+                };
+                let to_depth = ty == dml_ops::DML_OPERATOR_SPACE_TO_DEPTH
+                    || ty == dml_ops::DML_OPERATOR_SPACE_TO_DEPTH1;
+                plan(
+                    DmlOpKind::SpaceDepth {
+                        is_v1: ty == dml_ops::DML_OPERATOR_SPACE_TO_DEPTH1
+                            || ty == dml_ops::DML_OPERATOR_DEPTH_TO_SPACE1,
+                        to_depth,
+                        block_size,
+                        order,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_MAX_POOLING1 | dml_ops::DML_OPERATOR_MAX_POOLING2 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let indices = optional_tensor(memory, read_ptr(memory, payload + 16)?)?;
+                let dimension_count = read_u32(memory, payload + 24)?;
+                let strides =
+                    read_u32_list(memory, read_ptr(memory, payload + 32)?, dimension_count)?;
+                let window =
+                    read_u32_list(memory, read_ptr(memory, payload + 40)?, dimension_count)?;
+                let start_padding =
+                    read_u32_list(memory, read_ptr(memory, payload + 48)?, dimension_count)?;
+                let end_padding =
+                    read_u32_list(memory, read_ptr(memory, payload + 56)?, dimension_count)?;
+                let (dilations, supported) = if ty == dml_ops::DML_OPERATOR_MAX_POOLING2 {
+                    (
+                        read_u32_list(memory, read_ptr(memory, payload + 64)?, dimension_count)?,
+                        true,
+                    )
+                } else {
+                    (vec![1; dimension_count as usize], false)
+                };
+                let mut extra = Vec::new();
+                if let Some(indices) = indices {
+                    extra.push(indices);
+                }
+                plan(
+                    DmlOpKind::MaxPoolingEx {
+                        strides,
+                        window,
+                        start_padding,
+                        end_padding,
+                        dilations,
+                        has_indices: !extra.is_empty(),
+                        dilations_supported: supported,
+                    },
+                    vec![input],
+                    output,
+                    extra,
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_MAX_UNPOOLING => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let indices = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                plan(
+                    DmlOpKind::MaxUnpooling,
+                    vec![input, indices],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_SLICE1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let dimension_count = read_u32(memory, payload + 16)?;
+                let offsets =
+                    read_u32_list(memory, read_ptr(memory, payload + 24)?, dimension_count)?;
+                let sizes =
+                    read_u32_list(memory, read_ptr(memory, payload + 32)?, dimension_count)?;
+                let strides =
+                    read_i32_list(memory, read_ptr(memory, payload + 40)?, dimension_count)?;
+                plan(
+                    DmlOpKind::SliceEx {
+                        offsets,
+                        sizes,
+                        strides,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_CLIP1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let scale_bias_ptr = read_ptr(memory, payload + 16)?;
+                let (scale, bias, has_scale_bias) = if scale_bias_ptr == 0 {
+                    (0.0, 0.0, false)
+                } else {
+                    (
+                        read_f32(memory, scale_bias_ptr)?,
+                        read_f32(memory, scale_bias_ptr + 4)?,
+                        true,
+                    )
+                };
+                let min_max_type = read_u32(memory, payload + 24)?;
+                let min = read_scalar_union(memory, payload + 32, min_max_type)?;
+                let max = read_scalar_union(memory, payload + 40, min_max_type)?;
+                plan(
+                    DmlOpKind::Clip1 {
+                        min,
+                        max,
+                        scale,
+                        bias,
+                        has_scale_bias,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_AVERAGE_POOLING_GRAD => {
+                let gradient = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let dimension_count = read_u32(memory, payload + 16)?;
+                let strides =
+                    read_u32_list(memory, read_ptr(memory, payload + 24)?, dimension_count)?;
+                let window =
+                    read_u32_list(memory, read_ptr(memory, payload + 32)?, dimension_count)?;
+                let start_padding =
+                    read_u32_list(memory, read_ptr(memory, payload + 40)?, dimension_count)?;
+                let end_padding =
+                    read_u32_list(memory, read_ptr(memory, payload + 48)?, dimension_count)?;
+                let include_padding = read_u32(memory, payload + 56)? != 0;
+                plan(
+                    DmlOpKind::AveragePoolingGrad {
+                        strides,
+                        window,
+                        start_padding,
+                        end_padding,
+                        include_padding,
+                    },
+                    vec![gradient],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_MAX_POOLING_GRAD => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let gradient = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let dimension_count = read_u32(memory, payload + 24)?;
+                let strides =
+                    read_u32_list(memory, read_ptr(memory, payload + 32)?, dimension_count)?;
+                let window =
+                    read_u32_list(memory, read_ptr(memory, payload + 40)?, dimension_count)?;
+                let start_padding =
+                    read_u32_list(memory, read_ptr(memory, payload + 48)?, dimension_count)?;
+                let end_padding =
+                    read_u32_list(memory, read_ptr(memory, payload + 56)?, dimension_count)?;
+                let dilations =
+                    read_u32_list(memory, read_ptr(memory, payload + 64)?, dimension_count)?;
+                plan(
+                    DmlOpKind::MaxPoolingGrad {
+                        strides,
+                        window,
+                        start_padding,
+                        end_padding,
+                        dilations,
+                    },
+                    vec![input, gradient],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_RESAMPLE_GRAD | dml_ops::DML_OPERATOR_RESAMPLE_GRAD1 => {
+                let gradient = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let mode = read_u32(memory, payload + 16)?;
+                let (rounding, dimension_count, scales_offset) =
+                    if ty == dml_ops::DML_OPERATOR_RESAMPLE_GRAD1 {
+                        (
+                            read_u32(memory, payload + 20)?,
+                            read_u32(memory, payload + 24)?,
+                            32,
+                        )
+                    } else {
+                        (0, read_u32(memory, payload + 20)?, 24)
+                    };
+                let mode = dml_ops::DmlInterpolationMode::from_u32(mode).ok_or_else(|| {
+                    DmlError::invalid(format!("resample interpolation mode {mode} is undefined"))
+                })?;
+                let rounding = dml_ops::DmlAxisDirection::from_u32(rounding).ok_or_else(|| {
+                    DmlError::invalid(format!(
+                        "resample rounding direction {rounding} is undefined"
+                    ))
+                })?;
+                let scales = read_f32_list(
+                    memory,
+                    read_ptr(memory, payload + scales_offset)?,
+                    dimension_count,
+                )?;
+                let input_offsets = read_f32_list(
+                    memory,
+                    read_ptr(memory, payload + scales_offset + 8)?,
+                    dimension_count,
+                )?;
+                let output_offsets = read_f32_list(
+                    memory,
+                    read_ptr(memory, payload + scales_offset + 16)?,
+                    dimension_count,
+                )?;
+                plan(
+                    DmlOpKind::ResampleGrad {
+                        is_v1: ty == dml_ops::DML_OPERATOR_RESAMPLE_GRAD1,
+                        mode,
+                        rounding,
+                        scales,
+                        input_offsets,
+                        output_offsets,
+                    },
+                    vec![gradient],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_SLICE_GRAD => {
+                let gradient = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let dimension_count = read_u32(memory, payload + 16)?;
+                let offsets =
+                    read_u32_list(memory, read_ptr(memory, payload + 24)?, dimension_count)?;
+                let sizes =
+                    read_u32_list(memory, read_ptr(memory, payload + 32)?, dimension_count)?;
+                let strides =
+                    read_i32_list(memory, read_ptr(memory, payload + 40)?, dimension_count)?;
+                plan(
+                    DmlOpKind::SliceGrad {
+                        offsets,
+                        sizes,
+                        strides,
+                    },
+                    vec![gradient],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_CLIP_GRAD
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_CLIP_GRAD1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let gradient = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let (min, max) = if ty == dml_ops::DML_OPERATOR_ELEMENT_WISE_CLIP_GRAD1 {
+                    let min_max_type = read_u32(memory, payload + 24)?;
+                    (
+                        read_scalar_union(memory, payload + 32, min_max_type)?,
+                        read_scalar_union(memory, payload + 40, min_max_type)?,
+                    )
+                } else {
+                    (
+                        read_f32(memory, payload + 24)?,
+                        read_f32(memory, payload + 28)?,
+                    )
+                };
+                plan(
+                    DmlOpKind::ClipGrad {
+                        is_v1: ty == dml_ops::DML_OPERATOR_ELEMENT_WISE_CLIP_GRAD1,
+                        min,
+                        max,
+                    },
+                    vec![input, gradient],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_LOCAL_RESPONSE_NORMALIZATION_GRAD => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let gradient = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let cross_channel = read_u32(memory, payload + 24)? != 0;
+                let local_size = read_u32(memory, payload + 28)?;
+                let alpha = read_f32(memory, payload + 32)?;
+                let beta = read_f32(memory, payload + 36)?;
+                let bias = read_f32(memory, payload + 40)?;
+                plan(
+                    DmlOpKind::LrnGrad {
+                        cross_channel,
+                        local_size,
+                        alpha,
+                        beta,
+                        bias,
+                    },
+                    vec![input, gradient],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_BATCH_NORMALIZATION_GRAD
+            | dml_ops::DML_OPERATOR_BATCH_NORMALIZATION_TRAINING_GRAD => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let gradient = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let mean = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let variance = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let scale = tensor_at(memory, read_ptr(memory, payload + 32)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 40)?)?;
+                let scale_gradient = tensor_at(memory, read_ptr(memory, payload + 48)?)?;
+                let bias_gradient = tensor_at(memory, read_ptr(memory, payload + 56)?)?;
+                let epsilon = read_f32(memory, payload + 64)?;
+                let kind = if ty == dml_ops::DML_OPERATOR_BATCH_NORMALIZATION_GRAD {
+                    DmlOpKind::BatchNormalizationGrad { epsilon }
+                } else {
+                    DmlOpKind::BatchNormalizationTrainingGrad { epsilon }
+                };
+                plan(
+                    kind,
+                    vec![input, gradient, mean, variance, scale],
+                    output,
+                    vec![scale_gradient, bias_gradient],
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_BATCH_NORMALIZATION_TRAINING => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let scale = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let bias = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let fused_add = optional_tensor(memory, read_ptr(memory, payload + 24)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 32)?)?;
+                let mean = tensor_at(memory, read_ptr(memory, payload + 40)?)?;
+                let variance = tensor_at(memory, read_ptr(memory, payload + 48)?)?;
+                let epsilon = read_f32(memory, payload + 56)?;
+                if read_ptr(memory, payload + 64)? != 0 {
+                    return Err(DmlError::invalid(
+                        "batch normalization training fused activation is not supported",
+                    ));
+                }
+                let mut inputs = vec![input, scale, bias];
+                if let Some(fused_add) = fused_add {
+                    inputs.push(fused_add);
+                }
+                plan(
+                    DmlOpKind::BatchNormalizationTraining { epsilon },
+                    inputs,
+                    output,
+                    vec![mean, variance],
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ROI_ALIGN_GRAD => {
+                let input = optional_tensor(memory, read_ptr(memory, payload)?)?;
+                let gradient = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let roi = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let batch_indices = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let output = optional_tensor(memory, read_ptr(memory, payload + 32)?)?;
+                if read_ptr(memory, payload + 40)? != 0 {
+                    return Err(DmlError::invalid(
+                        "ROI align gradient ROI coordinate gradients are not supported",
+                    ));
+                }
+                let output = output.ok_or_else(|| {
+                    DmlError::new(E_POINTER, "ROI align gradient output tensor is null")
+                })?;
+                let reduction = read_u32(memory, payload + 48)?;
+                let mode = read_u32(memory, payload + 52)?;
+                let reduction = dml_ops::DmlReduceKind::from_reduce_function(reduction)
+                    .ok_or_else(|| {
+                        DmlError::invalid(format!(
+                            "ROI align gradient reduction function {reduction} is undefined"
+                        ))
+                    })?;
+                let mode = dml_ops::DmlInterpolationMode::from_u32(mode).ok_or_else(|| {
+                    DmlError::invalid(format!(
+                        "ROI align gradient interpolation mode {mode} is undefined"
+                    ))
+                })?;
+                let mut inputs = Vec::new();
+                if let Some(input) = input {
+                    inputs.push(input);
+                }
+                inputs.push(gradient);
+                inputs.push(roi);
+                inputs.push(batch_indices);
+                plan(
+                    DmlOpKind::RoiAlignGrad {
+                        reduction,
+                        mode,
+                        spatial_scale_x: read_f32(memory, payload + 56)?,
+                        spatial_scale_y: read_f32(memory, payload + 60)?,
+                        input_pixel_offset: read_f32(memory, payload + 64)?,
+                        output_pixel_offset: read_f32(memory, payload + 68)?,
+                        minimum_samples_per_output: read_u32(memory, payload + 72)?,
+                        maximum_samples_per_output: read_u32(memory, payload + 76)?,
+                        align_regions_to_corners: read_u32(memory, payload + 80)? != 0,
+                    },
+                    inputs,
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_RANDOM_GENERATOR => {
+                let state = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output_state = optional_tensor(memory, read_ptr(memory, payload + 16)?)?;
+                let generator_type = read_u32(memory, payload + 24)?;
+                let mut extra = Vec::new();
+                if let Some(state) = output_state {
+                    extra.push(state);
+                }
+                plan(
+                    DmlOpKind::RandomGenerator { generator_type },
+                    vec![state],
+                    output,
+                    extra,
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_NONZERO_COORDINATES => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let count = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let coordinates = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                plan(
+                    DmlOpKind::NonZeroCoordinates,
+                    vec![input],
+                    count,
+                    vec![coordinates],
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_DIAGONAL_MATRIX1 => {
+                let input = optional_tensor(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let value_type = read_u32(memory, payload + 16)?;
+                let value = read_scalar_union(memory, payload + 24, value_type)?;
+                let offset_begin = read_u32(memory, payload + 32)? as i32;
+                let offset_end = read_u32(memory, payload + 36)? as i32;
+                let mut inputs = Vec::new();
+                if let Some(input) = input {
+                    inputs.push(input);
+                }
+                plan(
+                    DmlOpKind::DiagonalMatrix1 {
+                        offset_begin,
+                        offset_end,
+                        value,
+                    },
+                    inputs,
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION
+            | dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION1 => {
+                let is_v1 = ty == dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION1;
+                let query = optional_tensor(memory, read_ptr(memory, payload)?)?;
+                let key = optional_tensor(memory, read_ptr(memory, payload + 8)?)?;
+                let value = optional_tensor(memory, read_ptr(memory, payload + 16)?)?;
+                let stacked_query_key = read_ptr(memory, payload + 24)?;
+                let stacked_key_value = read_ptr(memory, payload + 32)?;
+                let stacked_query_key_value = read_ptr(memory, payload + 40)?;
+                if stacked_query_key != 0 || stacked_key_value != 0 || stacked_query_key_value != 0
+                {
+                    return Err(DmlError::invalid(
+                        "multi-head attention stacked query/key/value tensors are not supported",
+                    ));
+                }
+                let bias = optional_tensor(memory, read_ptr(memory, payload + 48)?)?;
+                let mask = optional_tensor(memory, read_ptr(memory, payload + 56)?)?;
+                if read_ptr(memory, payload + 64)? != 0 {
+                    return Err(DmlError::invalid(
+                        "multi-head attention relative position bias is not supported",
+                    ));
+                }
+                if read_ptr(memory, payload + 72)? != 0 || read_ptr(memory, payload + 80)? != 0 {
+                    return Err(DmlError::invalid(
+                        "multi-head attention past key/value tensors are not supported",
+                    ));
+                }
+                let (output_offset, present_key_offset, present_value_offset, scale_offset) =
+                    if is_v1 {
+                        if read_ptr(memory, payload + 88)? != 0 {
+                            return Err(DmlError::invalid(
+                                "multi-head attention1 past sequence lengths are not supported",
+                            ));
+                        }
+                        (96u64, 104u64, 112u64, 120u64)
+                    } else {
+                        (88u64, 96u64, 104u64, 112u64)
+                    };
+                let output = tensor_at(memory, read_ptr(memory, payload + output_offset)?)?;
+                if read_ptr(memory, payload + present_key_offset)? != 0
+                    || read_ptr(memory, payload + present_value_offset)? != 0
+                {
+                    return Err(DmlError::invalid(
+                        "multi-head attention present key/value outputs are not supported",
+                    ));
+                }
+                let scale = read_f32(memory, payload + scale_offset)?;
+                let mask_filter_value = read_f32(memory, payload + scale_offset + 4)?;
+                let (query_head_count, key_value_head_count, mask_type_offset) = if is_v1 {
+                    (
+                        read_u32(memory, payload + 128)?,
+                        read_u32(memory, payload + 132)?,
+                        136u64,
+                    )
+                } else {
+                    let heads = read_u32(memory, payload + 120)?;
+                    (heads, heads, 124u64)
+                };
+                let mask_type = read_u32(memory, payload + mask_type_offset)?;
+                let query = query.ok_or_else(|| {
+                    DmlError::new(E_POINTER, "multi-head attention query tensor is null")
+                })?;
+                let key = key.ok_or_else(|| {
+                    DmlError::new(E_POINTER, "multi-head attention key tensor is null")
+                })?;
+                let value = value.ok_or_else(|| {
+                    DmlError::new(E_POINTER, "multi-head attention value tensor is null")
+                })?;
+                let has_bias = bias.is_some();
+                let has_mask = mask.is_some();
+                let mut inputs = vec![query, key, value];
+                if let Some(bias) = bias {
+                    inputs.push(bias);
+                }
+                if let Some(mask) = mask {
+                    inputs.push(mask);
+                }
+                plan(
+                    DmlOpKind::MultiHeadAttention {
+                        scale,
+                        mask_filter_value,
+                        query_head_count,
+                        key_value_head_count,
+                        mask_type,
+                        layout: dml_ops::DmlMhaLayout::Separate,
+                        has_bias,
+                        has_mask,
+                        is_v1,
+                    },
+                    inputs,
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_AVERAGE_POOLING1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let dimension_count = read_u32(memory, payload + 16)?;
+                let strides =
+                    read_u32_list(memory, read_ptr(memory, payload + 24)?, dimension_count)?;
+                let window =
+                    read_u32_list(memory, read_ptr(memory, payload + 32)?, dimension_count)?;
+                let start_padding =
+                    read_u32_list(memory, read_ptr(memory, payload + 40)?, dimension_count)?;
+                let end_padding =
+                    read_u32_list(memory, read_ptr(memory, payload + 48)?, dimension_count)?;
+                let dilations =
+                    read_u32_list(memory, read_ptr(memory, payload + 56)?, dimension_count)?;
+                let include_padding = read_u32(memory, payload + 64)? != 0;
+                plan(
+                    DmlOpKind::AveragePooling1 {
+                        strides,
+                        window,
+                        start_padding,
+                        end_padding,
+                        dilations,
+                        include_padding,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
             other => Err(DmlError::unsupported_operator(other)),
         }
     }
@@ -3076,6 +3888,17 @@ fn read_u32_list(memory: &dyn StateObjectMemory, address: u64, count: u32) -> Dm
     let mut values = Vec::with_capacity(count as usize);
     for index in 0..count as u64 {
         values.push(read_u32(memory, address + index * 4)?);
+    }
+    Ok(values)
+}
+
+fn read_i32_list(memory: &dyn StateObjectMemory, address: u64, count: u32) -> DmlResult<Vec<i32>> {
+    if count != 0 && address == 0 {
+        return Err(DmlError::new(E_POINTER, "operator array pointer is null"));
+    }
+    let mut values = Vec::with_capacity(count as usize);
+    for index in 0..count as u64 {
+        values.push(read_u32(memory, address + index * 4)? as i32);
     }
     Ok(values)
 }
@@ -5475,29 +6298,29 @@ mod tests {
         );
         assert_eq!(
             operator_support(dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION),
-            OperatorSupport::Unsupported
+            OperatorSupport::Implemented
         );
         assert_eq!(
             operator_support(dml_ops::DML_OPERATOR_RESAMPLE3),
             OperatorSupport::Unknown
         );
         assert_eq!(
-            unsupported_operator_error(dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION).message,
-            "DML_OPERATOR_TYPE 164 is not supported by this DirectML implementation"
+            unsupported_operator_error(175).message,
+            "DML_OPERATOR_TYPE 175 is not supported by this DirectML implementation"
         );
         let implemented = implemented_operator_types();
         let remaining = unsupported_operator_types();
-        assert_eq!(implemented.len(), 129);
-        assert_eq!(remaining.len(), 45);
+        assert_eq!(implemented.len(), 174);
+        assert_eq!(remaining.len(), 0);
         assert_eq!(implemented.len() + remaining.len(), 174);
         assert_eq!(implemented.is_empty(), false);
-        assert_eq!(remaining.is_empty(), false);
+        assert_eq!(remaining.is_empty(), true);
         assert_eq!(
-            implemented.contains(&dml_ops::DML_OPERATOR_FILL_VALUE_CONSTANT),
+            implemented.contains(&dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION),
             true
         );
         assert_eq!(
-            remaining.contains(&dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION),
+            implemented.contains(&dml_ops::DML_OPERATOR_ACTIVATION_HARDMAX),
             true
         );
     }
@@ -5582,6 +6405,398 @@ mod tests {
             "DML_OPERATOR_TYPE 103 ValueDataType 5 is not supported (FLOAT32 only)"
         );
     }
+    #[test]
+    fn dml_guest_parses_remaining_operator_families_and_rejects_stacked_mha() {
+        let mut memory = base_memory();
+        let input = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 1, 4],
+            None,
+        );
+        let output = write_tensor(
+            &mut memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 1, 4],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_ACTIVATION_HARDMAX,
+            &[input, output],
+        );
+        let plan = DmlRuntime::new()
+            .parse_operation_from_guest(&memory, desc)
+            .expect("hardmax plan");
+        assert_eq!(
+            plan.kind,
+            dml_ops::DmlOpKind::SoftmaxEx {
+                kind: dml_ops::DmlSoftmaxKind::Hardmax,
+                axes: vec![3]
+            }
+        );
+
+        let mut memory = base_memory();
+        let condition = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_UINT8,
+            &[1, 1, 1, 4],
+            None,
+        );
+        let a = write_tensor(
+            &mut memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 1, 4],
+            None,
+        );
+        let b = write_tensor(
+            &mut memory.data,
+            0x3000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 1, 4],
+            None,
+        );
+        let output = write_tensor(
+            &mut memory.data,
+            0x4000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 1, 4],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_IF,
+            &[condition, a, b, output],
+        );
+        let plan = DmlRuntime::new()
+            .parse_operation_from_guest(&memory, desc)
+            .expect("IF plan");
+        assert_eq!(plan.kind, dml_ops::DmlOpKind::If);
+        assert_eq!(plan.inputs.len(), 3);
+
+        let mut memory = base_memory();
+        let input = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 1, 2],
+            None,
+        );
+        let output = write_tensor(
+            &mut memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 1, 2],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_CLIP1,
+            &[input, output],
+        );
+        put_u64(&mut memory.data, 0x6000 + 0x20 + 16, 0);
+        put_u32(
+            &mut memory.data,
+            0x6000 + 0x20 + 24,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+        );
+        put_u32(&mut memory.data, 0x6000 + 0x20 + 32, (-1.0f32).to_bits());
+        put_u32(&mut memory.data, 0x6000 + 0x20 + 40, 2.0f32.to_bits());
+        let plan = DmlRuntime::new()
+            .parse_operation_from_guest(&memory, desc)
+            .expect("clip1 plan");
+        assert_eq!(
+            plan.kind,
+            dml_ops::DmlOpKind::Clip1 {
+                min: -1.0,
+                max: 2.0,
+                scale: 0.0,
+                bias: 0.0,
+                has_scale_bias: false
+            }
+        );
+
+        let mut memory = base_memory();
+        let input = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 4, 4],
+            None,
+        );
+        let output = write_tensor(
+            &mut memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 3, 3],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_LP_POOLING1,
+            &[input, output],
+        );
+        let payload = 0x6000 + 0x20;
+        put_u32(&mut memory.data, payload + 16, 2);
+        put_u64(&mut memory.data, payload + 24, 0x4000);
+        put_u64(&mut memory.data, payload + 32, 0x4010);
+        put_u64(&mut memory.data, payload + 40, 0x4020);
+        put_u64(&mut memory.data, payload + 48, 0x4030);
+        put_u64(&mut memory.data, payload + 56, 0x4040);
+        put_u32(&mut memory.data, payload + 64, 2);
+        for (index, value) in [1u32, 1].into_iter().enumerate() {
+            put_u32(&mut memory.data, 0x4000 + index * 4, value);
+        }
+        for (index, value) in [2u32, 2].into_iter().enumerate() {
+            put_u32(&mut memory.data, 0x4010 + index * 4, value);
+        }
+        for (index, value) in [2u32, 2].into_iter().enumerate() {
+            put_u32(&mut memory.data, 0x4040 + index * 4, value);
+        }
+        let plan = DmlRuntime::new()
+            .parse_operation_from_guest(&memory, desc)
+            .expect("LP pooling1 plan");
+        assert_eq!(
+            plan.kind,
+            dml_ops::DmlOpKind::LpPooling {
+                is_v1: true,
+                p: 2,
+                strides: vec![1, 1],
+                window: vec![2, 2],
+                start_padding: vec![0, 0],
+                end_padding: vec![0, 0],
+                dilations: vec![2, 2]
+            }
+        );
+
+        let mut memory = base_memory();
+        let input = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 2, 2],
+            None,
+        );
+        let output = write_tensor(
+            &mut memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 1, 1],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_SLICE1,
+            &[input, output],
+        );
+        let payload = 0x6000 + 0x20;
+        put_u32(&mut memory.data, payload + 16, 4);
+        put_u64(&mut memory.data, payload + 24, 0x4000);
+        put_u64(&mut memory.data, payload + 32, 0x4020);
+        put_u64(&mut memory.data, payload + 40, 0x4040);
+        for (index, value) in [0u32, 0, 0, 0].into_iter().enumerate() {
+            put_u32(&mut memory.data, 0x4000 + index * 4, value);
+        }
+        for (index, value) in [1u32, 1, 1, 1].into_iter().enumerate() {
+            put_u32(&mut memory.data, 0x4020 + index * 4, value);
+        }
+        for (index, value) in [1i32, 1, 1, 1].into_iter().enumerate() {
+            put_u32(&mut memory.data, 0x4040 + index * 4, value as u32);
+        }
+        let plan = DmlRuntime::new()
+            .parse_operation_from_guest(&memory, desc)
+            .expect("slice1 plan");
+        assert_eq!(
+            plan.kind,
+            dml_ops::DmlOpKind::SliceEx {
+                offsets: vec![0; 4],
+                sizes: vec![1; 4],
+                strides: vec![1; 4]
+            }
+        );
+
+        let mut memory = base_memory();
+        let state = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_UINT32,
+            &[1, 1, 1, 6],
+            None,
+        );
+        let output = write_tensor(
+            &mut memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_UINT32,
+            &[1, 1, 1, 4],
+            None,
+        );
+        let state_out = write_tensor(
+            &mut memory.data,
+            0x3000,
+            DML_TENSOR_DATA_TYPE_UINT32,
+            &[1, 1, 1, 6],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_RANDOM_GENERATOR,
+            &[state, output, state_out],
+        );
+        put_u32(&mut memory.data, 0x6000 + 0x20 + 24, 0);
+        let plan = DmlRuntime::new()
+            .parse_operation_from_guest(&memory, desc)
+            .expect("random plan");
+        assert_eq!(
+            plan.kind,
+            dml_ops::DmlOpKind::RandomGenerator { generator_type: 0 }
+        );
+        assert_eq!(plan.extra_outputs.len(), 1);
+
+        let mut memory = base_memory();
+        let input = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_UINT8,
+            &[2, 2],
+            None,
+        );
+        let count = write_tensor(
+            &mut memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_UINT32,
+            &[1],
+            None,
+        );
+        let coordinates = write_tensor(
+            &mut memory.data,
+            0x3000,
+            DML_TENSOR_DATA_TYPE_UINT32,
+            &[4, 2],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_NONZERO_COORDINATES,
+            &[input, count, coordinates],
+        );
+        let plan = DmlRuntime::new()
+            .parse_operation_from_guest(&memory, desc)
+            .expect("nonzero plan");
+        assert_eq!(plan.kind, dml_ops::DmlOpKind::NonZeroCoordinates);
+        assert_eq!(plan.extra_outputs.len(), 1);
+
+        let mut memory = base_memory();
+        let query = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 2],
+            None,
+        );
+        let key = write_tensor(
+            &mut memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 2],
+            None,
+        );
+        let value = write_tensor(
+            &mut memory.data,
+            0x3000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 2],
+            None,
+        );
+        let output = write_tensor(
+            &mut memory.data,
+            0x4000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 2],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION1,
+            &[query, key, value, 0, 0, 0, 0, 0, 0, 0, 0, 0, output],
+        );
+        let payload = 0x6000 + 0x20;
+        put_u32(&mut memory.data, payload + 120, 1.0f32.to_bits());
+        put_u32(&mut memory.data, payload + 124, (-1000.0f32).to_bits());
+        put_u32(&mut memory.data, payload + 128, 1);
+        put_u32(&mut memory.data, payload + 132, 1);
+        put_u32(&mut memory.data, payload + 136, 0);
+        let plan = DmlRuntime::new()
+            .parse_operation_from_guest(&memory, desc)
+            .expect("MHA1 plan");
+        assert_eq!(
+            plan.kind,
+            dml_ops::DmlOpKind::MultiHeadAttention {
+                scale: 1.0,
+                mask_filter_value: -1000.0,
+                query_head_count: 1,
+                key_value_head_count: 1,
+                mask_type: 0,
+                layout: dml_ops::DmlMhaLayout::Separate,
+                has_bias: false,
+                has_mask: false,
+                is_v1: true
+            }
+        );
+
+        let mut memory = base_memory();
+        let query = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 2],
+            None,
+        );
+        let stacked = write_tensor(
+            &mut memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 1, 2, 2],
+            None,
+        );
+        let output = write_tensor(
+            &mut memory.data,
+            0x3000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[1, 1, 2],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION,
+            &[query, 0, 0, stacked, 0, 0, 0, 0, 0, 0, 0, output],
+        );
+        let payload = 0x6000 + 0x20;
+        put_u32(&mut memory.data, payload + 112, 1.0f32.to_bits());
+        put_u32(&mut memory.data, payload + 116, 0.0f32.to_bits());
+        put_u32(&mut memory.data, payload + 120, 1);
+        put_u32(&mut memory.data, payload + 124, 0);
+        assert_eq!(
+            DmlRuntime::new()
+                .parse_operation_from_guest(&memory, desc)
+                .unwrap_err()
+                .message,
+            "multi-head attention stacked query/key/value tensors are not supported"
+        );
+    }
+
     #[test]
     fn dml_feature_level_6_3_rejects_6_4_resample3_exactly() {
         let mut runtime = DmlRuntime::new();

@@ -2339,6 +2339,21 @@
   "( runtime .dispatch_work_graph( gpu_list, executable, Some(\"chain\"), &D3d12DispatchGraphDesc { record_count: 1, records: empty_record, ..gpu_desc.clone() }, None, ) .expect(\"empty GPU record\"), 0 )",
   "( error.message, \"work graph record 0 output index 9 is out of range for node \\\"root\\\"[0] output count 1\" )"
  ],
+ "d3d12_work_graph_node_program_resolves_guest_dxil_and_rejects_malformed_shaders": [
+  "( runtime .ensure_work_graph_node_program(executable, Some(\"shader\"), 0) .expect(\"compile guest node\"), true )",
+  "( error.message, \"work graph node index 5 is out of range for 1 nodes\" )",
+  "(run.threads, 0)",
+  "(run.outputs, Vec::new())",
+  "( runtime .ensure_work_graph_node_program(plain_object, Some(\"plain\"), 0) .expect(\"no DXIL body\"), false )",
+  "(error.code, ReasonCode::RcDxilInvalid)"
+ ],
+ "d3d12_work_graph_ordered_rasterization_is_serialized_and_gpu_input_fails_closed": [
+  "( runtime .dispatch_bound_work_graph(list, &cpu_desc) .expect(\"ordered CPU dispatch\"), 3 )",
+  "(stream.commands.len(), 3)",
+  "( error.message, \"D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER cannot be \\ preserved for GPU-produced work-graph records on Metal\" )",
+  "( error.message, \"D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER requires a \\ graphics (mesh) node reachable from the entrypoint\" )",
+  "( error.message, \"D3D12_WORK_GRAPH_FLAGS 0x4 contain undefined bits\" )"
+ ],
  "d3d8thk_allocation_residency_rejects_budget_overrun_and_double_destroy": [
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTQueryAdapterInfo, &[query] ), 0 )",
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTMakeResident, &[resident] ), STATUS_GRAPHICS_NO_VIDEO_MEMORY )",
@@ -3241,6 +3256,20 @@
   "( validate_buffer_binding(16, 4, 16).unwrap_err().message, \"buffer binding size 4 is smaller than the required 16 bytes\" )",
   "( validate_buffer_binding(u64::MAX - 15, 32, 16) .unwrap_err() .message, \"buffer binding range overflows\" )"
  ],
+ "dml_extended_family_metal_edge_readback_matches_cpu": [
+  "(cpu_outputs, metal_outputs)",
+  "(read_f32(&cpu_outputs[0]), read_f32(&metal_outputs[0]))",
+  "(read_f32(&cpu_outputs[1]), read_f32(&metal_outputs[1]))",
+  "(read_f32(&cpu_outputs[2]), read_f32(&metal_outputs[2]))"
+ ],
+ "dml_extended_family_numeric_readback_edge_values_are_exact": [
+  "( run_cpu(&hardmax, &[&f32_bytes(&[1.0, 2.0, 3.0, 1.0])]), vec![0.0, 0.0, 1.0, 0.0] )",
+  "( run_cpu( &if_plan, &[ &[0u8, 1, 2, 0], &f32_bytes(&[10.0, 20.0, 30.0, 40.0]), &f32_bytes(&[1.0, 2.0, 3.0, 4.0]) ], ), vec![1.0, 20.0, 30.0, 4.0] )",
+  "( run_cpu_outputs(&bit_not, &[&[0x0f, 0xf0]])[0], vec![0xf0, 0x0f] )",
+  "(counted, vec![4, 8])",
+  "(read_f32(&outputs[0]), vec![4.0])",
+  "(u32::from_le_bytes(outputs[1][..4].try_into().unwrap()), 1)"
+ ],
  "dml_extended_rejects_invalid_descriptor_shapes_exactly": [
   "( convolution.validate().unwrap_err().message, \"convolution filter channel count 2 must equal input channels / groups (1)\" )",
   "( pooling.validate().unwrap_err().message, \"pooling output sizes must be [1, 1, 2, 2], got [1, 1, 1, 1]\" )",
@@ -3291,6 +3320,16 @@
  "dml_gemm_float16_metal_numeric_readback_edge_values": [
   "(read_f16(&cpu), vec![22.0, 28.0, 49.0, 64.0])"
  ],
+ "dml_gradient_and_aux_metal_edge_readback_matches_cpu": [
+  "( run_cpu_outputs(&random, &[&state]), run_metal_outputs(&random, &[&state]) )",
+  "( run_cpu_outputs(&nonzero, &[&[0u8, 3, 0, 4]]), run_metal_outputs(&nonzero, &[&[0u8, 3, 0, 4]]) )",
+  "( run_cpu(&avg_grad, &[&f32_bytes(&[1.0])]), vec![0.25, 0.25, 0.25, 0.25] )",
+  "( execute_plan( &max_unpool, DmlExecutionDevice::Metal, &[&f32_bytes(&[5.0]), &[4u8, 0, 0, 0]], &mut vec![0u8; 16][..], ) .unwrap_err() .message, \"max unpooling index 4 is outside the output element count 4\" )"
+ ],
+ "dml_gradient_and_training_families_edge_values_are_exact": [
+  "( run_cpu(&avg_grad, &[&f32_bytes(&[1.0])]), vec![0.25, 0.25, 0.25, 0.25] )",
+  "( run_cpu( &roi_grad_max, &[ &f32_bytes(&[1.0, 4.0, 2.0, 3.0]), &f32_bytes(&[1.0]), &f32_bytes(&[0.0, 0.0, 1.0, 1.0]), &[0u8, 0, 0, 0], ], ), vec![0.0, 0.0, 0.0, 1.0] )"
+ ],
  "dml_graph_execute_wired_unary_binary_pipeline_roundtrip": [
   "(decoded, vec![10.0, 12.0])",
   "( error.message, \"graph input 0 buffer is 4 bytes, graph requires 8\" )"
@@ -3304,6 +3343,14 @@
   "( plan.kind, dml_ops::DmlOpKind::Fill { value: 1.0, step: 2.0, sequence: true } )",
   "(plan.kind, dml_ops::DmlOpKind::Cast)",
   "( DmlRuntime::new() .parse_operation_from_guest(&bad, desc) .unwrap_err() .message, \"DML_OPERATOR_TYPE 103 ValueDataType 5 is not supported (FLOAT32 only)\" )"
+ ],
+ "dml_guest_parses_remaining_operator_families_and_rejects_stacked_mha": [
+  "( plan.kind, dml_ops::DmlOpKind::SoftmaxEx { kind: dml_ops::DmlSoftmaxKind::Hardmax, axes: vec![3] } )",
+  "(plan.kind, dml_ops::DmlOpKind::If)",
+  "(plan.inputs.len(), 3)",
+  "( plan.kind, dml_ops::DmlOpKind::Clip1 { min: -1.0, max: 2.0, scale: 0.0, bias: 0.0, has_scale_bias: false } )",
+  "( plan.kind, dml_ops::DmlOpKind::LpPooling { is_v1: true, p: 2, strides: vec![1, 1], window: vec![2, 2], start_padding: vec![0, 0], end_padding: vec![0, 0], dilations: vec![2, 2] } )",
+  "( plan.kind, dml_ops::DmlOpKind::SliceEx { offsets: vec![0; 4], sizes: vec![1; 4], strides: vec![1; 4] } )"
  ],
  "dml_guest_quantized_per_channel_scale_is_rejected_exactly": [
   "( error.message, \"DML_OPERATOR_TYPE 33 scale tensor is not broadcastable: quantization tensor dimension 0 size 3 does not match the output size 4\" )"
@@ -3331,6 +3378,14 @@
   "( run_cpu(&cumulative, &[&f32_bytes(&[1.0, 2.0, 3.0, 4.0])]), vec![2.0, 0.0, 4.0, 0.0] )",
   "( bad_cumulative.validate().unwrap_err().message, \"cumulative axis 2 is out of range for rank 2\" )"
  ],
+ "dml_new_operator_malformed_inputs_fail_exactly": [
+  "( bad_lp.validate().unwrap_err().message, \"LP pooling P must be non-zero\" )",
+  "( bad_if.validate().unwrap_err().message, \"IF tensor sizes are not broadcast-compatible at dimension 3: [2, 3, 3]\" )",
+  "( bad_slice.validate().unwrap_err().message, \"slice1 stride at axis 3 must be non-zero\" )",
+  "( bad_value_scale.validate().unwrap_err().message, \"value scale 2D ChannelCount must be 1 or 3, got 2\" )",
+  "( bad_random.validate().unwrap_err().message, \"Philox random generator state must contain exactly 6 UINT32 values\" )",
+  "( bad_mha.validate().unwrap_err().message, \"multi-head attention query head count 3 must be a multiple of key/value head count 2\" )"
+ ],
  "dml_operator_registry_enumerates_6_3_and_rejects_unimplemented_exactly": [
   "(DML_OPERATOR_TYPES_6_3.len(), 174)",
   "(DML_OPERATOR_TYPES_6_3[0].0, 1)",
@@ -3350,6 +3405,13 @@
  ],
  "dml_pooling_activation_batchnorm_metal_numeric_readback_edge_values": [
   "(max_pool.operator_type(), DML_OPERATOR_MAX_POOLING)"
+ ],
+ "dml_random_nonzero_diagonal_and_mha_edge_values_are_exact": [
+  "(first[0], second[0])",
+  "( first[1] .chunks_exact(4) .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap())) .collect::<Vec<_>>(), vec![1, 0, 0, 0, 0, 0] )",
+  "(first[0].iter().any(|byte| *byte != 0), true)",
+  "(u32::from_le_bytes(outputs[0][..4].try_into().unwrap()), 2)",
+  "( outputs[1] .chunks_exact(4) .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap())) .collect::<Vec<_>>(), vec![0, 1, 1, 1, 0, 0, 0, 0] )"
  ],
  "dml_record_dispatch_rejects_wrong_binding_count": [
   "(error.hresult, E_INVALIDARG)",
@@ -13927,9 +13989,34 @@
   "(overrides.local_root_arguments_table_index, Some(1))",
   "(overrides.program_entry, Some(true))"
  ],
+ "work_graph_node_program_binds_records_uavs_descriptor_and_root_constants": [
+  "(run.invocations, 4)",
+  "(run.threads, 4)",
+  "(run.outputs.len(), 4)",
+  "(run.outputs[0].node_index, 0)",
+  "(run.threads, 512)",
+  "(run.outputs.len(), 600)"
+ ],
+ "work_graph_node_program_compiles_guest_dxil_and_rejects_malformed_shaders": [
+  "(error.code, ReasonCode::RcDxilInvalid)",
+  "( error.message, \"work graph node shader translation failed in parse: invalid DXIL container header\" )"
+ ],
+ "work_graph_node_programs_chain_payloads_and_reject_malformed_bindings": [
+  "(first.outputs.len(), 3)",
+  "(second.outputs.len(), 3)",
+  "( error.message, \"work graph node produced 3 records but the current-node-output capacity is 1\" )"
+ ],
  "work_graph_null_shader_is_rejected": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
   "( error.message, \"work graph shader node has a null Shader name\" )"
+ ],
+ "work_graph_ordered_rasterization_and_payload_records_are_pinned": [
+  "( error.message, \"D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER cannot be \\ preserved for GPU-produced work-graph records on Metal\" )",
+  "( error.message, \"D3D12_WORK_GRAPH_FLAG_ENTRYPOINT_GRAPHICS_NODES_RASTERIZE_IN_ORDER requires a \\ graphics (mesh) node reachable from the entrypoint\" )",
+  "(payloads.len(), 3)",
+  "(payloads[2].payload.len(), 16)",
+  "(&payloads[2].payload[0..4], &20u32.to_le_bytes())",
+  "( payloads[2] .encode(record_stride) .expect(\"re-encode payload\"), bytes[2 * record_stride as usize..3 * record_stride as usize].to_vec() )"
  ],
  "work_graph_parser_covers_all_override_variants_and_rejects_malformed_nodes": [
   "(graph.program_name, \"graph\")",
@@ -13938,6 +14025,14 @@
   "( graph.entrypoint_index(&D3d12NodeId::new(\"entry\", 0)), Some(0) )",
   "( graph.entrypoint_index(&D3d12NodeId::new(\"missing\", 0)), None )",
   "(requirements.size_granularity_in_bytes, 8)"
+ ],
+ "work_graph_payload_fanout_preserves_opaque_payload_and_persistent_threads": [
+  "(run.final_records.len(), 3)",
+  "(final_words, input_payloads)",
+  "(run.node_counts, vec![3, 3, 3])",
+  "(run.stages, 3)",
+  "(run.threads_per_stage, 512)",
+  "(run.final_records.len(), 600)"
  ],
  "work_graph_plan_edge_cases_and_override_accessors_are_pinned": [
   "(none.local_root_arguments_table_index(), None)",
@@ -13957,7 +14052,7 @@
  ],
  "work_graph_undefined_flags_are_rejected": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
-  "(error.message, \"work graph flags 0x2 contain undefined bits\")"
+  "(error.message, \"work graph flags 0x4 contain undefined bits\")"
  ],
  "work_graph_validation_rejects_limits_cycles_and_excess_depth": [
   "( duplicate.validate().unwrap_err().message, \"work graph node \\\"n0\\\"[0] is defined more than once\" )",

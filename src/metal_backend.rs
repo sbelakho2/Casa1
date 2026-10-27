@@ -12311,10 +12311,69 @@ pub struct MetalWorkGraphRecord {
     pub output_index: u32,
 }
 
+/// A work-graph record with its complete opaque payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetalWorkGraphPayloadRecord {
+    pub node_index: u32,
+    pub output_index: u32,
+    pub payload: Vec<u8>,
+}
+
+impl MetalWorkGraphPayloadRecord {
+    /// Decode one record from a packed byte buffer.
+    pub fn decode(record: &[u8], record_stride: usize) -> AppResult<Self> {
+        if record_stride < 8 || record.len() < record_stride {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "work graph payload record needs at least 8 bytes and a {record_stride}-byte stride"
+                ),
+            ));
+        }
+        Ok(Self {
+            node_index: u32::from_le_bytes(record[0..4].try_into().expect("4-byte node index")),
+            output_index: u32::from_le_bytes(record[4..8].try_into().expect("4-byte output index")),
+            payload: record[8..record_stride].to_vec(),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.node_index == u32::MAX && self.output_index == u32::MAX
+    }
+
+    /// Encode this record at `record_stride` bytes per record. Payload bytes
+    /// beyond the stride are truncated and missing bytes are zero-filled.
+    pub fn encode(&self, record_stride: usize) -> Vec<u8> {
+        let stride = record_stride.max(8);
+        let mut bytes = vec![0u8; stride];
+        bytes[0..4].copy_from_slice(&self.node_index.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.output_index.to_le_bytes());
+        let payload_len = (stride - 8).min(self.payload.len());
+        bytes[8..8 + payload_len].copy_from_slice(&self.payload[..payload_len]);
+        bytes
+    }
+}
+
+/// GPU readback of a payload-preserving work-graph run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetalWorkGraphPayloadRun {
+    /// Records that reached leaf nodes, including their opaque payloads.
+    pub final_records: Vec<MetalWorkGraphPayloadRecord>,
+    /// Total records consumed by each node.
+    pub node_counts: Vec<u32>,
+    pub stages: u32,
+    pub empty_terminated: bool,
+    pub back_pressure: bool,
+    /// True when the persistent-thread stage processed more than one record
+    /// per dispatched thread.
+    pub persistent_threads: bool,
+    /// Number of threads dispatched per stage.
+    pub threads_per_stage: u32,
+}
+
 /// MSL kernels for GPU-side work-graph fan-out.
 pub const WORK_GRAPH_FANOUT_MSL: &str = r#"#include <metal_stdlib>
 using namespace metal;
-
 struct WorkGraphRecord {
     uint node_index;
     uint output_index;
@@ -12409,6 +12468,157 @@ kernel void d3d12_wg_fanout_stage(device const WorkGraphRecord* input [[buffer(0
     output[index] = WorkGraphRecord{target, 0u};
 }"#;
 
+/// MSL kernels for payload-preserving work-graph fan-out.
+///
+/// Unlike [`WORK_GRAPH_FANOUT_MSL`], the record buffer is a byte array with a
+/// caller-supplied stride. The first eight bytes are the node/output header
+/// and every remaining byte is opaque payload copied unchanged to the
+/// downstream record. `d3d12_wg_payload_persistent_stage` runs a small
+/// persistent grid: each thread pulls records from an atomic cursor until the
+/// stage is drained, so record counts above the thread count are still
+/// processed without growing the dispatch.
+pub const WORK_GRAPH_PAYLOAD_MSL: &str = r#"#include <metal_stdlib>
+using namespace metal;
+
+struct WorkGraphRecordHeader {
+    uint node_index;
+    uint output_index;
+};
+
+struct WorkGraphNodeSpec {
+    uint output_offset;
+    uint output_count;
+    uint mesh;
+};
+
+static inline void wg_copy_payload(device const uchar* source,
+                                   device uchar* destination,
+                                   uint payload_bytes) {
+    for (uint i = 0u; i < payload_bytes; ++i) {
+        destination[i] = source[i];
+    }
+}
+
+static inline void wg_process_payload_record(
+    device const uchar* input,
+    device uchar* output,
+    device atomic_uint* output_count,
+    device atomic_uint* output_usage,
+    device atomic_uint* flags,
+    device const WorkGraphNodeSpec* nodes,
+    device const uint* targets,
+    device const uint* limits,
+    device atomic_uint* node_counts,
+    uint input_count,
+    uint node_count,
+    uint depth,
+    uint max_depth,
+    device const uint* usage_slots,
+    uint input_stride,
+    uint output_stride,
+    uint record_index) {
+    if (record_index >= input_count) {
+        return;
+    }
+    device const WorkGraphRecordHeader* header =
+        (device const WorkGraphRecordHeader*)(input + record_index * input_stride);
+    if (header->node_index == 0xFFFFFFFFu && header->output_index == 0xFFFFFFFFu) {
+        return;
+    }
+    if (header->node_index >= node_count) {
+        atomic_fetch_or_explicit(flags, 1u, memory_order_relaxed);
+        return;
+    }
+    WorkGraphNodeSpec node = nodes[header->node_index];
+    if (node.mesh != 0u) {
+        atomic_fetch_add_explicit(node_counts + header->node_index, 1u, memory_order_relaxed);
+        return;
+    }
+    if (header->output_index >= node.output_count) {
+        atomic_fetch_or_explicit(flags, 2u, memory_order_relaxed);
+        return;
+    }
+    atomic_fetch_add_explicit(node_counts + header->node_index, 1u, memory_order_relaxed);
+    uint slot = node.output_offset + header->output_index;
+    uint target = targets[slot];
+    if (target == 0xFFFFFFFFu) {
+        return;
+    }
+    if (depth >= max_depth) {
+        atomic_fetch_or_explicit(flags, 4u, memory_order_relaxed);
+        return;
+    }
+    uint limit = limits[slot];
+    uint usage_slot = usage_slots[slot];
+    if (limit != 0u &&
+        atomic_fetch_add_explicit(output_usage + usage_slot, 1u, memory_order_relaxed) >= limit) {
+        atomic_fetch_or_explicit(flags, 8u, memory_order_relaxed);
+        return;
+    }
+    uint index = atomic_fetch_add_explicit(output_count, 1u, memory_order_relaxed);
+    device uchar* destination = output + index * output_stride;
+    device WorkGraphRecordHeader* output_header =
+        (device WorkGraphRecordHeader*)destination;
+    output_header->node_index = target;
+    output_header->output_index = 0u;
+    uint payload_bytes = min(input_stride, output_stride) - 8u;
+    wg_copy_payload(input + record_index * input_stride + 8u, destination + 8u, payload_bytes);
+}
+
+kernel void d3d12_wg_payload_stage(
+    device const uchar* input [[buffer(0)]],
+    device uchar* output [[buffer(1)]],
+    device atomic_uint* output_count [[buffer(2)]],
+    device atomic_uint* output_usage [[buffer(3)]],
+    device atomic_uint* flags [[buffer(4)]],
+    device const WorkGraphNodeSpec* nodes [[buffer(5)]],
+    device const uint* targets [[buffer(6)]],
+    device const uint* limits [[buffer(7)]],
+    device atomic_uint* node_counts [[buffer(8)]],
+    constant uint& input_count [[buffer(9)]],
+    constant uint& node_count [[buffer(10)]],
+    constant uint& depth [[buffer(11)]],
+    constant uint& max_depth [[buffer(12)]],
+    device const uint* usage_slots [[buffer(13)]],
+    constant uint& input_stride [[buffer(14)]],
+    constant uint& output_stride [[buffer(15)]],
+    uint gid [[thread_position_in_grid]]) {
+    wg_process_payload_record(input, output, output_count, output_usage, flags, nodes,
+                              targets, limits, node_counts, input_count, node_count,
+                              depth, max_depth, usage_slots, input_stride, output_stride, gid);
+}
+
+kernel void d3d12_wg_payload_persistent_stage(
+    device const uchar* input [[buffer(0)]],
+    device uchar* output [[buffer(1)]],
+    device atomic_uint* output_count [[buffer(2)]],
+    device atomic_uint* output_usage [[buffer(3)]],
+    device atomic_uint* flags [[buffer(4)]],
+    device const WorkGraphNodeSpec* nodes [[buffer(5)]],
+    device const uint* targets [[buffer(6)]],
+    device const uint* limits [[buffer(7)]],
+    device atomic_uint* node_counts [[buffer(8)]],
+    constant uint& input_count [[buffer(9)]],
+    constant uint& node_count [[buffer(10)]],
+    constant uint& depth [[buffer(11)]],
+    constant uint& max_depth [[buffer(12)]],
+    device const uint* usage_slots [[buffer(13)]],
+    constant uint& input_stride [[buffer(14)]],
+    constant uint& output_stride [[buffer(15)]],
+    device atomic_uint* cursor [[buffer(16)]],
+    uint gid [[thread_position_in_grid]]) {
+    while (true) {
+        uint record_index = atomic_fetch_add_explicit(cursor, 1u, memory_order_relaxed);
+        if (record_index >= input_count) {
+            return;
+        }
+        wg_process_payload_record(input, output, output_count, output_usage, flags, nodes,
+                                  targets, limits, node_counts, input_count, node_count,
+                                  depth, max_depth, usage_slots, input_stride, output_stride,
+                                  record_index);
+    }
+}"#;
+
 /// Real GPU-side work-graph fan-out pipelines.
 pub struct MetalWorkGraphFanout {
     /// Unique GPU resource handle.
@@ -12419,6 +12629,10 @@ pub struct MetalWorkGraphFanout {
     pub consumer_pipeline: metal::ComputePipelineState,
     /// One work-graph depth stage, driven entirely from GPU-written records.
     pub stage_pipeline: metal::ComputePipelineState,
+    /// Payload-preserving stage (arbitrary record stride).
+    pub payload_stage_pipeline: metal::ComputePipelineState,
+    /// Persistent-thread payload stage.
+    pub payload_persistent_pipeline: metal::ComputePipelineState,
 }
 
 impl MetalWorkGraphFanout {
@@ -12440,11 +12654,23 @@ impl MetalWorkGraphFanout {
             WORK_GRAPH_FANOUT_MSL,
             "d3d12_wg_fanout_stage",
             "work-graph stage",)?;
+        let payload_stage_pipeline = compile_compute_pipeline(
+            device,
+            WORK_GRAPH_PAYLOAD_MSL,
+            "d3d12_wg_payload_stage",
+            "work-graph payload stage",)?;
+        let payload_persistent_pipeline = compile_compute_pipeline(
+            device,
+            WORK_GRAPH_PAYLOAD_MSL,
+            "d3d12_wg_payload_persistent_stage",
+            "work-graph persistent payload stage",)?;
         Ok(Self {
             handle: alloc_gpu_id(),
             producer_pipeline,
             consumer_pipeline,
             stage_pipeline,
+            payload_stage_pipeline,
+            payload_persistent_pipeline,
         })
     }
 
@@ -12801,6 +13027,767 @@ impl MetalWorkGraphFanout {
             stages,
             empty_terminated,
             back_pressure,
+        })
+    }
+
+    /// Execute a complete multi-node work-graph fan-out while carrying each
+    /// record's full opaque payload.
+    ///
+    /// Records are byte buffers with `record_stride` bytes per record. The
+    /// first eight bytes are the node/output header and the rest is copied
+    /// unchanged into every downstream record. When `persistent_threads` is
+    /// set the stage runs a bounded persistent grid: threads pull records from
+    /// an atomic cursor instead of one thread per record, so large record
+    /// counts do not require a proportionally large dispatch.
+    pub fn execute_graph_payload(
+        &self,
+        device: &metal::DeviceRef,
+        records: &[u8],
+        record_count: u32,
+        record_stride: u64,
+        persistent_threads: bool,
+        spec: &MetalWorkGraphGraphSpec<'_>,
+    ) -> AppResult<MetalWorkGraphPayloadRun> {
+        if spec.nodes.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "work graph fan-out requires at least one node",
+            ));
+        }
+        if record_stride < 8 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "work graph payload record stride {record_stride} is smaller than the 8-byte header"
+                ),
+            ));
+        }
+        if !record_stride.is_multiple_of(4) {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("work graph payload record stride {record_stride} is not a multiple of 4"),
+            ));
+        }
+        let required = u64::from(record_count)
+            .checked_mul(record_stride)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "work graph payload record range overflows",
+                )
+            })?;
+        if required > records.len() as u64 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "work graph payload record range ({required} bytes) exceeds the supplied {} bytes",
+                    records.len()
+                ),
+            ));
+        }
+        let expected_outputs: u64 = spec
+            .nodes
+            .iter()
+            .map(|node| u64::from(node.output_count))
+            .sum();
+        if expected_outputs != spec.targets.len() as u64 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "work graph fan-out node table does not match the target table",
+            ));
+        }
+        if spec.limits.len() != spec.targets.len() || spec.usage_slots.len() != spec.targets.len() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "work graph fan-out limit/usage table does not match the target table",
+            ));
+        }
+        if spec.max_depth == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "work graph maximum depth must be non-zero",
+            ));
+        }
+
+        let node_count = spec.nodes.len() as u32;
+        let total_outputs = spec.targets.len() as u64;
+        let nodes_buffer = device.new_buffer_with_data(
+            spec.nodes.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(spec.nodes) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let table_buffer = |values: &[u32]| -> metal::Buffer {
+            if values.is_empty() {
+                device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared)
+            } else {
+                device.new_buffer_with_data(
+                    values.as_ptr() as *const std::ffi::c_void,
+                    std::mem::size_of_val(values) as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                )
+            }
+        };
+        let targets_buffer = table_buffer(spec.targets);
+        let limits_buffer = table_buffer(spec.limits);
+        let usage_slots_buffer = table_buffer(spec.usage_slots);
+        let zero_bytes = |len: u64| -> metal::Buffer {
+            let zeros = vec![0u8; len as usize];
+            device.new_buffer_with_data(
+                zeros.as_ptr() as *const std::ffi::c_void,
+                len,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let node_counts_buffer = zero_bytes(u64::from(node_count) * 4);
+
+        let mut input_count = record_count;
+        let mut input_stride = record_stride;
+        let mut owned_input: Option<metal::Buffer> = None;
+        let mut node_counts = vec![0u32; node_count as usize];
+        let mut stages = 0u32;
+        let mut back_pressure = false;
+        let mut final_records = Vec::new();
+        let mut persistent_threads_seen = false;
+        let mut threads_per_stage = 0u32;
+
+        if input_count == 0 {
+            return Ok(MetalWorkGraphPayloadRun {
+                final_records,
+                node_counts,
+                stages,
+                empty_terminated: true,
+                back_pressure,
+                persistent_threads: persistent_threads_seen,
+                threads_per_stage,
+            });
+        }
+        let initial_buffer = device.new_buffer_with_data(
+            records.as_ptr() as *const std::ffi::c_void,
+            required,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+
+        let empty_terminated = loop {
+            let input_buffer = owned_input
+                .as_ref()
+                .map(|buffer| buffer.as_ref())
+                .unwrap_or(initial_buffer.as_ref());
+            let output_stride = input_stride;
+            let output = device.new_buffer(
+                u64::from(input_count) * output_stride,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let output_count_buffer = zero_bytes(4);
+            let output_usage_buffer = zero_bytes(total_outputs.max(1) * 4);
+            let flags_buffer = zero_bytes(4);
+            let cursor_buffer = zero_bytes(4);
+            let input_count_buffer = device.new_buffer_with_data(
+                &input_count as *const u32 as *const std::ffi::c_void,
+                4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let node_count_buffer = device.new_buffer_with_data(
+                &node_count as *const u32 as *const std::ffi::c_void,
+                4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let depth_buffer = device.new_buffer_with_data(
+                &stages as *const u32 as *const std::ffi::c_void,
+                4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let max_depth_buffer = device.new_buffer_with_data(
+                &spec.max_depth as *const u32 as *const std::ffi::c_void,
+                4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let input_stride_buffer = device.new_buffer_with_data(
+                &(input_stride as u32) as *const u32 as *const std::ffi::c_void,
+                4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let output_stride_buffer = device.new_buffer_with_data(
+                &(output_stride as u32) as *const u32 as *const std::ffi::c_void,
+                4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let queue = device.new_command_queue();
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(if persistent_threads {
+                &self.payload_persistent_pipeline
+            } else {
+                &self.payload_stage_pipeline
+            });
+            encoder.set_buffer(0, Some(input_buffer), 0);
+            encoder.set_buffer(1, Some(&output), 0);
+            encoder.set_buffer(2, Some(&output_count_buffer), 0);
+            encoder.set_buffer(3, Some(&output_usage_buffer), 0);
+            encoder.set_buffer(4, Some(&flags_buffer), 0);
+            encoder.set_buffer(5, Some(&nodes_buffer), 0);
+            encoder.set_buffer(6, Some(&targets_buffer), 0);
+            encoder.set_buffer(7, Some(&limits_buffer), 0);
+            encoder.set_buffer(8, Some(&node_counts_buffer), 0);
+            encoder.set_buffer(9, Some(&input_count_buffer), 0);
+            encoder.set_buffer(10, Some(&node_count_buffer), 0);
+            encoder.set_buffer(11, Some(&depth_buffer), 0);
+            encoder.set_buffer(12, Some(&max_depth_buffer), 0);
+            encoder.set_buffer(13, Some(&usage_slots_buffer), 0);
+            encoder.set_buffer(14, Some(&input_stride_buffer), 0);
+            encoder.set_buffer(15, Some(&output_stride_buffer), 0);
+            encoder.set_buffer(16, Some(&cursor_buffer), 0);
+            let threads = if persistent_threads {
+                input_count.clamp(1, 512)
+            } else {
+                input_count
+            };
+            threads_per_stage = threads;
+            encoder.dispatch_threads(
+                metal::MTLSize {
+                    width: u64::from(threads),
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            stages = stages.saturating_add(1);
+            let produced = unsafe { *(output_count_buffer.contents() as *const u32) };
+            let flags = unsafe { *(flags_buffer.contents() as *const u32) };
+            if flags & 1 != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "work graph fan-out record references an invalid node index",
+                ));
+            }
+            if flags & 2 != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "work graph fan-out record references an output index beyond the node output count",
+                ));
+            }
+            if flags & 4 != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!(
+                        "work graph recursion depth exceeds the configured maximum {}",
+                        spec.max_depth
+                    ),
+                ));
+            }
+            back_pressure = flags & 8 != 0;
+            if input_count > threads {
+                persistent_threads_seen = true;
+            }
+            if produced == 0 || back_pressure {
+                let pointer = input_buffer.contents() as *const u8;
+                let stride = input_stride as usize;
+                final_records = (0..input_count as usize)
+                    .map(|index| unsafe {
+                        std::slice::from_raw_parts(pointer.add(index * stride), stride)
+                    })
+                    .filter_map(|record| MetalWorkGraphPayloadRecord::decode(record, stride).ok())
+                    .filter(|record| !record.is_empty())
+                    .collect();
+                break produced == 0 && !back_pressure;
+            }
+            owned_input = Some(output);
+            input_count = produced;
+            input_stride = output_stride;
+        };
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                node_counts_buffer.contents() as *const u32,
+                node_counts.as_mut_ptr(),
+                node_count as usize,
+            );
+        }
+        Ok(MetalWorkGraphPayloadRun {
+            final_records,
+            node_counts,
+            stages,
+            empty_terminated,
+            back_pressure,
+            persistent_threads: persistent_threads_seen,
+            threads_per_stage,
+        })
+    }
+}
+
+/// Reserved Metal buffer index of the node's input record array.
+pub const WORK_GRAPH_NODE_RECORD_BUFFER_INDEX: u64 = 24;
+/// Reserved Metal buffer index of the current-node-output array.
+pub const WORK_GRAPH_NODE_OUTPUT_BUFFER_INDEX: u64 = 25;
+/// Reserved Metal buffer index of the current-node-output record counter.
+pub const WORK_GRAPH_NODE_OUTPUT_COUNT_BUFFER_INDEX: u64 = 26;
+/// Reserved Metal buffer index of the node descriptor table.
+pub const WORK_GRAPH_NODE_DESCRIPTOR_TABLE_BUFFER_INDEX: u64 = 27;
+/// Reserved Metal buffer index of the node root constants.
+pub const WORK_GRAPH_NODE_ROOT_CONSTANTS_BUFFER_INDEX: u64 = 28;
+/// Reserved Metal buffer index of the packed execution parameters.
+pub const WORK_GRAPH_NODE_PARAMS_BUFFER_INDEX: u64 = 29;
+/// First reserved work-graph ABI buffer index.
+pub const WORK_GRAPH_NODE_ABI_FIRST_BUFFER: u64 = WORK_GRAPH_NODE_RECORD_BUFFER_INDEX;
+/// Last reserved work-graph ABI buffer index.
+pub const WORK_GRAPH_NODE_ABI_LAST_BUFFER: u64 = WORK_GRAPH_NODE_PARAMS_BUFFER_INDEX;
+/// UAV/SRV registers must stay below this index to avoid the ABI range.
+pub const WORK_GRAPH_NODE_RESOURCE_REGISTER_LIMIT: u32 = WORK_GRAPH_NODE_ABI_FIRST_BUFFER as u32;
+
+/// The MSL declarations injected into a guest node shader.
+const WORK_GRAPH_NODE_ABI_DECLARATIONS: &str = "\
+struct WorkGraphRecordHeader { uint node_index; uint output_index; };\n\
+struct WorkGraphParams {\n\
+    uint record_count;\n\
+    uint record_stride;\n\
+    uint output_stride;\n\
+    uint output_capacity;\n\
+    uint thread_count;\n\
+};\n\
+";
+
+/// The MSL kernel parameters injected into a guest node shader.
+///
+/// `_wg_records` is the node's input record array (opaque payload after the
+/// 8-byte header), `_wg_output` is the current-node-output array the node
+/// appends records to, and the remaining bindings expose the descriptor
+/// table, root constants and execution geometry. UAVs are bound at their own
+/// register indices, below [`WORK_GRAPH_NODE_ABI_FIRST_BUFFER`].
+fn work_graph_node_abi_parameters(uav_registers: &[u32]) -> String {
+    let mut parameters = String::from(
+        ",\n    device const uchar* _wg_records [[buffer(24)]]\
+         ,\n    device uchar* _wg_output [[buffer(25)]]\
+         ,\n    device atomic_uint* _wg_output_count [[buffer(26)]]\
+         ,\n    device const uchar* _wg_descriptor_table [[buffer(27)]]\
+         ,\n    device const uchar* _wg_root_constants [[buffer(28)]]\
+         ,\n    constant WorkGraphParams& _wg_params [[buffer(29)]]",
+    );
+    for register in uav_registers {
+        parameters.push_str(&format!(
+            ",\n    device uint* _res_1_{register} [[buffer({register})]]"
+        ));
+    }
+    parameters
+}
+
+/// Inject the work-graph node ABI into a translated MSL kernel entry point.
+///
+/// The generated MSL is not modified anywhere else: the ABI parameters are
+/// appended to the existing kernel signature and the record header helper is
+/// added once. UAV registers that overlap the reserved ABI range fail closed
+/// instead of silently rebinding a different resource.
+pub fn inject_work_graph_node_abi(
+    source: &str,
+    entry: &str,
+    uav_registers: &[u32],
+) -> AppResult<String> {
+    for register in uav_registers {
+        if *register >= WORK_GRAPH_NODE_RESOURCE_REGISTER_LIMIT {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "work graph node shader resource register {register} collides with the \
+                     reserved work-graph ABI buffer range \
+                     {}..={}",
+                    WORK_GRAPH_NODE_ABI_FIRST_BUFFER, WORK_GRAPH_NODE_ABI_LAST_BUFFER
+                ),
+            ));
+        }
+    }
+    let source = match source.find("[[threads_per_threadgroup(") {
+        Some(start) => match source[start..].find("]]") {
+            Some(relative_end) => {
+                let end = start + relative_end + 2;
+                let mut stripped = String::with_capacity(source.len());
+                stripped.push_str(source[..start].trim_end());
+                stripped.push_str(&source[end..]);
+                stripped
+            }
+            None => source.to_string(),
+        },
+        None => source.to_string(),
+    };
+    let source = source.as_str();
+    let marker = format!("kernel void {entry}(");
+    let start = source.find(&marker).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!("work graph node shader has no MSL kernel entry point {entry}"),
+        )
+    })?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (offset, character) in source[start + marker.len()..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                close = Some(start + marker.len() + offset);
+                break;
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    let close = close.ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!("work graph node shader entry point {entry} has an unterminated signature"),
+        )
+    })?;
+    let mut injected = String::with_capacity(source.len() + 512);
+    injected.push_str(WORK_GRAPH_NODE_ABI_DECLARATIONS);
+    injected.push_str(&source[..close]);
+    injected.push_str(&work_graph_node_abi_parameters(uav_registers));
+    injected.push_str(&source[close..]);
+    Ok(injected)
+}
+
+/// A compiled work-graph node program.
+///
+/// Mesh program nodes are lowered through the same compute pipeline because
+/// the toolchain used by this bridge has no MSL mesh function support; the
+/// dispatch remains serialised in record order when the ordered-rasterisation
+/// flag is set.
+pub struct MetalWorkGraphNodeProgram {
+    pub handle: u64,
+    pub pipeline: metal::ComputePipelineState,
+    pub entry: String,
+    pub threadgroup_size: (u32, u32, u32),
+    pub mesh: bool,
+}
+
+impl std::fmt::Debug for MetalWorkGraphNodeProgram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalWorkGraphNodeProgram")
+            .field("handle", &self.handle)
+            .field("entry", &self.entry)
+            .field("threadgroup_size", &self.threadgroup_size)
+            .field("mesh", &self.mesh)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One UAV/SRV binding for a work-graph node invocation.
+#[derive(Debug, Clone, Copy)]
+pub struct MetalWorkGraphNodeResource<'a> {
+    pub register: u32,
+    pub bytes: &'a [u8],
+}
+
+/// Inputs and output storage for one work-graph node execution.
+#[derive(Debug, Clone, Copy)]
+pub struct MetalWorkGraphNodeBindings<'a> {
+    /// Packed input records (`record_stride` bytes each).
+    pub records: &'a [u8],
+    pub record_count: u32,
+    pub record_stride: u64,
+    /// Maximum records the current-node-output can hold.
+    pub output_capacity: u32,
+    pub output_stride: u64,
+    pub resources: &'a [MetalWorkGraphNodeResource<'a>],
+    pub descriptor_table: &'a [u8],
+    pub root_constants: &'a [u8],
+    /// When true the node runs a bounded persistent grid and the shader must
+    /// stride by `_wg_thread_count`; otherwise one thread is dispatched per
+    /// input record.
+    pub persistent: bool,
+}
+
+/// Readback of one work-graph node execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetalWorkGraphNodeRun {
+    /// Records the node appended to its current-node-output.
+    pub outputs: Vec<MetalWorkGraphPayloadRecord>,
+    pub invocations: u32,
+    pub threads: u32,
+    pub persistent: bool,
+}
+
+impl MetalWorkGraphNodeProgram {
+    /// Compile a node program from MSL whose entry point already declares the
+    /// work-graph ABI.
+    pub fn compile(
+        device: &metal::DeviceRef,
+        msl_source: &str,
+        entry: &str,
+        threadgroup_size: (u32, u32, u32),
+        mesh: bool,
+    ) -> AppResult<Self> {
+        let pipeline = compile_compute_pipeline(device, msl_source, entry, "work-graph node")?;
+        Ok(Self {
+            handle: alloc_gpu_id(),
+            pipeline,
+            entry: entry.to_string(),
+            threadgroup_size,
+            mesh,
+        })
+    }
+
+    /// Compile a guest node shader from DXIL.
+    ///
+    /// The export's DXIL is lowered by the repository's DXIL-to-MSL pipeline,
+    /// then the work-graph ABI is injected. Any malformed container,
+    /// unsupported instruction or unparsable entry point fails with the
+    /// translator's or compiler's exact error.
+    pub fn from_dxil(
+        device: &metal::DeviceRef,
+        dxil: &[u8],
+        entry: &str,
+        stage: crate::shader::ShaderStage,
+        threadgroup_size: (u32, u32, u32),
+        mesh: bool,
+    ) -> AppResult<Self> {
+        let input = crate::shader::ShaderTranslationInput {
+            dxil: dxil.to_vec(),
+            stage,
+            root_signature: vec![0u8; 8],
+            compile_flags: crate::shader::CompileFlags {
+                fast_math: true,
+                denorm_mode: "preserve".to_string(),
+                debug: false,
+                optimization_level: 3,
+            },
+            gpu_family: "apple9".to_string(),
+            os_build: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            macwin_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        let output = crate::shader::translate_shader(&input).map_err(|error| {
+            AppError::new(
+                error.reason_code,
+                format!(
+                    "work graph node shader translation failed in {}: {}",
+                    error.failing_pass, error.message
+                ),
+            )
+        })?;
+        let source = crate::shader::msl_source_from_library_bytes(&output.mtl_library_bytes)?;
+        let metal_entry = output
+            .function_mapping
+            .get(entry)
+            .cloned()
+            .or_else(|| output.function_mapping.values().next().cloned())
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("work graph node shader export {entry:?} has no MSL function mapping"),
+                )
+            })?;
+        let uav_registers = output
+            .reflection
+            .resources
+            .iter()
+            .filter(|resource| {
+                resource.kind == crate::shader::ResourceKind::Buffer
+                    && resource.access == crate::shader::ResourceAccess::Write
+            })
+            .map(|resource| resource.register)
+            .collect::<Vec<_>>();
+        let source = inject_work_graph_node_abi(source, &metal_entry, &uav_registers)?;
+        Self::compile(device, &source, &metal_entry, threadgroup_size, mesh)
+    }
+
+    /// Run this node program over `bindings`.
+    ///
+    /// The node shader reads packed records from `_wg_records` and appends
+    /// result records to `_wg_output`, atomically incrementing
+    /// `_wg_output_count`. Input payloads and every UAV/resource buffer are
+    /// real Metal buffers; the readback returns the complete output payloads.
+    pub fn execute(
+        &self,
+        device: &metal::DeviceRef,
+        bindings: &MetalWorkGraphNodeBindings<'_>,
+    ) -> AppResult<MetalWorkGraphNodeRun> {
+        if bindings.record_stride < 8 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "work graph node record stride {} is smaller than the 8-byte record header",
+                    bindings.record_stride
+                ),
+            ));
+        }
+        if bindings.output_stride < 8 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "work graph node output stride {} is smaller than the 8-byte record header",
+                    bindings.output_stride
+                ),
+            ));
+        }
+        if bindings.output_capacity == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "work graph node output capacity must be non-zero",
+            ));
+        }
+        if bindings.record_count == 0 {
+            return Ok(MetalWorkGraphNodeRun {
+                outputs: Vec::new(),
+                invocations: 0,
+                threads: 0,
+                persistent: bindings.persistent,
+            });
+        }
+        let required = u64::from(bindings.record_count)
+            .checked_mul(bindings.record_stride)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "work graph node record range overflows",
+                )
+            })?;
+        if required > bindings.records.len() as u64 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "work graph node record range ({required} bytes) exceeds the supplied {} bytes",
+                    bindings.records.len()
+                ),
+            ));
+        }
+        for resource in bindings.resources {
+            if resource.register >= WORK_GRAPH_NODE_RESOURCE_REGISTER_LIMIT {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "work graph node resource register {} collides with the reserved ABI range",
+                        resource.register
+                    ),
+                ));
+            }
+        }
+        let output_len = u64::from(bindings.output_capacity)
+            .checked_mul(bindings.output_stride)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "work graph node output range overflows",
+                )
+            })?;
+        let records = device.new_buffer_with_data(
+            bindings.records.as_ptr() as *const std::ffi::c_void,
+            bindings.records.len() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let output = device.new_buffer(output_len, metal::MTLResourceOptions::StorageModeShared);
+        let output_count = device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        unsafe { *(output_count.contents() as *mut u32) = 0 };
+        let descriptor = if bindings.descriptor_table.is_empty() {
+            device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared)
+        } else {
+            device.new_buffer_with_data(
+                bindings.descriptor_table.as_ptr() as *const std::ffi::c_void,
+                bindings.descriptor_table.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let root_constants = if bindings.root_constants.is_empty() {
+            device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared)
+        } else {
+            device.new_buffer_with_data(
+                bindings.root_constants.as_ptr() as *const std::ffi::c_void,
+                bindings.root_constants.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let threads = if bindings.persistent {
+            bindings.record_count.clamp(1, 512)
+        } else {
+            bindings.record_count
+        };
+        let params = [
+            bindings.record_count,
+            bindings.record_stride as u32,
+            bindings.output_stride as u32,
+            bindings.output_capacity,
+            threads,
+        ];
+        let params = device.new_buffer_with_data(
+            params.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(&params) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(WORK_GRAPH_NODE_RECORD_BUFFER_INDEX, Some(&records), 0);
+        encoder.set_buffer(WORK_GRAPH_NODE_OUTPUT_BUFFER_INDEX, Some(&output), 0);
+        encoder.set_buffer(
+            WORK_GRAPH_NODE_OUTPUT_COUNT_BUFFER_INDEX,
+            Some(&output_count),
+            0,
+        );
+        encoder.set_buffer(
+            WORK_GRAPH_NODE_DESCRIPTOR_TABLE_BUFFER_INDEX,
+            Some(&descriptor),
+            0,
+        );
+        encoder.set_buffer(
+            WORK_GRAPH_NODE_ROOT_CONSTANTS_BUFFER_INDEX,
+            Some(&root_constants),
+            0,
+        );
+        encoder.set_buffer(WORK_GRAPH_NODE_PARAMS_BUFFER_INDEX, Some(&params), 0);
+        for resource in bindings.resources {
+            let buffer = if resource.bytes.is_empty() {
+                device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared)
+            } else {
+                device.new_buffer_with_data(
+                    resource.bytes.as_ptr() as *const std::ffi::c_void,
+                    resource.bytes.len() as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                )
+            };
+            encoder.set_buffer(u64::from(resource.register), Some(&buffer), 0);
+        }
+        let group = self.threadgroup_size;
+        encoder.dispatch_threads(
+            metal::MTLSize {
+                width: u64::from(threads),
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: u64::from(group.0.max(1)),
+                height: u64::from(group.1.max(1)),
+                depth: u64::from(group.2.max(1)),
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let produced = unsafe { *(output_count.contents() as *const u32) };
+        if produced > bindings.output_capacity {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "work graph node produced {produced} records but the current-node-output \
+                     capacity is {}",
+                    bindings.output_capacity
+                ),
+            ));
+        }
+        let pointer = output.contents() as *const u8;
+        let stride = bindings.output_stride as usize;
+        let outputs = (0..produced as usize)
+            .map(|index| unsafe {
+                let bytes = std::slice::from_raw_parts(pointer.add(index * stride), stride);
+                MetalWorkGraphPayloadRecord::decode(bytes, stride)
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+        Ok(MetalWorkGraphNodeRun {
+            outputs,
+            invocations: bindings.record_count,
+            threads,
+            persistent: bindings.persistent,
         })
     }
 }
@@ -26965,6 +27952,710 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
         assert_eq!(run.stages, 0);
         assert_eq!(run.final_records, Vec::<u32>::new());
         assert!(run.empty_terminated);
+    }
+
+    #[test]
+    fn work_graph_payload_fanout_preserves_opaque_payload_and_persistent_threads() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let fanout = MetalWorkGraphFanout::new(device.metal_device()).expect("fan-out pipelines");
+        let chain_nodes = [
+            MetalWorkGraphNodeSpec {
+                output_offset: 0,
+                output_count: 1,
+                mesh: 0,
+            },
+            MetalWorkGraphNodeSpec {
+                output_offset: 1,
+                output_count: 1,
+                mesh: 0,
+            },
+            MetalWorkGraphNodeSpec {
+                output_offset: 2,
+                output_count: 1,
+                mesh: 0,
+            },
+        ];
+        let chain_targets = [1u32, 2u32, u32::MAX];
+        let chain_limits = [0u32, 0u32, 0u32];
+        let chain_usage = [0u32, 1u32, 2u32];
+        let chain = MetalWorkGraphGraphSpec {
+            nodes: &chain_nodes,
+            targets: &chain_targets,
+            limits: &chain_limits,
+            usage_slots: &chain_usage,
+            max_depth: 32,
+        };
+        let payload = |node: u32, output: u32, seed: u32| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&node.to_le_bytes());
+            bytes.extend_from_slice(&output.to_le_bytes());
+            for word in 0..4 {
+                bytes.extend_from_slice(&(seed * 10 + word).to_le_bytes());
+            }
+            bytes
+        };
+        let records = [payload(0, 0, 1), payload(0, 0, 2), payload(0, 0, 3)].concat();
+        let run = fanout
+            .execute_graph_payload(device.metal_device(), &records, 3, 24, false, &chain)
+            .expect("payload chain");
+        assert_eq!(run.final_records.len(), 3);
+        assert!(
+            run.final_records
+                .iter()
+                .all(|record| record.node_index == 2)
+        );
+        assert!(
+            run.final_records
+                .iter()
+                .all(|record| record.payload.len() == 16)
+        );
+        let mut final_payloads = run
+            .final_records
+            .iter()
+            .map(|record| record.payload.clone())
+            .collect::<Vec<_>>();
+        let mut input_payloads = (1..=3u32)
+            .map(|seed| (0..4u32).map(|word| seed * 10 + word).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        final_payloads.sort();
+        input_payloads.sort();
+        let mut final_words = final_payloads
+            .iter()
+            .map(|payload| {
+                payload
+                    .chunks_exact(4)
+                    .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        final_words.sort();
+        assert_eq!(final_words, input_payloads);
+        assert_eq!(run.node_counts, vec![3, 3, 3]);
+        assert_eq!(run.stages, 3);
+        assert!(run.empty_terminated);
+
+        // A persistent grid processes record counts above the thread count.
+        let mut many = Vec::new();
+        for seed in 0..600u32 {
+            many.extend_from_slice(&payload(0, 0, seed));
+        }
+        let run = fanout
+            .execute_graph_payload(device.metal_device(), &many, 600, 24, true, &chain)
+            .expect("persistent payload chain");
+        assert!(run.persistent_threads);
+        assert_eq!(run.threads_per_stage, 512);
+        assert_eq!(run.final_records.len(), 600);
+        assert_eq!(run.node_counts, vec![600, 600, 600]);
+        assert_eq!(run.stages, 3);
+
+        // Malformed record layouts fail closed.
+        let error = fanout
+            .execute_graph_payload(device.metal_device(), &records, 3, 4, false, &chain)
+            .expect_err("short stride");
+        assert_eq!(
+            error.message,
+            "work graph payload record stride 4 is smaller than the 8-byte header"
+        );
+        let error = fanout
+            .execute_graph_payload(device.metal_device(), &records, 3, 10, false, &chain)
+            .expect_err("unaligned stride");
+        assert_eq!(
+            error.message,
+            "work graph payload record stride 10 is not a multiple of 4"
+        );
+        let error = fanout
+            .execute_graph_payload(
+                device.metal_device(),
+                &records,
+                u32::MAX,
+                u64::MAX - 3,
+                false,
+                &chain,
+            )
+            .expect_err("overflowing range");
+        assert_eq!(error.message, "work graph payload record range overflows");
+        let error = fanout
+            .execute_graph_payload(device.metal_device(), &[], 1, 24, false, &chain)
+            .expect_err("short supplied range");
+        assert_eq!(
+            error.message,
+            "work graph payload record range (24 bytes) exceeds the supplied 0 bytes"
+        );
+        let empty_nodes: [MetalWorkGraphNodeSpec; 0] = [];
+        let error = fanout
+            .execute_graph_payload(
+                device.metal_device(),
+                &records,
+                1,
+                24,
+                false,
+                &MetalWorkGraphGraphSpec {
+                    nodes: &empty_nodes,
+                    targets: &[],
+                    limits: &[],
+                    usage_slots: &[],
+                    max_depth: 32,
+                },
+            )
+            .expect_err("empty graph");
+        assert_eq!(
+            error.message,
+            "work graph fan-out requires at least one node"
+        );
+        let bad_target = fanout
+            .execute_graph_payload(
+                device.metal_device(),
+                &records,
+                1,
+                24,
+                false,
+                &MetalWorkGraphGraphSpec {
+                    nodes: &chain_nodes,
+                    targets: &[u32::MAX],
+                    limits: &chain_limits,
+                    usage_slots: &chain_usage,
+                    max_depth: 32,
+                },
+            )
+            .expect_err("target table mismatch");
+        assert_eq!(
+            bad_target.message,
+            "work graph fan-out node table does not match the target table"
+        );
+        let bad_limit = fanout
+            .execute_graph_payload(
+                device.metal_device(),
+                &records,
+                1,
+                24,
+                false,
+                &MetalWorkGraphGraphSpec {
+                    nodes: &chain_nodes,
+                    targets: &chain_targets,
+                    limits: &[],
+                    usage_slots: &chain_usage,
+                    max_depth: 32,
+                },
+            )
+            .expect_err("limit table mismatch");
+        assert_eq!(
+            bad_limit.message,
+            "work graph fan-out limit/usage table does not match the target table"
+        );
+        let zero_depth = fanout
+            .execute_graph_payload(
+                device.metal_device(),
+                &records,
+                1,
+                24,
+                false,
+                &MetalWorkGraphGraphSpec {
+                    nodes: &chain_nodes,
+                    targets: &chain_targets,
+                    limits: &chain_limits,
+                    usage_slots: &chain_usage,
+                    max_depth: 0,
+                },
+            )
+            .expect_err("zero depth");
+        assert_eq!(
+            zero_depth.message,
+            "work graph maximum depth must be non-zero"
+        );
+
+        let invalid_node = payload(9, 0, 0);
+        let error = fanout
+            .execute_graph_payload(device.metal_device(), &invalid_node, 1, 24, false, &chain)
+            .expect_err("invalid node index");
+        assert_eq!(
+            error.message,
+            "work graph fan-out record references an invalid node index"
+        );
+        let invalid_output = payload(0, 5, 0);
+        let error = fanout
+            .execute_graph_payload(device.metal_device(), &invalid_output, 1, 24, false, &chain)
+            .expect_err("invalid output index");
+        assert_eq!(
+            error.message,
+            "work graph fan-out record references an output index beyond the node output count"
+        );
+
+        let recursive_nodes = [MetalWorkGraphNodeSpec {
+            output_offset: 0,
+            output_count: 1,
+            mesh: 0,
+        }];
+        let recursive = MetalWorkGraphGraphSpec {
+            nodes: &recursive_nodes,
+            targets: &[0u32],
+            limits: &[0u32],
+            usage_slots: &[0u32],
+            max_depth: 2,
+        };
+        let recursive_payload = payload(0, 0, 0);
+        let error = fanout
+            .execute_graph_payload(
+                device.metal_device(),
+                &recursive_payload,
+                1,
+                24,
+                false,
+                &recursive,
+            )
+            .expect_err("recursion limit");
+        assert_eq!(
+            error.message,
+            "work graph recursion depth exceeds the configured maximum 2"
+        );
+    }
+
+    const WORK_GRAPH_NODE_TEST_MSL: &str = r#"#include <metal_stdlib>
+using namespace metal;
+struct WorkGraphParams {
+    uint record_count;
+    uint record_stride;
+    uint output_stride;
+    uint output_capacity;
+    uint thread_count;
+};
+kernel void wg_node(device const uchar* records [[buffer(24)]],
+                    device uchar* output [[buffer(25)]],
+                    device atomic_uint* output_count [[buffer(26)]],
+                    device const uchar* descriptor [[buffer(27)]],
+                    device const uchar* constants [[buffer(28)]],
+                    constant WorkGraphParams& wg [[buffer(29)]],
+                    device uint* uav [[buffer(0)]],
+                    uint gid [[thread_position_in_grid]]) {
+    uint base = ((device const uint*)descriptor)[0];
+    uint bias = ((device const uint*)constants)[0];
+    for (uint i = gid; i < wg.record_count; i += wg.thread_count) {
+        device const uint* header = (device const uint*)(records + i * wg.record_stride);
+        uint p0 = header[2];
+        uint p1 = header[3];
+        uint sum = p0 + p1 + base + bias;
+        uav[gid] = sum;
+        uint index = atomic_fetch_add_explicit(output_count, 1u, memory_order_relaxed);
+        if (index < wg.output_capacity) {
+            device uint* out = (device uint*)(output + index * wg.output_stride);
+            out[0] = header[0];
+            out[1] = 0u;
+            out[2] = sum;
+            out[3] = p1;
+        }
+    }
+}"#;
+
+    fn work_graph_node_records(count: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for _ in 0..count {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&2u32.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn work_graph_node_program_binds_records_uavs_descriptor_and_root_constants() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let program = MetalWorkGraphNodeProgram::compile(
+            device.metal_device(),
+            WORK_GRAPH_NODE_TEST_MSL,
+            "wg_node",
+            (64, 1, 1),
+            false,
+        )
+        .expect("node program");
+        let records = work_graph_node_records(4);
+        let uav = vec![0u8; 2048];
+        let descriptor = 10u32.to_le_bytes();
+        let root_constants = 7u32.to_le_bytes();
+        let resources = [MetalWorkGraphNodeResource {
+            register: 0,
+            bytes: &uav,
+        }];
+        let bindings = MetalWorkGraphNodeBindings {
+            records: &records,
+            record_count: 4,
+            record_stride: 16,
+            output_capacity: 4,
+            output_stride: 16,
+            resources: &resources,
+            descriptor_table: &descriptor,
+            root_constants: &root_constants,
+            persistent: false,
+        };
+        let run = program
+            .execute(device.metal_device(), &bindings)
+            .expect("node execution");
+        assert_eq!(run.invocations, 4);
+        assert_eq!(run.threads, 4);
+        assert_eq!(run.outputs.len(), 4);
+        assert!(
+            run.outputs
+                .iter()
+                .all(|record| record.payload == [20u32.to_le_bytes(), 2u32.to_le_bytes()].concat())
+        );
+        assert_eq!(run.outputs[0].node_index, 0);
+
+        // Persistent execution loops past the dispatched thread count.
+        let records = work_graph_node_records(600);
+        let bindings = MetalWorkGraphNodeBindings {
+            records: &records,
+            record_count: 600,
+            record_stride: 16,
+            output_capacity: 600,
+            output_stride: 16,
+            resources: &resources,
+            descriptor_table: &descriptor,
+            root_constants: &root_constants,
+            persistent: true,
+        };
+        let run = program
+            .execute(device.metal_device(), &bindings)
+            .expect("persistent node execution");
+        assert!(run.persistent);
+        assert_eq!(run.threads, 512);
+        assert_eq!(run.outputs.len(), 600);
+        assert!(
+            run.outputs
+                .iter()
+                .all(|record| record.payload == [20u32.to_le_bytes(), 2u32.to_le_bytes()].concat())
+        );
+
+        // Malformed bindings fail closed.
+        let error = program
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    record_stride: 4,
+                    ..bindings
+                },
+            )
+            .expect_err("short record stride");
+        assert_eq!(
+            error.message,
+            "work graph node record stride 4 is smaller than the 8-byte record header"
+        );
+        let error = program
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    output_stride: 4,
+                    ..bindings
+                },
+            )
+            .expect_err("short output stride");
+        assert_eq!(
+            error.message,
+            "work graph node output stride 4 is smaller than the 8-byte record header"
+        );
+        let error = program
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    output_capacity: 0,
+                    ..bindings
+                },
+            )
+            .expect_err("zero output capacity");
+        assert_eq!(
+            error.message,
+            "work graph node output capacity must be non-zero"
+        );
+        let error = program
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    record_count: 2,
+                    record_stride: u64::MAX,
+                    ..bindings
+                },
+            )
+            .expect_err("overflowing record range");
+        assert_eq!(error.message, "work graph node record range overflows");
+        let error = program
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    records: &[],
+                    ..bindings
+                },
+            )
+            .expect_err("short record buffer");
+        assert_eq!(
+            error.message,
+            "work graph node record range (9600 bytes) exceeds the supplied 0 bytes"
+        );
+        let colliding = [MetalWorkGraphNodeResource {
+            register: 24,
+            bytes: &uav,
+        }];
+        let error = program
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    resources: &colliding,
+                    ..bindings
+                },
+            )
+            .expect_err("reserved resource register");
+        assert_eq!(
+            error.message,
+            "work graph node resource register 24 collides with the reserved ABI range"
+        );
+        let error = program
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    output_capacity: 2,
+                    ..bindings
+                },
+            )
+            .expect_err("output overflow");
+        assert_eq!(
+            error.message,
+            "work graph node produced 600 records but the current-node-output capacity is 2"
+        );
+        let empty_records: Vec<u8> = Vec::new();
+        let run = program
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    records: &empty_records,
+                    record_count: 0,
+                    ..bindings
+                },
+            )
+            .expect("empty node execution");
+        assert_eq!(run.threads, 0);
+        assert_eq!(run.outputs, Vec::new());
+
+        // ABI injection is exact and rejects malformed signatures.
+        let source = "kernel void n(uint3 gid [[thread_position_in_grid]]) \
+                      [[threads_per_threadgroup(1, 1, 1)]] { }";
+        let injected = inject_work_graph_node_abi(source, "n", &[0, 1]).expect("inject ABI");
+        assert!(injected.contains("_wg_records [[buffer(24)]]"));
+        assert!(injected.contains("_res_1_1 [[buffer(1)]]"));
+        assert!(injected.contains("struct WorkGraphRecordHeader"));
+        let error = inject_work_graph_node_abi(source, "missing", &[]).expect_err("missing entry");
+        assert_eq!(
+            error.message,
+            "work graph node shader has no MSL kernel entry point missing"
+        );
+        let error = inject_work_graph_node_abi("kernel void n(", "n", &[])
+            .expect_err("unterminated signature");
+        assert_eq!(
+            error.message,
+            "work graph node shader entry point n has an unterminated signature"
+        );
+        let error = inject_work_graph_node_abi(source, "n", &[24]).expect_err("register collision");
+        assert_eq!(
+            error.message,
+            "work graph node shader resource register 24 collides with the reserved \
+             work-graph ABI buffer range 24..=29"
+        );
+    }
+
+    const WORK_GRAPH_NODE_CHAIN_MSL: &str = r#"#include <metal_stdlib>
+using namespace metal;
+struct WorkGraphParams {
+    uint record_count;
+    uint record_stride;
+    uint output_stride;
+    uint output_capacity;
+    uint thread_count;
+};
+kernel void wg_plus_one(device const uchar* records [[buffer(24)]],
+                        device uchar* output [[buffer(25)]],
+                        device atomic_uint* output_count [[buffer(26)]],
+                        constant WorkGraphParams& wg [[buffer(29)]],
+                        uint gid [[thread_position_in_grid]]) {
+    for (uint i = gid; i < wg.record_count; i += wg.thread_count) {
+        device const uint* header = (device const uint*)(records + i * wg.record_stride);
+        uint index = atomic_fetch_add_explicit(output_count, 1u, memory_order_relaxed);
+        if (index < wg.output_capacity) {
+            device uint* out = (device uint*)(output + index * wg.output_stride);
+            out[0] = header[0];
+            out[1] = 0u;
+            out[2] = header[2] + 1u;
+            out[3] = header[3];
+        }
+    }
+}
+kernel void wg_plus_ten(device const uchar* records [[buffer(24)]],
+                        device uchar* output [[buffer(25)]],
+                        device atomic_uint* output_count [[buffer(26)]],
+                        constant WorkGraphParams& wg [[buffer(29)]],
+                        uint gid [[thread_position_in_grid]]) {
+    for (uint i = gid; i < wg.record_count; i += wg.thread_count) {
+        device const uint* header = (device const uint*)(records + i * wg.record_stride);
+        uint index = atomic_fetch_add_explicit(output_count, 1u, memory_order_relaxed);
+        if (index < wg.output_capacity) {
+            device uint* out = (device uint*)(output + index * wg.output_stride);
+            out[0] = header[0];
+            out[1] = 0u;
+            out[2] = header[2] + 10u;
+            out[3] = header[3] + 10u;
+        }
+    }
+}"#;
+
+    #[test]
+    fn work_graph_node_programs_chain_payloads_and_reject_malformed_bindings() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let producer = MetalWorkGraphNodeProgram::compile(
+            device.metal_device(),
+            WORK_GRAPH_NODE_CHAIN_MSL,
+            "wg_plus_one",
+            (64, 1, 1),
+            false,
+        )
+        .expect("producer node");
+        let consumer = MetalWorkGraphNodeProgram::compile(
+            device.metal_device(),
+            WORK_GRAPH_NODE_CHAIN_MSL,
+            "wg_plus_ten",
+            (64, 1, 1),
+            false,
+        )
+        .expect("consumer node");
+        let records = work_graph_node_records(3);
+        let first = producer
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    records: &records,
+                    record_count: 3,
+                    record_stride: 16,
+                    output_capacity: 3,
+                    output_stride: 16,
+                    resources: &[],
+                    descriptor_table: &[],
+                    root_constants: &[],
+                    persistent: false,
+                },
+            )
+            .expect("producer run");
+        assert_eq!(first.outputs.len(), 3);
+        assert!(
+            first.outputs.iter().all(|record| {
+                record.payload == [2u32.to_le_bytes(), 2u32.to_le_bytes()].concat()
+            })
+        );
+        let mut chained = Vec::new();
+        for record in &first.outputs {
+            chained.extend_from_slice(&record.encode(16));
+        }
+        let second = consumer
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    records: &chained,
+                    record_count: first.outputs.len() as u32,
+                    record_stride: 16,
+                    output_capacity: 3,
+                    output_stride: 16,
+                    resources: &[],
+                    descriptor_table: &[],
+                    root_constants: &[],
+                    persistent: false,
+                },
+            )
+            .expect("consumer run");
+        assert_eq!(second.outputs.len(), 3);
+        assert!(second.outputs.iter().all(|record| {
+            record.payload == [12u32.to_le_bytes(), 12u32.to_le_bytes()].concat()
+        }));
+        let error = consumer
+            .execute(
+                device.metal_device(),
+                &MetalWorkGraphNodeBindings {
+                    records: &chained,
+                    record_count: 3,
+                    record_stride: 16,
+                    output_capacity: 1,
+                    output_stride: 16,
+                    resources: &[],
+                    descriptor_table: &[],
+                    root_constants: &[],
+                    persistent: false,
+                },
+            )
+            .expect_err("output capacity overflow");
+        assert_eq!(
+            error.message,
+            "work graph node produced 3 records but the current-node-output capacity is 1"
+        );
+    }
+
+    fn work_graph_dxil_container(entry: &str) -> Vec<u8> {
+        let mut program = Vec::new();
+        program.extend_from_slice(&0u32.to_le_bytes());
+        program.extend_from_slice(&0u32.to_le_bytes());
+        for _ in 0..3 {
+            program.extend_from_slice(&1u32.to_le_bytes());
+        }
+        program.extend_from_slice(&0u32.to_le_bytes());
+        let mut metadata = vec![entry.len() as u8];
+        metadata.extend_from_slice(entry.as_bytes());
+        let parts = [
+            (*b"PROG", program),
+            (*b"SIGN", b"aabb".to_vec()),
+            (*b"META", metadata),
+        ];
+        let header_size = 12 + parts.len() * 12;
+        let mut offset = header_size as u32;
+        let mut descriptors = Vec::new();
+        for (kind, payload) in &parts {
+            descriptors.push((*kind, offset, payload.len() as u32));
+            offset += payload.len() as u32;
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"DXIL");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        for (kind, offset, size) in &descriptors {
+            bytes.extend_from_slice(kind);
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for (_, payload) in &parts {
+            bytes.extend_from_slice(payload);
+        }
+        bytes
+    }
+
+    #[test]
+    fn work_graph_node_program_compiles_guest_dxil_and_rejects_malformed_shaders() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let dxil = work_graph_dxil_container("node0");
+        let program = MetalWorkGraphNodeProgram::from_dxil(
+            device.metal_device(),
+            &dxil,
+            "node0",
+            crate::shader::ShaderStage::Cs,
+            (1, 1, 1),
+            false,
+        )
+        .expect("guest DXIL node program");
+        assert!(!program.mesh);
+        assert!(program.entry.starts_with("msl_cs_"));
+        let error = MetalWorkGraphNodeProgram::from_dxil(
+            device.metal_device(),
+            b"not a DXIL container",
+            "node0",
+            crate::shader::ShaderStage::Cs,
+            (1, 1, 1),
+            false,
+        )
+        .expect_err("malformed DXIL");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(
+            error.message,
+            "work graph node shader translation failed in parse: invalid DXIL container header"
+        );
     }
 
     #[test]
