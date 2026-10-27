@@ -220,6 +220,106 @@ pub unsafe extern "C" fn jit_helper_store(
     }
 }
 
+/// Atomic x86 `xadd` on a guest memory operand.
+///
+/// This is the narrow JIT/CPU boundary for `lock xadd [mem], reg` (the
+/// instruction concurrent guest code uses for atomic counters).  The memory
+/// update and the original-value hand-back to the source register happen in
+/// one operation:
+///
+/// * cooperative execution (a live `MemoryImage`) performs a checked
+///   read/write pair — only one guest thread executes at a time in that mode;
+/// * production worker execution (no `MemoryImage`, a `GuestSliceMemory` view
+///   installed) uses the canonical store's atomic RMW, so two host workers
+///   incrementing the same aligned counter can never lose an update.
+///
+/// The helper writes the *original* memory value into `state.gpr[src_index]`
+/// with x86 width-merge semantics, so the emitted code only has to reload the
+/// guest register file afterwards.
+///
+/// # Safety
+///
+/// `state` must be a live `CpuState` for the calling guest thread; exactly one
+/// of `memory` (runtime owner) or the worker slice memory view (native worker)
+/// must be valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_helper_lock_xadd(
+    state: *mut CpuState,
+    memory: *mut MemoryImage,
+    address: u64,
+    value: u64,
+    width: u64,
+    src_index: u64,
+) {
+    let len = match width {
+        1 | 2 | 4 | 8 => width as usize,
+        _ => 4,
+    };
+    if state.is_null() {
+        return;
+    }
+    let mask = if len == 8 {
+        u64::MAX
+    } else {
+        (1_u64 << (len * 8)) - 1
+    };
+    let source = value & mask;
+    let original = if let Some(slice_memory) = worker_slice_memory() {
+        match slice_memory.atomic_fetch_add(address, source, len) {
+            Ok((original, code_write)) => {
+                if code_write {
+                    WORKER_SLICE_CODE_WRITTEN.with(|flag| flag.set(true));
+                    JIT_CODE_EPOCH.fetch_add(1, Ordering::AcqRel);
+                }
+                original
+            }
+            Err(fault) => {
+                unsafe {
+                    (*state).jit_pending_fault = Some(fault.address);
+                    (*state).jit_pending_fault_write = true;
+                }
+                return;
+            }
+        }
+    } else {
+        if memory.is_null() {
+            return;
+        }
+        let mem = unsafe { &mut *memory };
+        let previous = match len {
+            1 => mem.read_u8(address).map(u64::from),
+            2 => mem.read_u16(address).map(u64::from),
+            4 => mem.read_u32(address).map(u64::from),
+            _ => mem.read_u64(address),
+        };
+        let previous = match previous {
+            Ok(previous) => previous,
+            Err(_) => {
+                unsafe {
+                    (*state).jit_pending_fault = Some(address);
+                    (*state).jit_pending_fault_write = true;
+                }
+                return;
+            }
+        };
+        let next = previous.wrapping_add(source) & mask;
+        let bytes = next.to_le_bytes();
+        if let Err(fault) = mem.guest_write_checked(address, &bytes[..len]) {
+            unsafe {
+                (*state).jit_pending_fault = Some(fault.address);
+                (*state).jit_pending_fault_write = true;
+            }
+            return;
+        }
+        note_guest_code_write(address, len);
+        previous
+    };
+    let index = src_index as usize;
+    if let Some(register) = unsafe { (*state).gpr.get_mut(index) } {
+        *register = crate::cpu::merge_register_result(*register, original, len);
+    }
+}
+
 /// Universal single-instruction executor: executes ONE IR instruction directly
 /// on CpuState + MemoryImage.  Called from JIT-compiled code for instructions
 /// that don't have dedicated native emission arms.  This is NOT an interpreter
@@ -2810,6 +2910,37 @@ impl JitCompiler {
         self.emit_fault_check();
     }
 
+    /// Emit a call to `jit_helper_lock_xadd(state, memory, address, value,
+    /// width, src_index)`.  The helper performs the atomic memory update and
+    /// writes the original value into the source guest register, so the
+    /// emitted sequence saves/restores the guest register file like the store
+    /// helper and then tests the fault channel.
+    pub(super) fn emit_helper_lock_xadd(
+        &mut self,
+        addr_reg: u32,
+        val_reg: u32,
+        width: u64,
+        src_index: u64,
+        arch: GuestArch,
+    ) {
+        self.emit_store_guest_registers(arch);
+        self.emitter.mov_reg(24, 0); // CpuState
+        self.emitter.mov_reg(28, 2); // MemoryImage
+        self.emitter.mov_reg(27, addr_reg); // address
+        self.emitter.mov_reg(25, val_reg); // addend
+        self.emitter.mov_reg(0, 24);
+        self.emitter.mov_reg(1, 28);
+        self.emitter.mov_reg(2, 27);
+        self.emitter.mov_reg(3, 25);
+        self.emitter.movz(4, width as u16, 0);
+        self.emitter.movz(5, src_index as u16, 0);
+        self.emit_bl_to(AotHelper::LockXadd);
+        self.emitter.mov_reg(0, 24);
+        self.emit_load_guest_registers(arch);
+        self.emitter.mov_reg(2, 28);
+        self.emit_fault_check();
+    }
+
     /// Emit the immediate post-helper fault test:
     ///
     /// ```text
@@ -3864,6 +3995,34 @@ impl JitCompiler {
                     *width as u64,
                     arch,
                 );
+            }
+
+            // Atomic xadd to memory (`lock xadd [mem], reg`).  Native
+            // lowering keeps the block worker-safe: the helper performs the
+            // canonical-store atomic RMW, so concurrent guest threads
+            // incrementing one shared counter produce the exact total.
+            IrInstruction::LockXadd {
+                address,
+                src,
+                width,
+            } => {
+                if address.rip_relative {
+                    // RIP-relative addressing needs the instruction's RIP,
+                    // unavailable at IR level; the interpreter fallback
+                    // executes it against the live MemoryImage (and the block
+                    // stays a host barrier on workers).
+                    self.emit_interpreter_fallback(insn, arch)?;
+                } else {
+                    self.emit_effective_address(address, 21, 0, arch);
+                    let arm_src = regmap::guest_to_arm(src.index());
+                    self.emit_helper_lock_xadd(
+                        21,
+                        arm_src,
+                        *width as u64,
+                        src.index() as u64,
+                        arch,
+                    );
+                }
             }
 
             // Universal catch-all: for any instruction without a dedicated

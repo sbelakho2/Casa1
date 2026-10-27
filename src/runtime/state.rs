@@ -1393,6 +1393,11 @@ pub(crate) struct PeHostRuntime {
     pub(crate) production_waits: BTreeMap<u32, ProductionWait>,
     /// The bounded native worker pool (owned by the runtime; joined on drop).
     pub(crate) production_scheduler: Option<ProductionScheduler>,
+    /// Process-wide shared state for concurrent guest execution: the canonical
+    /// memory view, the process gate, native park/wake registry and the
+    /// published compiled-slice epoch.  Per-thread execution state lives in
+    /// [`GuestThreadContext`], never here.
+    pub(crate) process_shared: Arc<ProcessShared>,
     pub(crate) active_pumped_guest_thread: Option<u32>,
     pub(crate) yield_pumped_guest_thread: bool,
     /// Wait descriptor attached by a pumped thread's blocking-wait thunk;
@@ -2472,6 +2477,7 @@ impl PeHostRuntime {
             scheduler_mode: SchedulerMode::Cooperative,
             production_waits: BTreeMap::new(),
             production_scheduler: None,
+            process_shared: Arc::new(ProcessShared::new()),
             active_pumped_guest_thread: None,
             yield_pumped_guest_thread: false,
             pump_yield_with_wait: None,

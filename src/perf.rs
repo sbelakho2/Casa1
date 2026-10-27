@@ -1750,6 +1750,989 @@ impl Drop for MmappedFile {
 }
 
 // ===========================================================================
+// End-to-end GPU/present performance measurement (audit P1 #5)
+// ===========================================================================
+
+/// Why a real timestamp-backed metric cannot be reported. Every variant has an
+/// exact, user-visible reason; a metric is never replaced by a CPU-side
+/// bookkeeping estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingUnavailable {
+    /// No Metal device exists on this host.
+    NoMetalDevice,
+    /// The command buffer completed without `GPUStartTime`/`GPUEndTime`.
+    MissingGpuTimestamp,
+    /// The host does not expose command-buffer GPU timestamps.
+    UnsupportedGpuTimestamp,
+    /// `CAMetalLayer.nextDrawable` returned no drawable (headless present).
+    NoDrawable,
+    /// The drawable reported `presentedTime == 0` (not displayed).
+    MissingPresentTimestamp,
+    /// No input-event timestamp was correlated with the measured frame.
+    MissingInputTimestamp,
+    /// Fewer than two real present/GPU-completion timestamps were recorded.
+    NoFrameTimeSamples,
+    /// No shader compilation requests were recorded.
+    NoShaderCompileSamples,
+    /// No guest-instruction throughput sample was recorded.
+    NoGuestWork,
+    /// The host CPU clock could not be sampled.
+    MissingHostCpuTime,
+}
+
+impl TimingUnavailable {
+    pub fn reason(self) -> &'static str {
+        match self {
+            TimingUnavailable::NoMetalDevice => {
+                "no Metal device is available; GPU and drawable timestamps cannot be captured"
+            }
+            TimingUnavailable::MissingGpuTimestamp => {
+                "Metal command buffer completed without GPUStartTime/GPUEndTime timestamps"
+            }
+            TimingUnavailable::UnsupportedGpuTimestamp => {
+                "the Metal device does not expose command-buffer GPU timestamps"
+            }
+            TimingUnavailable::NoDrawable => {
+                "CAMetalLayer.nextDrawable returned no drawable (headless presentation); \
+                 drawable presentedTime is unavailable"
+            }
+            TimingUnavailable::MissingPresentTimestamp => {
+                "CAMetalLayer drawable reported presentedTime=0; no display presentation occurred"
+            }
+            TimingUnavailable::MissingInputTimestamp => {
+                "no input-event timestamp was correlated with the measured frames"
+            }
+            TimingUnavailable::NoFrameTimeSamples => {
+                "fewer than two real present or GPU-completion timestamps were recorded"
+            }
+            TimingUnavailable::NoShaderCompileSamples => {
+                "no shader compilation requests were recorded"
+            }
+            TimingUnavailable::NoGuestWork => "no guest-instruction throughput sample was recorded",
+            TimingUnavailable::MissingHostCpuTime => {
+                "the host process CPU clock could not be sampled"
+            }
+        }
+    }
+}
+
+/// Nearest-rank percentile over an already-sorted sample slice.
+///
+/// Returns `None` for an empty slice. Fractions `<= 0` select the minimum and
+/// fractions `>= 1` select the maximum, so callers cannot index out of bounds
+/// with a synthetic p999 on a one-sample window.
+pub fn percentile_ns(sorted: &[u64], fraction: f64) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    if !fraction.is_finite() || fraction <= 0.0 {
+        return sorted.first().copied();
+    }
+    if fraction >= 1.0 {
+        return sorted.last().copied();
+    }
+    let rank = (fraction * sorted.len() as f64).ceil() as usize;
+    Some(sorted[rank.saturating_sub(1).min(sorted.len() - 1)])
+}
+
+/// Exact order-statistic summary for one latency distribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PercentileStats {
+    pub sample_count: usize,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+    pub p999_ns: u64,
+}
+
+impl PercentileStats {
+    pub fn from_ns(samples: &[u64]) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        Some(Self {
+            sample_count: sorted.len(),
+            p50_ns: percentile_ns(&sorted, 0.50)?,
+            p95_ns: percentile_ns(&sorted, 0.95)?,
+            p99_ns: percentile_ns(&sorted, 0.99)?,
+            p999_ns: percentile_ns(&sorted, 0.999)?,
+        })
+    }
+
+    pub fn p50_us(&self) -> f64 {
+        self.p50_ns as f64 / 1_000.0
+    }
+
+    pub fn p95_us(&self) -> f64 {
+        self.p95_ns as f64 / 1_000.0
+    }
+
+    pub fn p99_us(&self) -> f64 {
+        self.p99_ns as f64 / 1_000.0
+    }
+
+    pub fn p999_us(&self) -> f64 {
+        self.p999_ns as f64 / 1_000.0
+    }
+}
+
+/// FPS implied by the mean of the slowest `fraction` samples.
+pub fn low_fps(samples_ns: &[u64], fraction: f64) -> Option<f64> {
+    if samples_ns.is_empty() {
+        return None;
+    }
+    let mut sorted = samples_ns.to_vec();
+    sorted.sort_unstable_by(|left, right| right.cmp(left));
+    let count = ((sorted.len() as f64 * fraction).ceil() as usize)
+        .max(1)
+        .min(sorted.len());
+    let worst: u128 = sorted[..count].iter().map(|value| *value as u128).sum();
+    let average_ns = worst as f64 / count as f64;
+    if average_ns <= 0.0 || !average_ns.is_finite() {
+        None
+    } else {
+        Some(1_000_000_000.0 / average_ns)
+    }
+}
+
+/// Correlates CoreAnimation media timestamps (GPU/present) with the
+/// monotonic instants used for input and submit events.
+#[derive(Debug, Clone, Copy)]
+pub struct MediaClock {
+    origin: Instant,
+    origin_seconds: f64,
+}
+
+impl MediaClock {
+    /// Anchor the two clocks at one point in time. Returns `None` when the
+    /// host has no CoreAnimation clock (non-Metal hosts).
+    pub fn capture() -> Option<Self> {
+        Self::from_parts(Instant::now(), crate::metal_backend::media_now_seconds())
+    }
+
+    pub fn from_parts(origin: Instant, origin_seconds: f64) -> Option<Self> {
+        if !origin_seconds.is_finite() || origin_seconds <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            origin,
+            origin_seconds,
+        })
+    }
+
+    /// Current monotonic timestamp on this clock's timeline.
+    pub fn now_ns(&self) -> u64 {
+        self.seconds_to_ns(crate::metal_backend::media_now_seconds())
+            .unwrap_or(0)
+    }
+
+    /// Convert a CoreAnimation media timestamp into the monotonic timeline.
+    /// Timestamps older than the anchor or outside the representable range
+    /// are rejected instead of wrapping.
+    pub fn seconds_to_ns(&self, seconds: f64) -> Option<u64> {
+        if !seconds.is_finite() {
+            return None;
+        }
+        let delta = seconds - self.origin_seconds;
+        let delta_ns = (delta * 1_000_000_000.0).round();
+        if !delta_ns.is_finite() || delta_ns < 0.0 || delta_ns > u64::MAX as f64 {
+            return None;
+        }
+        let offset = self
+            .origin
+            .checked_add(Duration::from_nanos(delta_ns as u64))?;
+        Some(offset.duration_since(self.origin).as_nanos() as u64)
+    }
+}
+
+/// One measured frame. Every duration is derived from a real timestamp; the
+/// accessors return `None` rather than substituting a wall-clock estimate when
+/// a timestamp is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameSample {
+    pub sequence: u64,
+    pub input_ns: Option<u64>,
+    pub submit_start_ns: u64,
+    pub submit_end_ns: u64,
+    pub gpu_start_ns: Option<u64>,
+    pub gpu_end_ns: Option<u64>,
+    pub present_ns: Option<u64>,
+    pub guest_instructions: u64,
+    pub host_cpu_ns: u64,
+    pub shader_compile_stall: bool,
+}
+
+impl FrameSample {
+    pub fn new(
+        sequence: u64,
+        input_ns: Option<u64>,
+        submit_start_ns: u64,
+        submit_end_ns: u64,
+    ) -> Self {
+        Self {
+            sequence,
+            input_ns,
+            submit_start_ns,
+            submit_end_ns,
+            gpu_start_ns: None,
+            gpu_end_ns: None,
+            present_ns: None,
+            guest_instructions: 0,
+            host_cpu_ns: 0,
+            shader_compile_stall: false,
+        }
+    }
+
+    pub fn with_gpu_timestamps(mut self, start_ns: u64, end_ns: u64) -> Self {
+        self.gpu_start_ns = Some(start_ns);
+        self.gpu_end_ns = Some(end_ns);
+        self
+    }
+
+    pub fn with_present_timestamp(mut self, present_ns: u64) -> Self {
+        self.present_ns = Some(present_ns);
+        self
+    }
+
+    pub fn with_guest_instructions(mut self, instructions: u64) -> Self {
+        self.guest_instructions = instructions;
+        self
+    }
+
+    pub fn with_host_cpu_ns(mut self, host_cpu_ns: u64) -> Self {
+        self.host_cpu_ns = host_cpu_ns;
+        self
+    }
+
+    pub fn with_shader_compile_stall(mut self, stalled: bool) -> Self {
+        self.shader_compile_stall = stalled;
+        self
+    }
+
+    /// Real CPU submit duration (`submit_end - submit_start`).
+    pub fn cpu_submit_ns(&self) -> Option<u64> {
+        self.submit_end_ns.checked_sub(self.submit_start_ns)
+    }
+
+    /// Real GPU execution duration (`GPUEndTime - GPUStartTime`).
+    pub fn gpu_time_ns(&self) -> Option<u64> {
+        match (self.gpu_start_ns, self.gpu_end_ns) {
+            (Some(start), Some(end)) => end.checked_sub(start),
+            _ => None,
+        }
+    }
+
+    pub fn input_to_present_ns(&self) -> Option<u64> {
+        match (self.input_ns, self.present_ns) {
+            (Some(input), Some(present)) => present.checked_sub(input),
+            _ => None,
+        }
+    }
+
+    pub fn input_to_gpu_completion_ns(&self) -> Option<u64> {
+        match (self.input_ns, self.gpu_end_ns) {
+            (Some(input), Some(end)) => end.checked_sub(input),
+            _ => None,
+        }
+    }
+
+    pub fn present_to_gpu_end_ns(&self) -> Option<i64> {
+        match (self.present_ns, self.gpu_end_ns) {
+            (Some(present), Some(end)) => i64::try_from(end)
+                .ok()
+                .zip(i64::try_from(present).ok())
+                .map(|(end, present)| end - present),
+            _ => None,
+        }
+    }
+
+    /// Timeline marker used for frame-time intervals: a real presentation
+    /// timestamp when the drawable was displayed, otherwise a real GPU
+    /// completion timestamp.
+    pub fn frame_marker_ns(&self) -> Option<u64> {
+        self.present_ns.or(self.gpu_end_ns)
+    }
+}
+
+/// Real host process CPU time in nanoseconds (`CLOCK_PROCESS_CPUTIME_ID`).
+pub fn process_cpu_time_ns() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        let mut timestamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes only to the provided timespec.
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut timestamp) };
+        if result == 0 {
+            (timestamp.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(timestamp.tv_nsec as u64)
+        } else {
+            0
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
+    }
+}
+
+/// Aggregated real-sample metrics for GPU/present measurement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuPresentSummary {
+    pub sample_count: usize,
+    pub gpu_sample_count: usize,
+    pub present_sample_count: usize,
+    pub gpu_unavailable: Option<TimingUnavailable>,
+    pub present_unavailable: Option<TimingUnavailable>,
+    pub frame_time: Option<PercentileStats>,
+    pub frame_time_unavailable: Option<TimingUnavailable>,
+    pub gpu_time: Option<PercentileStats>,
+    pub cpu_submit: Option<PercentileStats>,
+    pub input_to_present: Option<PercentileStats>,
+    pub input_to_present_unavailable: Option<TimingUnavailable>,
+    pub input_to_gpu_completion: Option<PercentileStats>,
+    pub input_to_gpu_unavailable: Option<TimingUnavailable>,
+    pub host_cpu_time: Option<PercentileStats>,
+    pub host_cpu_unavailable: Option<TimingUnavailable>,
+    pub frame_time_1pct_low_fps: Option<f64>,
+    pub frame_time_0p1pct_low_fps: Option<f64>,
+    pub gpu_idle_gap_us: Option<f64>,
+    pub shader_compile_requests: u64,
+    pub shader_compile_stalls: u64,
+    pub shader_compile_stall_rate: Option<f64>,
+    pub shader_compile_unavailable: Option<TimingUnavailable>,
+    pub guest_instructions: u64,
+    pub guest_wall_ns: u64,
+    pub guest_instructions_per_sec: Option<f64>,
+    pub guest_work_unavailable: Option<TimingUnavailable>,
+}
+
+impl GpuPresentSummary {
+    /// Machine-readable KPI entries. Unavailable entries carry the exact
+    /// fallback reason and never contain a fabricated number.
+    pub fn to_json_metrics(&self) -> BTreeMap<String, serde_json::Value> {
+        let mut metrics = BTreeMap::new();
+        let gpu_source = "Metal command buffer GPUStartTime/GPUEndTime";
+        let present_source = "CAMetalLayer drawable presentedTime correlated with the input event";
+        let frame_source =
+            "real present/GPU-completion timeline between consecutive measured frames";
+
+        macro_rules! insert {
+            ($key:expr, $value:expr, $unit:expr, $direction:expr, $source:expr $(,)?) => {{
+                if let Some(value) = $value.filter(|value: &f64| value.is_finite()) {
+                    metrics.insert(
+                        $key.to_string(),
+                        serde_json::json!({
+                            "available": true,
+                            "value": value,
+                            "unit": $unit,
+                            "direction": $direction,
+                            "source": $source,
+                        }),
+                    );
+                }
+            }};
+        }
+        macro_rules! unavailable {
+            ($key:expr, $reason:expr $(,)?) => {{
+                metrics.insert(
+                    $key.to_string(),
+                    serde_json::json!({
+                        "available": false,
+                        "reason": $reason.reason(),
+                        "source": "real Metal GPU/present timestamps",
+                    }),
+                );
+            }};
+        }
+
+        match self.frame_time {
+            Some(stats) => {
+                for (key, value) in [
+                    ("gpu_frame_time_p50_us", stats.p50_us()),
+                    ("gpu_frame_time_p95_us", stats.p95_us()),
+                    ("gpu_frame_time_p99_us", stats.p99_us()),
+                    ("gpu_frame_time_p999_us", stats.p999_us()),
+                ] {
+                    insert!(key, Some(value), "us", "lower", frame_source);
+                }
+            }
+            None => {
+                for key in [
+                    "gpu_frame_time_p50_us",
+                    "gpu_frame_time_p95_us",
+                    "gpu_frame_time_p99_us",
+                    "gpu_frame_time_p999_us",
+                ] {
+                    unavailable!(
+                        key,
+                        self.frame_time_unavailable
+                            .unwrap_or(TimingUnavailable::NoFrameTimeSamples),
+                    );
+                }
+            }
+        }
+        for (key, value, reason) in [
+            (
+                "gpu_frame_time_1pct_low_fps",
+                self.frame_time_1pct_low_fps,
+                TimingUnavailable::NoFrameTimeSamples,
+            ),
+            (
+                "gpu_frame_time_0p1pct_low_fps",
+                self.frame_time_0p1pct_low_fps,
+                TimingUnavailable::NoFrameTimeSamples,
+            ),
+        ] {
+            match value {
+                Some(value) => insert!(key, Some(value), "fps", "higher", frame_source),
+                None => unavailable!(key, self.frame_time_unavailable.unwrap_or(reason)),
+            }
+        }
+        match self.gpu_time {
+            Some(stats) => {
+                for (key, value) in [
+                    ("gpu_time_p50_us", stats.p50_us()),
+                    ("gpu_time_p99_us", stats.p99_us()),
+                ] {
+                    insert!(key, Some(value), "us", "lower", gpu_source);
+                }
+            }
+            None => {
+                for key in ["gpu_time_p50_us", "gpu_time_p99_us"] {
+                    unavailable!(
+                        key,
+                        self.gpu_unavailable
+                            .unwrap_or(TimingUnavailable::MissingGpuTimestamp),
+                    );
+                }
+            }
+        }
+        match self.cpu_submit {
+            Some(stats) => {
+                insert!(
+                    "cpu_submit_p50_us",
+                    Some(stats.p50_us()),
+                    "us",
+                    "lower",
+                    "CPU command encoding + commit (submit_start/submit_end)",
+                );
+                insert!(
+                    "cpu_submit_p99_us",
+                    Some(stats.p99_us()),
+                    "us",
+                    "lower",
+                    "CPU command encoding + commit (submit_start/submit_end)",
+                );
+            }
+            None => {
+                for key in ["cpu_submit_p50_us", "cpu_submit_p99_us"] {
+                    unavailable!(key, TimingUnavailable::NoFrameTimeSamples);
+                }
+            }
+        }
+        match self.input_to_present {
+            Some(stats) => {
+                for (key, value) in [
+                    ("input_to_present_p50_us", stats.p50_us()),
+                    ("input_to_present_p99_us", stats.p99_us()),
+                ] {
+                    insert!(key, Some(value), "us", "lower", present_source);
+                }
+            }
+            None => {
+                for key in ["input_to_present_p50_us", "input_to_present_p99_us"] {
+                    unavailable!(
+                        key,
+                        self.input_to_present_unavailable
+                            .unwrap_or(TimingUnavailable::MissingPresentTimestamp),
+                    );
+                }
+            }
+        }
+        match self.input_to_gpu_completion {
+            Some(stats) => {
+                for (key, value) in [
+                    ("input_to_gpu_completion_p50_us", stats.p50_us()),
+                    ("input_to_gpu_completion_p99_us", stats.p99_us()),
+                ] {
+                    insert!(
+                        key,
+                        Some(value),
+                        "us",
+                        "lower",
+                        "input event to real Metal GPUEndTime",
+                    );
+                }
+            }
+            None => {
+                for key in [
+                    "input_to_gpu_completion_p50_us",
+                    "input_to_gpu_completion_p99_us",
+                ] {
+                    unavailable!(
+                        key,
+                        self.input_to_gpu_unavailable
+                            .unwrap_or(TimingUnavailable::MissingInputTimestamp),
+                    );
+                }
+            }
+        }
+        match self.host_cpu_time {
+            Some(stats) => insert!(
+                "host_cpu_time_p50_us",
+                Some(stats.p50_us()),
+                "us",
+                "lower",
+                "CLOCK_PROCESS_CPUTIME_ID around measured frames",
+            ),
+            None => unavailable!(
+                "host_cpu_time_p50_us",
+                self.host_cpu_unavailable
+                    .unwrap_or(TimingUnavailable::MissingHostCpuTime),
+            ),
+        }
+        match self.shader_compile_stall_rate {
+            Some(value) => insert!(
+                "shader_compile_stall_rate_measured",
+                Some(value),
+                "stalls/request",
+                "lower",
+                "shader compilation requests recorded during the measurement window",
+            ),
+            None => unavailable!(
+                "shader_compile_stall_rate_measured",
+                self.shader_compile_unavailable
+                    .unwrap_or(TimingUnavailable::NoShaderCompileSamples),
+            ),
+        }
+        match self.guest_instructions_per_sec {
+            Some(value) => insert!(
+                "guest_instructions_per_sec",
+                Some(value),
+                "guest instructions/s",
+                "higher",
+                "guest instructions retired / measured wall time",
+            ),
+            None => unavailable!(
+                "guest_instructions_per_sec",
+                self.guest_work_unavailable
+                    .unwrap_or(TimingUnavailable::NoGuestWork),
+            ),
+        }
+        match self.gpu_idle_gap_us {
+            Some(value) => insert!(
+                "gpu_idle_gap_us",
+                Some(value),
+                "us",
+                "lower",
+                "next GPUStartTime - previous GPUEndTime",
+            ),
+            None => unavailable!(
+                "gpu_idle_gap_us",
+                self.gpu_unavailable
+                    .unwrap_or(TimingUnavailable::NoFrameTimeSamples),
+            ),
+        }
+        metrics
+    }
+}
+
+/// Collector for end-to-end frame samples. Aggregation uses only real
+/// timestamps; when a timestamp source is absent the corresponding metric is
+/// reported unavailable with an exact reason.
+#[derive(Debug, Default, Clone)]
+pub struct GpuPresentRecorder {
+    samples: Vec<FrameSample>,
+    gpu_unavailable: Option<TimingUnavailable>,
+    present_unavailable: Option<TimingUnavailable>,
+    shader_compile_requests: u64,
+    shader_compile_stalls: u64,
+    guest_instructions: u64,
+    guest_wall_ns: u64,
+}
+
+impl GpuPresentRecorder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_gpu_unavailable(&mut self, reason: TimingUnavailable) {
+        if self.gpu_unavailable.is_none() {
+            self.gpu_unavailable = Some(reason);
+        }
+    }
+
+    pub fn mark_present_unavailable(&mut self, reason: TimingUnavailable) {
+        if self.present_unavailable.is_none() {
+            self.present_unavailable = Some(reason);
+        }
+    }
+
+    pub fn record(&mut self, sample: FrameSample) {
+        self.samples.push(sample);
+    }
+
+    pub fn record_shader_compile(&mut self, stalled: bool) {
+        self.shader_compile_requests += 1;
+        if stalled {
+            self.shader_compile_stalls += 1;
+        }
+    }
+
+    pub fn record_guest_work(&mut self, instructions: u64, wall_ns: u64) {
+        self.guest_instructions = self.guest_instructions.saturating_add(instructions);
+        self.guest_wall_ns = self.guest_wall_ns.saturating_add(wall_ns);
+    }
+
+    pub fn samples(&self) -> &[FrameSample] {
+        &self.samples
+    }
+
+    pub fn summary(&self) -> GpuPresentSummary {
+        let gpu_times: Vec<u64> = self
+            .samples
+            .iter()
+            .filter_map(FrameSample::gpu_time_ns)
+            .collect();
+        let present_marks: Vec<u64> = self
+            .samples
+            .iter()
+            .filter_map(|sample| sample.present_ns)
+            .collect();
+        let gpu_ends: Vec<u64> = self
+            .samples
+            .iter()
+            .filter_map(|sample| sample.gpu_end_ns)
+            .collect();
+        let markers = if present_marks.len() >= 2 {
+            present_marks.clone()
+        } else {
+            gpu_ends.clone()
+        };
+        let frame_intervals: Vec<u64> = markers
+            .windows(2)
+            .filter_map(|pair| pair[1].checked_sub(pair[0]))
+            .filter(|interval| *interval > 0)
+            .collect();
+        let cpu_submit: Vec<u64> = self
+            .samples
+            .iter()
+            .filter_map(FrameSample::cpu_submit_ns)
+            .collect();
+        let input_to_present: Vec<u64> = self
+            .samples
+            .iter()
+            .filter_map(FrameSample::input_to_present_ns)
+            .collect();
+        let input_to_gpu_completion: Vec<u64> = self
+            .samples
+            .iter()
+            .filter_map(FrameSample::input_to_gpu_completion_ns)
+            .collect();
+        let host_cpu_times: Vec<u64> = self
+            .samples
+            .iter()
+            .map(|sample| sample.host_cpu_ns)
+            .filter(|value| *value > 0)
+            .collect();
+        let gpu_idle_gaps: Vec<u64> = self
+            .samples
+            .windows(2)
+            .filter_map(|pair| match (pair[0].gpu_end_ns, pair[1].gpu_start_ns) {
+                (Some(end), Some(start)) => start.checked_sub(end),
+                _ => None,
+            })
+            .filter(|gap| *gap > 0)
+            .collect();
+        let has_input = self.samples.iter().any(|sample| sample.input_ns.is_some());
+        let gpu_unavailable = if gpu_times.is_empty() {
+            Some(
+                self.gpu_unavailable
+                    .unwrap_or(TimingUnavailable::MissingGpuTimestamp),
+            )
+        } else {
+            None
+        };
+        let present_unavailable = if present_marks.is_empty() {
+            Some(
+                self.present_unavailable
+                    .unwrap_or(TimingUnavailable::MissingPresentTimestamp),
+            )
+        } else {
+            None
+        };
+        let frame_time_unavailable = frame_intervals.is_empty().then(|| {
+            present_unavailable
+                .or(gpu_unavailable)
+                .unwrap_or(TimingUnavailable::NoFrameTimeSamples)
+        });
+        let input_to_present_unavailable = input_to_present.is_empty().then_some({
+            if let Some(reason) = present_unavailable {
+                reason
+            } else if !has_input {
+                TimingUnavailable::MissingInputTimestamp
+            } else {
+                TimingUnavailable::MissingPresentTimestamp
+            }
+        });
+        let input_to_gpu_unavailable = input_to_gpu_completion.is_empty().then_some({
+            if let Some(reason) = gpu_unavailable {
+                reason
+            } else if !has_input {
+                TimingUnavailable::MissingInputTimestamp
+            } else {
+                TimingUnavailable::MissingGpuTimestamp
+            }
+        });
+        let host_cpu_unavailable = host_cpu_times
+            .is_empty()
+            .then_some(TimingUnavailable::MissingHostCpuTime);
+        let shader_compile_unavailable = (self.shader_compile_requests == 0)
+            .then_some(TimingUnavailable::NoShaderCompileSamples);
+        let shader_compile_stall_rate = (self.shader_compile_requests > 0)
+            .then(|| self.shader_compile_stalls as f64 / self.shader_compile_requests as f64);
+        let guest_work_unavailable = (self.guest_wall_ns == 0 || self.guest_instructions == 0)
+            .then_some(TimingUnavailable::NoGuestWork);
+        let guest_instructions_per_sec = (self.guest_wall_ns > 0 && self.guest_instructions > 0)
+            .then(|| self.guest_instructions as f64 * 1_000_000_000.0 / self.guest_wall_ns as f64);
+        GpuPresentSummary {
+            sample_count: self.samples.len(),
+            gpu_sample_count: gpu_times.len(),
+            present_sample_count: present_marks.len(),
+            gpu_unavailable,
+            present_unavailable,
+            frame_time: PercentileStats::from_ns(&frame_intervals),
+            frame_time_unavailable,
+            gpu_time: PercentileStats::from_ns(&gpu_times),
+            cpu_submit: PercentileStats::from_ns(&cpu_submit),
+            input_to_present: PercentileStats::from_ns(&input_to_present),
+            input_to_present_unavailable,
+            input_to_gpu_completion: PercentileStats::from_ns(&input_to_gpu_completion),
+            input_to_gpu_unavailable,
+            host_cpu_time: PercentileStats::from_ns(&host_cpu_times),
+            host_cpu_unavailable,
+            frame_time_1pct_low_fps: low_fps(&frame_intervals, 0.01),
+            frame_time_0p1pct_low_fps: low_fps(&frame_intervals, 0.001),
+            gpu_idle_gap_us: PercentileStats::from_ns(&gpu_idle_gaps).map(|stats| stats.p50_us()),
+            shader_compile_requests: self.shader_compile_requests,
+            shader_compile_stalls: self.shader_compile_stalls,
+            shader_compile_stall_rate,
+            shader_compile_unavailable,
+            guest_instructions: self.guest_instructions,
+            guest_wall_ns: self.guest_wall_ns,
+            guest_instructions_per_sec,
+            guest_work_unavailable,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+const GPU_BURN_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void casa1_perf_gpu_burn(device uint *out [[buffer(0)]],
+                                uint id [[thread_position_in_grid]]) {
+    uint value = id + 1u;
+    for (uint i = 0; i < 96u; ++i) {
+        value = value * 1664525u + 1013904223u;
+    }
+    out[id] = value;
+}
+"#;
+
+/// Run a real Metal compute submission per frame and record its GPU
+/// completion timestamps. When `CAMetalLayer` vends a drawable the drawable is
+/// presented and its `presentedTime` is correlated with the input timestamp;
+/// a headless layer records the exact `NoDrawable` fallback instead.
+#[cfg(target_os = "macos")]
+pub fn measure_gpu_present_into(
+    recorder: &mut GpuPresentRecorder,
+    frames: usize,
+) -> Result<(), String> {
+    use crate::metal_backend::{
+        DrawableTimingProbe, GpuTimestampReading, GpuTimingProbe, MetalGpuBackend,
+        PresentTimestampReading,
+    };
+    use core_graphics_types::geometry::CGSize;
+
+    if frames == 0 {
+        return Err("GPU present measurement needs at least one frame".to_string());
+    }
+    let mut backend = MetalGpuBackend::new().map_err(|error| error.message.clone())?;
+    let library = backend
+        .compile_shader(GPU_BURN_SHADER)
+        .map_err(|error| error.message.clone())?;
+    let pipeline_id = backend
+        .create_compute_pipeline("casa1_perf_gpu_burn", library)
+        .map_err(|error| error.message.clone())?;
+    let pipeline = backend
+        .get_compute_pipeline(pipeline_id)
+        .ok_or_else(|| "GPU present measurement: compute pipeline missing".to_string())?
+        .to_owned();
+    let device = backend.device().metal_device_owned();
+    let queue = backend.command_queue().to_owned();
+    let output = device.new_buffer(
+        (4096 * std::mem::size_of::<u32>()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let layer = metal::MetalLayer::new();
+    layer.set_device(&device);
+    layer.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+    layer.set_drawable_size(CGSize {
+        width: 64.0,
+        height: 64.0,
+    });
+    layer.set_framebuffer_only(false);
+    layer.set_display_sync_enabled(false);
+    let clock = MediaClock::capture().ok_or_else(|| {
+        TimingUnavailable::UnsupportedGpuTimestamp
+            .reason()
+            .to_string()
+    })?;
+    // A headless CAMetalLayer can still vend a drawable whose presentedTime
+    // stays zero, and acquiring drawables every frame then throttles the
+    // submission to the compositor. Present only while a real presentation
+    // timestamp is being produced; otherwise keep measuring unthrottled GPU
+    // work and report the exact presentation fallback.
+    let mut present_enabled = true;
+
+    for sequence in 0..frames as u64 {
+        let host_cpu_start = process_cpu_time_ns();
+        let input_ns = clock.now_ns();
+        let submit_start_ns = clock.now_ns();
+        let command_buffer = queue.new_command_buffer();
+        let gpu_probe = GpuTimingProbe::attach(command_buffer);
+        {
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_buffer(0, Some(&output), 0);
+            encoder.dispatch_threads(
+                metal::MTLSize::new(4096, 1, 1),
+                metal::MTLSize::new(64, 1, 1),
+            );
+            encoder.end_encoding();
+        }
+        let drawable = present_enabled.then(|| layer.next_drawable()).flatten();
+        let drawable_probe = drawable.map(DrawableTimingProbe::attach);
+        if let Some(drawable) = drawable {
+            command_buffer.present_drawable(drawable);
+        }
+        command_buffer.commit();
+        let submit_end_ns = clock.now_ns();
+        command_buffer.wait_until_completed();
+        if let Some(probe) = &drawable_probe {
+            for _ in 0..2 {
+                if probe.snapshot().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let host_cpu_ns = process_cpu_time_ns().saturating_sub(host_cpu_start);
+        let mut sample = FrameSample::new(sequence, Some(input_ns), submit_start_ns, submit_end_ns)
+            .with_host_cpu_ns(host_cpu_ns);
+
+        match gpu_probe.snapshot() {
+            Some(GpuTimestampReading::Measured {
+                start_seconds,
+                end_seconds,
+            }) => match (
+                clock.seconds_to_ns(start_seconds),
+                clock.seconds_to_ns(end_seconds),
+            ) {
+                (Some(start_ns), Some(end_ns)) if end_ns >= start_ns => {
+                    sample = sample.with_gpu_timestamps(start_ns, end_ns);
+                }
+                _ => recorder.mark_gpu_unavailable(TimingUnavailable::MissingGpuTimestamp),
+            },
+            Some(GpuTimestampReading::UnsupportedDevice) => {
+                recorder.mark_gpu_unavailable(TimingUnavailable::UnsupportedGpuTimestamp);
+            }
+            Some(GpuTimestampReading::MissingTimestamp { .. }) | None => {
+                recorder.mark_gpu_unavailable(TimingUnavailable::MissingGpuTimestamp);
+            }
+        }
+
+        match drawable_probe {
+            None => {
+                recorder.mark_present_unavailable(TimingUnavailable::NoDrawable);
+                present_enabled = false;
+            }
+            Some(probe) => match probe.snapshot() {
+                Some(PresentTimestampReading::Measured { presented_seconds }) => match clock
+                    .seconds_to_ns(presented_seconds)
+                {
+                    Some(present_ns) => {
+                        sample = sample.with_present_timestamp(present_ns);
+                    }
+                    None => {
+                        recorder
+                            .mark_present_unavailable(TimingUnavailable::MissingPresentTimestamp);
+                        present_enabled = false;
+                    }
+                },
+                Some(PresentTimestampReading::UnsupportedDevice) => {
+                    recorder.mark_present_unavailable(TimingUnavailable::UnsupportedGpuTimestamp);
+                    present_enabled = false;
+                }
+                Some(PresentTimestampReading::MissingTimestamp) | None => {
+                    recorder.mark_present_unavailable(TimingUnavailable::MissingPresentTimestamp);
+                    present_enabled = false;
+                }
+            },
+        }
+
+        recorder.record(sample);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn measure_gpu_present_into(
+    _recorder: &mut GpuPresentRecorder,
+    _frames: usize,
+) -> Result<(), String> {
+    Err(TimingUnavailable::NoMetalDevice.reason().to_string())
+}
+
+/// Every KPI key emitted by [`GpuPresentSummary::to_json_metrics`]. The
+/// performance gate uses this list to report one exact fallback reason for
+/// all timestamp-backed metrics when the host cannot measure them.
+pub const GPU_PRESENT_METRIC_KEYS: &[&str] = &[
+    "gpu_frame_time_p50_us",
+    "gpu_frame_time_p95_us",
+    "gpu_frame_time_p99_us",
+    "gpu_frame_time_p999_us",
+    "gpu_frame_time_1pct_low_fps",
+    "gpu_frame_time_0p1pct_low_fps",
+    "gpu_time_p50_us",
+    "gpu_time_p99_us",
+    "cpu_submit_p50_us",
+    "cpu_submit_p99_us",
+    "input_to_present_p50_us",
+    "input_to_present_p99_us",
+    "input_to_gpu_completion_p50_us",
+    "input_to_gpu_completion_p99_us",
+    "host_cpu_time_p50_us",
+    "shader_compile_stall_rate_measured",
+    "guest_instructions_per_sec",
+    "gpu_idle_gap_us",
+];
+
+/// Convenience wrapper returning a summary from a fresh measurement.
+pub fn measure_gpu_present(frames: usize) -> Result<GpuPresentSummary, String> {
+    let mut recorder = GpuPresentRecorder::new();
+    measure_gpu_present_into(&mut recorder, frames)?;
+    Ok(recorder.summary())
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -2025,5 +3008,315 @@ mod tests {
         let path = std::path::PathBuf::from("/tmp/casa1_nonexistent_mmap_test_12345");
         let result = MmappedFile::open(&path);
         assert!(result.is_err(), "expected Err for nonexistent mmap file");
+    }
+
+    // --- End-to-end GPU/present measurement (audit P1 #5) ---
+
+    #[test]
+    fn percentile_ns_rejects_empty_and_pins_single_outlier_boundaries() {
+        assert_eq!(percentile_ns(&[], 0.50), None);
+        assert_eq!(percentile_ns(&[7], 0.0), Some(7));
+        assert_eq!(percentile_ns(&[7], 0.50), Some(7));
+        assert_eq!(percentile_ns(&[7], 0.999), Some(7));
+        assert_eq!(percentile_ns(&[7], 1.0), Some(7));
+
+        let sorted = [1_u64, 2, 3, 1000];
+        assert_eq!(percentile_ns(&sorted, 0.50), Some(2));
+        assert_eq!(percentile_ns(&sorted, 0.99), Some(1000));
+        assert_eq!(percentile_ns(&sorted, 0.999), Some(1000));
+        assert_eq!(percentile_ns(&sorted, f64::NAN), Some(1));
+        assert_eq!(percentile_ns(&sorted, -1.0), Some(1));
+        assert_eq!(percentile_ns(&sorted, 2.0), Some(1000));
+    }
+
+    #[test]
+    fn percentile_stats_from_ns_rejects_empty_and_pins_outlier_percentiles() {
+        assert_eq!(PercentileStats::from_ns(&[]), None);
+
+        let stats = PercentileStats::from_ns(&[1, 2, 3, 4, 1000]).expect("one or more samples");
+        assert_eq!(stats.sample_count, 5);
+        assert_eq!(stats.p50_ns, 3);
+        assert_eq!(stats.p95_ns, 1000);
+        assert_eq!(stats.p99_ns, 1000);
+        assert_eq!(stats.p999_ns, 1000);
+        assert_eq!(stats.p50_us(), 0.003);
+        assert_eq!(stats.p999_us(), 1.0);
+    }
+
+    #[test]
+    fn low_fps_rejects_empty_and_pins_worst_outlier_average() {
+        assert_eq!(low_fps(&[], 0.01), None);
+        assert_eq!(low_fps(&[0, 0], 0.01), None);
+
+        let samples = [1_000_000_u64, 1_000_000, 1_000_000, 10_000_000];
+        assert_eq!(low_fps(&samples, 0.25), Some(100.0));
+        assert_eq!(low_fps(&samples, 0.0001), Some(100.0));
+    }
+
+    #[test]
+    fn timing_unavailable_fallback_reasons_are_exact() {
+        assert_eq!(
+            TimingUnavailable::NoMetalDevice.reason(),
+            "no Metal device is available; GPU and drawable timestamps cannot be captured"
+        );
+        assert_eq!(
+            TimingUnavailable::MissingGpuTimestamp.reason(),
+            "Metal command buffer completed without GPUStartTime/GPUEndTime timestamps"
+        );
+        assert_eq!(
+            TimingUnavailable::UnsupportedGpuTimestamp.reason(),
+            "the Metal device does not expose command-buffer GPU timestamps"
+        );
+        assert_eq!(
+            TimingUnavailable::NoDrawable.reason(),
+            "CAMetalLayer.nextDrawable returned no drawable (headless presentation); \
+             drawable presentedTime is unavailable"
+        );
+        assert_eq!(
+            TimingUnavailable::MissingPresentTimestamp.reason(),
+            "CAMetalLayer drawable reported presentedTime=0; no display presentation occurred"
+        );
+        assert_eq!(
+            TimingUnavailable::MissingInputTimestamp.reason(),
+            "no input-event timestamp was correlated with the measured frames"
+        );
+        assert_eq!(
+            TimingUnavailable::NoFrameTimeSamples.reason(),
+            "fewer than two real present or GPU-completion timestamps were recorded"
+        );
+    }
+
+    #[test]
+    fn gpu_timing_conversion_rejects_non_finite_and_pins_known_seconds() {
+        let clock = MediaClock::from_parts(Instant::now(), 100.0).expect("synthetic media clock");
+        assert_eq!(clock.seconds_to_ns(100.002), Some(2_000_000));
+        assert_eq!(clock.seconds_to_ns(100.0), Some(0));
+        assert_eq!(clock.seconds_to_ns(99.999), None);
+        assert_eq!(clock.seconds_to_ns(f64::NAN), None);
+        assert!(MediaClock::from_parts(Instant::now(), 0.0).is_none());
+
+        let sample = FrameSample::new(1, Some(100), 200, 260).with_gpu_timestamps(1_000, 2_500);
+        assert_eq!(sample.cpu_submit_ns(), Some(60));
+        assert_eq!(sample.gpu_time_ns(), Some(1_500));
+    }
+
+    #[test]
+    fn present_timestamp_correlation_rejects_missing_input_and_pins_exact_durations() {
+        let sample = FrameSample::new(7, Some(1_000), 1_100, 1_200)
+            .with_gpu_timestamps(1_400, 1_900)
+            .with_present_timestamp(1_500);
+        assert_eq!(sample.cpu_submit_ns(), Some(100));
+        assert_eq!(sample.gpu_time_ns(), Some(500));
+        assert_eq!(sample.input_to_present_ns(), Some(500));
+        assert_eq!(sample.input_to_gpu_completion_ns(), Some(900));
+        assert_eq!(sample.present_to_gpu_end_ns(), Some(400));
+        assert_eq!(sample.frame_marker_ns(), Some(1_500));
+
+        let without_present =
+            FrameSample::new(8, Some(1_000), 1_100, 1_200).with_gpu_timestamps(1_400, 1_900);
+        assert_eq!(without_present.input_to_present_ns(), None);
+        assert_eq!(without_present.frame_marker_ns(), Some(1_900));
+
+        let without_input = FrameSample::new(9, None, 1_100, 1_200)
+            .with_gpu_timestamps(1_400, 1_900)
+            .with_present_timestamp(1_500);
+        assert_eq!(without_input.input_to_present_ns(), None);
+        assert_eq!(without_input.input_to_gpu_completion_ns(), None);
+    }
+
+    #[test]
+    fn gpu_present_recorder_requires_real_samples_and_reports_exact_fallback() {
+        let summary = GpuPresentRecorder::new().summary();
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(
+            summary.gpu_unavailable,
+            Some(TimingUnavailable::MissingGpuTimestamp)
+        );
+        assert_eq!(
+            summary.present_unavailable,
+            Some(TimingUnavailable::MissingPresentTimestamp)
+        );
+        assert_eq!(summary.gpu_time, None);
+        assert_eq!(summary.frame_time, None);
+        let metrics = summary.to_json_metrics();
+        assert_eq!(
+            metrics["gpu_time_p50_us"]["available"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            metrics["gpu_time_p50_us"]["reason"],
+            serde_json::Value::String(TimingUnavailable::MissingGpuTimestamp.reason().to_string())
+        );
+
+        let mut unsupported = GpuPresentRecorder::new();
+        unsupported.mark_gpu_unavailable(TimingUnavailable::UnsupportedGpuTimestamp);
+        unsupported.mark_present_unavailable(TimingUnavailable::NoDrawable);
+        let summary = unsupported.summary();
+        assert_eq!(
+            summary.gpu_unavailable,
+            Some(TimingUnavailable::UnsupportedGpuTimestamp)
+        );
+        assert_eq!(
+            summary.present_unavailable,
+            Some(TimingUnavailable::NoDrawable)
+        );
+        let metrics = summary.to_json_metrics();
+        assert_eq!(
+            metrics["input_to_present_p50_us"]["reason"],
+            serde_json::Value::String(TimingUnavailable::NoDrawable.reason().to_string())
+        );
+    }
+
+    #[test]
+    fn gpu_present_summary_rejects_bookkeeping_and_pins_real_percentiles_and_lows() {
+        let mut recorder = GpuPresentRecorder::new();
+        recorder.record(
+            FrameSample::new(1, Some(500), 100, 200)
+                .with_gpu_timestamps(1_000, 2_000)
+                .with_present_timestamp(3_000)
+                .with_host_cpu_ns(50),
+        );
+        recorder.record(
+            FrameSample::new(2, Some(600), 300, 400)
+                .with_gpu_timestamps(5_000, 9_000)
+                .with_present_timestamp(7_000)
+                .with_host_cpu_ns(60),
+        );
+        recorder.record(
+            FrameSample::new(3, Some(700), 500, 600)
+                .with_gpu_timestamps(10_000, 11_000)
+                .with_present_timestamp(12_000)
+                .with_host_cpu_ns(70),
+        );
+        let summary = recorder.summary();
+        assert_eq!(summary.sample_count, 3);
+        assert_eq!(summary.gpu_sample_count, 3);
+        assert_eq!(summary.present_sample_count, 3);
+        assert_eq!(summary.frame_time.expect("frame time").p50_ns, 4_000);
+        assert_eq!(summary.gpu_time.expect("gpu time").p50_ns, 1_000);
+        assert_eq!(summary.gpu_time.expect("gpu time").p99_ns, 4_000);
+        assert_eq!(summary.cpu_submit.expect("submit").p50_ns, 100);
+        assert_eq!(
+            summary.input_to_present.expect("input->present").p50_ns,
+            6_400
+        );
+        assert_eq!(
+            summary
+                .input_to_gpu_completion
+                .expect("input->gpu end")
+                .p99_ns,
+            10_300
+        );
+        assert_eq!(summary.host_cpu_time.expect("host cpu").p50_ns, 60);
+        assert_eq!(summary.frame_time_1pct_low_fps, Some(200_000.0));
+        assert_eq!(summary.frame_time_0p1pct_low_fps, Some(200_000.0));
+        assert_eq!(summary.gpu_idle_gap_us, Some(1.0));
+
+        let metrics = summary.to_json_metrics();
+        assert_eq!(metrics["gpu_frame_time_p50_us"]["value"], 4.0);
+        assert_eq!(metrics["gpu_time_p99_us"]["value"], 4.0);
+        assert_eq!(metrics["cpu_submit_p50_us"]["value"], 0.1);
+        assert_eq!(metrics["input_to_present_p50_us"]["value"], 6.4);
+        assert_eq!(metrics["input_to_present_p99_us"]["value"], 11.3);
+        assert_eq!(metrics["input_to_gpu_completion_p99_us"]["value"], 10.3);
+        assert_eq!(metrics["host_cpu_time_p50_us"]["value"], 0.06);
+        assert_eq!(metrics["gpu_idle_gap_us"]["value"], 1.0);
+    }
+
+    #[test]
+    fn gpu_present_recorder_reports_missing_input_shader_and_guest_metrics_exactly() {
+        let mut recorder = GpuPresentRecorder::new();
+        recorder.record(
+            FrameSample::new(1, None, 100, 200)
+                .with_gpu_timestamps(1_000, 2_000)
+                .with_present_timestamp(2_500),
+        );
+        let summary = recorder.summary();
+        assert_eq!(
+            summary.input_to_present_unavailable,
+            Some(TimingUnavailable::MissingInputTimestamp)
+        );
+        assert_eq!(
+            summary.shader_compile_unavailable,
+            Some(TimingUnavailable::NoShaderCompileSamples)
+        );
+        assert_eq!(
+            summary.guest_work_unavailable,
+            Some(TimingUnavailable::NoGuestWork)
+        );
+        let metrics = summary.to_json_metrics();
+        assert_eq!(
+            metrics["input_to_present_p50_us"]["reason"],
+            serde_json::Value::String(
+                TimingUnavailable::MissingInputTimestamp
+                    .reason()
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            metrics["shader_compile_stall_rate_measured"]["reason"],
+            serde_json::Value::String(
+                TimingUnavailable::NoShaderCompileSamples
+                    .reason()
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            metrics["guest_instructions_per_sec"]["reason"],
+            serde_json::Value::String(TimingUnavailable::NoGuestWork.reason().to_string())
+        );
+
+        recorder.record_shader_compile(false);
+        recorder.record_shader_compile(true);
+        recorder.record_guest_work(1_000, 2_000_000);
+        let summary = recorder.summary();
+        assert_eq!(summary.shader_compile_requests, 2);
+        assert_eq!(summary.shader_compile_stalls, 1);
+        assert_eq!(summary.shader_compile_stall_rate, Some(0.5));
+        assert_eq!(summary.guest_instructions_per_sec, Some(500_000.0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn measure_gpu_present_rejects_zero_frames_with_exact_error() {
+        assert_eq!(
+            measure_gpu_present(0).expect_err("zero frames must be rejected"),
+            "GPU present measurement needs at least one frame"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn measure_gpu_present_captures_real_timestamps_or_exact_fallback() {
+        match measure_gpu_present(4) {
+            Ok(summary) => {
+                if summary.gpu_sample_count > 0 {
+                    let gpu = summary
+                        .gpu_time
+                        .expect("real GPU timestamps produce GPU time");
+                    assert_eq!(gpu.sample_count, summary.gpu_sample_count);
+                    assert_eq!(gpu.p50_ns > 0, true);
+                } else {
+                    assert_eq!(
+                        summary.gpu_unavailable,
+                        Some(TimingUnavailable::MissingGpuTimestamp)
+                    );
+                }
+                if summary.present_sample_count == 0 {
+                    let reason = summary
+                        .present_unavailable
+                        .expect("missing presentation must carry a reason");
+                    assert!(
+                        matches!(
+                            reason,
+                            TimingUnavailable::NoDrawable
+                                | TimingUnavailable::MissingPresentTimestamp
+                        ),
+                        "unexpected presentation fallback: {reason:?}"
+                    );
+                }
+            }
+            Err(error) => assert_eq!(error, TimingUnavailable::NoMetalDevice.reason()),
+        }
     }
 }

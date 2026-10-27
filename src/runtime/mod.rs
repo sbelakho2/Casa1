@@ -7,6 +7,10 @@ pub(crate) use self::state::*;
 mod loader;
 mod thread;
 pub(crate) use self::thread::*;
+mod thread_context;
+pub(crate) use self::thread_context::*;
+mod shared;
+pub(crate) use self::shared::*;
 pub mod handle_table;
 pub mod object_manager;
 pub(crate) mod process;
@@ -1680,6 +1684,14 @@ pub struct PeExecutionOptions {
     /// exactly like the Windows thread-start semantics.  `None` for every
     /// ordinary run.
     pub thread_start: Option<(u64, u64)>,
+    /// Scheduler mode requested by the caller.  `None` keeps the deterministic
+    /// cooperative scheduler (byte-identical single-host-thread execution);
+    /// `Some(workers)` runs ready guest threads concurrently on a bounded pool
+    /// of native host workers (real parallel JIT slice execution, with host
+    /// thunks and process-wide subsystems serialized through
+    /// `ProcessShared`).  `CASA1_SCHEDULER` / `CASA1_SCHEDULER_WORKERS` remain
+    /// as a host-environment override when this is `None`.
+    pub scheduler_workers: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -7307,6 +7319,16 @@ pub fn execute_with_options(
         load_trace_categories(env),
     );
     runtime.jit_mode = options.jit_mode.unwrap_or(crate::runner::JitMode::Auto);
+    if let Some(workers) = options.scheduler_workers
+        && !runtime.set_scheduler_mode(SchedulerMode::Production {
+            workers: workers.max(1),
+        })
+    {
+        return Err(AppError::new(
+            ReasonCode::RcUnimplInsn,
+            "cannot select the concurrent scheduler while guest waits are parked",
+        ));
+    }
     runtime.set_guest_arch(guest_arch);
     runtime.process_environment = env.clone();
     for observer in options.observers {

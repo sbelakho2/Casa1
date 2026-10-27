@@ -77,7 +77,9 @@ def run_case(
     baseline_entries: dict,
     estimate_docs: dict[str, dict],
     kpi_metrics: dict[str, dict],
-) -> tuple[int, str]:
+    thresholds: dict | None = None,
+    report: bool = False,
+) -> tuple[int, str, dict | None]:
     with tempfile.TemporaryDirectory(prefix=f"casa1-perf-{name}-") as directory:
         root = Path(directory)
         estimate_root = root / "criterion"
@@ -91,24 +93,31 @@ def run_case(
         kpi_path.write_text(
             json.dumps({"schema": 1, "metrics": kpi_metrics}), encoding="utf-8"
         )
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(GATE),
-                "--estimates-dir",
-                str(estimate_root),
-                "--kpi-file",
-                str(kpi_path),
-                "--baseline",
-                str(baseline_path),
-                "--filter",
-                FILTER,
-                "--no-run",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        return completed.returncode, completed.stdout + completed.stderr
+        command = [
+            sys.executable,
+            str(GATE),
+            "--estimates-dir",
+            str(estimate_root),
+            "--kpi-file",
+            str(kpi_path),
+            "--baseline",
+            str(baseline_path),
+            "--filter",
+            FILTER,
+            "--no-run",
+        ]
+        if thresholds is not None:
+            threshold_path = root / "thresholds.json"
+            threshold_path.write_text(json.dumps(thresholds), encoding="utf-8")
+            command.extend(["--thresholds", str(threshold_path)])
+        report_path = root / "report.json"
+        if report:
+            command.extend(["--report-json", str(report_path)])
+        completed = subprocess.run(command, capture_output=True, text=True)
+        report_doc = None
+        if report and report_path.is_file():
+            report_doc = json.loads(report_path.read_text(encoding="utf-8"))
+        return completed.returncode, completed.stdout + completed.stderr, report_doc
 
 
 CASES: list[tuple[str, int, str]] = []
@@ -121,7 +130,7 @@ def check(name: str, expected_code: int, expected_text: str) -> None:
 def main() -> int:
     benchmark = "gate/kpi/synthetic"
 
-    code, output = run_case(
+    code, output, _ = run_case(
         "pass",
         {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
         {benchmark: estimates(1000.0, 980.0, 1020.0)},
@@ -132,7 +141,7 @@ def main() -> int:
     assert "RESULT PASS benchmarks=1" in output, output
     check("pass", code, "PASS gate/kpi/synthetic")
 
-    code, output = run_case(
+    code, output, _ = run_case(
         "regression",
         {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
         {benchmark: estimates(1300.0, 1260.0, 1340.0)},
@@ -143,7 +152,7 @@ def main() -> int:
     assert "RESULT FAIL regressions=1 missing=0 mismatches=0" in output, output
     check("regression", code, "REGRESSION gate/kpi/synthetic")
 
-    code, output = run_case(
+    code, output, _ = run_case(
         "threshold-edge",
         {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
         {benchmark: estimates(1150.0, 1100.0, 1200.0)},
@@ -154,7 +163,7 @@ def main() -> int:
     assert "threshold edge" in output, output
     check("threshold_edge", code, "THRESHOLD_EDGE gate/kpi/synthetic")
 
-    code, output = run_case(
+    code, output, _ = run_case(
         "ci-overlap",
         {benchmark: timing_entry(1000.0, 900.0, 1100.0)},
         {benchmark: estimates(1300.0, 1050.0, 1500.0)},
@@ -165,7 +174,7 @@ def main() -> int:
     assert "confidence intervals overlap" in output, output
     check("ci_overlap", code, "CI_OVERLAP gate/kpi/synthetic")
 
-    code, output = run_case(
+    code, output, _ = run_case(
         "missing-benchmark",
         {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
         {},
@@ -177,7 +186,7 @@ def main() -> int:
     check("missing_benchmark", code, "MISSING_BENCHMARK gate/kpi/synthetic")
 
     metric = "kpi/synthetic_metric"
-    code, output = run_case(
+    code, output, _ = run_case(
         "kpi-regression",
         {metric: kpi_entry(0.10)},
         {},
@@ -187,7 +196,7 @@ def main() -> int:
     assert f"REGRESSION {metric}" in output, output
     check("kpi-regression", code, f"REGRESSION {metric}")
 
-    code, output = run_case(
+    code, output, _ = run_case(
         "kpi-unavailable",
         {"kpi/synthetic_unavailable": kpi_entry(0.0, available=False)},
         {},
@@ -200,7 +209,7 @@ def main() -> int:
     latency = "kpi/frame_latency_p50_us"
     absolute = dict(kpi_entry(1000.0))
     absolute["absolute_max"] = 2000.0
-    code, output = run_case(
+    code, output, _ = run_case(
         "absolute-target",
         {latency: absolute},
         {},
@@ -210,7 +219,50 @@ def main() -> int:
     assert f"TARGET_EXCEEDED {latency}" in output, output
     check("absolute-target", code, f"TARGET_EXCEEDED {latency}")
 
-    print("SELFTEST PASS cases=8")
+    pending = "kpi/synthetic_metric"
+    code, output, _ = run_case(
+        "kpi-baseline-pending",
+        {pending: kpi_entry(0.0, available=False)},
+        {},
+        {
+            "synthetic_metric": {
+                "available": True,
+                "value": 0.10,
+                "unit": "ratio",
+                "direction": "lower",
+            }
+        },
+    )
+    assert code == 0, (code, output)
+    assert f"BASELINE_PENDING {pending}" in output, output
+    assert "run --update to gate this metric" in output, output
+    check("kpi-baseline-pending", code, f"BASELINE_PENDING {pending}")
+
+    code, output, _ = run_case(
+        "threshold-override",
+        {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
+        {benchmark: estimates(1300.0, 1260.0, 1340.0)},
+        {},
+        thresholds={"timing": {benchmark: {"rel": 10.0, "abs": 0.0}}},
+    )
+    assert code == 0, (code, output)
+    assert f"PASS {benchmark}" in output, output
+    check("threshold-override", code, f"PASS {benchmark}")
+
+    code, output, report = run_case(
+        "report-json",
+        {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
+        {benchmark: estimates(1000.0, 980.0, 1020.0)},
+        {},
+        report=True,
+    )
+    assert code == 0, (code, output)
+    assert report is not None, output
+    assert report["result"] == "pass", report
+    assert report["entries"][0]["status"] == "PASS", report
+    check("report-json", code, "report.json result=pass")
+
+    print("SELFTEST PASS cases=11")
     for name, code, text in CASES:
         print(f"SELFTEST {name} exit={code} message={text}")
     return 0

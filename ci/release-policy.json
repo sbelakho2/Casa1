@@ -4,7 +4,8 @@
   "protected_branches": {
     "main": {
       "required_status_checks": [
-        "CI Gate"
+        "CI Gate",
+        "Windows Oracle"
       ],
       "strict": true,
       "enforce_admins": true,
@@ -52,6 +53,16 @@
         "audit-release-entitlements",
         "check-release-gate",
         "release-gate"
+      ]
+    },
+    ".github/workflows/windows-oracle.yml": {
+      "aggregate_job": "oracle-gate",
+      "aggregate_name": "Windows Oracle",
+      "required_jobs": [
+        "generate-corpus",
+        "reference-capture",
+        "compare",
+        "oracle-gate"
       ]
     }
   },
@@ -106,7 +117,28 @@
       "git branch -D",
       "git reset --hard",
       "--no-verify"
-    ]
+    ],
+    "windows_oracle": {
+      "workflow": ".github/workflows/windows-oracle.yml",
+      "source": "windows_reference/src/win32.rs",
+      "build_command": "cargo build --manifest-path windows_reference/Cargo.toml --release",
+      "required_categories": [
+        "crt_printf",
+        "string_ops"
+      ],
+      "symbols": [
+        {
+          "symbol": "snprintf",
+          "library": "legacy_stdio_definitions",
+          "category": "crt_printf"
+        },
+        {
+          "symbol": "CharUpperW",
+          "library": "user32",
+          "category": "string_ops"
+        }
+      ]
+    }
   },
   "manual_github_settings": [
     "Repository Settings > General: disable 'Allow force pushes' and 'Allow deletions' for main.",

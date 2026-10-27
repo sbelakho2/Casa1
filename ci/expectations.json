@@ -972,6 +972,11 @@
   "( error.message, \"CAMetalLayer present: empty copy region (source 8x8, drawable 0x0)\" )",
   "( error.message, \"CAMetalLayer present: 4x4 pixels need 64 bytes, got 4 (drawable 8x8)\" )"
  ],
+ "cametal_layer_timing_probe_rejects_fabricated_timing_when_present_is_absent": [
+  "(probe.submitted_seconds.is_some(), true)",
+  "(probe.gpu.is_some(), true)",
+  "(probe.drawable.is_some(), true)"
+ ],
  "cametal_region_validation_rejects_empty_and_short_regions_with_exact_errors": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
   "( error.message, \"CAMetalLayer present: empty copy region (source 8x8, drawable 0x0)\" )",
@@ -1490,6 +1495,9 @@
   "(pool.available_count(), 1)",
   "(error.code, ReasonCode::RcD3dInvalidState)"
  ],
+ "command_buffer_gpu_timestamp_fallback_is_exact_before_submission": [
+  "( command_buffer_gpu_timestamps(command_buffer), GpuTimestampReading::MissingTimestamp { status: \"NotEnqueued\" } )"
+ ],
  "commit_and_decommit_boundaries_are_exact": [
   "( manager.commit(base, PAGE_SIZE, Protection(0x80)), Err(STATUS_INVALID_PAGE_PROTECTION) )",
   "( manager.commit(base, 0, Protection::READWRITE), Err(STATUS_INVALID_PARAMETER) )",
@@ -1563,6 +1571,10 @@
   "(wakes.load(Ordering::SeqCst), WAITERS)",
   "(statistics.wait_count, WAITERS as u64)",
   "(statistics.timeout_count, 0)"
+ ],
+ "concurrent_unaligned_atomic_rmw_across_words_is_exact": [
+  "( read_u32_guest(&session, SLICE_COUNTER_A + 7), (WORKERS * PER_WORKER) as u32, \"an unaligned word-crossing atomic RMW must never lose an update\" )",
+  "( read_u32_guest(&session, SLICE_COUNTER_A), 0, \"the RMW must preserve the bytes outside the 4-byte operand\" )"
  ],
  "concurrent_views_above_four_gib_never_observe_torn_values": [
   "( observed >= last, true, \"the image view moved backwards: {observed} < {last}\" )",
@@ -2228,6 +2240,30 @@
   "(runtime.iosurface_present_count(), 0)",
   "(runtime.surface_writes(), 0)",
   "(&frame.bytes[..pixels.len()], &pixels)"
+ ],
+ "d3d12_present_timing_correlation_rejects_out_of_order_and_pins_known_samples": [
+  "(timing.gpu_time_ns(), Some(2_000_000))",
+  "(timing.input_to_present_ns(), Some(3_000_000))",
+  "(timing.input_to_gpu_completion_ns(), Some(4_000_000))",
+  "(timing.gpu_unavailable(), None)",
+  "(timing.present_unavailable(), None)",
+  "(reversed.gpu_time_ns(), None)"
+ ],
+ "d3d12_present_timing_missing_timestamps_report_exact_fallback": [
+  "( missing_present.present_unavailable(), Some(crate::perf::TimingUnavailable::NoDrawable) )",
+  "(missing_present.input_to_present_ns(), None)",
+  "( zero_present.present_unavailable(), Some(crate::perf::TimingUnavailable::MissingPresentTimestamp) )",
+  "( zero_present.present_unavailable().expect(\"reason\").reason(), \"CAMetalLayer drawable reported presentedTime=0; no display presentation occurred\" )",
+  "( unsupported.gpu_unavailable(), Some(crate::perf::TimingUnavailable::UnsupportedGpuTimestamp) )",
+  "(unsupported.gpu_time_ns(), None)"
+ ],
+ "d3d12_present_timing_request_is_cleared_by_invalid_present_without_stale_state": [
+  "(runtime.pending_present_input_seconds.is_some(), true)",
+  "(error.code, ReasonCode::RcD3dInvalidState)",
+  "(error.message, \"unknown swapchain 9999\")",
+  "(runtime.present_timing_requested, false)",
+  "(runtime.present_timing_requested, true)",
+  "(crate::metal_backend::present_timing_enabled(), false)"
  ],
  "d3d12_ray_procedural_intersection_accepts_and_rejects": [
   "(results[0].hit_kind, 0xFF)",
@@ -3564,6 +3600,9 @@
   "(submission.draw_calls, 1)",
   "(submission.backend_plan.render_passes.len(), 1)",
   "(submission.backend_plan.render_passes[0].draw_calls, 1)"
+ ],
+ "drawable_presented_timestamp_before_presentation_is_missing_exact": [
+  "( drawable_presented_timestamp(drawable), PresentTimestampReading::MissingTimestamp )"
  ],
  "driver_image_helpers_reject_malformed_layouts_and_paths": [
   "( pe_image_arch(&short), Err(\"driver island requires a PE image\".to_string()) )",
@@ -5033,6 +5072,44 @@
   "(result, 0)",
   "(runtime.last_error, ERROR_INVALID_PARAMETER)"
  ],
+ "gpu_present_recorder_reports_missing_input_shader_and_guest_metrics_exactly": [
+  "( summary.input_to_present_unavailable, Some(TimingUnavailable::MissingInputTimestamp) )",
+  "( summary.shader_compile_unavailable, Some(TimingUnavailable::NoShaderCompileSamples) )",
+  "( summary.guest_work_unavailable, Some(TimingUnavailable::NoGuestWork) )",
+  "( metrics[\"input_to_present_p50_us\"][\"reason\"], serde_json::Value::String( TimingUnavailable::MissingInputTimestamp .reason() .to_string() ) )",
+  "( metrics[\"shader_compile_stall_rate_measured\"][\"reason\"], serde_json::Value::String( TimingUnavailable::NoShaderCompileSamples .reason() .to_string() ) )",
+  "( metrics[\"guest_instructions_per_sec\"][\"reason\"], serde_json::Value::String(TimingUnavailable::NoGuestWork.reason().to_string()) )"
+ ],
+ "gpu_present_recorder_requires_real_samples_and_reports_exact_fallback": [
+  "(summary.sample_count, 0)",
+  "( summary.gpu_unavailable, Some(TimingUnavailable::MissingGpuTimestamp) )",
+  "( summary.present_unavailable, Some(TimingUnavailable::MissingPresentTimestamp) )",
+  "(summary.gpu_time, None)",
+  "(summary.frame_time, None)",
+  "( metrics[\"gpu_time_p50_us\"][\"available\"], serde_json::Value::Bool(false) )"
+ ],
+ "gpu_present_summary_rejects_bookkeeping_and_pins_real_percentiles_and_lows": [
+  "(summary.sample_count, 3)",
+  "(summary.gpu_sample_count, 3)",
+  "(summary.present_sample_count, 3)",
+  "(summary.frame_time.expect(\"frame time\").p50_ns, 4_000)",
+  "(summary.gpu_time.expect(\"gpu time\").p50_ns, 1_000)",
+  "(summary.gpu_time.expect(\"gpu time\").p99_ns, 4_000)"
+ ],
+ "gpu_timing_conversion_rejects_non_finite_and_pins_known_seconds": [
+  "(clock.seconds_to_ns(100.002), Some(2_000_000))",
+  "(clock.seconds_to_ns(100.0), Some(0))",
+  "(clock.seconds_to_ns(99.999), None)",
+  "(clock.seconds_to_ns(f64::NAN), None)",
+  "(sample.cpu_submit_ns(), Some(60))",
+  "(sample.gpu_time_ns(), Some(1_500))"
+ ],
+ "gpu_timing_probe_missing_snapshot_is_none_and_known_reading_is_exact": [
+  "( probe.snapshot(), Some(GpuTimestampReading::Measured { start_seconds: 1.0, end_seconds: 1.002 }) )",
+  "(GpuTimingProbe::default().snapshot(), None)",
+  "( drawable.snapshot(), Some(PresentTimestampReading::Measured { presented_seconds: 3.0 }) )",
+  "(DrawableTimingProbe::default().snapshot(), None)"
+ ],
  "gpu_va_vidmm_paging_dispatch_pins_contracts_on_x86_and_x64": [
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTMapGpuVirtualAddress, &[map] ), 0 )",
   "(load_u64(&memory, map + MAPGPUVA_OUT), va)",
@@ -5593,6 +5670,20 @@
   "(monitor.check_access(tcb, &descriptor, GENERIC_READ), Ok(()))",
   "( monitor.check_access(token_for_impersonation, &descriptor, GENERIC_WRITE), Err(STATUS_ACCESS_DENIED) )",
   "( monitor.check_access(token_for_impersonation, &descriptor, GENERIC_READ), Ok(()) )"
+ ],
+ "interface_gate_rejects_missing_method_rows": [
+  "( violations.len(), 1, \"a known interface without method rows must fail once\" )",
+  "( violations[0].kind, ApiGateViolationKind::InterfaceMethodRowsMissing )"
+ ],
+ "interface_gate_rejects_overstated_aggregate_status": [
+  "(aggregate.implementation, ImplementationLevel::Stub)",
+  "(aggregate.semantic_fidelity, SemanticFidelity::CannedFailure)",
+  "(aggregate.subsystem_capability, SubsystemCapability::Absent)",
+  "( violations.len(), 2, \"both fidelity and capability overstatement must be reported\" )"
+ ],
+ "interface_gate_rejects_unknown_interface_method_rows": [
+  "(violations.len(), 1, \"an unknown interface must fail once\")",
+  "(violations[0].kind, ApiGateViolationKind::InterfaceUnknown)"
  ],
  "interior_commit_of_a_reservation": [
   "(reservation, 0x7400_0000)",
@@ -6969,6 +7060,12 @@
   "( session.detached_real_dll_count(), 1, \"the host-backed state is parked in the detach-only list\" )",
   "( session.pending_dll_main_calls(), vec![(handle, 0x1000, 1), (handle, 0x1000, 0)], \"the load queued ATTACH; the last unload appends DllMain(DLL_PROCESS_DETACH)\" )"
  ],
+ "ledger_counts_include_method_level_deviations_without_error": [
+  "(method_count, 810)",
+  "(ledger.contains(\"Method-level accounting:\"), true)",
+  "( ledger.contains(&format!( \"{method_count} method rows, {method_count} deviate from exact/full\" )), true, \"the generated ledger must count every method-level deviation\" )",
+  "(report.gate.method_deviations, method_count)"
+ ],
  "legacy_sync_entry_points_never_leave_stale_or_duplicate_state": [
   "(runtime.synced_page_count(), 2)",
   "(runtime.synced_page_count(), 3)",
@@ -7029,6 +7126,14 @@
   "( dispatch_x86_thunk(&mut runtime, &mut memory, local_free, &[handle as u32]), 0 )",
   "(handle, 0)"
  ],
+ "lock_xadd_native_helper_boundary_mapped_add_and_unmapped_fault_are_exact": [
+  "( state.get(Register::Rcx), 0, \"xadd returns the original value\" )",
+  "( memory.read_u32(0x10_100).expect(\"counter mapped\"), 3, \"xadd adds the source into the memory operand\" )",
+  "(state.jit_pending_fault, None)",
+  "( state.jit_pending_fault, Some(unmapped), \"an unmapped xadd must report the precise faulting address\" )",
+  "(state.jit_pending_fault_write, true)",
+  "( state.get(Register::Rcx), 7, \"a faulted xadd must not modify the source register\" )"
+ ],
  "lookaside_depth_limit_releases_memory": [
   "(list.held_bytes(), 32)",
   "(list.free_depth(), 1)",
@@ -7074,6 +7179,12 @@
  ],
  "loopback_is_rejected_on_a_capture_endpoint": [
   "( plan_initialize( pid, object, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 100_000, 0, &format, ), Err(AUDCLNT_E_WRONG_ENDPOINT_TYPE), \"loopback on a true capture endpoint is the wrong endpoint type\" )"
+ ],
+ "low_fps_rejects_empty_and_pins_worst_outlier_average": [
+  "(low_fps(&[], 0.01), None)",
+  "(low_fps(&[0, 0], 0.01), None)",
+  "(low_fps(&samples, 0.25), Some(100.0))",
+  "(low_fps(&samples, 0.0001), Some(100.0))"
  ],
  "lrn_mvn_edge_nan_and_invalid_axes": [
   "( run_cpu(&lrn, &[&values]) .iter() .copied() .map(rounded) .collect::<Vec<_>>(), vec![5000, 4000, 3000] )",
@@ -7220,6 +7331,15 @@
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::IoFreeMdl, &[mdl], ), STATUS_INVALID_DEVICE_STATE )",
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::MmUnlockPages, &[mdl], ), STATUS_SUCCESS )",
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::MmUnlockPages, &[mdl], ), STATUS_INVALID_DEVICE_STATE )"
+ ],
+ "measure_gpu_present_captures_real_timestamps_or_exact_fallback": [
+  "(gpu.sample_count, summary.gpu_sample_count)",
+  "(gpu.p50_ns > 0, true)",
+  "( summary.gpu_unavailable, Some(TimingUnavailable::MissingGpuTimestamp) )",
+  "(error, TimingUnavailable::NoMetalDevice.reason())"
+ ],
+ "measure_gpu_present_rejects_zero_frames_with_exact_error": [
+  "( measure_gpu_present(0).expect_err(\"zero frames must be rejected\"), \"GPU present measurement needs at least one frame\" )"
  ],
  "media_foundation_objects_and_byte_stream": [
   "( call(&mut session, HostThunk::MfStartup, &[0x0007_0000, 0]), 0 )",
@@ -7530,6 +7650,22 @@
   "( temporal_device.message, \"MetalFX temporal scaling is not supported by this Metal device\" )",
   "(temporal.code, ReasonCode::RcUnsupportedPlatformApi)",
   "( temporal.message, \"MetalFX temporal: reactive masks require macOS 14.4 \\ (setReactiveMaskTextureEnabled: is unavailable)\" )"
+ ],
+ "method_level_deviations_are_counted_without_report_errors": [
+  "(summary.method_total, 5)",
+  "(summary.method_exact, 1)",
+  "(summary.method_restricted, 1)",
+  "(summary.method_approximate, 1)",
+  "(summary.method_synthetic_environment, 1)",
+  "(summary.method_canned_failure, 1)"
+ ],
+ "method_level_rows_missing_proof_seed_restricted_not_exact": [
+  "(create_buffer.method, \"CreateBuffer\")",
+  "( create_buffer.implementation, ImplementationLevel::Partial, \"a dispatched method without method-level proof is not Implemented-exact\" )",
+  "( create_buffer.semantic_fidelity, SemanticFidelity::Restricted, \"methods without proof never seed Exact\" )",
+  "( create_buffer.subsystem_capability, SubsystemCapability::Partial, \"methods without proof never seed Full\" )",
+  "( create_buffer.semantic_test_coverage, CoverageLevel::None, \"no method-level evidence exists yet\" )",
+  "(aggregate.method_count, 43)"
  ],
  "mf_begin_get_event_cancel_prevents_callback": [
   "( begin_get_event(&mut runtime, &mut memory, graph.source, MF_CB_OBJECT), u64::from(0x8000_000A_u32) )",
@@ -8379,6 +8515,12 @@
   "( object_type_index(crate::win32::ObjectType::DirectorySearch), 3 )",
   "( unique.len(), distinct.len(), \"no two distinct kernel types may share an index\" )"
  ],
+ "old_report_json_missing_method_fields_still_deserializes": [
+  "(report.method_registry.len(), 0)",
+  "(report.gate.interface_violation_count, 0)",
+  "(report.gate.method_deviations, 0)",
+  "( report .per_dll .get(\"kernel32.dll\") .expect(\"per-DLL summary\") .method_total, 0 )"
+ ],
  "ole32_ole_initialize_uninitialize_dispatch": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, init, &[0, 0]), 0, \"OleInitialize returns S_OK\" )",
   "( dispatch_x86_thunk(&mut runtime, &mut memory, uninit, &[0]), 0, \"OleUninitialize returns S_OK\" )"
@@ -8665,6 +8807,22 @@
   "(recycled_pipe, pipe, \"closed pipe value is recycled FIFO\")",
   "(err.code, ReasonCode::RcWin32InvalidHandle)",
   "( win32 .wait_for_single_object(event, 0, false, None) .expect(\"wait\"), WaitStatus::Timeout, \"original event must not be signaled by the stale completion\" )"
+ ],
+ "percentile_ns_rejects_empty_and_pins_single_outlier_boundaries": [
+  "(percentile_ns(&[], 0.50), None)",
+  "(percentile_ns(&[7], 0.0), Some(7))",
+  "(percentile_ns(&[7], 0.50), Some(7))",
+  "(percentile_ns(&[7], 0.999), Some(7))",
+  "(percentile_ns(&[7], 1.0), Some(7))",
+  "(percentile_ns(&sorted, 0.50), Some(2))"
+ ],
+ "percentile_stats_from_ns_rejects_empty_and_pins_outlier_percentiles": [
+  "(PercentileStats::from_ns(&[]), None)",
+  "(stats.sample_count, 5)",
+  "(stats.p50_ns, 3)",
+  "(stats.p95_ns, 1000)",
+  "(stats.p99_ns, 1000)",
+  "(stats.p999_ns, 1000)"
  ],
  "performance_information_derives_counts_and_rejects_a_short_buffer": [
   "(bytes.len(), SYSTEM_PERFORMANCE_INFORMATION_SIZE)",
@@ -9119,6 +9277,17 @@
   "( present_texture_to_layer(&texture, &bare_layer).expect(\"bare layer fallback\"), false, \"a layer with no device must not hand out a drawable\" )",
   "( present_texture_to_layer(&texture, swapchain.layer()).expect(\"clamped present\"), true, \"an 8x8 source must blit into a 4x2 drawable region\" )"
  ],
+ "present_timestamp_correlation_rejects_missing_input_and_pins_exact_durations": [
+  "(sample.cpu_submit_ns(), Some(100))",
+  "(sample.gpu_time_ns(), Some(500))",
+  "(sample.input_to_present_ns(), Some(500))",
+  "(sample.input_to_gpu_completion_ns(), Some(900))",
+  "(sample.present_to_gpu_end_ns(), Some(400))",
+  "(sample.frame_marker_ns(), Some(1_500))"
+ ],
+ "present_timing_disabled_capture_is_none_and_enabled_take_clears_stale_probe": [
+  "(taken.submitted_seconds, Some(2.0))"
+ ],
  "probe_cpu_model_absence_edge_not_fabricated": [
   "( identity.is_absent(\"machdep.cpu.model\"), identity.cpu.model.is_none() )"
  ],
@@ -9237,6 +9406,31 @@
   "(run_wait_job(job).reason, WaitWakeReason::PortTimedOut)",
   "(after.deadline_wakeups, before.deadline_wakeups)"
  ],
+ "production_concurrent_contexts_isolate_tls_and_last_error": [
+  "( by_thread[&0xE21].last_error, 0x1111, \"thread A's last error must stay private to thread A\" )",
+  "( by_thread[&0xE22].last_error, 0x2222, \"thread B's last error must stay private to thread B\" )",
+  "(by_thread[&0xE21].tls_slots.get(&3), Some(&0xAA00))",
+  "(by_thread[&0xE22].tls_slots.get(&3), Some(&0xBB00))",
+  "(by_thread[&0xE21].teb_base, TEB_A)",
+  "(by_thread[&0xE22].teb_base, TEB_B)"
+ ],
+ "production_concurrent_lock_xadd_shared_counter_is_exact": [
+  "(snapshots.len(), 2, \"both guest threads must report\")",
+  "( read_u32_guest(&session, SLICE_COUNTER_A), ITERATIONS * 2, \"two threads atomically incrementing one shared counter must produce the exact total\" )",
+  "( snapshots .iter() .filter(|snapshot| snapshot.state.rip == 0) .count(), 2, \"both loops must reach the guest return with RIP 0\" )",
+  "( after.worker_overlaps, before.worker_overlaps, \"the two slices must genuinely overlap on two host workers\" )"
+ ],
+ "production_concurrent_smc_code_writes_invalidate_both_blocks": [
+  "(runs.len(), 2)",
+  "( writes .iter() .filter(|(address, length)| { (*address == SLICE_CODE || *address == SLICE_CODE_2) && *length == 4 }) .count(), writes.len(), \"every recorded concurrent code write must be an exact 4-byte store on a code page\" )",
+  "assert!(jit.slice_block(SLICE_CODE)",
+  "assert!(jit.slice_block(SLICE_CODE_2)"
+ ],
+ "production_concurrent_thread_start_and_exit_race_has_exact_totals": [
+  "( snapshots .iter() .filter(|snapshot| snapshot.state.rip == 0) .count(), 2, \"both starting threads must exit cleanly in the same round\" )",
+  "(read_u32_guest(&session, SLICE_COUNTER_A), ITERATIONS * 2)",
+  "(read_u32_guest(&session, SLICE_COUNTER_B), ITERATIONS * 2)"
+ ],
  "production_contention_stress_has_exact_completion_invariants": [
   "(job_ids.len(), JOBS)",
   "( completion.reason, WaitWakeReason::ObjectSignaled, \"every job must observe its real wake, not a timeout\" )",
@@ -9248,6 +9442,11 @@
   "(session.runtime.production_waits.len(), 0)",
   "(after.poll_iterations, before.poll_iterations)",
   "(after.deadline_wakeups, before.deadline_wakeups)"
+ ],
+ "production_eight_concurrent_guest_threads_never_deadlock_and_count_exactly": [
+  "(snapshots.len(), THREADS as usize)",
+  "( read_u32_guest(&session, SLICE_COUNTER_A), ITERATIONS * THREADS, \"eight concurrent guest threads must produce the exact shared total\" )",
+  "( snapshots .iter() .filter(|snapshot| snapshot.state.rip == 0) .count(), THREADS as usize, \"every guest thread must finish (no deadlock)\" )"
  ],
  "production_event_wait_wakes_with_latency_bound_and_zero_idle_polls_no_busy_wait": [
   "( session.runtime.production_waits.len(), 1, \"the wait is owned by a native production job\" )",
@@ -9286,6 +9485,11 @@
   "(session.runtime.production_waits.len(), 0)",
   "( after.completion_port_wakeups, before.completion_port_wakeups, \"a closed port is not a packet handoff\" )",
   "( after.poll_iterations, before.poll_iterations, \"close wakeup is event-driven\" )"
+ ],
+ "production_process_gate_concurrent_operations_are_serialized": [
+  "( completed.load(std::sync::atomic::Ordering::SeqCst), 2_000, \"every process operation must complete exactly once\" )",
+  "( peak.load(std::sync::atomic::Ordering::SeqCst), 1, \"two guest threads must never hold the process gate concurrently\" )",
+  "( shared.process_operations(), 2_000, \"the process gate must account for every operation\" )"
  ],
  "production_pump_driven_completion_port_wake_is_event_driven_without_busy_wait": [
   "(exit_code, 0)",
@@ -9358,7 +9562,7 @@
  ],
  "production_slice_missing_exit_metadata_is_host_barrier": [
   "( completion.exit, GuestSliceExit::HostBarrier { rip: SLICE_JUMPIF_CODE }, \"conditional exit metadata loss must never fabricate a RIP\" )",
-  "( completion.slot.state.rip, SLICE_JUMPIF_CODE, \"the owner re-dispatches the original block address\" )"
+  "( completion.slot.context.state.rip, SLICE_JUMPIF_CODE, \"the owner re-dispatches the original block address\" )"
  ],
  "production_slice_race_two_guest_loops_overlap_with_exact_counters": [
   "( requests .iter() .map(|request| request.state.rip) .collect::<Vec<_>>(), vec![SLICE_CODE, SLICE_CODE_2] )",
@@ -9388,7 +9592,7 @@
  "production_slice_straight_line_fallback_is_host_barrier": [
   "( completion.exit, GuestSliceExit::HostBarrier { rip: SLICE_STRAIGHT_CODE }, \"a straight-line exit must return to the runtime owner\" )",
   "( completion.blocks_executed, 1, \"the straight-line block executed exactly once\" )",
-  "( completion.slot.state.get(Register::Rax), 0x1234, \"the worker applied the block result before the barrier\" )"
+  "( completion.slot.context.state.get(Register::Rax), 0x1234, \"the worker applied the block result before the barrier\" )"
  ],
  "production_terminate_race_prunes_parked_wait_and_never_resumes": [
   "(session.runtime.production_waits.len(), 1)",
@@ -9403,6 +9607,11 @@
  "production_thunk_serialization_stress_is_exactly_once_under_two_threads": [
   "( trace_calls(&session, \"time\", \"GetTickCount64\"), before + 2 * iterations as usize, \"every guest call must dispatch its thunk exactly once\" )",
   "(session.runtime.pending_guest_threads.len(), 0)"
+ ],
+ "production_two_parked_guest_threads_wake_simultaneously_without_deadlock": [
+  "( session.runtime.production_waits.len(), 2, \"both guest waits must be owned by native workers simultaneously\" )",
+  "( session.runtime.production_waits.len(), 0, \"both native wait jobs must complete\" )",
+  "( session .runtime .pending_guest_threads .iter() .filter(|thread| thread.wait_resume.is_some()) .count(), 2, \"both parked guest threads must be resumed exactly once\" )"
  ],
  "production_wait_all_repark_race_is_exact": [
   "( session.runtime.production_waits.len(), 1, \"a partial wait-all wake must re-park, never resume\" )",
@@ -10172,6 +10381,13 @@
  "seeded_deliberately_unsupported_entries_carry_compatibility_errors": [
   "(is_debugger.implementation, ImplementationLevel::Implemented)",
   "( is_debugger.semantic_test_coverage, CoverageLevel::Conformance, \"IsDebuggerPresent is bound to the section11 NT surface evidence\" )"
+ ],
+ "seeded_interface_aggregates_missing_method_proof_never_overstate": [
+  "( entry.semantic_fidelity, aggregate.semantic_fidelity, \"{dll}!{interface} aggregate fidelity must equal the worst child\" )",
+  "( entry.subsystem_capability, aggregate.subsystem_capability, \"{dll}!{interface} aggregate capability must equal the worst child\" )",
+  "(aggregate.semantic_fidelity, SemanticFidelity::Restricted)",
+  "(aggregate.subsystem_capability, SubsystemCapability::Partial)",
+  "( database.interface_completeness_gate().len(), 0, \"seeded aggregates must never overstate their method children\" )"
  ],
  "self_modifying_code_basic_invalidation": [
   "(rt.blocks_compiled, 1, \"exactly one block compiled\")",
@@ -12948,6 +13164,14 @@
   "( verify_coherence(&zero_frequency), Err(TimingError::FrequencyZero) )",
   "( verify_coherence(&negative), Err(TimingError::NegativeInterval) )"
  ],
+ "timing_unavailable_fallback_reasons_are_exact": [
+  "( TimingUnavailable::NoMetalDevice.reason(), \"no Metal device is available; GPU and drawable timestamps cannot be captured\" )",
+  "( TimingUnavailable::MissingGpuTimestamp.reason(), \"Metal command buffer completed without GPUStartTime/GPUEndTime timestamps\" )",
+  "( TimingUnavailable::UnsupportedGpuTimestamp.reason(), \"the Metal device does not expose command-buffer GPU timestamps\" )",
+  "( TimingUnavailable::NoDrawable.reason(), \"CAMetalLayer.nextDrawable returned no drawable (headless presentation); \\ drawable presentedTime is unavailable\" )",
+  "( TimingUnavailable::MissingPresentTimestamp.reason(), \"CAMetalLayer drawable reported presentedTime=0; no display presentation occurred\" )",
+  "( TimingUnavailable::MissingInputTimestamp.reason(), \"no input-event timestamp was correlated with the measured frames\" )"
+ ],
  "tls_alloc_exhaustion_reports_not_enough_memory": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, alloc_thunk, &[]), u64::from(expected) )",
   "(runtime.last_error, 0)",
@@ -13101,6 +13325,12 @@
   "( call_slot(&mut fixture, typelib, 9, &[typelib as u32, 99, 0, 0, 0, 0]), TYPE_E_ELEMENTNOTFOUND )",
   "( call_slot( &mut fixture, typelib, 5, &[typelib as u32, index, OUT as u32] ), 0, \"GetTypeInfoType({index})\" )",
   "(fixture.memory.read_u32(OUT).unwrap(), expected)"
+ ],
+ "understated_interface_aggregate_is_not_flagged_as_an_error": [
+  "(aggregate.required_count, 0)",
+  "(aggregate.semantic_fidelity, SemanticFidelity::Exact)",
+  "(aggregate.subsystem_capability, SubsystemCapability::Full)",
+  "( database.interface_completeness_gate().len(), 0, \"a conservative (understated) aggregate must not fail the interface gate\" )"
  ],
  "unknown_command_and_pre_startup_command_are_rejected": [
   "(rc(&run(&mut tpm, &get_random)), TPM_RC_INITIALIZE)",

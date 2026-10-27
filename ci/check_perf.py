@@ -41,6 +41,16 @@ EXIT_MISSING = 3
 EXIT_MISMATCH = 4
 EXIT_RUN_FAILED = 5
 
+# Machine-readable report entries accumulated by ``evaluate`` and written by
+# ``--report-json``. Each entry records the exact status and diagnostic.
+REPORT_ENTRIES: list[dict[str, Any]] = []
+
+
+def report_entry(entry_id: str, status: str, detail: str, **extra: Any) -> None:
+    REPORT_ENTRIES.append(
+        {"id": entry_id, "status": status, "detail": detail, **extra}
+    )
+
 # Per-benchmark gates.  ``rel`` is the minimum relative increase that counts as
 # a regression; ``abs`` is the floor in the benchmark's unit, so sub-noise
 # differences on very fast benchmarks do not fail the gate.  ``absolute_max``
@@ -107,6 +117,35 @@ KPI_GATES: dict[str, dict[str, Any]] = {
     "gfx_staged_upload_copy_rate": {"rel": 0.0, "abs": 0.0},
     "gfx_barriers_required_per_1000_considered": {"rel": 0.0, "abs": 0.0},
     "gpu_idle_gap_us": {"rel": 0.20, "abs": 100.0},
+    "gpu_frame_time_p50_us": {"rel": 0.10, "abs": 100.0, "absolute_max": 2000.0},
+    "gpu_frame_time_p95_us": {"rel": 0.10, "abs": 200.0},
+    "gpu_frame_time_p99_us": {"rel": 0.10, "abs": 200.0, "absolute_max": 5000.0},
+    "gpu_frame_time_p999_us": {"rel": 1.00, "abs": 500.0},
+    "gpu_frame_time_1pct_low_fps": {
+        "rel": 0.90,
+        "abs": 50000.0,
+        "direction": "higher",
+    },
+    "gpu_frame_time_0p1pct_low_fps": {
+        "rel": 0.90,
+        "abs": 20000.0,
+        "direction": "higher",
+    },
+    "gpu_time_p50_us": {"rel": 0.20, "abs": 100.0},
+    "gpu_time_p99_us": {"rel": 0.20, "abs": 200.0},
+    "cpu_submit_p50_us": {"rel": 0.20, "abs": 100.0},
+    "cpu_submit_p99_us": {"rel": 0.20, "abs": 200.0},
+    "input_to_present_p50_us": {"rel": 0.10, "abs": 100.0, "absolute_max": 2000.0},
+    "input_to_present_p99_us": {"rel": 0.10, "abs": 200.0, "absolute_max": 5000.0},
+    "input_to_gpu_completion_p50_us": {"rel": 0.15, "abs": 100.0},
+    "input_to_gpu_completion_p99_us": {"rel": 0.15, "abs": 200.0},
+    "host_cpu_time_p50_us": {"rel": 0.20, "abs": 100.0},
+    "shader_compile_stall_rate_measured": {"rel": 0.10, "abs": 0.05},
+    "guest_instructions_per_sec": {
+        "rel": 0.50,
+        "abs": 1000000.0,
+        "direction": "higher",
+    },
     "residency_churn_per_1000_frames": {"rel": 0.20, "abs": 1.0},
     "gpu_heap_faults_per_1000_frames": {"rel": 0.20, "abs": 1.0},
 }
@@ -427,26 +466,33 @@ def evaluate(
     # Detect estimates/KPIs that are not gated by the checked-in baseline.
     for benchmark_id in sorted(estimates):
         if benchmark_id not in entries:
-            print(f"BASELINE_MISMATCH {benchmark_id}: Criterion estimate is not in the baseline; run --update")
+            detail = "Criterion estimate is not in the baseline; run --update"
+            print(f"BASELINE_MISMATCH {benchmark_id}: {detail}")
+            report_entry(benchmark_id, "BASELINE_MISMATCH", detail)
             mismatches += 1
     for metric in sorted(kpis):
         entry_id = f"kpi/{metric}"
         if entry_id not in entries:
-            print(f"BASELINE_MISMATCH {entry_id}: KPI is not in the baseline; run --update")
+            detail = "KPI is not in the baseline; run --update"
+            print(f"BASELINE_MISMATCH {entry_id}: {detail}")
+            report_entry(entry_id, "BASELINE_MISMATCH", detail)
             mismatches += 1
 
     for entry_id, entry in sorted(entries.items()):
         kind = entry.get("kind", "timing")
         if kind == "timing":
             if entry_id not in estimates:
-                print(
-                    f"MISSING_BENCHMARK {entry_id}: no Criterion estimates under "
+                detail = (
+                    "no Criterion estimates under "
                     f"{estimates_root / entry_id / 'new' / 'estimates.json'}"
                 )
+                print(f"MISSING_BENCHMARK {entry_id}: {detail}")
+                report_entry(entry_id, "MISSING_BENCHMARK", detail)
                 missing += 1
                 continue
             status, detail = compare(entry_id, entry, estimates[entry_id])
             checked += 1
+            report_entry(entry_id, status, detail, kind="timing")
             if status == "REGRESSION":
                 print(f"REGRESSION {entry_id}: {detail}")
                 failures.append(entry_id)
@@ -458,24 +504,35 @@ def evaluate(
             else:
                 print(f"{status} {entry_id}: {detail}")
         else:
-            if not entry.get("available", True):
-                reason = entry.get("reason", "metric recorded unavailable")
-                print(f"UNAVAILABLE {entry_id}: {reason}")
-                continue
             metric = entry_id[len("kpi/") :] if entry_id.startswith("kpi/") else entry_id
+            if not entry.get("available", True):
+                observed = kpis.get(metric)
+                if observed is not None and observed.get("available"):
+                    detail = (
+                        "real samples present but the baseline entry is unavailable; "
+                        "run --update to gate this metric"
+                    )
+                    print(f"BASELINE_PENDING {entry_id}: {detail}")
+                    report_entry(entry_id, "BASELINE_PENDING", detail, kind="kpi")
+                else:
+                    reason = entry.get("reason", "metric recorded unavailable")
+                    print(f"UNAVAILABLE {entry_id}: {reason}")
+                    report_entry(entry_id, "UNAVAILABLE", reason, kind="kpi")
+                continue
             if metric not in kpis:
-                print(
-                    f"MISSING_BENCHMARK {entry_id}: KPI document {kpi_path} has no entry "
-                    f"(emitted by the gate/kpi benchmark)"
+                detail = (
+                    f"KPI document {kpi_path} has no entry "
+                    "(emitted by the gate/kpi benchmark)"
                 )
+                print(f"MISSING_BENCHMARK {entry_id}: {detail}")
+                report_entry(entry_id, "MISSING_BENCHMARK", detail, kind="kpi")
                 missing += 1
                 continue
             observed = kpis[metric]
             if not observed.get("available"):
-                print(
-                    f"UNAVAILABLE {entry_id}: "
-                    f"{observed.get('reason', 'metric reported unavailable')}"
-                )
+                reason = observed.get("reason", "metric reported unavailable")
+                print(f"UNAVAILABLE {entry_id}: {reason}")
+                report_entry(entry_id, "UNAVAILABLE", reason, kind="kpi")
                 continue
             value = float(observed["value"])
             status, detail = compare(
@@ -484,6 +541,14 @@ def evaluate(
                 {"median": value, "ci_low": None, "ci_high": None},
             )
             checked += 1
+            report_entry(
+                entry_id,
+                status,
+                detail,
+                kind="kpi",
+                value=value,
+                unit=observed.get("unit", ""),
+            )
             if status in ("REGRESSION", "TARGET_EXCEEDED"):
                 print(f"{status} {entry_id}: {detail}")
                 failures.append(entry_id)
@@ -534,6 +599,76 @@ def evaluate(
     return EXIT_PASS
 
 
+def apply_threshold_overrides(path: Path) -> dict[str, Any]:
+    """Merge a JSON threshold document over the built-in gate table.
+
+    The document may contain ``timing`` and ``kpi`` objects keyed by gate id
+    (``gate/kpi/...`` for timing, metric name for KPI). Values are partial
+    threshold objects (``rel``, ``abs``, ``direction``, ``absolute_max``).
+    The same document is applied to already-loaded baseline entries so a gate
+    run can use a stricter/looser budget without regenerating the baseline.
+    """
+    document = read_json(path)
+    for group, target in (("timing", TIMING_GATES), ("kpi", KPI_GATES)):
+        overrides = document.get(group) or {}
+        if not isinstance(overrides, dict):
+            raise SystemExit(f"invalid threshold override in {path}: {group} must be an object")
+        for key, value in overrides.items():
+            if not isinstance(value, dict):
+                raise SystemExit(
+                    f"invalid threshold override in {path}: {group}.{key} must be an object"
+                )
+            target.setdefault(key, {}).update(value)
+    return document
+
+
+def apply_thresholds_to_baseline(baseline: dict[str, Any], document: dict[str, Any]) -> None:
+    entries = baseline.get("entries")
+    if not isinstance(entries, dict):
+        return
+    timing = document.get("timing") or {}
+    kpi = document.get("kpi") or {}
+    for entry_id, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("kind", "timing")
+        metric = entry_id[len("kpi/") :] if entry_id.startswith("kpi/") else entry_id
+        override = timing.get(entry_id) if kind == "timing" else kpi.get(metric)
+        if not isinstance(override, dict):
+            continue
+        threshold = dict(entry.get("threshold") or {})
+        for key in ("rel", "abs"):
+            if key in override:
+                threshold[key] = override[key]
+        entry["threshold"] = threshold
+        for key in ("direction", "absolute_max", "absolute_min"):
+            if key in override:
+                entry[key] = override[key]
+
+
+def write_report(path: Path, exit_code: int, baseline_path: Path) -> None:
+    status = {
+        EXIT_PASS: "pass",
+        EXIT_REGRESSION: "regression",
+        EXIT_MISSING: "missing",
+        EXIT_MISMATCH: "mismatch",
+        EXIT_RUN_FAILED: "run_failed",
+    }.get(exit_code, "error")
+    write_json(
+        path,
+        {
+            "schema": 1,
+            "generated_at": __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ).isoformat(),
+            "baseline": str(baseline_path),
+            "result": status,
+            "exit_code": exit_code,
+            "entries": REPORT_ENTRIES,
+        },
+    )
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -563,11 +698,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=3,
         help="repeat the Criterion subset N times and keep the fastest median per benchmark (default: 3)",
     )
+    parser.add_argument(
+        "--thresholds",
+        type=Path,
+        default=None,
+        help="JSON file overriding timing/kpi thresholds (configurable budget)",
+    )
+    parser.add_argument(
+        "--report-json",
+        type=Path,
+        default=None,
+        help="write a machine-readable gate report with per-entry status",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    threshold_document = (
+        apply_threshold_overrides(args.thresholds)
+        if args.thresholds is not None
+        else None
+    )
     native = native_baseline(args.native_baseline)
 
     if args.estimates_dir is not None or args.no_run:
@@ -645,10 +797,18 @@ def main(argv: list[str]) -> int:
         )
         return EXIT_MISMATCH
     baseline = read_json(args.baseline)
+    if threshold_document is not None:
+        apply_thresholds_to_baseline(baseline, threshold_document)
     if int(baseline.get("schema", 0)) != SCHEMA:
-        print(f"BASELINE_MISMATCH {args.baseline}: schema {baseline.get('schema')} != {SCHEMA}")
-        return EXIT_MISMATCH
-    return evaluate(baseline, estimates, kpis, estimates_root, kpi_path)
+        detail = f"schema {baseline.get('schema')} != {SCHEMA}"
+        print(f"BASELINE_MISMATCH {args.baseline}: {detail}")
+        report_entry(str(args.baseline), "BASELINE_MISMATCH", detail)
+        exit_code = EXIT_MISMATCH
+    else:
+        exit_code = evaluate(baseline, estimates, kpis, estimates_root, kpi_path)
+    if args.report_json is not None:
+        write_report(args.report_json, exit_code, args.baseline)
+    return exit_code
 
 
 if __name__ == "__main__":

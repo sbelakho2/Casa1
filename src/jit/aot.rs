@@ -120,6 +120,7 @@ pub(super) enum AotHelper {
     SegmentBase,
     SetFlags,
     MaterializeFlags,
+    LockXadd,
 }
 
 impl AotHelper {
@@ -131,6 +132,7 @@ impl AotHelper {
             Self::SegmentBase => jit_helper_segment_base as *const () as u64,
             Self::SetFlags => jit_helper_set_flags as *const () as u64,
             Self::MaterializeFlags => jit_helper_materialize_flags as *const () as u64,
+            Self::LockXadd => jit_helper_lock_xadd as *const () as u64,
         }
     }
 
@@ -142,6 +144,7 @@ impl AotHelper {
             Self::SegmentBase => 4,
             Self::SetFlags => 5,
             Self::MaterializeFlags => 6,
+            Self::LockXadd => 7,
         }
     }
 
@@ -153,6 +156,7 @@ impl AotHelper {
             4 => Self::SegmentBase,
             5 => Self::SetFlags,
             6 => Self::MaterializeFlags,
+            7 => Self::LockXadd,
             _ => return None,
         })
     }

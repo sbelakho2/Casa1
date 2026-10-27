@@ -105,7 +105,11 @@ in-repo part of the protected-main/release policy:
 - every required CI/release job still exists;
 - the aggregate `CI Gate` and `Release Gate` jobs run with `if: always()` and
   need every required job;
-- the required status context for `main` (`CI Gate`) is a real job name;
+- the required status contexts for `main` (`CI Gate`, `Windows Oracle`) are
+  real job names, and the Windows oracle aggregate needs all three stages;
+- the Windows oracle reference build command and required categories are
+  present, and `CharUpperW`/`snprintf` are statically linked through
+  `user32`/`legacy_stdio_definitions` (the `__imp_*` link fix);
 - the dev API gate is named for completeness + regression and runs
   `api-report --gate completeness` plus the regression comparison;
 - the release gate runs the completeness gate;

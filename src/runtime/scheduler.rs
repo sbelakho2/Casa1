@@ -21,13 +21,9 @@ use crate::runtime::object_manager::ObjectId;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// TEB `LastErrorValue` offset for a guest architecture.
-fn teb_last_error_offset(arch: GuestArch) -> u64 {
-    match arch {
-        GuestArch::X64 => 0x68,
-        GuestArch::X86 => 0x34,
-    }
-}
+// TEB `LastErrorValue` offset for a guest architecture lives with the
+// per-thread context (`thread_context.rs`), which is the module that owns
+// per-thread execution state.
 
 /// macOS QoS class constants (`sys/qos.h`).
 const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
@@ -2238,6 +2234,7 @@ pub(crate) enum GuestSliceExit {
 }
 
 /// Per-guest-thread execution request for a production worker.
+#[allow(dead_code)] // compatibility request shape used by diagnostics/tests
 pub(crate) struct GuestSliceRequest {
     pub(crate) thread_id: u32,
     pub(crate) state: CpuState,
@@ -2258,34 +2255,48 @@ pub(crate) struct GuestSliceReport {
     pub(crate) metrics: crate::jit::SliceMetrics,
 }
 
+/// Result of executing one guest thread slice through the
+/// `(&ProcessShared, &mut GuestThreadContext)` API.
+#[allow(dead_code)] // fields are the scheduler's public test/diagnostic surface
+pub(crate) struct GuestThreadRun {
+    pub(crate) context: GuestThreadSnapshot,
+    pub(crate) exit: GuestSliceExit,
+    pub(crate) blocks_executed: u64,
+    pub(crate) worker_index: usize,
+    pub(crate) code_writes: Vec<(u64, usize)>,
+    pub(crate) metrics: crate::jit::SliceMetrics,
+}
+
 /// A persistent worker slot for one guest thread.  It is removed from the
 /// scheduler's slot map while a job runs on a worker and put back when the
 /// job completes, so exactly one host thread owns the guest state at a time.
+/// The slot's execution state is a [`GuestThreadContext`]: registers, flags,
+/// TEB/TLS/FLS, last error, JIT control caches and dispatcher scratch are all
+/// private to the guest thread; only [`ProcessShared`] is shared.
 struct GuestThreadSlot {
-    thread_id: u32,
-    priority: i32,
-    state: CpuState,
-    control: crate::jit::SliceThreadState,
+    context: GuestThreadContext,
     /// Park signal of the current production wait, retained with the slot so
     /// the wait object survives a slice-budget boundary.
     wait: Option<Arc<ParkSignal>>,
-    /// Native worker that last ran this slot (affinity hint).
-    worker_index: Option<usize>,
-    /// Completed slice rounds on this slot.
-    slices: u64,
 }
 
 impl GuestThreadSlot {
     fn new(thread_id: u32, state: CpuState) -> Self {
         Self {
-            thread_id,
-            priority: 0,
-            state,
-            control: crate::jit::SliceThreadState::default(),
+            context: GuestThreadContext::new(thread_id, state),
             wait: None,
-            worker_index: None,
-            slices: 0,
         }
+    }
+
+    fn from_context(context: GuestThreadContext) -> Self {
+        Self {
+            context,
+            wait: None,
+        }
+    }
+
+    fn thread_id(&self) -> u32 {
+        self.context.thread_id
     }
 }
 
@@ -2306,7 +2317,6 @@ pub(crate) struct GuestSlotSnapshot {
 struct GuestSliceJob {
     job_id: u64,
     slot: GuestThreadSlot,
-    program: Arc<crate::jit::GuestSliceProgram>,
     budget: u64,
     /// Optional simultaneous-start gate shared by all jobs of one round, so
     /// a multi-thread slice round really overlaps on the workers instead of
@@ -2367,13 +2377,25 @@ struct GuestSliceCompletion {
 /// shuts every worker down and joins it.
 pub(crate) struct ProductionScheduler {
     shared: Arc<ProductionShared>,
+    /// Process-wide state every native worker executes against.  Guest
+    /// execution is `(&ProcessShared, &mut GuestThreadContext)`; the pool
+    /// never hands a worker a `PeHostRuntime`.
+    process_shared: Arc<ProcessShared>,
     workers: Vec<std::thread::JoinHandle<()>>,
     worker_count: usize,
 }
 
 impl ProductionScheduler {
+    #[allow(dead_code)] // standalone-pool constructor used by scheduler tests
     pub(crate) fn new(workers: usize) -> Self {
+        Self::with_process_shared(workers, Arc::new(ProcessShared::new()))
+    }
+
+    /// Create a pool whose workers execute against the runtime's one
+    /// process-shared handle (canonical memory, process gate, code epoch).
+    pub(crate) fn with_process_shared(workers: usize, process_shared: Arc<ProcessShared>) -> Self {
         let workers = workers.clamp(1, MAX_PRODUCTION_WORKERS);
+        process_shared.reopen();
         let shared = Arc::new(ProductionShared {
             state: Mutex::new(ProductionState::default()),
             work_ready: Condvar::new(),
@@ -2383,14 +2405,16 @@ impl ProductionScheduler {
         let mut handles = Vec::with_capacity(workers);
         for index in 0..workers {
             let worker_shared = Arc::clone(&shared);
+            let worker_process = Arc::clone(&process_shared);
             let handle = std::thread::Builder::new()
                 .name(format!("casa1-guest-worker-{index}"))
-                .spawn(move || production_worker(worker_shared, index))
+                .spawn(move || production_worker(worker_shared, worker_process, index))
                 .expect("spawn production scheduler worker");
             handles.push(handle);
         }
         Self {
             shared,
+            process_shared,
             workers: handles,
             worker_count: workers,
         }
@@ -2429,15 +2453,30 @@ impl ProductionScheduler {
         job_id
     }
 
+    #[allow(dead_code)] // request-shaped submission used by scheduler tests
     fn submit_slice(
         &self,
         thread_id: u32,
         state: CpuState,
         priority: i32,
-        program: Arc<crate::jit::GuestSliceProgram>,
         budget: u64,
         start: Option<Arc<SliceStartGate>>,
     ) -> u64 {
+        let mut context = GuestThreadContext::new(thread_id, state);
+        context.priority = priority;
+        self.submit_context(context, budget, start)
+    }
+
+    /// Queue one guest thread's private context for a native worker.  This is
+    /// the concurrency API's submission point: only the context and the
+    /// process-shared handle cross the thread boundary.
+    fn submit_context(
+        &self,
+        context: GuestThreadContext,
+        budget: u64,
+        start: Option<Arc<SliceStartGate>>,
+    ) -> u64 {
+        let thread_id = context.thread_id;
         let mut shared = self
             .shared
             .state
@@ -2445,16 +2484,16 @@ impl ProductionScheduler {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let job_id = shared.next_slice_id;
         shared.next_slice_id = shared.next_slice_id.wrapping_add(1);
-        let mut slot = shared
-            .slots
-            .remove(&thread_id)
-            .unwrap_or_else(|| GuestThreadSlot::new(thread_id, state.clone()));
-        slot.state = state;
-        slot.priority = priority;
+        let slot = match shared.slots.remove(&thread_id) {
+            Some(mut slot) => {
+                slot.context.adopt(context);
+                slot
+            }
+            None => GuestThreadSlot::from_context(context),
+        };
         shared.slice_queue.push_back(GuestSliceJob {
             job_id,
             slot,
-            program,
             budget,
             start,
         });
@@ -2540,15 +2579,15 @@ impl ProductionScheduler {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         shared.slots.get(&thread_id).map(|slot| GuestSlotSnapshot {
-            thread_id: slot.thread_id,
-            priority: slot.priority,
-            rip: slot.state.rip,
-            fs_base: slot.state.segment_bases.fs,
-            slices: slot.slices,
-            worker_index: slot.worker_index,
+            thread_id: slot.context.thread_id,
+            priority: slot.context.priority,
+            rip: slot.context.state.rip,
+            fs_base: slot.context.state.segment_bases.fs,
+            slices: slot.context.slices,
+            worker_index: slot.context.worker_index,
             has_wait: slot.wait.is_some(),
-            translation_epoch: slot.control.epoch(),
-            metrics: slot.control.metrics,
+            translation_epoch: slot.context.control.epoch(),
+            metrics: slot.context.control.metrics,
         })
     }
 
@@ -2584,42 +2623,44 @@ impl ProductionScheduler {
         !state.completions.is_empty() || !state.slice_completions.is_empty()
     }
 
-    /// Run one round of production guest-code slices: every request is queued
-    /// independently, so different guest threads execute on different native
-    /// workers, then this (runtime-owner) thread collects every completion.
-    /// Host thunks never run here; a worker that reaches one reports
+    /// Run one round of concurrent guest-code slices for the supplied
+    /// per-thread contexts.  Each context is queued independently, so
+    /// different guest threads execute on different native workers, then this
+    /// (runtime-owner) thread collects every completion.  Host thunks never
+    /// run here; a worker that reaches one reports
     /// [`GuestSliceExit::HostBarrier`] and the owner executes it exactly once.
-    pub(crate) fn run_guest_slices(
+    ///
+    /// The immutable compiled program is published on the process-shared
+    /// handle for the duration of the round, so a worker needs only
+    /// `(&ProcessShared, &mut GuestThreadContext)` to execute guest code.
+    pub(crate) fn run_thread_contexts(
         &self,
-        requests: Vec<GuestSliceRequest>,
+        contexts: Vec<GuestThreadContext>,
         program: Arc<crate::jit::GuestSliceProgram>,
         budget: u64,
-    ) -> Vec<GuestSliceReport> {
+    ) -> Vec<GuestThreadRun> {
+        if contexts.is_empty() {
+            return Vec::new();
+        }
+        self.process_shared.publish_program(program);
         let mut pending = BTreeSet::new();
         // Only gate rounds that fit the pool; extra jobs would deadlock a
         // barrier sized for all requests.
-        let start = (requests.len() > 1 && requests.len() <= self.worker_count)
-            .then(|| Arc::new(SliceStartGate::new(requests.len())));
-        for request in requests {
-            let id = self.submit_slice(
-                request.thread_id,
-                request.state,
-                request.priority,
-                Arc::clone(&program),
-                budget,
-                start.as_ref().map(Arc::clone),
-            );
+        let start = (contexts.len() > 1 && contexts.len() <= self.worker_count)
+            .then(|| Arc::new(SliceStartGate::new(contexts.len())));
+        for context in contexts {
+            let id = self.submit_context(context, budget, start.as_ref().map(Arc::clone));
             pending.insert(id);
         }
-        let mut reports = Vec::with_capacity(pending.len());
+        let mut runs = Vec::with_capacity(pending.len());
         while !pending.is_empty() {
             if !self.wait_for_completion(Some(PRODUCTION_SLICE_TIMEOUT)) {
                 break;
             }
             for completion in self.take_slice_completions() {
                 if pending.remove(&completion.job_id) {
-                    let thread_id = completion.slot.thread_id;
-                    let state = completion.slot.state.clone();
+                    let thread_id = completion.slot.thread_id();
+                    let snapshot = completion.slot.context.snapshot();
                     // Return the persistent slot to the map so the next round
                     // reuses its predictor, inline caches and TEB/TLS state.
                     self.shared
@@ -2628,14 +2669,13 @@ impl ProductionScheduler {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .slots
                         .insert(thread_id, completion.slot);
-                    reports.push(GuestSliceReport {
-                        thread_id,
-                        state,
+                    runs.push(GuestThreadRun {
                         exit: completion.exit,
                         blocks_executed: completion.blocks_executed,
                         worker_index: completion.worker_index,
                         code_writes: completion.code_writes,
                         metrics: completion.metrics,
+                        context: snapshot,
                     });
                 }
             }
@@ -2649,7 +2689,40 @@ impl ProductionScheduler {
                 break;
             }
         }
-        reports
+        self.process_shared.clear_program();
+        runs
+    }
+
+    /// Compatibility wrapper used by the existing scheduler call sites/tests:
+    /// convert lightweight requests into per-thread contexts, run the round,
+    /// and return the historical report shape.
+    #[allow(dead_code)] // request-shaped round used by scheduler tests
+    pub(crate) fn run_guest_slices(
+        &self,
+        requests: Vec<GuestSliceRequest>,
+        program: Arc<crate::jit::GuestSliceProgram>,
+        budget: u64,
+    ) -> Vec<GuestSliceReport> {
+        let contexts: Vec<GuestThreadContext> = requests
+            .into_iter()
+            .map(|request| {
+                let mut context = GuestThreadContext::new(request.thread_id, request.state);
+                context.priority = request.priority;
+                context
+            })
+            .collect();
+        self.run_thread_contexts(contexts, program, budget)
+            .into_iter()
+            .map(|run| GuestSliceReport {
+                thread_id: run.context.thread_id,
+                state: run.context.state,
+                exit: run.exit,
+                blocks_executed: run.blocks_executed,
+                worker_index: run.worker_index,
+                code_writes: run.code_writes,
+                metrics: run.metrics,
+            })
+            .collect()
     }
 
     #[allow(dead_code)] // used by scheduler tests to observe worker queueing
@@ -2666,6 +2739,10 @@ impl Drop for ProductionScheduler {
         self.shared
             .shutdown
             .store(true, std::sync::atomic::Ordering::Release);
+        // In-flight slices poll `ProcessShared::shutdown` between blocks, so
+        // a dropped pool must stop them too (guest blocks are unlinked and
+        // never return to the dispatcher on their own).
+        self.process_shared.request_shutdown();
         // Worker slice blocks are deliberately unlinked, so each block
         // returns to the worker dispatcher (which polls `shutdown`) within a
         // bounded number of instructions.  Do not set the process-wide
@@ -2708,6 +2785,7 @@ fn pop_affine_slice(
 ) -> Option<GuestSliceJob> {
     let affine = queue.iter().position(|job| {
         job.slot
+            .context
             .worker_index
             .is_some_and(|assigned| assigned == worker_index)
     });
@@ -2717,7 +2795,11 @@ fn pop_affine_slice(
     }
 }
 
-fn production_worker(shared: Arc<ProductionShared>, worker_index: usize) {
+fn production_worker(
+    shared: Arc<ProductionShared>,
+    process_shared: Arc<ProcessShared>,
+    worker_index: usize,
+) {
     use std::sync::atomic::Ordering::Relaxed;
     SCHEDULER_COUNTERS.note_host_worker_identity();
     loop {
@@ -2733,7 +2815,7 @@ fn production_worker(shared: Arc<ProductionShared>, worker_index: usize) {
                 let thread_id;
                 let job = if let Some(job) = pop_affine_slice(&mut state.slice_queue, worker_index)
                 {
-                    thread_id = job.slot.thread_id;
+                    thread_id = job.slot.thread_id();
                     ProductionJob::Slice(job)
                 } else if let Some(job) = state.queue.pop_front() {
                     thread_id = job.thread_id;
@@ -2775,7 +2857,8 @@ fn production_worker(shared: Arc<ProductionShared>, worker_index: usize) {
                 state.completions.push_back(completion);
             }
             ProductionJob::Slice(job) => {
-                let completion = run_guest_slice_job(job, &shared.shutdown, worker_index);
+                let completion =
+                    run_guest_slice_job(job, &shared.shutdown, &process_shared, worker_index);
                 let mut state = shared
                     .state
                     .lock()
@@ -2797,38 +2880,30 @@ fn production_worker(shared: Arc<ProductionShared>, worker_index: usize) {
 fn run_guest_slice_job(
     mut job: GuestSliceJob,
     shutdown: &std::sync::atomic::AtomicBool,
+    process_shared: &ProcessShared,
     worker_index: usize,
 ) -> GuestSliceCompletion {
     use std::sync::atomic::Ordering;
     if let Some(start) = job.start.as_ref() {
         start.arrive_and_wait(shutdown);
     }
-    job.slot.worker_index = Some(worker_index);
-    job.slot.slices = job.slot.slices.saturating_add(1);
+    job.slot.context.worker_index = Some(worker_index);
     // Apply the guest thread's Windows priority as host QoS for the slice;
     // the guard restores the worker's previous class when it drops.
-    let _qos = GuestQosGuard::apply(job.slot.priority);
-    // SAFETY: the blocks belong to this worker program (compiled and
-    // finalized by the runtime owner), the slot is removed from the scheduler
-    // map for the duration of the job, and the memory view is installed by
-    // `run_slice` for the whole slice.
-    let report = unsafe {
-        crate::jit::run_slice(
-            &job.program,
-            &mut job.slot.state,
-            &mut job.slot.control,
-            job.budget,
-            shutdown,
-        )
-    };
+    let _qos = GuestQosGuard::apply(job.slot.context.priority);
+    // The worker executes guest code with ONLY the process-shared handle and
+    // the thread's private context.  No `PeHostRuntime` crosses the thread
+    // boundary: canonical memory, the compiled program, the safepoint/shutdown
+    // flag and the SMC epoch all live in `process_shared`.
+    let report = process_shared.run_thread(&mut job.slot.context, job.budget);
     let exit = match report.stop {
-        crate::jit::SliceStop::Budget => GuestSliceExit::Budget,
-        crate::jit::SliceStop::HostBarrier { rip } => GuestSliceExit::HostBarrier { rip },
-        crate::jit::SliceStop::GuestFault { address, write } => {
+        ThreadSliceStop::Budget => GuestSliceExit::Budget,
+        ThreadSliceStop::HostBarrier { rip } => GuestSliceExit::HostBarrier { rip },
+        ThreadSliceStop::GuestFault { address, write } => {
             GuestSliceExit::GuestFault { address, write }
         }
-        crate::jit::SliceStop::CodeWrite => GuestSliceExit::CodeWrite,
-        crate::jit::SliceStop::Safepoint => {
+        ThreadSliceStop::CodeWrite => GuestSliceExit::CodeWrite,
+        ThreadSliceStop::Safepoint => {
             // Same protocol as the blocking dispatcher: the request is
             // consumed when the block yields, unless the pool is shutting
             // down (Drop sets both).
@@ -2837,7 +2912,7 @@ fn run_guest_slice_job(
             }
             GuestSliceExit::Safepoint
         }
-        crate::jit::SliceStop::Shutdown => GuestSliceExit::Shutdown,
+        ThreadSliceStop::Shutdown => GuestSliceExit::Shutdown,
     };
     GuestSliceCompletion {
         job_id: job.job_id,
@@ -3070,20 +3145,57 @@ impl PeHostRuntime {
     /// on the production worker pool.  The runtime owner remains the only
     /// thread that touches runtime state: worker completions are returned for
     /// the owner to apply (thunks are never executed on a worker).
+    #[allow(dead_code)] // request-shaped dispatch used by scheduler tests
     pub(crate) fn dispatch_parallel_guest_slices(
         &mut self,
         memory: &mut MemoryImage,
         requests: Vec<GuestSliceRequest>,
         budget: u64,
     ) -> AppResult<Vec<GuestSliceReport>> {
-        if requests.is_empty() {
+        let contexts: Vec<GuestThreadContext> = requests
+            .into_iter()
+            .map(|request| {
+                let mut context = GuestThreadContext::new(request.thread_id, request.state);
+                context.priority = request.priority;
+                context
+            })
+            .collect();
+        Ok(self
+            .dispatch_parallel_thread_contexts(memory, contexts, budget)?
+            .into_iter()
+            .map(|run| GuestSliceReport {
+                thread_id: run.context.thread_id,
+                state: run.context.state,
+                exit: run.exit,
+                blocks_executed: run.blocks_executed,
+                worker_index: run.worker_index,
+                code_writes: run.code_writes,
+                metrics: run.metrics,
+            })
+            .collect())
+    }
+
+    /// Execute one round of concurrent guest slices for explicit per-thread
+    /// contexts.  This is the real concurrency entry point: the owner compiles
+    /// the reachable blocks once, publishes the immutable program on
+    /// [`ProcessShared`], and every context runs on a native worker against
+    /// the shared canonical memory.  Worker completions are applied (and
+    /// stale SMC pages invalidated) by the owner; no host thunk ever runs on a
+    /// worker.
+    pub(crate) fn dispatch_parallel_thread_contexts(
+        &mut self,
+        memory: &mut MemoryImage,
+        contexts: Vec<GuestThreadContext>,
+        budget: u64,
+    ) -> AppResult<Vec<GuestThreadRun>> {
+        if contexts.is_empty() {
             return Ok(Vec::new());
         }
         if self.production_scheduler.is_none() {
             return Ok(Vec::new());
         }
-        for request in &requests {
-            self.ensure_slice_blocks_for(memory, request.state.rip)?;
+        for context in &contexts {
+            self.ensure_slice_blocks_for(memory, context.state.rip)?;
         }
         let program = Arc::new(
             self.jit_runtime
@@ -3092,22 +3204,21 @@ impl PeHostRuntime {
                 .build_slice_program(memory),
         );
         let scheduler = self.production_scheduler.as_ref().expect("checked above");
-        let reports = scheduler.run_guest_slices(requests, program, budget);
+        let runs = scheduler.run_thread_contexts(contexts, program, budget);
         if let Some(jit) = self.jit_runtime.as_mut() {
             let mut wrote_code = false;
             let mut pages = BTreeSet::new();
-            for report in &reports {
-                if report.code_writes.is_empty() && matches!(report.exit, GuestSliceExit::CodeWrite)
-                {
+            for run in &runs {
+                if run.code_writes.is_empty() && matches!(run.exit, GuestSliceExit::CodeWrite) {
                     // A worker's SMC epoch guard fired without this program
                     // recording the exact store (e.g. the write came from a
                     // sibling program sharing the canonical store).  Invalidate
                     // conservatively at the guarded block's page.
-                    let page = report.state.rip & !0xfff;
+                    let page = run.context.state.rip & !0xfff;
                     pages.insert(page);
                     wrote_code = true;
                 }
-                for &(address, length) in &report.code_writes {
+                for &(address, length) in &run.code_writes {
                     let start = address & !0xfff;
                     let end = (address + length as u64 - 1) & !0xfff;
                     let mut page = start;
@@ -3125,7 +3236,7 @@ impl PeHostRuntime {
                 jit.clear_slice_blocks();
             }
         } // coverage: unreachable — jit_runtime was required (unwrapped) before the dispatch, so this if-let cannot take its None path
-        Ok(reports)
+        Ok(runs)
     }
 
     /// Production pump fast path.  When at least one runnable guest thread
@@ -3146,7 +3257,7 @@ impl PeHostRuntime {
         }
         let worker_limit = self.scheduler_mode.worker_count();
         let now = self.win32.get_tick_count64();
-        let candidates: Vec<(u32, CpuState)> = self
+        let candidates: Vec<GuestThreadContext> = self
             .pending_guest_threads
             .iter()
             .filter(|thread| {
@@ -3161,44 +3272,64 @@ impl PeHostRuntime {
                     && thread.wake_tick <= now
             })
             .take(worker_limit)
-            .map(|thread| (thread.thread_id, thread.state.clone()))
+            .map(|thread| {
+                let last_error = if thread.teb_base != 0 {
+                    memory
+                        .read_u32(thread.teb_base + teb_last_error_offset(thread.state.arch))
+                        .unwrap_or(0)
+                } else {
+                    self.fallback_last_errors
+                        .get(&thread.thread_id)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let mut context = GuestThreadContext::from_pending(thread, last_error);
+                context.priority = self.win32.thread_priority_by_id(thread.thread_id);
+                context
+            })
             .collect();
-        let mut requests = Vec::with_capacity(candidates.len());
-        for (thread_id, state) in candidates {
+        let mut contexts = Vec::with_capacity(candidates.len());
+        for context in candidates {
             // A block the slice compiler cannot handle is not an error: the
             // ordinary cooperative owner path executes it below.
-            if matches!(self.ensure_slice_block(memory, state.rip), Ok(true)) {
-                requests.push(GuestSliceRequest {
-                    thread_id,
-                    state,
-                    priority: self.win32.thread_priority_by_id(thread_id),
-                });
+            if matches!(self.ensure_slice_block(memory, context.state.rip), Ok(true)) {
+                contexts.push(context);
             }
         }
-        if requests.is_empty() {
+        if contexts.is_empty() {
             return Ok(None);
         }
-        let reports =
-            self.dispatch_parallel_guest_slices(memory, requests, PRODUCTION_SLICE_BLOCKS)?;
-        if reports.is_empty() {
+        let runs =
+            self.dispatch_parallel_thread_contexts(memory, contexts, PRODUCTION_SLICE_BLOCKS)?;
+        if runs.is_empty() {
             return Ok(None);
         }
         let mut processed = BTreeSet::new();
-        for report in reports {
-            if !processed.insert(report.thread_id) {
+        for run in runs {
+            if !processed.insert(run.context.thread_id) {
                 continue;
             }
             let Some(index) = self
                 .pending_guest_threads
                 .iter()
-                .position(|thread| thread.thread_id == report.thread_id)
+                .position(|thread| thread.thread_id == run.context.thread_id)
             else {
                 continue;
             };
             let Some(mut thread) = self.pending_guest_threads.remove(index) else {
                 continue; // coverage: unreachable — index came from position() on the same unmodified Vec
             };
-            thread.state = report.state;
+            thread.state = run.context.state;
+            thread.tls_vector_ptr = run.context.tls_vector_ptr;
+            if thread.teb_base != 0 {
+                let _ = memory.write_u32(
+                    thread.teb_base + teb_last_error_offset(thread.state.arch),
+                    run.context.last_error,
+                );
+            } else {
+                self.fallback_last_errors
+                    .insert(thread.thread_id, run.context.last_error);
+            }
             thread.state_machine = GuestThreadState::Runnable;
             self.pending_guest_threads.push_back(thread);
             notify_pump_wake();
@@ -3236,7 +3367,10 @@ impl PeHostRuntime {
                     None => true,
                 };
                 if needs_pool {
-                    self.production_scheduler = Some(ProductionScheduler::new(workers));
+                    self.production_scheduler = Some(ProductionScheduler::with_process_shared(
+                        workers,
+                        Arc::clone(&self.process_shared),
+                    ));
                 }
                 self.scheduler_mode = SchedulerMode::Production { workers };
                 true
@@ -6223,6 +6357,544 @@ mod tests {
         session.runtime.pending_guest_threads.clear();
     }
 
+    /// x86 loop that atomically adds one to `counter` `edx` times:
+    ///   mov ecx, 1 ; lock xadd [counter], ecx ; sub edx, 1 ; cmp edx, 0 ;
+    ///   jnz loop ; ret
+    fn lock_xadd_loop(counter: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]);
+        bytes.extend_from_slice(&[0xF0, 0x0F, 0xC1, 0x0D]);
+        bytes.extend_from_slice(&(counter as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0x83, 0xEA, 0x01]);
+        bytes.extend_from_slice(&[0x83, 0xFA, 0x00]);
+        let jump_from = bytes.len() + 2;
+        bytes.extend_from_slice(&[0x75, (-(jump_from as i8)) as u8]);
+        bytes.push(0xC3);
+        bytes
+    }
+
+    fn loop_context(thread_id: u32, rip: u64, rsp: u64, iterations: u32) -> GuestThreadContext {
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = rip;
+        state.set(Register::Rsp, rsp);
+        state.set(Register::Rdx, u64::from(iterations));
+        GuestThreadContext::new(thread_id, state)
+    }
+
+    fn rerun_contexts(
+        session: &mut NtThunkSession,
+        mut contexts: Vec<GuestThreadContext>,
+        budget: u64,
+        rounds: usize,
+    ) -> Vec<GuestThreadSnapshot> {
+        let mut snapshots: BTreeMap<u32, GuestThreadSnapshot> = BTreeMap::new();
+        for _ in 0..rounds {
+            if contexts.is_empty() {
+                break;
+            }
+            let runs = session
+                .runtime
+                .dispatch_parallel_thread_contexts(&mut session.memory, contexts, budget)
+                .expect("dispatch concurrent thread contexts");
+            let mut unfinished = Vec::new();
+            for run in runs {
+                if run.context.state.rip == 0 {
+                    snapshots.insert(run.context.thread_id, run.context);
+                } else {
+                    snapshots.insert(run.context.thread_id, run.context.clone());
+                    unfinished.push(GuestThreadContext::from_snapshot(&run.context));
+                }
+            }
+            contexts = unfinished;
+        }
+        snapshots.into_values().collect()
+    }
+
+    #[test]
+    fn production_concurrent_lock_xadd_shared_counter_is_exact() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        const ITERATIONS: u32 = 100_000;
+        session.map_guest(SLICE_CODE, &lock_xadd_loop(SLICE_COUNTER_A));
+        session.map_guest(SLICE_COUNTER_A, &[0_u8; 4]);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let contexts = vec![
+            loop_context(0xE01, SLICE_CODE, SLICE_STACK_A, ITERATIONS),
+            loop_context(0xE02, SLICE_CODE, SLICE_STACK_B, ITERATIONS),
+        ];
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let snapshots = rerun_contexts(&mut session, contexts, u64::from(ITERATIONS) + 8, 3);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_eq!(snapshots.len(), 2, "both guest threads must report");
+        assert_eq!(
+            read_u32_guest(&session, SLICE_COUNTER_A),
+            ITERATIONS * 2,
+            "two threads atomically incrementing one shared counter must produce the exact total"
+        );
+        assert_eq!(
+            snapshots
+                .iter()
+                .filter(|snapshot| snapshot.state.rip == 0)
+                .count(),
+            2,
+            "both loops must reach the guest return with RIP 0"
+        );
+        assert_ne!(
+            after.worker_overlaps, before.worker_overlaps,
+            "the two slices must genuinely overlap on two host workers"
+        );
+    }
+
+    #[test]
+    fn lock_xadd_native_helper_boundary_mapped_add_and_unmapped_fault_are_exact() {
+        let _guard = test_guard();
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x10_000, &[0_u8; 0x1000]);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rcx, 5);
+        // SAFETY: live local CpuState/MemoryImage for the whole call; the
+        // cooperative branch aliases the MemoryImage, never a null pointer.
+        unsafe {
+            crate::jit::jit_helper_lock_xadd(
+                &mut state as *mut CpuState,
+                &mut memory as *mut MemoryImage,
+                0x10_100,
+                3,
+                4,
+                Register::Rcx.index() as u64,
+            );
+        }
+        assert_eq!(
+            state.get(Register::Rcx),
+            0,
+            "xadd returns the original value"
+        );
+        assert_eq!(
+            memory.read_u32(0x10_100).expect("counter mapped"),
+            3,
+            "xadd adds the source into the memory operand"
+        );
+        assert_eq!(state.jit_pending_fault, None);
+
+        let unmapped = 0xDEAD_0000_u64;
+        state.set(Register::Rcx, 7);
+        // SAFETY: same live locals; the address is deliberately unmapped to
+        // exercise the helper's precise fault channel.
+        unsafe {
+            crate::jit::jit_helper_lock_xadd(
+                &mut state as *mut CpuState,
+                &mut memory as *mut MemoryImage,
+                unmapped,
+                1,
+                4,
+                Register::Rcx.index() as u64,
+            );
+        }
+        assert_eq!(
+            state.jit_pending_fault,
+            Some(unmapped),
+            "an unmapped xadd must report the precise faulting address"
+        );
+        assert_eq!(state.jit_pending_fault_write, true);
+        assert_eq!(
+            state.get(Register::Rcx),
+            7,
+            "a faulted xadd must not modify the source register"
+        );
+    }
+
+    #[test]
+    fn concurrent_unaligned_atomic_rmw_across_words_is_exact() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        session.map_guest(0x40_000 & !0xfff, &vec![0_u8; 0x1000]);
+        let program = session
+            .runtime
+            .jit_runtime
+            .as_ref()
+            .expect("jit")
+            .build_slice_program(&session.memory);
+        let view = std::sync::Arc::clone(&program.memory);
+        const WORKERS: u64 = 4;
+        const PER_WORKER: u64 = 10_000;
+        let mut workers = Vec::new();
+        for _ in 0..WORKERS {
+            let view = std::sync::Arc::clone(&view);
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..PER_WORKER {
+                    view.atomic_fetch_add(SLICE_COUNTER_A + 7, 1, 4)
+                        .expect("mapped atomic range");
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("atomic RMW worker joined");
+        }
+        assert_eq!(
+            read_u32_guest(&session, SLICE_COUNTER_A + 7),
+            (WORKERS * PER_WORKER) as u32,
+            "an unaligned word-crossing atomic RMW must never lose an update"
+        );
+        assert_eq!(
+            read_u32_guest(&session, SLICE_COUNTER_A),
+            0,
+            "the RMW must preserve the bytes outside the 4-byte operand"
+        );
+    }
+
+    #[test]
+    fn production_two_parked_guest_threads_wake_simultaneously_without_deadlock() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        map_cp_continuation(&mut session);
+        let (first, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        let (second, _) = session
+            .runtime
+            .win32
+            .create_event(false, false, false, None);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let mut first_thread = synthetic_pending_thread(0x901, 0, GuestThreadState::Waiting);
+        first_thread.wait = Some(object_wait(first));
+        let mut second_thread = synthetic_pending_thread(0x902, 0, GuestThreadState::Waiting);
+        second_thread.wait = Some(object_wait(second));
+        assert!(
+            session
+                .runtime
+                .start_production_wait(0x901, &object_wait(first))
+        );
+        assert!(
+            session
+                .runtime
+                .start_production_wait(0x902, &object_wait(second))
+        );
+        session
+            .runtime
+            .pending_guest_threads
+            .push_back(first_thread);
+        session
+            .runtime
+            .pending_guest_threads
+            .push_back(second_thread);
+        assert_eq!(
+            session.runtime.production_waits.len(),
+            2,
+            "both guest waits must be owned by native workers simultaneously"
+        );
+        wait_until_worker_active(&session, 2);
+        session
+            .runtime
+            .win32
+            .set_event(first)
+            .expect("signal first");
+        session
+            .runtime
+            .win32
+            .set_event(second)
+            .expect("signal second");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !session.runtime.production_waits.is_empty() {
+            let scheduler = session
+                .runtime
+                .production_scheduler
+                .as_ref()
+                .expect("production scheduler");
+            assert!(
+                scheduler.wait_for_completion(Some(std::time::Duration::from_millis(500))),
+                "a native waiter must report its wake"
+            );
+            let _ = session
+                .runtime
+                .reap_production_completions(&mut session.memory)
+                .expect("reap both waiter completions");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "two simultaneous guest waits must both wake (no deadlock)"
+            );
+        }
+        assert_eq!(
+            session.runtime.production_waits.len(),
+            0,
+            "both native wait jobs must complete"
+        );
+        assert_eq!(
+            session
+                .runtime
+                .pending_guest_threads
+                .iter()
+                .filter(|thread| thread.wait_resume.is_some())
+                .count(),
+            2,
+            "both parked guest threads must be resumed exactly once"
+        );
+    }
+
+    #[test]
+    fn production_process_gate_concurrent_operations_are_serialized() {
+        let shared = std::sync::Arc::new(ProcessShared::new());
+        let inside = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let shared = std::sync::Arc::clone(&shared);
+            let inside = std::sync::Arc::clone(&inside);
+            let peak = std::sync::Arc::clone(&peak);
+            let completed = std::sync::Arc::clone(&completed);
+            workers.push(std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
+                for _ in 0..500 {
+                    shared.with_process(|| {
+                        let current = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("process-gate worker joined");
+        }
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            2_000,
+            "every process operation must complete exactly once"
+        );
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two guest threads must never hold the process gate concurrently"
+        );
+        assert_eq!(
+            shared.process_operations(),
+            2_000,
+            "the process gate must account for every operation"
+        );
+    }
+
+    #[test]
+    fn production_concurrent_thread_start_and_exit_race_has_exact_totals() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        const ITERATIONS: u32 = 256;
+        session.map_guest(SLICE_CODE, &lock_xadd_loop(SLICE_COUNTER_A));
+        session.map_guest(SLICE_CODE_2, &lock_xadd_loop(SLICE_COUNTER_B));
+        session.map_guest(SLICE_COUNTER_A, &[0_u8; 4]);
+        session.map_guest(SLICE_COUNTER_B, &[0_u8; 4]);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        // Two rounds of freshly-started guest threads; each round starts both
+        // threads and lets them exit concurrently.
+        for _ in 0..2 {
+            let contexts = vec![
+                loop_context(0xE11, SLICE_CODE, SLICE_STACK_A, ITERATIONS),
+                loop_context(0xE12, SLICE_CODE_2, SLICE_STACK_B, ITERATIONS),
+            ];
+            let snapshots = rerun_contexts(&mut session, contexts, u64::from(ITERATIONS) + 8, 1);
+            assert_eq!(
+                snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.state.rip == 0)
+                    .count(),
+                2,
+                "both starting threads must exit cleanly in the same round"
+            );
+        }
+        assert_eq!(read_u32_guest(&session, SLICE_COUNTER_A), ITERATIONS * 2);
+        assert_eq!(read_u32_guest(&session, SLICE_COUNTER_B), ITERATIONS * 2);
+    }
+
+    #[test]
+    fn production_concurrent_contexts_isolate_tls_and_last_error() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        const ITERATIONS: u32 = 512;
+        const TEB_A: u64 = 0x20_000;
+        const TEB_B: u64 = 0x24_000;
+        session.map_guest(SLICE_CODE, &lock_xadd_loop(SLICE_COUNTER_A));
+        session.map_guest(SLICE_CODE_2, &lock_xadd_loop(SLICE_COUNTER_B));
+        session.map_guest(SLICE_COUNTER_A, &[0_u8; 4]);
+        session.map_guest(SLICE_COUNTER_B, &[0_u8; 4]);
+        session.map_guest(TEB_A, &[0_u8; 0x100]);
+        session.map_guest(TEB_B, &[0_u8; 0x100]);
+        session
+            .memory
+            .write_u32(TEB_A + teb_last_error_offset(GuestArch::X86), 0x1111);
+        session
+            .memory
+            .write_u32(TEB_B + teb_last_error_offset(GuestArch::X86), 0x2222);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let mut first = loop_context(0xE21, SLICE_CODE, SLICE_STACK_A, ITERATIONS);
+        first.teb_base = TEB_A;
+        first.tls_vector_ptr = 0x20_080;
+        first.tls_slots.insert(3, 0xAA00);
+        first.last_error = 0x1111;
+        let mut second = loop_context(0xE22, SLICE_CODE_2, SLICE_STACK_B, ITERATIONS);
+        second.teb_base = TEB_B;
+        second.tls_vector_ptr = 0x24_080;
+        second.tls_slots.insert(3, 0xBB00);
+        second.last_error = 0x2222;
+        let snapshots = rerun_contexts(&mut session, vec![first, second], 256, 2);
+        let by_thread: BTreeMap<u32, &GuestThreadSnapshot> = snapshots
+            .iter()
+            .map(|snapshot| (snapshot.thread_id, snapshot))
+            .collect();
+        assert_eq!(
+            by_thread[&0xE21].last_error, 0x1111,
+            "thread A's last error must stay private to thread A"
+        );
+        assert_eq!(
+            by_thread[&0xE22].last_error, 0x2222,
+            "thread B's last error must stay private to thread B"
+        );
+        assert_eq!(by_thread[&0xE21].tls_slots.get(&3), Some(&0xAA00));
+        assert_eq!(by_thread[&0xE22].tls_slots.get(&3), Some(&0xBB00));
+        assert_eq!(by_thread[&0xE21].teb_base, TEB_A);
+        assert_eq!(by_thread[&0xE22].teb_base, TEB_B);
+        assert_ne!(
+            session
+                .memory
+                .read_u32(TEB_A + teb_last_error_offset(GuestArch::X86))
+                .expect("TEB A readable"),
+            session
+                .memory
+                .read_u32(TEB_B + teb_last_error_offset(GuestArch::X86))
+                .expect("TEB B readable"),
+            "the two threads' TEB last-error slots must never alias"
+        );
+    }
+
+    #[test]
+    fn production_concurrent_smc_code_writes_invalidate_both_blocks() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        // Each block stores to its own first instruction and jumps back to
+        // itself; the worker must report the code write and the owner must
+        // invalidate the stale compiled block for both threads in one round.
+        for code in [SLICE_CODE, SLICE_CODE_2] {
+            session.map_guest(code & !0xfff, &vec![0_u8; 0x1000]);
+            let mut bytes = vec![0xC7, 0x05];
+            bytes.extend_from_slice(&(code as u32).to_le_bytes());
+            bytes.extend_from_slice(&0x9090_9090_u32.to_le_bytes());
+            bytes.extend_from_slice(&[0xEB, 0xFE]);
+            session.map_guest(code, &bytes);
+        }
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let contexts = vec![
+            loop_context(0xE31, SLICE_CODE, SLICE_STACK_A, 8),
+            loop_context(0xE32, SLICE_CODE_2, SLICE_STACK_B, 8),
+        ];
+        let runs = session
+            .runtime
+            .dispatch_parallel_thread_contexts(&mut session.memory, contexts, 8)
+            .expect("dispatch SMC writers");
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs.iter()
+                .all(|run| matches!(run.exit, GuestSliceExit::CodeWrite)),
+            "both concurrent self-modifying writers must stop at the code write"
+        );
+        // The code-write log belongs to the process-shared canonical store, so
+        // one completion may drain both threads' writes.  A sibling worker can
+        // also observe the other thread's epoch bump before it executes its own
+        // store, so the exact set is race-dependent; every recorded write must
+        // still be one of the two code addresses, and at least one must be
+        // recorded for the owner to invalidate.
+        let writes: Vec<(u64, usize)> = runs
+            .iter()
+            .flat_map(|run| run.code_writes.iter().copied())
+            .collect();
+        assert!(
+            !writes.is_empty(),
+            "the owner must receive at least the concurrent code-write address"
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(address, length)| {
+                    (*address == SLICE_CODE || *address == SLICE_CODE_2) && *length == 4
+                })
+                .count(),
+            writes.len(),
+            "every recorded concurrent code write must be an exact 4-byte store on a code page"
+        );
+        let jit = session.runtime.jit_runtime.as_ref().expect("jit");
+        assert!(jit.slice_block(SLICE_CODE).is_none());
+        assert!(jit.slice_block(SLICE_CODE_2).is_none());
+    }
+
+    #[test]
+    fn production_eight_concurrent_guest_threads_never_deadlock_and_count_exactly() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        const THREADS: u32 = 8;
+        const ITERATIONS: u32 = 25_000;
+        session.map_guest(SLICE_CODE, &lock_xadd_loop(SLICE_COUNTER_A));
+        session.map_guest(SLICE_COUNTER_A, &[0_u8; 4]);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 8 })
+        );
+        let contexts: Vec<GuestThreadContext> = (0..THREADS)
+            .map(|index| {
+                let rsp = 0x10_100 + u64::from(index) * 0x100;
+                loop_context(0xE40 + index, SLICE_CODE, rsp, ITERATIONS)
+            })
+            .collect();
+        let before = SCHEDULER_COUNTERS.snapshot();
+        let snapshots = rerun_contexts(&mut session, contexts, u64::from(ITERATIONS) + 8, 3);
+        let after = SCHEDULER_COUNTERS.snapshot();
+        assert_eq!(snapshots.len(), THREADS as usize);
+        assert_eq!(
+            read_u32_guest(&session, SLICE_COUNTER_A),
+            ITERATIONS * THREADS,
+            "eight concurrent guest threads must produce the exact shared total"
+        );
+        assert_eq!(
+            snapshots
+                .iter()
+                .filter(|snapshot| snapshot.state.rip == 0)
+                .count(),
+            THREADS as usize,
+            "every guest thread must finish (no deadlock)"
+        );
+        assert!(
+            after.max_concurrent_worker_jobs >= u64::from(THREADS),
+            "all eight guest threads must run on host workers simultaneously"
+        );
+        assert!(after.worker_overlaps > before.worker_overlaps);
+    }
+
     #[test]
     fn production_worker_barrier_never_double_dispatches_host_thunk() {
         // The owner's x86 thunk path runs the callback machinery, whose host
@@ -6670,12 +7342,13 @@ mod tests {
                 .build_slice_program(&session.memory),
         );
         let state = session.runtime.pending_guest_threads[0].state.clone();
+        session.runtime.process_shared.publish_program(program);
         let scheduler = session
             .runtime
             .production_scheduler
             .as_ref()
             .expect("production scheduler");
-        let _job = scheduler.submit_slice(0xD1, state, 0, program, u64::MAX, None);
+        let _job = scheduler.submit_slice(0xD1, state, 0, u64::MAX, None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while scheduler.active_job_count() == 0 {
             assert!(std::time::Instant::now() < deadline);
@@ -6830,6 +7503,7 @@ mod tests {
                 completion_ready: Condvar::new(),
                 shutdown: std::sync::atomic::AtomicBool::new(shutdown),
             }),
+            process_shared: Arc::new(ProcessShared::new()),
             workers: Vec::new(),
             worker_count,
         }
@@ -6860,14 +7534,18 @@ mod tests {
         state: CpuState,
         program: Arc<crate::jit::GuestSliceProgram>,
         budget: u64,
-    ) -> GuestSliceJob {
-        GuestSliceJob {
-            job_id: 0,
-            slot: GuestThreadSlot::new(thread_id, state),
-            program,
-            budget,
-            start: None,
-        }
+    ) -> (GuestSliceJob, Arc<ProcessShared>) {
+        let process_shared = Arc::new(ProcessShared::new());
+        process_shared.publish_program(program);
+        (
+            GuestSliceJob {
+                job_id: 0,
+                slot: GuestThreadSlot::new(thread_id, state),
+                budget,
+                start: None,
+            },
+            process_shared,
+        )
     }
 
     fn slice_completion(job_id: u64, thread_id: u32, state: CpuState) -> GuestSliceCompletion {
@@ -7145,9 +7823,11 @@ mod tests {
         program.blocks.insert(SLICE_STRAIGHT_CODE, block);
         let mut state = CpuState::new(GuestArch::X86);
         state.rip = SLICE_STRAIGHT_CODE;
+        let (job, process_shared) = slice_job(0x79, state, Arc::new(program), 4);
         let completion = run_guest_slice_job(
-            slice_job(0x79, state, Arc::new(program), 4),
+            job,
             &std::sync::atomic::AtomicBool::new(false),
+            &process_shared,
             0,
         );
         assert_eq!(
@@ -7162,7 +7842,7 @@ mod tests {
             "the straight-line block executed exactly once"
         );
         assert_eq!(
-            completion.slot.state.get(Register::Rax),
+            completion.slot.context.state.get(Register::Rax),
             0x1234,
             "the worker applied the block result before the barrier"
         );
@@ -7196,9 +7876,11 @@ mod tests {
         program.blocks.insert(SLICE_JUMPIF_CODE, block);
         let mut state = CpuState::new(GuestArch::X86);
         state.rip = SLICE_JUMPIF_CODE;
+        let (job, process_shared) = slice_job(0x7A, state, Arc::new(program), 4);
         let completion = run_guest_slice_job(
-            slice_job(0x7A, state, Arc::new(program), 4),
+            job,
             &std::sync::atomic::AtomicBool::new(false),
+            &process_shared,
             0,
         );
         assert_eq!(
@@ -7209,7 +7891,7 @@ mod tests {
             "conditional exit metadata loss must never fabricate a RIP"
         );
         assert_eq!(
-            completion.slot.state.rip, SLICE_JUMPIF_CODE,
+            completion.slot.context.state.rip, SLICE_JUMPIF_CODE,
             "the owner re-dispatches the original block address"
         );
     }

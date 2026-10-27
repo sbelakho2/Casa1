@@ -257,6 +257,287 @@ pub fn is_headless() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// GPU / present timestamp capture (audit P1 #5)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+#[link(name = "QuartzCore", kind = "framework")]
+unsafe extern "C" {
+    /// CoreAnimation's monotonic clock. `MTLCommandBuffer.GPUStartTime`,
+    /// `MTLCommandBuffer.GPUEndTime` and `CAMetalDrawable.presentedTime` are
+    /// all expressed on this clock, so it is the correlation source.
+    fn CACurrentMediaTime() -> f64;
+}
+
+/// Current CoreAnimation media time in seconds.
+///
+/// GPU and drawable timestamps share this time base. Returns `0.0` on
+/// non-macOS hosts, where Metal timestamp capture is unsupported.
+pub fn media_now_seconds() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: CACurrentMediaTime is a pure, thread-safe clock read.
+        unsafe { CACurrentMediaTime() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0.0
+    }
+}
+
+/// Result of reading `GPUStartTime`/`GPUEndTime` from a command buffer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GpuTimestampReading {
+    /// Real GPU timestamps in CoreAnimation media seconds.
+    Measured {
+        start_seconds: f64,
+        end_seconds: f64,
+    },
+    /// The command buffer has not completed or the driver reported no values.
+    MissingTimestamp { status: &'static str },
+    /// Metal timestamp capture is unavailable on this host.
+    UnsupportedDevice,
+}
+
+/// Result of reading `CAMetalDrawable.presentedTime`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PresentTimestampReading {
+    /// Real presentation timestamp in CoreAnimation media seconds.
+    Measured { presented_seconds: f64 },
+    /// The drawable was not presented (or the value is still zero).
+    MissingTimestamp,
+    /// Drawable presentation timestamps are unavailable on this host.
+    UnsupportedDevice,
+}
+
+fn command_buffer_status_name(status: metal::MTLCommandBufferStatus) -> &'static str {
+    match status {
+        metal::MTLCommandBufferStatus::NotEnqueued => "NotEnqueued",
+        metal::MTLCommandBufferStatus::Enqueued => "Enqueued",
+        metal::MTLCommandBufferStatus::Committed => "Committed",
+        metal::MTLCommandBufferStatus::Scheduled => "Scheduled",
+        metal::MTLCommandBufferStatus::Completed => "Completed",
+        metal::MTLCommandBufferStatus::Error => "Error",
+    }
+}
+
+/// Read real GPU start/end timestamps from a command buffer.
+///
+/// The values are only meaningful after the command buffer reaches
+/// `Completed`; before that the exact `MissingTimestamp` status is returned
+/// instead of fabricating a duration.
+#[cfg(target_os = "macos")]
+pub fn command_buffer_gpu_timestamps(
+    command_buffer: &metal::CommandBufferRef,
+) -> GpuTimestampReading {
+    let status = command_buffer.status();
+    if status != metal::MTLCommandBufferStatus::Completed {
+        return GpuTimestampReading::MissingTimestamp {
+            status: command_buffer_status_name(status),
+        };
+    }
+    let object = command_buffer.as_ptr() as *mut objc::runtime::Object;
+    // SAFETY: `object` is a live MTLCommandBuffer; both selectors return
+    // CFTimeInterval (double) and are valid after completion.
+    let start: f64 = unsafe { msg_send![object, GPUStartTime] };
+    let end: f64 = unsafe { msg_send![object, GPUEndTime] };
+    if !start.is_finite() || !end.is_finite() || start <= 0.0 || end <= 0.0 || end < start {
+        return GpuTimestampReading::MissingTimestamp {
+            status: "Completed",
+        };
+    }
+    GpuTimestampReading::Measured {
+        start_seconds: start,
+        end_seconds: end,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn command_buffer_gpu_timestamps(
+    _command_buffer: &metal::CommandBufferRef,
+) -> GpuTimestampReading {
+    GpuTimestampReading::UnsupportedDevice
+}
+
+/// Read a drawable's real presentation timestamp.
+#[cfg(target_os = "macos")]
+pub fn drawable_presented_timestamp(drawable: &metal::MetalDrawableRef) -> PresentTimestampReading {
+    let presented = drawable.presented_time();
+    if !presented.is_finite() || presented <= 0.0 {
+        return PresentTimestampReading::MissingTimestamp;
+    }
+    PresentTimestampReading::Measured {
+        presented_seconds: presented,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn drawable_presented_timestamp(
+    _drawable: &metal::MetalDrawableRef,
+) -> PresentTimestampReading {
+    PresentTimestampReading::UnsupportedDevice
+}
+
+/// Asynchronous GPU timing probe attached to a command buffer's completion
+/// handler. The command buffer keeps the handler alive; callers poll
+/// [`snapshot`](Self::snapshot) after the buffer completes.
+#[derive(Clone, Default)]
+pub struct GpuTimingProbe {
+    slot: std::sync::Arc<std::sync::Mutex<Option<GpuTimestampReading>>>,
+}
+
+impl GpuTimingProbe {
+    #[cfg(target_os = "macos")]
+    pub fn attach(command_buffer: &metal::CommandBufferRef) -> Self {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&slot);
+        let block = block::ConcreteBlock::new(move |buffer: &metal::CommandBufferRef| {
+            let reading = command_buffer_gpu_timestamps(buffer);
+            if let Ok(mut guard) = sink.lock() {
+                *guard = Some(reading);
+            }
+        });
+        let block = block.copy();
+        command_buffer.add_completed_handler(&block);
+        Self { slot }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn attach(_command_buffer: &metal::CommandBufferRef) -> Self {
+        Self::default()
+    }
+
+    /// Seed a probe with a known reading (synthetic command-buffer timing).
+    pub fn with_reading(reading: GpuTimestampReading) -> Self {
+        Self {
+            slot: std::sync::Arc::new(std::sync::Mutex::new(Some(reading))),
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<GpuTimestampReading> {
+        self.slot.lock().ok().and_then(|guard| *guard)
+    }
+}
+
+/// Asynchronous drawable presentation-timestamp probe.
+#[derive(Clone, Default)]
+pub struct DrawableTimingProbe {
+    slot: std::sync::Arc<std::sync::Mutex<Option<PresentTimestampReading>>>,
+}
+
+impl DrawableTimingProbe {
+    #[cfg(target_os = "macos")]
+    pub fn attach(drawable: &metal::MetalDrawableRef) -> Self {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&slot);
+        let block = block::ConcreteBlock::new(move |drawable: &metal::DrawableRef| {
+            let presented = drawable.presented_time();
+            let reading = if presented.is_finite() && presented > 0.0 {
+                PresentTimestampReading::Measured {
+                    presented_seconds: presented,
+                }
+            } else {
+                PresentTimestampReading::MissingTimestamp
+            };
+            if let Ok(mut guard) = sink.lock() {
+                *guard = Some(reading);
+            }
+        });
+        let block = block.copy();
+        drawable.add_presented_handler(&block);
+        Self { slot }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn attach(_drawable: &metal::MetalDrawableRef) -> Self {
+        Self::default()
+    }
+
+    /// Seed a probe with a known reading (synthetic presentation timing).
+    pub fn with_reading(reading: PresentTimestampReading) -> Self {
+        Self {
+            slot: std::sync::Arc::new(std::sync::Mutex::new(Some(reading))),
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<PresentTimestampReading> {
+        self.slot.lock().ok().and_then(|guard| *guard)
+    }
+}
+
+/// Timing captured from the most recent present submitted on this thread.
+#[derive(Clone, Default)]
+pub struct PresentTimingProbe {
+    /// CoreAnimation media time at submission start.
+    pub submitted_seconds: Option<f64>,
+    /// GPU completion probe for the presentation command buffer.
+    pub gpu: Option<GpuTimingProbe>,
+    /// Drawable presentation probe.
+    pub drawable: Option<DrawableTimingProbe>,
+}
+
+static PRESENT_TIMING_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    static LAST_PRESENT_TIMING: std::cell::RefCell<Option<PresentTimingProbe>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Enable/disable present-timestamp probes. Disabled by default so the normal
+/// present path pays no handler or thread-local cost. The performance harness
+/// enables this only for its measurement window.
+pub fn set_present_timing_enabled(enabled: bool) {
+    PRESENT_TIMING_ENABLED.store(enabled, Ordering::Relaxed);
+    if !enabled {
+        clear_last_present_timing();
+    }
+}
+
+pub fn present_timing_enabled() -> bool {
+    PRESENT_TIMING_ENABLED.load(Ordering::Relaxed)
+}
+
+fn record_last_present_timing(probe: PresentTimingProbe) {
+    if !present_timing_enabled() {
+        return;
+    }
+    LAST_PRESENT_TIMING.with(|slot| {
+        if let Ok(mut guard) = slot.try_borrow_mut() {
+            *guard = Some(probe);
+        }
+    });
+}
+
+/// Take (and clear) the timing probes submitted by the most recent present on
+/// this thread. Returns `None` when timing capture is disabled or the present
+/// did not submit GPU work (for example a headless present with no drawable).
+pub fn take_last_present_timing() -> Option<PresentTimingProbe> {
+    LAST_PRESENT_TIMING.with(|slot| slot.borrow_mut().take())
+}
+
+pub fn clear_last_present_timing() {
+    LAST_PRESENT_TIMING.with(|slot| {
+        if let Ok(mut guard) = slot.try_borrow_mut() {
+            *guard = None;
+        }
+    });
+}
+
+fn begin_present_timing_probe(command_buffer: &metal::CommandBufferRef) -> PresentTimingProbe {
+    PresentTimingProbe {
+        submitted_seconds: Some(media_now_seconds()),
+        gpu: Some(GpuTimingProbe::attach(command_buffer)),
+        drawable: None,
+    }
+}
+
+fn finish_present_timing_probe(mut probe: PresentTimingProbe, drawable: &metal::MetalDrawableRef) {
+    probe.drawable = Some(DrawableTimingProbe::attach(drawable));
+    record_last_present_timing(probe);
+}
+
+// ---------------------------------------------------------------------------
 // Metal device wrapper
 // ---------------------------------------------------------------------------
 
@@ -3930,6 +4211,7 @@ kernel void bgra_to_nv12(texture2d<float, access::read> source [[texture(0)]],
         let device = self.luma.device();
         let queue = device.new_command_queue();
         let command_buffer = queue.new_command_buffer();
+        let timing = present_timing_enabled().then(|| begin_present_timing_probe(&command_buffer));
         {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.composite_pipeline);
@@ -3944,6 +4226,9 @@ kernel void bgra_to_nv12(texture2d<float, access::read> source [[texture(0)]],
         }
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+        if let Some(timing) = timing {
+            finish_present_timing_probe(timing, drawable);
+        }
         self.composite_passes.fetch_add(1, Ordering::Relaxed);
         self.drawable_binds.fetch_add(1, Ordering::Relaxed);
         Ok(true)
@@ -4132,6 +4417,7 @@ pub fn present_texture_to_layer(
     let device = source.device();
     let queue = device.new_command_queue();
     let command_buffer = queue.new_command_buffer();
+    let timing = present_timing_enabled().then(|| begin_present_timing_probe(&command_buffer));
     {
         let blit = command_buffer.new_blit_command_encoder();
         blit.copy_from_texture(
@@ -4153,6 +4439,9 @@ pub fn present_texture_to_layer(
     }
     command_buffer.present_drawable(drawable);
     command_buffer.commit();
+    if let Some(timing) = timing {
+        finish_present_timing_probe(timing, drawable);
+    }
     Ok(true)
 }
 
@@ -4206,6 +4495,7 @@ pub fn present_bytes_to_layer(
     );
     let queue = device.new_command_queue();
     let command_buffer = queue.new_command_buffer();
+    let timing = present_timing_enabled().then(|| begin_present_timing_probe(&command_buffer));
     {
         let blit = command_buffer.new_blit_command_encoder();
         blit.copy_from_buffer_to_texture(
@@ -4228,6 +4518,9 @@ pub fn present_bytes_to_layer(
     }
     command_buffer.present_drawable(drawable);
     command_buffer.commit();
+    if let Some(timing) = timing {
+        finish_present_timing_probe(timing, drawable);
+    }
     Ok(true)
 }
 
@@ -29687,5 +29980,122 @@ declare void @ray.storePayloadField(i32, ...)
                 depth: 1
             }
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn command_buffer_gpu_timestamp_fallback_is_exact_before_submission() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        assert_eq!(
+            command_buffer_gpu_timestamps(command_buffer),
+            GpuTimestampReading::MissingTimestamp {
+                status: "NotEnqueued"
+            }
+        );
+    }
+
+    #[test]
+    fn gpu_timing_probe_missing_snapshot_is_none_and_known_reading_is_exact() {
+        let probe = GpuTimingProbe::with_reading(GpuTimestampReading::Measured {
+            start_seconds: 1.0,
+            end_seconds: 1.002,
+        });
+        assert_eq!(
+            probe.snapshot(),
+            Some(GpuTimestampReading::Measured {
+                start_seconds: 1.0,
+                end_seconds: 1.002
+            })
+        );
+        assert_eq!(GpuTimingProbe::default().snapshot(), None);
+
+        let drawable = DrawableTimingProbe::with_reading(PresentTimestampReading::Measured {
+            presented_seconds: 3.0,
+        });
+        assert_eq!(
+            drawable.snapshot(),
+            Some(PresentTimestampReading::Measured {
+                presented_seconds: 3.0
+            })
+        );
+        assert_eq!(DrawableTimingProbe::default().snapshot(), None);
+    }
+
+    #[test]
+    fn present_timing_disabled_capture_is_none_and_enabled_take_clears_stale_probe() {
+        set_present_timing_enabled(false);
+        record_last_present_timing(PresentTimingProbe::default());
+        assert!(take_last_present_timing().is_none());
+
+        set_present_timing_enabled(true);
+        record_last_present_timing(PresentTimingProbe {
+            submitted_seconds: Some(2.0),
+            gpu: None,
+            drawable: None,
+        });
+        let taken = take_last_present_timing().expect("enabled capture");
+        assert_eq!(taken.submitted_seconds, Some(2.0));
+        assert!(take_last_present_timing().is_none());
+
+        record_last_present_timing(PresentTimingProbe::default());
+        set_present_timing_enabled(false);
+        assert!(take_last_present_timing().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drawable_presented_timestamp_before_presentation_is_missing_exact() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let layer = metal::MetalLayer::new();
+        layer.set_device(&device);
+        layer.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        layer.set_drawable_size(core_graphics_types::geometry::CGSize {
+            width: 8.0,
+            height: 8.0,
+        });
+        let Some(drawable) = layer.next_drawable() else {
+            return;
+        };
+        assert_eq!(
+            drawable_presented_timestamp(drawable),
+            PresentTimestampReading::MissingTimestamp
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cametal_layer_timing_probe_rejects_fabricated_timing_when_present_is_absent() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let mut channel = IoSurfacePresentChannel::new(8, 8, metal::MTLPixelFormat::BGRA8Unorm)
+            .expect("IOSurface present channel");
+        let texture = channel.metal_texture().expect("aliasing texture");
+        let layer = metal::MetalLayer::new();
+        layer.set_device(&device);
+        layer.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        layer.set_drawable_size(core_graphics_types::geometry::CGSize {
+            width: 8.0,
+            height: 8.0,
+        });
+        set_present_timing_enabled(true);
+        clear_last_present_timing();
+        match present_texture_to_layer(texture, &layer) {
+            Ok(true) => {
+                let probe = take_last_present_timing().expect("submitted present timing probe");
+                assert_eq!(probe.submitted_seconds.is_some(), true);
+                assert_eq!(probe.gpu.is_some(), true);
+                assert_eq!(probe.drawable.is_some(), true);
+            }
+            Ok(false) => assert!(take_last_present_timing().is_none()),
+            Err(error) => panic!("unexpected CAMetalLayer present error: {error:?}"),
+        }
+        set_present_timing_enabled(false);
     }
 }

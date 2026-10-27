@@ -2872,6 +2872,17 @@ fn gate_frame_metrics() -> Result<GateFrameMetrics, String> {
     })
 }
 
+fn gate_gpu_present_metrics() -> Result<BTreeMap<String, serde_json::Value>, String> {
+    use casa1::perf::{GpuPresentRecorder, measure_gpu_present_into};
+
+    let mut recorder = GpuPresentRecorder::new();
+    measure_gpu_present_into(&mut recorder, 256)?;
+    let mut metrics = recorder.summary().to_json_metrics();
+    metrics.remove("shader_compile_stall_rate_measured");
+    metrics.remove("guest_instructions_per_sec");
+    Ok(metrics)
+}
+
 fn gate_pso_metrics() -> Result<(f64, f64), String> {
     use casa1::metal_backend::MetalGpuBackend;
 
@@ -3063,6 +3074,18 @@ fn bench_gate_kpis(c: &mut Criterion) {
     use std::collections::BTreeMap;
 
     let mut metrics: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    match gate_gpu_present_metrics() {
+        Ok(gpu_metrics) => {
+            for (key, value) in gpu_metrics {
+                metrics.insert(key, value);
+            }
+        }
+        Err(reason) => {
+            for key in casa1::perf::GPU_PRESENT_METRIC_KEYS {
+                metrics.insert(key.to_string(), gate_kpi_missing(reason.clone()));
+            }
+        }
+    }
     let jit_ready = casa1::jit::jit_execution_available();
 
     if jit_ready {
@@ -3350,11 +3373,21 @@ fn bench_gate_kpis(c: &mut Criterion) {
                     "shader::compile_with_cache over two cache-warm requests",
                 ),
             );
+            metrics.insert(
+                "shader_compile_stall_rate_measured".to_string(),
+                gate_kpi_ok(
+                    cold,
+                    "stalls/request",
+                    "lower",
+                    "shader::compile_with_cache cold requests in the measurement window",
+                ),
+            );
         }
         Err(reason) => {
             for key in [
                 "shader_compile_stall_rate_cold",
                 "shader_compile_stall_rate_warm",
+                "shader_compile_stall_rate_measured",
             ] {
                 metrics.insert(key.to_string(), gate_kpi_missing(reason.clone()));
             }
@@ -3426,19 +3459,28 @@ fn bench_gate_kpis(c: &mut Criterion) {
                     "execute_ir NOP dispatch, 1024-instruction block, 1000 iterations",
                 ),
             );
+            metrics.insert(
+                "guest_instructions_per_sec".to_string(),
+                gate_kpi_ok(
+                    mips * 1_000_000.0,
+                    "guest instructions/s",
+                    "higher",
+                    "execute_ir NOP dispatch, 1024-instruction block, 1000 iterations",
+                ),
+            );
         } else {
             metrics.insert(
                 "legacy_dispatch_mips".to_string(),
+                gate_kpi_missing("legacy dispatch measurement elapsed in zero time"),
+            );
+            metrics.insert(
+                "guest_instructions_per_sec".to_string(),
                 gate_kpi_missing("legacy dispatch measurement elapsed in zero time"),
             );
         }
     }
 
     for (key, reason) in [
-        (
-            "gpu_idle_gap_us",
-            "no GPU completion-timestamp history is retained; the queue exposes drain callbacks only, so inter-frame GPU idle gaps cannot be measured without a new timestamp query path",
-        ),
         (
             "residency_churn_per_1000_frames",
             "MTLResidencySet exposes membership and allocated size but no add/remove event counter, and the backend does not record commit churn",

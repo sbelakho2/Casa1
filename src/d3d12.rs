@@ -442,6 +442,146 @@ impl std::fmt::Debug for D3d12MetalRayTracing {
     }
 }
 
+/// Real timing for one swapchain present.
+///
+/// The GPU and drawable probes are populated only when the caller marked the
+/// frame for timing (`mark_input_event` / `enable_present_timing`) before
+/// calling [`D3d12Runtime::present`]. Durations come from real Metal
+/// `GPUStartTime`/`GPUEndTime` and `CAMetalDrawable.presentedTime` values, never
+/// from CPU bookkeeping.
+#[derive(Clone, Default)]
+pub struct D3d12PresentTiming {
+    /// CoreAnimation media time of the input event correlated with this frame.
+    pub input_seconds: Option<f64>,
+    /// CoreAnimation media time at command submission.
+    pub submitted_seconds: Option<f64>,
+    pub gpu: Option<crate::metal_backend::GpuTimingProbe>,
+    pub drawable: Option<crate::metal_backend::DrawableTimingProbe>,
+}
+
+impl std::fmt::Debug for D3d12PresentTiming {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("D3d12PresentTiming")
+            .field("input_seconds", &self.input_seconds)
+            .field("submitted_seconds", &self.submitted_seconds)
+            .field("has_gpu_probe", &self.gpu.is_some())
+            .field("has_drawable_probe", &self.drawable.is_some())
+            .finish()
+    }
+}
+
+fn seconds_delta_to_ns(start: f64, end: f64) -> Option<u64> {
+    let delta = (end - start) * 1_000_000_000.0;
+    if !delta.is_finite() || delta < 0.0 || delta > u64::MAX as f64 {
+        None
+    } else {
+        Some(delta.round() as u64)
+    }
+}
+
+impl D3d12PresentTiming {
+    /// Build a timing record from known values. Used by tests and by callers
+    /// that already own real timestamps.
+    pub fn from_seconds(
+        input_seconds: Option<f64>,
+        submitted_seconds: Option<f64>,
+        gpu_seconds: Option<(f64, f64)>,
+        presented_seconds: Option<f64>,
+    ) -> Self {
+        let gpu = gpu_seconds.map(|(start, end)| {
+            let reading = if start.is_finite() && end.is_finite() && start > 0.0 && end >= start {
+                crate::metal_backend::GpuTimestampReading::Measured {
+                    start_seconds: start,
+                    end_seconds: end,
+                }
+            } else {
+                crate::metal_backend::GpuTimestampReading::MissingTimestamp {
+                    status: "Completed",
+                }
+            };
+            crate::metal_backend::GpuTimingProbe::with_reading(reading)
+        });
+        let drawable = presented_seconds.map(|presented_seconds| {
+            let reading = if presented_seconds.is_finite() && presented_seconds > 0.0 {
+                crate::metal_backend::PresentTimestampReading::Measured { presented_seconds }
+            } else {
+                crate::metal_backend::PresentTimestampReading::MissingTimestamp
+            };
+            crate::metal_backend::DrawableTimingProbe::with_reading(reading)
+        });
+        Self {
+            input_seconds,
+            submitted_seconds,
+            gpu,
+            drawable,
+        }
+    }
+
+    pub fn gpu_seconds(&self) -> Option<(f64, f64)> {
+        match self.gpu.as_ref()?.snapshot()? {
+            crate::metal_backend::GpuTimestampReading::Measured {
+                start_seconds,
+                end_seconds,
+            } => Some((start_seconds, end_seconds)),
+            _ => None,
+        }
+    }
+
+    pub fn presented_seconds(&self) -> Option<f64> {
+        match self.drawable.as_ref()?.snapshot()? {
+            crate::metal_backend::PresentTimestampReading::Measured { presented_seconds } => {
+                Some(presented_seconds)
+            }
+            _ => None,
+        }
+    }
+
+    /// Real GPU execution time, or `None` when the timestamps are absent.
+    pub fn gpu_time_ns(&self) -> Option<u64> {
+        let (start, end) = self.gpu_seconds()?;
+        seconds_delta_to_ns(start, end)
+    }
+
+    /// Real input-event → drawable-presentation duration.
+    pub fn input_to_present_ns(&self) -> Option<u64> {
+        seconds_delta_to_ns(self.input_seconds?, self.presented_seconds()?)
+    }
+
+    /// Real input-event → GPU-completion duration.
+    pub fn input_to_gpu_completion_ns(&self) -> Option<u64> {
+        let (_, end) = self.gpu_seconds()?;
+        seconds_delta_to_ns(self.input_seconds?, end)
+    }
+
+    /// Exact reason the GPU timestamp is unavailable, or `None` when measured.
+    pub fn gpu_unavailable(&self) -> Option<crate::perf::TimingUnavailable> {
+        match self.gpu.as_ref().and_then(|probe| probe.snapshot()) {
+            Some(crate::metal_backend::GpuTimestampReading::Measured { .. }) => None,
+            Some(crate::metal_backend::GpuTimestampReading::UnsupportedDevice) => {
+                Some(crate::perf::TimingUnavailable::UnsupportedGpuTimestamp)
+            }
+            Some(crate::metal_backend::GpuTimestampReading::MissingTimestamp { .. }) | None => {
+                Some(crate::perf::TimingUnavailable::MissingGpuTimestamp)
+            }
+        }
+    }
+
+    /// Exact reason the drawable presentation timestamp is unavailable.
+    pub fn present_unavailable(&self) -> Option<crate::perf::TimingUnavailable> {
+        match self.drawable.as_ref().and_then(|probe| probe.snapshot()) {
+            Some(crate::metal_backend::PresentTimestampReading::Measured { .. }) => None,
+            Some(crate::metal_backend::PresentTimestampReading::UnsupportedDevice) => {
+                Some(crate::perf::TimingUnavailable::UnsupportedGpuTimestamp)
+            }
+            Some(crate::metal_backend::PresentTimestampReading::MissingTimestamp) => {
+                Some(crate::perf::TimingUnavailable::MissingPresentTimestamp)
+            }
+            None => Some(crate::perf::TimingUnavailable::NoDrawable),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct D3d12Runtime {
     backend: GraphicsBackend,
@@ -569,6 +709,12 @@ pub struct D3d12Runtime {
     metal4_batch_last_error: Option<AppError>,
     /// Shared-event value of the most recent successful grouped submission.
     metal4_batch_last_event: Option<u64>,
+    /// Input-event timestamp for the next timed present.
+    pending_present_input_seconds: Option<f64>,
+    /// True when the caller asked for timing on the next present.
+    present_timing_requested: bool,
+    /// Timing of the most recent real present, when timing was requested.
+    last_present_timing: Option<D3d12PresentTiming>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -797,6 +943,9 @@ impl Default for D3d12Runtime {
             metal4_batch_fallbacks: 0,
             metal4_batch_last_error: None,
             metal4_batch_last_event: None,
+            pending_present_input_seconds: None,
+            present_timing_requested: false,
+            last_present_timing: None,
         }
     }
 }
@@ -866,6 +1015,9 @@ impl D3d12Runtime {
             metal4_batch_fallbacks: 0,
             metal4_batch_last_error: None,
             metal4_batch_last_event: None,
+            pending_present_input_seconds: None,
+            present_timing_requested: false,
+            last_present_timing: None,
         }
     }
 
@@ -1467,12 +1619,39 @@ impl D3d12Runtime {
         Ok(())
     }
 
+    /// Mark the next present as correlated with an input event. This enables
+    /// real Metal GPU/drawable timing for exactly that present.
+    pub fn mark_input_event(&mut self) {
+        self.pending_present_input_seconds = Some(crate::metal_backend::media_now_seconds());
+        self.present_timing_requested = true;
+    }
+
+    /// Request GPU/drawable timing for the next present without an input
+    /// correlation.
+    pub fn enable_present_timing(&mut self) {
+        self.present_timing_requested = true;
+    }
+
+    /// Timing for the most recent present, when timing was requested.
+    pub fn last_present_timing(&self) -> Option<&D3d12PresentTiming> {
+        self.last_present_timing.as_ref()
+    }
+
+    /// Take the most recent present timing, leaving the slot empty.
+    pub fn take_last_present_timing(&mut self) -> Option<D3d12PresentTiming> {
+        self.last_present_timing.take()
+    }
+
     pub fn present(
         &mut self,
         swapchain: SwapchainId,
         sync_interval: u32,
         allow_tearing: bool,
     ) -> AppResult<PresentResult> {
+        let input_seconds = self.pending_present_input_seconds.take();
+        let timing_requested = self.present_timing_requested || input_seconds.is_some();
+        self.present_timing_requested = false;
+        self.last_present_timing = None;
         let state = self.backend.swapchain_state(swapchain)?;
         let backbuffer_ids = state.backbuffers.clone();
         let is_primary = self.present_swapchain == Some(swapchain);
@@ -1598,9 +1777,27 @@ impl D3d12Runtime {
             self.fallback_uploads += backbuffer_ids.len() as u64;
         }
         let used_metalfx = metalfx_output.is_some();
+        if timing_requested {
+            crate::metal_backend::clear_last_present_timing();
+            crate::metal_backend::set_present_timing_enabled(true);
+        }
         let result = self
             .backend
             .present(swapchain, sync_interval, allow_tearing);
+        if timing_requested {
+            if result.is_ok()
+                && let Some(probe) = crate::metal_backend::take_last_present_timing()
+            {
+                self.last_present_timing = Some(D3d12PresentTiming {
+                    input_seconds,
+                    submitted_seconds: probe.submitted_seconds,
+                    gpu: probe.gpu,
+                    drawable: probe.drawable,
+                });
+            }
+            crate::metal_backend::set_present_timing_enabled(false);
+            crate::metal_backend::clear_last_present_timing();
+        }
         if result.is_ok() {
             if used_metalfx {
                 self.metalfx_scaled_presents += 1;
@@ -14288,5 +14485,106 @@ entry:
         );
         assert_eq!(runtime.metal4_batch_fallbacks(), 1);
         assert_eq!(runtime.metal4_batch_last_error(), None);
+    }
+
+    #[test]
+    fn d3d12_present_timing_correlation_rejects_out_of_order_and_pins_known_samples() {
+        let timing = D3d12PresentTiming::from_seconds(
+            Some(10.0),
+            Some(10.0005),
+            Some((10.002, 10.004)),
+            Some(10.003),
+        );
+        assert_eq!(timing.gpu_time_ns(), Some(2_000_000));
+        assert_eq!(timing.input_to_present_ns(), Some(3_000_000));
+        assert_eq!(timing.input_to_gpu_completion_ns(), Some(4_000_000));
+        assert_eq!(timing.gpu_unavailable(), None);
+        assert_eq!(timing.present_unavailable(), None);
+
+        let reversed = D3d12PresentTiming::from_seconds(
+            Some(10.0),
+            Some(10.0005),
+            Some((10.004, 10.002)),
+            Some(10.003),
+        );
+        assert_eq!(reversed.gpu_time_ns(), None);
+        assert_eq!(
+            reversed.gpu_unavailable(),
+            Some(crate::perf::TimingUnavailable::MissingGpuTimestamp)
+        );
+    }
+
+    #[test]
+    fn d3d12_present_timing_missing_timestamps_report_exact_fallback() {
+        let missing_present = D3d12PresentTiming::from_seconds(
+            Some(10.0),
+            Some(10.001),
+            Some((10.002, 10.004)),
+            None,
+        );
+        assert_eq!(
+            missing_present.present_unavailable(),
+            Some(crate::perf::TimingUnavailable::NoDrawable)
+        );
+        assert_eq!(missing_present.input_to_present_ns(), None);
+
+        let zero_present = D3d12PresentTiming {
+            input_seconds: Some(10.0),
+            submitted_seconds: Some(10.001),
+            gpu: None,
+            drawable: Some(crate::metal_backend::DrawableTimingProbe::with_reading(
+                crate::metal_backend::PresentTimestampReading::MissingTimestamp,
+            )),
+        };
+        assert_eq!(
+            zero_present.present_unavailable(),
+            Some(crate::perf::TimingUnavailable::MissingPresentTimestamp)
+        );
+        assert_eq!(
+            zero_present.present_unavailable().expect("reason").reason(),
+            "CAMetalLayer drawable reported presentedTime=0; no display presentation occurred"
+        );
+
+        let unsupported = D3d12PresentTiming {
+            input_seconds: Some(10.0),
+            submitted_seconds: Some(10.001),
+            gpu: Some(crate::metal_backend::GpuTimingProbe::with_reading(
+                crate::metal_backend::GpuTimestampReading::UnsupportedDevice,
+            )),
+            drawable: None,
+        };
+        assert_eq!(
+            unsupported.gpu_unavailable(),
+            Some(crate::perf::TimingUnavailable::UnsupportedGpuTimestamp)
+        );
+        assert_eq!(unsupported.gpu_time_ns(), None);
+
+        let no_gpu = D3d12PresentTiming::from_seconds(Some(10.0), Some(10.001), None, None);
+        assert_eq!(
+            no_gpu.gpu_unavailable(),
+            Some(crate::perf::TimingUnavailable::MissingGpuTimestamp)
+        );
+        assert_eq!(no_gpu.input_to_gpu_completion_ns(), None);
+    }
+
+    #[test]
+    fn d3d12_present_timing_request_is_cleared_by_invalid_present_without_stale_state() {
+        let mut runtime = D3d12Runtime::new();
+        assert!(runtime.last_present_timing().is_none());
+        runtime.mark_input_event();
+        assert!(runtime.present_timing_requested);
+        assert_eq!(runtime.pending_present_input_seconds.is_some(), true);
+        let error = runtime
+            .present(9999, 1, false)
+            .expect_err("an unknown swapchain must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(error.message, "unknown swapchain 9999");
+        assert_eq!(runtime.present_timing_requested, false);
+        runtime.enable_present_timing();
+        assert_eq!(runtime.present_timing_requested, true);
+        assert!(runtime.pending_present_input_seconds.is_none());
+        assert!(runtime.last_present_timing().is_none());
+        assert_eq!(crate::metal_backend::present_timing_enabled(), false);
+        assert!(runtime.take_last_present_timing().is_none());
     }
 }

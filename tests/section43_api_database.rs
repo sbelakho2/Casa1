@@ -11,11 +11,11 @@
 
 use casa1::api_database::{
     ApiCompletenessReport, ApiDatabase, ApiEntry, ApiGateViolationKind, CompatibilityTier,
-    CoverageLevel, SemanticFidelity, SubsystemCapability, WindowsVersion,
+    CoverageLevel, InterfaceMethodEntry, SemanticFidelity, SubsystemCapability, WindowsVersion,
 };
 use casa1::compatibility_profile::CompatibilityProfile;
 use casa1::host_thunks::{ImplementationLevel, SupportPolicy};
-use casa1::import_coverage::{WorkloadId, coverage_for_pe};
+use casa1::import_coverage::{coverage_for_pe, WorkloadId};
 use serde_json::Value;
 use std::path::Path;
 
@@ -174,6 +174,298 @@ fn database_seeds_interface_tables_at_runtime_levels() {
         .expect("IMFMediaSession entry");
     assert_eq!(session.implementation, ImplementationLevel::Implemented);
     assert!(!session.transitional);
+}
+
+#[test]
+fn method_level_rows_missing_proof_seed_restricted_not_exact() {
+    let database = ApiDatabase::from_thunk_metadata();
+    let create_buffer = database
+        .lookup_interface_method("d3d11.dll", "ID3D11Device", "CreateBuffer")
+        .expect("CreateBuffer must be seeded from the D3D11 vtable metadata");
+    assert_eq!(create_buffer.method, "CreateBuffer");
+    assert_eq!(
+        create_buffer.implementation,
+        ImplementationLevel::Partial,
+        "a dispatched method without method-level proof is not Implemented-exact"
+    );
+    assert_eq!(
+        create_buffer.semantic_fidelity,
+        SemanticFidelity::Restricted,
+        "methods without proof never seed Exact"
+    );
+    assert_eq!(
+        create_buffer.subsystem_capability,
+        SubsystemCapability::Partial,
+        "methods without proof never seed Full"
+    );
+    assert_eq!(
+        create_buffer.semantic_test_coverage,
+        CoverageLevel::None,
+        "no method-level evidence exists yet"
+    );
+    assert!(create_buffer.required);
+
+    let aggregate = database
+        .interface_aggregate_status("d3d11.dll", "ID3D11Device")
+        .expect("ID3D11Device aggregate");
+    assert_eq!(aggregate.method_count, 43);
+    assert_eq!(aggregate.required_count, 40);
+    assert_eq!(aggregate.semantic_fidelity, SemanticFidelity::Restricted);
+    assert_eq!(aggregate.subsystem_capability, SubsystemCapability::Partial);
+
+    assert_eq!(
+        database
+            .lookup_interface_method("d3d11.dll", "ID3D11Device", "NoSuchMethod")
+            .map(|method| method.method.as_str()),
+        None,
+        "unknown methods must not resolve"
+    );
+}
+
+#[test]
+fn interface_gate_rejects_overstated_aggregate_status() {
+    let mut database = ApiDatabase::new();
+    let mut entry = ApiEntry::new(
+        "d3d11.dll",
+        "ID3D11Device",
+        ImplementationLevel::Implemented,
+    );
+    entry.semantic_fidelity = SemanticFidelity::Exact;
+    entry.subsystem_capability = SubsystemCapability::Full;
+    database.add_entry(entry);
+    database.add_interface_method(InterfaceMethodEntry::new(
+        "d3d11.dll",
+        "ID3D11Device",
+        "CreateBuffer",
+        true,
+        ImplementationLevel::Partial,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        CoverageLevel::None,
+    ));
+    database.add_interface_method(InterfaceMethodEntry::new(
+        "d3d11.dll",
+        "ID3D11Device",
+        "CreateQuery",
+        true,
+        ImplementationLevel::Stub,
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        CoverageLevel::None,
+    ));
+
+    let aggregate = database
+        .interface_aggregate_status("d3d11.dll", "ID3D11Device")
+        .expect("aggregate");
+    assert_eq!(aggregate.implementation, ImplementationLevel::Stub);
+    assert_eq!(aggregate.semantic_fidelity, SemanticFidelity::CannedFailure);
+    assert_eq!(aggregate.subsystem_capability, SubsystemCapability::Absent);
+
+    let violations = database.interface_completeness_gate();
+    assert_eq!(
+        violations.len(),
+        2,
+        "both fidelity and capability overstatement must be reported"
+    );
+    assert!(
+        violations.iter().all(|violation| violation.kind
+            == ApiGateViolationKind::InterfaceAggregateOverstatesChildren),
+        "unexpected violation kinds: {violations:?}"
+    );
+}
+
+#[test]
+fn understated_interface_aggregate_is_not_flagged_as_an_error() {
+    let mut database = ApiDatabase::new();
+    let mut entry = ApiEntry::new("dxgi.dll", "IDXGIFactory", ImplementationLevel::Implemented);
+    entry.semantic_fidelity = SemanticFidelity::Restricted;
+    entry.subsystem_capability = SubsystemCapability::Partial;
+    database.add_entry(entry);
+    database.add_interface_method(InterfaceMethodEntry::new(
+        "dxgi.dll",
+        "IDXGIFactory",
+        "EnumAdapters",
+        false,
+        ImplementationLevel::Implemented,
+        SemanticFidelity::Exact,
+        SubsystemCapability::Full,
+        CoverageLevel::Conformance,
+    ));
+
+    let aggregate = database
+        .interface_aggregate_status("dxgi.dll", "IDXGIFactory")
+        .expect("aggregate");
+    assert_eq!(aggregate.required_count, 0);
+    assert_eq!(aggregate.semantic_fidelity, SemanticFidelity::Exact);
+    assert_eq!(aggregate.subsystem_capability, SubsystemCapability::Full);
+    assert_eq!(
+        database.interface_completeness_gate().len(),
+        0,
+        "a conservative (understated) aggregate must not fail the interface gate"
+    );
+}
+
+#[test]
+fn interface_gate_rejects_missing_method_rows() {
+    let mut database = ApiDatabase::new();
+    let mut entry = ApiEntry::new("dxgi.dll", "IDXGIFactory", ImplementationLevel::Implemented);
+    entry.semantic_fidelity = SemanticFidelity::Restricted;
+    entry.subsystem_capability = SubsystemCapability::Partial;
+    database.add_entry(entry);
+
+    let violations = database.interface_completeness_gate();
+    assert_eq!(
+        violations.len(),
+        1,
+        "a known interface without method rows must fail once"
+    );
+    assert_eq!(
+        violations[0].kind,
+        ApiGateViolationKind::InterfaceMethodRowsMissing
+    );
+}
+
+#[test]
+fn interface_gate_rejects_unknown_interface_method_rows() {
+    let mut database = ApiDatabase::new();
+    database.add_entry(ApiEntry::new(
+        "gpu.dll",
+        "IUnknownFake",
+        ImplementationLevel::Implemented,
+    ));
+    database.add_interface_method(InterfaceMethodEntry::new(
+        "gpu.dll",
+        "IUnknownFake",
+        "DoThing",
+        true,
+        ImplementationLevel::Partial,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        CoverageLevel::None,
+    ));
+
+    let violations = database.interface_completeness_gate();
+    assert_eq!(violations.len(), 1, "an unknown interface must fail once");
+    assert_eq!(violations[0].kind, ApiGateViolationKind::InterfaceUnknown);
+}
+
+#[test]
+fn seeded_interface_aggregates_missing_method_proof_never_overstate() {
+    let database = ApiDatabase::from_thunk_metadata();
+    for (dll, interface) in [
+        ("d3d11.dll", "ID3D11Device"),
+        ("d3d12.dll", "ID3D12Device"),
+        ("dxgi.dll", "IDXGIFactory"),
+    ] {
+        let entry = database
+            .lookup(dll, interface)
+            .unwrap_or_else(|| panic!("{dll}!{interface} entry"));
+        let aggregate = database
+            .interface_aggregate_status(dll, interface)
+            .unwrap_or_else(|| panic!("{dll}!{interface} aggregate"));
+        assert_eq!(
+            entry.semantic_fidelity, aggregate.semantic_fidelity,
+            "{dll}!{interface} aggregate fidelity must equal the worst child"
+        );
+        assert_eq!(
+            entry.subsystem_capability, aggregate.subsystem_capability,
+            "{dll}!{interface} aggregate capability must equal the worst child"
+        );
+        assert_eq!(aggregate.semantic_fidelity, SemanticFidelity::Restricted);
+        assert_eq!(aggregate.subsystem_capability, SubsystemCapability::Partial);
+    }
+    assert_eq!(
+        database.interface_completeness_gate().len(),
+        0,
+        "seeded aggregates must never overstate their method children"
+    );
+}
+
+#[test]
+fn method_level_deviations_are_counted_without_report_errors() {
+    let mut database = ApiDatabase::new();
+    database.add_entry(ApiEntry::new(
+        "d3d11.dll",
+        "ID3D11Device",
+        ImplementationLevel::Implemented,
+    ));
+    let rows = [
+        (
+            "ExactMethod",
+            ImplementationLevel::Implemented,
+            SemanticFidelity::Exact,
+            SubsystemCapability::Full,
+            CoverageLevel::Conformance,
+        ),
+        (
+            "RestrictedMethod",
+            ImplementationLevel::Partial,
+            SemanticFidelity::Restricted,
+            SubsystemCapability::Partial,
+            CoverageLevel::None,
+        ),
+        (
+            "ApproximateMethod",
+            ImplementationLevel::Partial,
+            SemanticFidelity::Approximate,
+            SubsystemCapability::Partial,
+            CoverageLevel::None,
+        ),
+        (
+            "SyntheticMethod",
+            ImplementationLevel::Partial,
+            SemanticFidelity::SyntheticEnvironment,
+            SubsystemCapability::Absent,
+            CoverageLevel::Unit,
+        ),
+        (
+            "CannedMethod",
+            ImplementationLevel::Unsupported,
+            SemanticFidelity::CannedFailure,
+            SubsystemCapability::Absent,
+            CoverageLevel::None,
+        ),
+    ];
+    for (method, implementation, fidelity, capability, coverage) in rows {
+        database.add_interface_method(InterfaceMethodEntry::new(
+            "d3d11.dll",
+            "ID3D11Device",
+            method,
+            true,
+            implementation,
+            fidelity,
+            capability,
+            coverage,
+        ));
+    }
+
+    let report = database.completeness_report();
+    let summary = report
+        .per_dll
+        .get("d3d11.dll")
+        .expect("d3d11 method summary");
+    assert_eq!(summary.method_total, 5);
+    assert_eq!(summary.method_exact, 1);
+    assert_eq!(summary.method_restricted, 1);
+    assert_eq!(summary.method_approximate, 1);
+    assert_eq!(summary.method_synthetic_environment, 1);
+    assert_eq!(summary.method_canned_failure, 1);
+    assert_eq!(summary.method_capability_full, 1);
+    assert_eq!(summary.method_capability_partial, 2);
+    assert_eq!(summary.method_capability_absent, 2);
+    assert_eq!(summary.method_covered, 2);
+    assert_eq!(summary.method_uncovered, 3);
+    assert_eq!(summary.method_deviations, 4);
+    assert_eq!(report.gate.method_deviations, 4);
+    assert_eq!(report.method_registry.len(), 5);
+    assert_eq!(
+        report.gate.interface_violation_count, 2,
+        "the default Exact/Full aggregate overstates both axes"
+    );
+    assert_eq!(
+        report.gate.interface_violations.len(),
+        report.gate.interface_violation_count
+    );
 }
 
 #[test]
@@ -336,16 +628,12 @@ fn deliberately_unsupported_clears_shipping_but_not_user_mode_completeness() {
     assert_eq!(shipping.len(), 2);
     assert_eq!(completeness.len(), 2);
     for violations in [&shipping, &completeness] {
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.kind == ApiGateViolationKind::StubNotDeliberatelyUnsupported)
-        );
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.kind == ApiGateViolationKind::UnsupportedNotDeliberatelyUnsupported)
-        );
+        assert!(violations
+            .iter()
+            .any(|v| v.kind == ApiGateViolationKind::StubNotDeliberatelyUnsupported));
+        assert!(violations
+            .iter()
+            .any(|v| v.kind == ApiGateViolationKind::UnsupportedNotDeliberatelyUnsupported));
     }
 
     // Registering the stub as deliberately unsupported with a guest-visible
@@ -492,6 +780,71 @@ fn record_workload_dedups_and_reports_found() {
 // ---------------------------------------------------------------------------
 // (f) Report generator
 // ---------------------------------------------------------------------------
+
+#[test]
+fn ledger_counts_include_method_level_deviations_without_error() {
+    let database = ApiDatabase::from_thunk_metadata();
+    let method_count = database.interface_methods().len();
+    assert_eq!(method_count, 810);
+    let ledger = database.compatibility_limitations_markdown();
+    assert_eq!(ledger.contains("Method-level accounting:"), true);
+    assert_eq!(
+        ledger.contains(&format!(
+            "{method_count} method rows, {method_count} deviate from exact/full"
+        )),
+        true,
+        "the generated ledger must count every method-level deviation"
+    );
+    let report = database.completeness_report();
+    assert_eq!(report.gate.method_deviations, method_count);
+}
+
+#[test]
+fn old_report_json_missing_method_fields_still_deserializes() {
+    let old = serde_json::json!({
+        "generated_at": "2026-01-01T00:00:00Z",
+        "per_dll": {
+            "kernel32.dll": {
+                "total": 1,
+                "implemented": 1,
+                "partial": 0,
+                "stub": 0,
+                "unsupported": 0,
+                "differential_tested": 0,
+                "conformance_tested": 0,
+                "transitional_partial": 0,
+                "exact": 1,
+                "restricted": 0,
+                "approximate": 0,
+                "synthetic_environment": 0,
+                "canned_failure": 0,
+                "capability_full": 1,
+                "capability_partial": 0,
+                "capability_absent": 0
+            }
+        },
+        "gate": {
+            "shipping_violations": [],
+            "shipping_violation_count": 0,
+            "completeness_violations": [],
+            "completeness_violation_count": 0
+        },
+        "registry": []
+    });
+    let report: ApiCompletenessReport =
+        serde_json::from_value(old).expect("old report JSON must still deserialize");
+    assert_eq!(report.method_registry.len(), 0);
+    assert_eq!(report.gate.interface_violation_count, 0);
+    assert_eq!(report.gate.method_deviations, 0);
+    assert_eq!(
+        report
+            .per_dll
+            .get("kernel32.dll")
+            .expect("per-DLL summary")
+            .method_total,
+        0
+    );
+}
 
 #[test]
 fn report_generator_emits_expected_json_shape() {

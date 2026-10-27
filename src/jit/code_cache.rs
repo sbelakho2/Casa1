@@ -1033,6 +1033,10 @@ pub(crate) struct GuestSliceMemory {
     /// Guest code-page writes observed by workers, drained by the runtime
     /// owner to invalidate stale compiled blocks before the next dispatch.
     pub(super) code_writes: Mutex<Vec<(u64, usize)>>,
+    /// Serializes RMW operations that span more than one canonical word.
+    /// Naturally aligned 1/2/4/8-byte read-modify-writes stay lock-free on
+    /// their word's atomic value.
+    pub(super) rmw_lock: Mutex<()>,
 }
 
 impl GuestSliceMemory {
@@ -1047,6 +1051,7 @@ impl GuestSliceMemory {
             fully_mapped,
             code_pages,
             code_writes: Mutex::new(Vec::new()),
+            rmw_lock: Mutex::new(()),
         }
     }
 
@@ -1178,6 +1183,72 @@ impl GuestSliceMemory {
                 .push((address, len));
         }
         Ok(touches_code)
+    }
+
+    /// Atomic read-modify-write add through the shared canonical store.
+    ///
+    /// Returns the value BEFORE the add (x86 `xadd` semantics) and whether the
+    /// modified range touched a compiled-code page.  A naturally aligned
+    /// access inside one canonical 8-byte word is a single lock-free atomic
+    /// update, so two guest threads executing `lock xadd [shared], reg`
+    /// concurrently can never lose an increment.  An access that spans two
+    /// words falls back to a process-wide RMW mutex.
+    pub(crate) fn atomic_fetch_add(
+        &self,
+        address: u64,
+        value: u64,
+        len: usize,
+    ) -> Result<(u64, bool), GuestMemoryFault> {
+        use std::sync::atomic::Ordering;
+        if len == 0 || len > 8 || !self.range_available(address, len) {
+            return Err(self.first_fault(address, len, true));
+        }
+        let word_base = address & !7;
+        let offset = (address - word_base) as usize;
+        let mask = if len == 8 {
+            u64::MAX
+        } else {
+            (1_u64 << (len * 8)) - 1
+        };
+        let within_word = offset + len <= 8;
+        let original = if within_word {
+            let field_mask = mask << (offset * 8);
+            let field_bits = value & mask;
+            let word = self.atomic_word(word_base);
+            if offset == 0 && len == 8 {
+                word.fetch_add(field_bits, Ordering::SeqCst)
+            } else {
+                let mut previous = 0_u64;
+                word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+                    previous = old;
+                    let field = (old >> (offset * 8)) & mask;
+                    let next = field.wrapping_add(field_bits) & mask;
+                    Some((old & !field_mask) | (next << (offset * 8)))
+                })
+                .expect("atomic guest-word update never fails");
+                (previous >> (offset * 8)) & mask
+            }
+        } else {
+            let _guard = self
+                .rmw_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = self.load(address, len)?;
+            self.store(address, &previous.wrapping_add(value).to_le_bytes()[..len])?;
+            previous
+        };
+        let touches_code = self
+            .code_pages
+            .range((address & !0xfff)..=((address + len as u64 - 1) & !0xfff))
+            .next()
+            .is_some();
+        if touches_code {
+            self.code_writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((address, len));
+        }
+        Ok((original, touches_code))
     }
 
     pub(crate) fn take_code_writes(&self) -> Vec<(u64, usize)> {

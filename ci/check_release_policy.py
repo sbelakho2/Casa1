@@ -287,6 +287,100 @@ def check_status_contexts(policy: dict, parsed: dict[str, dict[str, dict]]) -> l
     return errors
 
 
+def parse_extern_link_blocks(text: str) -> dict[str, set[str]]:
+    """Map each ``extern "C"`` symbol to the ``#[link(name = ...)]`` libraries
+    attached to its block.
+
+    This is a static check of the Windows reference's import libraries: it
+    cannot run a Windows linker here, but it can prove that ``CharUpperW`` is
+    linked through ``user32`` and ``snprintf`` through
+    ``legacy_stdio_definitions`` instead of surfacing as an unresolved
+    ``__imp_*`` symbol.
+    """
+    blocks: dict[str, set[str]] = {}
+    pending: list[str] = []
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        link = re.match(r'#\[link\(name\s*=\s*"([^"]+)"', line)
+        if link:
+            pending.append(link.group(1))
+            index += 1
+            continue
+        if line.startswith("#[") or not line or line.startswith("//"):
+            index += 1
+            continue
+        if re.match(r'(?:pub\s+)?(?:unsafe\s+)?extern\s+"C"\s*\{', line):
+            index += 1
+            while index < len(lines) and lines[index].strip() != "}":
+                symbol = re.match(
+                    r"\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)", lines[index]
+                )
+                if symbol:
+                    blocks.setdefault(symbol.group(1), set()).update(pending)
+                index += 1
+            pending = []
+            index += 1
+            continue
+        pending = []
+        index += 1
+    return blocks
+
+
+def check_windows_oracle(
+    policy: dict, parsed: dict[str, dict[str, dict]], root: pathlib.Path
+) -> list[str]:
+    errors: list[str] = []
+    contract = policy.get("contract") or {}
+    spec = contract.get("windows_oracle")
+    if not isinstance(spec, dict):
+        return ["contract.windows_oracle must describe the required oracle link check"]
+    workflow_rel = spec.get("workflow", ".github/workflows/windows-oracle.yml")
+    workflow = workflow_text(root, workflow_rel)
+    build_command = spec.get(
+        "build_command",
+        "cargo build --manifest-path windows_reference/Cargo.toml --release",
+    )
+    require_contains(errors, workflow_rel, workflow, [build_command, "toJSON(needs)"])
+    for category in spec.get("required_categories") or []:
+        if "--required-categories" not in workflow or category not in workflow:
+            errors.append(
+                f"{workflow_rel}: required differential category {category!r} is not "
+                "passed to --required-categories"
+            )
+    source = root / spec.get("source", "windows_reference/src/win32.rs")
+    if not source.is_file():
+        errors.append(f"Windows oracle link source missing: {source}")
+        return errors
+    blocks = parse_extern_link_blocks(read_text(source))
+    manifest_path = root / "ci" / "test-manifest.json"
+    manifest = read_text(manifest_path) if manifest_path.is_file() else ""
+    for item in spec.get("symbols") or []:
+        if not isinstance(item, dict):
+            errors.append("contract.windows_oracle.symbols entries must be objects")
+            continue
+        symbol = item.get("symbol", "")
+        library = item.get("library", "")
+        libraries = blocks.get(symbol)
+        if libraries is None:
+            errors.append(
+                f"windows_reference: symbol {symbol!r} is not declared in an extern block"
+            )
+        elif library not in libraries:
+            errors.append(
+                f"windows_reference: {symbol!r} is linked with {sorted(libraries)}, "
+                f"expected {library!r}"
+            )
+        category = item.get("category")
+        if category and f"windows-oracle:{category}" not in manifest:
+            errors.append(
+                f"windows_reference: {symbol!r} category {category!r} is not "
+                "covered by the compiled evidence manifest"
+            )
+    return errors
+
+
 def check_contract(policy: dict, parsed: dict[str, dict[str, dict]], root: pathlib.Path) -> list[str]:
     errors: list[str] = []
     contract = policy.get("contract") or {}
@@ -538,6 +632,7 @@ def check_contract(policy: dict, parsed: dict[str, dict[str, dict]], root: pathl
             errors.append(
                 f"manual_github_settings must document the server-side term {term!r}"
             )
+    errors.extend(check_windows_oracle(policy, parsed, root))
     return errors
 
 

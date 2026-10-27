@@ -371,6 +371,35 @@ the differential tests skip until a real Windows capture is available.
    does not compute or the capture does not cover — the workflow cannot
    succeed with untested categories.
 
+4. **oracle-gate** (`Windows Oracle`): an `if: always()` aggregate job that
+   requires all three stages and prints `toJSON(needs)`, so a skipped or
+   failed corpus/capture/compare stage can never be reported as success.
+   `Windows Oracle` is a required status check on `main` in
+   `ci/release-policy.json`, and `ci/check_release_policy.py` verifies the
+   aggregate job, the reference build command, and the required differential
+   categories.
+
+### 6.1 Link-library static check
+
+The reference links `CharUpperW` through `user32` and `snprintf` through the
+UCRT plus `legacy_stdio_definitions`; without those libraries MSVC leaves
+`__imp_CharUpperW` / `__imp_snprintf` unresolved at link time. The fix is
+verified statically (no Windows build is run in this repository) by
+`ci/check_release_policy.py`, which maps each symbol to the `#[link(name = …)]`
+libraries attached to its `extern "C"` block. The policy is data-driven:
+
+```json
+"windows_oracle": {
+  "symbols": [
+    {"symbol": "snprintf", "library": "legacy_stdio_definitions", "category": "crt_printf"},
+    {"symbol": "CharUpperW", "library": "user32", "category": "string_ops"}
+  ]
+}
+```
+
+A missing/moved declaration or a dropped library fails the `policy-check` job
+exactly like a missing required workflow job.
+
 The checked-in golden fixture is validated by the regular `cargo test
 --tests` run (`tests/section42_windows_oracle.rs`).
 

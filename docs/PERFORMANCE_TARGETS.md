@@ -59,9 +59,82 @@ ci/check_perf.sh --update
 # Adversarial self-tests for the gate itself (pass/regression/edge/CI/missing)
 ci/check_perf.sh --self-test
 
+# Machine-readable per-entry report and a configurable budget override
+ci/check_perf.sh --report-json target/perf-report.json \
+  --thresholds ci/perf-thresholds.json
+
 # In Kiwi-CI
 kiwi run --job perf
 ```
+
+`--report-json PATH` writes a schema-1 document with every gate id, its
+status (`PASS`, `REGRESSION`, `TARGET_EXCEEDED`, `BASELINE_PENDING`,
+`UNAVAILABLE`, `MISSING_BENCHMARK`, `BASELINE_MISMATCH`), detail text, and the
+final exit code. `--thresholds PATH` merges a JSON document over the built-in
+table and over already-loaded baseline entries, so a stricter or looser budget
+can be applied without regenerating the baseline:
+
+```json
+{
+  "timing": {"gate/kpi/frame_present_64x64": {"rel": 0.30, "abs": 250.0}},
+  "kpi": {"gpu_frame_time_p99_us": {"rel": 0.15, "abs": 250.0}}
+}
+```
+
+### Real GPU/present timestamps (audit P1 #5)
+
+`casa1::perf` now measures the whole input → submit → present → GPU
+completion chain with real timestamps instead of CPU bookkeeping:
+
+| Source | What is captured |
+|---|---|
+| `MTLCommandBuffer.GPUStartTime` / `GPUEndTime` | Real GPU execution interval for the presentation command buffer (seconds on the CoreAnimation media clock). |
+| `CAMetalDrawable.presentedTime` | Real display presentation timestamp, correlated with the input event on the same media clock. |
+| CPU submission window | `submit_start`/`submit_end` around encoder creation and `commit`. |
+| `CLOCK_PROCESS_CPUTIME_ID` | Real host process CPU time around the measured frame. |
+| Guest instruction counter | Real guest instructions retired divided by measured wall time. |
+
+`casa1::perf::measure_gpu_present_into` encodes a real Metal compute
+submission per frame, attaches a completion handler (`GpuTimingProbe`) and a
+drawable presented handler (`DrawableTimingProbe`), then correlates all four
+clocks. The same probes are exposed to the D3D12 swapchain through
+`D3d12Runtime::mark_input_event` / `enable_present_timing` and
+`D3d12PresentTiming`.
+
+Emitted KPIs (all real-sample only):
+
+| KPI | Unit | Direction | Notes |
+|---|---|---|---|
+| `gpu_frame_time_p50/p95/p99/p999_us` | µs | lower | Present-to-present intervals when a drawable timestamp exists, otherwise GPU completion intervals. |
+| `gpu_frame_time_1pct_low_fps`, `gpu_frame_time_0p1pct_low_fps` | fps | higher | Mean of the slowest 1 % / 0.1 % of real frame intervals. |
+| `gpu_time_p50_us`, `gpu_time_p99_us` | µs | lower | `GPUEndTime - GPUStartTime`. |
+| `cpu_submit_p50_us`, `cpu_submit_p99_us` | µs | lower | CPU encode + commit window. |
+| `input_to_present_p50_us`, `input_to_present_p99_us` | µs | lower | Input event → `presentedTime`; `absolute_max` 2000/5000 µs. |
+| `input_to_gpu_completion_p50/p99_us` | µs | lower | Input event → `GPUEndTime`. |
+| `host_cpu_time_p50_us` | µs | lower | Process CPU time around the frame. |
+| `shader_compile_stall_rate_measured` | stalls/request | lower | Measured in the same window as the shader-cache gate. |
+| `guest_instructions_per_sec` | instructions/s | higher | Real guest throughput sample. |
+| `gpu_idle_gap_us` | µs | lower | `next GPUStartTime - previous GPUEndTime`. |
+
+When a timestamp source is absent, the metric is emitted as
+`{"available": false, "reason": "<exact reason>"}` and never replaced by a
+wall-clock estimate. Exact fallbacks:
+
+| Condition | Reason |
+|---|---|
+| No Metal device | `no Metal device is available; GPU and drawable timestamps cannot be captured` |
+| Completed buffer without timestamps | `Metal command buffer completed without GPUStartTime/GPUEndTime timestamps` |
+| Unsupported host | `the Metal device does not expose command-buffer GPU timestamps` |
+| Headless layer | `CAMetalLayer.nextDrawable returned no drawable (headless presentation); drawable presentedTime is unavailable` |
+| Drawable not displayed | `CAMetalLayer drawable reported presentedTime=0; no display presentation occurred` |
+| No correlated input | `no input-event timestamp was correlated with the measured frames` |
+
+New timestamp KPIs are recorded as `available: false` in
+`ci/perf-baseline.json` until the first real capture. A run that observes real
+samples for such an entry prints `BASELINE_PENDING` and passes; after
+`ci/check_perf.sh --update` the entry is promoted and regressions fail with
+`REGRESSION`/`TARGET_EXCEEDED`. Unavailable metrics always pass with an
+`UNAVAILABLE` line.
 
 The script is `ci/check_perf.py`; `ci/check_perf.sh` is a thin wrapper. The
 default Criterion filter is `gate/kpi`. The script runs
@@ -178,7 +251,7 @@ recorded as unavailable in `ci/perf-baseline.json`, and printed by the gate as
 
 | Metric | Exact reason |
 |---|---|
-| GPU idle gaps (`kpi/gpu_idle_gap_us`) | No GPU completion-timestamp history is retained. The DirectStorage queue exposes drain callbacks only, so inter-frame GPU idle gaps cannot be measured without a new timestamp-query path. |
+| GPU idle gaps (`kpi/gpu_idle_gap_us`) | Measured once real `GPUStartTime`/`GPUEndTime` history exists (see above); the checked-in baseline is still the pre-capture unavailable entry until `--update`. |
 | Residency churn (`kpi/residency_churn_per_1000_frames`) | `MTLResidencySet` exposes membership and allocated size but no add/remove event counter, and the backend does not record commit churn. |
 | GPU heap faults (`kpi/gpu_heap_faults_per_1000_frames`) | Metal does not expose `MTLHeap` page-fault counts. The backend tracks staging fallbacks, not GPU page faults. |
 | Native-relative CPU ratio (`NATIVE_BASELINE`) | No native ARM64-equivalent reference binary/benchmark is checked in. Supply `ci/perf-native-baseline.json` to enable ratios; until then the gate prints `NATIVE_BASELINE unavailable`. |
@@ -209,3 +282,6 @@ exit code and diagnostic for:
 | KPI regression | exit 2, `REGRESSION` |
 | Explicitly unavailable KPI | exit 0, `UNAVAILABLE` |
 | Median above a documented `absolute_max` | exit 2, `TARGET_EXCEEDED` |
+| Real samples for an unavailable baseline entry | exit 0, `BASELINE_PENDING` |
+| Budget override loosens a failing threshold | exit 0, `PASS` |
+| Machine-readable report requested | `result=pass` with per-entry `PASS` |
