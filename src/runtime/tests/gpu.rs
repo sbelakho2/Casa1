@@ -3816,7 +3816,10 @@ fn d3d12_dml_create_device1_feature_level_and_device1_query_interface() {
         state.set(Register::Rsp, base + 0x100);
         state.set(Register::Rcx, device);
         state.set(Register::Rdx, 0);
-        state.set(Register::R8, 0x2000);
+        state.set(
+            Register::R8,
+            crate::d3d12::directml::DML_FEATURE_LEVEL_6_4 as u64,
+        );
         state.set(Register::R9, iid);
         memory.write_u64(base + 0x100, 0x1000_0300);
         memory.write_u64(base + 0x100 + 0x28, out);

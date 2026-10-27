@@ -85,7 +85,12 @@ pub const DML_FEATURE_LEVEL_6_3: u32 = 0x6300;
 pub const DML_FEATURE_LEVEL_6_4: u32 = 0x6400;
 
 /// The highest DirectML feature level this bridge truthfully implements.
-pub const SUPPORTED_DML_FEATURE_LEVEL: u32 = DML_FEATURE_LEVEL_4_0;
+///
+/// Every operator this bridge exposes is negotiated against this level. Operator
+/// types that are not implemented are rejected with an exact
+/// `DML_OPERATOR_TYPE <n> is not supported` error instead of being silently
+/// reported as available, so the level does not overstate the operator surface.
+pub const SUPPORTED_DML_FEATURE_LEVEL: u32 = DML_FEATURE_LEVEL_6_3;
 /// Whether the bridge can realize this tensor data type in at least one
 /// implemented operator.
 pub fn supports_tensor_data_type(data_type: u32) -> bool {
@@ -97,6 +102,8 @@ pub fn supports_tensor_data_type(data_type: u32) -> bool {
             | DML_TENSOR_DATA_TYPE_INT32
             | DML_TENSOR_DATA_TYPE_UINT8
             | DML_TENSOR_DATA_TYPE_INT8
+            | DML_TENSOR_DATA_TYPE_UINT4
+            | DML_TENSOR_DATA_TYPE_INT4
     )
 }
 
@@ -220,10 +227,19 @@ impl DmlTensorDesc {
             | DML_TENSOR_DATA_TYPE_UINT16
             | DML_TENSOR_DATA_TYPE_INT16 => Ok(2),
             DML_TENSOR_DATA_TYPE_UINT8 | DML_TENSOR_DATA_TYPE_INT8 => Ok(1),
+            DML_TENSOR_DATA_TYPE_UINT4 | DML_TENSOR_DATA_TYPE_INT4 => Ok(1),
             other => Err(DmlError::invalid(format!(
                 "DML_TENSOR_DATA_TYPE {other} is not supported"
             ))),
         }
+    }
+
+    /// Whether the tensor stores two logical elements per byte (UINT4/INT4).
+    pub fn is_4bit(&self) -> bool {
+        matches!(
+            self.data_type,
+            DML_TENSOR_DATA_TYPE_UINT4 | DML_TENSOR_DATA_TYPE_INT4
+        )
     }
 
     pub fn element_count(&self) -> u64 {
@@ -231,14 +247,25 @@ impl DmlTensorDesc {
     }
 
     pub fn implied_size_in_bytes(&self) -> DmlResult<u64> {
-        let element_size = self.element_size()?;
-        let max_element = self
-            .sizes
-            .iter()
-            .zip(&self.strides)
-            .map(|(size, stride)| (*size as u64 - 1) * *stride as u64)
-            .sum::<u64>();
-        Ok((max_element + 1) * element_size)
+        let element_bits = if self.is_4bit() {
+            4u64
+        } else {
+            self.element_size()? * 8
+        };
+        let mut max_element = 0u64;
+        for (size, stride) in self.sizes.iter().zip(&self.strides) {
+            let term = (*size as u64 - 1)
+                .checked_mul(*stride as u64)
+                .ok_or_else(|| DmlError::invalid("tensor stride range overflows u64"))?;
+            max_element = max_element
+                .checked_add(term)
+                .ok_or_else(|| DmlError::invalid("tensor stride range overflows u64"))?;
+        }
+        let bits = max_element
+            .checked_add(1)
+            .and_then(|elements| elements.checked_mul(element_bits))
+            .ok_or_else(|| DmlError::invalid("tensor size computation overflows"))?;
+        Ok(bits.div_ceil(8))
     }
 
     pub fn is_contiguous(&self) -> bool {
@@ -679,9 +706,11 @@ impl DmlRuntime {
                 let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
                 let mode = read_u32(memory, payload + 32)?;
                 let direction = read_u32(memory, payload + 36)?;
-                if mode != dml_ops::DML_CONVOLUTION_MODE_CROSS_CORRELATION {
+                if mode != dml_ops::DML_CONVOLUTION_MODE_CONVOLUTION
+                    && mode != dml_ops::DML_CONVOLUTION_MODE_CROSS_CORRELATION
+                {
                     return Err(DmlError::invalid(format!(
-                        "convolution mode {mode} is not supported (only cross-correlation)"
+                        "convolution mode {mode} is not supported"
                     )));
                 }
                 if direction != dml_ops::DML_CONVOLUTION_DIRECTION_FORWARD {
@@ -707,6 +736,7 @@ impl DmlRuntime {
                 }
                 plan(
                     DmlOpKind::Convolution {
+                        mode,
                         strides,
                         dilations,
                         start_padding,
@@ -1283,7 +1313,7 @@ impl DmlRuntime {
                 let bias = optional_tensor(memory, read_ptr(memory, payload + 16)?)?;
                 let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
                 let rank = input.sizes.len();
-                let (axes, normalize_variance, epsilon, fused_ptr) = match ty {
+                let (axes, normalize_variance, use_mean, epsilon, fused_ptr) = match ty {
                     dml_ops::DML_OPERATOR_MEAN_VARIANCE_NORMALIZATION => {
                         let cross_channel = read_u32(memory, payload + 32)? != 0;
                         let axes = if cross_channel {
@@ -1296,6 +1326,7 @@ impl DmlRuntime {
                         (
                             axes,
                             read_u32(memory, payload + 36)? != 0,
+                            true,
                             read_f32(memory, payload + 40)?,
                             48,
                         )
@@ -1305,21 +1336,18 @@ impl DmlRuntime {
                         (
                             read_u32_list(memory, read_ptr(memory, payload + 40)?, count)?,
                             read_u32(memory, payload + 48)? != 0,
+                            true,
                             read_f32(memory, payload + 52)?,
                             56,
                         )
                     }
                     _ => {
                         let count = read_u32(memory, payload + 32)?;
-                        if read_u32(memory, payload + 48)? == 0 {
-                            return Err(DmlError::invalid(
-                                "mean variance normalization with UseMean disabled is not supported",
-                            ));
-                        }
                         (
                             read_u32_list(memory, read_ptr(memory, payload + 40)?, count)?,
-                            read_u32(memory, payload + 52)? != 0,
-                            read_f32(memory, payload + 56)?,
+                            read_u32(memory, payload + 48)? != 0,
+                            read_u32(memory, payload + 56)? != 0,
+                            read_f32(memory, payload + 52)?,
                             64,
                         )
                     }
@@ -1335,6 +1363,7 @@ impl DmlRuntime {
                     DmlOpKind::MeanVarianceNormalization {
                         axes,
                         normalize_variance,
+                        use_mean,
                         epsilon,
                     },
                     inputs,
@@ -1628,7 +1657,14 @@ impl DmlRuntime {
 
     /// Create an extended (non-element-wise) DirectML operator.
     pub fn create_operation(&mut self, device: u64, plan: dml_ops::DmlOpPlan) -> DmlResult<u64> {
-        self.device(device)?;
+        let feature_level = self.device(device)?.feature_level;
+        let required = plan.kind.minimum_feature_level();
+        if required > feature_level {
+            return Err(DmlError::unsupported_feature(format!(
+                "DML_OPERATOR_TYPE {} requires DML_FEATURE_LEVEL {required:#x}, device supports {feature_level:#x}",
+                plan.operator_type()
+            )));
+        }
         plan.validate()?;
         let handle = self.alloc_handle();
         self.operations.insert(
@@ -2070,6 +2106,19 @@ impl DmlRuntime {
             .remove(&handle)
             .map(|_| ())
             .ok_or_else(|| DmlError::invalid(format!("unknown DML graph {handle:#x}")))
+    }
+
+    /// Execute a compiled graph. `inputs` holds one buffer per graph input and
+    /// `outputs` one mutable buffer per graph output, in graph order.
+    pub fn execute_graph(
+        &self,
+        compiled: u64,
+        inputs: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) -> DmlResult<()> {
+        let record = self.graph(compiled)?;
+        let backend = self.device(record.device)?.execution_device;
+        dml_ops::execute_graph_plan(&record.plan, backend, inputs, outputs)
     }
 
     pub fn create_operator_initializer(
@@ -4485,7 +4534,7 @@ mod tests {
         assert_eq!(error.hresult, DXGI_ERROR_UNSUPPORTED);
         assert_eq!(
             error.message,
-            "requested DML_FEATURE_LEVEL 0x6400 exceeds the supported 0x4000"
+            "requested DML_FEATURE_LEVEL 0x6400 exceeds the supported 0x6300"
         );
     }
 
@@ -4628,7 +4677,7 @@ mod tests {
             &mut memory.data,
             0x2000,
             DML_TENSOR_DATA_TYPE_FLOAT32,
-            &[4],
+            &[3],
             None,
         );
         let output = write_tensor(
@@ -4651,18 +4700,18 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.message,
-            "DML_OPERATOR_TYPE 33 supports only a scalar scale tensor"
+            "DML_OPERATOR_TYPE 33 scale tensor is not broadcastable: quantization tensor dimension 0 size 3 does not match the output size 4"
         );
     }
 
     #[test]
     fn dml_feature_level_boundary_negotiation_and_operator_minimums() {
-        assert_eq!(SUPPORTED_DML_FEATURE_LEVEL, DML_FEATURE_LEVEL_4_0);
+        assert_eq!(SUPPORTED_DML_FEATURE_LEVEL, DML_FEATURE_LEVEL_6_3);
         let mut runtime = DmlRuntime::new();
         let device = create_test_device(&mut runtime);
         assert_eq!(
             runtime.device(device).expect("device").feature_level,
-            DML_FEATURE_LEVEL_4_0
+            DML_FEATURE_LEVEL_6_3
         );
         let error = runtime
             .create_device(0x100, 0, DML_FEATURE_LEVEL_6_4, IID_IDMLDEVICE)
@@ -4692,9 +4741,22 @@ mod tests {
             dml_ops::DmlOpKind::Dequantize {
                 quantization_type: 2
             }
-            .minimum_feature_level()
-                > SUPPORTED_DML_FEATURE_LEVEL,
-            true
+            .minimum_feature_level(),
+            DML_FEATURE_LEVEL_6_3
+        );
+        assert_eq!(
+            dml_ops::DmlOpKind::QuantizedLinearAveragePooling {
+                strides: vec![1, 1],
+                window: vec![1, 1],
+                start_padding: vec![0, 0],
+                end_padding: vec![0, 0],
+                dilations: vec![1, 1],
+                include_padding: false,
+                input_zero_point: false,
+                output_zero_point: false,
+            }
+            .minimum_feature_level(),
+            DML_FEATURE_LEVEL_6_2
         );
     }
 
@@ -4818,6 +4880,146 @@ mod tests {
     }
 
     #[test]
+    fn dml_graph_execute_wired_unary_binary_pipeline_roundtrip() {
+        let mut runtime = DmlRuntime::new();
+        let device = runtime
+            .create_device_on(
+                0x100,
+                0,
+                DML_FEATURE_LEVEL_1_0,
+                IID_IDMLDEVICE,
+                dml_ops::DmlExecutionDevice::Cpu,
+            )
+            .expect("cpu device");
+        let tensor = |sizes: &[u32]| desc_tensor(DML_TENSOR_DATA_TYPE_FLOAT32, sizes, None);
+        let relu = dml_ops::DmlOpPlan {
+            kind: dml_ops::DmlOpKind::Activation {
+                activation: dml_ops::DmlActivation::Relu,
+                alpha: 0.0,
+            },
+            inputs: vec![tensor(&[2])],
+            output: tensor(&[2]),
+            extra_outputs: Vec::new(),
+            fused_activation: None,
+        };
+        let add = dml_ops::DmlOpPlan {
+            kind: dml_ops::DmlOpKind::Binary {
+                op: dml_ops::DmlBinaryOp::Add,
+            },
+            inputs: vec![tensor(&[2]), tensor(&[2])],
+            output: tensor(&[2]),
+            extra_outputs: Vec::new(),
+            fused_activation: None,
+        };
+        let relu_template = relu.clone();
+        let add_template = add.clone();
+        let relu_handle = runtime.create_operation(device, relu).expect("relu");
+        let add_handle = runtime.create_operation(device, add).expect("add");
+        let mut memory = base_memory();
+        put_u32(&mut memory.data, 0x100, 2);
+        put_u32(&mut memory.data, 0x104, 1);
+        put_u32(&mut memory.data, 0x108, 2);
+        put_u64(&mut memory.data, 0x110, 0x200);
+        put_u32(&mut memory.data, 0x118, 2);
+        put_u64(&mut memory.data, 0x120, 0x300);
+        put_u32(&mut memory.data, 0x128, 1);
+        put_u64(&mut memory.data, 0x130, 0x400);
+        put_u32(&mut memory.data, 0x138, 1);
+        put_u64(&mut memory.data, 0x140, 0x500);
+        put_u32(&mut memory.data, 0x200, DML_GRAPH_NODE_TYPE_OPERATOR);
+        put_u64(&mut memory.data, 0x208, 0x600);
+        put_u64(&mut memory.data, 0x600, 0x9100);
+        put_u32(&mut memory.data, 0x210, DML_GRAPH_NODE_TYPE_OPERATOR);
+        put_u64(&mut memory.data, 0x218, 0x608);
+        put_u64(&mut memory.data, 0x608, 0x9101);
+        // Graph input 0 -> ReLU input.
+        put_u32(&mut memory.data, 0x300, DML_GRAPH_EDGE_TYPE_INPUT);
+        put_u64(&mut memory.data, 0x308, 0x360);
+        put_u32(&mut memory.data, 0x360, 0);
+        put_u32(&mut memory.data, 0x364, 0);
+        put_u32(&mut memory.data, 0x368, 0);
+        // Graph input 1 -> Add A.
+        put_u32(&mut memory.data, 0x310, DML_GRAPH_EDGE_TYPE_INPUT);
+        put_u64(&mut memory.data, 0x318, 0x370);
+        put_u32(&mut memory.data, 0x370, 1);
+        put_u32(&mut memory.data, 0x374, 1);
+        put_u32(&mut memory.data, 0x378, 0);
+        // ReLU output -> Add B.
+        put_u32(&mut memory.data, 0x500, DML_GRAPH_EDGE_TYPE_INTERMEDIATE);
+        put_u64(&mut memory.data, 0x508, 0x540);
+        put_u32(&mut memory.data, 0x540, 0);
+        put_u32(&mut memory.data, 0x544, 0);
+        put_u32(&mut memory.data, 0x548, 1);
+        put_u32(&mut memory.data, 0x54c, 1);
+        // Add output -> graph output 0.
+        put_u32(&mut memory.data, 0x400, DML_GRAPH_EDGE_TYPE_OUTPUT);
+        put_u64(&mut memory.data, 0x408, 0x410);
+        put_u32(&mut memory.data, 0x410, 1);
+        put_u32(&mut memory.data, 0x414, 0);
+        put_u32(&mut memory.data, 0x418, 0);
+        let mut handle_map = BTreeMap::new();
+        handle_map.insert(0x9100, relu_handle);
+        handle_map.insert(0x9101, add_handle);
+        let graph = runtime
+            .compile_graph_from_guest(device, &memory, 0x100, &handle_map, 0)
+            .expect("binary graph");
+        let a = [-1.0f32, 2.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let b = [10.0f32, 10.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut output = vec![0u8; 8];
+        runtime
+            .execute_graph(graph, &[&a, &b], &mut [&mut output])
+            .expect("graph execution");
+        let decoded = output
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, vec![10.0, 12.0]);
+        let error = runtime
+            .execute_graph(graph, &[&a[..4], &b], &mut [&mut output])
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "graph input 0 buffer is 4 bytes, graph requires 8"
+        );
+
+        if let Ok(metal_device) = runtime.create_device_on(
+            0x100,
+            0,
+            DML_FEATURE_LEVEL_1_0,
+            IID_IDMLDEVICE,
+            dml_ops::DmlExecutionDevice::Metal,
+        ) {
+            let relu_handle = runtime
+                .create_operation(metal_device, relu_template)
+                .expect("metal relu");
+            let add_handle = runtime
+                .create_operation(metal_device, add_template)
+                .expect("metal add");
+            let mut metal_handles = BTreeMap::new();
+            metal_handles.insert(0x9100, relu_handle);
+            metal_handles.insert(0x9101, add_handle);
+            let metal_graph = runtime
+                .compile_graph_from_guest(metal_device, &memory, 0x100, &metal_handles, 0)
+                .expect("metal binary graph");
+            let mut metal_output = vec![0u8; 8];
+            runtime
+                .execute_graph(metal_graph, &[&a, &b], &mut [&mut metal_output])
+                .expect("metal graph execution");
+            let decoded = metal_output
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(decoded, vec![10.0, 12.0]);
+        }
+    }
+
+    #[test]
     fn dml_feature_level_boundary_negotiation_helper_and_data_types() {
         assert_eq!(
             negotiate_feature_levels(&[
@@ -4828,6 +5030,10 @@ mod tests {
             ]),
             DML_FEATURE_LEVEL_4_0
         );
+        assert_eq!(
+            negotiate_feature_levels(&[DML_FEATURE_LEVEL_5_2, DML_FEATURE_LEVEL_6_3]),
+            DML_FEATURE_LEVEL_6_3
+        );
         assert_eq!(negotiate_feature_levels(&[DML_FEATURE_LEVEL_6_4]), 0);
         assert_eq!(negotiate_feature_levels(&[]), 0);
         for supported in [
@@ -4837,6 +5043,8 @@ mod tests {
             DML_TENSOR_DATA_TYPE_INT32,
             DML_TENSOR_DATA_TYPE_UINT8,
             DML_TENSOR_DATA_TYPE_INT8,
+            DML_TENSOR_DATA_TYPE_UINT4,
+            DML_TENSOR_DATA_TYPE_INT4,
         ] {
             assert_eq!(supports_tensor_data_type(supported), true);
         }

@@ -645,6 +645,123 @@ pub fn parse_ec_entry_thunk_rva(
     Ok(Some(target))
 }
 
+/// Maximum number of bytes scanned when locating the body of an ARM64EC
+/// entry thunk.  Larger code ranges fail closed instead of doing unbounded
+/// work in the loader.
+pub const EC_THUNK_SCAN_LIMIT: u32 = 0x10_0000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EcThunkKind {
+    /// Twelve-byte x64 stub: `mov rax, imm64; jmp rax`.
+    X64EntryStub,
+    /// Canonical x64 fast-forward sequence ending in `jmp rel32`.
+    X64FastForward,
+    /// Native body whose pre-entry metadata points at an entry thunk.
+    EcEntryThunk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EcThunkRoute {
+    pub kind: EcThunkKind,
+    /// The real native body that must receive the translated arguments.
+    pub body_rva: u32,
+}
+
+fn mapped_at<'a>(mapped: &'a [u8], rva: u32, len: u32, size_of_image: u32) -> Option<&'a [u8]> {
+    let end = rva.checked_add(len)?;
+    if end > size_of_image || end as usize > mapped.len() {
+        return None;
+    }
+    Some(&mapped[rva as usize..end as usize])
+}
+
+/// Detect a PE-provided thunk body at `rva` inside a mapped image.
+///
+/// The two x64 forms are recognized exactly (the emitted entry stub and the
+/// canonical fast-forward sequence).  The ARM64EC entry-thunk form is found by
+/// scanning the enclosing native code range for a function whose four bytes of
+/// pre-entry metadata resolve to `rva`; that body is the real target and must
+/// receive the converted arguments instead of the thunk.
+pub fn detect_ec_thunk_body(
+    mapped: &[u8],
+    image_base: u64,
+    rva: u32,
+    code_start: u32,
+    code_end: u32,
+    size_of_image: u32,
+) -> AppResult<Option<EcThunkRoute>> {
+    if rva >= size_of_image {
+        return Err(malformed("ARM64EC thunk target is outside SizeOfImage"));
+    }
+    if code_start > code_end || code_end > size_of_image {
+        return Err(malformed("ARM64EC thunk scan range is invalid"));
+    }
+    if code_end - code_start > EC_THUNK_SCAN_LIMIT {
+        return Err(malformed(
+            "ARM64EC thunk scan range exceeds the supported limit",
+        ));
+    }
+    if code_end as usize > mapped.len() {
+        return Err(malformed("ARM64EC thunk scan range is not mapped"));
+    }
+
+    if let Some(bytes) = mapped_at(mapped, rva, 12, size_of_image) {
+        if bytes[0] == 0x48 && bytes[1] == 0xb8 && bytes[10] == 0xff && bytes[11] == 0xe0 {
+            let target = u64::from_le_bytes(bytes[2..10].try_into().expect("8 bytes"));
+            let target_end = image_base
+                .checked_add(u64::from(size_of_image))
+                .ok_or_else(|| malformed("ARM64EC image address range overflows"))?;
+            if target < image_base || target >= target_end {
+                return Err(malformed(
+                    "ARM64EC x64 entry stub target lies outside the image",
+                ));
+            }
+            return Ok(Some(EcThunkRoute {
+                kind: EcThunkKind::X64EntryStub,
+                body_rva: (target - image_base) as u32,
+            }));
+        }
+        const FFS_PREFIX: [u8; 9] = [0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d];
+        if bytes[..9] == FFS_PREFIX
+            && bytes[9] == 0xe9
+            && let Some(rel) = mapped_at(mapped, rva, 14, size_of_image)
+        {
+            let displacement = i32::from_le_bytes(rel[10..14].try_into().expect("4 bytes"));
+            let next = i64::from(rva) + 14;
+            let target = next + i64::from(displacement);
+            if !(0..i64::from(size_of_image)).contains(&target) {
+                return Err(malformed(
+                    "ARM64EC fast-forward thunk points outside the image",
+                ));
+            }
+            return Ok(Some(EcThunkRoute {
+                kind: EcThunkKind::X64FastForward,
+                body_rva: target as u32,
+            }));
+        }
+    }
+
+    let mut candidate = code_start & !3;
+    while candidate.saturating_add(4) <= code_end {
+        if candidate >= EC_ENTRY_THUNK_METADATA_SIZE {
+            let raw = u32::from_le_bytes(
+                mapped[candidate as usize - 4..candidate as usize]
+                    .try_into()
+                    .expect("4 bytes"),
+            );
+            let delta = (raw & EC_ENTRY_THUNK_DELTA_MASK) as i32;
+            if delta != 0 && i64::from(candidate) + i64::from(delta) == i64::from(rva) {
+                return Ok(Some(EcThunkRoute {
+                    kind: EcThunkKind::EcEntryThunk,
+                    body_rva: candidate,
+                }));
+            }
+        }
+        candidate = candidate.saturating_add(4);
+    }
+    Ok(None)
+}
+
 pub fn parse_hybrid_aux_iat(
     bytes: &[u8],
     sections: &[PeSection],
@@ -1743,6 +1860,104 @@ mod tests {
             error.message,
             "ARM64EC entry thunk points outside the image"
         );
+    }
+
+    #[test]
+    fn arm64x_ec_thunk_body_detection_boundary_routes_the_real_body_exactly() {
+        let image_base = 0x1_8000_0000u64;
+        let mut mapped = vec![0u8; 0x3000];
+        // Body at 0x1000 has metadata pointing at entry thunk 0x1100.
+        put_u32(&mut mapped, 0x0ffc, 0x100 | 1);
+        let route = detect_ec_thunk_body(&mapped, image_base, 0x1100, 0x1000, 0x1200, 0x3000)
+            .expect("detect EC entry thunk")
+            .expect("metadata route");
+        assert_eq!(
+            route,
+            EcThunkRoute {
+                kind: EcThunkKind::EcEntryThunk,
+                body_rva: 0x1000
+            }
+        );
+
+        // Twelve-byte x64 entry stub at 0x1200 targeting the body.
+        mapped[0x1200..0x1202].copy_from_slice(&[0x48, 0xb8]);
+        mapped[0x1202..0x120a].copy_from_slice(&(image_base + 0x1000).to_le_bytes());
+        mapped[0x120a..0x120c].copy_from_slice(&[0xff, 0xe0]);
+        let route = detect_ec_thunk_body(&mapped, image_base, 0x1200, 0x1200, 0x1300, 0x3000)
+            .expect("detect x64 entry stub")
+            .expect("stub route");
+        assert_eq!(
+            route,
+            EcThunkRoute {
+                kind: EcThunkKind::X64EntryStub,
+                body_rva: 0x1000
+            }
+        );
+
+        // Canonical x64 fast-forward sequence at 0x1300 tail-jumping to 0x1000.
+        let prefix = [0x48u8, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d, 0xe9];
+        mapped[0x1300..0x130a].copy_from_slice(&prefix);
+        let next = 0x1300i64 + 14;
+        let displacement = 0x1000i64 - next;
+        mapped[0x130a..0x130e].copy_from_slice(&(displacement as i32).to_le_bytes());
+        let route = detect_ec_thunk_body(&mapped, image_base, 0x1300, 0x1300, 0x1400, 0x3000)
+            .expect("detect fast-forward thunk")
+            .expect("fast-forward route");
+        assert_eq!(
+            route,
+            EcThunkRoute {
+                kind: EcThunkKind::X64FastForward,
+                body_rva: 0x1000
+            }
+        );
+
+        put_u32(&mut mapped, 0x1800, 0xd65f_03c0);
+        assert_eq!(
+            detect_ec_thunk_body(&mapped, image_base, 0x1800, 0x1800, 0x1900, 0x3000)
+                .expect("ordinary body is not a thunk"),
+            None
+        );
+    }
+
+    #[test]
+    fn arm64x_ec_thunk_detection_rejects_malformed_metadata_exactly() {
+        let image_base = 0x1_8000_0000u64;
+        let mut mapped = vec![0u8; 0x2000];
+        mapped[0x1200..0x1202].copy_from_slice(&[0x48, 0xb8]);
+        mapped[0x1202..0x120a].copy_from_slice(&(image_base + 0x3000).to_le_bytes());
+        mapped[0x120a..0x120c].copy_from_slice(&[0xff, 0xe0]);
+        let outside = detect_ec_thunk_body(&mapped, image_base, 0x1200, 0x1200, 0x1300, 0x2000)
+            .expect_err("out-of-image stub target must be rejected");
+        assert_eq!(outside.code, ReasonCode::RcPeParseInvalid);
+        assert_eq!(
+            outside.message,
+            "ARM64EC x64 entry stub target lies outside the image"
+        );
+
+        let oversized = detect_ec_thunk_body(
+            &[],
+            image_base,
+            0,
+            0,
+            EC_THUNK_SCAN_LIMIT + 1,
+            EC_THUNK_SCAN_LIMIT + 1,
+        )
+        .expect_err("oversized scan range must fail closed");
+        assert_eq!(
+            oversized.message,
+            "ARM64EC thunk scan range exceeds the supported limit"
+        );
+
+        let outside_target = detect_ec_thunk_body(&mapped, image_base, 0x2000, 0, 0x1000, 0x2000)
+            .expect_err("target outside SizeOfImage must be rejected");
+        assert_eq!(
+            outside_target.message,
+            "ARM64EC thunk target is outside SizeOfImage"
+        );
+
+        let unmapped = detect_ec_thunk_body(&[0u8; 0x100], image_base, 0, 0, 0x1000, 0x1000)
+            .expect_err("unmapped scan range must be rejected");
+        assert_eq!(unmapped.message, "ARM64EC thunk scan range is not mapped");
     }
 
     #[test]

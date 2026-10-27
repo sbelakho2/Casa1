@@ -11,9 +11,10 @@
 //! host math.
 
 use super::{
-    DML_TENSOR_DATA_TYPE_FLOAT16, DML_TENSOR_DATA_TYPE_FLOAT32, DML_TENSOR_DATA_TYPE_INT8,
-    DML_TENSOR_DATA_TYPE_INT32, DML_TENSOR_DATA_TYPE_UINT8, DML_TENSOR_DATA_TYPE_UINT32,
-    DML_TENSOR_MIN_ALIGNMENT, DmlError, DmlResult, DmlTensorDesc, E_FAIL,
+    DML_TENSOR_DATA_TYPE_FLOAT16, DML_TENSOR_DATA_TYPE_FLOAT32, DML_TENSOR_DATA_TYPE_INT4,
+    DML_TENSOR_DATA_TYPE_INT8, DML_TENSOR_DATA_TYPE_INT32, DML_TENSOR_DATA_TYPE_UINT4,
+    DML_TENSOR_DATA_TYPE_UINT8, DML_TENSOR_DATA_TYPE_UINT32, DML_TENSOR_MIN_ALIGNMENT, DmlError,
+    DmlResult, DmlTensorDesc, E_FAIL,
 };
 use crate::metal_backend::MetalDevice;
 
@@ -371,6 +372,7 @@ pub enum DmlOpKind {
         beta: f32,
     },
     Convolution {
+        mode: u32,
         strides: Vec<u32>,
         dilations: Vec<u32>,
         start_padding: Vec<u32>,
@@ -514,6 +516,7 @@ pub enum DmlOpKind {
     MeanVarianceNormalization {
         axes: Vec<u32>,
         normalize_variance: bool,
+        use_mean: bool,
         epsilon: f32,
     },
     Adam {
@@ -668,13 +671,19 @@ impl DmlOpKind {
             | Self::LocalResponseNormalization { .. }
             | Self::Split { .. } => super::DML_FEATURE_LEVEL_2_0,
             Self::GatherElements { .. }
-            | Self::GatherNd { .. }
             | Self::ScatterNd { .. }
             | Self::MatrixMultiplyInteger { .. }
             | Self::ConvolutionInteger { .. }
-            | Self::Resample { .. }
             | Self::TopK { .. }
             | Self::MeanVarianceNormalization { .. } => super::DML_FEATURE_LEVEL_2_1,
+            Self::Resample { antialiased, .. } => {
+                if *antialiased {
+                    super::DML_FEATURE_LEVEL_6_3
+                } else {
+                    super::DML_FEATURE_LEVEL_2_1
+                }
+            }
+            Self::GatherNd { .. } => super::DML_FEATURE_LEVEL_6_0,
             Self::ArgMin { .. } | Self::ArgMax { .. } | Self::Adam { .. } => {
                 super::DML_FEATURE_LEVEL_3_0
             }
@@ -765,11 +774,18 @@ impl DmlOpPlan {
     }
 
     /// Number of kernel invocations. Recurrent kernels use one thread per
-    /// batch element; every other kernel uses one thread per output element.
+    /// batch element; a quantized output packs two 4-bit elements per thread;
+    /// every other kernel uses one thread per output element.
     pub fn dispatch_count(&self) -> u64 {
         match &self.kind {
             DmlOpKind::Rnn { .. } | DmlOpKind::Gru { .. } | DmlOpKind::Lstm { .. } => {
                 self.inputs[0].sizes.get(1).copied().unwrap_or(1) as u64
+            }
+            DmlOpKind::QuantizeLinear if self.output.is_4bit() => {
+                self.output.element_count().div_ceil(2)
+            }
+            DmlOpKind::Quantize { .. } if self.output.is_4bit() => {
+                self.output.element_count().div_ceil(2)
             }
             _ => self.output.element_count(),
         }
@@ -1047,13 +1063,18 @@ impl DmlOpPlan {
                     if Some(index) == sequence_index {
                         expect_index_dtype(desc, ty, "sequence lengths")?;
                     } else {
-                        expect_dtype(desc, &[DML_TENSOR_DATA_TYPE_FLOAT32], ty, "recurrent")?;
+                        expect_dtype(
+                            desc,
+                            &[DML_TENSOR_DATA_TYPE_FLOAT32, DML_TENSOR_DATA_TYPE_FLOAT16],
+                            ty,
+                            "recurrent",
+                        )?;
                     }
                 }
                 for output in self.outputs() {
                     expect_dtype(
                         output,
-                        &[DML_TENSOR_DATA_TYPE_FLOAT32],
+                        &[DML_TENSOR_DATA_TYPE_FLOAT32, DML_TENSOR_DATA_TYPE_FLOAT16],
                         ty,
                         "recurrent output",
                     )?;
@@ -1195,10 +1216,26 @@ impl DmlOpPlan {
                     ty,
                     "scale",
                 )?;
+                expect_dtype(
+                    &self.output,
+                    &[
+                        DML_TENSOR_DATA_TYPE_UINT8,
+                        DML_TENSOR_DATA_TYPE_INT8,
+                        DML_TENSOR_DATA_TYPE_UINT4,
+                        DML_TENSOR_DATA_TYPE_INT4,
+                    ],
+                    ty,
+                    "output",
+                )?;
                 if self.inputs.len() == 3 {
                     expect_dtype(
                         &self.inputs[2],
-                        &[DML_TENSOR_DATA_TYPE_UINT8, DML_TENSOR_DATA_TYPE_INT8],
+                        &[
+                            DML_TENSOR_DATA_TYPE_UINT8,
+                            DML_TENSOR_DATA_TYPE_INT8,
+                            DML_TENSOR_DATA_TYPE_UINT4,
+                            DML_TENSOR_DATA_TYPE_INT4,
+                        ],
                         ty,
                         "zero point",
                     )?;
@@ -1207,16 +1244,23 @@ impl DmlOpPlan {
                             "quantize zero point and output DataTypes must match",
                         ));
                     }
-                } else if self.output.data_type != DML_TENSOR_DATA_TYPE_UINT8 {
+                } else if self.output.data_type != DML_TENSOR_DATA_TYPE_UINT8
+                    && self.output.data_type != DML_TENSOR_DATA_TYPE_UINT4
+                {
                     return Err(DmlError::invalid(
-                        "quantize without a zero point tensor must produce UINT8",
+                        "quantize without a zero point tensor must produce UINT8 or UINT4",
                     ));
                 }
             }
             DmlOpKind::DequantizeLinear => {
                 expect_dtype(
                     &self.inputs[0],
-                    &[DML_TENSOR_DATA_TYPE_UINT8, DML_TENSOR_DATA_TYPE_INT8],
+                    &[
+                        DML_TENSOR_DATA_TYPE_UINT8,
+                        DML_TENSOR_DATA_TYPE_INT8,
+                        DML_TENSOR_DATA_TYPE_UINT4,
+                        DML_TENSOR_DATA_TYPE_INT4,
+                    ],
                     ty,
                     "input",
                 )?;
@@ -1229,7 +1273,12 @@ impl DmlOpPlan {
                 if self.inputs.len() == 3 {
                     expect_dtype(
                         &self.inputs[2],
-                        &[DML_TENSOR_DATA_TYPE_UINT8, DML_TENSOR_DATA_TYPE_INT8],
+                        &[
+                            DML_TENSOR_DATA_TYPE_UINT8,
+                            DML_TENSOR_DATA_TYPE_INT8,
+                            DML_TENSOR_DATA_TYPE_UINT4,
+                            DML_TENSOR_DATA_TYPE_INT4,
+                        ],
                         ty,
                         "zero point",
                     )?;
@@ -1497,14 +1546,24 @@ impl DmlOpPlan {
                     )?;
                     expect_dtype(
                         &self.output,
-                        &[DML_TENSOR_DATA_TYPE_UINT8, DML_TENSOR_DATA_TYPE_INT8],
+                        &[
+                            DML_TENSOR_DATA_TYPE_UINT8,
+                            DML_TENSOR_DATA_TYPE_INT8,
+                            DML_TENSOR_DATA_TYPE_UINT4,
+                            DML_TENSOR_DATA_TYPE_INT4,
+                        ],
                         ty,
                         "output",
                     )?;
                 } else {
                     expect_dtype(
                         &self.inputs[0],
-                        &[DML_TENSOR_DATA_TYPE_UINT8, DML_TENSOR_DATA_TYPE_INT8],
+                        &[
+                            DML_TENSOR_DATA_TYPE_UINT8,
+                            DML_TENSOR_DATA_TYPE_INT8,
+                            DML_TENSOR_DATA_TYPE_UINT4,
+                            DML_TENSOR_DATA_TYPE_INT4,
+                        ],
                         ty,
                         "input",
                     )?;
@@ -1524,6 +1583,8 @@ impl DmlOpPlan {
                     | DML_TENSOR_DATA_TYPE_INT32
                     | DML_TENSOR_DATA_TYPE_UINT8
                     | DML_TENSOR_DATA_TYPE_INT8
+                    | DML_TENSOR_DATA_TYPE_UINT4
+                    | DML_TENSOR_DATA_TYPE_INT4
             );
             if !supported {
                 return Err(DmlError::invalid(format!(
@@ -1573,6 +1634,7 @@ impl DmlOpPlan {
                 ..
             } => self.validate_gemm(*trans_a, *trans_b, *beta),
             DmlOpKind::Convolution {
+                mode,
                 strides,
                 dilations,
                 start_padding,
@@ -1580,6 +1642,7 @@ impl DmlOpPlan {
                 output_padding,
                 group_count,
             } => self.validate_convolution(
+                *mode,
                 strides,
                 dilations,
                 start_padding,
@@ -1768,8 +1831,9 @@ impl DmlOpPlan {
             DmlOpKind::MeanVarianceNormalization {
                 axes,
                 normalize_variance,
+                use_mean,
                 epsilon,
-            } => self.validate_mvn(axes, *normalize_variance, *epsilon),
+            } => self.validate_mvn(axes, *normalize_variance, *use_mean, *epsilon),
             DmlOpKind::Adam {
                 learning_rate,
                 beta1,
@@ -1904,6 +1968,7 @@ impl DmlOpPlan {
 
     fn validate_convolution(
         &self,
+        mode: u32,
         strides: &[u32],
         dilations: &[u32],
         start_padding: &[u32],
@@ -1911,6 +1976,13 @@ impl DmlOpPlan {
         output_padding: &[u32],
         group_count: u32,
     ) -> DmlResult<()> {
+        if mode != DML_CONVOLUTION_MODE_CONVOLUTION
+            && mode != DML_CONVOLUTION_MODE_CROSS_CORRELATION
+        {
+            return Err(DmlError::invalid(format!(
+                "convolution mode {mode} is not supported"
+            )));
+        }
         if !(2..=3).contains(&self.inputs.len()) {
             return Err(DmlError::invalid(format!(
                 "convolution requires 2 or 3 input tensors, got {}",
@@ -2317,21 +2389,16 @@ impl DmlOpPlan {
         outputs: &[DmlRecurrentOutput],
         gates: u32,
     ) -> DmlResult<()> {
-        if direction != DmlRecurrentDirection::Forward {
-            return Err(DmlError::invalid(format!(
-                "DML_OPERATOR_TYPE {ty} only supports DML_RECURRENT_NETWORK_DIRECTION_FORWARD"
-            )));
-        }
+        let directions = match direction {
+            DmlRecurrentDirection::Forward | DmlRecurrentDirection::Backward => 1u32,
+            DmlRecurrentDirection::Bidirectional => 2u32,
+        };
+        let gate_count = gates * directions;
         if self.inputs.len() != options.input_count() {
             return Err(DmlError::invalid(format!(
                 "DML_OPERATOR_TYPE {ty} expects {} input tensor(s), got {}",
                 options.input_count(),
                 self.inputs.len()
-            )));
-        }
-        if options.peephole {
-            return Err(DmlError::invalid(format!(
-                "DML_OPERATOR_TYPE {ty} peephole tensors are not supported"
             )));
         }
         let input = &self.inputs[0];
@@ -2343,9 +2410,9 @@ impl DmlOpPlan {
             )));
         }
         let [sequence, batch, input_size] = [input.sizes[0], input.sizes[1], input.sizes[2]];
-        if weight.sizes[0] != gates {
+        if weight.sizes[0] != gate_count {
             return Err(DmlError::invalid(format!(
-                "DML_OPERATOR_TYPE {ty} weight gate count must be {gates}, got {}",
+                "DML_OPERATOR_TYPE {ty} weight gate count must be {gate_count}, got {}",
                 weight.sizes[0]
             )));
         }
@@ -2361,19 +2428,19 @@ impl DmlOpPlan {
                 "DML_OPERATOR_TYPE {ty} hidden size must be non-zero"
             )));
         }
-        if recurrence.sizes != [gates, hidden, hidden] {
+        if recurrence.sizes != [gate_count, hidden, hidden] {
             return Err(DmlError::invalid(format!(
-                "DML_OPERATOR_TYPE {ty} recurrence sizes must be [{gates}, {hidden}, {hidden}], got {:?}",
+                "DML_OPERATOR_TYPE {ty} recurrence sizes must be [{gate_count}, {hidden}, {hidden}], got {:?}",
                 recurrence.sizes
             )));
         }
         let mut slot = 3;
         if options.bias {
             let bias = &self.inputs[slot];
-            if bias.element_count() != gates as u64 * hidden as u64 || !bias.is_contiguous() {
+            if bias.element_count() != gate_count as u64 * hidden as u64 || !bias.is_contiguous() {
                 return Err(DmlError::invalid(format!(
                     "DML_OPERATOR_TYPE {ty} bias must be a contiguous tensor with {} elements",
-                    gates as u64 * hidden as u64
+                    gate_count as u64 * hidden as u64
                 )));
             }
             slot += 1;
@@ -2415,6 +2482,21 @@ impl DmlOpPlan {
                     "DML_OPERATOR_TYPE {ty} sequence lengths must contain {batch} contiguous elements"
                 )));
             }
+            slot += 1;
+        }
+        if options.peephole {
+            let peephole = &self.inputs[slot];
+            let expected = directions as u64 * 3 * hidden as u64;
+            if ty != DML_OPERATOR_LSTM {
+                return Err(DmlError::invalid(format!(
+                    "DML_OPERATOR_TYPE {ty} does not accept a peephole tensor"
+                )));
+            }
+            if peephole.element_count() != expected || !peephole.is_contiguous() {
+                return Err(DmlError::invalid(format!(
+                    "DML_OPERATOR_TYPE {ty} peephole tensor must contain {expected} contiguous elements (directions x 3 gates x hidden)"
+                )));
+            }
         }
         let expected_activations = match ty {
             DML_OPERATOR_RNN => 1..=2,
@@ -2443,13 +2525,7 @@ impl DmlOpPlan {
                 self.output_count()
             )));
         }
-        for output in self.outputs() {
-            if !output.is_contiguous() {
-                return Err(DmlError::invalid(format!(
-                    "DML_OPERATOR_TYPE {ty} recurrent outputs must be contiguous"
-                )));
-            }
-        }
+        let hidden_output = hidden * directions;
         let mut seen = Vec::new();
         for (role, output) in outputs.iter().zip(self.outputs()) {
             if seen.contains(role) {
@@ -2458,17 +2534,16 @@ impl DmlOpPlan {
                 )));
             }
             seen.push(*role);
+            if output.sizes.len() != 3 {
+                return Err(DmlError::invalid(format!(
+                    "DML_OPERATOR_TYPE {ty} recurrent outputs must be rank 3"
+                )));
+            }
             let expected = match role {
-                DmlRecurrentOutput::Sequence => {
-                    if output.sizes != [sequence, batch, hidden] {
-                        return Err(DmlError::invalid(format!(
-                            "DML_OPERATOR_TYPE {ty} output sequence sizes must be [{sequence}, {batch}, {hidden}], got {:?}",
-                            output.sizes
-                        )));
-                    }
-                    continue;
+                DmlRecurrentOutput::Sequence => [sequence, batch, hidden_output],
+                DmlRecurrentOutput::Single | DmlRecurrentOutput::CellSingle => {
+                    [1, batch, hidden_output]
                 }
-                DmlRecurrentOutput::Single | DmlRecurrentOutput::CellSingle => [1, batch, hidden],
             };
             if output.sizes != expected {
                 return Err(DmlError::invalid(format!(
@@ -2605,7 +2680,7 @@ impl DmlOpPlan {
 
     fn validate_resample(
         &self,
-        _mode: DmlInterpolationMode,
+        mode: DmlInterpolationMode,
         scales: &[f32],
         input_offsets: &[f32],
         output_offsets: &[f32],
@@ -2634,8 +2709,10 @@ impl DmlOpPlan {
         {
             return Err(DmlError::invalid("resample pixel offsets must be finite"));
         }
-        if antialiased {
-            return Err(DmlError::invalid("antialiased resample is not supported"));
+        if antialiased && mode != DmlInterpolationMode::Linear {
+            return Err(DmlError::invalid(
+                "antialiased resample requires linear interpolation",
+            ));
         }
         if self.output.sizes.len() != rank {
             return Err(DmlError::invalid(
@@ -2854,19 +2931,33 @@ impl DmlOpPlan {
                 "gather-nd IndicesDimensionCount {indices_dimension_count} must be 0 or {indices_rank}"
             )));
         }
-        if batch_dimension_count != 0 {
-            return Err(DmlError::invalid(
-                "gather-nd batched indices (BatchDimensionCount != 0) are not supported",
-            ));
+        let batch = batch_dimension_count as usize;
+        if batch >= indices_rank {
+            return Err(DmlError::invalid(format!(
+                "gather-nd BatchDimensionCount {batch_dimension_count} leaves no index dimensions in a rank-{indices_rank} indices tensor"
+            )));
+        }
+        if batch > input_rank {
+            return Err(DmlError::invalid(format!(
+                "gather-nd BatchDimensionCount {batch_dimension_count} exceeds the input rank {input_rank}"
+            )));
+        }
+        if indices.sizes[..batch] != input.sizes[..batch] {
+            return Err(DmlError::invalid(format!(
+                "gather-nd batch dimensions {:?} must match the input batch dimensions {:?}",
+                &indices.sizes[..batch],
+                &input.sizes[..batch]
+            )));
         }
         let indexed = indices.sizes[indices_rank - 1];
-        if indexed as usize > input_rank {
+        if indexed as usize > input_rank - batch {
             return Err(DmlError::invalid(format!(
-                "gather-nd indices last dimension {indexed} exceeds the input rank {input_rank}"
+                "gather-nd indices last dimension {indexed} exceeds the indexed input rank {}",
+                input_rank - batch
             )));
         }
         let mut expected = indices.sizes[..indices_rank - 1].to_vec();
-        expected.extend_from_slice(&input.sizes[indexed as usize..]);
+        expected.extend_from_slice(&input.sizes[batch + indexed as usize..]);
         if self.output.sizes != expected {
             return Err(DmlError::invalid(format!(
                 "gather-nd output sizes must be {expected:?}, got {:?}",
@@ -3126,7 +3217,13 @@ impl DmlOpPlan {
         Ok(())
     }
 
-    fn validate_mvn(&self, axes: &[u32], _normalize_variance: bool, epsilon: f32) -> DmlResult<()> {
+    fn validate_mvn(
+        &self,
+        axes: &[u32],
+        _normalize_variance: bool,
+        _use_mean: bool,
+        epsilon: f32,
+    ) -> DmlResult<()> {
         if !(1..=3).contains(&self.inputs.len()) {
             return Err(DmlError::invalid(format!(
                 "mean variance normalization expects 1 to 3 input tensors, got {}",
@@ -3255,21 +3352,36 @@ impl DmlOpPlan {
                 self.inputs.len()
             )));
         }
+        let coords = coord_names(self.output.sizes.len());
         let scale = &self.inputs[1];
-        if scale.element_count() != 1 || !scale.is_contiguous() {
+        if !scale.is_contiguous() {
             return Err(DmlError::invalid(format!(
-                "DML_OPERATOR_TYPE {} supports only a scalar scale tensor",
+                "DML_OPERATOR_TYPE {} scale tensor must be contiguous",
                 self.operator_type()
             )));
         }
+        quantization_tensor_index(scale, &self.output, &coords).map_err(|error| {
+            DmlError::invalid(format!(
+                "DML_OPERATOR_TYPE {} scale tensor is not broadcastable: {}",
+                self.operator_type(),
+                error.message
+            ))
+        })?;
         if self.inputs.len() == 3 {
             let zero_point = &self.inputs[2];
-            if zero_point.element_count() != 1 || !zero_point.is_contiguous() {
+            if !zero_point.is_contiguous() {
                 return Err(DmlError::invalid(format!(
-                    "DML_OPERATOR_TYPE {} supports only a scalar zero point tensor",
+                    "DML_OPERATOR_TYPE {} zero point tensor must be contiguous",
                     self.operator_type()
                 )));
             }
+            quantization_tensor_index(zero_point, &self.output, &coords).map_err(|error| {
+                DmlError::invalid(format!(
+                    "DML_OPERATOR_TYPE {} zero point tensor is not broadcastable: {}",
+                    self.operator_type(),
+                    error.message
+                ))
+            })?;
         }
         if self.output.sizes != self.inputs[0].sizes {
             return Err(DmlError::invalid(format!(
@@ -3360,29 +3472,41 @@ impl DmlOpPlan {
 
     fn require_scalar_quantization_tensors(&self) -> DmlResult<()> {
         let roles = self.input_roles();
+        let dummy = coord_names(self.output.sizes.len());
         for (index, desc) in self.inputs.iter().enumerate() {
             let role = roles.get(index).copied().unwrap_or("input");
             if role.contains("scale") {
-                if desc.data_type != DML_TENSOR_DATA_TYPE_FLOAT32
-                    || desc.element_count() != 1
-                    || !desc.is_contiguous()
-                {
+                if desc.data_type != DML_TENSOR_DATA_TYPE_FLOAT32 || !desc.is_contiguous() {
                     return Err(DmlError::invalid(format!(
-                        "quantized operator scale input {index} ({role}) must be a scalar FLOAT32 tensor"
+                        "quantized operator scale input {index} ({role}) must be a contiguous FLOAT32 tensor"
                     )));
                 }
+                quantization_tensor_index(desc, &self.output, &dummy).map_err(|error| {
+                    DmlError::invalid(format!(
+                        "quantized operator scale input {index} ({role}) is not broadcastable: {}",
+                        error.message
+                    ))
+                })?;
             }
             if role.contains("zero point") {
                 if !matches!(
                     desc.data_type,
-                    DML_TENSOR_DATA_TYPE_UINT8 | DML_TENSOR_DATA_TYPE_INT8
-                ) || desc.element_count() != 1
-                    || !desc.is_contiguous()
+                    DML_TENSOR_DATA_TYPE_UINT8
+                        | DML_TENSOR_DATA_TYPE_INT8
+                        | DML_TENSOR_DATA_TYPE_UINT4
+                        | DML_TENSOR_DATA_TYPE_INT4
+                ) || !desc.is_contiguous()
                 {
                     return Err(DmlError::invalid(format!(
-                        "quantized operator zero point input {index} ({role}) must be a scalar UINT8 or INT8 tensor"
+                        "quantized operator zero point input {index} ({role}) must be a contiguous UINT8, INT8, UINT4, or INT4 tensor"
                     )));
                 }
+                quantization_tensor_index(desc, &self.output, &dummy).map_err(|error| {
+                    DmlError::invalid(format!(
+                        "quantized operator zero point input {index} ({role}) is not broadcastable: {}",
+                        error.message
+                    ))
+                })?;
             }
         }
         Ok(())
@@ -3453,14 +3577,19 @@ impl DmlOpPlan {
         group_count: u32,
         quantized_output: bool,
     ) -> DmlResult<()> {
-        if !(2..=4).contains(&self.inputs.len()) {
+        if !(2..=8).contains(&self.inputs.len()) {
             return Err(DmlError::invalid(format!(
-                "integer convolution requires 2 to 4 input tensors, got {}",
+                "integer convolution requires 2 to 8 input tensors, got {}",
                 self.inputs.len()
             )));
         }
         let input = &self.inputs[0];
-        let filter = &self.inputs[1];
+        let filter_index = self
+            .input_roles()
+            .iter()
+            .position(|role| *role == "filter")
+            .unwrap_or(1);
+        let filter = &self.inputs[filter_index];
         if input.sizes.len() != 4 || filter.sizes.len() != 4 || self.output.sizes.len() != 4 {
             return Err(DmlError::invalid(
                 "integer convolution requires rank-4 NCHW tensors",
@@ -3621,15 +3750,19 @@ impl DmlOpPlan {
                 self.inputs.len()
             )));
         }
+        let coords = coord_names(self.output.sizes.len());
         for desc in &self.inputs[1..] {
-            if desc.data_type != DML_TENSOR_DATA_TYPE_FLOAT32
-                || desc.element_count() != 1
-                || !desc.is_contiguous()
-            {
+            if desc.data_type != DML_TENSOR_DATA_TYPE_FLOAT32 || !desc.is_contiguous() {
                 return Err(DmlError::invalid(
-                    "quantize/dequantize quantization tensors must be scalar FLOAT32",
+                    "quantize/dequantize quantization tensors must be contiguous FLOAT32",
                 ));
             }
+            quantization_tensor_index(desc, &self.output, &coords).map_err(|error| {
+                DmlError::invalid(format!(
+                    "quantize/dequantize quantization tensor is not broadcastable: {}",
+                    error.message
+                ))
+            })?;
         }
         if self.output.sizes != self.inputs[0].sizes {
             return Err(DmlError::invalid(
@@ -3733,7 +3866,11 @@ fn checked_product(sizes: &[u32]) -> DmlResult<u64> {
 }
 
 fn checked_implied_size(desc: &DmlTensorDesc) -> DmlResult<u64> {
-    let element_size = desc.element_size()?;
+    let element_bits = if desc.is_4bit() {
+        4u64
+    } else {
+        desc.element_size()?.saturating_mul(8)
+    };
     let mut max_element = 0u64;
     for (size, stride) in desc.sizes.iter().zip(&desc.strides) {
         let term = (*size as u64 - 1)
@@ -3745,7 +3882,8 @@ fn checked_implied_size(desc: &DmlTensorDesc) -> DmlResult<u64> {
     }
     max_element
         .checked_add(1)
-        .and_then(|elements| elements.checked_mul(element_size))
+        .and_then(|elements| elements.checked_mul(element_bits))
+        .map(|bits| bits.div_ceil(8))
         .ok_or_else(|| DmlError::invalid("tensor stride range overflows u64"))
 }
 
@@ -3841,10 +3979,29 @@ fn msl_scalar(data_type: u32, ty: u32) -> DmlResult<&'static str> {
         DML_TENSOR_DATA_TYPE_INT32 => Ok("int"),
         DML_TENSOR_DATA_TYPE_UINT8 => Ok("uchar"),
         DML_TENSOR_DATA_TYPE_INT8 => Ok("char"),
+        DML_TENSOR_DATA_TYPE_UINT4 | DML_TENSOR_DATA_TYPE_INT4 => Ok("uchar"),
         other => Err(DmlError::invalid(format!(
             "DML_TENSOR_DATA_TYPE {other} is not supported for DML_OPERATOR_TYPE {ty}"
         ))),
     }
+}
+
+fn packed_read_4bit(pointer: &str, index: &str, signed: bool) -> String {
+    let byte = format!("({index}) / 2u");
+    let shift = "(((index) % 2u) * 4u)".to_string();
+    let raw = format!("(({pointer}[{byte}] >> {shift}) & 0x0fu)");
+    if signed {
+        format!("((int({raw}) & 8) != 0 ? int({raw}) - 16 : int({raw}))")
+    } else {
+        format!("int({raw})")
+    }
+}
+
+fn packed_store_4bit(low: &str, high: &str, signed: bool) -> String {
+    let (minimum, maximum) = if signed { (-8.0, 7.0) } else { (0.0, 15.0) };
+    format!(
+        "(uchar)((int(clamp(rint({low}), {minimum:?}f, {maximum:?}f)) & 15) | ((int(clamp(rint({high}), {minimum:?}f, {maximum:?}f)) & 15) << 4))"
+    )
 }
 
 fn msl_type_unchecked(data_type: u32) -> &'static str {
@@ -3982,6 +4139,84 @@ fn broadcast_index(desc: &DmlTensorDesc) -> String {
     } else {
         terms.join(" + ")
     }
+}
+
+/// Index expression for a quantization scale/zero-point tensor. A scalar is
+/// broadcast everywhere; a tensor either matches the output rank with
+/// broadcast dimensions or is a per-axis vector mapped to the output channel
+/// (axis 1) or last axis.
+fn quantization_tensor_index(
+    desc: &DmlTensorDesc,
+    output: &DmlTensorDesc,
+    coords: &[String],
+) -> DmlResult<String> {
+    if desc.element_count() == 1 {
+        return Ok("0".to_string());
+    }
+    if desc.sizes.len() == output.sizes.len() {
+        let mut terms = Vec::with_capacity(desc.sizes.len());
+        for dimension in 0..desc.sizes.len() {
+            if desc.sizes[dimension] == 1 {
+                continue;
+            }
+            if desc.sizes[dimension] != output.sizes[dimension] {
+                return Err(DmlError::invalid(format!(
+                    "quantization tensor dimension {dimension} size {} does not match the output size {}",
+                    desc.sizes[dimension], output.sizes[dimension]
+                )));
+            }
+            terms.push(format!(
+                "({}) * {}u",
+                coords[dimension], desc.strides[dimension]
+            ));
+        }
+        return Ok(if terms.is_empty() {
+            "0".to_string()
+        } else {
+            terms.join(" + ")
+        });
+    }
+    if desc.sizes.len() == 1 {
+        let size = desc.sizes[0];
+        let axis = if output.sizes.len() >= 2 && output.sizes[1] == size {
+            1
+        } else if *output.sizes.last().expect("non-empty output") == size {
+            output.sizes.len() - 1
+        } else {
+            output
+                .sizes
+                .iter()
+                .position(|candidate| *candidate == size)
+                .ok_or_else(|| {
+                    DmlError::invalid(format!(
+                        "quantization tensor axis size {size} does not match any output dimension"
+                    ))
+                })?
+        };
+        return Ok(format!("({}) * {}u", coords[axis], desc.strides[0]));
+    }
+    Err(DmlError::invalid(
+        "quantization tensor must be scalar, per-axis, or broadcastable to the output rank",
+    ))
+}
+
+fn quantization_index_for_linear(
+    desc: &DmlTensorDesc,
+    output: &DmlTensorDesc,
+    index: &str,
+) -> DmlResult<String> {
+    let mut coords = Vec::with_capacity(output.sizes.len());
+    for dimension in 0..output.sizes.len() {
+        let divisor: u64 = output.sizes[dimension + 1..]
+            .iter()
+            .map(|size| *size as u64)
+            .product();
+        coords.push(format!(
+            "(({index}) / {divisor}u % {}u)",
+            output.sizes[dimension]
+        ));
+    }
+    quantization_tensor_index(desc, output, &coords)
 }
 
 fn emit_scalar_binary(op: DmlBinaryOp) -> &'static str {
@@ -4224,6 +4459,7 @@ fn emit_gemm_msl(
 #[allow(clippy::too_many_arguments)]
 fn emit_convolution_msl(
     plan: &DmlOpPlan,
+    mode: u32,
     strides: &[u32],
     dilations: &[u32],
     start_padding: &[u32],
@@ -4277,8 +4513,13 @@ fn emit_convolution_msl(
         "o0 * {}u + ic * {}u + uint(iy) * {}u + uint(ix) * {}u",
         input.strides[0], input.strides[1], input.strides[2], input.strides[3]
     );
+    let (filter_y, filter_x) = if mode == DML_CONVOLUTION_MODE_CONVOLUTION {
+        (format!("({kh}u - 1u - fy)"), format!("({kw}u - 1u - fx)"))
+    } else {
+        ("fy".to_string(), "fx".to_string())
+    };
     let filter_index = format!(
-        "o1 * {}u + cg * {}u + fy * {}u + fx * {}u",
+        "o1 * {}u + cg * {}u + {filter_y} * {}u + {filter_x} * {}u",
         filter.strides[0], filter.strides[1], filter.strides[2], filter.strides[3]
     );
     source.push_str(&format!(
@@ -4875,6 +5116,7 @@ fn emit_resample_msl(
     input_offsets: &[f32],
     output_offsets: &[f32],
     rounding: DmlAxisDirection,
+    antialiased: bool,
 ) -> DmlResult<String> {
     let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
     let input = &plan.inputs[0];
@@ -4891,7 +5133,58 @@ fn emit_resample_msl(
         ));
     }
     let out_index = output_index_expr(&plan.output);
-    if mode == DmlInterpolationMode::NearestNeighbor {
+    if antialiased {
+        for dimension in 0..rank {
+            source.push_str(&format!(
+                "    float r{dimension} = fmax(0.5f, 0.5f / {});\n",
+                msl_float(scales[dimension])
+            ));
+            source.push_str(&format!(
+                "    int start{dimension} = int(floor(s{dimension} - r{dimension}));\n"
+            ));
+            source.push_str(&format!(
+                "    int end{dimension} = int(ceil(s{dimension} + r{dimension}));\n"
+            ));
+        }
+        source.push_str("    float result = 0.0f;\n    float total = 0.0f;\n");
+        let mut indent = String::from("    ");
+        for dimension in 0..rank {
+            source.push_str(&format!(
+                "{indent}for (int q{dimension} = start{dimension}; q{dimension} <= end{dimension}; ++q{dimension}) {{\n"
+            ));
+            source.push_str(&format!(
+                "{indent}    if (q{dimension} < 0 || q{dimension} >= {}) continue;\n",
+                input.sizes[dimension]
+            ));
+            source.push_str(&format!(
+                "{indent}    float w{dimension} = 1.0f - fabs(float(q{dimension}) - s{dimension}) / r{dimension};\n"
+            ));
+            source.push_str(&format!(
+                "{indent}    if (w{dimension} <= 0.0f) continue;\n"
+            ));
+            indent.push_str("    ");
+        }
+        let index = linear_index(
+            input,
+            &(0..rank)
+                .map(|dimension| format!("uint(q{dimension})"))
+                .collect::<Vec<_>>(),
+        );
+        let weight = (0..rank)
+            .map(|dimension| format!("w{dimension}"))
+            .collect::<Vec<_>>()
+            .join(" * ");
+        source.push_str(&format!(
+            "{indent}float weight = {weight};\n{indent}result += weight * float(in0[{index}]);\n{indent}total += weight;\n"
+        ));
+        for _ in 0..rank {
+            indent.truncate(indent.len().saturating_sub(4));
+            source.push_str(&format!("{indent}}}\n"));
+        }
+        source.push_str(&format!(
+            "    out[{out_index}] = total <= 0.0f ? ({scalar})0 : ({scalar})(result / total);\n"
+        ));
+    } else if mode == DmlInterpolationMode::NearestNeighbor {
         let mut coords = Vec::with_capacity(rank);
         for dimension in 0..rank {
             let size = input.sizes[dimension];
@@ -5109,24 +5402,28 @@ fn emit_gather_nd_msl(
     plan: &DmlOpPlan,
     _input_dimension_count: u32,
     _indices_dimension_count: u32,
-    _batch_dimension_count: u32,
+    batch_dimension_count: u32,
 ) -> DmlResult<String> {
     let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
     let input = &plan.inputs[0];
     let indices = &plan.inputs[1];
     let indices_rank = indices.sizes.len();
+    let batch = batch_dimension_count as usize;
     let indexed = indices.sizes[indices_rank - 1] as usize;
     let mut source = msl_header(plan, scalar);
     push_guard(&mut source, &plan.output);
     push_output_coords(&mut source, &plan.output);
     let mut input_coords = Vec::with_capacity(input.sizes.len());
     for dimension in 0..input.sizes.len() {
-        if dimension < indexed {
+        if dimension < batch {
+            input_coords.push(format!("o{dimension}"));
+        } else if dimension < batch + indexed {
+            let index_dimension = dimension - batch;
             let mut idx_coords = vec![String::new(); indices_rank];
             for (position, coordinate) in idx_coords.iter_mut().take(indices_rank - 1).enumerate() {
                 *coordinate = format!("o{position}");
             }
-            idx_coords[indices_rank - 1] = format!("{dimension}u");
+            idx_coords[indices_rank - 1] = format!("{index_dimension}u");
             let index_expr = linear_index(indices, &idx_coords);
             source.push_str(&format!("    int i{dimension} = int(in1[{index_expr}]);\n"));
             input_coords.push(format!(
@@ -5134,20 +5431,29 @@ fn emit_gather_nd_msl(
                 input.sizes[dimension] - 1
             ));
         } else {
-            input_coords.push(format!("o{}", indices_rank - 1 + dimension - indexed));
+            input_coords.push(format!(
+                "o{}",
+                indices_rank - 1 + dimension - batch - indexed
+            ));
         }
     }
     let mut valid_terms = Vec::new();
     for dimension in 0..indexed {
         valid_terms.push(format!(
-            "i{dimension} >= 0 && i{dimension} < {}",
-            input.sizes[dimension]
+            "i{} >= 0 && i{} < {}",
+            batch + dimension,
+            batch + dimension,
+            input.sizes[batch + dimension]
         ));
     }
+    let condition = if valid_terms.is_empty() {
+        "true".to_string()
+    } else {
+        valid_terms.join(" && ")
+    };
     source.push_str(&format!(
-        "    out[{}] = ({}) ? in0[{}] : ({scalar})0;\n",
+        "    out[{}] = ({condition}) ? in0[{}] : ({scalar})0;\n",
         output_index_expr(&plan.output),
-        valid_terms.join(" && "),
         linear_index(input, &input_coords)
     ));
     source.push_str("}\n");
@@ -5530,6 +5836,7 @@ fn emit_mvn_msl(
     plan: &DmlOpPlan,
     axes: &[u32],
     normalize_variance: bool,
+    use_mean: bool,
     epsilon: f32,
 ) -> DmlResult<String> {
     let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
@@ -5570,7 +5877,11 @@ fn emit_mvn_msl(
     source.push_str(&format!(
         "        float v = float(in0[{index_expr}]);\n        sum += v;\n        sum_sq += v * v;\n    }}\n"
     ));
-    source.push_str(&format!("    float mean = sum / {reduction_count}.0f;\n"));
+    if use_mean {
+        source.push_str(&format!("    float mean = sum / {reduction_count}.0f;\n"));
+    } else {
+        source.push_str("    float mean = 0.0f;\n");
+    }
     let normalized = if normalize_variance {
         format!(
             "(float(in0[{}]) - mean) * rsqrt(sum_sq / {reduction_count}.0f - mean * mean + {})",
@@ -5669,21 +5980,91 @@ fn emit_adam_msl(
 fn emit_quantize_linear_msl(plan: &DmlOpPlan, dequantize: bool) -> DmlResult<String> {
     let out_scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
     let in_scalar = msl_scalar(plan.inputs[0].data_type, plan.operator_type())?;
+    let out_4bit = plan.output.is_4bit();
+    let in_4bit = plan.inputs[0].is_4bit();
+    let count = plan.output.element_count();
     let mut source = msl_header_outputs(plan, in_scalar, &[out_scalar]);
+    let zero_desc = plan.inputs.get(2);
+    if out_4bit && !dequantize {
+        source.push_str(&format!(
+            "    uint base = gid * 2u;\n    if (base >= {count}u) return;\n"
+        ));
+        let signed = plan.output.data_type == DML_TENSOR_DATA_TYPE_INT4;
+        let mut values = Vec::new();
+        for offset in 0..2u64 {
+            let index = if offset == 0 {
+                "base".to_string()
+            } else {
+                "(base + 1u)".to_string()
+            };
+            let scale = quantization_index_for_linear(&plan.inputs[1], &plan.output, &index)?;
+            let zero = match zero_desc {
+                Some(desc) => {
+                    let expr = quantization_index_for_linear(desc, &plan.output, &index)?;
+                    if desc.is_4bit() {
+                        format!(
+                            "float({})",
+                            packed_read_4bit(
+                                "in2",
+                                &expr,
+                                desc.data_type == DML_TENSOR_DATA_TYPE_INT4
+                            )
+                        )
+                    } else {
+                        format!("float(in2[{expr}])")
+                    }
+                }
+                None => "0.0f".to_string(),
+            };
+            let guard = if offset == 0 {
+                String::new()
+            } else {
+                format!("(base + 1u) < {count}u ? ")
+            };
+            let term = format!("{guard}(rint(float(in0[{index}]) / float(in1[{scale}])) + {zero})");
+            let term = if offset == 0 {
+                term
+            } else {
+                format!("{term} : 0.0f")
+            };
+            values.push(term);
+        }
+        source.push_str(&format!(
+            "    out0[gid] = {};\n}}\n",
+            packed_store_4bit(&values[0], &values[1], signed)
+        ));
+        return Ok(source);
+    }
     push_guard(&mut source, &plan.output);
-    source.push_str("    float scale = float(in1[0]);\n");
-    let zero_point = if plan.inputs.len() == 3 {
-        "float(in2[0])"
+    let scale = quantization_index_for_linear(&plan.inputs[1], &plan.output, "gid")?;
+    let zero_point = match zero_desc {
+        Some(desc) => {
+            let expr = quantization_index_for_linear(desc, &plan.output, "gid")?;
+            if desc.is_4bit() {
+                format!(
+                    "float({})",
+                    packed_read_4bit("in2", &expr, desc.data_type == DML_TENSOR_DATA_TYPE_INT4)
+                )
+            } else {
+                format!("float(in2[{expr}])")
+            }
+        }
+        None => "0.0f".to_string(),
+    };
+    let input_value = if in_4bit {
+        let signed = plan.inputs[0].data_type == DML_TENSOR_DATA_TYPE_INT4;
+        let read = packed_read_4bit("in0", "gid", signed);
+        format!("float({read})")
     } else {
-        "0.0f"
+        "float(in0[gid])".to_string()
     };
     if dequantize {
         source.push_str(&format!(
-            "    float value = (float(in0[gid]) - {zero_point}) * scale;\n"
+            "    float value = ({input_value} - {zero_point}) * float(in1[{scale}]);\n"
         ));
     } else {
         source.push_str(&format!(
-            "    float value = rint(float(in0[gid]) / scale) + {zero_point};\n"
+            "    float value = rint({input_value} / float(in1[{scale}])) + {zero_point};\n"
         ));
     }
     source.push_str(&format!(
@@ -5730,22 +6111,29 @@ fn emit_quantized_add_msl(plan: &DmlOpPlan) -> DmlResult<String> {
     let b_zero = quantized_input_index(plan, "B zero point");
     let out_scale = quantized_input_index(plan, "output scale").expect("output scale");
     let out_zero = quantized_input_index(plan, "output zero point");
+    let quantizer = |index: usize| {
+        quantization_index_for_linear(&plan.inputs[index], &plan.output, "gid")
+            .expect("quantization tensor validated")
+    };
     source.push_str(&format!(
-        "    float a = (float(in{a_index}[gid]) - {}) * float(in{a_scale}[0]);\n",
+        "    float a = (float(in{a_index}[gid]) - {}) * float(in{a_scale}[{}]);\n",
         a_zero
-            .map(|i| format!("float(in{i}[0])"))
-            .unwrap_or_else(|| "0.0f".to_string())
+            .map(|i| format!("float(in{i}[{}])", quantizer(i)))
+            .unwrap_or_else(|| "0.0f".to_string()),
+        quantizer(a_scale)
     ));
     source.push_str(&format!(
-        "    float b = (float(in{b_index}[gid]) - {}) * float(in{b_scale}[0]);\n",
+        "    float b = (float(in{b_index}[gid]) - {}) * float(in{b_scale}[{}]);\n",
         b_zero
-            .map(|i| format!("float(in{i}[0])"))
-            .unwrap_or_else(|| "0.0f".to_string())
+            .map(|i| format!("float(in{i}[{}])", quantizer(i)))
+            .unwrap_or_else(|| "0.0f".to_string()),
+        quantizer(b_scale)
     ));
     source.push_str(&format!(
-        "    float value = (a + b) / float(in{out_scale}[0]) + {};\n",
+        "    float value = (a + b) / float(in{out_scale}[{}]) + {};\n",
+        quantizer(out_scale),
         out_zero
-            .map(|i| format!("float(in{i}[0])"))
+            .map(|i| format!("float(in{i}[{}])", quantizer(i)))
             .unwrap_or_else(|| "0.0f".to_string())
     ));
     source.push_str(&format!(
@@ -5811,6 +6199,21 @@ fn emit_integer_matmul_msl(plan: &DmlOpPlan) -> DmlResult<String> {
     } else {
         batch_terms_b.join(" + ")
     };
+    let output_coords: Vec<String> = (0..rank)
+        .map(|dimension| {
+            if dimension + 2 < rank {
+                format!("bc{dimension}")
+            } else if dimension + 2 == rank {
+                "m".to_string()
+            } else {
+                "n".to_string()
+            }
+        })
+        .collect();
+    let quant = |index: usize| {
+        quantization_tensor_index(&plan.inputs[index], &plan.output, &output_coords)
+            .expect("quantization tensor validated")
+    };
     source.push_str("    float acc = 0.0f;\n");
     source.push_str(&format!("    for (uint kk = 0u; kk < {k}u; ++kk) {{\n"));
     source.push_str(&format!(
@@ -5824,24 +6227,30 @@ fn emit_integer_matmul_msl(plan: &DmlOpPlan) -> DmlResult<String> {
         b.strides[b.sizes.len() - 1]
     ));
     if let Some(index) = a_zero {
-        source.push_str(&format!("        av -= float(in{index}[0]);\n"));
+        source.push_str(&format!(
+            "        av -= float(in{index}[{}]);\n",
+            quant(index)
+        ));
     }
     if let Some(index) = b_zero {
-        source.push_str(&format!("        bv -= float(in{index}[0]);\n"));
+        source.push_str(&format!(
+            "        bv -= float(in{index}[{}]);\n",
+            quant(index)
+        ));
     }
     source.push_str("        acc += av * bv;\n    }\n");
     if *quantized_output {
         if let Some(index) = a_scale {
-            source.push_str(&format!("    acc *= float(in{index}[0]);\n"));
+            source.push_str(&format!("    acc *= float(in{index}[{}]);\n", quant(index)));
         }
         if let Some(index) = b_scale {
-            source.push_str(&format!("    acc *= float(in{index}[0]);\n"));
+            source.push_str(&format!("    acc *= float(in{index}[{}]);\n", quant(index)));
         }
         if let Some(index) = out_scale {
-            source.push_str(&format!("    acc /= float(in{index}[0]);\n"));
+            source.push_str(&format!("    acc /= float(in{index}[{}]);\n", quant(index)));
         }
         if let Some(index) = out_zero {
-            source.push_str(&format!("    acc += float(in{index}[0]);\n"));
+            source.push_str(&format!("    acc += float(in{index}[{}]);\n", quant(index)));
         }
         source.push_str(&format!(
             "    out0[{}] = {};\n}}\n",
@@ -5890,26 +6299,32 @@ fn emit_integer_matmul_to_float_msl(plan: &DmlOpPlan) -> DmlResult<String> {
         b.strides[b.sizes.len() - 2],
         b.strides[b.sizes.len() - 1]
     ));
+    let output_coords = coord_names(rank);
+    let quant = |index: usize| {
+        quantization_tensor_index(&plan.inputs[index], &plan.output, &output_coords)
+            .expect("quantization tensor validated")
+    };
     if let Some(index) = a_zero {
-        source.push_str(&format!("        av -= float(in{index}[0]);\n"));
+        source.push_str(&format!(
+            "        av -= float(in{index}[{}]);\n",
+            quant(index)
+        ));
     }
     if let Some(index) = b_zero {
-        source.push_str(&format!("        bv -= float(in{index}[0]);\n"));
+        source.push_str(&format!(
+            "        bv -= float(in{index}[{}]);\n",
+            quant(index)
+        ));
     }
     source.push_str("        acc += av * bv;\n    }\n");
     if let Some(index) = a_scale {
-        source.push_str(&format!("    acc *= float(in{index}[0]);\n"));
+        source.push_str(&format!("    acc *= float(in{index}[{}]);\n", quant(index)));
     }
     if let Some(index) = b_scale {
-        source.push_str(&format!("    acc *= float(in{index}[0]);\n"));
+        source.push_str(&format!("    acc *= float(in{index}[{}]);\n", quant(index)));
     }
     if let Some(index) = bias {
-        let bias_index = if plan.inputs[index].element_count() == 1 {
-            "0u".to_string()
-        } else {
-            "n".to_string()
-        };
-        source.push_str(&format!("    acc += float(in{index}[{bias_index}]);\n"));
+        source.push_str(&format!("    acc += float(in{index}[{}]);\n", quant(index)));
     }
     source.push_str(&format!(
         "    out0[{}] = acc;\n}}\n",
@@ -5987,28 +6402,62 @@ fn emit_integer_convolution_msl(plan: &DmlOpPlan) -> DmlResult<String> {
         "                float bv = float(in{filter_index}[o1 * {}u + cg * {}u + fy * {}u + fx * {}u]);\n",
         filter.strides[0], filter.strides[1], filter.strides[2], filter.strides[3]
     ));
+    let input_quant_coords = vec![
+        "o0".to_string(),
+        "ic".to_string(),
+        "o2".to_string(),
+        "o3".to_string(),
+    ];
+    let filter_quant_coords = coord_names(4);
+    let input_quant = |index: usize| {
+        quantization_tensor_index(&plan.inputs[index], &plan.output, &input_quant_coords)
+            .expect("quantization tensor validated")
+    };
+    let filter_quant = |index: usize| {
+        quantization_tensor_index(&plan.inputs[index], &plan.output, &filter_quant_coords)
+            .expect("quantization tensor validated")
+    };
     if let Some(index) = input_zero {
-        source.push_str(&format!("                av -= float(in{index}[0]);\n"));
+        source.push_str(&format!(
+            "                av -= float(in{index}[{}]);\n",
+            input_quant(index)
+        ));
     }
     if let Some(index) = filter_zero {
-        source.push_str(&format!("                bv -= float(in{index}[0]);\n"));
+        source.push_str(&format!(
+            "                bv -= float(in{index}[{}]);\n",
+            filter_quant(index)
+        ));
+    }
+    if *quantized_output && let Some(index) = input_scale {
+        source.push_str(&format!(
+            "                av *= float(in{index}[{}]);\n",
+            input_quant(index)
+        ));
     }
     source.push_str("                acc += av * bv;\n            }\n        }\n    }\n");
     if *quantized_output {
-        if let Some(index) = input_scale {
-            source.push_str(&format!("    acc *= float(in{index}[0]);\n"));
-        }
+        let _ = input_scale;
         if let Some(index) = filter_scale {
-            source.push_str(&format!("    acc *= float(in{index}[0]);\n"));
+            source.push_str(&format!(
+                "    acc *= float(in{index}[{}]);\n",
+                filter_quant(index)
+            ));
         }
         if let Some(index) = bias_index {
             source.push_str(&format!("    acc += float(in{index}[o1]);\n"));
         }
         if let Some(index) = out_scale {
-            source.push_str(&format!("    acc /= float(in{index}[0]);\n"));
+            source.push_str(&format!(
+                "    acc /= float(in{index}[{}]);\n",
+                filter_quant(index)
+            ));
         }
         if let Some(index) = out_zero {
-            source.push_str(&format!("    acc += float(in{index}[0]);\n"));
+            source.push_str(&format!(
+                "    acc += float(in{index}[{}]);\n",
+                filter_quant(index)
+            ));
         }
         source.push_str(&format!(
             "    out0[{}] = {};\n}}\n",
@@ -6072,10 +6521,16 @@ fn emit_quantized_avg_pool_msl(plan: &DmlOpPlan) -> DmlResult<String> {
         "            if (ix < 0 || ix >= {}) continue;\n",
         input.sizes[3]
     ));
+    let channel_coords = coord_names(4);
+    let input_quant = |index: usize| {
+        quantization_tensor_index(&plan.inputs[index], &plan.output, &channel_coords)
+            .expect("quantization tensor validated")
+    };
     source.push_str(&format!(
-        "            float value = (float(in0[o0 * {}u + o1 * {}u + uint(iy) * {}u + uint(ix) * {}u]) - {}) * float(in{input_scale}[0]);\n",
+        "            float value = (float(in0[o0 * {}u + o1 * {}u + uint(iy) * {}u + uint(ix) * {}u]) - {}) * float(in{input_scale}[{}]);\n",
         input.strides[0], input.strides[1], input.strides[2], input.strides[3],
-        input_zero.map(|i| format!("float(in{i}[0])")).unwrap_or_else(|| "0.0f".to_string())
+        input_zero.map(|i| format!("float(in{i}[{}])", input_quant(i))).unwrap_or_else(|| "0.0f".to_string()),
+        input_quant(input_scale)
     ));
     source.push_str("            acc += value;\n            valid += 1u;\n        }\n    }\n");
     let divisor_value = if *include_padding {
@@ -6087,9 +6542,10 @@ fn emit_quantized_avg_pool_msl(plan: &DmlOpPlan) -> DmlResult<String> {
         "    float mean = valid == 0u ? 0.0f : acc / float({divisor_value});\n"
     ));
     source.push_str(&format!(
-        "    float value = mean / float(in{out_scale}[0]) + {};\n",
+        "    float value = mean / float(in{out_scale}[{}]) + {};\n",
+        input_quant(out_scale),
         out_zero
-            .map(|i| format!("float(in{i}[0])"))
+            .map(|i| format!("float(in{i}[{}])", input_quant(i)))
             .unwrap_or_else(|| "0.0f".to_string())
     ));
     source.push_str(&format!(
@@ -6107,25 +6563,80 @@ fn emit_generic_quantize_msl(
 ) -> DmlResult<String> {
     let out_scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
     let in_scalar = msl_scalar(plan.inputs[0].data_type, plan.operator_type())?;
+    let out_4bit = plan.output.is_4bit();
+    let in_4bit = plan.inputs[0].is_4bit();
+    let count = plan.output.element_count();
     let mut source = msl_header_outputs(plan, in_scalar, &[out_scalar]);
-    push_guard(&mut source, &plan.output);
-    let scale = if quantization_type >= 1 {
-        "float(in1[0])"
-    } else {
-        "1.0f"
+    let scale_at = |index: &str| -> DmlResult<String> {
+        if quantization_type >= 1 {
+            Ok(format!(
+                "float(in1[{}])",
+                quantization_index_for_linear(&plan.inputs[1], &plan.output, index)?
+            ))
+        } else {
+            Ok("1.0f".to_string())
+        }
     };
-    let zero = if quantization_type == 2 {
-        "float(in2[0])"
+    let zero_at = |index: &str| -> DmlResult<String> {
+        if quantization_type >= 2 {
+            let desc = &plan.inputs[2];
+            let element = quantization_index_for_linear(desc, &plan.output, index)?;
+            if desc.is_4bit() {
+                Ok(format!(
+                    "float({})",
+                    packed_read_4bit("in2", &element, desc.data_type == DML_TENSOR_DATA_TYPE_INT4)
+                ))
+            } else {
+                Ok(format!("float(in2[{element}])"))
+            }
+        } else {
+            Ok("0.0f".to_string())
+        }
+    };
+    if out_4bit && !dequantize {
+        source.push_str(&format!(
+            "    uint base = gid * 2u;\n    if (base >= {count}u) return;\n"
+        ));
+        let signed = plan.output.data_type == DML_TENSOR_DATA_TYPE_INT4;
+        let mut values = Vec::new();
+        for offset in 0..2u64 {
+            let index = if offset == 0 {
+                "base".to_string()
+            } else {
+                "(base + 1u)".to_string()
+            };
+            let scale = scale_at(&index)?;
+            let zero = zero_at(&index)?;
+            let term = format!("(rint(float(in0[{index}]) / {scale}) + {zero})");
+            let term = if offset == 0 {
+                term
+            } else {
+                format!("(base + 1u) < {count}u ? {term} : 0.0f")
+            };
+            values.push(term);
+        }
+        source.push_str(&format!(
+            "    out0[gid] = {};\n}}\n",
+            packed_store_4bit(&values[0], &values[1], signed)
+        ));
+        return Ok(source);
+    }
+    push_guard(&mut source, &plan.output);
+    let scale = scale_at("gid")?;
+    let zero = zero_at("gid")?;
+    let input_value = if in_4bit {
+        let signed = plan.inputs[0].data_type == DML_TENSOR_DATA_TYPE_INT4;
+        format!("float({})", packed_read_4bit("in0", "gid", signed))
     } else {
-        "0.0f"
+        "float(in0[gid])".to_string()
     };
     if dequantize {
         source.push_str(&format!(
-            "    float value = (float(in0[gid]) - {zero}) * {scale};\n"
+            "    float value = ({input_value} - {zero}) * {scale};\n"
         ));
     } else {
         source.push_str(&format!(
-            "    float value = rint(float(in0[gid]) / {scale}) + {zero};\n"
+            "    float value = rint({input_value} / {scale}) + {zero};\n"
         ));
     }
     source.push_str(&format!(
@@ -6144,7 +6655,8 @@ fn recurrent_activation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_recurrent_msl(
+#[allow(dead_code)]
+fn emit_recurrent_msl_legacy(
     plan: &DmlOpPlan,
     ty: u32,
     direction: DmlRecurrentDirection,
@@ -6371,6 +6883,308 @@ fn emit_recurrent_msl(
     Ok(source)
 }
 
+fn emit_recurrent_msl(
+    plan: &DmlOpPlan,
+    ty: u32,
+    direction: DmlRecurrentDirection,
+    activations: &[DmlActivation],
+    options: DmlRecurrentOptions,
+    outputs: &[DmlRecurrentOutput],
+    extras: RecurrentExtras,
+) -> DmlResult<String> {
+    let directions = match direction {
+        DmlRecurrentDirection::Forward | DmlRecurrentDirection::Backward => 1u32,
+        DmlRecurrentDirection::Bidirectional => 2u32,
+    };
+    let gates = match ty {
+        DML_OPERATOR_RNN => 1u32,
+        DML_OPERATOR_GRU => 3u32,
+        _ => 4u32,
+    };
+    let input = &plan.inputs[0];
+    let weight = &plan.inputs[1];
+    let recurrence = &plan.inputs[2];
+    let [sequence, batch_size, input_size] = [input.sizes[0], input.sizes[1], input.sizes[2]];
+    let hidden = weight.sizes[1];
+    let gate_span = gates * hidden;
+    let output_scalars = plan
+        .outputs()
+        .map(|output| msl_scalar(output.data_type, ty))
+        .collect::<DmlResult<Vec<_>>>()?;
+    let mut source = msl_header_outputs(plan, "float", &output_scalars);
+    source.push_str("    uint b = gid;\n");
+    source.push_str(&format!(
+        "    if (b >= {batch_size}u) return;\n    uint hidden = {hidden}u;\n"
+    ));
+    source.push_str(&format!(
+        "    for (uint dir = 0u; dir < {directions}u; ++dir) {{\n"
+    ));
+    let scratch_span = 7u64 * batch_size as u64 * hidden as u64;
+    source.push_str(&format!("        uint sbase = dir * {scratch_span}u;\n"));
+    source.push_str(&format!(
+        "        uint h0 = sbase + b * hidden;\n        uint h1 = sbase + ({batch_size}u + b) * hidden;\n        uint c0 = sbase + (2u * {batch_size}u + b) * hidden;\n        uint gb = sbase + 3u * {batch_size}u * hidden + b * hidden * 4u;\n"
+    ));
+    let bias_index = if options.bias { Some(3) } else { None };
+    let hidden_init_index = 3 + usize::from(options.bias);
+    let cell_init_index = hidden_init_index + usize::from(options.hidden_init);
+    let sequence_lengths_index = cell_init_index + usize::from(options.cell_init);
+    let peephole_index = sequence_lengths_index + usize::from(options.sequence_lengths);
+    source.push_str("        for (uint j = 0u; j < hidden; ++j) {\n");
+    if options.hidden_init {
+        let desc = &plan.inputs[hidden_init_index];
+        source.push_str(&format!(
+            "            scratch[h0 + j] = float(in{hidden_init_index}[b * {}u + j * {}u]);\n",
+            desc.strides[1], desc.strides[2]
+        ));
+    } else {
+        source.push_str("            scratch[h0 + j] = 0.0f;\n");
+    }
+    if options.cell_init {
+        let desc = &plan.inputs[cell_init_index];
+        source.push_str(&format!(
+            "            scratch[c0 + j] = float(in{cell_init_index}[b * {}u + j * {}u]);\n",
+            desc.strides[1], desc.strides[2]
+        ));
+    } else {
+        source.push_str("            scratch[c0 + j] = 0.0f;\n");
+    }
+    source.push_str("        }\n");
+    if options.sequence_lengths {
+        let desc = &plan.inputs[sequence_lengths_index];
+        source.push_str(&format!(
+            "        uint t_end = min({sequence}u, uint(max(int(in{sequence_lengths_index}[b * {}u]), 0)));\n",
+            desc.strides[0]
+        ));
+    } else {
+        source.push_str(&format!("        uint t_end = {sequence}u;\n"));
+    }
+    let reverse = match direction {
+        DmlRecurrentDirection::Forward => "false",
+        DmlRecurrentDirection::Backward => "true",
+        DmlRecurrentDirection::Bidirectional => "dir == 1u",
+    };
+    let sequence_output = outputs
+        .iter()
+        .position(|output| *output == DmlRecurrentOutput::Sequence);
+    let single_output = outputs
+        .iter()
+        .position(|output| *output == DmlRecurrentOutput::Single);
+    let cell_output = outputs
+        .iter()
+        .position(|output| *output == DmlRecurrentOutput::CellSingle);
+    source.push_str(&format!(
+        "        for (uint step = 0u; step < {sequence}u; ++step) {{\n"
+    ));
+    source.push_str(&format!(
+        "            uint t = ({reverse}) ? ({sequence}u - 1u - step) : step;\n"
+    ));
+    source.push_str("            if (t < t_end) {\n");
+    let weight_index = |gate: u32| {
+        format!(
+            "in1[((dir * {gate_span}u + {}u + j) * {}u + i * {}u)]",
+            gate * hidden,
+            weight.strides[0],
+            weight.strides[2]
+        )
+    };
+    let recurrence_index = |gate: u32| {
+        format!(
+            "in2[((dir * {gate_span}u + {}u + j) * {}u + i * {}u)]",
+            gate * hidden,
+            recurrence.strides[0],
+            recurrence.strides[2]
+        )
+    };
+    let bias_index_expr = |gate: u32| {
+        bias_index.map(|index| {
+            format!(
+                "float(in{index}[dir * {gate_span}u + {}u + j])",
+                gate * hidden
+            )
+        })
+    };
+    let input_index = format!(
+        "in0[t * {}u + b * {}u + i * {}u]",
+        input.strides[0], input.strides[1], input.strides[2]
+    );
+    match ty {
+        DML_OPERATOR_RNN => {
+            let activation = recurrent_activation(activations, 0, DmlActivation::Tanh);
+            source.push_str("                for (uint j = 0u; j < hidden; ++j) {\n");
+            source.push_str("                    float sum = 0.0f;\n");
+            source.push_str(&format!(
+                "                    for (uint i = 0u; i < {input_size}u; ++i) sum += float({input_index}) * float({});\n",
+                weight_index(0)
+            ));
+            source.push_str(&format!(
+                "                    for (uint i = 0u; i < hidden; ++i) sum += scratch[h0 + i] * float({});\n",
+                recurrence_index(0)
+            ));
+            if let Some(bias) = bias_index_expr(0) {
+                source.push_str(&format!("                    sum += {bias};\n"));
+            }
+            source.push_str(&format!(
+                "                    scratch[h1 + j] = {};\n                }}\n",
+                activation_msl(activation, 0.0, "sum")
+            ));
+        }
+        DML_OPERATOR_GRU => {
+            let gate_activation = recurrent_activation(activations, 0, DmlActivation::Sigmoid);
+            let candidate_activation = recurrent_activation(activations, 1, DmlActivation::Tanh);
+            source.push_str("                for (uint j = 0u; j < hidden; ++j) {\n");
+            source.push_str("                    float z = 0.0f, r = 0.0f;\n");
+            source.push_str(&format!(
+                "                    for (uint i = 0u; i < {input_size}u; ++i) {{ float xv = float({input_index}); z += xv * float({}); r += xv * float({}); }}\n",
+                weight_index(0),
+                weight_index(1)
+            ));
+            source.push_str(&format!(
+                "                    for (uint i = 0u; i < hidden; ++i) {{ float hv = scratch[h0 + i]; z += hv * float({}); r += hv * float({}); }}\n",
+                recurrence_index(0),
+                recurrence_index(1)
+            ));
+            if let (Some(z_bias), Some(r_bias)) = (bias_index_expr(0), bias_index_expr(1)) {
+                source.push_str(&format!(
+                    "                    z += {z_bias}; r += {r_bias};\n"
+                ));
+            }
+            source.push_str(&format!(
+                "                    z = {}; r = {};\n                    scratch[gb + j] = z; scratch[gb + hidden + j] = r;\n",
+                activation_msl(gate_activation, 0.0, "z"),
+                activation_msl(gate_activation, 0.0, "r")
+            ));
+            source.push_str("                }\n");
+            source.push_str("                for (uint j = 0u; j < hidden; ++j) {\n");
+            source.push_str("                    float reset = scratch[gb + hidden + j];\n");
+            source.push_str("                    float candidate = 0.0f;\n");
+            source.push_str(&format!(
+                "                    for (uint i = 0u; i < {input_size}u; ++i) candidate += float({input_index}) * float({});\n",
+                weight_index(2)
+            ));
+            source.push_str("                    float recurrent = 0.0f;\n");
+            source.push_str(&format!(
+                "                    for (uint i = 0u; i < hidden; ++i) recurrent += scratch[h0 + i] * float({});\n",
+                recurrence_index(2)
+            ));
+            if let Some(bias) = bias_index_expr(2) {
+                source.push_str(&format!("                    candidate += {bias};\n"));
+            }
+            let _ = extras.linear_before_reset;
+            source.push_str(&format!(
+                "                    candidate = {};\n",
+                activation_msl(candidate_activation, 0.0, "candidate + reset * recurrent")
+            ));
+            source.push_str(
+                "                    float update = scratch[gb + j];\n                    scratch[h1 + j] = (1.0f - update) * scratch[h0 + j] + update * candidate;\n                }\n",
+            );
+        }
+        _ => {
+            let gate_activation = recurrent_activation(activations, 0, DmlActivation::Sigmoid);
+            let cell_activation = recurrent_activation(activations, 1, DmlActivation::Tanh);
+            let output_activation = recurrent_activation(activations, 2, DmlActivation::Tanh);
+            let gate_names = ["i_gate", "o_gate", "f_gate", "c_gate"];
+            source.push_str("                for (uint j = 0u; j < hidden; ++j) {\n");
+            for (gate, name) in gate_names.iter().enumerate() {
+                source.push_str(&format!("                    float {name} = 0.0f;\n"));
+                source.push_str(&format!(
+                    "                    for (uint i = 0u; i < {input_size}u; ++i) {name} += float({input_index}) * float({});\n",
+                    weight_index(gate as u32)
+                ));
+                source.push_str(&format!(
+                    "                    for (uint i = 0u; i < hidden; ++i) {name} += scratch[h0 + i] * float({});\n",
+                    recurrence_index(gate as u32)
+                ));
+                if let Some(bias) = bias_index_expr(gate as u32) {
+                    source.push_str(&format!("                    {name} += {bias};\n"));
+                }
+            }
+            source.push_str(&format!(
+                "                    i_gate = {};\n                    o_gate = {};\n                    f_gate = {};\n                    c_gate = {};\n",
+                activation_msl(gate_activation, 0.0, "i_gate"),
+                activation_msl(gate_activation, 0.0, "o_gate"),
+                activation_msl(gate_activation, 0.0, "f_gate"),
+                activation_msl(cell_activation, 0.0, "c_gate")
+            ));
+            if options.peephole {
+                source.push_str(&format!(
+                    "                    i_gate += float(in{peephole_index}[dir * {}u + j]) * scratch[c0 + j];\n                    f_gate += float(in{peephole_index}[dir * {}u + hidden + j]) * scratch[c0 + j];\n",
+                    3 * hidden,
+                    3 * hidden
+                ));
+                source.push_str(&format!(
+                    "                    i_gate = {};\n                    f_gate = {};\n",
+                    activation_msl(gate_activation, 0.0, "i_gate"),
+                    activation_msl(gate_activation, 0.0, "f_gate")
+                ));
+            }
+            if extras.couple_input_forget {
+                source.push_str("                    f_gate = 1.0f - i_gate;\n");
+            }
+            source.push_str(
+                "                    float cell = f_gate * scratch[c0 + j] + i_gate * c_gate;\n",
+            );
+            if extras.use_clip_threshold {
+                source.push_str(&format!(
+                    "                    cell = clamp(cell, -{}, {});\n",
+                    msl_float(extras.clip_threshold),
+                    msl_float(extras.clip_threshold)
+                ));
+            }
+            source.push_str("                    scratch[gb + j] = cell;\n");
+            if options.peephole {
+                source.push_str(&format!(
+                    "                    float o_gate_peep = float(in{peephole_index}[dir * {}u + 2u * hidden + j]);\n                    float o_gate_value = {} + o_gate_peep * cell;\n                    scratch[h1 + j] = {} * {};\n",
+                    3 * hidden,
+                    activation_msl(gate_activation, 0.0, "o_gate"),
+                    activation_msl(gate_activation, 0.0, "o_gate_value"),
+                    activation_msl(output_activation, 0.0, "cell")
+                ));
+            } else {
+                source.push_str(&format!(
+                    "                    scratch[h1 + j] = o_gate * {};\n",
+                    activation_msl(output_activation, 0.0, "cell")
+                ));
+            }
+            source.push_str("                }\n");
+        }
+    }
+    source.push_str(
+        "            } else {\n                for (uint j = 0u; j < hidden; ++j) scratch[h1 + j] = scratch[h0 + j];\n            }\n",
+    );
+    if let Some(role) = sequence_output {
+        let output = plan.outputs().nth(role).expect("sequence output");
+        let scalar = output_scalars[role];
+        source.push_str("            for (uint j = 0u; j < hidden; ++j) {\n");
+        source.push_str(&format!(
+            "                out{role}[t * {}u + b * {}u + (dir * hidden + j) * {}u] = ({scalar})scratch[h1 + j];\n",
+            output.strides[0], output.strides[1], output.strides[2]
+        ));
+        source.push_str("            }\n");
+    }
+    source.push_str(
+        "            for (uint j = 0u; j < hidden; ++j) scratch[h0 + j] = scratch[h1 + j];\n",
+    );
+    if ty == DML_OPERATOR_LSTM {
+        source.push_str("            if (t < t_end) for (uint j = 0u; j < hidden; ++j) scratch[c0 + j] = scratch[gb + j];\n");
+    }
+    source.push_str("        }\n");
+    for (role, output) in [(single_output, "single"), (cell_output, "cell")] {
+        let Some(role) = role else { continue };
+        let desc = plan.outputs().nth(role).expect("recurrent output");
+        let scalar = output_scalars[role];
+        let source_state = if output == "cell" { "c0" } else { "h0" };
+        source.push_str("        for (uint j = 0u; j < hidden; ++j) {\n");
+        source.push_str(&format!(
+            "            out{role}[b * {}u + (dir * hidden + j) * {}u] = ({scalar})scratch[{source_state} + j];\n",
+            desc.strides[1], desc.strides[2]
+        ));
+        source.push_str("        }\n");
+    }
+    source.push_str("    }\n");
+    source.push_str("}\n");
+    Ok(source)
+}
+
 pub fn emit_msl(plan: &DmlOpPlan) -> DmlResult<String> {
     plan.validate()?;
     let mut source = match &plan.kind {
@@ -6381,12 +7195,13 @@ pub fn emit_msl(plan: &DmlOpPlan) -> DmlResult<String> {
             beta,
         } => emit_gemm_msl(plan, *trans_a, *trans_b, *alpha, *beta),
         DmlOpKind::Convolution {
+            mode,
             strides,
             dilations,
             start_padding,
             group_count,
             ..
-        } => emit_convolution_msl(plan, strides, dilations, start_padding, *group_count),
+        } => emit_convolution_msl(plan, *mode, strides, dilations, start_padding, *group_count),
         DmlOpKind::Pooling {
             kind,
             strides,
@@ -6488,7 +7303,7 @@ pub fn emit_msl(plan: &DmlOpPlan) -> DmlResult<String> {
             input_offsets,
             output_offsets,
             rounding,
-            ..
+            antialiased,
         } => emit_resample_msl(
             plan,
             *mode,
@@ -6496,6 +7311,7 @@ pub fn emit_msl(plan: &DmlOpPlan) -> DmlResult<String> {
             input_offsets,
             output_offsets,
             *rounding,
+            *antialiased,
         ),
         DmlOpKind::TopK { axis, k, direction } => emit_top_k_msl(plan, *axis, *k, *direction),
         DmlOpKind::Tile { repeats } => emit_tile_msl(plan, repeats),
@@ -6558,8 +7374,9 @@ pub fn emit_msl(plan: &DmlOpPlan) -> DmlResult<String> {
         DmlOpKind::MeanVarianceNormalization {
             axes,
             normalize_variance,
+            use_mean,
             epsilon,
-        } => emit_mvn_msl(plan, axes, *normalize_variance, *epsilon),
+        } => emit_mvn_msl(plan, axes, *normalize_variance, *use_mean, *epsilon),
         DmlOpKind::Adam {
             learning_rate,
             beta1,
@@ -6674,6 +7491,403 @@ pub fn execute_plan_outputs(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum GraphSource {
+    Input(usize),
+    Node(u32, usize),
+}
+
+fn graph_wiring(
+    graph: &super::DmlGraphPlan,
+) -> DmlResult<(
+    Vec<Vec<Option<GraphSource>>>,
+    Vec<Option<GraphSource>>,
+    Vec<u64>,
+)> {
+    let mut inputs: Vec<Vec<Option<GraphSource>>> = graph
+        .nodes
+        .iter()
+        .map(|node| vec![None; node.inputs.len()])
+        .collect();
+    for edge in &graph.input_edges {
+        let slot = inputs
+            .get_mut(edge.to_node as usize)
+            .and_then(|node| node.get_mut(edge.to_node_input as usize))
+            .ok_or_else(|| {
+                DmlError::invalid(format!(
+                    "input edge targets node {} input {}, which does not exist",
+                    edge.to_node, edge.to_node_input
+                ))
+            })?;
+        *slot = Some(GraphSource::Input(edge.graph_input as usize));
+    }
+    for edge in &graph.intermediate_edges {
+        if edge.from_node as usize >= graph.nodes.len() {
+            return Err(DmlError::invalid(format!(
+                "intermediate edge references node {}, which does not exist",
+                edge.from_node
+            )));
+        }
+        let slot = inputs
+            .get_mut(edge.to_node as usize)
+            .and_then(|node| node.get_mut(edge.to_node_input as usize))
+            .ok_or_else(|| {
+                DmlError::invalid(format!(
+                    "intermediate edge targets node {} input {}, which does not exist",
+                    edge.to_node, edge.to_node_input
+                ))
+            })?;
+        *slot = Some(GraphSource::Node(
+            edge.from_node,
+            edge.from_node_output as usize,
+        ));
+    }
+    for (node_index, node) in graph.nodes.iter().enumerate() {
+        for (input_index, source) in inputs[node_index].iter().enumerate() {
+            if source.is_none() {
+                return Err(DmlError::invalid(format!(
+                    "graph node {node_index} input {input_index} is not connected"
+                )));
+            }
+        }
+        for (input_index, desc) in node.inputs.iter().enumerate() {
+            if let Some(GraphSource::Node(from_node, from_output)) = inputs[node_index][input_index]
+            {
+                let source = graph
+                    .nodes
+                    .get(from_node as usize)
+                    .and_then(|node| node.outputs().nth(from_output));
+                let Some(source) = source else {
+                    return Err(DmlError::invalid(format!(
+                        "graph edge references node {from_node} output {from_output}, which does not exist"
+                    )));
+                };
+                if source.total_size_in_bytes < desc.total_size_in_bytes {
+                    return Err(DmlError::invalid(format!(
+                        "graph node {node_index} input {input_index} requires {} bytes but node {from_node} output {from_output} provides {}",
+                        desc.total_size_in_bytes, source.total_size_in_bytes
+                    )));
+                }
+            }
+        }
+    }
+    let mut outputs = vec![None; graph.output_count as usize];
+    for edge in &graph.output_edges {
+        if edge.graph_output as usize >= outputs.len() {
+            return Err(DmlError::invalid(format!(
+                "graph output {} is out of range",
+                edge.graph_output
+            )));
+        }
+        let exists = graph
+            .nodes
+            .get(edge.from_node as usize)
+            .and_then(|node| node.outputs().nth(edge.from_node_output as usize))
+            .is_some();
+        if !exists {
+            return Err(DmlError::invalid(format!(
+                "output edge references node {} output {}, which does not exist",
+                edge.from_node, edge.from_node_output
+            )));
+        }
+        outputs[edge.graph_output as usize] = Some(GraphSource::Node(
+            edge.from_node,
+            edge.from_node_output as usize,
+        ));
+    }
+    for (index, source) in outputs.iter().enumerate() {
+        if source.is_none() {
+            return Err(DmlError::invalid(format!(
+                "graph output {index} is not connected"
+            )));
+        }
+    }
+    let mut input_sizes = vec![0u64; graph.input_count as usize];
+    for (node_index, node) in graph.nodes.iter().enumerate() {
+        for (input_index, source) in inputs[node_index].iter().enumerate() {
+            if let Some(GraphSource::Input(index)) = source {
+                input_sizes[*index] =
+                    input_sizes[*index].max(node.inputs[input_index].total_size_in_bytes);
+            }
+        }
+    }
+    for (index, size) in input_sizes.iter().enumerate() {
+        if *size == 0 {
+            return Err(DmlError::invalid(format!(
+                "graph input {index} is not connected"
+            )));
+        }
+    }
+    Ok((inputs, outputs, input_sizes))
+}
+
+/// Execute a validated DirectML graph. Nodes run in topological order; the
+/// Metal backend compiles every node into one MSL library and records all
+/// kernels on a single command buffer, wiring node outputs directly into
+/// downstream input buffers (no host round-trip between nodes).
+pub fn execute_graph_plan(
+    graph: &super::DmlGraphPlan,
+    backend: DmlExecutionDevice,
+    inputs: &[&[u8]],
+    outputs: &mut [&mut [u8]],
+) -> DmlResult<()> {
+    let (wiring, output_sources, input_sizes) = graph_wiring(graph)?;
+    let mut seen = vec![false; graph.nodes.len()];
+    for node in &graph.execution_order {
+        let Some(flag) = seen.get_mut(*node as usize) else {
+            return Err(DmlError::invalid(format!(
+                "graph execution order references node {node}, which does not exist"
+            )));
+        };
+        if *flag {
+            return Err(DmlError::invalid(format!(
+                "graph execution order contains node {node} more than once"
+            )));
+        }
+        *flag = true;
+    }
+    if let Some(index) = seen.iter().position(|value| !value) {
+        return Err(DmlError::invalid(format!(
+            "graph execution order does not include node {index}"
+        )));
+    }
+    if inputs.len() != graph.input_count as usize {
+        return Err(DmlError::invalid(format!(
+            "graph expects {} input buffers, got {}",
+            graph.input_count,
+            inputs.len()
+        )));
+    }
+    if outputs.len() != graph.output_count as usize {
+        return Err(DmlError::invalid(format!(
+            "graph expects {} output buffers, got {}",
+            graph.output_count,
+            outputs.len()
+        )));
+    }
+    for (index, (buffer, size)) in inputs.iter().zip(&input_sizes).enumerate() {
+        if buffer.len() < *size as usize {
+            return Err(DmlError::invalid(format!(
+                "graph input {index} buffer is {} bytes, graph requires {size}",
+                buffer.len()
+            )));
+        }
+    }
+    for (index, (buffer, source)) in outputs.iter().zip(&output_sources).enumerate() {
+        let Some(GraphSource::Node(node, output)) = source else {
+            return Err(DmlError::invalid(format!(
+                "graph output {index} has no source"
+            )));
+        };
+        let desc = graph.nodes[*node as usize]
+            .outputs()
+            .nth(*output)
+            .ok_or_else(|| DmlError::invalid("graph output source is missing"))?;
+        if buffer.len() < desc.total_size_in_bytes as usize {
+            return Err(DmlError::invalid(format!(
+                "graph output {index} buffer is {} bytes, graph requires {}",
+                buffer.len(),
+                desc.total_size_in_bytes
+            )));
+        }
+    }
+    match backend {
+        DmlExecutionDevice::Cpu => {
+            execute_graph_cpu(graph, &wiring, &output_sources, inputs, outputs)
+        }
+        DmlExecutionDevice::Metal => {
+            execute_graph_metal(graph, &wiring, &output_sources, inputs, outputs)
+        }
+    }
+}
+
+fn execute_graph_cpu(
+    graph: &super::DmlGraphPlan,
+    wiring: &[Vec<Option<GraphSource>>],
+    output_sources: &[Option<GraphSource>],
+    inputs: &[&[u8]],
+    outputs: &mut [&mut [u8]],
+) -> DmlResult<()> {
+    let mut produced: std::collections::BTreeMap<(u32, usize), Vec<u8>> =
+        std::collections::BTreeMap::new();
+    for node_index in &graph.execution_order {
+        let node = &graph.nodes[*node_index as usize];
+        let input_buffers: Vec<&[u8]> = wiring[*node_index as usize]
+            .iter()
+            .map(|source| match source.expect("graph wiring validated") {
+                GraphSource::Input(index) => Ok(inputs[index]),
+                GraphSource::Node(node, output) => produced
+                    .get(&(node, output))
+                    .map(|buffer| buffer.as_slice())
+                    .ok_or_else(|| {
+                        DmlError::invalid(format!(
+                            "graph node {node} output {output} is not available"
+                        ))
+                    }),
+            })
+            .collect::<DmlResult<Vec<_>>>()?;
+        let mut node_outputs: Vec<Vec<u8>> = node
+            .outputs()
+            .map(|desc| vec![0u8; desc.total_size_in_bytes as usize])
+            .collect();
+        {
+            let mut slices: Vec<&mut [u8]> = node_outputs
+                .iter_mut()
+                .map(|buffer| buffer.as_mut_slice())
+                .collect();
+            execute_plan_outputs(node, DmlExecutionDevice::Cpu, &input_buffers, &mut slices)?;
+        }
+        for (output, buffer) in node_outputs.into_iter().enumerate() {
+            produced.insert((*node_index, output), buffer);
+        }
+    }
+    for (index, source) in output_sources.iter().enumerate() {
+        let Some(GraphSource::Node(node, output)) = source else {
+            return Err(DmlError::invalid("graph output source is missing"));
+        };
+        let buffer = produced
+            .get(&(*node, *output))
+            .ok_or_else(|| DmlError::invalid("graph output was not produced"))?;
+        outputs[index][..buffer.len()].copy_from_slice(buffer);
+    }
+    Ok(())
+}
+
+fn execute_graph_metal(
+    graph: &super::DmlGraphPlan,
+    wiring: &[Vec<Option<GraphSource>>],
+    output_sources: &[Option<GraphSource>],
+    inputs: &[&[u8]],
+    outputs: &mut [&mut [u8]],
+) -> DmlResult<()> {
+    let device = MetalDevice::system_default().map_err(|error| {
+        DmlError::unsupported_feature(format!("no Metal device available: {error}"))
+    })?;
+    let mut combined = String::new();
+    for (index, node) in graph.nodes.iter().enumerate() {
+        let source = emit_msl(node)?;
+        combined.push_str(&source.replace(
+            "kernel void dml_op(",
+            &format!("kernel void dml_node{index}("),
+        ));
+    }
+    let library = device.compile_shader_library(&combined).map_err(|error| {
+        DmlError::new(E_FAIL, format!("graph Metal compilation failed: {error}"))
+    })?;
+    let (_, _, input_sizes) = graph_wiring(graph)?;
+    let input_buffers: Vec<_> = inputs
+        .iter()
+        .zip(&input_sizes)
+        .map(|(data, size)| {
+            device.create_buffer_with_data(
+                &data[..*size as usize],
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        })
+        .collect();
+    let mut node_buffers: Vec<Vec<metal::Buffer>> = Vec::with_capacity(graph.nodes.len());
+    for node in &graph.nodes {
+        node_buffers.push(
+            node.outputs()
+                .map(|desc| {
+                    device.create_buffer(
+                        desc.total_size_in_bytes,
+                        metal::MTLResourceOptions::StorageModeShared,
+                    )
+                })
+                .collect(),
+        );
+    }
+    let mut scratch_buffers: Vec<Option<metal::Buffer>> = Vec::with_capacity(graph.nodes.len());
+    for node in &graph.nodes {
+        let scratch = match &node.kind {
+            DmlOpKind::Rnn { direction, .. }
+            | DmlOpKind::Gru { direction, .. }
+            | DmlOpKind::Lstm { direction, .. } => {
+                let batch = node.inputs[0].sizes[1] as u64;
+                let hidden = node.inputs[1].sizes[1] as u64;
+                let directions = if *direction == DmlRecurrentDirection::Bidirectional {
+                    2
+                } else {
+                    1
+                };
+                Some(device.create_buffer(
+                    batch * hidden * 7 * 4 * directions,
+                    metal::MTLResourceOptions::StorageModeShared,
+                ))
+            }
+            _ => None,
+        };
+        scratch_buffers.push(scratch);
+    }
+    let queue = device.create_command_queue();
+    let command_buffer = queue.new_command_buffer();
+    {
+        let encoder = command_buffer.new_compute_command_encoder();
+        for node_index in &graph.execution_order {
+            let index = *node_index as usize;
+            let node = &graph.nodes[index];
+            let function = library
+                .get_function(&format!("dml_node{index}"), None)
+                .map_err(|error| {
+                    DmlError::new(E_FAIL, format!("dml_node{index} not found: {error}"))
+                })?;
+            let pipeline = device
+                .metal_device()
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|error| {
+                    DmlError::new(E_FAIL, format!("pipeline creation failed: {error}"))
+                })?;
+            encoder.set_compute_pipeline_state(&pipeline);
+            for (input_index, source) in wiring[index].iter().enumerate() {
+                let buffer = match source.expect("graph wiring validated") {
+                    GraphSource::Input(graph_input) => &input_buffers[graph_input],
+                    GraphSource::Node(node, output) => &node_buffers[node as usize][output],
+                };
+                encoder.set_buffer(input_index as u64, Some(buffer), 0);
+            }
+            let output_start = node.inputs.len() as u64;
+            for (output_index, buffer) in node_buffers[index].iter().enumerate() {
+                encoder.set_buffer(output_start + output_index as u64, Some(buffer), 0);
+            }
+            if let Some(scratch) = &scratch_buffers[index] {
+                encoder.set_buffer(
+                    output_start + node_buffers[index].len() as u64,
+                    Some(scratch),
+                    0,
+                );
+            }
+            let count = node.dispatch_count();
+            let max_threads = pipeline.max_total_threads_per_threadgroup();
+            let threadgroup = max_threads.clamp(1, 256);
+            encoder.dispatch_threads(
+                metal::MTLSize::new(count.max(1), 1, 1),
+                metal::MTLSize::new(threadgroup, 1, 1),
+            );
+        }
+        encoder.end_encoding();
+    }
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    if command_buffer.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(DmlError::new(
+            E_FAIL,
+            "Metal command buffer failed while executing the DirectML graph",
+        ));
+    }
+    for (index, source) in output_sources.iter().enumerate() {
+        let Some(GraphSource::Node(node, output)) = source else {
+            return Err(DmlError::invalid("graph output source is missing"));
+        };
+        let buffer = &node_buffers[*node as usize][*output];
+        let length = buffer.length() as usize;
+        let contents =
+            unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, length) };
+        outputs[index][..length].copy_from_slice(contents);
+    }
+    Ok(())
+}
+
 fn execute_metal(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) -> DmlResult<()> {
     let device = MetalDevice::system_default().map_err(|error| {
         DmlError::unsupported_feature(format!("no Metal device available: {error}"))
@@ -6710,12 +7924,19 @@ fn execute_metal(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) 
             )
         })
         .collect();
-    let scratch_buffer = match plan.kind {
-        DmlOpKind::Rnn { .. } | DmlOpKind::Gru { .. } | DmlOpKind::Lstm { .. } => {
+    let scratch_buffer = match &plan.kind {
+        DmlOpKind::Rnn { direction, .. }
+        | DmlOpKind::Gru { direction, .. }
+        | DmlOpKind::Lstm { direction, .. } => {
             let batch = plan.inputs[0].sizes[1] as u64;
             let hidden = plan.inputs[1].sizes[1] as u64;
+            let directions = if *direction == DmlRecurrentDirection::Bidirectional {
+                2
+            } else {
+                1
+            };
             Some(device.create_buffer(
-                batch * hidden * 7 * 4,
+                batch * hidden * 7 * 4 * directions,
                 metal::MTLResourceOptions::StorageModeShared,
             ))
         }
@@ -6863,6 +8084,15 @@ fn load_scalar(bytes: &[u8], index: u64, data_type: u32) -> f32 {
         ) as f32,
         DML_TENSOR_DATA_TYPE_UINT8 => bytes[index] as f32,
         DML_TENSOR_DATA_TYPE_INT8 => (bytes[index] as i8) as f32,
+        DML_TENSOR_DATA_TYPE_UINT4 => ((bytes[index / 2] >> ((index % 2) * 4)) & 0x0f) as f32,
+        DML_TENSOR_DATA_TYPE_INT4 => {
+            let raw = ((bytes[index / 2] >> ((index % 2) * 4)) & 0x0f) as i8;
+            if raw & 0x08 != 0 {
+                raw as f32 - 16.0
+            } else {
+                raw as f32
+            }
+        }
         _ => 0.0,
     }
 }
@@ -6916,6 +8146,16 @@ fn store_quantized(bytes: &mut [u8], index: u64, data_type: u32, value: f32) {
         DML_TENSOR_DATA_TYPE_INT8 => {
             bytes[index] = value.round_ties_even().clamp(-128.0, 127.0) as i8 as u8;
         }
+        DML_TENSOR_DATA_TYPE_UINT4 | DML_TENSOR_DATA_TYPE_INT4 => {
+            let range = if data_type == DML_TENSOR_DATA_TYPE_INT4 {
+                (-8.0, 7.0)
+            } else {
+                (0.0, 15.0)
+            };
+            let quantized = value.round_ties_even().clamp(range.0, range.1) as i32 & 0x0f;
+            let shift = (index % 2) * 4;
+            bytes[index / 2] = (bytes[index / 2] & !(0x0f << shift)) | ((quantized as u8) << shift);
+        }
         _ => store_scalar(bytes, index as u64, data_type, value),
     }
 }
@@ -6948,6 +8188,47 @@ fn index_of(coords: &[u64], strides: &[u32]) -> u64 {
         .zip(strides)
         .map(|(coord, stride)| coord * *stride as u64)
         .sum()
+}
+
+fn quantization_element_index(
+    desc: &DmlTensorDesc,
+    output: &DmlTensorDesc,
+    output_coords: &[u64],
+) -> u64 {
+    if desc.element_count() == 1 {
+        return 0;
+    }
+    if desc.sizes.len() == output.sizes.len() {
+        let mapped = desc
+            .sizes
+            .iter()
+            .enumerate()
+            .map(|(dimension, size)| {
+                if *size == 1 {
+                    0
+                } else {
+                    output_coords[dimension]
+                }
+            })
+            .collect::<Vec<_>>();
+        return index_of(&mapped, &desc.strides);
+    }
+    if desc.sizes.len() == 1 {
+        let size = desc.sizes[0];
+        let axis = if output.sizes.len() >= 2 && output.sizes[1] == size {
+            1
+        } else if *output.sizes.last().expect("non-empty output") == size {
+            output.sizes.len() - 1
+        } else {
+            output
+                .sizes
+                .iter()
+                .position(|candidate| *candidate == size)
+                .unwrap_or(0)
+        };
+        return output_coords[axis] * desc.strides[0] as u64;
+    }
+    0
 }
 
 fn output_index(desc: &DmlTensorDesc, gid: u64) -> u64 {
@@ -7014,6 +8295,7 @@ fn execute_cpu(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) ->
             }
         }
         DmlOpKind::Convolution {
+            mode,
             strides,
             dilations,
             start_padding,
@@ -7048,7 +8330,16 @@ fn execute_cpu(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) ->
                                 iy as u64,
                                 ix as u64,
                             ];
-                            let filter_coords = [out_channel, cg, fy, fx];
+                            let filter_coords = if *mode == DML_CONVOLUTION_MODE_CONVOLUTION {
+                                [
+                                    out_channel,
+                                    cg,
+                                    filter.sizes[2] as u64 - 1 - fy,
+                                    filter.sizes[3] as u64 - 1 - fx,
+                                ]
+                            } else {
+                                [out_channel, cg, fy, fx]
+                            };
                             acc += load_scalar(
                                 inputs[0],
                                 index_of(&input_coords, &input.strides),
@@ -7543,7 +8834,7 @@ fn execute_cpu(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) ->
             input_offsets,
             output_offsets,
             rounding,
-            ..
+            antialiased,
         } => execute_resample_cpu(
             plan,
             inputs[0],
@@ -7553,6 +8844,7 @@ fn execute_cpu(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) ->
             input_offsets,
             output_offsets,
             *rounding,
+            *antialiased,
         )?,
         DmlOpKind::TopK { axis, k, direction } => execute_top_k_cpu(
             plan,
@@ -7644,8 +8936,17 @@ fn execute_cpu(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) ->
         DmlOpKind::MeanVarianceNormalization {
             axes,
             normalize_variance,
+            use_mean,
             epsilon,
-        } => execute_mvn_cpu(plan, inputs, output, axes, *normalize_variance, *epsilon)?,
+        } => execute_mvn_cpu(
+            plan,
+            inputs,
+            output,
+            axes,
+            *normalize_variance,
+            *use_mean,
+            *epsilon,
+        )?,
         DmlOpKind::Adam {
             learning_rate,
             beta1,
@@ -7736,7 +9037,8 @@ fn execute_binary_cpu(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_recurrent_cpu(
+#[allow(dead_code)]
+fn execute_recurrent_cpu_legacy(
     plan: &DmlOpPlan,
     inputs: &[&[u8]],
     outputs: &mut [&mut [u8]],
@@ -8042,6 +9344,394 @@ fn execute_recurrent_cpu(
     Ok(())
 }
 
+fn execute_recurrent_cpu(
+    plan: &DmlOpPlan,
+    inputs: &[&[u8]],
+    outputs: &mut [&mut [u8]],
+    ty: u32,
+    direction: DmlRecurrentDirection,
+    activations: &[DmlActivation],
+    options: DmlRecurrentOptions,
+    roles: &[DmlRecurrentOutput],
+    extras: RecurrentExtras,
+) -> DmlResult<()> {
+    let directions = match direction {
+        DmlRecurrentDirection::Forward | DmlRecurrentDirection::Backward => 1u32,
+        DmlRecurrentDirection::Bidirectional => 2u32,
+    };
+    let gates = match ty {
+        DML_OPERATOR_RNN => 1u32,
+        DML_OPERATOR_GRU => 3u32,
+        _ => 4u32,
+    };
+    let input = &plan.inputs[0];
+    let weight = &plan.inputs[1];
+    let recurrence = &plan.inputs[2];
+    let [sequence, batch, input_size] = [input.sizes[0], input.sizes[1], input.sizes[2]];
+    let hidden = weight.sizes[1] as usize;
+    let batch_usize = batch as usize;
+    let input_size_usize = input_size as usize;
+    let gate_span = gates * hidden as u32;
+    let bias_index = if options.bias { Some(3) } else { None };
+    let hidden_init_index = 3 + usize::from(options.bias);
+    let cell_init_index = hidden_init_index + usize::from(options.hidden_init);
+    let sequence_lengths_index = cell_init_index + usize::from(options.cell_init);
+    let peephole_index = sequence_lengths_index + usize::from(options.sequence_lengths);
+    let sequence_role = roles
+        .iter()
+        .position(|role| *role == DmlRecurrentOutput::Sequence);
+    let single_role = roles
+        .iter()
+        .position(|role| *role == DmlRecurrentOutput::Single);
+    let cell_role = roles
+        .iter()
+        .position(|role| *role == DmlRecurrentOutput::CellSingle);
+    for dir in 0..directions {
+        let reverse = match direction {
+            DmlRecurrentDirection::Forward => false,
+            DmlRecurrentDirection::Backward => true,
+            DmlRecurrentDirection::Bidirectional => dir == 1,
+        };
+        let gate_offset = dir * gate_span;
+        let gate_origin = (dir * gates) as u64;
+        let mut hidden_state = vec![vec![0.0f32; hidden]; batch_usize];
+        let mut cell_state = vec![vec![0.0f32; hidden]; batch_usize];
+        if options.hidden_init {
+            let desc = &plan.inputs[hidden_init_index];
+            for b in 0..batch_usize {
+                for j in 0..hidden {
+                    hidden_state[b][j] = load_scalar(
+                        inputs[hidden_init_index],
+                        index_of(&[0, b as u64, j as u64], &desc.strides),
+                        desc.data_type,
+                    );
+                }
+            }
+        }
+        if options.cell_init {
+            let desc = &plan.inputs[cell_init_index];
+            for b in 0..batch_usize {
+                for j in 0..hidden {
+                    cell_state[b][j] = load_scalar(
+                        inputs[cell_init_index],
+                        index_of(&[0, b as u64, j as u64], &desc.strides),
+                        desc.data_type,
+                    );
+                }
+            }
+        }
+        let gate_activation = recurrent_activation(activations, 0, DmlActivation::Tanh);
+        for b in 0..batch_usize {
+            let t_end = if options.sequence_lengths {
+                let desc = &plan.inputs[sequence_lengths_index];
+                load_integer(
+                    inputs[sequence_lengths_index],
+                    index_of(&[b as u64], &desc.strides),
+                    desc.data_type,
+                )
+                .clamp(0, sequence as i64) as u32
+            } else {
+                sequence
+            };
+            for step in 0..sequence {
+                let t = if reverse { sequence - 1 - step } else { step };
+                if t < t_end {
+                    let mut next = vec![0.0f32; hidden];
+                    match ty {
+                        DML_OPERATOR_RNN => {
+                            for j in 0..hidden {
+                                let mut sum = 0.0f64;
+                                for i in 0..input_size_usize {
+                                    let x = load_scalar(
+                                        inputs[0],
+                                        index_of(&[t as u64, b as u64, i as u64], &input.strides),
+                                        input.data_type,
+                                    );
+                                    let w = load_scalar(
+                                        inputs[1],
+                                        index_of(
+                                            &[gate_origin, j as u64, i as u64],
+                                            &weight.strides,
+                                        ),
+                                        weight.data_type,
+                                    );
+                                    sum += x as f64 * w as f64;
+                                }
+                                for i in 0..hidden {
+                                    let hsv = hidden_state[b][i];
+                                    let r = load_scalar(
+                                        inputs[2],
+                                        index_of(
+                                            &[gate_origin, j as u64, i as u64],
+                                            &recurrence.strides,
+                                        ),
+                                        recurrence.data_type,
+                                    );
+                                    sum += hsv as f64 * r as f64;
+                                }
+                                if let Some(index) = bias_index {
+                                    sum += load_scalar(
+                                        inputs[index],
+                                        (gate_offset + j as u32) as u64,
+                                        plan.inputs[index].data_type,
+                                    ) as f64;
+                                }
+                                next[j] = activation_cpu(gate_activation, sum as f32);
+                            }
+                        }
+                        DML_OPERATOR_GRU => {
+                            let gate = recurrent_activation(activations, 0, DmlActivation::Sigmoid);
+                            let candidate_activation =
+                                recurrent_activation(activations, 1, DmlActivation::Tanh);
+                            let hidden_now = hidden_state[b].clone();
+                            let mut z = vec![0.0f32; hidden];
+                            let mut r = vec![0.0f32; hidden];
+                            for j in 0..hidden {
+                                let mut z_sum = 0.0f64;
+                                let mut r_sum = 0.0f64;
+                                for i in 0..input_size_usize {
+                                    let x = load_scalar(
+                                        inputs[0],
+                                        index_of(&[t as u64, b as u64, i as u64], &input.strides),
+                                        input.data_type,
+                                    ) as f64;
+                                    z_sum += x * load_scalar(
+                                        inputs[1],
+                                        index_of(
+                                            &[gate_origin, j as u64, i as u64],
+                                            &weight.strides,
+                                        ),
+                                        weight.data_type,
+                                    ) as f64;
+                                    r_sum += x * load_scalar(
+                                        inputs[1],
+                                        index_of(
+                                            &[gate_origin + 1, j as u64, i as u64],
+                                            &weight.strides,
+                                        ),
+                                        weight.data_type,
+                                    ) as f64;
+                                }
+                                for i in 0..hidden {
+                                    let hsv = hidden_now[i] as f64;
+                                    z_sum += hsv
+                                        * load_scalar(
+                                            inputs[2],
+                                            index_of(
+                                                &[gate_origin, j as u64, i as u64],
+                                                &recurrence.strides,
+                                            ),
+                                            recurrence.data_type,
+                                        ) as f64;
+                                    r_sum += hsv
+                                        * load_scalar(
+                                            inputs[2],
+                                            index_of(
+                                                &[gate_origin + 1, j as u64, i as u64],
+                                                &recurrence.strides,
+                                            ),
+                                            recurrence.data_type,
+                                        ) as f64;
+                                }
+                                if let Some(index) = bias_index {
+                                    z_sum += load_scalar(
+                                        inputs[index],
+                                        (gate_offset + j as u32) as u64,
+                                        plan.inputs[index].data_type,
+                                    ) as f64;
+                                    r_sum += load_scalar(
+                                        inputs[index],
+                                        (gate_offset + hidden as u32 + j as u32) as u64,
+                                        plan.inputs[index].data_type,
+                                    ) as f64;
+                                }
+                                z[j] = activation_cpu(gate, z_sum as f32);
+                                r[j] = activation_cpu(gate, r_sum as f32);
+                            }
+                            for j in 0..hidden {
+                                let mut input_term = 0.0f64;
+                                for i in 0..input_size_usize {
+                                    input_term += load_scalar(
+                                        inputs[0],
+                                        index_of(&[t as u64, b as u64, i as u64], &input.strides),
+                                        input.data_type,
+                                    ) as f64
+                                        * load_scalar(
+                                            inputs[1],
+                                            index_of(
+                                                &[gate_origin + 2, j as u64, i as u64],
+                                                &weight.strides,
+                                            ),
+                                            weight.data_type,
+                                        ) as f64;
+                                }
+                                let mut recurrent_term = 0.0f64;
+                                for i in 0..hidden {
+                                    recurrent_term += hidden_now[i] as f64
+                                        * load_scalar(
+                                            inputs[2],
+                                            index_of(
+                                                &[gate_origin + 2, j as u64, i as u64],
+                                                &recurrence.strides,
+                                            ),
+                                            recurrence.data_type,
+                                        ) as f64;
+                                }
+                                if let Some(index) = bias_index {
+                                    input_term += load_scalar(
+                                        inputs[index],
+                                        (gate_offset + 2 * hidden as u32 + j as u32) as u64,
+                                        plan.inputs[index].data_type,
+                                    ) as f64;
+                                }
+                                let combined = input_term + r[j] as f64 * recurrent_term;
+                                let candidate =
+                                    activation_cpu(candidate_activation, combined as f32);
+                                next[j] = (1.0 - z[j]) * hidden_now[j] + z[j] * candidate;
+                            }
+                        }
+                        _ => {
+                            let gate = recurrent_activation(activations, 0, DmlActivation::Sigmoid);
+                            let cell_gate =
+                                recurrent_activation(activations, 1, DmlActivation::Tanh);
+                            let output_activation =
+                                recurrent_activation(activations, 2, DmlActivation::Tanh);
+                            let hidden_now = hidden_state[b].clone();
+                            for j in 0..hidden {
+                                let mut sums = [0.0f64; 4];
+                                for (gate_index, sum) in sums.iter_mut().enumerate() {
+                                    let gate_coord = gate_origin + gate_index as u64;
+                                    for i in 0..input_size_usize {
+                                        *sum += load_scalar(
+                                            inputs[0],
+                                            index_of(
+                                                &[t as u64, b as u64, i as u64],
+                                                &input.strides,
+                                            ),
+                                            input.data_type,
+                                        ) as f64
+                                            * load_scalar(
+                                                inputs[1],
+                                                index_of(
+                                                    &[gate_coord, j as u64, i as u64],
+                                                    &weight.strides,
+                                                ),
+                                                weight.data_type,
+                                            ) as f64;
+                                    }
+                                    for i in 0..hidden {
+                                        *sum += hidden_now[i] as f64
+                                            * load_scalar(
+                                                inputs[2],
+                                                index_of(
+                                                    &[gate_coord, j as u64, i as u64],
+                                                    &recurrence.strides,
+                                                ),
+                                                recurrence.data_type,
+                                            ) as f64;
+                                    }
+                                    if let Some(index) = bias_index {
+                                        let row = gate_offset
+                                            + gate_index as u32 * hidden as u32
+                                            + j as u32;
+                                        *sum += load_scalar(
+                                            inputs[index],
+                                            row as u64,
+                                            plan.inputs[index].data_type,
+                                        ) as f64;
+                                    }
+                                }
+                                let mut i_gate = activation_cpu(gate, sums[0] as f32);
+                                let mut f_gate = activation_cpu(gate, sums[2] as f32);
+                                let c_gate = activation_cpu(cell_gate, sums[3] as f32);
+                                if options.peephole {
+                                    let desc = &plan.inputs[peephole_index];
+                                    let base = dir as u64 * 3 * hidden as u64;
+                                    i_gate += load_scalar(
+                                        inputs[peephole_index],
+                                        base + j as u64,
+                                        desc.data_type,
+                                    ) * cell_state[b][j];
+                                    f_gate += load_scalar(
+                                        inputs[peephole_index],
+                                        base + hidden as u64 + j as u64,
+                                        desc.data_type,
+                                    ) * cell_state[b][j];
+                                    i_gate = activation_cpu(gate, i_gate);
+                                    f_gate = activation_cpu(gate, f_gate);
+                                }
+                                if extras.couple_input_forget {
+                                    f_gate = 1.0 - i_gate;
+                                }
+                                let mut cell = f_gate * cell_state[b][j] + i_gate * c_gate;
+                                if extras.use_clip_threshold {
+                                    cell =
+                                        cell.clamp(-extras.clip_threshold, extras.clip_threshold);
+                                }
+                                cell_state[b][j] = cell;
+                                let mut o_gate = activation_cpu(gate, sums[1] as f32);
+                                if options.peephole {
+                                    let desc = &plan.inputs[peephole_index];
+                                    let base = dir as u64 * 3 * hidden as u64;
+                                    o_gate += load_scalar(
+                                        inputs[peephole_index],
+                                        base + 2 * hidden as u64 + j as u64,
+                                        desc.data_type,
+                                    ) * cell;
+                                    o_gate = activation_cpu(gate, o_gate);
+                                }
+                                next[j] = o_gate * activation_cpu(output_activation, cell);
+                            }
+                        }
+                    }
+                    hidden_state[b] = next;
+                }
+                if let Some(role) = sequence_role {
+                    let desc = &plan.outputs().nth(role).expect("role output").clone();
+                    for j in 0..hidden {
+                        let index = index_of(
+                            &[t as u64, b as u64, (dir as usize * hidden + j) as u64],
+                            &desc.strides,
+                        );
+                        store_scalar(
+                            &mut outputs[role][..],
+                            index,
+                            desc.data_type,
+                            hidden_state[b][j],
+                        );
+                    }
+                }
+            }
+            let column_offset = dir as usize * hidden;
+            if let Some(role) = single_role {
+                let desc = plan.outputs().nth(role).expect("role output").clone();
+                for j in 0..hidden {
+                    let index = index_of(&[0, b as u64, (column_offset + j) as u64], &desc.strides);
+                    store_scalar(
+                        &mut outputs[role][..],
+                        index,
+                        desc.data_type,
+                        hidden_state[b][j],
+                    );
+                }
+            }
+            if let Some(role) = cell_role {
+                let desc = plan.outputs().nth(role).expect("role output").clone();
+                for j in 0..hidden {
+                    let index = index_of(&[0, b as u64, (column_offset + j) as u64], &desc.strides);
+                    store_scalar(
+                        &mut outputs[role][..],
+                        index,
+                        desc.data_type,
+                        cell_state[b][j],
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn execute_arg_reduce_cpu(
     plan: &DmlOpPlan,
     input_bytes: &[u8],
@@ -8186,19 +9876,88 @@ fn execute_resample_cpu(
     input_offsets: &[f32],
     output_offsets: &[f32],
     rounding: DmlAxisDirection,
+    antialiased: bool,
 ) -> DmlResult<()> {
     let input = &plan.inputs[0];
     let rank = input.sizes.len();
     let count = plan.output.element_count();
     for gid in 0..count {
         let output_coords = coords_of(gid, &plan.output.sizes);
-        let coords: Vec<f32> = (0..rank)
+        let coords: Vec<f64> = (0..rank)
             .map(|dimension| {
-                (output_coords[dimension] as f32 + output_offsets[dimension]) / scales[dimension]
-                    + input_offsets[dimension]
+                if antialiased {
+                    (output_coords[dimension] as f64 + output_offsets[dimension] as f64 + 0.5)
+                        / scales[dimension] as f64
+                        + input_offsets[dimension] as f64
+                        - 0.5
+                } else {
+                    (output_coords[dimension] as f64 + output_offsets[dimension] as f64)
+                        / scales[dimension] as f64
+                        + input_offsets[dimension] as f64
+                }
             })
             .collect();
-        let value = if mode == DmlInterpolationMode::NearestNeighbor {
+        let value = if antialiased {
+            let radii: Vec<f64> = scales
+                .iter()
+                .map(|scale| (0.5f64 / *scale as f64).max(0.5))
+                .collect();
+            let starts: Vec<i64> = (0..rank)
+                .map(|dimension| (coords[dimension] - radii[dimension]).floor() as i64)
+                .collect();
+            let ends: Vec<i64> = (0..rank)
+                .map(|dimension| (coords[dimension] + radii[dimension]).ceil() as i64)
+                .collect();
+            let mut taps: Vec<i64> = starts.clone();
+            let mut result = 0.0f64;
+            let mut total = 0.0f64;
+            let mut done = false;
+            while !done {
+                let mut weight = 1.0f64;
+                let mut in_bounds = true;
+                for dimension in 0..rank {
+                    if taps[dimension] < 0 || taps[dimension] >= input.sizes[dimension] as i64 {
+                        in_bounds = false;
+                        break;
+                    }
+                    let tap_weight =
+                        1.0 - (taps[dimension] as f64 - coords[dimension]).abs() / radii[dimension];
+                    if tap_weight <= 0.0 {
+                        in_bounds = false;
+                        break;
+                    }
+                    weight *= tap_weight;
+                }
+                if in_bounds {
+                    let input_coords: Vec<u64> = taps.iter().map(|tap| *tap as u64).collect();
+                    result += weight
+                        * load_scalar(
+                            input_bytes,
+                            index_of(&input_coords, &input.strides),
+                            input.data_type,
+                        ) as f64;
+                    total += weight;
+                }
+                let mut dimension = rank;
+                loop {
+                    if dimension == 0 {
+                        done = true;
+                        break;
+                    }
+                    dimension -= 1;
+                    if taps[dimension] < ends[dimension] {
+                        taps[dimension] += 1;
+                        break;
+                    }
+                    taps[dimension] = starts[dimension];
+                }
+            }
+            if total <= 0.0 {
+                0.0
+            } else {
+                (result / total) as f32
+            }
+        } else if mode == DmlInterpolationMode::NearestNeighbor {
             let mut input_coords = Vec::with_capacity(rank);
             for dimension in 0..rank {
                 let rounded = match rounding {
@@ -8214,9 +9973,9 @@ fn execute_resample_cpu(
                 input.data_type,
             )
         } else {
-            let mut result = 0.0f32;
+            let mut result = 0.0f64;
             for mask in 0..(1usize << rank) {
-                let mut weight = 1.0f32;
+                let mut weight = 1.0f64;
                 let mut input_coords = Vec::with_capacity(rank);
                 for dimension in 0..rank {
                     let bit = (mask >> dimension) & 1;
@@ -8233,9 +9992,9 @@ fn execute_resample_cpu(
                         input_bytes,
                         index_of(&input_coords, &input.strides),
                         input.data_type,
-                    );
+                    ) as f64;
             }
-            result
+            result as f32
         };
         store_scalar(
             output,
@@ -8466,17 +10225,21 @@ fn execute_gather_nd_cpu(
     output: &mut [u8],
     _input_dimension_count: u32,
     _indices_dimension_count: u32,
-    _batch_dimension_count: u32,
+    batch_dimension_count: u32,
 ) -> DmlResult<()> {
     let input = &plan.inputs[0];
     let indices = &plan.inputs[1];
     let indices_rank = indices.sizes.len();
+    let batch = batch_dimension_count as usize;
     let indexed = indices.sizes[indices_rank - 1] as usize;
     let count = plan.output.element_count();
     for gid in 0..count {
         let output_coords = coords_of(gid, &plan.output.sizes);
         let mut input_coords = Vec::with_capacity(input.sizes.len());
         let mut valid = true;
+        for dimension in 0..batch {
+            input_coords.push(output_coords[dimension]);
+        }
         for dimension in 0..indexed {
             let mut index_coords = Vec::with_capacity(indices_rank);
             index_coords.extend_from_slice(&output_coords[..indices_rank - 1]);
@@ -8486,15 +10249,15 @@ fn execute_gather_nd_cpu(
                 index_of(&index_coords, &indices.strides),
                 indices.data_type,
             );
-            if index < 0 || index as u64 >= input.sizes[dimension] as u64 {
+            if index < 0 || index as u64 >= input.sizes[batch + dimension] as u64 {
                 valid = false;
                 input_coords.push(0);
             } else {
                 input_coords.push(index as u64);
             }
         }
-        for dimension in indexed..input.sizes.len() {
-            input_coords.push(output_coords[indices_rank - 1 + dimension - indexed]);
+        for dimension in batch + indexed..input.sizes.len() {
+            input_coords.push(output_coords[indices_rank - 1 + dimension - batch - indexed]);
         }
         let value = if valid {
             load_scalar(
@@ -8937,6 +10700,7 @@ fn execute_mvn_cpu(
     output: &mut [u8],
     axes: &[u32],
     normalize_variance: bool,
+    use_mean: bool,
     epsilon: f32,
 ) -> DmlResult<()> {
     let input = &plan.inputs[0];
@@ -8966,7 +10730,11 @@ fn execute_mvn_cpu(
             sum += value;
             sum_sq += value * value;
         }
-        let mean = sum / reduction_count as f64;
+        let mean = if use_mean {
+            sum / reduction_count as f64
+        } else {
+            0.0
+        };
         let x = load_scalar(
             inputs[0],
             index_of(&output_coords, &input.strides),
@@ -9066,13 +10834,16 @@ fn execute_quantize_linear_cpu(
     dequantize: bool,
 ) -> DmlResult<()> {
     let count = plan.output.element_count();
-    let scale = load_scalar(inputs[1], 0, plan.inputs[1].data_type);
-    let zero = if plan.inputs.len() == 3 {
-        load_scalar(inputs[2], 0, plan.inputs[2].data_type)
-    } else {
-        0.0
-    };
     for gid in 0..count {
+        let coords = coords_of(gid, &plan.output.sizes);
+        let scale_index = quantization_element_index(&plan.inputs[1], &plan.output, &coords);
+        let scale = load_scalar(inputs[1], scale_index, plan.inputs[1].data_type);
+        let zero = if plan.inputs.len() == 3 {
+            let index = quantization_element_index(&plan.inputs[2], &plan.output, &coords);
+            load_scalar(inputs[2], index, plan.inputs[2].data_type)
+        } else {
+            0.0
+        };
         let source = load_scalar(inputs[0], gid, plan.inputs[0].data_type);
         let value = if dequantize {
             (source - zero) * scale
@@ -9136,28 +10907,24 @@ fn execute_quantized_add_cpu(
     let b_zero = quantized_input_index(plan, "B zero point");
     let out_scale = quantized_input_index(plan, "output scale").expect("output scale");
     let out_zero = quantized_input_index(plan, "output zero point");
-    let a_scale_value = load_scalar(inputs[a_scale], 0, plan.inputs[a_scale].data_type);
-    let b_scale_value = load_scalar(inputs[b_scale], 0, plan.inputs[b_scale].data_type);
-    let out_scale_value = load_scalar(inputs[out_scale], 0, plan.inputs[out_scale].data_type);
-    let a_zero_value = a_zero
-        .map(|index| load_scalar(inputs[index], 0, plan.inputs[index].data_type))
-        .unwrap_or(0.0);
-    let b_zero_value = b_zero
-        .map(|index| load_scalar(inputs[index], 0, plan.inputs[index].data_type))
-        .unwrap_or(0.0);
-    let out_zero_value = out_zero
-        .map(|index| load_scalar(inputs[index], 0, plan.inputs[index].data_type))
-        .unwrap_or(0.0);
+    let quant = |index: usize, coords: &[u64]| {
+        let element = quantization_element_index(&plan.inputs[index], &plan.output, coords);
+        load_scalar(inputs[index], element, plan.inputs[index].data_type)
+    };
     for gid in 0..count {
-        let a = (load_scalar(inputs[a_index], gid, plan.inputs[a_index].data_type) - a_zero_value)
-            * a_scale_value;
-        let b = (load_scalar(inputs[b_index], gid, plan.inputs[b_index].data_type) - b_zero_value)
-            * b_scale_value;
+        let coords = coords_of(gid, &plan.output.sizes);
+        let a = (load_scalar(inputs[a_index], gid, plan.inputs[a_index].data_type)
+            - a_zero.map(|index| quant(index, &coords)).unwrap_or(0.0))
+            * quant(a_scale, &coords);
+        let b = (load_scalar(inputs[b_index], gid, plan.inputs[b_index].data_type)
+            - b_zero.map(|index| quant(index, &coords)).unwrap_or(0.0))
+            * quant(b_scale, &coords);
         store_quantized(
             output,
             output_index(&plan.output, gid),
             plan.output.data_type,
-            (a + b) / out_scale_value + out_zero_value,
+            (a + b) / quant(out_scale, &coords)
+                + out_zero.map(|index| quant(index, &coords)).unwrap_or(0.0),
         );
     }
     Ok(())
@@ -9187,11 +10954,17 @@ fn execute_integer_matmul_cpu(
     let rank = a.sizes.len();
     let inner = a.sizes[rank - 1];
     let n = plan.output.sizes[rank - 1];
+    let quant = |index: usize, coords: &[u64]| {
+        let element = quantization_element_index(&plan.inputs[index], &plan.output, coords);
+        load_scalar(inputs[index], element, plan.inputs[index].data_type) as f64
+    };
     for gid in 0..count {
         let coords = coords_of(gid, &plan.output.sizes);
         let batch = coords[..rank - 2].to_vec();
         let m = coords[rank - 2];
         let column = coords[rank - 1];
+        let a_zero_value = a_zero.map(|index| quant(index, &coords));
+        let b_zero_value = b_zero.map(|index| quant(index, &coords));
         let mut acc = 0.0f64;
         for kk in 0..inner as u64 {
             let mut a_coords = batch.clone();
@@ -9207,27 +10980,27 @@ fn execute_integer_matmul_cpu(
                 index_of(&b_coords, &b.strides),
                 b.data_type,
             ) as f64;
-            if let Some(index) = a_zero {
-                av -= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+            if let Some(zero) = a_zero_value {
+                av -= zero;
             }
-            if let Some(index) = b_zero {
-                bv -= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+            if let Some(zero) = b_zero_value {
+                bv -= zero;
             }
             acc += av * bv;
         }
         let index = output_index(&plan.output, gid);
         if *quantized_output {
             if let Some(index) = a_scale {
-                acc *= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+                acc *= quant(index, &coords);
             }
             if let Some(index) = b_scale {
-                acc *= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+                acc *= quant(index, &coords);
             }
             if let Some(index) = out_scale {
-                acc /= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+                acc /= quant(index, &coords);
             }
             if let Some(index) = out_zero {
-                acc += load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+                acc += quant(index, &coords);
             }
             store_quantized(output, index, plan.output.data_type, acc as f32);
         } else {
@@ -9267,12 +11040,18 @@ fn execute_integer_convolution_cpu(
     let count = plan.output.element_count();
     let channels_per_group = input.sizes[1] / group_count;
     let filters_per_group = plan.output.sizes[1] / group_count;
+    let quant = |index: usize, coords: &[u64]| {
+        let element = quantization_element_index(&plan.inputs[index], &plan.output, coords);
+        load_scalar(inputs[index], element, plan.inputs[index].data_type) as f64
+    };
     for gid in 0..count {
         let coords = coords_of(gid, &plan.output.sizes);
         let [batch, out_channel, oh, ow] = [coords[0], coords[1], coords[2], coords[3]];
         let group = out_channel / filters_per_group as u64;
         let mut acc = 0.0f64;
         for cg in 0..channels_per_group as u64 {
+            let input_channel = group * channels_per_group as u64 + cg;
+            let input_quant_coords = [batch, input_channel, oh, ow];
             for fy in 0..filter.sizes[2] as u64 {
                 let iy = oh as i64 * strides[0] as i64 - start_padding[0] as i64
                     + fy as i64 * dilations[0] as i64;
@@ -9288,12 +11067,7 @@ fn execute_integer_convolution_cpu(
                     let mut av = load_scalar(
                         inputs[0],
                         index_of(
-                            &[
-                                batch,
-                                group * channels_per_group as u64 + cg,
-                                iy as u64,
-                                ix as u64,
-                            ],
+                            &[batch, input_channel, iy as u64, ix as u64],
                             &input.strides,
                         ),
                         input.data_type,
@@ -9304,10 +11078,13 @@ fn execute_integer_convolution_cpu(
                         filter.data_type,
                     ) as f64;
                     if let Some(index) = input_zero {
-                        av -= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+                        av -= quant(index, &input_quant_coords);
                     }
                     if let Some(index) = filter_zero {
-                        bv -= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+                        bv -= quant(index, &coords);
+                    }
+                    if let Some(index) = input_scale {
+                        av *= quant(index, &input_quant_coords);
                     }
                     acc += av * bv;
                 }
@@ -9315,20 +11092,18 @@ fn execute_integer_convolution_cpu(
         }
         let index = output_index(&plan.output, gid);
         if *quantized_output {
-            if let Some(index) = input_scale {
-                acc *= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
-            }
+            let _ = input_scale;
             if let Some(index) = filter_scale {
-                acc *= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+                acc *= quant(index, &coords);
             }
             if let Some(index) = bias_index {
                 acc += load_scalar(inputs[index], out_channel, plan.inputs[index].data_type) as f64;
             }
             if let Some(index) = out_scale {
-                acc /= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+                acc /= quant(index, &coords);
             }
             if let Some(index) = out_zero {
-                acc += load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+                acc += quant(index, &coords);
             }
             store_quantized(output, index, plan.output.data_type, acc as f32);
         } else {
@@ -9359,19 +11134,19 @@ fn execute_quantized_avg_pool_cpu(
     let input_zero = quantized_input_index(plan, "input zero point");
     let out_scale = quantized_input_index(plan, "output scale").expect("output scale");
     let out_zero = quantized_input_index(plan, "output zero point");
-    let input_scale_value = load_scalar(inputs[input_scale], 0, plan.inputs[input_scale].data_type);
-    let out_scale_value = load_scalar(inputs[out_scale], 0, plan.inputs[out_scale].data_type);
-    let input_zero_value = input_zero
-        .map(|index| load_scalar(inputs[index], 0, plan.inputs[index].data_type))
-        .unwrap_or(0.0);
-    let out_zero_value = out_zero
-        .map(|index| load_scalar(inputs[index], 0, plan.inputs[index].data_type))
-        .unwrap_or(0.0);
     let count = plan.output.element_count();
     let divisor = window[0] as u64 * window[1] as u64;
+    let quant = |index: usize, coords: &[u64]| {
+        let element = quantization_element_index(&plan.inputs[index], &plan.output, coords);
+        load_scalar(inputs[index], element, plan.inputs[index].data_type)
+    };
     for gid in 0..count {
         let coords = coords_of(gid, &plan.output.sizes);
         let [batch, channel, oh, ow] = [coords[0], coords[1], coords[2], coords[3]];
+        let input_scale_value = quant(input_scale, &coords);
+        let input_zero_value = input_zero.map(|index| quant(index, &coords)).unwrap_or(0.0);
+        let out_scale_value = quant(out_scale, &coords);
+        let out_zero_value = out_zero.map(|index| quant(index, &coords)).unwrap_or(0.0);
         let mut sum = 0.0f64;
         let mut valid = 0u64;
         for wy in 0..window[0] as u64 {
@@ -9428,11 +11203,17 @@ fn execute_integer_matmul_to_float_cpu(
     let count = plan.output.element_count();
     let rank = a.sizes.len();
     let inner = a.sizes[rank - 1];
+    let quant = |index: usize, coords: &[u64]| {
+        let element = quantization_element_index(&plan.inputs[index], &plan.output, coords);
+        load_scalar(inputs[index], element, plan.inputs[index].data_type) as f64
+    };
     for gid in 0..count {
         let coords = coords_of(gid, &plan.output.sizes);
         let batch = coords[..rank - 2].to_vec();
         let m = coords[rank - 2];
         let column = coords[rank - 1];
+        let a_zero_value = a_zero.map(|index| quant(index, &coords));
+        let b_zero_value = b_zero.map(|index| quant(index, &coords));
         let mut acc = 0.0f64;
         for kk in 0..inner as u64 {
             let mut a_coords = batch.clone();
@@ -9448,27 +11229,22 @@ fn execute_integer_matmul_to_float_cpu(
                 index_of(&b_coords, &b.strides),
                 b.data_type,
             ) as f64;
-            if let Some(index) = a_zero {
-                av -= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+            if let Some(zero) = a_zero_value {
+                av -= zero;
             }
-            if let Some(index) = b_zero {
-                bv -= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+            if let Some(zero) = b_zero_value {
+                bv -= zero;
             }
             acc += av * bv;
         }
         if let Some(index) = a_scale {
-            acc *= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+            acc *= quant(index, &coords);
         }
         if let Some(index) = b_scale {
-            acc *= load_scalar(inputs[index], 0, plan.inputs[index].data_type) as f64;
+            acc *= quant(index, &coords);
         }
         if let Some(index) = bias {
-            let bias_index = if plan.inputs[index].element_count() == 1 {
-                0
-            } else {
-                column
-            };
-            acc += load_scalar(inputs[index], bias_index, plan.inputs[index].data_type) as f64;
+            acc += quant(index, &coords);
         }
         store_scalar(
             output,
@@ -9488,17 +11264,20 @@ fn execute_generic_quantize_cpu(
     dequantize: bool,
 ) -> DmlResult<()> {
     let count = plan.output.element_count();
-    let scale = if quantization_type >= 1 {
-        load_scalar(inputs[1], 0, plan.inputs[1].data_type)
-    } else {
-        1.0
-    };
-    let zero = if quantization_type == 2 {
-        load_scalar(inputs[2], 0, plan.inputs[2].data_type)
-    } else {
-        0.0
-    };
     for gid in 0..count {
+        let coords = coords_of(gid, &plan.output.sizes);
+        let scale = if quantization_type >= 1 {
+            let element = quantization_element_index(&plan.inputs[1], &plan.output, &coords);
+            load_scalar(inputs[1], element, plan.inputs[1].data_type)
+        } else {
+            1.0
+        };
+        let zero = if quantization_type == 2 {
+            let element = quantization_element_index(&plan.inputs[2], &plan.output, &coords);
+            load_scalar(inputs[2], element, plan.inputs[2].data_type)
+        } else {
+            0.0
+        };
         let source = load_scalar(inputs[0], gid, plan.inputs[0].data_type);
         let index = output_index(&plan.output, gid);
         if dequantize {
@@ -9606,7 +11385,10 @@ mod tests {
     fn tensor(data_type: u32, sizes: &[u32], strides: Option<&[u32]>) -> DmlTensorDesc {
         let element_size = match data_type {
             DML_TENSOR_DATA_TYPE_FLOAT16 => 2,
-            DML_TENSOR_DATA_TYPE_UINT8 | DML_TENSOR_DATA_TYPE_INT8 => 1,
+            DML_TENSOR_DATA_TYPE_UINT8
+            | DML_TENSOR_DATA_TYPE_INT8
+            | DML_TENSOR_DATA_TYPE_UINT4
+            | DML_TENSOR_DATA_TYPE_INT4 => 1,
             _ => 4,
         };
         let strides = strides.map(|value| value.to_vec()).unwrap_or_else(|| {
@@ -9624,12 +11406,18 @@ mod tests {
             .map(|(size, stride)| (*size as u64).saturating_sub(1) * *stride as u64)
             .sum::<u64>()
             + 1;
+        let total_size_in_bytes =
+            if data_type == DML_TENSOR_DATA_TYPE_UINT4 || data_type == DML_TENSOR_DATA_TYPE_INT4 {
+                implied.div_ceil(2)
+            } else {
+                implied.saturating_mul(element_size)
+            };
         DmlTensorDesc {
             data_type,
             flags: 0,
             sizes: sizes.to_vec(),
             strides,
-            total_size_in_bytes: implied.saturating_mul(element_size),
+            total_size_in_bytes,
             guaranteed_base_offset_alignment: 0,
         }
     }
@@ -9771,6 +11559,7 @@ mod tests {
         let filter = tensor(DML_TENSOR_DATA_TYPE_FLOAT16, &[1, 1, 1, 1], None);
         let convolution = plan(
             DmlOpKind::Convolution {
+                mode: DML_CONVOLUTION_MODE_CROSS_CORRELATION,
                 strides: vec![1, 1],
                 dilations: vec![1, 1],
                 start_padding: vec![0, 0],
@@ -9802,6 +11591,7 @@ mod tests {
         let out = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 2, 2], None);
         let convolution = plan(
             DmlOpKind::Convolution {
+                mode: DML_CONVOLUTION_MODE_CROSS_CORRELATION,
                 strides: vec![1, 1],
                 dilations: vec![1, 1],
                 start_padding: vec![0, 0],
@@ -10012,6 +11802,7 @@ mod tests {
         let output = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 2, 2], None);
         let convolution = plan(
             DmlOpKind::Convolution {
+                mode: DML_CONVOLUTION_MODE_CROSS_CORRELATION,
                 strides: vec![1, 1],
                 dilations: vec![1, 1],
                 start_padding: vec![0, 0],
@@ -10857,7 +12648,7 @@ mod tests {
             run_cpu(&gather_nd, &[&nd_values, &nd_index_values]),
             vec![2.0, 3.0]
         );
-        let unsupported_batch = plan(
+        let mismatched_batch = plan(
             DmlOpKind::GatherNd {
                 input_dimension_count: 2,
                 indices_dimension_count: 0,
@@ -10865,13 +12656,13 @@ mod tests {
             },
             vec![
                 tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 2], None),
-                tensor(DML_TENSOR_DATA_TYPE_UINT32, &[1, 1, 2], None),
+                tensor(DML_TENSOR_DATA_TYPE_UINT32, &[3, 1, 2], None),
             ],
-            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 2], None),
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[3, 1, 2], None),
         );
         assert_eq!(
-            unsupported_batch.validate().unwrap_err().message,
-            "gather-nd batched indices (BatchDimensionCount != 0) are not supported"
+            mismatched_batch.validate().unwrap_err().message,
+            "gather-nd batch dimensions [3] must match the input batch dimensions [2]"
         );
     }
 
@@ -10973,6 +12764,7 @@ mod tests {
             DmlOpKind::MeanVarianceNormalization {
                 axes: vec![2, 3],
                 normalize_variance: true,
+                use_mean: true,
                 epsilon: 0.0,
             },
             vec![mvn_input.clone()],
@@ -10990,6 +12782,7 @@ mod tests {
             DmlOpKind::MeanVarianceNormalization {
                 axes: vec![4],
                 normalize_variance: true,
+                use_mean: true,
                 epsilon: 0.0,
             },
             vec![tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 2, 1, 2], None)],
@@ -11102,12 +12895,12 @@ mod tests {
         );
         let per_channel = plan(
             DmlOpKind::QuantizeLinear,
-            vec![input, tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[4], None)],
+            vec![input, tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[3], None)],
             tensor(DML_TENSOR_DATA_TYPE_UINT8, &[4], None),
         );
         assert_eq!(
             per_channel.validate().unwrap_err().message,
-            "DML_OPERATOR_TYPE 33 supports only a scalar scale tensor"
+            "DML_OPERATOR_TYPE 33 scale tensor is not broadcastable: quantization tensor dimension 0 size 3 does not match the output size 4"
         );
     }
 
@@ -11246,7 +13039,7 @@ mod tests {
         );
         assert_eq!(
             unsupported.validate().unwrap_err().message,
-            "quantized operator scale input 1 (A scale) must be a scalar FLOAT32 tensor"
+            "quantized operator scale input 1 (A scale) is not broadcastable: quantization tensor axis size 4 does not match any output dimension"
         );
     }
 
@@ -11376,14 +13169,14 @@ mod tests {
 
         let mut invalid = rnn.clone();
         invalid.kind = DmlOpKind::Rnn {
-            direction: DmlRecurrentDirection::Backward,
+            direction: DmlRecurrentDirection::Bidirectional,
             activations: Vec::new(),
             options: DmlRecurrentOptions::default(),
             outputs: vec![DmlRecurrentOutput::Single],
         };
         assert_eq!(
             invalid.validate().unwrap_err().message,
-            "DML_OPERATOR_TYPE 76 only supports DML_RECURRENT_NETWORK_DIRECTION_FORWARD"
+            "DML_OPERATOR_TYPE 76 weight gate count must be 2, got 1"
         );
     }
 
@@ -11591,6 +13384,7 @@ mod tests {
             DmlOpKind::MeanVarianceNormalization {
                 axes: vec![2, 3],
                 normalize_variance: true,
+                use_mean: true,
                 epsilon: 0.0,
             },
             vec![mvn_input.clone()],
@@ -11670,6 +13464,408 @@ mod tests {
         assert_eq!(
             read_f32(&run_metal_outputs(&mmi2f, &[&a_bits, &one, &b_bits, &one, &bias])[0]),
             vec![11.5]
+        );
+    }
+
+    #[test]
+    fn recurrent_backward_bidirectional_peephole_f16_and_noncontiguous_edge() {
+        let input = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[3, 1, 1], None);
+        let weight = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 1], None);
+        let recurrence = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 1], None);
+        let sequence_output = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[3, 1, 1], None);
+        let backward = DmlOpPlan {
+            kind: DmlOpKind::Rnn {
+                direction: DmlRecurrentDirection::Backward,
+                activations: vec![DmlActivation::Identity],
+                options: DmlRecurrentOptions::default(),
+                outputs: vec![DmlRecurrentOutput::Sequence],
+            },
+            inputs: vec![input.clone(), weight.clone(), recurrence.clone()],
+            output: sequence_output.clone(),
+            extra_outputs: Vec::new(),
+            fused_activation: None,
+        };
+        let values = f32_bytes(&[1.0, 2.0, 3.0]);
+        let one = f32_bytes(&[1.0]);
+        assert_eq!(
+            run_cpu(&backward, &[&values, &one, &one]),
+            vec![6.0, 5.0, 3.0]
+        );
+
+        let bidirectional = DmlOpPlan {
+            kind: DmlOpKind::Rnn {
+                direction: DmlRecurrentDirection::Bidirectional,
+                activations: vec![DmlActivation::Identity],
+                options: DmlRecurrentOptions::default(),
+                outputs: vec![DmlRecurrentOutput::Sequence],
+            },
+            inputs: vec![
+                input,
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 1, 1], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 1, 1], None),
+            ],
+            output: tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[3, 1, 2], None),
+            extra_outputs: Vec::new(),
+            fused_activation: None,
+        };
+        let both = f32_bytes(&[1.0, 1.0]);
+        assert_eq!(
+            run_cpu(&bidirectional, &[&values, &both, &both]),
+            vec![1.0, 6.0, 3.0, 5.0, 6.0, 3.0]
+        );
+
+        let f16_input = tensor(DML_TENSOR_DATA_TYPE_FLOAT16, &[3, 1, 1], None);
+        let f16_weight = tensor(DML_TENSOR_DATA_TYPE_FLOAT16, &[1, 1, 1], None);
+        let f16_recurrence = tensor(DML_TENSOR_DATA_TYPE_FLOAT16, &[1, 1, 1], None);
+        let f16_output = tensor(DML_TENSOR_DATA_TYPE_FLOAT16, &[3, 1, 1], None);
+        let f16_plan = DmlOpPlan {
+            kind: DmlOpKind::Rnn {
+                direction: DmlRecurrentDirection::Backward,
+                activations: vec![DmlActivation::Identity],
+                options: DmlRecurrentOptions::default(),
+                outputs: vec![DmlRecurrentOutput::Sequence],
+            },
+            inputs: vec![f16_input, f16_weight, f16_recurrence],
+            output: f16_output,
+            extra_outputs: Vec::new(),
+            fused_activation: None,
+        };
+        let mut f16_result = vec![0u8; 6];
+        execute_plan(
+            &f16_plan,
+            DmlExecutionDevice::Cpu,
+            &[
+                &f16_bytes(&[1.0, 2.0, 3.0]),
+                &f16_bytes(&[1.0]),
+                &f16_bytes(&[1.0]),
+            ],
+            &mut f16_result,
+        )
+        .expect("f16 recurrent execution");
+        assert_eq!(read_f16(&f16_result), vec![6.0, 5.0, 3.0]);
+
+        let strided_output = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 1, 2], Some(&[3, 1, 2]));
+        let strided = DmlOpPlan {
+            kind: DmlOpKind::Rnn {
+                direction: DmlRecurrentDirection::Forward,
+                activations: vec![DmlActivation::Identity],
+                options: DmlRecurrentOptions::default(),
+                outputs: vec![DmlRecurrentOutput::Sequence],
+            },
+            inputs: vec![
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 1, 1], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 2, 1], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 2, 2], None),
+            ],
+            output: strided_output,
+            extra_outputs: Vec::new(),
+            fused_activation: None,
+        };
+        let weights = f32_bytes(&[1.0, 0.0]);
+        let recurrent = f32_bytes(&[0.0, 0.0, 0.0, 0.0]);
+        let mut strided_result = vec![0u8; 24];
+        execute_plan(
+            &strided,
+            DmlExecutionDevice::Cpu,
+            &[&f32_bytes(&[1.0, 2.0]), &weights, &recurrent],
+            &mut strided_result,
+        )
+        .expect("strided recurrent execution");
+        let strided_values = read_f32(&strided_result);
+        assert_eq!((strided_values[0], strided_values[2]), (1.0, 0.0));
+        assert_eq!((strided_values[3], strided_values[5]), (2.0, 0.0));
+
+        let peephole_lstm = DmlOpPlan {
+            kind: DmlOpKind::Lstm {
+                direction: DmlRecurrentDirection::Forward,
+                activations: Vec::new(),
+                options: DmlRecurrentOptions {
+                    peephole: true,
+                    ..DmlRecurrentOptions::default()
+                },
+                outputs: vec![DmlRecurrentOutput::Single],
+                clip_threshold: 0.0,
+                use_clip_threshold: false,
+                couple_input_forget: false,
+            },
+            inputs: vec![
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 1], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[4, 1, 1], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[4, 1, 1], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2], None),
+            ],
+            output: tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 1], None),
+            extra_outputs: Vec::new(),
+            fused_activation: None,
+        };
+        assert_eq!(
+            peephole_lstm.validate().unwrap_err().message,
+            "DML_OPERATOR_TYPE 77 peephole tensor must contain 3 contiguous elements (directions x 3 gates x hidden)"
+        );
+    }
+
+    #[test]
+    fn quantized_per_channel_4bit_and_malformed_layout_edge_cases() {
+        let input = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[4], None);
+        let per_channel = plan(
+            DmlOpKind::QuantizeLinear,
+            vec![
+                input.clone(),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[4], None),
+            ],
+            tensor(DML_TENSOR_DATA_TYPE_UINT8, &[4], None),
+        );
+        let values = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
+        let scale = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            run_cpu_outputs(&per_channel, &[&values, &scale])[0],
+            vec![1u8, 1, 1, 1]
+        );
+
+        let packed = plan(
+            DmlOpKind::QuantizeLinear,
+            vec![
+                input.clone(),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1], None),
+            ],
+            tensor(DML_TENSOR_DATA_TYPE_UINT4, &[4], None),
+        );
+        assert_eq!(
+            run_cpu_outputs(
+                &packed,
+                &[&f32_bytes(&[0.0, 1.0, 15.0, 16.0]), &f32_bytes(&[1.0])]
+            )[0],
+            vec![0x10u8, 0xff]
+        );
+
+        let signed = plan(
+            DmlOpKind::DequantizeLinear,
+            vec![
+                tensor(DML_TENSOR_DATA_TYPE_INT4, &[2], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1], None),
+            ],
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2], None),
+        );
+        assert_eq!(
+            run_cpu(&signed, &[&[0x8fu8], &f32_bytes(&[1.0])]),
+            vec![-1.0, -8.0]
+        );
+
+        let mut malformed = tensor(DML_TENSOR_DATA_TYPE_UINT4, &[4], None);
+        malformed.total_size_in_bytes = 1;
+        let malformed_plan = plan(
+            DmlOpKind::QuantizeLinear,
+            vec![input, tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1], None)],
+            malformed,
+        );
+        assert_eq!(
+            malformed_plan.validate().unwrap_err().message,
+            "tensor TotalTensorSizeInBytes 1 is smaller than the implied 2 bytes"
+        );
+
+        let quantized_matmul = plan(
+            DmlOpKind::MatrixMultiplyInteger {
+                quantized_output: true,
+                a_zero_point: false,
+                b_zero_point: false,
+                output_scale: true,
+                output_zero_point: false,
+            },
+            vec![
+                tensor(DML_TENSOR_DATA_TYPE_INT8, &[1, 2], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1], None),
+                tensor(DML_TENSOR_DATA_TYPE_INT8, &[2, 2], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1], None),
+            ],
+            tensor(DML_TENSOR_DATA_TYPE_UINT8, &[1, 2], None),
+        );
+        let a_values = [1i8, 1]
+            .iter()
+            .map(|value| *value as u8)
+            .collect::<Vec<_>>();
+        let b_values = [1i8, 2, 3, 4]
+            .iter()
+            .map(|value| *value as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            run_cpu_outputs(
+                &quantized_matmul,
+                &[
+                    &a_values,
+                    &f32_bytes(&[1.0]),
+                    &b_values,
+                    &f32_bytes(&[1.0, 2.0]),
+                    &f32_bytes(&[1.0]),
+                ]
+            )[0],
+            vec![4u8, 12]
+        );
+
+        let quantized_conv = plan(
+            DmlOpKind::ConvolutionInteger {
+                strides: vec![1, 1],
+                dilations: vec![1, 1],
+                start_padding: vec![0, 0],
+                end_padding: vec![0, 0],
+                group_count: 1,
+                quantized_output: true,
+                input_zero_point: false,
+                filter_zero_point: false,
+                bias: false,
+                output_scale: true,
+                output_zero_point: false,
+            },
+            vec![
+                tensor(DML_TENSOR_DATA_TYPE_UINT8, &[1, 2, 1, 1], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2], None),
+                tensor(DML_TENSOR_DATA_TYPE_UINT8, &[2, 2, 1, 1], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1], None),
+            ],
+            tensor(DML_TENSOR_DATA_TYPE_UINT8, &[1, 2, 1, 1], None),
+        );
+        assert_eq!(
+            run_cpu_outputs(
+                &quantized_conv,
+                &[
+                    &[1u8, 2],
+                    &f32_bytes(&[1.0, 2.0]),
+                    &[1u8, 0, 0, 1],
+                    &f32_bytes(&[1.0]),
+                    &f32_bytes(&[1.0]),
+                ]
+            )[0],
+            vec![1u8, 4]
+        );
+    }
+
+    #[test]
+    fn batched_gathernd_antialias_convolution_mode_and_mvn_no_mean_edge() {
+        let input = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 3], None);
+        let indices = tensor(DML_TENSOR_DATA_TYPE_UINT32, &[2, 2, 1], None);
+        let batched = plan(
+            DmlOpKind::GatherNd {
+                input_dimension_count: 2,
+                indices_dimension_count: 3,
+                batch_dimension_count: 1,
+            },
+            vec![input, indices],
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 2], None),
+        );
+        let input_values = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let index_values = [0u32, 2, 1, 1]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            run_cpu(&batched, &[&input_values, &index_values]),
+            vec![1.0, 3.0, 5.0, 5.0]
+        );
+
+        let resample_input = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 4, 4], None);
+        let antialiased = plan(
+            DmlOpKind::Resample {
+                mode: DmlInterpolationMode::Linear,
+                scales: vec![1.0, 1.0, 0.5, 0.5],
+                input_offsets: vec![0.0; 4],
+                output_offsets: vec![0.0; 4],
+                rounding: DmlAxisDirection::Increasing,
+                antialiased: true,
+            },
+            vec![resample_input],
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 2, 2], None),
+        );
+        let pixels = (1..=16).map(|value| value as f32).collect::<Vec<_>>();
+        assert_eq!(
+            run_cpu(&antialiased, &[&f32_bytes(&pixels)])
+                .iter()
+                .copied()
+                .map(rounded)
+                .collect::<Vec<_>>(),
+            vec![35000, 55000, 115000, 135000]
+        );
+
+        let conv_input = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 3, 3], None);
+        let filter = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 2, 2], None);
+        let image = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let kernel = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
+        let mut outputs = Vec::new();
+        for mode in [
+            DML_CONVOLUTION_MODE_CONVOLUTION,
+            DML_CONVOLUTION_MODE_CROSS_CORRELATION,
+        ] {
+            let convolution = plan(
+                DmlOpKind::Convolution {
+                    mode,
+                    strides: vec![1, 1],
+                    dilations: vec![1, 1],
+                    start_padding: vec![0, 0],
+                    end_padding: vec![0, 0],
+                    output_padding: vec![0, 0],
+                    group_count: 1,
+                },
+                vec![conv_input.clone(), filter.clone()],
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 2, 2], None),
+            );
+            outputs.push(run_cpu(&convolution, &[&image, &kernel])[0]);
+        }
+        assert_eq!(outputs, vec![23.0, 37.0]);
+
+        let mvn = plan(
+            DmlOpKind::MeanVarianceNormalization {
+                axes: vec![2, 3],
+                normalize_variance: true,
+                use_mean: false,
+                epsilon: 0.0,
+            },
+            vec![tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 2, 1, 2], None)],
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 2, 1, 2], None),
+        );
+        assert_eq!(
+            run_cpu(&mvn, &[&f32_bytes(&[1.0, 3.0, 2.0, 6.0])])
+                .iter()
+                .copied()
+                .map(rounded)
+                .collect::<Vec<_>>(),
+            vec![4472, 13416, 4472, 13416]
+        );
+
+        let invalid_mode = plan(
+            DmlOpKind::Convolution {
+                mode: 2,
+                strides: vec![1, 1],
+                dilations: vec![1, 1],
+                start_padding: vec![0, 0],
+                end_padding: vec![0, 0],
+                output_padding: vec![0, 0],
+                group_count: 1,
+            },
+            vec![
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 3, 3], None),
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 2, 2], None),
+            ],
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 2, 2], None),
+        );
+        assert_eq!(
+            invalid_mode.validate().unwrap_err().message,
+            "convolution mode 2 is not supported"
+        );
+        let invalid_antialiased = plan(
+            DmlOpKind::Resample {
+                mode: DmlInterpolationMode::NearestNeighbor,
+                scales: vec![1.0, 1.0, 0.5, 0.5],
+                input_offsets: vec![0.0; 4],
+                output_offsets: vec![0.0; 4],
+                rounding: DmlAxisDirection::Increasing,
+                antialiased: true,
+            },
+            vec![tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 4, 4], None)],
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 2, 2], None),
+        );
+        assert_eq!(
+            invalid_antialiased.validate().unwrap_err().message,
+            "antialiased resample requires linear interpolation"
         );
     }
 }

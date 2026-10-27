@@ -6871,30 +6871,72 @@ impl PeHostRuntime {
     }
 }
 
-fn arm64_dispatch_runtime_thunk(
+fn arm64_dispatch_runtime_import(
     runtime_ptr: *mut PeHostRuntime,
     memory_ptr: *mut MemoryImage,
     scratch: u64,
     thunk: u64,
-    args: [u64; 8],
-) -> u64 {
+    call: &crate::arm64::EcImportCall,
+) -> crate::arm64::EcImportResult {
     // SAFETY: the native ARM64 image is fully synchronous; the runtime and
     // memory outlive the call and no other borrow is active while the guest
     // thread executes.
-    eprintln!("[arm64-dispatch] enter thunk={thunk:#x} args={args:?}");
+    eprintln!(
+        "[arm64-dispatch] enter thunk={thunk:#x} abi={:?} gpr={:?} vec={:?}",
+        call.abi, call.registers.gpr, call.registers.vec
+    );
     let runtime = unsafe { &mut *runtime_ptr };
     let memory = unsafe { &mut *memory_ptr };
     let mut state = CpuState::new(GuestArch::X64);
     state.set(Register::Rsp, scratch);
     state.rip = 0;
     write_u64(memory, scratch, 0);
-    for (index, value) in args.iter().copied().enumerate().skip(4) {
-        write_u64(memory, scratch + 0x28 + ((index - 4) as u64 * 8), value);
+    let mut stack_arguments = Vec::new();
+    match call.abi {
+        crate::arm64::EcImportAbi::ClassParallel => {
+            for (destination, source) in [
+                (Register::Rcx, 0usize),
+                (Register::Rdx, 1),
+                (Register::R8, 2),
+                (Register::R9, 3),
+            ] {
+                state.set(destination, call.registers.gpr[source]);
+            }
+            for (index, value) in call.registers.vec.iter().copied().take(4).enumerate() {
+                state.xmm[index] = crate::cpu::XmmValue {
+                    low: value as u64,
+                    high: (value >> 64) as u64,
+                };
+            }
+            stack_arguments.extend(call.registers.gpr[4..8].iter().copied());
+            for value in call.registers.vec[4..8].iter().copied() {
+                if value != 0 {
+                    stack_arguments.push(value as u64);
+                }
+            }
+        }
+        crate::arm64::EcImportAbi::Variadic => {
+            // ARM64EC variadic passes every register argument in x0-x3.
+            // x64 variadic duplicates floating-point values into the
+            // corresponding XMM register, so publish both classes.
+            for (destination, source) in [
+                (Register::Rcx, 0usize),
+                (Register::Rdx, 1),
+                (Register::R8, 2),
+                (Register::R9, 3),
+            ] {
+                state.set(destination, call.registers.gpr[source]);
+                state.xmm[source] = crate::cpu::XmmValue {
+                    low: call.registers.gpr[source],
+                    high: 0,
+                };
+            }
+            stack_arguments.extend(call.variadic_stack.iter().copied());
+        }
     }
-    state.set(Register::Rcx, args[0]);
-    state.set(Register::Rdx, args[1]);
-    state.set(Register::R8, args[2]);
-    state.set(Register::R9, args[3]);
+    for (index, value) in stack_arguments.iter().copied().enumerate() {
+        write_u64(memory, scratch + 0x28 + (index as u64 * 8), value);
+    }
     let dispatched = runtime.dispatch_import(thunk, &mut state, memory);
     eprintln!(
         "[arm64-dispatch] dispatched={:?} rax={:#x}",
@@ -6904,15 +6946,23 @@ fn arm64_dispatch_runtime_thunk(
     match dispatched {
         Ok(Some(code)) => {
             ARM64_GUEST_EXIT.with(|slot| slot.set(Some(code)));
-            state.get(Register::Rax)
         }
-        Ok(None) => state.get(Register::Rax),
+        Ok(None) => {}
         Err(error) => {
             ARM64_IMPORT_ERROR.with(|slot| {
                 *slot.borrow_mut() = Some(error);
             });
-            u64::MAX
+            return crate::arm64::EcImportResult {
+                rax: u64::MAX,
+                ..crate::arm64::EcImportResult::default()
+            };
         }
+    }
+    crate::arm64::EcImportResult {
+        rax: state.get(Register::Rax),
+        rdx: state.get(Register::Rdx),
+        xmm0: u128::from(state.xmm[0].low) | (u128::from(state.xmm[0].high) << 64),
+        xmm1: u128::from(state.xmm[1].low) | (u128::from(state.xmm[1].high) << 64),
     }
 }
 
@@ -7023,18 +7073,12 @@ fn execute_native_arm64_image(
                 )
             }
         };
-        let arm64_thunk =
-            runner
-                .imports
-                .register(key.clone(), move |a0, a1, a2, a3, a4, a5, a6, a7| {
-                    arm64_dispatch_runtime_thunk(
-                        runtime_ptr,
-                        memory_ptr,
-                        scratch,
-                        thunk_address,
-                        [a0, a1, a2, a3, a4, a5, a6, a7],
-                    )
-                })?;
+        let import_abi = crate::arm64::EcImportAbi::for_import_name(&key);
+        let arm64_thunk = runner
+            .imports
+            .register_abi(key.clone(), import_abi, move |call| {
+                arm64_dispatch_runtime_import(runtime_ptr, memory_ptr, scratch, thunk_address, call)
+            })?;
         let lowered_key = key.to_ascii_lowercase();
         let slot_thunk = if lowered_key.contains("__os_arm64x_check_icall") {
             check_thunk
@@ -7117,6 +7161,9 @@ fn execute_native_arm64_image(
         return Err(error.to_app_error());
     }
     if let Some(error) = crate::arm64::take_call_checker_error() {
+        return Err(error.to_app_error());
+    }
+    if let Some(error) = crate::arm64::take_vector_import_error() {
         return Err(error.to_app_error());
     }
     if let Some(error) = ARM64_IMPORT_ERROR.with(|slot| slot.borrow_mut().take()) {

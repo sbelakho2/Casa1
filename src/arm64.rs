@@ -31,6 +31,14 @@ pub const ARM64EC_THUNK_ARENA_SIZE: usize = 0x10000;
 
 pub const STATUS_NOT_SUPPORTED: u32 = 0xc000_00bb;
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xc000_0005;
+pub const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
+pub const STATUS_INTEGER_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
+pub const STATUS_BREAKPOINT: u32 = 0x8000_0003;
+
+/// Upper bound on the variadic stack area described by `x5`.  A larger value
+/// cannot be trusted as ABI metadata, so the transition fails closed instead
+/// of reading an attacker-controlled range.
+pub const EC_VARIADIC_STACK_LIMIT: u64 = 0x1_0000;
 
 pub const MISSING_CROSS_ISA_PIECE: &str =
     "x64 guest instruction execution under the ARM64EC ABI (the x64<->ARM64EC thunk bridge)";
@@ -239,12 +247,23 @@ impl EcSignature {
         }
     }
 
+    /// Variadic signature with the fixed parameter types in `params`.
+    ///
+    /// ARM64EC variadic calls only use `x0`-`x3` for register parameters,
+    /// regardless of class, and describe the overflow area with `x4` (pointer
+    /// to the first stack parameter) and `x5` (stack parameter bytes).
+    pub fn variadic(params: impl Into<Vec<EcParamKind>>, returns: EcReturnKind) -> Self {
+        Self {
+            params: params.into(),
+            returns,
+            variadic: true,
+            mode: EcAbiMode::Positional,
+        }
+    }
+
     fn layouts(&self) -> AppResult<Vec<EcArgLayout>> {
         if self.variadic {
-            return Err(EcTransitionError::unsupported(
-                "variadic ARM64EC call signatures require `x4`/`x5` stack metadata",
-            )
-            .to_app_error());
+            return Ok(self.variadic_layouts());
         }
         let mut x64_gprs = [1usize, 2, 8, 9] // rcx, rdx, r8, r9
             .into_iter();
@@ -315,6 +334,53 @@ impl EcSignature {
         Ok(layouts)
     }
 
+    /// x64 keeps its per-class register assignment and spills overflow by
+    /// class; ARM64EC variadic uses only `x0`-`x3` and spills everything else
+    /// in argument order.  Floating-point variadic parameters travel in a
+    /// general-purpose register on the ARM64EC side.
+    fn variadic_layouts(&self) -> Vec<EcArgLayout> {
+        let mut x64_gprs = [1usize, 2, 8, 9].into_iter();
+        let mut x64_vectors = (0usize..4).into_iter();
+        let mut ec_gprs = (0usize..4).into_iter();
+        let mut x64_stack = 0u64;
+        let mut ec_stack = 0u64;
+        let mut layouts = Vec::with_capacity(self.params.len());
+        for kind in &self.params {
+            let x64 = match kind {
+                EcParamKind::Integer => x64_gprs.next().map_or_else(
+                    || {
+                        let offset = x64_stack * 8;
+                        x64_stack += 1;
+                        EcArgLocation::Stack(offset)
+                    },
+                    EcArgLocation::Gpr,
+                ),
+                EcParamKind::Float => x64_vectors.next().map_or_else(
+                    || {
+                        let offset = x64_stack * 8;
+                        x64_stack += 1;
+                        EcArgLocation::Stack(offset)
+                    },
+                    EcArgLocation::Vector,
+                ),
+            };
+            let ec = ec_gprs.next().map_or_else(
+                || {
+                    let offset = ec_stack * 8;
+                    ec_stack += 1;
+                    EcArgLocation::Stack(offset)
+                },
+                EcArgLocation::Gpr,
+            );
+            layouts.push(EcArgLayout {
+                kind: *kind,
+                x64,
+                ec,
+            });
+        }
+        layouts
+    }
+
     pub fn x64_stack_arg_bytes(&self) -> AppResult<u64> {
         Ok(self
             .layouts()?
@@ -348,6 +414,48 @@ pub struct EcArgLayout {
     pub kind: EcParamKind,
     pub x64: EcArgLocation,
     pub ec: EcArgLocation,
+}
+
+/// The `x4`/`x5` metadata word pair of an ARM64EC variadic call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EcVariadicMetadata {
+    /// `x4`: address of the first stack-passed parameter.
+    pub stack_pointer: u64,
+    /// `x5`: size in bytes of all stack-passed parameters.
+    pub stack_bytes: u64,
+}
+
+impl EcVariadicMetadata {
+    pub fn new(stack_pointer: u64, stack_bytes: u64) -> AppResult<Self> {
+        if stack_bytes % 8 != 0 {
+            return Err(EcTransitionError::malformed(format!(
+                "ARM64EC variadic x5 stack size 0x{stack_bytes:x} is not 8-byte aligned"
+            ))
+            .to_app_error());
+        }
+        if stack_bytes > EC_VARIADIC_STACK_LIMIT {
+            return Err(EcTransitionError::malformed(format!(
+                "ARM64EC variadic x5 stack size 0x{stack_bytes:x} exceeds the supported limit 0x{EC_VARIADIC_STACK_LIMIT:x}"
+            ))
+            .to_app_error());
+        }
+        if stack_bytes != 0 && stack_pointer == 0 {
+            return Err(
+                EcTransitionError::malformed("ARM64EC variadic x4 stack pointer is null")
+                    .to_app_error(),
+            );
+        }
+        if stack_bytes != 0 && stack_pointer % 8 != 0 {
+            return Err(EcTransitionError::malformed(format!(
+                "ARM64EC variadic x4 stack pointer 0x{stack_pointer:x} is not 8-byte aligned"
+            ))
+            .to_app_error());
+        }
+        Ok(Self {
+            stack_pointer,
+            stack_bytes,
+        })
+    }
 }
 
 /// Raw canonical register state used at an x64 ↔ ARM64EC boundary.
@@ -458,6 +566,10 @@ pub struct EcCallArguments {
     pub vec: [u128; 8],
     pub stack: Vec<u64>,
     pub returns: EcReturnKind,
+    /// Whether the callee is variadic and consumes `x4`/`x5` metadata.
+    pub variadic: bool,
+    /// Number of stack-parameter bytes to publish in `x5`.
+    pub variadic_stack_bytes: u64,
 }
 
 impl Default for EcCallArguments {
@@ -467,7 +579,21 @@ impl Default for EcCallArguments {
             vec: [0; 8],
             stack: Vec::new(),
             returns: EcReturnKind::Integer,
+            variadic: false,
+            variadic_stack_bytes: 0,
         }
+    }
+}
+
+impl EcCallArguments {
+    /// Metadata to place in `x4`/`x5` for the native stack at `sp`.
+    pub fn variadic_metadata(&self, sp: u64) -> AppResult<Option<EcVariadicMetadata>> {
+        if !self.variadic {
+            return Ok(None);
+        }
+        let bytes = self.stack.len() as u64 * 8;
+        let pointer = if bytes == 0 { 0 } else { sp };
+        Ok(Some(EcVariadicMetadata::new(pointer, bytes)?))
     }
 }
 
@@ -651,6 +777,12 @@ pub fn x64_to_ec_arguments(
     state: &X64AbiState,
     stack: &dyn EcStackAccess,
 ) -> AppResult<EcCallArguments> {
+    if signature.variadic && signature.mode != EcAbiMode::Positional {
+        return Err(EcTransitionError::malformed(
+            "ARM64EC variadic signatures require positional type metadata",
+        )
+        .to_app_error());
+    }
     if signature.mode == EcAbiMode::ClassParallel {
         let mut args = EcCallArguments {
             returns: signature.returns,
@@ -686,9 +818,10 @@ pub fn x64_to_ec_arguments(
     let layouts = signature.layouts()?;
     let mut args = EcCallArguments {
         returns: signature.returns,
+        variadic: signature.variadic,
         ..EcCallArguments::default()
     };
-    for (index, layout) in layouts.iter().enumerate() {
+    for layout in &layouts {
         let value = match layout.x64 {
             EcArgLocation::Gpr(register) => state.gpr[register],
             EcArgLocation::Vector(register) => state.xmm[register] as u64,
@@ -703,8 +836,8 @@ pub fn x64_to_ec_arguments(
             }
             EcArgLocation::Stack(_) => args.stack.push(value),
         }
-        let _ = index;
     }
+    args.variadic_stack_bytes = args.stack.len() as u64 * 8;
     Ok(args)
 }
 
@@ -716,6 +849,30 @@ pub fn ec_to_x64_arguments(
     state: &EcAbiState,
     stack: &dyn EcStackAccess,
 ) -> AppResult<X64CallArguments> {
+    if signature.variadic && signature.mode != EcAbiMode::Positional {
+        return Err(EcTransitionError::malformed(
+            "ARM64EC variadic signatures require positional type metadata",
+        )
+        .to_app_error());
+    }
+    if signature.variadic {
+        let metadata = EcVariadicMetadata::new(state.x[4], state.x[5])?;
+        let expected = signature.ec_stack_arg_bytes()?;
+        if metadata.stack_bytes != expected {
+            return Err(EcTransitionError::malformed(format!(
+                "ARM64EC variadic x5 stack size 0x{:x} does not match the signature's 0x{expected:x}",
+                metadata.stack_bytes
+            ))
+            .to_app_error());
+        }
+        if expected != 0 && metadata.stack_pointer != state.sp {
+            return Err(EcTransitionError::malformed(format!(
+                "ARM64EC variadic x4 stack pointer 0x{:016x} does not point at the transition stack 0x{:016x}",
+                metadata.stack_pointer, state.sp
+            ))
+            .to_app_error());
+        }
+    }
     if signature.mode == EcAbiMode::ClassParallel {
         let mut args = X64CallArguments {
             returns: signature.returns,
@@ -2046,13 +2203,349 @@ pub extern "C" fn casa1_arm64_bridge_recover_teb() -> u64 {
     BRIDGE_TEB_STACK.with(|stack| stack.borrow().last().copied().unwrap_or(0))
 }
 
-struct BridgeTebGuard;
+/// A host signal raised asynchronously while native ARM64EC code was running,
+/// converted to the Windows exception the guest can observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EcHostSignalException {
+    pub signal: i32,
+    pub status: u32,
+    pub fault_address: u64,
+}
 
-impl Drop for BridgeTebGuard {
-    fn drop(&mut self) {
-        BRIDGE_TEB_STACK.with(|stack| {
-            stack.borrow_mut().pop();
+impl EcHostSignalException {
+    pub fn to_app_error(&self) -> AppError {
+        AppError::new(
+            ReasonCode::RcInvalidParameter,
+            format!(
+                "ARM64EC host signal {} at 0x{:016x} converted to Windows exception 0x{:08x}",
+                self.signal, self.fault_address, self.status
+            ),
+        )
+        .with_hint(format!("ntstatus=0x{:08x}", self.status))
+    }
+
+    /// The SEH-compatible record for this signal, when the mapping is exact.
+    pub fn exception_record(&self) -> Option<crate::seh::ExceptionRecord> {
+        Some(crate::seh::ExceptionRecord::new(
+            self.status,
+            self.fault_address,
+        ))
+    }
+}
+
+/// Map a synchronous host signal to the exact Windows NTSTATUS.  Signals with
+/// no Windows exception counterpart fail closed.
+pub fn host_signal_to_ntstatus(signal: i32) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        match signal {
+            libc::SIGSEGV | libc::SIGBUS => Some(STATUS_ACCESS_VIOLATION),
+            libc::SIGILL => Some(STATUS_ILLEGAL_INSTRUCTION),
+            libc::SIGFPE => Some(STATUS_INTEGER_DIVIDE_BY_ZERO),
+            libc::SIGTRAP => Some(STATUS_BREAKPOINT),
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        None
+    }
+}
+
+pub fn convert_host_signal(signal: i32, fault_address: u64) -> AppResult<EcHostSignalException> {
+    let status = host_signal_to_ntstatus(signal).ok_or_else(|| {
+        EcTransitionError::unsupported(format!(
+            "ARM64EC host signal {signal} has no Windows exception mapping"
+        ))
+        .to_app_error()
+    })?;
+    Ok(EcHostSignalException {
+        signal,
+        status,
+        fault_address,
+    })
+}
+
+thread_local! {
+    static EC_LAST_HOST_SIGNAL: RefCell<Option<EcHostSignalException>> =
+        const { RefCell::new(None) };
+}
+
+pub fn take_last_host_signal() -> Option<EcHostSignalException> {
+    EC_LAST_HOST_SIGNAL.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(unix)]
+mod host_signal {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+    /// Opaque and deliberately larger than every supported C `jmp_buf`.
+    #[repr(C, align(16))]
+    pub struct SignalJmpBuf {
+        words: [u64; 64],
+    }
+
+    unsafe extern "C" {
+        // `setjmp`/`longjmp` have no `libc` binding; the buffer above is large
+        // enough for every supported aarch64/Unix host.
+        fn setjmp(env: *mut SignalJmpBuf) -> i32;
+        fn longjmp(env: *mut SignalJmpBuf, value: i32) -> !;
+    }
+
+    const SIGNALS: [libc::c_int; 4] = [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE];
+    static PREVIOUS: [AtomicPtr<libc::sigaction>; 4] = [
+        const { AtomicPtr::new(std::ptr::null_mut()) },
+        const { AtomicPtr::new(std::ptr::null_mut()) },
+        const { AtomicPtr::new(std::ptr::null_mut()) },
+        const { AtomicPtr::new(std::ptr::null_mut()) },
+    ];
+    static INSTALL_DEPTH: AtomicUsize = AtomicUsize::new(0);
+    static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone, Copy)]
+    struct SignalSlot {
+        active: bool,
+        jump: *mut SignalJmpBuf,
+        signal: i32,
+        status: u32,
+        fault_address: u64,
+    }
+
+    thread_local! {
+        static SLOT: Cell<SignalSlot> = const {
+            Cell::new(SignalSlot {
+                active: false,
+                jump: std::ptr::null_mut(),
+                signal: 0,
+                status: 0,
+                fault_address: 0,
+            })
+        };
+    }
+
+    pub struct Guard;
+
+    fn default_action(signal: libc::c_int) {
+        // SAFETY: restoring the default action and re-raising reproduces the
+        // host's normal fatal behavior when the signal is not ours.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    fn forward(signal: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+        let Some(index) = SIGNALS.iter().position(|candidate| *candidate == signal) else {
+            default_action(signal);
+            return;
+        };
+        let pointer = PREVIOUS[index].load(Ordering::Acquire);
+        if pointer.is_null() {
+            default_action(signal);
+            return;
+        }
+        // SAFETY: the pointer was installed by `install` and only released
+        // after the handler was restored in `Guard::drop`.
+        let action = unsafe { &*pointer };
+        let handler = action.sa_sigaction;
+        if handler == libc::SIG_DFL as usize {
+            default_action(signal);
+            return;
+        }
+        if handler == libc::SIG_IGN as usize {
+            return;
+        }
+        if action.sa_flags & libc::SA_SIGINFO != 0 {
+            // SAFETY: the saved action advertised the three-argument ABI.
+            let callback: unsafe extern "C" fn(
+                libc::c_int,
+                *mut libc::siginfo_t,
+                *mut libc::c_void,
+            ) = unsafe { std::mem::transmute(handler) };
+            unsafe { callback(signal, info, context) };
+        } else {
+            // SAFETY: the saved action advertised the one-argument ABI.
+            let callback: unsafe extern "C" fn(libc::c_int) =
+                unsafe { std::mem::transmute(handler) };
+            unsafe { callback(signal) };
+        }
+    }
+
+    extern "C" fn handle(
+        signal: libc::c_int,
+        info: *mut libc::siginfo_t,
+        context: *mut libc::c_void,
+    ) {
+        let converted = host_signal_to_ntstatus(signal);
+        if let Some(status) = converted {
+            let _ = SLOT.try_with(|slot| {
+                let mut value = slot.get();
+                if value.active && !value.jump.is_null() {
+                    value.signal = signal;
+                    value.status = status;
+                    value.fault_address = if info.is_null() {
+                        0
+                    } else {
+                        // SAFETY: the kernel supplies a valid siginfo_t for
+                        // SA_SIGINFO handlers.
+                        unsafe { (*info).si_addr() as u64 }
+                    };
+                    slot.set(value);
+                    // SAFETY: `jump` points at the live `run` frame and was
+                    // initialized by `setjmp` before `active` became true.
+                    unsafe { longjmp(value.jump, 1) }
+                }
+            });
+        }
+        forward(signal, info, context);
+    }
+
+    fn restore_from(index: usize) {
+        for (offset, signal) in SIGNALS.iter().enumerate().skip(index) {
+            let pointer = PREVIOUS[offset].swap(std::ptr::null_mut(), Ordering::SeqCst);
+            if !pointer.is_null() {
+                // SAFETY: the boxed action was created by `install`.
+                unsafe {
+                    libc::sigaction(*signal, pointer, std::ptr::null_mut());
+                    drop(Box::from_raw(pointer));
+                }
+            }
+        }
+    }
+
+    fn install() -> AppResult<Guard> {
+        let _lock = INSTALL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if INSTALL_DEPTH.fetch_add(1, Ordering::SeqCst) != 0 {
+            return Ok(Guard);
+        }
+        for (index, signal) in SIGNALS.iter().enumerate() {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = handle as *const () as usize;
+            action.sa_flags = libc::SA_SIGINFO;
+            // SAFETY: `action.sa_mask` is a valid, owned sigset_t.
+            unsafe { libc::sigemptyset(&mut action.sa_mask) };
+            let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: `action` and `previous` are valid for the call.
+            if unsafe { libc::sigaction(*signal, &action, &mut previous) } != 0 {
+                restore_from(0);
+                INSTALL_DEPTH.store(0, Ordering::SeqCst);
+                return Err(AppError::new(
+                    ReasonCode::RcUnsupportedPlatform,
+                    "failed to install ARM64EC host signal conversion handler",
+                ));
+            }
+            PREVIOUS[index].store(Box::into_raw(Box::new(previous)), Ordering::SeqCst);
+        }
+        Ok(Guard)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _lock = INSTALL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if INSTALL_DEPTH.fetch_sub(1, Ordering::SeqCst) == 1 {
+                restore_from(0);
+            }
+        }
+    }
+
+    fn unblock(signal: libc::c_int) {
+        // SAFETY: all pointers refer to valid local sigset_t values.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, signal);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        }
+    }
+
+    fn block_all() -> libc::sigset_t {
+        // SAFETY: `set` is initialized before use.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            for signal in SIGNALS {
+                libc::sigaddset(&mut set, signal);
+            }
+            set
+        }
+    }
+
+    /// Run `call` with SIGSEGV/SIGBUS/SIGILL/SIGFPE converted into an exact
+    /// `EcHostSignalException`.  Signals delivered outside this window are
+    /// forwarded to the previously installed handler.
+    pub fn run(call: impl FnOnce()) -> AppResult<()> {
+        let _guard = install()?;
+        let mut jump = std::mem::MaybeUninit::<SignalJmpBuf>::uninit();
+        let blocked = block_all();
+        let mut previous_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: valid sigset_t pointers; the mask is restored below.
+        unsafe {
+            libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut previous_mask);
+        }
+        SLOT.with(|slot| {
+            slot.set(SignalSlot {
+                active: false,
+                jump: jump.as_mut_ptr(),
+                signal: 0,
+                status: 0,
+                fault_address: 0,
+            });
         });
+        let jumped = unsafe { setjmp(jump.as_mut_ptr()) };
+        if jumped != 0 {
+            let value = SLOT.with(|slot| {
+                let value = slot.get();
+                slot.set(SignalSlot {
+                    active: false,
+                    jump: std::ptr::null_mut(),
+                    signal: 0,
+                    status: 0,
+                    fault_address: 0,
+                });
+                value
+            });
+            unblock(value.signal);
+            // SAFETY: restoring the pre-window mask keeps unrelated signals
+            // behaving exactly as they did before the transition.
+            unsafe {
+                libc::sigprocmask(libc::SIG_SETMASK, &previous_mask, std::ptr::null_mut());
+            }
+            let exception = EcHostSignalException {
+                signal: value.signal,
+                status: value.status,
+                fault_address: value.fault_address,
+            };
+            EC_LAST_HOST_SIGNAL.with(|slot| *slot.borrow_mut() = Some(exception));
+            return Err(exception.to_app_error());
+        }
+        SLOT.with(|slot| {
+            let mut value = slot.get();
+            value.active = true;
+            slot.set(value);
+        });
+        // SAFETY: restoring the mask may deliver a pending signal only after
+        // `active` is set, so it is converted by the handler above.
+        unsafe {
+            libc::sigprocmask(libc::SIG_SETMASK, &previous_mask, std::ptr::null_mut());
+        }
+        call();
+        SLOT.with(|slot| {
+            slot.set(SignalSlot {
+                active: false,
+                jump: std::ptr::null_mut(),
+                signal: 0,
+                status: 0,
+                fault_address: 0,
+            });
+        });
+        Ok(())
     }
 }
 
@@ -2067,13 +2560,23 @@ fn invoke_bridge(context: &mut Arm64Context) -> AppResult<()> {
         return Err(Arm64Exception::EntryPointOutsideExecutableRegion { pc: 0 }.to_app_error());
     }
     BRIDGE_TEB_STACK.with(|stack| stack.borrow_mut().push(context.x[18]));
-    let _teb_guard = BridgeTebGuard;
     #[cfg(target_os = "macos")]
     unsafe {
         libc::pthread_jit_write_protect_np(1);
     }
-    unsafe { casa1_arm64_call_bridge(context as *mut Arm64Context) };
-    Ok(())
+    #[cfg(unix)]
+    let result = host_signal::run(|| unsafe {
+        casa1_arm64_call_bridge(context as *mut Arm64Context);
+    });
+    #[cfg(not(unix))]
+    let result = {
+        unsafe { casa1_arm64_call_bridge(context as *mut Arm64Context) };
+        Ok(())
+    };
+    BRIDGE_TEB_STACK.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+    result
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -2370,10 +2873,89 @@ impl Arm64Assembler {
     }
 }
 
+/// Size of the frame a generated vector import thunk hands to the host.
+pub const EC_IMPORT_FRAME_SIZE: usize = 272;
+
+/// Calling convention an import thunk uses when translating to x64.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EcImportAbi {
+    /// Four integer and four vector registers, with per-class overflow.
+    ClassParallel = 0,
+    /// ARM64EC variadic: `x0`-`x3` plus `x4`/`x5` stack metadata.
+    Variadic = 1,
+}
+
+impl EcImportAbi {
+    /// Identify common CRT variadic imports so their `x4`/`x5` metadata is
+    /// translated instead of being mistaken for ordinary arguments.
+    pub fn for_import_name(name: &str) -> Self {
+        let lower = name.to_ascii_lowercase();
+        let va_list_form = ["vprintf", "vsprintf", "vwprintf", "vswprintf", "vscanf"]
+            .iter()
+            .any(|needle| lower.contains(needle));
+        let variadic = !va_list_form
+            && ["printf", "scanf", "wsprintf", "wprintf", "swscanf"]
+                .iter()
+                .any(|needle| lower.contains(needle));
+        if variadic {
+            Self::Variadic
+        } else {
+            Self::ClassParallel
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EcImportRegisters {
+    pub gpr: [u64; 8],
+    pub vec: [u128; 8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcImportCall {
+    pub abi: EcImportAbi,
+    pub registers: EcImportRegisters,
+    /// Variadic overflow arguments read from the `x4`/`x5` area.
+    pub variadic_stack: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EcImportResult {
+    pub rax: u64,
+    pub rdx: u64,
+    pub xmm0: u128,
+    pub xmm1: u128,
+}
+
+/// Frame handed by a generated vector import thunk to [`ec_import_dispatch`].
+/// The field order is part of the generated-code ABI.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct EcImportFrame {
+    pub gpr: [u64; 8],
+    /// q0..q7, each as (low, high).
+    pub vec: [[u64; 2]; 8],
+    /// Caller stack pointer at the thunk entry.
+    pub sp: u64,
+    /// x18 (TEB) at the thunk entry.
+    pub teb: u64,
+    /// x30 (link register) at the thunk entry.
+    pub lr: u64,
+    /// [`EcImportAbi`] encoded as 0 or 1.
+    pub abi: u64,
+    pub result_gpr: [u64; 2],
+    pub result_vec: [[u64; 2]; 2],
+}
+
 type ImportCallback = Box<dyn FnMut(u64, u64, u64, u64, u64, u64, u64, u64) -> u64>;
+type VectorImportCallback = Box<dyn FnMut(&EcImportCall) -> EcImportResult>;
 
 thread_local! {
     static IMPORT_CALLBACKS: RefCell<HashMap<u64, ImportCallback>> = RefCell::new(HashMap::new());
+    static VECTOR_IMPORT_CALLBACKS: RefCell<HashMap<u64, VectorImportCallback>> =
+        RefCell::new(HashMap::new());
+    static VECTOR_IMPORT_ERROR: RefCell<Option<EcTransitionError>> = const { RefCell::new(None) };
     static NEXT_IMPORT_ID: Cell<u64> = const { Cell::new(1) };
 }
 
@@ -2397,6 +2979,113 @@ extern "C" fn arm64_import_dispatch(
         cell.borrow_mut().insert(id, callback);
     });
     result
+}
+
+fn read_variadic_stack(pointer: u64, bytes: u64) -> AppResult<Vec<u64>> {
+    if bytes == 0 {
+        return Ok(Vec::new());
+    }
+    if bytes % 8 != 0 || bytes > EC_VARIADIC_STACK_LIMIT {
+        return Err(EcTransitionError::malformed(format!(
+            "ARM64EC variadic stack size 0x{bytes:x} is invalid"
+        ))
+        .to_app_error());
+    }
+    let end = pointer.checked_add(bytes).ok_or_else(|| {
+        EcTransitionError::fault("ARM64EC variadic stack range overflows").to_app_error()
+    })?;
+    let mut page = pointer & !0xfff;
+    while page < end {
+        if !host_page_mapped(page) {
+            return Err(EcTransitionError::fault(format!(
+                "ARM64EC variadic stack at 0x{pointer:016x} is not mapped"
+            ))
+            .to_app_error());
+        }
+        page = page.saturating_add(0x1000);
+    }
+    // SAFETY: every page in the range was just checked as mapped and the
+    // length is bounded by EC_VARIADIC_STACK_LIMIT.
+    let raw = unsafe { std::slice::from_raw_parts(pointer as *const u8, bytes as usize) };
+    Ok(raw
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8 bytes")))
+        .collect())
+}
+
+fn call_vector_import(id: u64, call: EcImportCall) -> AppResult<EcImportResult> {
+    let callback = VECTOR_IMPORT_CALLBACKS.with(|cell| cell.borrow_mut().remove(&id));
+    let Some(mut callback) = callback else {
+        return Err(EcTransitionError::unsupported(format!(
+            "ARM64EC vector import callback {id} is not installed"
+        ))
+        .to_app_error());
+    };
+    let result = callback(&call);
+    VECTOR_IMPORT_CALLBACKS.with(|cell| {
+        cell.borrow_mut().insert(id, callback);
+    });
+    Ok(result)
+}
+
+/// Host side of a generated vector import thunk.  It forwards `x0`-`x7` and
+/// `q0`-`q7`, resolves the ARM64EC variadic `x4`/`x5` description when the
+/// import is variadic, and publishes both return classes.
+extern "C" fn ec_import_dispatch(frame: *mut EcImportFrame, id: u64) {
+    // SAFETY: generated thunks pass a pointer to their own live frame and call
+    // this function synchronously.
+    let frame = unsafe { &mut *frame };
+    let mut registers = EcImportRegisters::default();
+    registers.gpr.copy_from_slice(&frame.gpr);
+    for (index, pair) in frame.vec.iter().enumerate() {
+        registers.vec[index] = u128::from(pair[0]) | (u128::from(pair[1]) << 64);
+    }
+    let abi = if frame.abi == EcImportAbi::Variadic as u64 {
+        EcImportAbi::Variadic
+    } else {
+        EcImportAbi::ClassParallel
+    };
+    let outcome = match abi {
+        EcImportAbi::Variadic => EcVariadicMetadata::new(registers.gpr[4], registers.gpr[5])
+            .and_then(|metadata| read_variadic_stack(metadata.stack_pointer, metadata.stack_bytes))
+            .and_then(|stack| {
+                call_vector_import(
+                    id,
+                    EcImportCall {
+                        abi,
+                        registers,
+                        variadic_stack: stack,
+                    },
+                )
+            }),
+        EcImportAbi::ClassParallel => call_vector_import(
+            id,
+            EcImportCall {
+                abi,
+                registers,
+                variadic_stack: Vec::new(),
+            },
+        ),
+    };
+    match outcome {
+        Ok(result) => {
+            frame.result_gpr = [result.rax, result.rdx];
+            frame.result_vec = [
+                [result.xmm0 as u64, (result.xmm0 >> 64) as u64],
+                [result.xmm1 as u64, (result.xmm1 >> 64) as u64],
+            ];
+        }
+        Err(error) => {
+            let transition = EcTransitionError::from_app_error(&error);
+            VECTOR_IMPORT_ERROR.with(|slot| *slot.borrow_mut() = Some(transition));
+            frame.result_gpr = [u64::MAX, 0];
+            frame.result_vec = [[0; 2]; 2];
+        }
+    }
+}
+
+pub fn take_vector_import_error() -> Option<EcTransitionError> {
+    VECTOR_IMPORT_ERROR.with(|slot| slot.borrow_mut().take())
 }
 
 pub struct Arm64ImportTable {
@@ -2450,6 +3139,74 @@ impl Arm64ImportTable {
         Ok(address)
     }
 
+    /// Register an import that observes and returns both the integer and
+    /// vector argument classes (`x0`-`x7`/`q0`-`q7`).
+    pub fn register_abi(
+        &mut self,
+        name: impl Into<String>,
+        abi: EcImportAbi,
+        callback: impl FnMut(&EcImportCall) -> EcImportResult + 'static,
+    ) -> AppResult<u64> {
+        let id = NEXT_IMPORT_ID.with(|next| {
+            let id = next.get();
+            next.set(id.wrapping_add(1).max(1));
+            id
+        });
+        VECTOR_IMPORT_CALLBACKS.with(|cell| {
+            cell.borrow_mut().insert(id, Box::new(callback));
+        });
+        let thunk = build_import_call_thunk(id, abi, ec_import_dispatch as *const () as usize);
+        let offset = self.next_offset;
+        let next = offset.checked_add(thunk.len()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcInvalidParameter,
+                "import thunk table overflow",
+            )
+        })?;
+        if next > self.region.len() {
+            return Err(AppError::new(
+                ReasonCode::RcJitCodeAllocFailed,
+                "ARM64 import thunk table is full",
+            ));
+        }
+        self.region.write(offset, &thunk)?;
+        self.region.finish_writes()?;
+        self.next_offset = next;
+        let address = self.region.address() + offset as u64;
+        self.names.insert(name.into(), address);
+        Ok(address)
+    }
+
+    /// Call an import with both register classes populated.  Useful for
+    /// float/vector imports and for pinning the two return directions.
+    pub fn call_with_registers(
+        &self,
+        name: &str,
+        gpr: [u64; 8],
+        vec: [u128; 8],
+    ) -> AppResult<EcImportResult> {
+        let address = self.resolve(name).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcImportMissing,
+                format!("missing ARM64 import {name}"),
+            )
+        })?;
+        let mut executor = Arm64Executor::new()?;
+        let mut context = executor.prepare_context(address, &[]);
+        context.x[..8].copy_from_slice(&gpr);
+        context.d[..8].copy_from_slice(&vec);
+        executor.call_with_context(&mut context)?;
+        if let Some(error) = take_vector_import_error() {
+            return Err(error.to_app_error());
+        }
+        Ok(EcImportResult {
+            rax: context.x[0],
+            rdx: context.x[1],
+            xmm0: context.d[0],
+            xmm1: context.d[1],
+        })
+    }
+
     pub fn resolve(&self, name: &str) -> Option<u64> {
         self.names.get(name).copied()
     }
@@ -2495,6 +3252,61 @@ fn build_import_thunk(id: u64, dispatch: usize) -> [u8; 72] {
     bytes[..writer.bytes().len()].copy_from_slice(writer.bytes());
     bytes[56..64].copy_from_slice(&id.to_le_bytes());
     bytes[64..72].copy_from_slice(&(dispatch as u64).to_le_bytes());
+    bytes
+}
+
+fn build_import_call_thunk(id: u64, abi: EcImportAbi, dispatch: usize) -> Vec<u8> {
+    let mut assembler = Arm64Assembler::new();
+    assembler
+        .sub_x_imm(31, 31, EC_IMPORT_FRAME_SIZE as u32)
+        .add_x_imm(16, 31, EC_IMPORT_FRAME_SIZE as u32)
+        .str_x_imm(16, 31, 192)
+        .str_x_imm(18, 31, 200)
+        .str_x_imm(30, 31, 208)
+        .movz_x(16, abi as u16, 0)
+        .str_x_imm(16, 31, 216)
+        .stp_x(0, 1, 31, 0)
+        .stp_x(2, 3, 31, 16)
+        .stp_x(4, 5, 31, 32)
+        .stp_x(6, 7, 31, 48)
+        .stp_q(0, 1, 31, 64)
+        .stp_q(2, 3, 31, 96)
+        .stp_q(4, 5, 31, 128)
+        .stp_q(6, 7, 31, 160)
+        .ldr_x_imm(17, 18, 0x118)
+        .mov_x(18, 17)
+        .add_x_imm(0, 31, 0);
+    let id_literal_instruction = {
+        let offset = assembler.bytes().len();
+        assembler.ldr_x_literal(1, 0);
+        Some(offset)
+    };
+    let dispatch_literal_instruction = {
+        let offset = assembler.bytes().len();
+        assembler.ldr_x_literal(16, 0);
+        Some(offset)
+    };
+    assembler
+        .blr(16)
+        .ldr_x_imm(0, 31, 224)
+        .ldr_x_imm(1, 31, 232)
+        .ldp_q(0, 1, 31, 240)
+        .ldr_x_imm(18, 31, 200)
+        .ldr_x_imm(30, 31, 208)
+        .add_x_imm(31, 31, EC_IMPORT_FRAME_SIZE as u32)
+        .ret();
+    let mut bytes = assembler.into_bytes();
+    pad_to(&mut bytes, 8);
+    let id_literal = bytes.len();
+    bytes.extend_from_slice(&id.to_le_bytes());
+    let dispatch_literal = bytes.len();
+    bytes.extend_from_slice(&(dispatch as u64).to_le_bytes());
+    if let Some(offset) = id_literal_instruction {
+        patch_ldr_literal(&mut bytes, offset, id_literal);
+    }
+    if let Some(offset) = dispatch_literal_instruction {
+        patch_ldr_literal(&mut bytes, offset, dispatch_literal);
+    }
     bytes
 }
 
@@ -2951,6 +3763,7 @@ pub struct Arm64Image {
     protected: bool,
     thunk_cursor: usize,
     thunk_limit: usize,
+    code_ranges: Vec<arm64x::ChpeCodeRange>,
 }
 
 impl Arm64Image {
@@ -2977,6 +3790,10 @@ impl Arm64Image {
             ));
         }
         region.write(0, &mapped.memory)?;
+        let code_ranges = image
+            .chpe_metadata()
+            .map(|chpe| chpe.code_map.clone())
+            .unwrap_or_default();
         Ok(Self {
             region,
             base,
@@ -2985,7 +3802,26 @@ impl Arm64Image {
             protected: false,
             thunk_cursor: arena_start,
             thunk_limit: arena_start + ARM64EC_THUNK_ARENA_SIZE,
+            code_ranges,
         })
+    }
+
+    /// Detect a PE-provided x64 entry stub, fast-forward sequence, or ARM64EC
+    /// entry thunk at `rva` and return the native body it forwards to.
+    pub fn resolve_thunk_body(&self, rva: u32) -> AppResult<Option<u32>> {
+        let Some(range) = self.code_ranges.iter().find(|range| range.contains(rva)) else {
+            return Ok(None);
+        };
+        let mapped = &self.region.as_slice()[..self.size];
+        Ok(arm64x::detect_ec_thunk_body(
+            mapped,
+            self.base,
+            rva,
+            range.start_rva,
+            range.end_rva(),
+            self.size as u32,
+        )?
+        .map(|route| route.body_rva))
     }
 
     /// Copy a generated transition thunk into the image-adjacent arena and
@@ -3199,13 +4035,19 @@ impl Arm64NativeRunner {
     }
 
     pub fn call_entry(&mut self, image: &ParsedPe, args: &[u64]) -> AppResult<Arm64CallResult> {
-        let entry = self.image.entry_point(image, HybridView::Native)?;
+        let rva = arm64x::route_entry_point(image, HybridView::Native)?;
+        let entry = self.image.address_for_rva(rva)?;
+        let entry = match self.image.resolve_thunk_body(rva)? {
+            Some(body_rva) => self.image.address_for_rva(body_rva)?,
+            None => entry,
+        };
         let mut context = self.executor.prepare_context(entry, args);
         self.executor.call_with_context(&mut context)?;
         Ok(Arm64CallResult { context })
     }
 
     pub fn call_rva(&mut self, rva: u32, args: &[u64]) -> AppResult<Arm64CallResult> {
+        let rva = self.image.resolve_thunk_body(rva)?.unwrap_or(rva);
         let entry = self.image.address_for_rva(rva)?;
         let mut context = self.executor.prepare_context(entry, args);
         self.executor.call_with_context(&mut context)?;
@@ -3242,6 +4084,13 @@ pub fn enter_ec_from_x64_native(
     }
     let return_address = transition_stack_read(x64_stack, rsp)?;
     let args = x64_to_ec_arguments(signature, x64, x64_stack)?;
+    // An export or entry thunk body must not be executed as a native function
+    // after the x64-to-EC translation has already happened.  Route to the real
+    // body instead so arguments are translated exactly once.
+    let target_rva = runner
+        .image
+        .resolve_thunk_body(target_rva)?
+        .unwrap_or(target_rva);
     let entry = runner.image.address_for_rva(target_rva)?;
     let (sp, native_base, native_top) = runner.reserve_transition_stack()?;
     if sp % ARM64_STACK_ALIGNMENT != 0 {
@@ -3256,10 +4105,15 @@ pub fn enter_ec_from_x64_native(
         runner.release_transition_stack(sp);
         return Err(error);
     }
+    let variadic = args.variadic_metadata(sp)?;
     let mut context = runner.executor.prepare_context(entry, &[]);
     context.pc = entry;
     context.sp = sp;
     context.x[..8].copy_from_slice(&args.gpr);
+    if let Some(metadata) = variadic {
+        context.x[4] = metadata.stack_pointer;
+        context.x[5] = metadata.stack_bytes;
+    }
     context.d[..8].copy_from_slice(&args.vec);
     context.x[18] = runner.executor.teb_address();
     context.x[30] = 0;
@@ -3895,6 +4749,226 @@ mod tests {
     }
 
     #[test]
+    fn arm64ec_ec_variadic_mixed_x4_x5_boundary_is_exact() {
+        use crate::cpu::Register;
+        let signature = EcSignature::variadic(
+            vec![
+                EcParamKind::Integer,
+                EcParamKind::Float,
+                EcParamKind::Integer,
+                EcParamKind::Float,
+                EcParamKind::Integer,
+                EcParamKind::Float,
+                EcParamKind::Integer,
+                EcParamKind::Float,
+                EcParamKind::Integer,
+            ],
+            EcReturnKind::Integer,
+        );
+        let mut memory = vec![0u8; 0x100];
+        let base = 0x8000u64;
+        let mut stack = BufferStack {
+            base,
+            bytes: &mut memory,
+        };
+        let mut x64 = X64AbiState::default();
+        x64.gpr[Register::Rsp.index()] = base;
+        x64.gpr[Register::Rcx.index()] = 0x11;
+        x64.gpr[Register::Rdx.index()] = 0x22;
+        x64.gpr[Register::R8.index()] = 0x33;
+        x64.gpr[Register::R9.index()] = 0x44;
+        x64.xmm[0] = 1.5f64.to_bits() as u128;
+        x64.xmm[1] = 2.5f64.to_bits() as u128;
+        x64.xmm[2] = 3.5f64.to_bits() as u128;
+        x64.xmm[3] = 4.5f64.to_bits() as u128;
+        stack.write_u64(base + 0x28, 0x55).unwrap();
+        let ec = x64_to_ec_arguments(&signature, &x64, &stack).expect("variadic to EC");
+        assert_eq!(
+            ec.gpr[..4],
+            [0x11, 1.5f64.to_bits(), 0x22, 2.5f64.to_bits()],
+            "ARM64EC variadic uses x0-x3 for both classes"
+        );
+        assert_eq!(
+            ec.stack,
+            vec![0x33, 3.5f64.to_bits(), 0x44, 4.5f64.to_bits(), 0x55],
+            "overflow keeps argument order"
+        );
+        assert!(ec.variadic);
+        assert_eq!(ec.variadic_stack_bytes, 40);
+        assert_eq!(
+            ec.variadic_metadata(0x9000)
+                .expect("metadata")
+                .expect("variadic"),
+            EcVariadicMetadata {
+                stack_pointer: 0x9000,
+                stack_bytes: 40
+            }
+        );
+
+        let mut ec_state = EcAbiState::default();
+        ec_state.sp = 0x9000;
+        ec_state.x[..4].copy_from_slice(&ec.gpr[..4]);
+        ec_state.x[4] = 0x9000;
+        ec_state.x[5] = 40;
+        let mut out = vec![0u8; 0x100];
+        let mut out_stack = BufferStack {
+            base: 0x9000,
+            bytes: &mut out,
+        };
+        for (index, value) in ec.stack.iter().copied().enumerate() {
+            out_stack
+                .write_u64(0x9000 + index as u64 * 8, value)
+                .unwrap();
+        }
+        let back = ec_to_x64_arguments(&signature, &ec_state, &out_stack).expect("variadic to x64");
+        assert_eq!(back.gpr[Register::Rcx.index()], 0x11);
+        assert_eq!(back.gpr[Register::Rdx.index()], 0x22);
+        assert_eq!(back.gpr[Register::R8.index()], 0x33);
+        assert_eq!(back.gpr[Register::R9.index()], 0x44);
+        assert_eq!(back.vec[0], 1.5f64.to_bits() as u128);
+        assert_eq!(back.vec[1], 2.5f64.to_bits() as u128);
+        assert_eq!(back.vec[2], 3.5f64.to_bits() as u128);
+        assert_eq!(back.vec[3], 4.5f64.to_bits() as u128);
+        assert_eq!(back.stack, vec![0x55]);
+    }
+
+    #[test]
+    fn arm64ec_ec_variadic_malformed_x4_x5_is_rejected_exactly() {
+        let null_pointer = EcVariadicMetadata::new(0, 8)
+            .expect_err("zero x4 with a non-empty overflow area must fail");
+        assert_eq!(null_pointer.code, ReasonCode::RcPeParseInvalid);
+        assert_eq!(
+            null_pointer.message,
+            "ARM64EC variadic x4 stack pointer is null"
+        );
+
+        let misaligned_pointer =
+            EcVariadicMetadata::new(0x1001, 8).expect_err("misaligned x4 must fail");
+        assert_eq!(
+            misaligned_pointer.message,
+            "ARM64EC variadic x4 stack pointer 0x1001 is not 8-byte aligned"
+        );
+
+        let misaligned_size =
+            EcVariadicMetadata::new(0x1000, 9).expect_err("misaligned x5 must fail");
+        assert_eq!(
+            misaligned_size.message,
+            "ARM64EC variadic x5 stack size 0x9 is not 8-byte aligned"
+        );
+
+        let oversized = EcVariadicMetadata::new(0x1000, EC_VARIADIC_STACK_LIMIT + 8)
+            .expect_err("oversized x5 must fail closed");
+        assert_eq!(
+            oversized.message,
+            format!(
+                "ARM64EC variadic x5 stack size 0x{:x} exceeds the supported limit 0x{:x}",
+                EC_VARIADIC_STACK_LIMIT + 8,
+                EC_VARIADIC_STACK_LIMIT
+            )
+        );
+
+        let signature = EcSignature::variadic(vec![EcParamKind::Integer; 6], EcReturnKind::Integer);
+        let mut state = EcAbiState::default();
+        state.sp = 0x9000;
+        state.x[4] = 0x9000;
+        state.x[5] = 8;
+        let mut bytes = vec![0u8; 0x100];
+        let stack = BufferStack {
+            base: 0x9000,
+            bytes: &mut bytes,
+        };
+        let mismatch = ec_to_x64_arguments(&signature, &state, &stack)
+            .expect_err("x5 must match the signature's stack area");
+        assert_eq!(
+            mismatch.message,
+            "ARM64EC variadic x5 stack size 0x8 does not match the signature's 0x10"
+        );
+    }
+
+    #[test]
+    fn arm64ec_ec_float_and_vector_import_classes_boundary_is_exact() {
+        if !native_arm64_available() {
+            return;
+        }
+        let mut imports = Arm64ImportTable::new().expect("import table");
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed_slot = observed.clone();
+        imports
+            .register_abi("FloatImport", EcImportAbi::ClassParallel, move |call| {
+                *observed_slot.borrow_mut() = Some(call.clone());
+                EcImportResult {
+                    rax: 0xfeed,
+                    rdx: 0xbeef,
+                    xmm0: 7.25f64.to_bits() as u128,
+                    xmm1: 9.5f64.to_bits() as u128,
+                }
+            })
+            .expect("register float import");
+        let gpr = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut vec = [0u128; 8];
+        for (index, value) in vec.iter_mut().enumerate() {
+            *value = (index as f64 + 0.5).to_bits() as u128;
+        }
+        let result = imports
+            .call_with_registers("FloatImport", gpr, vec)
+            .expect("call float import");
+        let call = observed
+            .borrow_mut()
+            .take()
+            .expect("callback must observe the import");
+        assert_eq!(call.abi, EcImportAbi::ClassParallel);
+        assert_eq!(call.registers.gpr, gpr);
+        assert_eq!(call.registers.vec, vec);
+        assert_eq!(result.rax, 0xfeed);
+        assert_eq!(result.rdx, 0xbeef);
+        assert_eq!(result.xmm0, 7.25f64.to_bits() as u128);
+        assert_eq!(result.xmm1, 9.5f64.to_bits() as u128);
+    }
+
+    #[test]
+    fn arm64ec_ec_variadic_import_x4_x5_forwarding_is_exact() {
+        if !native_arm64_available() {
+            return;
+        }
+        let mut imports = Arm64ImportTable::new().expect("import table");
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed_slot = observed.clone();
+        imports
+            .register_abi("VariadicImport", EcImportAbi::Variadic, move |call| {
+                *observed_slot.borrow_mut() = Some(call.clone());
+                EcImportResult {
+                    rax: call.variadic_stack.first().copied().unwrap_or(0),
+                    ..EcImportResult::default()
+                }
+            })
+            .expect("register variadic import");
+        let overflow = [0xa1u64, 0xb2, 0xc3];
+        let pointer = overflow.as_ptr() as u64;
+        let mut gpr = [0u64; 8];
+        gpr[..4].copy_from_slice(&[0x10, 0x20, 0x30, 0x40]);
+        gpr[4] = pointer;
+        gpr[5] = (overflow.len() as u64) * 8;
+        let result = imports
+            .call_with_registers("VariadicImport", gpr, [0u128; 8])
+            .expect("call variadic import");
+        let call = observed
+            .borrow_mut()
+            .take()
+            .expect("callback must observe the variadic import");
+        assert_eq!(call.abi, EcImportAbi::Variadic);
+        assert_eq!(call.registers.gpr[..4], [0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(call.variadic_stack, vec![0xa1, 0xb2, 0xc3]);
+        assert_eq!(result.rax, 0xa1);
+
+        let mut malformed = [0u64; 8];
+        malformed[5] = 8;
+        let error = imports
+            .call_with_registers("VariadicImport", malformed, [0u128; 8])
+            .expect_err("null x4 variadic metadata must fail closed");
+        assert_eq!(error.message, "ARM64EC variadic x4 stack pointer is null");
+    }
+
+    #[test]
     fn arm64ec_ec_call_checker_rejects_missing_chpe_map_exactly() {
         let mut image = pe::pe_stub_for_tests();
         image.machine = IMAGE_FILE_MACHINE_ARM64EC;
@@ -4088,6 +5162,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(EcExitFrame, target), 232);
         assert_eq!(std::mem::offset_of!(EcExitFrame, result_vec), 272);
         assert_eq!(std::mem::size_of::<EcCheckResult>(), 24);
+        assert_eq!(std::mem::size_of::<EcImportFrame>(), EC_IMPORT_FRAME_SIZE);
+        assert_eq!(std::mem::offset_of!(EcImportFrame, vec), 64);
+        assert_eq!(std::mem::offset_of!(EcImportFrame, abi), 216);
+        assert_eq!(std::mem::offset_of!(EcImportFrame, result_vec), 240);
     }
 
     fn arm64ec_hybrid_pe(entry_rva: u32, ec_code: &[u8], x64_code: &[u8]) -> Vec<u8> {
@@ -4364,6 +5442,66 @@ mod tests {
         assert_eq!(
             result.termination,
             crate::runtime::ExecutionTermination::GuestExit { code: 42 }
+        );
+    }
+
+    #[test]
+    fn arm64ec_ec_async_host_signal_converts_to_windows_exception_exactly() {
+        if !native_arm64_available() || !cfg!(unix) {
+            return;
+        }
+        // ldr x0, [x0] with x0 == 0 faults synchronously in native code.
+        let mut assembler = Arm64Assembler::new();
+        assembler.ldr_x_imm(0, 0, 0).ret();
+        let error = execute_arm64_function(&assembler.into_bytes(), &[0])
+            .expect_err("host SIGSEGV must be converted, not abort the process");
+        assert_eq!(error.code, ReasonCode::RcInvalidParameter);
+        assert_eq!(
+            error.message,
+            format!(
+                "ARM64EC host signal {} at 0x0000000000000000 converted to Windows exception 0x{:08x}",
+                libc::SIGSEGV,
+                STATUS_ACCESS_VIOLATION
+            )
+        );
+        assert_eq!(
+            error.reproduction_hints,
+            vec!["ntstatus=0xc0000005".to_string()]
+        );
+        let exception = take_last_host_signal().expect("converted signal record");
+        assert_eq!(exception.signal, libc::SIGSEGV);
+        assert_eq!(exception.status, STATUS_ACCESS_VIOLATION);
+        assert_eq!(exception.fault_address, 0);
+        assert_eq!(
+            exception
+                .exception_record()
+                .expect("SEH-compatible record")
+                .code,
+            STATUS_ACCESS_VIOLATION
+        );
+
+        // The fault must not poison the bridge: ordinary native execution
+        // continues on the same thread after the converted exception.
+        let value = execute_arm64_function(&leaf_add(20, 22), &[])
+            .expect("native execution continues after signal conversion");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn arm64ec_ec_unmapped_host_signal_fails_closed_exactly() {
+        let error = convert_host_signal(libc::SIGTERM, 0x1234)
+            .expect_err("a signal without a Windows counterpart must fail closed");
+        assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+        assert_eq!(
+            error.message,
+            format!(
+                "ARM64EC host signal {} has no Windows exception mapping",
+                libc::SIGTERM
+            )
+        );
+        assert_eq!(
+            error.reproduction_hints,
+            vec!["ntstatus=0xc00000bb".to_string()]
         );
     }
 }

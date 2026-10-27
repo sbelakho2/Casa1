@@ -488,6 +488,14 @@
  "arm64_zero_entry_point_is_rejected_exactly": [
   "( error.message, \"ARM64 entry point 0x0000000000000000 is outside the executable region\" )"
  ],
+ "arm64ec_ec_async_host_signal_converts_to_windows_exception_exactly": [
+  "(error.code, ReasonCode::RcInvalidParameter)",
+  "( error.message, format!( \"ARM64EC host signal {} at 0x0000000000000000 converted to Windows exception 0x{:08x}\", libc::SIGSEGV, STATUS_ACCESS_VIOLATION ) )",
+  "( error.reproduction_hints, vec![\"ntstatus=0xc0000005\".to_string()] )",
+  "(exception.signal, libc::SIGSEGV)",
+  "(exception.status, STATUS_ACCESS_VIOLATION)",
+  "(exception.fault_address, 0)"
+ ],
  "arm64ec_ec_call_checker_rejects_missing_chpe_map_exactly": [
   "(error.code, ReasonCode::RcPeParseInvalid)",
   "(error.message, \"ARM64EC image is missing CHPE metadata\")",
@@ -527,7 +535,8 @@
   "(std::mem::offset_of!(EcExitFrame, sp), 208)",
   "(std::mem::offset_of!(EcExitFrame, target), 232)",
   "(std::mem::offset_of!(EcExitFrame, result_vec), 272)",
-  "(std::mem::size_of::<EcCheckResult>(), 24)"
+  "(std::mem::size_of::<EcCheckResult>(), 24)",
+  "(std::mem::size_of::<EcImportFrame>(), EC_IMPORT_FRAME_SIZE)"
  ],
  "arm64ec_ec_exit_thunk_mixed_argument_boundary_is_exact": [
   "(request.target, 0x1_8000_2000)",
@@ -536,6 +545,14 @@
   "(request.args.gpr[Register::R9.index()], 0x44)",
   "(request.args.vec[0], 1.5f64.to_bits() as u128)",
   "(request.args.stack, vec![0x99])"
+ ],
+ "arm64ec_ec_float_and_vector_import_classes_boundary_is_exact": [
+  "(call.abi, EcImportAbi::ClassParallel)",
+  "(call.registers.gpr, gpr)",
+  "(call.registers.vec, vec)",
+  "(result.rax, 0xfeed)",
+  "(result.rdx, 0xbeef)",
+  "(result.xmm0, 7.25f64.to_bits() as u128)"
  ],
  "arm64ec_ec_hybrid_direct_native_to_x64_call_boundary_is_pinned": [
   "(result.exit_code, 42)",
@@ -567,6 +584,11 @@
   "(x64.rip, 0x4444)",
   "(chain.depth(), 2)"
  ],
+ "arm64ec_ec_unmapped_host_signal_fails_closed_exactly": [
+  "(error.code, ReasonCode::RcUnimplInsn)",
+  "( error.message, format!( \"ARM64EC host signal {} has no Windows exception mapping\", libc::SIGTERM ) )",
+  "( error.reproduction_hints, vec![\"ntstatus=0xc00000bb\".to_string()] )"
+ ],
  "arm64ec_ec_unwind_across_transition_reports_exact_status": [
   "(error.code, ReasonCode::RcInvalidParameter)",
   "( error.reproduction_hints, vec![\"ntstatus=0xc0000005\".to_string()] )",
@@ -574,6 +596,29 @@
   "(records.len(), 1)",
   "(records[0].status, STATUS_ACCESS_VIOLATION)",
   "(records[0].from, Arm64Isa::Arm64)"
+ ],
+ "arm64ec_ec_variadic_import_x4_x5_forwarding_is_exact": [
+  "(call.abi, EcImportAbi::Variadic)",
+  "(call.registers.gpr[..4], [0x10, 0x20, 0x30, 0x40])",
+  "(call.variadic_stack, vec![0xa1, 0xb2, 0xc3])",
+  "(result.rax, 0xa1)",
+  "(error.message, \"ARM64EC variadic x4 stack pointer is null\")"
+ ],
+ "arm64ec_ec_variadic_malformed_x4_x5_is_rejected_exactly": [
+  "(null_pointer.code, ReasonCode::RcPeParseInvalid)",
+  "( null_pointer.message, \"ARM64EC variadic x4 stack pointer is null\" )",
+  "( misaligned_pointer.message, \"ARM64EC variadic x4 stack pointer 0x1001 is not 8-byte aligned\" )",
+  "( misaligned_size.message, \"ARM64EC variadic x5 stack size 0x9 is not 8-byte aligned\" )",
+  "( oversized.message, format!( \"ARM64EC variadic x5 stack size 0x{:x} exceeds the supported limit 0x{:x}\", EC_VARIADIC_STACK_LIMIT + 8, EC_VARIADIC_STACK_LIMIT ) )",
+  "( mismatch.message, \"ARM64EC variadic x5 stack size 0x8 does not match the signature's 0x10\" )"
+ ],
+ "arm64ec_ec_variadic_mixed_x4_x5_boundary_is_exact": [
+  "( ec.gpr[..4], [0x11, 1.5f64.to_bits(), 0x22, 2.5f64.to_bits()], \"ARM64EC variadic uses x0-x3 for both classes\" )",
+  "( ec.stack, vec![0x33, 3.5f64.to_bits(), 0x44, 4.5f64.to_bits(), 0x55], \"overflow keeps argument order\" )",
+  "(ec.variadic_stack_bytes, 40)",
+  "( ec.variadic_metadata(0x9000) .expect(\"metadata\") .expect(\"variadic\"), EcVariadicMetadata { stack_pointer: 0x9000, stack_bytes: 40 } )",
+  "(back.gpr[Register::Rcx.index()], 0x11)",
+  "(back.gpr[Register::Rdx.index()], 0x22)"
  ],
  "arm64ec_ec_x64_entry_stub_encoding_boundary_is_pinned": [
   "(&stub[0..2], &[0x48, 0xb8])",
@@ -618,6 +663,19 @@
   "(chpe.function_kind_at(0x1400), Some(EcFunctionKind::X64))",
   "(chpe.function_kind_at(0x17ff), Some(EcFunctionKind::X64))",
   "(chpe.function_kind_at(0x1800), None)"
+ ],
+ "arm64x_ec_thunk_body_detection_boundary_routes_the_real_body_exactly": [
+  "( route, EcThunkRoute { kind: EcThunkKind::EcEntryThunk, body_rva: 0x1000 } )",
+  "( route, EcThunkRoute { kind: EcThunkKind::X64EntryStub, body_rva: 0x1000 } )",
+  "( route, EcThunkRoute { kind: EcThunkKind::X64FastForward, body_rva: 0x1000 } )",
+  "( detect_ec_thunk_body(&mapped, image_base, 0x1800, 0x1800, 0x1900, 0x3000) .expect(\"ordinary body is not a thunk\"), None )"
+ ],
+ "arm64x_ec_thunk_detection_rejects_malformed_metadata_exactly": [
+  "(outside.code, ReasonCode::RcPeParseInvalid)",
+  "( outside.message, \"ARM64EC x64 entry stub target lies outside the image\" )",
+  "( oversized.message, \"ARM64EC thunk scan range exceeds the supported limit\" )",
+  "( outside_target.message, \"ARM64EC thunk target is outside SizeOfImage\" )",
+  "(unmapped.message, \"ARM64EC thunk scan range is not mapped\")"
  ],
  "arm64x_invalid_dynamic_relocation_type_is_rejected": [
   "(error.message, \"invalid ARM64X relocation type\")"
@@ -796,6 +854,14 @@
   "( rc(&run(&mut tpm, &bad_hmac)), rc_session(TPM_RC_AUTH_FAIL, 1) )",
   "(rc(&good_response), TPM_RC_SUCCESS)",
   "(auth.u32().expect(\"session count\"), 1)"
+ ],
+ "batched_gathernd_antialias_convolution_mode_and_mvn_no_mean_edge": [
+  "( run_cpu(&batched, &[&input_values, &index_values]), vec![1.0, 3.0, 5.0, 5.0] )",
+  "( run_cpu(&antialiased, &[&f32_bytes(&pixels)]) .iter() .copied() .map(rounded) .collect::<Vec<_>>(), vec![35000, 55000, 115000, 135000] )",
+  "(outputs, vec![23.0, 37.0])",
+  "( run_cpu(&mvn, &[&f32_bytes(&[1.0, 3.0, 2.0, 6.0])]) .iter() .copied() .map(rounded) .collect::<Vec<_>>(), vec![4472, 13416, 4472, 13416] )",
+  "( invalid_mode.validate().unwrap_err().message, \"convolution mode 2 is not supported\" )",
+  "( invalid_antialiased.validate().unwrap_err().message, \"antialiased resample requires linear interpolation\" )"
  ],
  "bcrypt_thunk_hash_random_and_aes_roundtrip": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, open, &[provider_out as u32, sha_alg as u32, 0, 0], ), 0 )",
@@ -3142,7 +3208,7 @@
  ],
  "dml_device_rejects_feature_level_above_implemented_level": [
   "(error.hresult, DXGI_ERROR_UNSUPPORTED)",
-  "( error.message, \"requested DML_FEATURE_LEVEL 0x6400 exceeds the supported 0x4000\" )"
+  "( error.message, \"requested DML_FEATURE_LEVEL 0x6400 exceeds the supported 0x6300\" )"
  ],
  "dml_device_rejects_unknown_iid": [
   "(error.hresult, E_NOINTERFACE)"
@@ -3176,19 +3242,20 @@
   "( zero_stride_plan.validate().unwrap_err().message, \"output tensor strides must be non-zero\" )"
  ],
  "dml_feature_level_boundary_negotiation_and_operator_minimums": [
-  "(SUPPORTED_DML_FEATURE_LEVEL, DML_FEATURE_LEVEL_4_0)",
-  "( runtime.device(device).expect(\"device\").feature_level, DML_FEATURE_LEVEL_4_0 )",
+  "(SUPPORTED_DML_FEATURE_LEVEL, DML_FEATURE_LEVEL_6_3)",
+  "( runtime.device(device).expect(\"device\").feature_level, DML_FEATURE_LEVEL_6_3 )",
   "(error.hresult, DXGI_ERROR_UNSUPPORTED)",
   "( kind.minimum_feature_level() <= SUPPORTED_DML_FEATURE_LEVEL, true )",
-  "( dml_ops::DmlOpKind::Dequantize { quantization_type: 2 } .minimum_feature_level() > SUPPORTED_DML_FEATURE_LEVEL, true )"
+  "( dml_ops::DmlOpKind::Dequantize { quantization_type: 2 } .minimum_feature_level(), DML_FEATURE_LEVEL_6_3 )",
+  "( dml_ops::DmlOpKind::QuantizedLinearAveragePooling { strides: vec![1, 1], window: vec![1, 1], start_padding: vec![0, 0], end_padding: vec![0, 0], dilations: vec![1, 1], include_padding: false, input_zero_point: false, output_zero_point: false, } .minimum_feature_level(), DML_FEATURE_LEVEL_6_2 )"
  ],
  "dml_feature_level_boundary_negotiation_helper_and_data_types": [
   "( negotiate_feature_levels(&[ DML_FEATURE_LEVEL_1_0, DML_FEATURE_LEVEL_2_0, DML_FEATURE_LEVEL_4_0, DML_FEATURE_LEVEL_6_4, ]), DML_FEATURE_LEVEL_4_0 )",
+  "( negotiate_feature_levels(&[DML_FEATURE_LEVEL_5_2, DML_FEATURE_LEVEL_6_3]), DML_FEATURE_LEVEL_6_3 )",
   "(negotiate_feature_levels(&[DML_FEATURE_LEVEL_6_4]), 0)",
   "(negotiate_feature_levels(&[]), 0)",
   "(supports_tensor_data_type(supported), true)",
-  "( supports_tensor_data_type(DML_TENSOR_DATA_TYPE_UINT16), false )",
-  "( supports_tensor_data_type(DML_TENSOR_DATA_TYPE_FLOAT64), false )"
+  "( supports_tensor_data_type(DML_TENSOR_DATA_TYPE_UINT16), false )"
  ],
  "dml_float16_conversion_roundtrip_edge_values": [
   "(f32_to_f16(value), bits)",
@@ -3204,13 +3271,17 @@
  "dml_gemm_float16_metal_numeric_readback_edge_values": [
   "(read_f16(&cpu), vec![22.0, 28.0, 49.0, 64.0])"
  ],
+ "dml_graph_execute_wired_unary_binary_pipeline_roundtrip": [
+  "(decoded, vec![10.0, 12.0])",
+  "( error.message, \"graph input 0 buffer is 4 bytes, graph requires 8\" )"
+ ],
  "dml_guest_extended_operator_parsing_reaches_argmax_and_rejects_axis_overflow": [
   "(plan.operator_type(), dml_ops::DML_OPERATOR_ARGMAX)",
   "( plan.kind, dml_ops::DmlOpKind::ArgMax { axes: vec![1], direction: dml_ops::DmlAxisDirection::Increasing, } )",
   "( error.message, \"argmin/argmax axis 4 is out of range for rank 4\" )"
  ],
  "dml_guest_quantized_per_channel_scale_is_rejected_exactly": [
-  "( error.message, \"DML_OPERATOR_TYPE 33 supports only a scalar scale tensor\" )"
+  "( error.message, \"DML_OPERATOR_TYPE 33 scale tensor is not broadcastable: quantization tensor dimension 0 size 3 does not match the output size 4\" )"
  ],
  "dml_invalid_dimension_count_is_rejected": [
   "(error.hresult, E_INVALIDARG)",
@@ -5402,7 +5473,7 @@
   "(result[0], vec![2u8])",
   "(result[0], vec![5u8])",
   "( run_cpu( &mmi2f, &[&a_bits, &scale_one, &b_bits, &scale_one, &bias_values] ), vec![11.5] )",
-  "( unsupported.validate().unwrap_err().message, \"quantized operator scale input 1 (A scale) must be a scalar FLOAT32 tensor\" )"
+  "( unsupported.validate().unwrap_err().message, \"quantized operator scale input 1 (A scale) is not broadcastable: quantization tensor axis size 4 does not match any output dimension\" )"
  ],
  "integrity_and_identification_impersonation_deny_writes": [
   "( monitor.check_access(token, &descriptor, GENERIC_READ), Err(STATUS_ACCESS_DENIED) )",
@@ -9347,12 +9418,20 @@
  "quantized_linear_edge_zero_scale_and_unsupported_per_channel_layout": [
   "(result[0], vec![3u8, 4, 5, 7])",
   "( run_cpu(&dequantize, &[&[3u8, 4, 5, 7], &scale_values, &zero_values]), vec![0.0, 0.5, 1.0, 2.0] )",
-  "( per_channel.validate().unwrap_err().message, \"DML_OPERATOR_TYPE 33 supports only a scalar scale tensor\" )"
+  "( per_channel.validate().unwrap_err().message, \"DML_OPERATOR_TYPE 33 scale tensor is not broadcastable: quantization tensor dimension 0 size 3 does not match the output size 4\" )"
  ],
  "quantized_metal_numeric_edge_readback": [
   "(outputs[0], vec![3u8, 4, 5, 7])",
   "( outputs[0] .chunks_exact(4) .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap())) .collect::<Vec<_>>(), vec![19, 22, 43, 50] )",
   "( read_f32(&run_metal_outputs(&mmi2f, &[&a_bits, &one, &b_bits, &one, &bias])[0]), vec![11.5] )"
+ ],
+ "quantized_per_channel_4bit_and_malformed_layout_edge_cases": [
+  "( run_cpu_outputs(&per_channel, &[&values, &scale])[0], vec![1u8, 1, 1, 1] )",
+  "( run_cpu_outputs( &packed, &[&f32_bytes(&[0.0, 1.0, 15.0, 16.0]), &f32_bytes(&[1.0])] )[0], vec![0x10u8, 0xff] )",
+  "( run_cpu(&signed, &[&[0x8fu8], &f32_bytes(&[1.0])]), vec![-1.0, -8.0] )",
+  "( malformed_plan.validate().unwrap_err().message, \"tensor TotalTensorSizeInBytes 1 is smaller than the implied 2 bytes\" )",
+  "( run_cpu_outputs( &quantized_matmul, &[ &a_values, &f32_bytes(&[1.0]), &b_values, &f32_bytes(&[1.0, 2.0]), &f32_bytes(&[1.0]), ] )[0], vec![4u8, 12] )",
+  "( run_cpu_outputs( &quantized_conv, &[ &[1u8, 2], &f32_bytes(&[1.0, 2.0]), &[1u8, 0, 0, 1], &f32_bytes(&[1.0]), &f32_bytes(&[1.0]), ] )[0], vec![1u8, 4] )"
  ],
  "query_information_thread_classes_agree_with_the_win32_subsystem": [
   "( session.call_x86( nt_set_information, &[handle, THREAD_PRIORITY_CLASS, OUT_PTR as u32, 4] ), STATUS_SUCCESS.raw() )",
@@ -9534,11 +9613,19 @@
  "record_workload_dedups_and_reports_found": [
   "(entry.workloads_reaching, vec![\"fixture-a\", \"fixture-b\"])"
  ],
+ "recurrent_backward_bidirectional_peephole_f16_and_noncontiguous_edge": [
+  "( run_cpu(&backward, &[&values, &one, &one]), vec![6.0, 5.0, 3.0] )",
+  "( run_cpu(&bidirectional, &[&values, &both, &both]), vec![1.0, 6.0, 3.0, 5.0, 6.0, 3.0] )",
+  "(read_f16(&f16_result), vec![6.0, 5.0, 3.0])",
+  "((strided_values[0], strided_values[2]), (1.0, 0.0))",
+  "((strided_values[3], strided_values[5]), (2.0, 0.0))",
+  "( peephole_lstm.validate().unwrap_err().message, \"DML_OPERATOR_TYPE 77 peephole tensor must contain 3 contiguous elements (directions x 3 gates x hidden)\" )"
+ ],
  "recurrent_edge_nan_and_invalid_direction_rejected": [
   "( read_f32(&result[0]) .iter() .copied() .map(rounded) .collect::<Vec<_>>(), vec![7616] )",
   "( read_f32(&result[0]) .iter() .copied() .map(rounded) .collect::<Vec<_>>(), vec![3808] )",
   "( read_f32(&result[0]) .iter() .copied() .map(rounded) .collect::<Vec<_>>(), vec![3696] )",
-  "( invalid.validate().unwrap_err().message, \"DML_OPERATOR_TYPE 76 only supports DML_RECURRENT_NETWORK_DIRECTION_FORWARD\" )"
+  "( invalid.validate().unwrap_err().message, \"DML_OPERATOR_TYPE 76 weight gate count must be 2, got 1\" )"
  ],
  "recurrent_metal_numeric_edge_readback": [
   "( read_f32(&outputs[0]) .iter() .copied() .map(rounded) .collect::<Vec<_>>(), vec![expected] )"
