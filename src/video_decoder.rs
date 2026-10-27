@@ -3699,7 +3699,7 @@ fn read_ue(data: &[u8], bit_offset: &mut u64) -> u32 {
         value |= bit;
     }
 
-    value - 1
+    value.saturating_sub(1)
 }
 
 /// Read one signed Exp-Golomb coded value from the bitstream.

@@ -698,7 +698,7 @@ pub fn unwind_frames(
             let res = virtual_unwind(&active_info, context, memory_reader);
             if res == UnwindResult::Collided {
                 chain_depth += 1;
-                match active_info.chained_info_rva.and_then(&get_unwind_info) {
+                match active_info.chained_info_rva.and_then(get_unwind_info) {
                     Some(next) => {
                         active_info = next;
                         continue;

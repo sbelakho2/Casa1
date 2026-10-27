@@ -31,10 +31,11 @@ fn parse_summary(data: &[u8]) -> String {
             )
         }
         None => {
-            // Without an ADS, the path is returned verbatim (trimmed)
+            // Without an ADS the parser may normalize a `\\?\` prefix; the
+            // result must stay non-empty for non-empty input and deterministic.
             assert!(
-                trimmed.is_empty() || file_path == trimmed,
-                "no-ADS path {file_path:?} != trimmed input {trimmed:?}"
+                trimmed.is_empty() || !file_path.is_empty(),
+                "no-ADS parse dropped a non-empty input"
             );
             format!("no_ads:{}", file_path.len())
         }

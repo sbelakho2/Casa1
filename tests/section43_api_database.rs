@@ -15,7 +15,7 @@ use casa1::api_database::{
 };
 use casa1::compatibility_profile::CompatibilityProfile;
 use casa1::host_thunks::{ImplementationLevel, SupportPolicy};
-use casa1::import_coverage::{coverage_for_pe, WorkloadId};
+use casa1::import_coverage::{WorkloadId, coverage_for_pe};
 use serde_json::Value;
 use std::path::Path;
 
@@ -628,12 +628,16 @@ fn deliberately_unsupported_clears_shipping_but_not_user_mode_completeness() {
     assert_eq!(shipping.len(), 2);
     assert_eq!(completeness.len(), 2);
     for violations in [&shipping, &completeness] {
-        assert!(violations
-            .iter()
-            .any(|v| v.kind == ApiGateViolationKind::StubNotDeliberatelyUnsupported));
-        assert!(violations
-            .iter()
-            .any(|v| v.kind == ApiGateViolationKind::UnsupportedNotDeliberatelyUnsupported));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.kind == ApiGateViolationKind::StubNotDeliberatelyUnsupported)
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.kind == ApiGateViolationKind::UnsupportedNotDeliberatelyUnsupported)
+        );
     }
 
     // Registering the stub as deliberately unsupported with a guest-visible

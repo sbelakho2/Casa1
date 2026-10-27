@@ -32,7 +32,8 @@ jobs:
       - name: Install FFmpeg system dependencies (all-features build needs them)
         run: |
           set -euo pipefail
-          brew install ffmpeg
+          brew install ffmpeg@7
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
           # ffmpeg-next discovers the system libraries through pkg-config.
           # Homebrew does not put its lib/pkgconfig on the default search path
           # for every runner image, so make it explicit for this step and for

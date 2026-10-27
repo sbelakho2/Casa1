@@ -619,8 +619,12 @@ mod test_faults {
 mod tests {
     use super::*;
 
-    fn device() -> metal::Device {
-        metal::Device::system_default().expect("Metal device")
+    fn device() -> Option<metal::Device> {
+        let metal = crate::metal_backend::MetalDevice::system_default().ok()?;
+        if !Metal4Queue::is_supported(metal.metal_device()) {
+            return None;
+        }
+        Some(metal.metal_device_owned())
     }
 
     fn shared_values(device: &metal::Device, values: &[u32]) -> metal::Buffer {
@@ -652,7 +656,9 @@ mod tests {
 
     #[test]
     fn metal4_batch_parallel_two_lists_preserve_order_and_fence() {
-        let device = device();
+        let Some(device) = device() else {
+            return;
+        };
         let mut batch = Metal4Batch::with_device(device.clone()).expect("Metal 4 batch");
         let output = shared_values(&device, &[0, 0, 0]);
 
@@ -681,7 +687,9 @@ mod tests {
 
     #[test]
     fn metal4_batch_empty_batch_boundary_commits_nothing() {
-        let device = device();
+        let Some(device) = device() else {
+            return;
+        };
         let mut batch = Metal4Batch::with_device(device).expect("Metal 4 batch");
         let cloned = batch.clone();
         assert_eq!(cloned.stats(), Metal4BatchStats::default());
@@ -701,7 +709,9 @@ mod tests {
 
     #[test]
     fn metal4_batch_duplicate_list_is_rejected_exactly() {
-        let device = device();
+        let Some(device) = device() else {
+            return;
+        };
         let mut batch = Metal4Batch::with_device(device).expect("Metal 4 batch");
         let first = Metal4ListPlan::new(7);
         let second = Metal4ListPlan::new(7);
@@ -721,7 +731,9 @@ mod tests {
 
     #[test]
     fn metal4_batch_invalid_ranges_and_zero_sizes_are_rejected_exactly() {
-        let device = device();
+        let Some(device) = device() else {
+            return;
+        };
         let mut batch = Metal4Batch::with_device(device.clone()).expect("Metal 4 batch");
         let output = shared_values(&device, &[0, 0]);
 
@@ -752,7 +764,9 @@ mod tests {
 
     #[test]
     fn metal4_batch_allocator_reuse_after_completion_has_no_leak() {
-        let device = device();
+        let Some(device) = device() else {
+            return;
+        };
         let mut batch = Metal4Batch::with_device(device.clone()).expect("Metal 4 batch");
         let output = shared_values(&device, &[0, 0]);
         let residency = crate::metal_backend::create_residency_set(&device, Some("batch"), 1)
@@ -790,7 +804,9 @@ mod tests {
 
     #[test]
     fn metal4_batch_duplicate_submit_after_completion_is_safe() {
-        let device = device();
+        let Some(device) = device() else {
+            return;
+        };
         let mut batch = Metal4Batch::with_device(device).expect("Metal 4 batch");
         let first = batch.execute_markers(&[42]).expect("first marker batch");
         assert_eq!(first.event_value, 1);
@@ -812,7 +828,9 @@ mod tests {
     #[test]
     fn metal4_batch_unsupported_device_reports_exact_error() {
         test_faults::force_unsupported(true);
-        let error = Metal4Batch::with_device(device()).expect_err("unsupported device");
+        let error =
+            Metal4Batch::with_device(metal::Device::system_default().expect("Metal device"))
+                .expect_err("unsupported device");
         test_faults::force_unsupported(false);
         assert_eq!(error.code, ReasonCode::RcD3dFeatureUnsupported);
         assert_eq!(
@@ -823,7 +841,9 @@ mod tests {
 
     #[test]
     fn metal4_batch_forced_submission_failure_is_exact_and_recoverable() {
-        let device = device();
+        let Some(device) = device() else {
+            return;
+        };
         let mut batch = Metal4Batch::with_device(device.clone()).expect("Metal 4 batch");
         let output = shared_values(&device, &[0]);
         let plan = Metal4ListPlan::new(1).with_op(fill(&output, 0, 0x55, 4));
@@ -848,7 +868,9 @@ mod tests {
 
     #[test]
     fn metal4_batch_fence_timeout_is_exact_and_pending_submission_drains() {
-        let device = device();
+        let Some(device) = device() else {
+            return;
+        };
         let mut batch = Metal4Batch::with_device(device.clone()).expect("Metal 4 batch");
         let output = shared_values(&device, &[0]);
         let plan = Metal4ListPlan::new(1).with_op(fill(&output, 0, 0x77, 4));
@@ -883,7 +905,9 @@ mod tests {
 
     #[test]
     fn metal4_batch_timeout_drop_retains_pending_fence_until_completion() {
-        let device = device();
+        let Some(device) = device() else {
+            return;
+        };
         let output = shared_values(&device, &[0]);
         {
             let mut batch = Metal4Batch::with_device(device.clone()).expect("Metal 4 batch");
