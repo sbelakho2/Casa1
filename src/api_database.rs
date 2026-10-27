@@ -1484,10 +1484,12 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "mscoree.dll",
         "GetCORSystemDirectory",
         None,
-        SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "Models a Windows machine with no .NET CLR installed: the directory query \
-         fails as it would without a runtime directory.",
+        SemanticFidelity::Exact,
+        SubsystemCapability::Partial,
+        "Reports the directory of the CoreCLR runtime actually installed on the \
+         host, including the terminating separator and the required-character \
+         count.  A host with no runtime still returns E_FAIL; the legacy \
+         .NET Framework directory (Microsoft.NET\\Framework*) is absent.",
     ),
     semantic_override(
         "mscorwks.dll",

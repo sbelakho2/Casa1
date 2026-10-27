@@ -547,22 +547,42 @@ impl PeHostRuntime {
     }
 
     /// `GetCORSystemDirectory(pbuffer, cchBuffer, pdwlength)` — reports the
-    /// .NET Framework CLR directory, which does not exist on this host.
+    /// directory of the CoreCLR runtime this host actually provides.  A host
+    /// with no runtime keeps the real E_FAIL contract.
     pub(crate) fn dispatch_get_cor_system_directory(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let buffer = guest_call_arg(state, memory, 0)?;
-        let _capacity = guest_call_arg_u32(state, memory, 1)?;
+        let capacity = guest_call_arg_u32(state, memory, 1)?;
         let length_out = guest_call_arg(state, memory, 2)?;
-        if buffer != 0 {
-            write_guest_u16(memory, buffer, 0).ok();
+        let Some(runtime) = crate::clr_meta::installed_runtimes().into_iter().next() else {
+            if buffer != 0 {
+                write_guest_u16(memory, buffer, 0).ok();
+            }
+            if length_out != 0 {
+                write_guest_u32(memory, length_out, 0).ok();
+            }
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        };
+        let mut directory = runtime.directory.to_string_lossy().into_owned();
+        if !directory.ends_with('\\') {
+            directory.push('\\');
         }
+        let units: Vec<u16> = directory.encode_utf16().chain(std::iter::once(0)).collect();
         if length_out != 0 {
-            write_guest_u32(memory, length_out, 0).ok();
+            write_guest_u32(memory, length_out, units.len() as u32).ok();
         }
-        state.set(Register::Rax, u64::from(E_FAIL));
+        if buffer == 0 || capacity < units.len() as u32 {
+            state.set(Register::Rax, u64::from(HRESULT_INSUFFICIENT_BUFFER));
+            return Ok(());
+        }
+        for (index, unit) in units.iter().enumerate() {
+            write_guest_u16(memory, buffer + (index as u64 * 2), *unit).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 

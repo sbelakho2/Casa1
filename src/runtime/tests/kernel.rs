@@ -3022,6 +3022,53 @@ fn nt_usb_ioctls_route_to_the_host_bridge_with_exact_statuses() {
 }
 
 #[test]
+fn cor_system_directory_reports_the_installed_coreclr_exactly() {
+    with_big_stack(|| {
+        let (mut runtime, _temp) = test_runtime("cor-directory");
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetCorSystemDirectory);
+        let mut memory = MemoryImage::default();
+        let length_out = 0x40_000_u64;
+        let buffer = 0x41_000_u64;
+        memory.map_bytes(length_out, &[0_u8; 4]);
+        memory.map_bytes(buffer, &vec![0_u8; 2048]);
+
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 0, length_out as u32]),
+            0x8007_007A
+        );
+        let required = memory.read_u32(length_out).expect("required");
+        assert_ne!(required, 0);
+
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                thunk,
+                &[buffer as u32, 1024, length_out as u32]
+            ),
+            0
+        );
+        let mut units = Vec::new();
+        let mut cursor = buffer;
+        loop {
+            let unit = memory.read_u16(cursor).expect("unit");
+            units.push(unit);
+            if unit == 0 {
+                break;
+            }
+            cursor += 2;
+        }
+        let directory = String::from_utf16(&units[..units.len() - 1]).expect("utf16");
+        assert!(
+            directory.contains("Microsoft.NETCore.App"),
+            "unexpected runtime directory: {directory}"
+        );
+        assert!(directory.ends_with('\\'));
+        assert_eq!(memory.read_u32(length_out).expect("length"), required);
+    });
+}
+
+#[test]
 fn tbs_tpm_dispatch_rejects_bad_contracts_and_runs_startup_exactly() {
     with_big_stack(|| {
         let (mut runtime, _temp) = test_runtime("tbs-tpm");

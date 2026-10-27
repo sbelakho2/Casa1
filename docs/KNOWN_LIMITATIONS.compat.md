@@ -6,7 +6,7 @@
 
 Every tracked export whose dispatch is not exact or whose backing subsystem is not fully available, per the semantic axes of the API database (level = dispatch quality; fidelity = how close the guest-visible behavior is to the documented operation; capability = whether the Windows subsystem the operation belongs to exists in the modeled environment).
 
-**Counts**: 37 entries deviate from exact/full — fidelity Exact 6, Restricted 16, SyntheticEnvironment 15, capability Full 1, Partial 27, Absent 9.
+**Counts**: 37 entries deviate from exact/full — fidelity Exact 7, Restricted 16, SyntheticEnvironment 14, capability Full 1, Partial 28, Absent 8.
 
 
 ### actxprxy.dll
@@ -75,7 +75,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 - `CLRCreateInstance` — level `Implemented`, fidelity `Exact`, capability `Partial` — Exposes the CoreCLR runtimes really installed on the host: the meta host, ICLRRuntimeInfo and a real ICLRRuntimeHost whose ExecuteInDefaultAppDomain runs managed static methods natively on ARM64 CoreCLR.  Managed (.NET Core) images also execute through the managed image path.  The legacy .NET Framework activation contract (CorBindToRuntime*) remains absent, so .NET Framework-only images do not run; the capability is partial, never synthetic.
 - `CorBindToRuntime` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — Models a Windows machine with no .NET CLR installed: activation answers COR_E_CLRNOTAVAILABLE.
 - `CorBindToRuntimeEx` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — Models a Windows machine with no .NET CLR installed: activation answers COR_E_CLRNOTAVAILABLE.
-- `GetCORSystemDirectory` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — Models a Windows machine with no .NET CLR installed: the directory query fails as it would without a runtime directory.
+- `GetCORSystemDirectory` — level `Implemented`, fidelity `Exact`, capability `Partial` — Reports the directory of the CoreCLR runtime actually installed on the host, including the terminating separator and the required-character count.  A host with no runtime still returns E_FAIL; the legacy .NET Framework directory (Microsoft.NET\Framework*) is absent.
 
 ### mscorwks.dll
 
